@@ -9,6 +9,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
 use tur::Downloader;
+use tur::ProgressReporter;
 use tur::backend::tokenizer::TokenOutputStream;
 use tur::models::Gwen35ModelForCausalLM;
 
@@ -45,6 +46,7 @@ struct TextGeneration {
     logits_processor: LogitsProcessor,
     repeat_penalty: f32,
     repeat_last_n: usize,
+    progress: Option<ProgressReporter>,
 }
 
 impl TextGeneration {
@@ -58,6 +60,7 @@ impl TextGeneration {
         repeat_penalty: f32,
         repeat_last_n: usize,
         device: &Device,
+        progress: Option<ProgressReporter>,
     ) -> Self {
         let logits_processor = LogitsProcessor::new(seed, temp, top_p);
         Self {
@@ -67,11 +70,11 @@ impl TextGeneration {
             repeat_penalty,
             repeat_last_n,
             device: device.clone(),
+            progress,
         }
     }
 
     fn run(&mut self, prompt: &str, sample_len: usize) -> Result<()> {
-        use std::io::Write;
         self.tokenizer.clear();
         let mut tokens = self
             .tokenizer
@@ -80,12 +83,11 @@ impl TextGeneration {
             .map_err(anyhow::Error::msg)?
             .get_ids()
             .to_vec();
-        for &t in tokens.iter() {
-            if let Some(t) = self.tokenizer.next_token(t)? {
-                print!("{t}")
-            }
+
+        // Initialize generation progress bar
+        if let Some(ref progress) = self.progress {
+            progress.init_generation(sample_len);
         }
-        std::io::stdout().flush()?;
 
         let mut generated_tokens = 0usize;
         let eos_token = match self.tokenizer.get_token("<|endoftext|>") {
@@ -118,23 +120,51 @@ impl TextGeneration {
             let next_token = self.logits_processor.sample(&logits)?;
             tokens.push(next_token);
             generated_tokens += 1;
+
+            // Update progress bar
+            if let Some(ref progress) = self.progress {
+                progress.inc_generation();
+            }
+
             if next_token == eos_token || next_token == eos_token2 {
                 break;
             }
             if let Some(t) = self.tokenizer.next_token(next_token)? {
-                print!("{t}");
-                std::io::stdout().flush()?;
+                if let Some(ref progress) = self.progress {
+                    progress.print(&t);
+                } else {
+                    use std::io::Write;
+                    print!("{t}");
+                    std::io::stdout().flush()?;
+                }
             }
         }
         let dt = start_gen.elapsed();
         if let Some(rest) = self.tokenizer.decode_rest().map_err(anyhow::Error::msg)? {
-            print!("{rest}");
+            if let Some(ref progress) = self.progress {
+                progress.print(&rest);
+            } else {
+                print!("{rest}");
+            }
         }
-        std::io::stdout().flush()?;
-        info!(
-            "\n{generated_tokens} tokens generated ({:.2} token/s)",
-            generated_tokens as f64 / dt.as_secs_f64(),
-        );
+
+        // Flush any remaining buffered text
+        if let Some(ref progress) = self.progress {
+            progress.flush_text();
+        } else {
+            use std::io::Write;
+            std::io::stdout().flush()?;
+        }
+
+        // Finish generation progress bar
+        if let Some(ref progress) = self.progress {
+            progress.finish_generation(generated_tokens, dt.as_secs_f64());
+        } else {
+            info!(
+                "\n{generated_tokens} tokens generated ({:.2} token/s)",
+                generated_tokens as f64 / dt.as_secs_f64(),
+            );
+        }
         Ok(())
     }
 }
@@ -233,22 +263,9 @@ fn main() -> Result<()> {
     // Parse the JSON and extract text_config
     let config_json: serde_json::Value = serde_json::from_str(&config_content)
         .map_err(|e| anyhow::anyhow!("Failed to parse config JSON: {}", e))?;
-
-    debug!("Model Config value: {:?}", config_json);
-
-    // let text_config = config_json
-    //     .get("text_config")
-    //     .ok_or_else(|| anyhow::anyhow!("Config missing text_config field"))?;
-
     let config: tur::models::qwen3_5::Config = serde_json::from_value(config_json.clone())
         .map_err(|e| anyhow::anyhow!("Failed to parse text_config: {}", e))?;
 
-    // // Extract rope_theta from rope_parameters if present
-    // if let Some(rope_params) = text_config.get("rope_parameters") {
-    //     if let Some(rope_theta) = rope_params.get("rope_theta").and_then(|v| v.as_f64()) {
-    //         config.rope_theta = rope_theta;
-    //     }
-    // }
     debug!("Model Config: {:?}", config);
 
     let safetensors = paths.get_weight_filenames();
@@ -258,9 +275,12 @@ fn main() -> Result<()> {
     let tokenizer = Tokenizer::from_file(&tokenizer_path).unwrap();
     debug!("Loaded Tokenizer from: {:?}", tokenizer_path);
 
+    // Create progress reporter
+    let progress = ProgressReporter::new();
+
     // let vb = VarBuilderX::new(&paths, gguf, DType::F32, &device)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safetensors, dtype, &device)? };
-    let model = Gwen35ModelForCausalLM::new(&config, vb)?;
+    let model = Gwen35ModelForCausalLM::new_with_progress(&config, vb, Some(&progress))?;
 
     debug!(
         "✓ Loaded Qwen 3.5 with {} safetensor shard(s)",
@@ -275,6 +295,7 @@ fn main() -> Result<()> {
         args.repeat_penalty,
         args.repeat_last_n,
         &device,
+        Some(progress),
     );
     debug!("✓ Model is initialized and ready for inference");
 
@@ -284,129 +305,5 @@ fn main() -> Result<()> {
 
     pipeline.run(&prompt_str, args.sample_len)?;
 
-    // let tokens = tos
-    //     .tokenizer()
-    //     .encode(prompt_str, true)
-    //     .map_err(anyhow::Error::msg)?;
-
-    // let tokens = tokens.get_ids();
-
-    // let mut all_tokens = vec![];
-
-    // let mut logits_processor = {
-    //     let temperature = args.temperature;
-    //     let sampling = if temperature <= 0. {
-    //         Sampling::ArgMax
-    //     } else {
-    //         match (args.top_k, args.top_p) {
-    //             (None, None) => Sampling::All { temperature },
-    //             (Some(k), None) => Sampling::TopK { k, temperature },
-    //             (None, Some(p)) => Sampling::TopP { p, temperature },
-    //             (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature },
-    //         }
-    //     };
-    //     trace!("Using sampling: {:?}", sampling);
-    //     LogitsProcessor::from_sampling(args.seed, sampling)
-    // };
-
-    // let start_prompt_processing = std::time::Instant::now();
-
-    // let mut next_token = {
-    //     let input = Tensor::new(tokens, &device)?.unsqueeze(0)?;
-    //     let logits = model.forward(&input)?;
-    //     let logits = logits.i((0, tokens.len() - 1))?;
-    //     logits_processor.sample(&logits)?
-    // };
-
-    // let prompt_dt = start_prompt_processing.elapsed();
-    // trace!(
-    //     "Prompt was processed in {:?}. Next token: {}",
-    //     prompt_dt, next_token
-    // );
-
-    // let eos_token = *tos
-    //     .tokenizer()
-    //     .get_vocab(true)
-    //     .get("<|im_end|>")
-    //     .ok_or_else(|| anyhow::anyhow!("Tokenizer missing <|im_end|> token"))?;
-
-    // let start_post_prompt = std::time::Instant::now();
-    // let mut sampled = 0usize;
-
-    // while sampled < args.sample_len && next_token != eos_token {
-    //     if let Some(t) = tos.next_token(next_token)? {
-    //         trace!("{t}");
-    //     }
-
-    //     let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
-    //     let logits = model.forward(&input)?;
-    //     let logits = logits.i((0, 0))?;
-    //     next_token = logits_processor.sample(&logits)?;
-    //     sampled += 1;
-    //     all_tokens.push(next_token);
-    // }
-
-    // if next_token == eos_token {
-    //     debug!(
-    //         "Encountered EOS token after generating {} token(s)",
-    //         sampled
-    //     );
-    // }
-
-    // if let Some(rest) = tos.decode_rest()? {
-    //     trace!("{rest}");
-    // }
-
-    // let dt = start_post_prompt.elapsed();
-    // info!(
-    //     "\n{:4} prompt tokens processed: {:.2} token/s",
-    //     tokens.len(),
-    //     tokens.len() as f64 / prompt_dt.as_secs_f64(),
-    // );
-    // info!(
-    //     "{sampled:4} tokens generated: {:.2} token/s",
-    //     sampled as f64 / dt.as_secs_f64(),
-    // );
-
-    // // Run a simple forward pass with dummy token IDs
-    // info!("Running forward pass...");
-
-    // // Create a simple input: batch_size=1, seq_len=5 with token IDs [1, 2, 3, 4, 5]
-    // let input_ids = Tensor::new(&[1u32, 2u32, 3u32, 4u32, 5u32], &device)?.reshape((1, 5))?; // Shape: [batch_size, seq_len]
-
-    // debug!("Input shape: {:?}", input_ids.shape());
-
-    // // Forward pass
-    // let logits = model.forward(&input_ids)?;
-
-    // debug!("Output logits shape: {:?}", logits.shape());
-    // debug!(
-    //     "Expected shape: [batch_size=1, seq_len=5, vocab_size={}]",
-    //     model.vocab_size()
-    // );
-
-    // // Verify output shape
-    // let (batch_size, seq_len, vocab_size) = logits.dims3()?;
-    // assert_eq!(batch_size, 1, "Batch size mismatch");
-    // assert_eq!(seq_len, 5, "Sequence length mismatch");
-    // assert_eq!(vocab_size, model.vocab_size(), "Vocab size mismatch");
-
-    // info!("✓ Forward pass successful!");
-    // info!("  Input shape: [1, 5]");
-    // info!(
-    //     "  Output shape: [{}, {}, {}]",
-    //     batch_size, seq_len, vocab_size
-    // );
-
-    // // Get the last token's logits for next token prediction
-    // let last_token_logits = logits.i((0, seq_len - 1))?;
-    // debug!("Last token logits shape: {:?}", last_token_logits.shape());
-
-    // // Find the token with highest probability (argmax)
-    // let next_token = last_token_logits.argmax(0)?;
-    // let next_token_id = next_token.to_scalar::<u32>()?;
-    // info!("  Predicted next token ID: {}", next_token_id);
-
-    //drop(model);
     Ok(())
 }

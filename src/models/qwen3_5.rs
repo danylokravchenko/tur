@@ -1,3 +1,4 @@
+use crate::backend::progress::ProgressReporter;
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{Activation, VarBuilder, kv_cache::ConcatKvCache};
 use candle_transformers::{
@@ -414,14 +415,39 @@ pub struct Model {
 
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_progress(cfg, vb, None)
+    }
+
+    pub fn new_with_progress(
+        cfg: &Config,
+        vb: VarBuilder,
+        progress: Option<&ProgressReporter>,
+    ) -> Result<Self> {
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let rotary = Arc::new(Qwen3RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
+
+        // Initialize progress bar for layer loading
+        if let Some(p) = progress {
+            p.init_loading(cfg.num_hidden_layers);
+        }
+
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb.pp("model.layers");
         for i in 0..cfg.num_hidden_layers {
             layers.push(DecoderLayer::new(cfg, rotary.clone(), vb_l.pp(i))?);
+
+            // Report progress after each layer is loaded
+            if let Some(p) = progress {
+                p.inc_loading();
+            }
         }
+
+        // Finish loading progress
+        if let Some(p) = progress {
+            p.finish_loading();
+        }
+
         Ok(Self {
             embed_tokens,
             layers,
@@ -491,7 +517,15 @@ pub struct ModelForCausalLM {
 
 impl ModelForCausalLM {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let base = Model::new(cfg, vb.clone())?;
+        Self::new_with_progress(cfg, vb, None)
+    }
+
+    pub fn new_with_progress(
+        cfg: &Config,
+        vb: VarBuilder,
+        progress: Option<&ProgressReporter>,
+    ) -> Result<Self> {
+        let base = Model::new_with_progress(cfg, vb.clone(), progress)?;
         let lm_head = if cfg.tie_word_embeddings {
             Linear::from_weights(base.embed_tokens.embeddings().clone(), None)
         } else {
