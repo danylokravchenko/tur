@@ -1,10 +1,42 @@
-use candle_core::Result;
+use crate::{Result, TurError};
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::trace;
+
+// File name constants
+mod file_names {
+    pub const TOKENIZER: &str = "tokenizer.json";
+    pub const TOKENIZER_CONFIG: &str = "tokenizer_config.json";
+    pub const CONFIG: &str = "config.json";
+    pub const GENERATION_CONFIG: &str = "generation_config.json";
+    pub const CHAT_TEMPLATE: &str = "chat_template.json";
+    pub const MODEL_SAFETENSORS: &str = "model.safetensors";
+    pub const MODEL_SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
+}
+
+// File extension constants
+mod extensions {
+    pub const SAFETENSORS: &str = ".safetensors";
+    pub const GGUF: &str = ".gguf";
+    pub const INDEX_JSON: &str = ".index.json";
+}
+
+// Repository constants
+mod repos {
+    pub const DEFAULT_ORG: &str = "Qwen";
+    pub const GGUF_ORG: &str = "unsloth";
+    pub const GGUF_SUFFIX: &str = "-GGUF";
+    pub const DEFAULT_REVISION: &str = "main";
+}
+
+// Retry configuration constants
+mod retry {
+    pub const MAX_RETRIES: u32 = 5;
+    pub const BASE_DELAY_SECS: u64 = 5;
+}
 
 #[derive(Debug, Clone)]
 pub struct Downloader {
@@ -79,39 +111,40 @@ impl Downloader {
         ) {
             (None, Some(path), None) => {
                 if !Path::new(path).is_dir() {
-                    candle_core::bail!(
-                        "Safetensor weight path must be a directory! \n\t***Tips: use `--f` to specify gguf model file!***"
-                    );
+                    return Err(TurError::HfHub(
+                        "Safetensor weight path must be a directory! \n\t***Tips: use `--f` to specify gguf model file!***".to_string()
+                    ));
                 }
 
                 let mut filenames = vec![];
-                let index_path = Path::new(path).join("model.safetensors.index.json");
+                let index_path = Path::new(path).join(file_names::MODEL_SAFETENSORS_INDEX);
                 if index_path.exists() {
-                    filenames = load_local_safetensors(path, "model.safetensors.index.json")?;
+                    filenames = load_local_safetensors(path, file_names::MODEL_SAFETENSORS_INDEX)?;
                 } else {
-                    filenames.push(Path::new(path).join("model.safetensors"));
+                    filenames.push(Path::new(path).join(file_names::MODEL_SAFETENSORS));
                 }
 
                 (
                     ModelPaths {
-                        tokenizer_filename: Path::new(path).join("tokenizer.json"),
-                        tokenizer_config_filename: Path::new(path).join("tokenizer_config.json"),
-                        config_filename: Path::new(path).join("config.json"),
+                        tokenizer_filename: Path::new(path).join(file_names::TOKENIZER),
+                        tokenizer_config_filename: Path::new(path)
+                            .join(file_names::TOKENIZER_CONFIG),
+                        config_filename: Path::new(path).join(file_names::CONFIG),
                         generation_config_filename: if Path::new(path)
-                            .join("generation_config.json")
+                            .join(file_names::GENERATION_CONFIG)
                             .exists()
                         {
-                            Path::new(path).join("generation_config.json")
+                            Path::new(path).join(file_names::GENERATION_CONFIG)
                         } else {
                             PathBuf::new()
                         },
                         filenames,
                         auxiliary_filenames: Vec::new(),
                         chat_template_filename: if Path::new(path)
-                            .join("chat_template.json")
+                            .join(file_names::CHAT_TEMPLATE)
                             .exists()
                         {
-                            Some(Path::new(path).join("chat_template.json"))
+                            Some(Path::new(path).join(file_names::CHAT_TEMPLATE))
                         } else {
                             None
                         },
@@ -125,9 +158,9 @@ impl Downloader {
                 false,
             ),
             _ => {
-                candle_core::bail!(
-                    "Invalid configuration!\n***Tips***: \n \t For local model weights: --weight-path <path/to/folder>\n \t For remote SafeTensors: --model-id Qwen3-0.6B\n \t For remote GGUF: --model-id Qwen3-0.6B --quantization Q4_K_M"
-                );
+                return Err(TurError::HfHub(
+                    "Invalid configuration!\n***Tips***: \n \t For local model weights: --weight-path <path/to/folder>\n \t For remote SafeTensors: --model-id Qwen3-0.6B\n \t For remote GGUF: --model-id Qwen3-0.6B --quantization Q4_K_M".to_string(),
+                ));
             }
         };
 
@@ -141,13 +174,13 @@ impl Downloader {
         retries: u32,
         base_delay: std::time::Duration,
     ) -> Result<PathBuf> {
-        let mut last_err: Option<candle_core::Error> = None;
+        let mut last_err: Option<crate::TurError> = None;
 
         for attempt in 1..=retries {
             match api.get(rfilename).map_err(candle_core::Error::wrap) {
                 Ok(path) => return Ok(path),
                 Err(e) => {
-                    last_err = Some(e);
+                    last_err = Some(e.into());
                     if attempt == retries {
                         break;
                     }
@@ -157,10 +190,13 @@ impl Downloader {
         }
 
         Err(last_err.unwrap_or_else(|| {
-            candle_core::Error::msg(format!(
-                "Failed downloading {} after {} attempts",
-                rfilename, retries
-            ))
+            TurError::HfHub(
+                format!(
+                    "Failed downloading {} after {} attempts",
+                    rfilename, retries
+                )
+                .to_string(),
+            )
         }))
     }
 
@@ -184,20 +220,22 @@ impl Downloader {
         let repo = api.repo(Repo::with_revision(
             full_repo.clone(),
             RepoType::Model,
-            "main".to_string(),
+            repos::DEFAULT_REVISION.to_string(),
         ));
 
         let tokenizer_filename = repo
-            .get("tokenizer.json")
+            .get(file_names::TOKENIZER)
             .map_err(candle_core::Error::wrap)?;
-        let config_filename = repo.get("config.json").map_err(candle_core::Error::wrap)?;
+        let config_filename = repo
+            .get(file_names::CONFIG)
+            .map_err(candle_core::Error::wrap)?;
 
-        let tokenizer_config_filename = match repo.get("tokenizer_config.json") {
+        let tokenizer_config_filename = match repo.get(file_names::TOKENIZER_CONFIG) {
             Ok(f) => f,
             _ => PathBuf::new(),
         };
 
-        let generation_config_filename = match repo.get("generation_config.json") {
+        let generation_config_filename = match repo.get(file_names::GENERATION_CONFIG) {
             Ok(f) => f,
             _ => PathBuf::new(),
         };
@@ -211,11 +249,15 @@ impl Downloader {
             .map(|x| x.rfilename.clone())
             .filter(|x| {
                 // Include .safetensors files but exclude the index file
-                x.ends_with(".safetensors") && !x.contains(".index.json")
+                x.ends_with(extensions::SAFETENSORS) && !x.contains(extensions::INDEX_JSON)
             })
         {
-            let filename =
-                self.hf_get_with_retry(&repo, &rfilename, 5, std::time::Duration::from_secs(5))?;
+            let filename = self.hf_get_with_retry(
+                &repo,
+                &rfilename,
+                retry::MAX_RETRIES,
+                std::time::Duration::from_secs(retry::BASE_DELAY_SECS),
+            )?;
             filenames.push(filename);
         }
 
@@ -243,9 +285,10 @@ impl Downloader {
         // Resolve repos: config from main repo, weights from unsloth GGUF repo
         let (config_repo, gguf_repo) = resolve_gguf_repos(model_id)?;
         let gguf_filename = format!(
-            "{}-{}.gguf",
+            "{}-{}{}",
             model_id.split('/').last().unwrap_or(model_id),
-            quantization
+            quantization,
+            extensions::GGUF
         );
 
         trace!(
@@ -265,28 +308,28 @@ impl Downloader {
         let config_repo_api = api.repo(Repo::with_revision(
             config_repo.clone(),
             RepoType::Model,
-            "main".to_string(),
+            repos::DEFAULT_REVISION.to_string(),
         ));
 
         let tokenizer_filename = config_repo_api
-            .get("tokenizer.json")
+            .get(file_names::TOKENIZER)
             .map_err(candle_core::Error::wrap)?;
 
         let config_filename = config_repo_api
-            .get("config.json")
+            .get(file_names::CONFIG)
             .map_err(candle_core::Error::wrap)?;
 
-        let tokenizer_config_filename = match config_repo_api.get("tokenizer_config.json") {
+        let tokenizer_config_filename = match config_repo_api.get(file_names::TOKENIZER_CONFIG) {
             Ok(f) => f,
             _ => PathBuf::new(),
         };
 
-        let generation_config_filename = match config_repo_api.get("generation_config.json") {
+        let generation_config_filename = match config_repo_api.get(file_names::GENERATION_CONFIG) {
             Ok(f) => f,
             _ => PathBuf::new(),
         };
 
-        let chat_template_filename = match config_repo_api.get("chat_template.json") {
+        let chat_template_filename = match config_repo_api.get(file_names::CHAT_TEMPLATE) {
             Ok(f) => Some(f),
             _ => None,
         };
@@ -295,7 +338,7 @@ impl Downloader {
         let gguf_repo_api = api.repo(Repo::with_revision(
             gguf_repo.clone(),
             RepoType::Model,
-            "main".to_string(),
+            repos::DEFAULT_REVISION.to_string(),
         ));
 
         let downloaded_file = gguf_repo_api
@@ -345,7 +388,7 @@ fn resolve_model_repo(model_id: &str) -> Result<String> {
         Ok(model_id.to_string())
     } else {
         // Simplified name - assume Qwen org
-        Ok(format!("Qwen/{}", model_id))
+        Ok(format!("{}/{}", repos::DEFAULT_ORG, model_id))
     }
 }
 
@@ -357,7 +400,7 @@ fn resolve_model_repo(model_id: &str) -> Result<String> {
 fn resolve_gguf_repos(model_id: &str) -> Result<(String, String)> {
     let config_repo = resolve_model_repo(model_id)?;
     let model_name = config_repo.split('/').last().unwrap_or(model_id);
-    let gguf_repo = format!("unsloth/{}-GGUF", model_name);
+    let gguf_repo = format!("{}/{}{}", repos::GGUF_ORG, model_name, repos::GGUF_SUFFIX);
 
     Ok((config_repo, gguf_repo))
 }

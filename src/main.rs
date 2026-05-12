@@ -7,13 +7,11 @@ use tracing::{debug, info, trace};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
-use tur::Downloader;
-use tur::ProgressReporter;
 use tur::backend::tokenizer::TokenOutputStream;
 use tur::models::Qwen35ModelForCausalLM;
 use tur::weights::VarBuilderX;
+use tur::{Downloader, ProgressReporter, Result, TurError};
 
-use anyhow::Result;
 const DEFAULT_PROMPT: &str = "Who are you?";
 
 fn init_tracing() {
@@ -80,7 +78,7 @@ impl TextGeneration {
             .tokenizer
             .tokenizer()
             .encode(prompt, true)
-            .map_err(anyhow::Error::msg)?
+            .map_err(|e| TurError::Tokenizer(e.to_string()))?
             .get_ids()
             .to_vec();
 
@@ -92,11 +90,19 @@ impl TextGeneration {
         let mut generated_tokens = 0usize;
         let eos_token = match self.tokenizer.get_token("<|endoftext|>") {
             Some(token) => token,
-            None => anyhow::bail!("cannot find the <|endoftext|> token"),
+            None => {
+                return Err(TurError::Tokenizer(
+                    "cannot find the <|endoftext|> token".to_string(),
+                ));
+            }
         };
         let eos_token2 = match self.tokenizer.get_token("<|im_end|>") {
             Some(token) => token,
-            None => anyhow::bail!("cannot find the <|im_end|> token"),
+            None => {
+                return Err(TurError::Tokenizer(
+                    "cannot find the <|im_end|> token".to_string(),
+                ));
+            }
         };
         let start_gen = std::time::Instant::now();
         for index in 0..sample_len {
@@ -140,7 +146,11 @@ impl TextGeneration {
             }
         }
         let dt = start_gen.elapsed();
-        if let Some(rest) = self.tokenizer.decode_rest().map_err(anyhow::Error::msg)? {
+        if let Some(rest) = self
+            .tokenizer
+            .decode_rest()
+            .map_err(|e| TurError::Tokenizer(e.to_string()))?
+        {
             if let Some(ref progress) = self.progress {
                 progress.print(&rest);
             } else {
@@ -215,6 +225,15 @@ struct Args {
     /// The context size to consider for the repeat penalty.
     #[arg(long, default_value_t = 64)]
     repeat_last_n: usize,
+
+    /// Enable thinking/reasoning mode (allows model to show its reasoning process)
+    #[arg(long)]
+    thinking: bool,
+}
+
+fn format_prompt(prompt: &str, thinking: bool) -> String {
+    let think_tag = if thinking { " /think" } else { " /no_think" };
+    format!("<|im_start|>user\n{prompt}{think_tag}<|im_end|>\n<|im_start|>assistant\n")
 }
 
 fn main() -> Result<()> {
@@ -225,13 +244,15 @@ fn main() -> Result<()> {
 
     let device = Device::new_metal(0)?;
     //let device = Device::Cpu;
+    // DType for non-quantized operations (embeddings, norms, activations)
+    // When using GGUF quantized models, linear layer weights remain quantized
     let dtype = if device.is_cuda() || device.is_metal() {
         DType::BF16
     } else {
         DType::F32
     };
     debug!("Device: {:?}", device);
-    debug!("DType: {:?}", dtype);
+    debug!("DType for non-quantized ops: {:?}", dtype);
     debug!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
         candle_core::utils::with_avx(),
@@ -241,7 +262,7 @@ fn main() -> Result<()> {
     );
 
     if args.model_id.is_none() && args.weight_path.is_none() {
-        anyhow::bail!(
+        return Err(TurError::Other(
             "Please provide a weight source:\n\
              Examples:\n\
              - Full precision SafeTensors:\n\
@@ -250,7 +271,8 @@ fn main() -> Result<()> {
                --model-id Qwen3-0.6B --quantization Q4_K_M\n\
              - Local weights:\n\
                --weight-path /path/to/model"
-        );
+                .to_string(),
+        ));
     }
 
     // Log download strategy
@@ -275,30 +297,34 @@ fn main() -> Result<()> {
     // Load config from downloaded config.json
     let config_path = paths.get_config_filename();
     trace!("Reading config file: {}", config_path.display());
-    let config_content = std::fs::read_to_string(&config_path).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to read config file {}: {}",
-            config_path.display(),
-            e
-        )
-    })?;
+    let config_content = std::fs::read_to_string(&config_path)?;
 
     // Parse the JSON and extract text_config
-    let config_json: serde_json::Value = serde_json::from_str(&config_content)
-        .map_err(|e| anyhow::anyhow!("Failed to parse config JSON: {}", e))?;
-    let config: tur::models::qwen3_5::Config = serde_json::from_value(config_json.clone())
-        .map_err(|e| anyhow::anyhow!("Failed to parse text_config: {}", e))?;
+    let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
+    let config: tur::models::qwen3::Config = serde_json::from_value(config_json.clone())?;
 
     debug!("Model Config: {:?}", config);
 
     let weight_files = paths.get_weight_filenames();
     if gguf {
         debug!("Loading GGUF quantized model from: {:?}", weight_files);
+        if device.is_cpu() {
+            debug!(
+                "CPU mode: Linear layers will use quantized weights (QMatMul) for memory efficiency"
+            );
+        } else {
+            debug!(
+                "GPU/Metal mode: Dequantizing linear layers to {:?} for better performance",
+                dtype
+            );
+        }
+        debug!("Embeddings and norms will use {:?}", dtype);
     } else {
         debug!(
             "Loading full-precision SafeTensors model from: {:?}",
             weight_files
         );
+        debug!("All operations will use {:?}", dtype);
     }
 
     let tokenizer_path = paths.get_tokenizer_filename();
@@ -333,11 +359,10 @@ fn main() -> Result<()> {
     );
     debug!("✓ Model is initialized and ready for inference");
 
-    let prompt_str =
-        format!("<|im_start|>user\n{DEFAULT_PROMPT}<|im_end|>\n<|im_start|>assistant\n");
-    trace!("formatted prompt: {}", &prompt_str);
+    let prompt = format_prompt(&DEFAULT_PROMPT, args.thinking);
+    trace!("formatted prompt: {}", &prompt);
 
-    pipeline.run(&prompt_str, args.sample_len)?;
+    pipeline.run(&prompt, args.sample_len)?;
 
     Ok(())
 }

@@ -59,21 +59,37 @@ pub fn rms_norm_sharded(
     is_gemma: bool,
     shard: Shard,
 ) -> Result<NormX> {
-    let (weight, dtype) = match &vb.0 {
-        Either::Left(vb) => {
-            let ws = vb.get_with_hints(size, "weight", shard)?;
+    let (weight, norm_dtype) = match &vb.0 {
+        Either::Left(inner_vb) => {
+            let ws = inner_vb.get_with_hints(size, "weight", shard)?;
             if ws.dtype() != dtype {
                 (ws.to_dtype(dtype)?, dtype)
             } else {
                 (ws, dtype)
             }
         }
-        Either::Right(vb) => (vb.get(size, "weight")?.dequantize(vb.device())?, DType::F32),
+        Either::Right(inner_vb) => {
+            // // Dequantize and convert to target dtype (BF16 on GPU/Metal, F32 on CPU)
+            // let w = inner_vb
+            //     .get(size, "weight")?
+            //     .dequantize(inner_vb.device())?;
+            // let w = if w.dtype() != dtype {
+            //     w.to_dtype(dtype)?
+            // } else {
+            //     w
+            // };
+            // (w, dtype)
+            // GGUF: Dequantize to F32 (QMatMul also outputs F32)
+            let w = inner_vb
+                .get(size, "weight")?
+                .dequantize(inner_vb.device())?;
+            (w, DType::F32)
+        }
     };
 
     let weight = if is_gemma { (weight + 1.0)? } else { weight };
     Ok(NormX {
         norm: Either::Left(RmsNorm::new(weight, eps)),
-        dtype,
+        dtype: norm_dtype,
     })
 }

@@ -71,9 +71,9 @@ impl Qwen3RotaryEmbedding {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3MLP {
-    gate_proj: candle_nn::Linear,
-    up_proj: candle_nn::Linear,
-    down_proj: candle_nn::Linear,
+    gate_proj: layers::LinearX,
+    up_proj: layers::LinearX,
+    down_proj: layers::LinearX,
     act_fn: Activation,
 }
 
@@ -106,10 +106,10 @@ impl Module for Qwen3MLP {
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3Attention {
     // projections
-    q_proj: candle_nn::Linear,
-    k_proj: candle_nn::Linear,
-    v_proj: candle_nn::Linear,
-    o_proj: candle_nn::Linear,
+    q_proj: layers::LinearX,
+    k_proj: layers::LinearX,
+    v_proj: layers::LinearX,
+    o_proj: layers::LinearX,
     // norms
     q_norm: layers::norm::NormX,
     k_norm: layers::norm::NormX,
@@ -588,7 +588,7 @@ impl Model {
 #[derive(Debug, Clone)]
 pub struct ModelForCausalLM {
     base: Model,
-    lm_head: candle_nn::Linear,
+    lm_head: layers::LinearX,
 }
 
 impl ModelForCausalLM {
@@ -603,7 +603,10 @@ impl ModelForCausalLM {
     ) -> Result<Self> {
         let base = Model::new_with_progress(cfg, vb.clone(), progress)?;
         let lm_head = if cfg.tie_word_embeddings {
-            candle_nn::Linear::new(base.embed_tokens.embeddings().clone(), None)
+            layers::LinearX::Standard(candle_nn::Linear::new(
+                base.embed_tokens.embeddings().clone(),
+                None,
+            ))
         } else {
             // GGUF models use "output" instead of "lm_head"
             let lm_head_name = if vb.is_qvar_builder() {

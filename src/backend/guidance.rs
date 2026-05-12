@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use crate::{Result, TurError};
 use llguidance::ParserFactory as LlgParserFactory;
 use tokenizers::Tokenizer;
 use toktrie_hf_tokenizers::ByteTokenizer;
@@ -25,7 +25,10 @@ pub fn build_llg_factory(
             v
         }
     });
-    let env = ByteTokenizer::from_tokenizer(tokenizer)?.into_tok_env(target_vocab)?;
-    let factory = ParserFactory::new_simple(&env)?;
+    let env = ByteTokenizer::from_tokenizer(tokenizer)
+        .map_err(|e| TurError::Guidance(e.to_string()))?
+        .into_tok_env(target_vocab)
+        .map_err(|e| TurError::Guidance(e.to_string()))?;
+    let factory = ParserFactory::new_simple(&env).map_err(|e| TurError::Guidance(e.to_string()))?;
     Ok(Arc::new(factory))
 }

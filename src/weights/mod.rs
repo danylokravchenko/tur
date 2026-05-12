@@ -84,7 +84,17 @@ impl VarBuilderX<'_> {
     pub fn dtype(&self) -> DType {
         match &self.0 {
             Either::Left(vb) => vb.dtype(),
-            Either::Right(_) => DType::F32, // GGUF always dequantizes to F32
+            Either::Right(_) => {
+                // GGUF: QMatMul dequantizes to F32 internally
+                // Embeddings and norms will use F32
+                // let device = self.device();
+                // if device.is_cuda() || device.is_metal() {
+                //     DType::BF16
+                // } else {
+                //     DType::F32
+                // }
+                DType::F32
+            }
         }
     }
 
@@ -134,14 +144,22 @@ impl VarBuilderX<'_> {
     ) -> Result<Tensor> {
         match &self.0 {
             Either::Left(vb) => vb.get_with_hints_dtype(s, name, shard, dtype),
-            Either::Right(vb) => vb.get(s, name).and_then(|x| x.dequantize(vb.device())),
+            Either::Right(vb) => {
+                // For GGUF, dequantize to requested dtype
+                // This is used for non-linear operations like embeddings and norms
+                vb.get(s, name).and_then(|x| x.dequantize(vb.device()))
+            }
         }
     }
 
     pub fn get<S: Into<candle_core::Shape>>(&self, s: S, name: &str) -> Result<Tensor> {
         match &self.0 {
             Either::Left(vb) => vb.get(s, name),
-            Either::Right(vb) => vb.get(s, name).and_then(|x| x.dequantize(vb.device())),
+            Either::Right(vb) => {
+                // For GGUF, dequantize to F32
+                // This is used for non-linear operations like embeddings and norms
+                vb.get(s, name).and_then(|x| x.dequantize(vb.device()))
+            }
         }
     }
 
