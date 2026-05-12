@@ -1,5 +1,4 @@
 use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use clap::Parser;
 use tokenizers::Tokenizer;
@@ -11,7 +10,8 @@ use tracing_subscriber::{EnvFilter, Layer, fmt};
 use tur::Downloader;
 use tur::ProgressReporter;
 use tur::backend::tokenizer::TokenOutputStream;
-use tur::models::Gwen35ModelForCausalLM;
+use tur::models::Qwen35ModelForCausalLM;
+use tur::weights::VarBuilderX;
 
 use anyhow::Result;
 const DEFAULT_PROMPT: &str = "Who are you?";
@@ -40,7 +40,7 @@ fn init_tracing() {
 }
 
 struct TextGeneration {
-    model: Gwen35ModelForCausalLM,
+    model: Qwen35ModelForCausalLM,
     device: Device,
     tokenizer: TokenOutputStream,
     logits_processor: LogitsProcessor,
@@ -52,7 +52,7 @@ struct TextGeneration {
 impl TextGeneration {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        model: Gwen35ModelForCausalLM,
+        model: Qwen35ModelForCausalLM,
         tokenizer: Tokenizer,
         seed: u64,
         temp: Option<f64>,
@@ -172,17 +172,21 @@ impl TextGeneration {
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Qwen 3.5 Model - Clean Implementation", long_about = None)]
 struct Args {
-    /// Hugging Face model ID for downloading weights
+    /// Simplified model ID (e.g., "Qwen3-0.6B" or full "Qwen/Qwen3-0.6B").
+    /// Config and tokenizer are always downloaded from the main repo.
+    /// If --quantization is specified, GGUF weights are downloaded from unsloth/<model>-GGUF
     #[arg(long, env = "HF_MODEL_ID")]
     model_id: Option<String>,
 
-    /// Local path to a directory containing safetensors weights
+    /// Local path to a directory containing model weights (safetensors or GGUF)
     #[arg(long, env = "MODEL_WEIGHT_PATH")]
     weight_path: Option<String>,
 
-    /// Optional weight filename inside the local path
-    #[arg(long, env = "MODEL_WEIGHT_FILE")]
-    weight_file: Option<String>,
+    /// Quantization level for GGUF models (e.g., Q4_K_M, Q5_K_M, Q8_0).
+    /// When specified, downloads GGUF weights from unsloth repo instead of SafeTensors.
+    /// Example: --model-id Qwen3-0.6B --quantization Q4_K_M
+    #[arg(long, short = 'q', env = "QUANTIZATION")]
+    quantization: Option<String>,
 
     /// The length of the sample to generate (in tokens).
     #[arg(short = 'n', long, default_value_t = 1000)]
@@ -238,16 +242,35 @@ fn main() -> Result<()> {
 
     if args.model_id.is_none() && args.weight_path.is_none() {
         anyhow::bail!(
-            "Please provide a weight source: `--weight-path <path>` for local safetensors or `--model-id <hf-model>` for Hugging Face downloads."
+            "Please provide a weight source:\n\
+             Examples:\n\
+             - Full precision SafeTensors:\n\
+               --model-id Qwen3-0.6B\n\
+             - Quantized GGUF (auto-downloads from unsloth):\n\
+               --model-id Qwen3-0.6B --quantization Q4_K_M\n\
+             - Local weights:\n\
+               --weight-path /path/to/model"
         );
     }
 
-    let downloader = Downloader::new(args.model_id, args.weight_path, args.weight_file);
-    let (paths, gguf) = downloader.prepare_model_weights(None, None)?;
-
-    if gguf {
-        anyhow::bail!("GGUF model loading is not implemented in this example.");
+    // Log download strategy
+    if let Some(ref model_id) = args.model_id {
+        let model_name = model_id.split('/').last().unwrap_or(model_id);
+        if let Some(ref quant) = args.quantization {
+            info!("Downloading quantized GGUF model:");
+            info!("  - Model: {}", model_name);
+            info!("  - Quantization: {}", quant);
+            info!("  - Config/tokenizer from: Qwen/{}", model_name);
+            info!("  - GGUF weights from: unsloth/{}-GGUF", model_name);
+        } else {
+            info!("Downloading full-precision SafeTensors model:");
+            info!("  - Model: {}", model_name);
+            info!("  - Repo: Qwen/{}", model_name);
+        }
     }
+
+    let downloader = Downloader::new(args.model_id, args.weight_path, args.quantization);
+    let (paths, gguf) = downloader.prepare_model_weights(None, None)?;
 
     // Load config from downloaded config.json
     let config_path = paths.get_config_filename();
@@ -268,8 +291,15 @@ fn main() -> Result<()> {
 
     debug!("Model Config: {:?}", config);
 
-    let safetensors = paths.get_weight_filenames();
-    debug!("Loaded weight paths: {:?}", safetensors);
+    let weight_files = paths.get_weight_filenames();
+    if gguf {
+        debug!("Loading GGUF quantized model from: {:?}", weight_files);
+    } else {
+        debug!(
+            "Loading full-precision SafeTensors model from: {:?}",
+            weight_files
+        );
+    }
 
     let tokenizer_path = paths.get_tokenizer_filename();
     let tokenizer = Tokenizer::from_file(&tokenizer_path).unwrap();
@@ -278,14 +308,18 @@ fn main() -> Result<()> {
     // Create progress reporter
     let progress = ProgressReporter::new();
 
-    // let vb = VarBuilderX::new(&paths, gguf, DType::F32, &device)?;
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safetensors, dtype, &device)? };
-    let model = Gwen35ModelForCausalLM::new_with_progress(&config, vb, Some(&progress))?;
+    // VarBuilderX automatically handles both quantized (GGUF) and full-precision (SafeTensors)
+    let vb = VarBuilderX::new(&paths, gguf, dtype, &device)?;
+    let model = Qwen35ModelForCausalLM::new_with_progress(&config, vb, Some(&progress))?;
 
-    debug!(
-        "✓ Loaded Qwen 3.5 with {} safetensor shard(s)",
-        safetensors.len()
-    );
+    if gguf {
+        debug!("✓ Loaded quantized Qwen 3.5 model (GGUF format)");
+    } else {
+        debug!(
+            "✓ Loaded full-precision Qwen 3.5 with {} safetensor shard(s)",
+            weight_files.len()
+        );
+    }
     let mut pipeline = TextGeneration::new(
         model,
         tokenizer,

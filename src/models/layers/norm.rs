@@ -6,6 +6,7 @@ use either::Either;
 
 use crate::weights::VarBuilderX;
 
+#[derive(Clone)]
 pub struct NormX {
     norm: Either<RmsNorm, LayerNorm>,
     dtype: DType,

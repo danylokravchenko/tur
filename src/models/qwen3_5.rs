@@ -1,10 +1,9 @@
 use crate::backend::progress::ProgressReporter;
+use crate::models::layers;
+use crate::weights::VarBuilderX;
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{Activation, VarBuilder, kv_cache::ConcatKvCache};
-use candle_transformers::{
-    models::with_tracing::{Linear, RmsNorm, linear_b, linear_no_bias},
-    utils::repeat_kv,
-};
+use candle_nn::{Activation, kv_cache::ConcatKvCache};
+use candle_transformers::utils::repeat_kv;
 use std::sync::Arc;
 
 #[cfg(feature = "flash-attn")]
@@ -72,18 +71,25 @@ impl Qwen3RotaryEmbedding {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3MLP {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: candle_nn::Linear,
+    up_proj: candle_nn::Linear,
+    down_proj: candle_nn::Linear,
     act_fn: Activation,
 }
 
 impl Qwen3MLP {
-    pub(crate) fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &Config, vb: VarBuilderX) -> Result<Self> {
+        // GGUF models use "ffn_gate", "ffn_up", "ffn_down" instead of "gate_proj", "up_proj", "down_proj"
+        let (gate_name, up_name, down_name) = if vb.is_qvar_builder() {
+            ("ffn_gate", "ffn_up", "ffn_down")
+        } else {
+            ("gate_proj", "up_proj", "down_proj")
+        };
+
         Ok(Self {
-            gate_proj: linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"))?,
-            up_proj: linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?,
-            down_proj: linear_no_bias(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?,
+            gate_proj: layers::linear(cfg.hidden_size, cfg.intermediate_size, vb.pp(gate_name))?,
+            up_proj: layers::linear(cfg.hidden_size, cfg.intermediate_size, vb.pp(up_name))?,
+            down_proj: layers::linear(cfg.intermediate_size, cfg.hidden_size, vb.pp(down_name))?,
             act_fn: cfg.hidden_act,
         })
     }
@@ -100,13 +106,13 @@ impl Module for Qwen3MLP {
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3Attention {
     // projections
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: candle_nn::Linear,
+    k_proj: candle_nn::Linear,
+    v_proj: candle_nn::Linear,
+    o_proj: candle_nn::Linear,
     // norms
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
+    q_norm: layers::norm::NormX,
+    k_norm: layers::norm::NormX,
     // hyper params
     num_heads: usize,
     num_kv_heads: usize,
@@ -122,7 +128,7 @@ impl Qwen3Attention {
     pub(crate) fn new(
         cfg: &Config,
         rotary_emb: Arc<Qwen3RotaryEmbedding>,
-        vb: VarBuilder,
+        vb: VarBuilderX,
     ) -> Result<Self> {
         if cfg.use_sliding_window {
             candle_core::bail!("sliding window is not supported")
@@ -133,33 +139,39 @@ impl Qwen3Attention {
         let num_kv_heads = cfg.num_key_value_heads;
         let num_kv_groups = num_heads / num_kv_heads;
 
-        let q_proj = linear_b(
-            cfg.hidden_size,
-            num_heads * head_dim,
-            cfg.attention_bias,
-            vb.pp("q_proj"),
-        )?;
-        let k_proj = linear_b(
-            cfg.hidden_size,
-            num_kv_heads * head_dim,
-            cfg.attention_bias,
-            vb.pp("k_proj"),
-        )?;
-        let v_proj = linear_b(
-            cfg.hidden_size,
-            num_kv_heads * head_dim,
-            cfg.attention_bias,
-            vb.pp("v_proj"),
-        )?;
-        let o_proj = linear_b(
-            num_heads * head_dim,
-            cfg.hidden_size,
-            cfg.attention_bias,
-            vb.pp("o_proj"),
-        )?;
+        // GGUF models use "attn_q", "attn_k", "attn_v", "attn_output" instead of "*_proj"
+        let (q_name, k_name, v_name, o_name) = if vb.is_qvar_builder() {
+            ("attn_q", "attn_k", "attn_v", "attn_output")
+        } else {
+            ("q_proj", "k_proj", "v_proj", "o_proj")
+        };
 
-        let q_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
-        let k_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
+        let q_proj = layers::linear(cfg.hidden_size, num_heads * head_dim, vb.pp(q_name))?;
+        let k_proj = layers::linear(cfg.hidden_size, num_kv_heads * head_dim, vb.pp(k_name))?;
+        let v_proj = layers::linear(cfg.hidden_size, num_kv_heads * head_dim, vb.pp(v_name))?;
+        let o_proj = layers::linear(num_heads * head_dim, cfg.hidden_size, vb.pp(o_name))?;
+
+        // GGUF models use "attn_q_norm" and "attn_k_norm"
+        let (q_norm_name, k_norm_name) = if vb.is_qvar_builder() {
+            ("attn_q_norm", "attn_k_norm")
+        } else {
+            ("q_norm", "k_norm")
+        };
+
+        let q_norm = layers::norm::rms_norm(
+            head_dim,
+            cfg.rms_norm_eps,
+            vb.pp(q_norm_name),
+            vb.dtype(),
+            false,
+        )?;
+        let k_norm = layers::norm::rms_norm(
+            head_dim,
+            cfg.rms_norm_eps,
+            vb.pp(k_norm_name),
+            vb.dtype(),
+            false,
+        )?;
 
         // Necessary because the hidden_size in the config isn't always accurate
         let hidden_size = head_dim * cfg.num_attention_heads;
@@ -368,19 +380,49 @@ impl Qwen3Attention {
 struct DecoderLayer {
     self_attn: Qwen3Attention,
     mlp: Qwen3MLP,
-    ln1: RmsNorm,
-    ln2: RmsNorm,
+    ln1: layers::norm::NormX,
+    ln2: layers::norm::NormX,
 }
 
 impl DecoderLayer {
-    fn new(cfg: &Config, rotary: Arc<Qwen3RotaryEmbedding>, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Qwen3Attention::new(cfg, rotary, vb.pp("self_attn"))?;
-        let mlp = Qwen3MLP::new(cfg, vb.pp("mlp"))?;
-        let ln1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let ln2 = RmsNorm::new(
+    fn new(cfg: &Config, rotary: Arc<Qwen3RotaryEmbedding>, vb: VarBuilderX) -> Result<Self> {
+        // GGUF models don't have "self_attn" or "mlp" prefixes - components are directly under the block
+        // SafeTensors: layers.0.self_attn.q_proj.weight
+        // GGUF: blk.0.attn_q.weight
+        let self_attn = if vb.is_qvar_builder() {
+            Qwen3Attention::new(cfg, rotary, vb.clone())?
+        } else {
+            Qwen3Attention::new(cfg, rotary, vb.pp("self_attn"))?
+        };
+
+        // SafeTensors: blk.0.mlp.gate_proj.weight
+        // GGUF: blk.0.ffn_gate.weight
+        let mlp = if vb.is_qvar_builder() {
+            Qwen3MLP::new(cfg, vb.clone())?
+        } else {
+            Qwen3MLP::new(cfg, vb.pp("mlp"))?
+        };
+
+        // GGUF models use "attn_norm" and "ffn_norm" instead of "input_layernorm" and "post_attention_layernorm"
+        let (ln1_name, ln2_name) = if vb.is_qvar_builder() {
+            ("attn_norm", "ffn_norm")
+        } else {
+            ("input_layernorm", "post_attention_layernorm")
+        };
+
+        let ln1 = layers::norm::rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
+            vb.pp(ln1_name),
+            vb.dtype(),
+            false,
+        )?;
+        let ln2 = layers::norm::rms_norm(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp(ln2_name),
+            vb.dtype(),
+            false,
         )?;
         Ok(Self {
             self_attn,
@@ -408,24 +450,34 @@ impl DecoderLayer {
 pub struct Model {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
+    norm: layers::norm::NormX,
     device: Device,
     dtype: DType,
 }
 
 impl Model {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, vb: VarBuilderX) -> Result<Self> {
         Self::new_with_progress(cfg, vb, None)
     }
 
     pub fn new_with_progress(
         cfg: &Config,
-        vb: VarBuilder,
+        vb: VarBuilderX,
         progress: Option<&ProgressReporter>,
     ) -> Result<Self> {
-        let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
-        let rotary = Arc::new(Qwen3RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
+        // GGUF models use "token_embd" instead of "model.embed_tokens"
+        let embed_path = if vb.is_qvar_builder() {
+            "token_embd"
+        } else {
+            "model.embed_tokens"
+        };
+        let (embed_tokens, _) = layers::embedding(
+            Some(cfg.vocab_size),
+            cfg.hidden_size,
+            vb.pp(embed_path),
+            vb.dtype(),
+        )?;
+        let rotary = Arc::new(Qwen3RotaryEmbedding::new(vb.dtype(), cfg, &vb.device())?);
 
         // Initialize progress bar for layer loading
         if let Some(p) = progress {
@@ -433,9 +485,19 @@ impl Model {
         }
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        let vb_l = vb.pp("model.layers");
+        // GGUF models use "blk" instead of "model.layers"
+        let layers_path = if vb.is_qvar_builder() {
+            "blk"
+        } else {
+            "model.layers"
+        };
+        let vb_l = vb.pp(layers_path);
         for i in 0..cfg.num_hidden_layers {
-            layers.push(DecoderLayer::new(cfg, rotary.clone(), vb_l.pp(i))?);
+            layers.push(DecoderLayer::new(
+                cfg,
+                rotary.clone(),
+                vb_l.pp(&i.to_string()),
+            )?);
 
             // Report progress after each layer is loaded
             if let Some(p) = progress {
@@ -451,8 +513,22 @@ impl Model {
         Ok(Self {
             embed_tokens,
             layers,
-            norm: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?,
-            device: vb.device().clone(),
+            norm: {
+                // GGUF models use "output_norm" instead of "model.norm"
+                let norm_path = if vb.is_qvar_builder() {
+                    "output_norm"
+                } else {
+                    "model.norm"
+                };
+                layers::norm::rms_norm(
+                    cfg.hidden_size,
+                    cfg.rms_norm_eps,
+                    vb.pp(norm_path),
+                    vb.dtype(),
+                    false,
+                )?
+            },
+            device: vb.device(),
             dtype: vb.dtype(),
         })
     }
@@ -512,24 +588,30 @@ impl Model {
 #[derive(Debug, Clone)]
 pub struct ModelForCausalLM {
     base: Model,
-    lm_head: Linear,
+    lm_head: candle_nn::Linear,
 }
 
 impl ModelForCausalLM {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, vb: VarBuilderX) -> Result<Self> {
         Self::new_with_progress(cfg, vb, None)
     }
 
     pub fn new_with_progress(
         cfg: &Config,
-        vb: VarBuilder,
+        vb: VarBuilderX,
         progress: Option<&ProgressReporter>,
     ) -> Result<Self> {
         let base = Model::new_with_progress(cfg, vb.clone(), progress)?;
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::from_weights(base.embed_tokens.embeddings().clone(), None)
+            candle_nn::Linear::new(base.embed_tokens.embeddings().clone(), None)
         } else {
-            linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+            // GGUF models use "output" instead of "lm_head"
+            let lm_head_name = if vb.is_qvar_builder() {
+                "output"
+            } else {
+                "lm_head"
+            };
+            layers::linear(cfg.hidden_size, cfg.vocab_size, vb.pp(lm_head_name))?
         };
         Ok(Self { base, lm_head })
     }

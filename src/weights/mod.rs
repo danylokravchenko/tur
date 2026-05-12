@@ -81,6 +81,13 @@ impl VarBuilderX<'_> {
         }
     }
 
+    pub fn dtype(&self) -> DType {
+        match &self.0 {
+            Either::Left(vb) => vb.dtype(),
+            Either::Right(_) => DType::F32, // GGUF always dequantizes to F32
+        }
+    }
+
     pub fn pp(&self, name: &str) -> VarBuilderX<'_> {
         let next_path = if self.1.is_empty() {
             name.to_string()

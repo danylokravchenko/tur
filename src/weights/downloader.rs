@@ -10,7 +10,7 @@ use tracing::trace;
 pub struct Downloader {
     pub model_id: Option<String>,
     pub weight_path: Option<String>,
-    pub weight_file: Option<String>,
+    pub quantization: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -58,12 +58,12 @@ impl Downloader {
     pub fn new(
         model_id: Option<String>,
         weight_path: Option<String>,
-        weight_file: Option<String>,
+        quantization: Option<String>,
     ) -> Self {
         Self {
             model_id,
             weight_path,
-            weight_file,
+            quantization,
         }
     }
 
@@ -75,7 +75,7 @@ impl Downloader {
         let (paths, gguf): (ModelPaths, bool) = match (
             &self.model_id,
             &self.weight_path,
-            &self.weight_file,
+            &self.quantization,
         ) {
             (None, Some(path), None) => {
                 if !Path::new(path).is_dir() {
@@ -120,10 +120,13 @@ impl Downloader {
                 )
             }
             (Some(_), None, Some(_)) => (self.download_gguf_model(hf_token, hf_token_path)?, true),
-            (Some(_), None, None) => (self.download_model(hf_token, hf_token_path)?, false),
+            (Some(_), None, None) => (
+                self.download_safetensors_model(hf_token, hf_token_path)?,
+                false,
+            ),
             _ => {
                 candle_core::bail!(
-                    "No model id or weight_path/weight_file provided!\n***Tips***: \n \t For local model weights, `--w <path/to/folder>` for safetensors models or gguf models.\n \t For remote safetensor models, `--m <model_id>` to download from HuggingFace hub. \n \t For remote gguf models, `--m <model_id> --f <weight_file>` to download from HuggingFace hub."
+                    "Invalid configuration!\n***Tips***: \n \t For local model weights: --weight-path <path/to/folder>\n \t For remote SafeTensors: --model-id Qwen3-0.6B\n \t For remote GGUF: --model-id Qwen3-0.6B --quantization Q4_K_M"
                 );
             }
         };
@@ -161,13 +164,15 @@ impl Downloader {
         }))
     }
 
-    fn download_model(
+    fn download_safetensors_model(
         &self,
         hf_token: Option<String>,
         hf_token_path: Option<String>,
     ) -> Result<ModelPaths> {
         let model_id = self.model_id.as_ref().unwrap();
-        trace!("Downloading model {model_id} from HF Hub");
+        let full_repo = resolve_model_repo(model_id)?;
+
+        trace!("Downloading SafeTensors model from {}", full_repo);
 
         let token = get_token(hf_token, hf_token_path)?;
         let mut builder = ApiBuilder::new().with_progress(true);
@@ -177,7 +182,7 @@ impl Downloader {
 
         let api = builder.build().map_err(candle_core::Error::wrap)?;
         let repo = api.repo(Repo::with_revision(
-            model_id.clone(),
+            full_repo.clone(),
             RepoType::Model,
             "main".to_string(),
         ));
@@ -214,7 +219,7 @@ impl Downloader {
             filenames.push(filename);
         }
 
-        trace!("Downloaded files for the model: {:?}", filenames);
+        trace!("Downloaded SafeTensors files: {:?}", filenames);
 
         Ok(ModelPaths {
             tokenizer_filename,
@@ -233,7 +238,20 @@ impl Downloader {
         hf_token_path: Option<String>,
     ) -> Result<ModelPaths> {
         let model_id = self.model_id.as_ref().unwrap();
-        let filename = self.weight_file.as_ref().unwrap();
+        let quantization = self.quantization.as_ref().unwrap();
+
+        // Resolve repos: config from main repo, weights from unsloth GGUF repo
+        let (config_repo, gguf_repo) = resolve_gguf_repos(model_id)?;
+        let gguf_filename = format!(
+            "{}-{}.gguf",
+            model_id.split('/').last().unwrap_or(model_id),
+            quantization
+        );
+
+        trace!(
+            "Downloading GGUF model:\n  Config/tokenizer from: {}\n  GGUF weights from: {} (file: {})",
+            config_repo, gguf_repo, gguf_filename
+        );
 
         let token = get_token(hf_token, hf_token_path)?;
         let mut builder = ApiBuilder::new().with_progress(true);
@@ -242,23 +260,60 @@ impl Downloader {
         }
 
         let api = builder.build().map_err(candle_core::Error::wrap)?;
-        let repo = api.repo(Repo::with_revision(
-            model_id.clone(),
+
+        // Download config and tokenizer from main repo
+        let config_repo_api = api.repo(Repo::with_revision(
+            config_repo.clone(),
             RepoType::Model,
             "main".to_string(),
         ));
 
-        let downloaded_file = repo
-            .get(filename.as_str())
+        let tokenizer_filename = config_repo_api
+            .get("tokenizer.json")
             .map_err(candle_core::Error::wrap)?;
+
+        let config_filename = config_repo_api
+            .get("config.json")
+            .map_err(candle_core::Error::wrap)?;
+
+        let tokenizer_config_filename = match config_repo_api.get("tokenizer_config.json") {
+            Ok(f) => f,
+            _ => PathBuf::new(),
+        };
+
+        let generation_config_filename = match config_repo_api.get("generation_config.json") {
+            Ok(f) => f,
+            _ => PathBuf::new(),
+        };
+
+        let chat_template_filename = match config_repo_api.get("chat_template.json") {
+            Ok(f) => Some(f),
+            _ => None,
+        };
+
+        // Download GGUF weight file from unsloth repo
+        let gguf_repo_api = api.repo(Repo::with_revision(
+            gguf_repo.clone(),
+            RepoType::Model,
+            "main".to_string(),
+        ));
+
+        let downloaded_file = gguf_repo_api
+            .get(&gguf_filename)
+            .map_err(candle_core::Error::wrap)?;
+
+        trace!("Downloaded GGUF file: {:?}", downloaded_file);
+        trace!("Downloaded tokenizer: {:?}", tokenizer_filename);
+        trace!("Downloaded config: {:?}", config_filename);
+
         Ok(ModelPaths {
-            tokenizer_filename: PathBuf::new(),
-            tokenizer_config_filename: PathBuf::new(),
-            config_filename: PathBuf::new(),
-            generation_config_filename: PathBuf::new(),
+            tokenizer_filename,
+            tokenizer_config_filename,
+            config_filename,
+            generation_config_filename,
             filenames: vec![downloaded_file],
             auxiliary_filenames: Vec::new(),
-            chat_template_filename: None,
+            chat_template_filename,
         })
     }
 }
@@ -278,6 +333,33 @@ fn load_local_safetensors(path: &str, index_name: &str) -> Result<Vec<PathBuf>> 
         .collect();
     filenames.sort();
     Ok(filenames)
+}
+
+/// Resolve a simplified model ID to full HuggingFace repo path
+/// Examples:
+///   - "Qwen3-0.6B" -> "Qwen/Qwen3-0.6B"
+///   - "Qwen/Qwen3-0.6B" -> "Qwen/Qwen3-0.6B" (already full)
+fn resolve_model_repo(model_id: &str) -> Result<String> {
+    if model_id.contains('/') {
+        // Already a full repo path
+        Ok(model_id.to_string())
+    } else {
+        // Simplified name - assume Qwen org
+        Ok(format!("Qwen/{}", model_id))
+    }
+}
+
+/// Resolve repos for GGUF downloads
+/// Returns (config_repo, gguf_repo)
+/// Examples:
+///   - "Qwen3-0.6B" -> ("Qwen/Qwen3-0.6B", "unsloth/Qwen3-0.6B-GGUF")
+///   - "Qwen/Qwen3-0.6B" -> ("Qwen/Qwen3-0.6B", "unsloth/Qwen3-0.6B-GGUF")
+fn resolve_gguf_repos(model_id: &str) -> Result<(String, String)> {
+    let config_repo = resolve_model_repo(model_id)?;
+    let model_name = config_repo.split('/').last().unwrap_or(model_id);
+    let gguf_repo = format!("unsloth/{}-GGUF", model_name);
+
+    Ok((config_repo, gguf_repo))
 }
 
 fn get_token(hf_token: Option<String>, hf_token_path: Option<String>) -> Result<String> {
