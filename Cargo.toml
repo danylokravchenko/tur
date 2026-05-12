@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
 candle-core = "0.10.1"
 candle-nn = "0.10.1"
 attention-rs = { git = "https://github.com/guoqingbao/attention.rs.git", version="0.5.3", rev = "8f89810" }
@@ -15,6 +18,7 @@ parking_lot = "0.12.5"
 metal = { version = "0.33.0", features = ["mps"], optional = true }
 hf-hub = "0.5.0"
 clap = { version = "4.6.1", features = ["derive", "env"] }
+either = { version = "1.15.0", features = ["serde"] }
 
 [features]
 default = ["metal"]

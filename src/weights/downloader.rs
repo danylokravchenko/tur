@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tracing::trace;
 
 #[derive(Debug, Clone)]
 pub struct Downloader {
@@ -166,6 +167,7 @@ impl Downloader {
         hf_token_path: Option<String>,
     ) -> Result<ModelPaths> {
         let model_id = self.model_id.as_ref().unwrap();
+        trace!("Downloading model {model_id} from HF Hub");
 
         let token = get_token(hf_token, hf_token_path)?;
         let mut builder = ApiBuilder::new().with_progress(true);
@@ -202,12 +204,17 @@ impl Downloader {
             .siblings
             .iter()
             .map(|x| x.rfilename.clone())
-            .filter(|x| x.ends_with(".safetensors"))
+            .filter(|x| {
+                // Include .safetensors files but exclude the index file
+                x.ends_with(".safetensors") && !x.contains(".index.json")
+            })
         {
             let filename =
                 self.hf_get_with_retry(&repo, &rfilename, 5, std::time::Duration::from_secs(5))?;
             filenames.push(filename);
         }
+
+        trace!("Downloaded files for the model: {:?}", filenames);
 
         Ok(ModelPaths {
             tokenizer_filename,

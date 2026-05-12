@@ -1,7 +1,33 @@
-use candle_core::{DType, Device};
-use candle_nn::VarBuilder;
+use candle_core::{DType, Device, IndexOp, Tensor};
 use clap::Parser;
-use tur::{Downloader, Qwen3_5ForCausalLM};
+use tracing::level_filters::LevelFilter;
+use tracing::{debug, info};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer, fmt};
+use tur::{Downloader, Qwen3_5ForCausalLM, VarBuilderX};
+
+fn init_tracing() {
+    let registry = tracing_subscriber::registry();
+
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(LevelFilter::TRACE.to_string()))
+        .add_directive("ureq=error".parse().unwrap())
+        .add_directive("rustls=error".parse().unwrap());
+
+    let console_layer = fmt::layer()
+        .compact()
+        .with_file(false)
+        .with_line_number(false)
+        .with_thread_names(true)
+        .with_thread_ids(true)
+        .with_target(true)
+        .with_filter(env_filter.clone());
+
+    let subscriber = registry.with(console_layer);
+
+    subscriber.try_init().unwrap();
+}
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Qwen 3.5 Model - Clean Implementation", long_about = None)]
@@ -20,13 +46,13 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
+    init_tracing();
     let args = Args::parse();
 
-    println!("Qwen 3.5 Model - Clean Implementation");
-    println!("=====================================\n");
+    info!("Qwen 3.5 Model - Clean Implementation");
 
     let device = Device::Cpu;
-    println!("Device: {:?}\n", device);
+    debug!("Device: {:?}", device);
 
     if args.model_id.is_none() && args.weight_path.is_none() {
         anyhow::bail!(
@@ -69,30 +95,58 @@ fn main() -> anyhow::Result<()> {
             config.rope_theta = rope_theta;
         }
     }
-
-    println!("Model Config:");
-    println!("  - Vocabulary size: {}", config.vocab_size);
-    println!("  - Hidden size: {}", config.hidden_size);
-    println!("  - Number of heads: {}", config.num_attention_heads);
-    println!("  - Number of layers: {}", config.num_hidden_layers);
-    println!("  - Intermediate size: {}\n", config.intermediate_size);
+    debug!("Model Config: {:?}", config);
 
     let safetensors = paths.get_weight_filenames();
-    println!("Loaded weight paths:");
-    for path in &safetensors {
-        println!("  - {}", path.display());
-    }
+    debug!("Loaded weight paths: {:?}", safetensors);
 
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safetensors, DType::F32, &device)? };
-    let model = Qwen3_5ForCausalLM::new(config, vb, &device)?;
+    let vb = VarBuilderX::new(&paths, gguf, DType::F32, &device)?;
+    let model = Qwen3_5ForCausalLM::new(config, vb, DType::F32, &device)?;
 
-    println!(
+    debug!(
         "\n✓ Loaded Qwen 3.5 with {} safetensor shard(s)",
         safetensors.len()
     );
-    println!("✓ Model is initialized and ready for inference");
+    debug!("✓ Model is initialized and ready for inference");
 
-    // TODO: run a forward pass with token IDs once the input pipeline is wired.
+    // Run a simple forward pass with dummy token IDs
+    info!("Running forward pass...");
+
+    // Create a simple input: batch_size=1, seq_len=5 with token IDs [1, 2, 3, 4, 5]
+    let input_ids = Tensor::new(&[1u32, 2u32, 3u32, 4u32, 5u32], &device)?.reshape((1, 5))?; // Shape: [batch_size, seq_len]
+
+    debug!("Input shape: {:?}", input_ids.shape());
+
+    // Forward pass
+    let logits = model.forward(&input_ids)?;
+
+    debug!("Output logits shape: {:?}", logits.shape());
+    debug!(
+        "Expected shape: [batch_size=1, seq_len=5, vocab_size={}]",
+        model.vocab_size()
+    );
+
+    // Verify output shape
+    let (batch_size, seq_len, vocab_size) = logits.dims3()?;
+    assert_eq!(batch_size, 1, "Batch size mismatch");
+    assert_eq!(seq_len, 5, "Sequence length mismatch");
+    assert_eq!(vocab_size, model.vocab_size(), "Vocab size mismatch");
+
+    info!("✓ Forward pass successful!");
+    info!("  Input shape: [1, 5]");
+    info!(
+        "  Output shape: [{}, {}, {}]",
+        batch_size, seq_len, vocab_size
+    );
+
+    // Get the last token's logits for next token prediction
+    let last_token_logits = logits.i((0, seq_len - 1))?;
+    debug!("Last token logits shape: {:?}", last_token_logits.shape());
+
+    // Find the token with highest probability (argmax)
+    let next_token = last_token_logits.argmax(0)?;
+    let next_token_id = next_token.to_scalar::<u32>()?;
+    info!("  Predicted next token ID: {}", next_token_id);
 
     drop(model);
     Ok(())
