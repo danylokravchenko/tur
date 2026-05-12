@@ -4,9 +4,6 @@ use either::Either;
 
 use crate::weights::VarBuilderX;
 
-// pub mod distributed;
-// pub mod linear;
-pub mod mamba;
 pub mod norm;
 
 /// Create a linear layer from VarBuilderX
