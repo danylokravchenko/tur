@@ -5,11 +5,13 @@ use std::fs::File;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+type LastCachedTensor = Arc<Mutex<Option<(String, Arc<QTensor>)>>>;
+
 #[derive(Clone)]
 pub struct VarBuilder {
     content: Arc<candle_core::quantized::gguf_file::Content>,
     file: Arc<std::sync::Mutex<File>>, // Keep file open for lazy loading
-    cache: Arc<Mutex<Option<(String, Arc<QTensor>)>>>, // last cached tensor
+    cache: LastCachedTensor,           // last cached tensor
     path: Vec<String>,
     device: Device,
 }
@@ -52,18 +54,18 @@ impl VarBuilder {
 
         {
             let cache_guard = self.cache.lock().unwrap();
-            if let Some((ref cached_name, ref cached_tensor)) = *cache_guard {
-                if cached_name == &path {
-                    // Return cached tensor
-                    let shape = s.into();
-                    if cached_tensor.shape() != &shape {
-                        candle::bail!(
-                            "shape mismatch for {name}, got {:?}, expected {shape:?}",
-                            cached_tensor.shape()
-                        );
-                    }
-                    return Ok(cached_tensor.clone());
+            if let Some((ref cached_name, ref cached_tensor)) = *cache_guard
+                && cached_name == &path
+            {
+                // Return cached tensor
+                let shape = s.into();
+                if cached_tensor.shape() != &shape {
+                    candle::bail!(
+                        "shape mismatch for {name}, got {:?}, expected {shape:?}",
+                        cached_tensor.shape()
+                    );
                 }
+                return Ok(cached_tensor.clone());
             }
         }
 

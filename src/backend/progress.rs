@@ -113,9 +113,9 @@ impl ProgressReporter {
             *buffer = buffer[last_newline + 1..].to_string();
 
             if let Some(pb) = self.generation_bar.read().as_ref() {
-                pb.println(&to_print.trim_end_matches('\n'));
+                pb.println(to_print.trim_end_matches('\n'));
             } else if let Some(pb) = self.loading_bar.read().as_ref() {
-                pb.println(&to_print.trim_end_matches('\n'));
+                pb.println(to_print.trim_end_matches('\n'));
             } else {
                 print!("{}", to_print);
                 let _ = std::io::stdout().flush();

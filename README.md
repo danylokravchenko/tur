@@ -8,6 +8,8 @@ For normal:
 cargo run -- --model-id 'Qwen3-0.6B' --sample-len 200
 ```
 
+For thinking add `--thinking` flag.
+
 For quant:
 
 ```bash

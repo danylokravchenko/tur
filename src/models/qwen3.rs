@@ -631,3 +631,13 @@ impl ModelForCausalLM {
         self.base.clear_kv_cache();
     }
 }
+
+impl super::ModelImpl for ModelForCausalLM {
+    fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        let (_, l) = input.dims2()?;
+        self.base
+            .forward(input, offset)?
+            .narrow(1, l - 1, 1)?
+            .apply(&self.lm_head)
+    }
+}
