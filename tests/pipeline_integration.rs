@@ -46,17 +46,13 @@ fn test_pipeline_end_to_end_generation() {
     let model = ModelForCausalLM::new(&config, vb).unwrap();
     let tokenizer = load_tokenizer().unwrap();
 
-    let mut pipeline = TextGeneration::new(
-        model,
-        tokenizer,
-        299792458,
-        Some(0.8),
-        Some(0.9),
-        1.1,
-        64,
-        &device,
-        None,
-    );
+    let mut pipeline = TextGeneration::builder(model, tokenizer, device.clone())
+        .seed(299792458)
+        .temperature(0.8)
+        .top_p(0.9)
+        .repeat_penalty(1.1)
+        .repeat_last_n(64)
+        .build();
 
     // Test basic generation works
     let result = pipeline.run("Hello", 10);
@@ -74,17 +70,14 @@ fn test_pipeline_end_to_end_generation() {
     let tokenizer = load_tokenizer().unwrap();
     let progress = ProgressReporter::new();
 
-    let mut pipeline_with_progress = TextGeneration::new(
-        model,
-        tokenizer,
-        299792458,
-        Some(0.8),
-        Some(0.9),
-        1.1,
-        64,
-        &device,
-        Some(progress),
-    );
+    let mut pipeline_with_progress = TextGeneration::builder(model, tokenizer, device)
+        .seed(299792458)
+        .temperature(0.8)
+        .top_p(0.9)
+        .repeat_penalty(1.1)
+        .repeat_last_n(64)
+        .progress(progress)
+        .build();
 
     let result = pipeline_with_progress.run("Test with progress", 5);
     assert!(
@@ -112,17 +105,19 @@ fn test_pipeline_parameter_variations() {
 
     for (temp, top_p, penalty, desc) in test_cases {
         let model = ModelForCausalLM::new(&config, vb.clone()).unwrap();
-        let mut pipeline = TextGeneration::new(
-            model,
-            tokenizer.clone(),
-            299792458,
-            temp,
-            top_p,
-            penalty,
-            64,
-            &device,
-            None,
-        );
+        let mut builder = TextGeneration::builder(model, tokenizer.clone(), device.clone())
+            .seed(299792458)
+            .repeat_penalty(penalty)
+            .repeat_last_n(64);
+
+        if let Some(t) = temp {
+            builder = builder.temperature(t);
+        }
+        if let Some(p) = top_p {
+            builder = builder.top_p(p);
+        }
+
+        let mut pipeline = builder.build();
 
         let result = pipeline.run("Test", 10);
         assert!(result.is_ok(), "{} failed: {:?}", desc, result.err());

@@ -640,4 +640,10 @@ impl super::ModelImpl for ModelForCausalLM {
             .narrow(1, l - 1, 1)?
             .apply(&self.lm_head)
     }
+
+    #[inline]
+    fn format_prompt(prompt: &str, thinking: bool) -> String {
+        let think_tag = if thinking { " /think" } else { " /no_think" };
+        format!("<|im_start|>user\n{prompt}{think_tag}<|im_end|>\n<|im_start|>assistant\n")
+    }
 }

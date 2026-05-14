@@ -1,4 +1,30 @@
 use crate::{Result, TurError};
+use candle_core::Tensor;
+
+/// Trait for processing logits and sampling tokens
+/// This abstraction allows for different sampling strategies including:
+/// - Standard temperature/top-p sampling (LogitsProcessor)
+/// - Guided generation with constraints (future)
+/// - Custom sampling strategies
+pub trait LogitsSampler: Send {
+    /// Sample a token from the logits tensor
+    fn sample(&mut self, logits: &Tensor) -> Result<u32>;
+
+    /// Optional: Apply guidance or constraints to logits before sampling
+    /// Returns a new tensor only if modifications are needed, otherwise returns None
+    /// to avoid unnecessary cloning
+    fn apply_constraints(&mut self, _logits: &Tensor, _context: &[u32]) -> Result<Option<Tensor>> {
+        // Default implementation: no constraints, no modifications
+        Ok(None)
+    }
+}
+
+/// Standard implementation using candle's LogitsProcessor
+impl LogitsSampler for candle_transformers::generation::LogitsProcessor {
+    fn sample(&mut self, logits: &Tensor) -> Result<u32> {
+        self.sample(logits).map_err(TurError::CandleError)
+    }
+}
 
 /// This is a wrapper around a tokenizer to ensure that tokens can be returned to the user in a
 /// streaming way rather than having to wait for the full decoding.

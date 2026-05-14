@@ -7,4 +7,5 @@ pub use qwen3::{Config, Model, ModelForCausalLM as Qwen35ModelForCausalLM};
 
 pub trait ModelImpl {
     fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor>;
+    fn format_prompt(prompt: &str, thinking: bool) -> String;
 }

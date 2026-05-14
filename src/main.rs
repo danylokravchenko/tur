@@ -202,17 +202,20 @@ fn main() -> Result<()> {
             weight_files.len()
         );
     }
-    let mut pipeline = TextGeneration::new(
-        model,
-        tokenizer,
-        args.seed,
-        args.temperature,
-        args.top_p,
-        args.repeat_penalty,
-        args.repeat_last_n,
-        &device,
-        Some(progress),
-    );
+    let mut builder = TextGeneration::builder(model, tokenizer, device.clone())
+        .seed(args.seed)
+        .repeat_penalty(args.repeat_penalty)
+        .repeat_last_n(args.repeat_last_n)
+        .progress(progress);
+
+    if let Some(temp) = args.temperature {
+        builder = builder.temperature(temp);
+    }
+    if let Some(top_p) = args.top_p {
+        builder = builder.top_p(top_p);
+    }
+
+    let mut pipeline = builder.build();
     debug!("✓ Model is initialized and ready for inference");
 
     let prompt = format_prompt(DEFAULT_PROMPT, args.thinking);
