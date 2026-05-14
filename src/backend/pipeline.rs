@@ -2,12 +2,32 @@ use candle_core::{DType, Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 use tracing::info;
+use uuid::Uuid;
 
 use crate::{
     ProgressReporter, Result, TurError,
     backend::tokenizer::{LogitsSampler, TokenOutputStream},
     models::ModelImpl,
 };
+
+/// Request struct for text generation, suitable for scheduling and prefix-caching
+#[derive(Debug, Clone)]
+pub struct GenerationRequest {
+    pub id: Uuid,
+    pub prompt: String,
+    pub sample_len: usize,
+}
+
+impl GenerationRequest {
+    /// Create a new request with auto-generated UUID
+    pub fn new(prompt: String, sample_len: usize) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            prompt,
+            sample_len,
+        }
+    }
+}
 
 /// Statistics for generation runs
 #[derive(Debug, Clone)]
@@ -393,12 +413,13 @@ impl<T: ModelImpl> TextGeneration<T> {
         &mut self.engine
     }
 
-    pub fn run(&mut self, prompt: &str, sample_len: usize) -> Result<GenerationStats> {
+    pub fn run(&mut self, request: &GenerationRequest) -> Result<GenerationStats> {
+        let sample_len = request.sample_len;
         self.tokenizer.clear();
         let mut tokens = self
             .tokenizer
             .tokenizer()
-            .encode(prompt, true)
+            .encode(request.prompt.as_str(), true)
             .map_err(|e| TurError::Tokenizer(e.to_string()))?
             .get_ids()
             .to_vec();

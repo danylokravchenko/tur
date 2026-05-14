@@ -6,6 +6,7 @@ use tracing::{debug, info, trace};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
+use tur::backend::pipeline::GenerationRequest;
 use tur::models::Qwen35ModelForCausalLM;
 use tur::weights::VarBuilderX;
 use tur::{Downloader, ProgressReporter, Result, TextGeneration, TurError};
@@ -292,7 +293,8 @@ fn main() -> Result<()> {
     let prompt = format_prompt(DEFAULT_PROMPT, args.thinking);
     trace!("formatted prompt: {}", &prompt);
 
-    pipeline.run(&prompt, args.sample_len)?;
+    let request = GenerationRequest::new(prompt, args.sample_len);
+    pipeline.run(&request)?;
 
     Ok(())
 }

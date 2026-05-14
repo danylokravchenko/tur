@@ -1,6 +1,6 @@
 use candle_core::Device;
 use tur::ProgressReporter;
-use tur::backend::pipeline::TextGeneration;
+use tur::backend::pipeline::{GenerationRequest, TextGeneration};
 use tur::models::qwen3::{Config, ModelForCausalLM};
 use tur::weights::{Downloader, VarBuilderX};
 
@@ -55,12 +55,14 @@ fn test_pipeline_end_to_end_generation() {
         .build();
 
     // Test basic generation works
-    let result = pipeline.run("Hello", 10);
+    let request = GenerationRequest::new("Hello".to_string(), 10);
+    let result = pipeline.run(&request);
     assert!(result.is_ok(), "Generation failed: {:?}", result.err());
 
     // Test multiple sequential runs (verifies state management)
     for _ in 0..3 {
-        let result = pipeline.run("Test", 5);
+        let request = GenerationRequest::new("Test".to_string(), 5);
+        let result = pipeline.run(&request);
         assert!(result.is_ok(), "Sequential run failed: {:?}", result.err());
     }
 
@@ -79,7 +81,8 @@ fn test_pipeline_end_to_end_generation() {
         .progress(progress)
         .build();
 
-    let result = pipeline_with_progress.run("Test with progress", 5);
+    let request = GenerationRequest::new("Test with progress".to_string(), 5);
+    let result = pipeline_with_progress.run(&request);
     assert!(
         result.is_ok(),
         "Generation with progress failed: {:?}",
@@ -119,7 +122,8 @@ fn test_pipeline_parameter_variations() {
 
         let mut pipeline = builder.build();
 
-        let result = pipeline.run("Test", 10);
+        let request = GenerationRequest::new("Test".to_string(), 10);
+        let result = pipeline.run(&request);
         assert!(result.is_ok(), "{} failed: {:?}", desc, result.err());
     }
 }
