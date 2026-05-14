@@ -1,6 +1,3 @@
-# ==============================================================================
-# CLIPPY CONFIGURATION FOR LOGRANGE PROJECT
-# ==============================================================================
 # This configuration enforces strict coding standards for a high-performance,
 # async Rust project dealing with database operations and networking.
 

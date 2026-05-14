@@ -12,6 +12,76 @@ use tur::{Downloader, ProgressReporter, Result, TextGeneration, TurError};
 
 const DEFAULT_PROMPT: &str = "Who are you?";
 
+#[allow(clippy::print_stdout)]
+fn print_bunner() {
+    let banner = match std::fs::read_to_string("assets/banner.txt") {
+        Ok(banner) => banner,
+        Err(_) => return,
+    };
+
+    // Electric Blue Neon
+    // let colors = [
+    //     "\x1b[38;5;21m",
+    //     "\x1b[38;5;27m",
+    //     "\x1b[38;5;33m",
+    //     "\x1b[38;5;39m",
+    //     "\x1b[38;5;45m",
+    //     "\x1b[38;5;51m",
+    //     "\x1b[38;5;87m",
+    //     "\x1b[38;5;123m",
+    //     "\x1b[38;5;159m",
+    //     "\x1b[38;5;195m",
+    //     "\x1b[38;5;231m",
+    //     "\x1b[38;5;195m",
+    //     "\x1b[38;5;159m",
+    //     "\x1b[38;5;123m",
+    //     "\x1b[38;5;87m",
+    //     "\x1b[38;5;51m",
+    //     "\x1b[38;5;45m",
+    //     "\x1b[38;5;39m",
+    //     "\x1b[38;5;33m",
+    //     "\x1b[38;5;27m",
+    // ];
+
+    // Blade Runner (Orange→Purple→Blue)
+    let colors = [
+        "\x1b[38;5;208m",
+        "\x1b[38;5;214m",
+        "\x1b[38;5;220m",
+        "\x1b[38;5;226m",
+        "\x1b[38;5;220m",
+        "\x1b[38;5;214m",
+        "\x1b[38;5;208m",
+        "\x1b[38;5;202m",
+        "\x1b[38;5;196m",
+        "\x1b[38;5;197m",
+        "\x1b[38;5;198m",
+        "\x1b[38;5;165m",
+        "\x1b[38;5;129m",
+        "\x1b[38;5;93m",
+        "\x1b[38;5;57m",
+        "\x1b[38;5;21m",
+        "\x1b[38;5;27m",
+        "\x1b[38;5;33m",
+        "\x1b[38;5;39m",
+        "\x1b[38;5;45m",
+    ];
+    let reset = "\x1b[0m";
+    let lines: Vec<&str> = banner.lines().collect();
+
+    for line in lines {
+        let chars: Vec<char> = line.chars().collect();
+        let line_len = chars.len();
+
+        for (i, ch) in chars.iter().enumerate() {
+            // Calculate color index based on position
+            let color_idx = (i * (colors.len() - 1)) / line_len;
+            print!("{}{}", colors[color_idx], ch);
+        }
+        println!("{reset}");
+    }
+}
+
 fn init_tracing() {
     let registry = tracing_subscriber::registry();
 
@@ -95,6 +165,7 @@ fn format_prompt(prompt: &str, thinking: bool) -> String {
 fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
+    print_bunner();
 
     info!("Qwen 3.5 Model - Clean Implementation");
 
