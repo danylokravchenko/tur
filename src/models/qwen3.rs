@@ -581,7 +581,7 @@ impl Model {
                 states.len()
             );
         }
-        for (layer, (k, v)) in self.layers.iter_mut().zip(states.into_iter()) {
+        for (layer, (k, v)) in self.layers.iter_mut().zip(states) {
             layer.set_kv_state(k, v)?;
         }
         Ok(())

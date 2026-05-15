@@ -2,7 +2,8 @@ use candle_core::Device;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tur::ProgressReporter;
-use tur::backend::pipeline::{GenerationRequest, InferenceEngine, TextGeneration};
+use tur::backend::InferenceEngine;
+use tur::backend::pipeline::{GenerationRequest, TextGeneration};
 use tur::backend::prefix_cache::PrefixCache;
 use tur::backend::tokenizer::TokenOutputStream;
 use tur::models::qwen3::{Config, ModelForCausalLM};
@@ -253,7 +254,7 @@ fn test_prefix_cache_partial_hit() {
     }
 
     // Verify cache has entries
-    assert!(cache.read().len() > 0, "Cache should have entries");
+    assert!(!cache.read().is_empty(), "Cache should have entries");
 }
 
 #[test]

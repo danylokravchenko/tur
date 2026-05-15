@@ -287,11 +287,10 @@ fn main() -> Result<()> {
     }
 
     // Build inference engine with all parameters
-    let mut engine_builder =
-        tur::backend::pipeline::InferenceEngine::builder(model, device.clone())
-            .seed(args.seed)
-            .repeat_penalty(args.repeat_penalty)
-            .repeat_last_n(args.repeat_last_n);
+    let mut engine_builder = tur::backend::InferenceEngine::builder(model, device.clone())
+        .seed(args.seed)
+        .repeat_penalty(args.repeat_penalty)
+        .repeat_last_n(args.repeat_last_n);
 
     if let Some(temp) = args.temperature {
         engine_builder = engine_builder.temperature(temp);

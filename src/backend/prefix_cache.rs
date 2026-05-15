@@ -207,14 +207,14 @@ impl PrefixCache {
 
     /// Evict the least recently used entry
     fn evict_lru(&mut self) {
-        if let Some(key) = self.lru_queue.pop_front() {
-            if let Some(entry) = self.entries.remove(&key) {
-                self.stats.evictions += 1;
-                self.stats.total_tokens_cached = self
-                    .stats
-                    .total_tokens_cached
-                    .saturating_sub(entry.tokens.len());
-            }
+        if let Some(key) = self.lru_queue.pop_front()
+            && let Some(entry) = self.entries.remove(&key)
+        {
+            self.stats.evictions += 1;
+            self.stats.total_tokens_cached = self
+                .stats
+                .total_tokens_cached
+                .saturating_sub(entry.tokens.len());
         }
     }
 

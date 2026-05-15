@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 use tur::Downloader;
-use tur::backend::pipeline::InferenceEngine;
+use tur::backend::InferenceEngine;
 use tur::backend::prefix_cache::PrefixCache;
 use tur::backend::tokenizer::TokenOutputStream;
 use tur::models::{ModelImpl, Qwen35ModelForCausalLM};
