@@ -8,7 +8,20 @@ pub use qwen3::{Config, Model, ModelForCausalLM as Qwen35ModelForCausalLM};
 
 pub trait ModelImpl {
     fn name(&self) -> &'static str;
+
+    /// Forward pass for single request (existing)
     fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor>;
+
+    /// Forward pass for batched requests with variable positions
+    ///
+    /// # Arguments
+    /// * `input` - Batched input tensor of shape [batch_size, seq_len]
+    /// * `positions` - Position offset for each request in the batch
+    ///
+    /// # Returns
+    /// Tensor of shape [batch_size, seq_len, vocab_size] with logits for each position
+    fn forward_batch(&mut self, input: &Tensor, positions: &[usize]) -> Result<Tensor>;
+
     fn format_prompt(prompt: &str, thinking: bool) -> String;
 
     /// Extract current KV cache state from all layers

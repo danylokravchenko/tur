@@ -3,6 +3,7 @@ use candle_transformers::generation::LogitsProcessor;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tracing::{debug, trace};
+use uuid::Uuid;
 
 use crate::{
     Result, TurError,
@@ -363,6 +364,99 @@ impl<T: ModelImpl> InferenceEngine<T> {
     /// Access the underlying model mutably
     pub fn model_mut(&mut self) -> &mut T {
         &mut self.model
+    }
+
+    /// Perform batched prefill: encode multiple prompts and get first tokens
+    /// Returns vector of (first_token, request_id) pairs
+    pub fn prefill_batch(&mut self, batch_tokens: &[(Uuid, Vec<u32>)]) -> Result<Vec<(Uuid, u32)>> {
+        if batch_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Find max length in batch
+        let max_len = batch_tokens
+            .iter()
+            .map(|(_, tokens)| tokens.len())
+            .max()
+            .unwrap_or(0);
+
+        // Prepare batched input
+        let batch_size = batch_tokens.len();
+        let mut input_data = Vec::with_capacity(batch_size * max_len);
+        let positions = vec![0; batch_size]; // All start at position 0 for prefill
+
+        // Pad sequences to max length
+        for (_, tokens) in batch_tokens.iter() {
+            input_data.extend_from_slice(tokens);
+            // Pad with zeros if needed (will be masked in attention)
+            input_data.extend(std::iter::repeat_n(0, max_len.saturating_sub(tokens.len())));
+        }
+
+        let input = Tensor::from_vec(input_data, (batch_size, max_len), &self.device)?;
+        trace!(batch_size, max_len, "running batched prefill forward pass");
+
+        let logits = self.model.forward_batch(&input, &positions)?;
+
+        // Sample next token for each request
+        let mut results = Vec::with_capacity(batch_size);
+        for (idx, (id, tokens)) in batch_tokens.iter().enumerate() {
+            // Extract logits for this request: [1, 1, vocab_size]
+            let request_logits = logits
+                .narrow(0, idx, 1)?
+                .squeeze(0)?
+                .squeeze(0)?
+                .to_dtype(DType::F32)?;
+            let processed_logits = self.process_logits(request_logits, tokens)?;
+            let next_token = self.sampler.sample(&processed_logits)?;
+            results.push((*id, next_token));
+            trace!(request_id = ?id, next_token, "batched prefill sampled token");
+        }
+
+        Ok(results)
+    }
+
+    /// Perform batched decode step: process one token per request
+    /// Returns vector of (next_token, request_id) pairs
+    pub fn decode_batch(
+        &mut self,
+        batch_data: &[(Uuid, Vec<u32>, usize)], // (id, all_tokens, position)
+    ) -> Result<Vec<(Uuid, u32)>> {
+        if batch_data.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let batch_size = batch_data.len();
+
+        // Prepare batched input - last token from each request
+        let mut input_data = Vec::with_capacity(batch_size);
+        let mut positions = Vec::with_capacity(batch_size);
+
+        for (_, tokens, pos) in batch_data.iter() {
+            input_data.push(*tokens.last().unwrap_or(&0));
+            positions.push(*pos);
+        }
+
+        let input = Tensor::from_vec(input_data, (batch_size, 1), &self.device)?;
+        trace!(batch_size, "running batched decode forward pass");
+
+        let logits = self.model.forward_batch(&input, &positions)?;
+
+        // Sample next token for each request
+        let mut results = Vec::with_capacity(batch_size);
+        for (idx, (id, tokens, _)) in batch_data.iter().enumerate() {
+            // Extract logits for this request: [1, 1, vocab_size]
+            let request_logits = logits
+                .narrow(0, idx, 1)?
+                .squeeze(0)?
+                .squeeze(0)?
+                .to_dtype(DType::F32)?;
+            let processed_logits = self.process_logits(request_logits, tokens)?;
+            let next_token = self.sampler.sample(&processed_logits)?;
+            results.push((*id, next_token));
+            trace!(request_id = ?id, next_token, "batched decode sampled token");
+        }
+
+        Ok(results)
     }
 }
 

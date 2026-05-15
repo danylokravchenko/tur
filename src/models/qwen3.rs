@@ -68,6 +68,49 @@ impl Qwen3RotaryEmbedding {
         let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
+
+    /// Apply RoPE with variable positions per batch element (q, k shape: B x H x L x D)
+    /// positions[i] is the starting position for batch element i
+    pub(crate) fn apply_batch(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        positions: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        let (batch_size, _num_heads, seq_len, _head_dim) = q.dims4()?;
+
+        if positions.len() != batch_size {
+            candle_core::bail!(
+                "positions length {} must match batch size {}",
+                positions.len(),
+                batch_size
+            );
+        }
+
+        // For each batch element, apply RoPE with its specific position offset
+        let mut q_embeds = Vec::with_capacity(batch_size);
+        let mut k_embeds = Vec::with_capacity(batch_size);
+
+        for (b_idx, &offset) in positions.iter().enumerate() {
+            let q_b = q.narrow(0, b_idx, 1)?; // [1, H, L, D]
+            let k_b = k.narrow(0, b_idx, 1)?; // [1, H, L, D]
+
+            let cos = self.cos.narrow(0, offset, seq_len)?;
+            let sin = self.sin.narrow(0, offset, seq_len)?;
+
+            let q_embed = candle_nn::rotary_emb::rope(&q_b.contiguous()?, &cos, &sin)?;
+            let k_embed = candle_nn::rotary_emb::rope(&k_b.contiguous()?, &cos, &sin)?;
+
+            q_embeds.push(q_embed);
+            k_embeds.push(k_embed);
+        }
+
+        // Concatenate along batch dimension
+        let q_result = Tensor::cat(&q_embeds, 0)?;
+        let k_result = Tensor::cat(&k_embeds, 0)?;
+
+        Ok((q_result, k_result))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +292,87 @@ impl Qwen3Attention {
         #[cfg(feature = "flash-attn")]
         if !on_cpu {
             return self.forward_flash_attn(&q, &k, &v, offset, b, l);
+        }
+
+        self.forward_standard_attn(&q, &k, &v, attn_mask, b, l)
+    }
+
+    /// Batched forward pass with variable positions per request
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor of shape [batch_size, seq_len, hidden_size]
+    /// * `attn_mask` - Optional attention mask
+    /// * `positions` - Position offset for each batch element
+    pub(crate) fn forward_batch(
+        &mut self,
+        x: &Tensor,
+        attn_mask: Option<&Tensor>,
+        positions: &[usize],
+    ) -> Result<Tensor> {
+        let (b, l, _) = x.dims3()?;
+
+        if positions.len() != b {
+            candle_core::bail!(
+                "positions length {} must match batch size {}",
+                positions.len(),
+                b
+            );
+        }
+
+        // 1. Proj
+        let q = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v = self.v_proj.forward(x)?;
+
+        // 2. Reshape: (B, L, H, D) -> (B, H, L, D)
+        let q = q
+            .reshape((b, l, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        // 3. Per-head RMSNorm
+        let q_flat = q.flatten(0, 2)?;
+        let k_flat = k.flatten(0, 2)?;
+        let q_flat = self.q_norm.forward(&q_flat)?;
+        let k_flat = self.k_norm.forward(&k_flat)?;
+        let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
+        let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
+
+        // 4. RoPE with variable positions
+        let (q, k) = self.rotary_emb.apply_batch(&q, &k, positions)?;
+
+        // 5. Accumulate KV cache
+        let (k, v) = self.kv_cache.append(&k, &v)?;
+
+        // 6. Attention dispatch
+        let on_cpu = x.device().is_cpu();
+
+        #[cfg(not(feature = "flash-attn"))]
+        if on_cpu {
+            return self.forward_cpu_flash_attn(
+                &q,
+                &k,
+                &v,
+                *positions.iter().min().unwrap_or(&0),
+                b,
+                l,
+            );
+        }
+        #[cfg(feature = "flash-attn")]
+        if !on_cpu {
+            return self.forward_flash_attn(
+                &q,
+                &k,
+                &v,
+                *positions.iter().min().unwrap_or(&0),
+                b,
+                l,
+            );
         }
 
         self.forward_standard_attn(&q, &k, &v, attn_mask, b, l)
@@ -452,6 +576,20 @@ impl DecoderLayer {
         x + h2
     }
 
+    fn forward_batch(
+        &mut self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        positions: &[usize],
+    ) -> Result<Tensor> {
+        let h = self.ln1.forward(x)?;
+        let h = self.self_attn.forward_batch(&h, mask, positions)?;
+        let x = (x + h)?;
+        let h2 = self.ln2.forward(&x)?;
+        let h2 = h2.apply(&self.mlp)?;
+        x + h2
+    }
+
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
     }
@@ -631,6 +769,48 @@ impl Model {
         }
         self.norm.forward(&h)
     }
+
+    /// Batched forward pass with variable positions per request
+    ///
+    /// # Arguments
+    /// * `input` - Batched input tensor of shape [batch_size, seq_len]
+    /// * `positions` - Position offset for each batch element
+    ///
+    /// # Returns
+    /// Hidden states tensor of shape [batch_size, seq_len, hidden_size]
+    pub fn forward_batch(&mut self, input: &Tensor, positions: &[usize]) -> Result<Tensor> {
+        let (b, l) = input.dims2()?;
+
+        if positions.len() != b {
+            candle_core::bail!(
+                "positions length {} must match batch size {}",
+                positions.len(),
+                b
+            );
+        }
+
+        let mut h = self.embed_tokens.forward(input)?;
+
+        // Build causal mask only for the standard attention fallback path.
+        // Both CPU flash and GPU flash handle masking internally.
+        #[cfg(not(feature = "flash-attn"))]
+        let needs_mask = !self.device.is_cpu() && l > 1;
+        #[cfg(feature = "flash-attn")]
+        let needs_mask = self.device.is_cpu() && l > 1;
+
+        // For batched execution with variable positions, use minimum offset for mask
+        let min_offset = *positions.iter().min().unwrap_or(&0);
+        let causal = if needs_mask {
+            Some(self.causal_mask(b, l, min_offset, None)?)
+        } else {
+            None
+        };
+
+        for layer in &mut self.layers {
+            h = layer.forward_batch(&h, causal.as_ref(), positions)?;
+        }
+        self.norm.forward(&h)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -687,6 +867,28 @@ impl super::ModelImpl for ModelForCausalLM {
             .forward(input, offset)?
             .narrow(1, l - 1, 1)?
             .apply(&self.lm_head)
+    }
+
+    fn forward_batch(&mut self, input: &Tensor, positions: &[usize]) -> Result<Tensor> {
+        let (b, l) = input.dims2()?;
+
+        if positions.len() != b {
+            candle_core::bail!(
+                "positions length {} must match batch size {}",
+                positions.len(),
+                b
+            );
+        }
+
+        // Get hidden states for all positions
+        let hidden_states = self.base.forward_batch(input, positions)?;
+
+        // For each batch element, extract the last token's logits
+        // hidden_states shape: [batch_size, seq_len, hidden_size]
+        let last_hidden = hidden_states.narrow(1, l - 1, 1)?;
+
+        // Apply language model head
+        last_hidden.apply(&self.lm_head)
     }
 
     #[inline]
