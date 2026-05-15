@@ -9,4 +9,8 @@ pub mod scheduler;
 pub mod tokenizer;
 
 pub use engine::{InferenceEngine, InferenceEngineBuilder};
-pub use pipeline::{GenerationRequest, TextGeneration, TextGenerationBuilder};
+pub use pipeline::{
+    GenerationRequest, GenerationResult, GenerationStats, RequestHandle, TextGeneration,
+    TextGenerationBuilder,
+};
+pub use scheduler::SchedulingPolicy;

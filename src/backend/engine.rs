@@ -458,6 +458,94 @@ impl<T: ModelImpl> InferenceEngine<T> {
 
         Ok(results)
     }
+
+    /// Run continuous batching loop with scheduler integration
+    /// This is the main entry point for continuous batching execution
+    pub fn run_continuous_batching(
+        &mut self,
+        scheduler: &mut crate::backend::scheduler::ContinuousBatchScheduler,
+        eos_tokens: (u32, u32),
+    ) -> Result<()> {
+        // 1. Admit new requests from queue
+        let admitted = scheduler.admit_requests()?;
+        trace!(admitted_count = admitted.len(), "admitted new requests");
+
+        // 2. Form and execute prefill batch
+        if let Some(prefill_batch) = scheduler.form_prefill_batch() {
+            trace!(
+                batch_size = prefill_batch.request_ids.len(),
+                total_tokens = prefill_batch.total_tokens,
+                "executing prefill batch"
+            );
+
+            // Gather tokens for each request
+            let mut batch_tokens = Vec::new();
+            for id in &prefill_batch.request_ids {
+                if let Some(request) = scheduler.get_request(id) {
+                    batch_tokens.push((*id, request.prompt_tokens.clone()));
+                }
+            }
+
+            // Execute batched prefill
+            let results = self.prefill_batch(&batch_tokens)?;
+
+            // Update requests with first generated tokens and transition to decode
+            for (id, next_token) in results {
+                if let Some(request) = scheduler.get_request_mut(&id) {
+                    request.generated_tokens.push(next_token);
+                    request.position = request.seq_len();
+                }
+                scheduler.transition_to_decode(&id)?;
+            }
+        }
+
+        // 3. Form and execute decode batch
+        if let Some(decode_batch) = scheduler.form_decode_batch() {
+            trace!(
+                batch_size = decode_batch.request_ids.len(),
+                total_tokens = decode_batch.total_tokens,
+                "executing decode batch"
+            );
+
+            // Gather data for each request
+            let mut batch_data = Vec::new();
+            let mut to_complete = Vec::new();
+
+            for id in &decode_batch.request_ids {
+                if let Some(request) = scheduler.get_request(id) {
+                    let all_tokens = request.all_tokens();
+                    batch_data.push((*id, all_tokens, request.position));
+                }
+            }
+
+            // Execute batched decode
+            let results = self.decode_batch(&batch_data)?;
+
+            // Update requests with new tokens
+            for (id, next_token) in results {
+                if let Some(request) = scheduler.get_request_mut(&id) {
+                    request.generated_tokens.push(next_token);
+                    request.position = request.seq_len();
+
+                    // Check if request should be completed
+                    if next_token == eos_tokens.0
+                        || next_token == eos_tokens.1
+                        || request.should_stop()
+                    {
+                        to_complete.push(id);
+                    }
+                }
+            }
+
+            // Complete finished requests
+            for id in to_complete {
+                scheduler.complete_request(&id)?;
+                trace!(request_id = ?id, "completed request");
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Detailed statistics separating prefill and decode phases

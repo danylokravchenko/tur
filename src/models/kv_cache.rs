@@ -10,6 +10,37 @@ use candle_nn::kv_cache::ConcatKvCache;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
+/// Cache strategy for KV cache management
+pub enum CacheStrategy {
+    /// Simple contiguous cache - model owns the cache (single request mode)
+    /// The model maintains a SimpleKvCache for accumulating KV state
+    Simple(SimpleKvCache),
+    /// Paged cache - requests own block tables, model uses shared allocator (batching mode)
+    /// The model receives block tables as parameters and uses the shared allocator
+    Paged(Arc<RwLock<BlockAllocator>>),
+}
+
+impl std::fmt::Debug for CacheStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Simple(_) => f.debug_tuple("Simple").field(&"SimpleKvCache").finish(),
+            Self::Paged(_) => f
+                .debug_tuple("Paged")
+                .field(&"Arc<RwLock<BlockAllocator>>")
+                .finish(),
+        }
+    }
+}
+
+impl Clone for CacheStrategy {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Simple(cache) => Self::Simple(cache.clone()),
+            Self::Paged(allocator) => Self::Paged(allocator.clone()),
+        }
+    }
+}
+
 /// Trait for KV cache implementations
 pub trait KvCacheImpl: Send + Sync {
     /// Append new K and V tensors to the cache
@@ -143,6 +174,7 @@ impl KvBlock {
 }
 
 /// Block allocator managing physical memory blocks
+#[derive(Debug)]
 pub struct BlockAllocator {
     /// Pool of free block IDs
     free_blocks: Vec<BlockId>,

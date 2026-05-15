@@ -278,10 +278,10 @@ fn main() -> Result<()> {
     let model = Qwen35ModelForCausalLM::new_with_progress(&config, vb, Some(&progress))?;
 
     if gguf {
-        debug!("✓ Loaded quantized Qwen 3.5 model (GGUF format)");
+        debug!("✓ Loading quantized Qwen 3.5 model (GGUF format)");
     } else {
         debug!(
-            "✓ Loaded full-precision Qwen 3.5 with {} safetensor shard(s)",
+            "✓ Loading full-precision Qwen 3.5 with {} safetensor shard(s)",
             weight_files.len()
         );
     }

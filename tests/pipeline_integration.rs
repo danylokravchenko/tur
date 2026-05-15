@@ -297,3 +297,222 @@ fn test_prefix_cache_with_pipeline() {
         );
     }
 }
+
+#[test]
+fn test_continuous_batching_basic() {
+    // Test basic continuous batching setup and usage
+    let (vb, config, device) = download_test_model().unwrap();
+    let model = ModelForCausalLM::new(&config, vb).unwrap();
+    let tokenizer = load_tokenizer().unwrap();
+
+    // Enable batching with builder
+    let mut pipeline = TextGeneration::builder(model, tokenizer, device.clone())
+        .seed(299792458)
+        .temperature(0.8)
+        .enable_batching(true)
+        .max_batch_size(4)
+        .max_prefill_batch(2)
+        .max_decode_batch(4)
+        .build();
+
+    assert!(pipeline.is_batching_enabled(), "Batching should be enabled");
+
+    // Submit multiple requests
+    let requests = vec![
+        GenerationRequest::new("Hello".to_string(), 5),
+        GenerationRequest::new("How are you?".to_string(), 5),
+        GenerationRequest::new("What is Rust?".to_string(), 5),
+    ];
+
+    let mut handles = Vec::new();
+    for request in &requests {
+        let handle = pipeline.submit_request(request).unwrap();
+        handles.push(handle);
+    }
+
+    // Process all requests until completion
+    pipeline.run_until_complete().unwrap();
+
+    // Retrieve results
+    for handle in &handles {
+        let result = pipeline.try_get_result(handle);
+        assert!(result.is_some(), "Result should be available");
+
+        let result = result.unwrap();
+        assert!(
+            !result.generated_text.is_empty(),
+            "Should have generated text"
+        );
+        assert!(
+            !result.generated_tokens.is_empty(),
+            "Should have generated tokens"
+        );
+    }
+
+    // Verify all requests completed
+    assert_eq!(pipeline.active_request_count(), 0);
+    assert_eq!(pipeline.queued_request_count(), 0);
+}
+
+#[test]
+fn test_continuous_batching_step_by_step() {
+    // Test manual step-by-step execution for fine-grained control
+    let (vb, config, device) = download_test_model().unwrap();
+    let model = ModelForCausalLM::new(&config, vb).unwrap();
+    let tokenizer = load_tokenizer().unwrap();
+
+    let mut pipeline = TextGeneration::builder(model, tokenizer, device)
+        .seed(299792458)
+        .enable_batching(true)
+        .max_batch_size(2)
+        .build();
+
+    // Submit requests
+    let req1 = GenerationRequest::new("Test 1".to_string(), 3);
+    let req2 = GenerationRequest::new("Test 2".to_string(), 3);
+
+    let handle1 = pipeline.submit_request(&req1).unwrap();
+    let handle2 = pipeline.submit_request(&req2).unwrap();
+
+    // Manually step through execution
+    let mut iterations = 0;
+    let max_iterations = 20; // Safety limit
+
+    while pipeline.active_request_count() > 0 || pipeline.queued_request_count() > 0 {
+        let active = pipeline.step().unwrap();
+        iterations += 1;
+
+        if iterations > max_iterations {
+            panic!("Too many iterations, possible infinite loop");
+        }
+
+        if active == 0 {
+            break;
+        }
+    }
+
+    // Verify results
+    let result1 = pipeline.try_get_result(&handle1);
+    let result2 = pipeline.try_get_result(&handle2);
+
+    assert!(result1.is_some(), "Request 1 should be completed");
+    assert!(result2.is_some(), "Request 2 should be completed");
+}
+
+#[test]
+fn test_continuous_batching_blocking_get() {
+    // Test blocking result retrieval
+    let (vb, config, device) = download_test_model().unwrap();
+    let model = ModelForCausalLM::new(&config, vb).unwrap();
+    let tokenizer = load_tokenizer().unwrap();
+
+    let mut pipeline = TextGeneration::builder(model, tokenizer, device)
+        .seed(299792458)
+        .enable_batching(true)
+        .build();
+
+    let request = GenerationRequest::new("Hello world".to_string(), 5);
+    let handle = pipeline.submit_request(&request).unwrap();
+
+    // Blocking get - will process until this request completes
+    let result = pipeline.get_result(&handle).unwrap();
+
+    assert_eq!(result.request_id, handle.id);
+    assert!(!result.generated_text.is_empty());
+    assert!(!result.generated_tokens.is_empty());
+}
+
+#[test]
+fn test_continuous_batching_mixed_lengths() {
+    // Test handling requests with different generation lengths
+    let (vb, config, device) = download_test_model().unwrap();
+    let model = ModelForCausalLM::new(&config, vb).unwrap();
+    let tokenizer = load_tokenizer().unwrap();
+
+    let mut pipeline = TextGeneration::builder(model, tokenizer, device)
+        .seed(299792458)
+        .enable_batching(true)
+        .max_batch_size(3)
+        .build();
+
+    // Submit requests with varying lengths
+    let short_req = GenerationRequest::new("Hi".to_string(), 2);
+    let medium_req = GenerationRequest::new("Hello".to_string(), 5);
+    let long_req = GenerationRequest::new("Tell me".to_string(), 10);
+
+    let h1 = pipeline.submit_request(&short_req).unwrap();
+    let h2 = pipeline.submit_request(&medium_req).unwrap();
+    let h3 = pipeline.submit_request(&long_req).unwrap();
+
+    // Process all
+    pipeline.run_until_complete().unwrap();
+
+    // All should complete successfully
+    assert!(pipeline.try_get_result(&h1).is_some());
+    assert!(pipeline.try_get_result(&h2).is_some());
+    assert!(pipeline.try_get_result(&h3).is_some());
+}
+
+#[test]
+fn test_continuous_batching_sequential_submission() {
+    // Test submitting requests while others are processing
+    let (vb, config, device) = download_test_model().unwrap();
+    let model = ModelForCausalLM::new(&config, vb).unwrap();
+    let tokenizer = load_tokenizer().unwrap();
+
+    let mut pipeline = TextGeneration::builder(model, tokenizer, device)
+        .seed(299792458)
+        .enable_batching(true)
+        .build();
+
+    // Submit first batch
+    let req1 = GenerationRequest::new("First".to_string(), 5);
+    let h1 = pipeline.submit_request(&req1).unwrap();
+
+    // Process a few steps
+    for _ in 0..3 {
+        pipeline.step().unwrap();
+    }
+
+    // Submit more while first is processing
+    let req2 = GenerationRequest::new("Second".to_string(), 5);
+    let req3 = GenerationRequest::new("Third".to_string(), 5);
+    let h2 = pipeline.submit_request(&req2).unwrap();
+    let h3 = pipeline.submit_request(&req3).unwrap();
+
+    // Complete all
+    pipeline.run_until_complete().unwrap();
+
+    // All should be done
+    assert!(pipeline.try_get_result(&h1).is_some());
+    assert!(pipeline.try_get_result(&h2).is_some());
+    assert!(pipeline.try_get_result(&h3).is_some());
+}
+
+#[test]
+fn test_continuous_batching_result_management() {
+    // Test result storage and retrieval
+    let (vb, config, device) = download_test_model().unwrap();
+    let model = ModelForCausalLM::new(&config, vb).unwrap();
+    let tokenizer = load_tokenizer().unwrap();
+
+    let mut pipeline = TextGeneration::builder(model, tokenizer, device)
+        .seed(299792458)
+        .enable_batching(true)
+        .build();
+
+    let req = GenerationRequest::new("Test".to_string(), 3);
+    let handle = pipeline.submit_request(&req).unwrap();
+
+    pipeline.run_until_complete().unwrap();
+
+    // Get all results
+    let all_results = pipeline.get_all_results();
+    assert_eq!(all_results.len(), 1);
+    assert!(all_results.contains_key(&handle.id));
+
+    // Clear results
+    pipeline.clear_results();
+    let all_results_after = pipeline.get_all_results();
+    assert_eq!(all_results_after.len(), 0);
+}

@@ -256,6 +256,127 @@ impl ContinuousBatchScheduler {
         let blocks = total_tokens.div_ceil(block_size);
         Ok(blocks)
     }
+
+    /// Check if there are any active requests
+    pub fn has_active_requests(&self) -> bool {
+        self.batch_manager.num_active_requests() > 0
+    }
+
+    /// Check if there are any queued requests
+    pub fn has_queued_requests(&self) -> bool {
+        self.batch_manager.num_queued_requests() > 0
+    }
+
+    /// Get number of active requests
+    pub fn active_request_count(&self) -> usize {
+        self.batch_manager.num_active_requests()
+    }
+
+    /// Get number of queued requests
+    pub fn queued_request_count(&self) -> usize {
+        self.batch_manager.num_queued_requests()
+    }
+
+    /// Get request state by ID
+    pub fn get_request_state(&self, request_id: &Uuid) -> Option<&RequestState> {
+        self.batch_manager.get_request(request_id)
+    }
+
+    /// Main scheduling iteration - admits requests, forms batches, and executes them
+    /// Returns list of completed requests with their generated tokens
+    pub fn schedule_iteration<T: crate::models::ModelImpl>(
+        &mut self,
+        engine: &mut crate::backend::engine::InferenceEngine<T>,
+    ) -> Result<Vec<(Uuid, Vec<u32>)>> {
+        use tracing::debug;
+
+        // 1. Admit new requests from queue
+        let admitted = self.admit_requests()?;
+        if !admitted.is_empty() {
+            debug!("Admitted {} new requests", admitted.len());
+        }
+
+        let mut completed = Vec::new();
+
+        // 2. Form and execute prefill batch
+        if let Some(prefill_batch) = self.form_prefill_batch() {
+            debug!(
+                "Executing prefill batch: {} requests, {} tokens",
+                prefill_batch.request_ids.len(),
+                prefill_batch.total_tokens
+            );
+
+            // Collect tokens for each request in the batch
+            let batch_tokens: Vec<(Uuid, Vec<u32>)> = prefill_batch
+                .request_ids
+                .iter()
+                .filter_map(|id| {
+                    self.get_request(id)
+                        .map(|req| (*id, req.prompt_tokens.clone()))
+                })
+                .collect();
+
+            // Execute prefill batch
+            let results = engine.prefill_batch(&batch_tokens)?;
+
+            // Update request states with first generated token
+            for (request_id, first_token) in results {
+                if let Some(request) = self.get_request_mut(&request_id) {
+                    request.generated_tokens.push(first_token);
+                    request.position = request.prompt_tokens.len();
+                }
+                // Transition to decode phase
+                self.transition_to_decode(&request_id)?;
+            }
+        }
+
+        // 3. Form and execute decode batch
+        if let Some(decode_batch) = self.form_decode_batch() {
+            debug!(
+                "Executing decode batch: {} requests",
+                decode_batch.request_ids.len()
+            );
+
+            // Collect tokens and positions for each request
+            let batch_data: Vec<(Uuid, Vec<u32>, usize)> = decode_batch
+                .request_ids
+                .iter()
+                .filter_map(|id| {
+                    self.get_request(id).map(|req| {
+                        let all_tokens = req.all_tokens();
+                        (*id, all_tokens, req.position)
+                    })
+                })
+                .collect();
+
+            // Execute decode batch
+            let results = engine.decode_batch(&batch_data)?;
+
+            // Update request states and check for completion
+            for (request_id, next_token) in results {
+                let should_complete = if let Some(request) = self.get_request_mut(&request_id) {
+                    request.generated_tokens.push(next_token);
+                    request.position += 1;
+
+                    // Check if request should stop
+                    request.should_stop()
+                        || next_token == 151643 // EOS token for Qwen
+                        || next_token == 151645 // Alternative EOS
+                } else {
+                    false
+                };
+
+                // Complete request if needed
+                if should_complete {
+                    let tokens = self.complete_request(&request_id)?;
+                    completed.push((request_id, tokens));
+                    debug!("Request {} completed", request_id);
+                }
+            }
+        }
+
+        Ok(completed)
+    }
 }
 
 /// Statistics about scheduler state
@@ -653,5 +774,246 @@ mod tests {
         let tokens = scheduler.complete_request(&request_id).unwrap();
         assert!(!tokens.is_empty());
         assert!(scheduler.get_request(&request_id).is_none());
+    }
+
+    #[test]
+    fn test_schedule_iteration() {
+        let mut scheduler = create_test_scheduler(SchedulingPolicy::FCFS);
+
+        // Enqueue multiple requests
+        let req1 = create_test_request(5, 10, 0);
+        let req2 = create_test_request(8, 10, 0);
+        let id1 = req1.id;
+        let id2 = req2.id;
+
+        scheduler.enqueue_request(req1);
+        scheduler.enqueue_request(req2);
+
+        // Verify initial state
+        assert_eq!(scheduler.queued_request_count(), 2);
+        assert_eq!(scheduler.active_request_count(), 0);
+
+        // Note: We can't actually call schedule_iteration without a real model,
+        // but we can test the individual components it uses:
+
+        // 1. Test admission
+        let admitted = scheduler.admit_requests().unwrap();
+        assert_eq!(admitted.len(), 2);
+        assert!(admitted.contains(&id1));
+        assert!(admitted.contains(&id2));
+
+        // 2. Test prefill batch formation
+        let prefill_batch = scheduler.form_prefill_batch();
+        assert!(prefill_batch.is_some());
+        let batch = prefill_batch.unwrap();
+        assert_eq!(batch.phase, RequestPhase::Prefilling);
+        assert_eq!(batch.request_ids.len(), 2);
+
+        // 3. Simulate prefill completion by transitioning to decode
+        scheduler.transition_to_decode(&id1).unwrap();
+        scheduler.transition_to_decode(&id2).unwrap();
+
+        // 4. Test decode batch formation
+        let decode_batch = scheduler.form_decode_batch();
+        assert!(decode_batch.is_some());
+        let batch = decode_batch.unwrap();
+        assert_eq!(batch.phase, RequestPhase::Decoding);
+        assert_eq!(batch.request_ids.len(), 2);
+
+        // 5. Simulate completion
+        let tokens1 = scheduler.complete_request(&id1).unwrap();
+        let tokens2 = scheduler.complete_request(&id2).unwrap();
+        assert!(!tokens1.is_empty());
+        assert!(!tokens2.is_empty());
+
+        // Verify final state
+        assert_eq!(scheduler.active_request_count(), 0);
+        assert_eq!(scheduler.queued_request_count(), 0);
+    }
+
+    #[test]
+    fn test_schedule_iteration_workflow() {
+        let mut scheduler = create_test_scheduler(SchedulingPolicy::FCFS);
+
+        // Create requests with different characteristics
+        let short_req = create_test_request(3, 5, 0);
+        let long_req = create_test_request(10, 20, 0);
+        let short_id = short_req.id;
+        let long_id = long_req.id;
+
+        scheduler.enqueue_request(short_req);
+        scheduler.enqueue_request(long_req);
+
+        // Step 1: Admission
+        let admitted = scheduler.admit_requests().unwrap();
+        assert_eq!(admitted.len(), 2);
+
+        // Step 2: Prefill phase
+        let prefill_batch = scheduler.form_prefill_batch().unwrap();
+        assert_eq!(prefill_batch.request_ids.len(), 2);
+        assert_eq!(prefill_batch.phase, RequestPhase::Prefilling);
+
+        // Verify requests are in prefilling state
+        assert_eq!(
+            scheduler.get_request(&short_id).unwrap().phase,
+            RequestPhase::Prefilling
+        );
+        assert_eq!(
+            scheduler.get_request(&long_id).unwrap().phase,
+            RequestPhase::Prefilling
+        );
+
+        // Step 3: Transition to decode (simulating prefill completion)
+        scheduler.transition_to_decode(&short_id).unwrap();
+        scheduler.transition_to_decode(&long_id).unwrap();
+
+        // Step 4: Decode phase
+        let decode_batch = scheduler.form_decode_batch().unwrap();
+        assert_eq!(decode_batch.request_ids.len(), 2);
+        assert_eq!(decode_batch.phase, RequestPhase::Decoding);
+
+        // Verify requests are in decoding state
+        assert_eq!(
+            scheduler.get_request(&short_id).unwrap().phase,
+            RequestPhase::Decoding
+        );
+        assert_eq!(
+            scheduler.get_request(&long_id).unwrap().phase,
+            RequestPhase::Decoding
+        );
+
+        // Step 5: Complete short request first
+        let short_tokens = scheduler.complete_request(&short_id).unwrap();
+        assert_eq!(short_tokens.len(), 3); // Original prompt tokens
+
+        // Long request should still be active
+        assert!(scheduler.get_request(&long_id).is_some());
+        assert_eq!(scheduler.active_request_count(), 1);
+
+        // Step 6: Complete long request
+        let long_tokens = scheduler.complete_request(&long_id).unwrap();
+        assert_eq!(long_tokens.len(), 10);
+
+        // All requests completed
+        assert_eq!(scheduler.active_request_count(), 0);
+    }
+
+    #[test]
+    fn test_schedule_iteration_mixed_phases() {
+        let mut scheduler = create_test_scheduler(SchedulingPolicy::FCFS);
+
+        // Create and admit first batch
+        let req1 = create_test_request(5, 10, 0);
+        let req2 = create_test_request(5, 10, 0);
+        let id1 = req1.id;
+        let id2 = req2.id;
+
+        scheduler.enqueue_request(req1);
+        scheduler.enqueue_request(req2);
+        scheduler.admit_requests().unwrap();
+
+        // Transition first request to decode
+        scheduler.transition_to_decode(&id1).unwrap();
+
+        // Now we have mixed phases: id1 in decode, id2 in prefill
+        assert_eq!(
+            scheduler.get_request(&id1).unwrap().phase,
+            RequestPhase::Decoding
+        );
+        assert_eq!(
+            scheduler.get_request(&id2).unwrap().phase,
+            RequestPhase::Prefilling
+        );
+
+        // Add new request while others are active
+        let req3 = create_test_request(5, 10, 0);
+        let id3 = req3.id;
+        scheduler.enqueue_request(req3);
+
+        // Admit the new request
+        let admitted = scheduler.admit_requests().unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0], id3);
+
+        // Form batches - should separate by phase
+        let prefill_batch = scheduler.form_prefill_batch().unwrap();
+        assert_eq!(prefill_batch.request_ids.len(), 2); // id2 and id3
+
+        let decode_batch = scheduler.form_decode_batch().unwrap();
+        assert_eq!(decode_batch.request_ids.len(), 1); // id1
+
+        // Verify batch contents
+        assert!(prefill_batch.request_ids.contains(&id2));
+        assert!(prefill_batch.request_ids.contains(&id3));
+        assert!(decode_batch.request_ids.contains(&id1));
+    }
+
+    #[test]
+    fn test_schedule_iteration_memory_pressure() {
+        // Create scheduler with limited memory
+        // Use smaller model params and very limited memory to trigger pressure
+        let memory_pool = Arc::new(RwLock::new(MemoryPool::new(
+            5 * 1024 * 1024,
+            16,
+            8,
+            8,
+            64,
+            2,
+            candle_core::Device::Cpu,
+        )));
+        let tokenizer = Arc::new(Tokenizer::from_file("tokenizer.json").unwrap_or_else(|_| {
+            tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
+        }));
+        let config = BatchConfig::default();
+        let mut scheduler =
+            ContinuousBatchScheduler::new(SchedulingPolicy::FCFS, config, memory_pool, tokenizer);
+
+        // Enqueue many requests with larger size to exceed memory
+        let mut ids = Vec::new();
+        for _ in 0..10 {
+            let request = create_test_request(50, 100, 0); // Larger requests to trigger memory pressure
+            ids.push(request.id);
+            scheduler.enqueue_request(request);
+        }
+
+        // First admission should only admit what fits in memory
+        let admitted1 = scheduler.admit_requests().unwrap();
+
+        // Should admit at least one request
+        assert!(!admitted1.is_empty(), "Should admit at least one request");
+
+        // Should not admit all requests due to memory limit
+        assert!(
+            admitted1.len() < 10,
+            "Should not admit all requests due to memory limit. Admitted: {}, Total blocks available: {}",
+            admitted1.len(),
+            scheduler.get_stats().total_blocks
+        );
+
+        let stats1 = scheduler.get_stats();
+        assert!(
+            stats1.queued_requests > 0,
+            "Some requests should remain queued"
+        );
+
+        // Complete one request to free memory
+        if let Some(id) = admitted1.first() {
+            scheduler.complete_request(id).unwrap();
+        }
+
+        // Now we should be able to admit more
+        let admitted2 = scheduler.admit_requests().unwrap();
+
+        // After freeing memory, should be able to admit at least one more
+        if stats1.queued_requests > 0 {
+            assert!(
+                !admitted2.is_empty(),
+                "Should admit more requests after freeing memory"
+            );
+        }
+
+        // Total admitted should still be less than total requests
+        let total_admitted = admitted1.len() + admitted2.len() - 1; // -1 for completed
+        assert!(total_admitted < 10, "Should not have admitted all requests");
     }
 }
