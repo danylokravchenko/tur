@@ -1,11 +1,14 @@
 use candle_core::{DType, Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
+use parking_lot::RwLock;
+use std::sync::Arc;
 use tokenizers::Tokenizer;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::{
     ProgressReporter, Result, TurError,
+    backend::prefix_cache::{PrefixCache, PrefixCacheEntry, SharedPrefixCache},
     backend::tokenizer::{LogitsSampler, TokenOutputStream},
     models::ModelImpl,
 };
@@ -51,12 +54,21 @@ pub struct DetailedGenerationStats {
     pub generated_tokens: usize,
     /// Total time for decode phase
     pub decode_ms: f64,
+    /// Whether prefix cache was hit
+    pub cache_hit: bool,
+    /// Number of tokens restored from cache
+    pub cached_tokens: usize,
 }
 
 impl DetailedGenerationStats {
     pub fn report(&self, name: &str) {
         println!("\n=== Generation Stats: {} ===", name);
-        println!("Prefill Phase:");
+        if self.cache_hit {
+            println!("Prefix Cache: HIT ({} tokens restored)", self.cached_tokens);
+        } else {
+            println!("Prefix Cache: MISS");
+        }
+        println!("\nPrefill Phase:");
         println!("  Prompt tokens: {}", self.prompt_tokens);
         println!("  Prefill time: {:.2} ms", self.prefill_ms);
         println!(
@@ -83,6 +95,7 @@ pub struct InferenceEngine<T: ModelImpl> {
     sampler: Box<dyn LogitsSampler>,
     repeat_penalty: f32,
     repeat_last_n: usize,
+    prefix_cache: Option<SharedPrefixCache>,
 }
 
 /// Builder for InferenceEngine
@@ -94,6 +107,7 @@ pub struct InferenceEngineBuilder<T: ModelImpl> {
     top_p: Option<f64>,
     repeat_penalty: f32,
     repeat_last_n: usize,
+    prefix_cache: Option<SharedPrefixCache>,
 }
 
 impl<T: ModelImpl> InferenceEngineBuilder<T> {
@@ -106,6 +120,7 @@ impl<T: ModelImpl> InferenceEngineBuilder<T> {
             top_p: None,
             repeat_penalty: 1.0,
             repeat_last_n: 64,
+            prefix_cache: None,
         }
     }
 
@@ -134,6 +149,21 @@ impl<T: ModelImpl> InferenceEngineBuilder<T> {
         self
     }
 
+    /// Enable prefix caching with specified configuration
+    pub fn with_prefix_cache(mut self, max_entries: usize, max_token_length: usize) -> Self {
+        self.prefix_cache = Some(Arc::new(RwLock::new(PrefixCache::new(
+            max_entries,
+            max_token_length,
+        ))));
+        self
+    }
+
+    /// Use a shared prefix cache instance
+    pub fn with_shared_prefix_cache(mut self, cache: SharedPrefixCache) -> Self {
+        self.prefix_cache = Some(cache);
+        self
+    }
+
     pub fn build(self) -> InferenceEngine<T> {
         let sampler: Box<dyn LogitsSampler> =
             Box::new(LogitsProcessor::new(self.seed, self.temp, self.top_p));
@@ -143,6 +173,7 @@ impl<T: ModelImpl> InferenceEngineBuilder<T> {
             sampler,
             repeat_penalty: self.repeat_penalty,
             repeat_last_n: self.repeat_last_n,
+            prefix_cache: self.prefix_cache,
         }
     }
 }
@@ -167,6 +198,7 @@ impl<T: ModelImpl> InferenceEngine<T> {
             sampler,
             repeat_penalty,
             repeat_last_n,
+            prefix_cache: None,
         }
     }
     /// Get EOS tokens from tokenizer
@@ -202,18 +234,121 @@ impl<T: ModelImpl> InferenceEngine<T> {
         }
     }
 
+    /// Try to restore KV cache state from prefix cache
+    /// Returns (cache_hit, cached_token_count)
+    fn try_restore_from_cache(&mut self, tokens: &[u32]) -> Result<(bool, usize)> {
+        let cache = match &self.prefix_cache {
+            Some(c) => c,
+            None => return Ok((false, 0)),
+        };
+
+        let mut cache = cache.write();
+
+        // Find longest matching prefix
+        let (key, match_len) = cache.find_longest_prefix(tokens);
+
+        if match_len == 0 {
+            cache.record_miss();
+            return Ok((false, 0));
+        }
+
+        // Get the cached entry
+        let entry = match cache.get(key) {
+            Some(e) => e,
+            None => {
+                cache.record_miss();
+                return Ok((false, 0));
+            }
+        };
+
+        // Validate compatibility
+        if !entry.is_compatible(
+            &self.device,
+            self.model
+                .get_kv_cache_state()?
+                .first()
+                .map(|(k, _)| k.dtype())
+                .unwrap_or(DType::F32),
+        ) {
+            cache.record_miss();
+            return Ok((false, 0));
+        }
+
+        // Restore KV cache state
+        self.model.set_kv_cache_state(entry.kv_states.clone())?;
+
+        // Update stats
+        cache.record_hit(match_len);
+
+        Ok((true, match_len))
+    }
+
+    /// Store current KV cache state to prefix cache
+    fn store_to_cache(&mut self, tokens: &[u32]) -> Result<()> {
+        let cache = match &self.prefix_cache {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        // Extract current KV cache state
+        let kv_states = self.model.get_kv_cache_state()?;
+
+        // Don't cache if no state
+        if kv_states.is_empty() {
+            return Ok(());
+        }
+
+        // Get dtype from first tensor
+        let dtype = kv_states
+            .first()
+            .map(|(k, _)| k.dtype())
+            .unwrap_or(DType::F32);
+        // Create cache entry
+        let entry = PrefixCacheEntry::new(tokens.to_vec(), kv_states, self.device.clone(), dtype);
+
+        // Insert into cache
+        let mut cache = cache.write();
+        cache.insert(entry);
+
+        Ok(())
+    }
+
     /// Perform prefill: encode full prompt and get first token
-    /// Returns (first_token, prefill_duration)
-    pub fn prefill(&mut self, tokens: &[u32]) -> Result<(u32, std::time::Duration)> {
+    /// Returns (first_token, prefill_duration, cache_hit, cached_tokens)
+    pub fn prefill(&mut self, tokens: &[u32]) -> Result<(u32, std::time::Duration, bool, usize)> {
         let start = std::time::Instant::now();
 
-        let input = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
-        let logits = self.model.forward(&input, 0)?;
+        // Try to restore from cache
+        let (cache_hit, cached_len) = self.try_restore_from_cache(tokens)?;
+
+        // If entire prompt is cached, we still need at least one token to process
+        // to get the next token prediction
+        let remaining_tokens = &tokens[cached_len..];
+
+        // Ensure we have at least one token to process
+        let (process_tokens, process_offset) = if remaining_tokens.is_empty() {
+            // All tokens cached - process last token to get next prediction
+            (
+                &tokens[tokens.len().saturating_sub(1)..],
+                tokens.len().saturating_sub(1),
+            )
+        } else {
+            (remaining_tokens, cached_len)
+        };
+
+        let input = Tensor::new(process_tokens, &self.device)?.unsqueeze(0)?;
+        let logits = self.model.forward(&input, process_offset)?;
+
+        // Store to cache if enabled and not already cached
+        if !cache_hit && self.prefix_cache.is_some() {
+            self.store_to_cache(tokens)?;
+        }
+
         let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
         let logits = self.process_logits(logits, tokens)?;
         let next_token = self.sampler.sample(&logits)?;
 
-        Ok((next_token, start.elapsed()))
+        Ok((next_token, start.elapsed(), cache_hit, cached_len))
     }
 
     /// Perform single decode step with KV cache reuse
@@ -242,7 +377,7 @@ impl<T: ModelImpl> InferenceEngine<T> {
         let mut token_vec = tokens.to_vec();
 
         // Prefill phase
-        let (first_token, prefill_duration) = self.prefill(tokens)?;
+        let (first_token, prefill_duration, cache_hit, cached_tokens) = self.prefill(tokens)?;
         token_vec.push(first_token);
         let prefill_ms = prefill_duration.as_secs_f64() * 1000.0;
 
@@ -273,6 +408,8 @@ impl<T: ModelImpl> InferenceEngine<T> {
             latency_per_token_ms,
             generated_tokens,
             decode_ms,
+            cache_hit,
+            cached_tokens,
         })
     }
 
@@ -435,7 +572,7 @@ impl<T: ModelImpl> TextGeneration<T> {
         let start_gen = std::time::Instant::now();
 
         // Prefill phase
-        let (first_token, _) = self.engine.prefill(&tokens)?;
+        let (first_token, _, _, _) = self.engine.prefill(&tokens)?;
         tokens.push(first_token);
         generated_tokens += 1;
 

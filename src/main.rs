@@ -1,5 +1,7 @@
 use candle_core::{DType, Device};
 use clap::Parser;
+use parking_lot::RwLock;
+use std::sync::Arc;
 use tokenizers::Tokenizer;
 use tracing::level_filters::LevelFilter;
 use tracing::{debug, info, trace};
@@ -7,6 +9,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
 use tur::backend::pipeline::GenerationRequest;
+use tur::backend::prefix_cache::PrefixCache;
 use tur::models::Qwen35ModelForCausalLM;
 use tur::weights::VarBuilderX;
 use tur::{Downloader, ProgressReporter, Result, TextGeneration, TurError};
@@ -156,11 +159,18 @@ struct Args {
     /// Enable thinking/reasoning mode (allows model to show its reasoning process)
     #[arg(long)]
     thinking: bool,
-}
 
-fn format_prompt(prompt: &str, thinking: bool) -> String {
-    let think_tag = if thinking { " /think" } else { " /no_think" };
-    format!("<|im_start|>user\n{prompt}{think_tag}<|im_end|>\n<|im_start|>assistant\n")
+    /// Enable prefix cache optimization
+    #[arg(long)]
+    prefix_cache: bool,
+
+    /// Maximum number of cached prefixes (default: 100)
+    #[arg(long, default_value_t = 100)]
+    cache_max_entries: usize,
+
+    /// Maximum token length for cached prefixes (default: 2048)
+    #[arg(long, default_value_t = 2048)]
+    cache_max_tokens: usize,
 }
 
 fn main() -> Result<()> {
@@ -171,7 +181,7 @@ fn main() -> Result<()> {
     info!("Qwen 3.5 Model - Clean Implementation");
 
     let device = Device::new_metal(0)?;
-    //let device = Device::Cpu;
+
     // DType for non-quantized operations (embeddings, norms, activations)
     // When using GGUF quantized models, linear layer weights remain quantized
     let dtype = if device.is_cuda() || device.is_metal() {
@@ -179,6 +189,7 @@ fn main() -> Result<()> {
     } else {
         DType::F32
     };
+
     debug!("Device: {:?}", device);
     debug!("DType for non-quantized ops: {:?}", dtype);
     debug!(
@@ -274,23 +285,41 @@ fn main() -> Result<()> {
             weight_files.len()
         );
     }
-    let mut builder = TextGeneration::builder(model, tokenizer, device.clone())
-        .seed(args.seed)
-        .repeat_penalty(args.repeat_penalty)
-        .repeat_last_n(args.repeat_last_n)
-        .progress(progress);
+
+    // Build inference engine with all parameters
+    let mut engine_builder =
+        tur::backend::pipeline::InferenceEngine::builder(model, device.clone())
+            .seed(args.seed)
+            .repeat_penalty(args.repeat_penalty)
+            .repeat_last_n(args.repeat_last_n);
 
     if let Some(temp) = args.temperature {
-        builder = builder.temperature(temp);
+        engine_builder = engine_builder.temperature(temp);
     }
     if let Some(top_p) = args.top_p {
-        builder = builder.top_p(top_p);
+        engine_builder = engine_builder.top_p(top_p);
     }
 
-    let mut pipeline = builder.build();
+    // Enable prefix cache if requested
+    if args.prefix_cache {
+        let cache = Arc::new(RwLock::new(PrefixCache::new(
+            args.cache_max_entries,
+            args.cache_max_tokens,
+        )));
+        info!(
+            "✓ Prefix cache enabled (max_entries: {}, max_tokens: {})",
+            args.cache_max_entries, args.cache_max_tokens
+        );
+        engine_builder = engine_builder.with_shared_prefix_cache(cache);
+    }
+
+    let engine = engine_builder.build();
+
+    // Create text generation pipeline from engine
+    let mut pipeline = TextGeneration::from_engine(engine, tokenizer, Some(progress));
     debug!("✓ Model is initialized and ready for inference");
 
-    let prompt = format_prompt(DEFAULT_PROMPT, args.thinking);
+    let prompt = pipeline.format_prompt(DEFAULT_PROMPT, args.thinking);
     trace!("formatted prompt: {}", &prompt);
 
     let request = GenerationRequest::new(prompt, args.sample_len);

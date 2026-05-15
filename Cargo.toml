@@ -37,6 +37,7 @@ num-traits = "0.2.19"
 rayon = "1.12.0"
 libc = { version = "0.2.147" }
 half = "2.7.1"
+ahash = "0.8.12"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6.1"

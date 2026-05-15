@@ -1,8 +1,9 @@
 use crate::backend::progress::ProgressReporter;
+use crate::models::kv_cache::KvCache;
 use crate::models::layers;
 use crate::weights::VarBuilderX;
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{Activation, kv_cache::ConcatKvCache};
+use candle_nn::Activation;
 use candle_transformers::utils::repeat_kv;
 use std::sync::Arc;
 
@@ -121,7 +122,7 @@ pub(crate) struct Qwen3Attention {
     hidden_size: usize,
     // utils
     rotary_emb: Arc<Qwen3RotaryEmbedding>,
-    kv_cache: ConcatKvCache,
+    kv_cache: KvCache,
 }
 
 impl Qwen3Attention {
@@ -178,7 +179,7 @@ impl Qwen3Attention {
 
         // dim=2 because we concatenate along the sequence dimension
         // For tensors of shape [batch, heads, seq, head_dim]
-        let kv_cache = ConcatKvCache::new(2);
+        let kv_cache = KvCache::new(2);
 
         Ok(Self {
             q_proj,
@@ -374,6 +375,16 @@ impl Qwen3Attention {
     pub(crate) fn clear_kv_cache(&mut self) {
         self.kv_cache.reset();
     }
+
+    /// Get current KV cache state for this attention layer
+    pub(crate) fn get_kv_state(&self) -> Option<(Tensor, Tensor)> {
+        self.kv_cache.get_state()
+    }
+
+    /// Restore KV cache state for this attention layer
+    pub(crate) fn set_kv_state(&mut self, k: Tensor, v: Tensor) -> Result<()> {
+        self.kv_cache.set_state(k, v)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -443,6 +454,14 @@ impl DecoderLayer {
 
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
+    }
+
+    fn get_kv_state(&self) -> Option<(Tensor, Tensor)> {
+        self.self_attn.get_kv_state()
+    }
+
+    fn set_kv_state(&mut self, k: Tensor, v: Tensor) -> Result<()> {
+        self.self_attn.set_kv_state(k, v)
     }
 }
 
@@ -537,6 +556,35 @@ impl Model {
         for l in &mut self.layers {
             l.clear_kv_cache();
         }
+    }
+
+    /// Get KV cache state from all layers
+    fn get_kv_cache_state(&self) -> Result<Vec<(Tensor, Tensor)>> {
+        let mut states = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            if let Some((k, v)) = layer.get_kv_state() {
+                states.push((k, v));
+            } else {
+                // If any layer has no state, return empty vec
+                return Ok(Vec::new());
+            }
+        }
+        Ok(states)
+    }
+
+    /// Restore KV cache state to all layers
+    fn set_kv_cache_state(&mut self, states: Vec<(Tensor, Tensor)>) -> Result<()> {
+        if states.len() != self.layers.len() {
+            candle_core::bail!(
+                "KV cache state length mismatch: expected {} layers, got {}",
+                self.layers.len(),
+                states.len()
+            );
+        }
+        for (layer, (k, v)) in self.layers.iter_mut().zip(states.into_iter()) {
+            layer.set_kv_state(k, v)?;
+        }
+        Ok(())
     }
 
     fn causal_mask(
@@ -645,5 +693,17 @@ impl super::ModelImpl for ModelForCausalLM {
     fn format_prompt(prompt: &str, thinking: bool) -> String {
         let think_tag = if thinking { " /think" } else { " /no_think" };
         format!("<|im_start|>user\n{prompt}{think_tag}<|im_end|>\n<|im_start|>assistant\n")
+    }
+
+    fn get_kv_cache_state(&self) -> Result<Vec<(Tensor, Tensor)>> {
+        self.base.get_kv_cache_state()
+    }
+
+    fn set_kv_cache_state(&mut self, state: Vec<(Tensor, Tensor)>) -> Result<()> {
+        self.base.set_kv_cache_state(state)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.base.clear_kv_cache();
     }
 }

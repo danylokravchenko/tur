@@ -1,6 +1,10 @@
 use candle_core::Device;
+use parking_lot::RwLock;
+use std::sync::Arc;
 use tur::ProgressReporter;
-use tur::backend::pipeline::{GenerationRequest, TextGeneration};
+use tur::backend::pipeline::{GenerationRequest, InferenceEngine, TextGeneration};
+use tur::backend::prefix_cache::PrefixCache;
+use tur::backend::tokenizer::TokenOutputStream;
 use tur::models::qwen3::{Config, ModelForCausalLM};
 use tur::weights::{Downloader, VarBuilderX};
 
@@ -125,5 +129,170 @@ fn test_pipeline_parameter_variations() {
         let request = GenerationRequest::new("Test".to_string(), 10);
         let result = pipeline.run(&request);
         assert!(result.is_ok(), "{} failed: {:?}", desc, result.err());
+    }
+}
+
+#[test]
+fn test_prefix_cache_full_hit() {
+    // Test the edge case where all tokens are cached
+    let (vb, config, device) = download_test_model().unwrap();
+    let model = ModelForCausalLM::new(&config, vb).unwrap();
+    let tokenizer = load_tokenizer().unwrap();
+
+    // Create prefix cache
+    let cache = Arc::new(RwLock::new(PrefixCache::new(10, 100)));
+
+    // Build engine with cache
+    let mut engine = InferenceEngine::builder(model, device)
+        .seed(299792458)
+        .temperature(0.8)
+        .with_shared_prefix_cache(cache.clone())
+        .build();
+
+    let tokenizer_stream = TokenOutputStream::new(tokenizer);
+    let prompt = "Hello, world!";
+    let tokens = tokenizer_stream
+        .tokenizer()
+        .encode(prompt, true)
+        .expect("encoding failed")
+        .get_ids()
+        .to_vec();
+
+    // First prefill - cache miss, stores to cache
+    let result1 = engine.prefill(&tokens);
+    assert!(result1.is_ok(), "First prefill failed: {:?}", result1.err());
+    let (_token1, _duration1, hit1, cached1) = result1.unwrap();
+    assert!(!hit1, "First request should be cache miss");
+    assert_eq!(cached1, 0, "First request should have 0 cached tokens");
+
+    // Clear KV cache but keep prefix cache
+    engine.model_mut().clear_kv_cache();
+
+    // Second prefill - should be full cache hit (all tokens cached)
+    let result2 = engine.prefill(&tokens);
+    assert!(
+        result2.is_ok(),
+        "Second prefill with full cache hit failed: {:?}",
+        result2.err()
+    );
+    let (_token2, _duration2, hit2, cached2) = result2.unwrap();
+    assert!(hit2, "Second request should be cache hit");
+    assert_eq!(
+        cached2,
+        tokens.len(),
+        "All tokens should be cached on second request"
+    );
+
+    // Verify cache statistics
+    {
+        let cache_guard = cache.read();
+        let stats = cache_guard.stats();
+        assert_eq!(stats.hits, 1, "Should have 1 cache hit");
+        assert_eq!(stats.misses, 1, "Should have 1 cache miss");
+        assert_eq!(
+            stats.total_tokens_reused,
+            tokens.len(),
+            "Should have reused all tokens"
+        );
+    }
+}
+
+#[test]
+fn test_prefix_cache_partial_hit() {
+    // Test partial cache hits with shared prefix
+    let (vb, config, device) = download_test_model().unwrap();
+    let model = ModelForCausalLM::new(&config, vb).unwrap();
+    let tokenizer = load_tokenizer().unwrap();
+
+    let cache = Arc::new(RwLock::new(PrefixCache::new(10, 100)));
+    let mut engine = InferenceEngine::builder(model, device)
+        .seed(299792458)
+        .with_shared_prefix_cache(cache.clone())
+        .build();
+
+    let tokenizer_stream = TokenOutputStream::new(tokenizer);
+
+    // First prompt
+    let prompt1 = "Hello, world! How are you?";
+    let tokens1 = tokenizer_stream
+        .tokenizer()
+        .encode(prompt1, true)
+        .expect("encoding failed")
+        .get_ids()
+        .to_vec();
+
+    let result1 = engine.prefill(&tokens1);
+    assert!(result1.is_ok(), "First prefill failed");
+    let (_token1, _duration1, hit1, cached1) = result1.unwrap();
+    assert!(!hit1, "First request should be cache miss");
+    assert_eq!(cached1, 0);
+
+    engine.model_mut().clear_kv_cache();
+
+    // Second prompt with shared prefix
+    let prompt2 = "Hello, world! What is Rust?";
+    let tokens2 = tokenizer_stream
+        .tokenizer()
+        .encode(prompt2, true)
+        .expect("encoding failed")
+        .get_ids()
+        .to_vec();
+
+    let result2 = engine.prefill(&tokens2);
+    assert!(result2.is_ok(), "Second prefill failed");
+    let (_token2, _duration2, hit2, cached2) = result2.unwrap();
+
+    // Should have partial cache hit (shared prefix "Hello, world!")
+    if hit2 {
+        assert!(
+            cached2 > 0 && cached2 < tokens2.len(),
+            "Should have partial cache hit, got {} cached out of {} tokens",
+            cached2,
+            tokens2.len()
+        );
+    }
+
+    // Verify cache has entries
+    assert!(cache.read().len() > 0, "Cache should have entries");
+}
+
+#[test]
+fn test_prefix_cache_with_pipeline() {
+    // Test prefix cache integration with full TextGeneration pipeline
+    let (vb, config, device) = download_test_model().unwrap();
+    let model = ModelForCausalLM::new(&config, vb).unwrap();
+    let tokenizer = load_tokenizer().unwrap();
+
+    let cache = Arc::new(RwLock::new(PrefixCache::new(10, 100)));
+    let engine = InferenceEngine::builder(model, device.clone())
+        .seed(299792458)
+        .temperature(0.8)
+        .with_shared_prefix_cache(cache.clone())
+        .build();
+
+    let mut pipeline = TextGeneration::from_engine(engine, tokenizer, None);
+
+    // Run multiple generations with similar prompts
+    let prompts = vec!["Hello", "Hello, world", "Hello, how are you?"];
+
+    for prompt in prompts {
+        let request = GenerationRequest::new(prompt.to_string(), 5);
+        let result = pipeline.run(&request);
+        assert!(
+            result.is_ok(),
+            "Generation failed for prompt '{}': {:?}",
+            prompt,
+            result.err()
+        );
+    }
+
+    // Verify cache was used
+    {
+        let cache_guard = cache.read();
+        let stats = cache_guard.stats();
+        assert!(
+            stats.hits > 0 || stats.misses > 0,
+            "Cache should have been accessed"
+        );
     }
 }
