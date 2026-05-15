@@ -58,7 +58,7 @@ impl MemoryPool {
             2 * num_layers * num_heads * block_size * head_dim * bytes_per_element;
 
         let total_blocks = if bytes_per_block > 0 {
-            total_memory_bytes / bytes_per_block
+            total_memory_bytes.checked_div(bytes_per_block).unwrap_or(0)
         } else {
             0
         };
@@ -74,6 +74,7 @@ impl MemoryPool {
     }
 
     /// Create a memory pool with custom thresholds
+    #[allow(clippy::too_many_arguments)]
     pub fn with_thresholds(
         total_memory_bytes: usize,
         block_size: usize,

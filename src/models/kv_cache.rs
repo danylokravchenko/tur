@@ -194,11 +194,11 @@ impl BlockAllocator {
     /// Allocate a new block
     pub fn allocate(&mut self) -> Result<BlockId> {
         // Try to reuse a free block first
-        if let Some(block_id) = self.free_blocks.pop() {
-            if let Some(block) = self.allocated_blocks.get_mut(&block_id) {
-                block.ref_count = 1;
-                return Ok(block_id);
-            }
+        if let Some(block_id) = self.free_blocks.pop()
+            && let Some(block) = self.allocated_blocks.get_mut(&block_id)
+        {
+            block.ref_count = 1;
+            return Ok(block_id);
         }
 
         // No free blocks, create a new one if under limit
@@ -314,7 +314,7 @@ impl PagedKvCache {
     /// Allocate blocks for new tokens
     fn allocate_blocks(&mut self, num_tokens: usize) -> Result<()> {
         let total_tokens = self.seq_len + num_tokens;
-        let blocks_needed = (total_tokens + self.block_size - 1) / self.block_size;
+        let blocks_needed = total_tokens.div_ceil(self.block_size);
 
         let mut allocator = self.allocator.write();
         while self.block_table.len() < blocks_needed {
