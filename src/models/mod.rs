@@ -7,6 +7,7 @@ use candle_core::{Result, Tensor};
 pub use qwen3::{Config, Model, ModelForCausalLM as Qwen35ModelForCausalLM};
 
 pub trait ModelImpl {
+    fn name(&self) -> &'static str;
     fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor>;
     fn format_prompt(prompt: &str, thinking: bool) -> String;
 

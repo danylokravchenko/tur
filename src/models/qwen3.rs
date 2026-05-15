@@ -1,5 +1,5 @@
 use crate::backend::progress::ProgressReporter;
-use crate::models::kv_cache::KvCache;
+use crate::models::kv_cache::{KvCache, KvCacheImpl};
 use crate::models::layers;
 use crate::weights::VarBuilderX;
 use candle_core::{DType, Device, Module, Result, Tensor};
@@ -705,5 +705,9 @@ impl super::ModelImpl for ModelForCausalLM {
 
     fn clear_kv_cache(&mut self) {
         self.base.clear_kv_cache();
+    }
+
+    fn name(&self) -> &'static str {
+        "Qwen3"
     }
 }

@@ -1,6 +1,6 @@
 use candle_core::Device;
 use tokenizers::Tokenizer;
-use tracing::info;
+use tracing::{info, trace};
 use uuid::Uuid;
 
 use crate::{
@@ -164,6 +164,12 @@ impl<T: ModelImpl> TextGeneration<T> {
     pub fn run(&mut self, request: &GenerationRequest) -> Result<GenerationStats> {
         let sample_len = request.sample_len;
         self.tokenizer.clear();
+        trace!(
+            request_id = %request.id,
+            prompt_chars = request.prompt.chars().count(),
+            sample_len,
+            "starting text generation request",
+        );
         let mut tokens = self
             .tokenizer
             .tokenizer()
@@ -171,6 +177,11 @@ impl<T: ModelImpl> TextGeneration<T> {
             .map_err(|e| TurError::Tokenizer(e.to_string()))?
             .get_ids()
             .to_vec();
+        trace!(
+            request_id = %request.id,
+            prompt_tokens = tokens.len(),
+            "prompt encoded into tokens",
+        );
 
         // Initialize generation progress bar
         if let Some(ref progress) = self.progress {
@@ -183,7 +194,14 @@ impl<T: ModelImpl> TextGeneration<T> {
         let start_gen = std::time::Instant::now();
 
         // Prefill phase
-        let (first_token, _, _, _) = self.engine.prefill(&tokens)?;
+        let (first_token, _, cache_hit, cached_tokens) = self.engine.prefill(&tokens)?;
+        trace!(
+            request_id = %request.id,
+            first_token,
+            cache_hit,
+            cached_tokens,
+            "engine prefetched prompt and produced first token",
+        );
         tokens.push(first_token);
         generated_tokens += 1;
 
@@ -195,6 +213,11 @@ impl<T: ModelImpl> TextGeneration<T> {
             && first_token != eos_token2
             && let Some(t) = self.tokenizer.next_token(first_token)?
         {
+            trace!(
+                request_id = %request.id,
+                text_chars = t.chars().count(),
+                "decoded first token into text chunk",
+            );
             if let Some(ref progress) = self.progress {
                 progress.print(&t);
             } else if self.emit_output {
@@ -221,9 +244,21 @@ impl<T: ModelImpl> TextGeneration<T> {
             }
 
             if next_token == eos_token || next_token == eos_token2 {
+                trace!(
+                    request_id = %request.id,
+                    next_token,
+                    generated_tokens,
+                    "decode loop reached EOS token",
+                );
                 break;
             }
             if let Some(t) = self.tokenizer.next_token(next_token)? {
+                trace!(
+                    request_id = %request.id,
+                    next_token,
+                    text_chars = t.chars().count(),
+                    "decoded token into text chunk",
+                );
                 if let Some(ref progress) = self.progress {
                     progress.print(&t);
                 } else if self.emit_output {
@@ -239,6 +274,11 @@ impl<T: ModelImpl> TextGeneration<T> {
             .decode_rest()
             .map_err(|e| TurError::Tokenizer(e.to_string()))?
         {
+            trace!(
+                request_id = %request.id,
+                text_chars = rest.chars().count(),
+                "flushed remaining decoded text",
+            );
             if let Some(ref progress) = self.progress {
                 progress.print(&rest);
             } else if self.emit_output {
@@ -253,6 +293,13 @@ impl<T: ModelImpl> TextGeneration<T> {
             use std::io::Write;
             std::io::stdout().flush()?;
         }
+
+        trace!(
+            request_id = %request.id,
+            generated_tokens,
+            elapsed_ms = dt.as_secs_f64() * 1000.0,
+            "generation request completed",
+        );
 
         // Finish generation progress bar
         if let Some(ref progress) = self.progress {

@@ -2,6 +2,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
 use parking_lot::RwLock;
 use std::sync::Arc;
+use tracing::{debug, trace};
 
 use crate::{
     Result, TurError,
@@ -101,6 +102,10 @@ impl<T: ModelImpl> InferenceEngineBuilder<T> {
         } else {
             Box::new(LogitsProcessor::new(self.seed, self.temp, self.top_p))
         };
+        debug!(
+            model_name = self.model.name(),
+            "Created a new inference engine for model",
+        );
         InferenceEngine {
             model: self.model,
             device: self.device,
@@ -226,6 +231,10 @@ impl<T: ModelImpl> InferenceEngine<T> {
         // Insert into cache
         let mut cache = cache.write();
         cache.insert(entry);
+        trace!(
+            tokens = tokens.len(),
+            "stored prompt tokens in prefix cache",
+        );
 
         Ok(())
     }
@@ -254,6 +263,10 @@ impl<T: ModelImpl> InferenceEngine<T> {
         };
 
         let input = Tensor::new(process_tokens, &self.device)?.unsqueeze(0)?;
+        trace!(
+            processed_tokens = process_tokens.len(),
+            process_offset, "running prefill forward pass on tokens",
+        );
         let logits = self.model.forward(&input, process_offset)?;
 
         // Store to cache if enabled and not already cached
@@ -264,6 +277,12 @@ impl<T: ModelImpl> InferenceEngine<T> {
         let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
         let logits = self.process_logits(logits, tokens)?;
         let next_token = self.sampler.sample(&logits)?;
+        trace!(
+            next_token,
+            cache_hit,
+            cached_tokens = cached_len,
+            "prefill sampled first token"
+        );
 
         Ok((next_token, start.elapsed(), cache_hit, cached_len))
     }
@@ -276,11 +295,17 @@ impl<T: ModelImpl> InferenceEngine<T> {
         let ctxt = &tokens[pos..];
 
         let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
+        trace!(
+            tokens = ctxt.len(),
+            start_pos, "decoding next token from context",
+        );
         let logits = self.model.forward(&input, start_pos)?;
         let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
         let logits = self.process_logits(logits, tokens)?;
 
-        self.sampler.sample(&logits)
+        let next_token = self.sampler.sample(&logits)?;
+        trace!(next_token, "decode step sampled token");
+        Ok(next_token)
     }
 
     /// Run separated inference: prefill + decode with detailed stats
