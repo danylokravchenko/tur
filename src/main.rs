@@ -216,9 +216,14 @@ fn main() -> Result<()> {
         dtype,
     );
 
-    // Build inference engine with all parameters
+    // Build inference engine with all parameters.
+    // on_token streams each decoded token; here we route it through ProgressReporter so
+    // text is printed above the progress bar. Replace this closure to send tokens
+    // elsewhere (e.g. an HTTP stream, a channel, a file).
+    let progress_for_tokens = progress.clone();
     let mut pipeline_builder = TextGeneration::builder(&factory, device.clone())
         .progress(progress.clone())
+        .on_token(move |t| progress_for_tokens.print(t))
         .seed(args.seed)
         .repeat_penalty(args.repeat_penalty)
         .repeat_last_n(args.repeat_last_n);

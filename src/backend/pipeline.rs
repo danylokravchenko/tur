@@ -70,7 +70,7 @@ pub struct TextGeneration<T: ModelConstructor> {
     engine: InferenceEngine<T>,
     tokenizer: TokenOutputStream,
     progress: Option<ProgressReporter>,
-    emit_output: bool,
+    on_token: Option<Box<dyn FnMut(&str)>>,
     batching: Option<BatchingComponents>,
     results: Arc<RwLock<HashMap<Uuid, GenerationResult>>>,
     /// Insertion-order tracking for bounded eviction of `results`.
@@ -88,7 +88,7 @@ pub struct TextGenerationBuilder<'a, T: ModelConstructor> {
     repeat_penalty: f32,
     repeat_last_n: usize,
     progress: Option<ProgressReporter>,
-    emit_output: bool,
+    on_token: Option<Box<dyn FnMut(&str)>>,
     prefix_cache: Option<super::prefix_cache::SharedPrefixCache>,
     // Batching configuration
     enable_batching: bool,
@@ -110,7 +110,7 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             repeat_penalty: 1.0,
             repeat_last_n: 64,
             progress: None,
-            emit_output: true,
+            on_token: None,
             prefix_cache: None,
             enable_batching: false,
             max_batch_size: 16,
@@ -151,8 +151,8 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
         self
     }
 
-    pub fn emit_output(mut self, emit: bool) -> Self {
-        self.emit_output = emit;
+    pub fn on_token<F: FnMut(&str) + 'static>(mut self, callback: F) -> Self {
+        self.on_token = Some(Box::new(callback));
         self
     }
 
@@ -210,7 +210,7 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             top_p = ?self.top_p,
             repeat_penalty = self.repeat_penalty,
             repeat_last_n = self.repeat_last_n,
-            emit_output = self.emit_output,
+            has_on_token = self.on_token.is_some(),
             has_prefix_cache = self.prefix_cache.is_some(),
             enable_batching = self.enable_batching,
             max_batch_size = self.max_batch_size,
@@ -321,7 +321,7 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             engine,
             tokenizer: TokenOutputStream::new(tokenizer),
             progress: self.progress,
-            emit_output: self.emit_output,
+            on_token: self.on_token,
             batching,
             results: Arc::new(RwLock::new(HashMap::new())),
             result_order: VecDeque::new(),
@@ -402,12 +402,8 @@ impl<T: ModelConstructor> TextGeneration<T> {
                 text_chars = t.chars().count(),
                 "Decoded first token into text chunk",
             );
-            if let Some(ref progress) = self.progress {
-                progress.print(&t);
-            } else if self.emit_output {
-                use std::io::Write;
-                print!("{t}");
-                std::io::stdout().flush()?;
+            if let Some(ref mut on_token) = self.on_token {
+                on_token(&t);
             }
         }
 
@@ -442,12 +438,8 @@ impl<T: ModelConstructor> TextGeneration<T> {
                     text_chars = t.chars().count(),
                     "Decoded token into text chunk",
                 );
-                if let Some(ref progress) = self.progress {
-                    progress.print(&t);
-                } else if self.emit_output {
-                    use std::io::Write;
-                    print!("{t}");
-                    std::io::stdout().flush()?;
+                if let Some(ref mut on_token) = self.on_token {
+                    on_token(&t);
                 }
             }
         }
@@ -462,18 +454,13 @@ impl<T: ModelConstructor> TextGeneration<T> {
                 text_chars = rest.chars().count(),
                 "Flushed remaining decoded text",
             );
-            if let Some(ref progress) = self.progress {
-                progress.print(&rest);
-            } else if self.emit_output {
-                print!("{rest}");
+            if let Some(ref mut on_token) = self.on_token {
+                on_token(&rest);
             }
         }
 
         if let Some(ref progress) = self.progress {
             progress.flush_text();
-        } else if self.emit_output {
-            use std::io::Write;
-            std::io::stdout().flush()?;
         }
 
         trace!(
