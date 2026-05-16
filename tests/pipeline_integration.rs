@@ -250,6 +250,7 @@ fn test_prefix_cache_with_pipeline() {
 
 #[test]
 fn test_continuous_batching_basic() {
+    tur::shared::init_tracing();
     // Test basic continuous batching setup and usage
     let (factory, device, _) = create_test_factory();
 

@@ -1,10 +1,6 @@
 use candle_core::{DType, Device};
 use clap::Parser;
-use tracing::level_filters::LevelFilter;
 use tracing::{debug, info, trace};
-use tracing_subscriber::layer::SubscriberExt as _;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer, fmt};
 use tur::backend::pipeline::GenerationRequest;
 use tur::{ProgressReporter, Result, TextGeneration, TurError};
 
@@ -78,29 +74,6 @@ fn print_bunner() {
         }
         println!("{reset}");
     }
-}
-
-fn init_tracing() {
-    let registry = tracing_subscriber::registry();
-
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(LevelFilter::DEBUG.to_string()))
-        .add_directive("ureq=error".parse().unwrap())
-        .add_directive("tokenizers=error".parse().unwrap())
-        .add_directive("rustls=error".parse().unwrap());
-
-    let console_layer = fmt::layer()
-        .compact()
-        .with_file(false)
-        .with_line_number(false)
-        .with_thread_names(true)
-        .with_thread_ids(true)
-        .with_target(true)
-        .with_filter(env_filter.clone());
-
-    let subscriber = registry.with(console_layer);
-
-    subscriber.try_init().unwrap();
 }
 
 #[derive(Debug, Parser)]
@@ -188,7 +161,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    init_tracing();
+    tur::shared::init_tracing();
     let args = Args::parse();
     print_bunner();
 

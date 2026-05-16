@@ -203,7 +203,7 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             max_prefill_batch = self.max_prefill_batch,
             max_decode_batch = self.max_decode_batch,
             scheduling_policy = ?self.scheduling_policy,
-            "building text generation pipeline with configuration"
+            "Building text generation pipeline with configuration"
         );
 
         let mut engine_builder = InferenceEngine::builder(self.factory, self.device.clone())
@@ -252,7 +252,7 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
                 memory_pool_size_bytes,
                 max_prefill_tokens,
                 max_decode_tokens,
-                "initializing continuous batching components"
+                "Initializing continuous batching components"
             );
 
             let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(
@@ -297,11 +297,11 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
                 Some(block_allocator.clone()),
             )
         } else {
-            debug!("batching disabled, using single-request mode");
+            debug!("Batching disabled, using single-request mode");
             (None, None, None)
         };
 
-        debug!("text generation pipeline built successfully");
+        debug!("Text generation pipeline built successfully");
 
         TextGeneration {
             engine,
@@ -338,7 +338,7 @@ impl<T: ModelConstructor> TextGeneration<T> {
             request_id = %request.id,
             prompt_chars = request.prompt.chars().count(),
             sample_len,
-            "starting text generation request",
+            "Starting text generation request",
         );
         let mut tokens = self
             .tokenizer
@@ -350,7 +350,7 @@ impl<T: ModelConstructor> TextGeneration<T> {
         trace!(
             request_id = %request.id,
             prompt_tokens = tokens.len(),
-            "prompt encoded into tokens",
+            "Prompt encoded into tokens",
         );
 
         // Initialize generation progress bar
@@ -370,7 +370,7 @@ impl<T: ModelConstructor> TextGeneration<T> {
             first_token,
             cache_hit,
             cached_tokens,
-            "engine prefetched prompt and produced first token",
+            "Engine prefetched prompt and produced first token",
         );
         tokens.push(first_token);
         generated_tokens += 1;
@@ -386,7 +386,7 @@ impl<T: ModelConstructor> TextGeneration<T> {
             trace!(
                 request_id = %request.id,
                 text_chars = t.chars().count(),
-                "decoded first token into text chunk",
+                "Decoded first token into text chunk",
             );
             if let Some(ref progress) = self.progress {
                 progress.print(&t);
@@ -418,7 +418,7 @@ impl<T: ModelConstructor> TextGeneration<T> {
                     request_id = %request.id,
                     next_token,
                     generated_tokens,
-                    "decode loop reached EOS token",
+                    "Decode loop reached EOS token",
                 );
                 break;
             }
@@ -427,7 +427,7 @@ impl<T: ModelConstructor> TextGeneration<T> {
                     request_id = %request.id,
                     next_token,
                     text_chars = t.chars().count(),
-                    "decoded token into text chunk",
+                    "Decoded token into text chunk",
                 );
                 if let Some(ref progress) = self.progress {
                     progress.print(&t);
@@ -447,7 +447,7 @@ impl<T: ModelConstructor> TextGeneration<T> {
             trace!(
                 request_id = %request.id,
                 text_chars = rest.chars().count(),
-                "flushed remaining decoded text",
+                "Flushed remaining decoded text",
             );
             if let Some(ref progress) = self.progress {
                 progress.print(&rest);
@@ -468,7 +468,7 @@ impl<T: ModelConstructor> TextGeneration<T> {
             request_id = %request.id,
             generated_tokens,
             elapsed_ms = dt.as_secs_f64() * 1000.0,
-            "generation request completed",
+            "Generation request completed",
         );
 
         // Finish generation progress bar
@@ -517,7 +517,7 @@ impl<T: ModelConstructor> TextGeneration<T> {
             request_id = %request.id,
             prompt_tokens = tokens.len(),
             sample_len = request.sample_len,
-            "submitting request to scheduler"
+            "Submitting request to scheduler"
         );
 
         // Create request state
@@ -575,7 +575,7 @@ impl<T: ModelConstructor> TextGeneration<T> {
                 trace!(
                     request_id = %request_id,
                     generated_tokens = tokens.len(),
-                    "request completed"
+                    "Request completed"
                 );
             }
         }

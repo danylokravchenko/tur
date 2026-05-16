@@ -119,7 +119,7 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
             repeat_last_n = self.repeat_last_n,
             prefix_cache = ?self.prefix_cache,
             has_custom_sampler = self.sampler.is_some(),
-            "building inference engine with configuration"
+            "Building inference engine with configuration"
         );
 
         // Create model using factory
@@ -132,7 +132,7 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
         };
         debug!(
             model_name = model.name(),
-            "created inference engine for model",
+            "Created inference engine for model",
         );
         let engine = InferenceEngine {
             model,
@@ -262,7 +262,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         cache.insert(entry);
         trace!(
             tokens = tokens.len(),
-            "stored prompt tokens in prefix cache",
+            "Stored prompt tokens in prefix cache",
         );
 
         Ok(())
@@ -294,7 +294,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         let input = Tensor::new(process_tokens, &self.device)?.unsqueeze(0)?;
         trace!(
             processed_tokens = process_tokens.len(),
-            process_offset, "running prefill forward pass on tokens",
+            process_offset, "Running prefill forward pass on tokens",
         );
         let logits = self.model.forward(&input, process_offset)?;
 
@@ -310,7 +310,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
             next_token,
             cache_hit,
             cached_tokens = cached_len,
-            "prefill sampled first token"
+            "Prefill sampled first token"
         );
 
         Ok((next_token, start.elapsed(), cache_hit, cached_len))
@@ -326,14 +326,14 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
         trace!(
             tokens = ctxt.len(),
-            start_pos, "decoding next token from context",
+            start_pos, "Decoding next token from context",
         );
         let logits = self.model.forward(&input, start_pos)?;
         let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
         let logits = self.process_logits(logits, tokens)?;
 
         let next_token = self.sampler.sample(&logits)?;
-        trace!(next_token, "decode step sampled token");
+        trace!(next_token, "Decode step sampled token");
         Ok(next_token)
     }
 
@@ -421,7 +421,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         }
 
         let input = Tensor::from_vec(input_data, (batch_size, max_len), &self.device)?;
-        trace!(batch_size, max_len, "running batched prefill forward pass");
+        trace!(batch_size, max_len, "Running batched prefill forward pass");
 
         let logits = self.model.forward_batch(&input, &positions)?;
 
@@ -437,7 +437,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
             let processed_logits = self.process_logits(request_logits, tokens)?;
             let next_token = self.sampler.sample(&processed_logits)?;
             results.push((*id, next_token));
-            trace!(request_id = ?id, next_token, "batched prefill sampled token");
+            trace!(request_id = ?id, next_token, "Batched prefill sampled token");
         }
 
         Ok(results)
@@ -465,7 +465,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         }
 
         let input = Tensor::from_vec(input_data, (batch_size, 1), &self.device)?;
-        trace!(batch_size, "running batched decode forward pass");
+        trace!(batch_size, "Running batched decode forward pass");
 
         let logits = self.model.forward_batch(&input, &positions)?;
 
@@ -481,7 +481,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
             let processed_logits = self.process_logits(request_logits, tokens)?;
             let next_token = self.sampler.sample(&processed_logits)?;
             results.push((*id, next_token));
-            trace!(request_id = ?id, next_token, "batched decode sampled token");
+            trace!(request_id = ?id, next_token, "Batched decode sampled token");
         }
 
         Ok(results)
@@ -496,14 +496,14 @@ impl<T: ModelConstructor> InferenceEngine<T> {
     ) -> Result<()> {
         // 1. Admit new requests from queue
         let admitted = scheduler.admit_requests()?;
-        trace!(admitted_count = admitted.len(), "admitted new requests");
+        trace!(admitted_count = admitted.len(), "Admitted new requests");
 
         // 2. Form and execute prefill batch
         if let Some(prefill_batch) = scheduler.form_prefill_batch() {
             trace!(
                 batch_size = prefill_batch.request_ids.len(),
                 total_tokens = prefill_batch.total_tokens,
-                "executing prefill batch"
+                "Executing prefill batch"
             );
 
             // Gather tokens for each request
@@ -532,7 +532,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
             trace!(
                 batch_size = decode_batch.request_ids.len(),
                 total_tokens = decode_batch.total_tokens,
-                "executing decode batch"
+                "Executing decode batch"
             );
 
             // Gather data for each request
@@ -568,7 +568,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
             // Complete finished requests
             for id in to_complete {
                 scheduler.complete_request(&id)?;
-                trace!(request_id = ?id, "completed request");
+                trace!(request_id = ?id, "Completed request");
             }
         }
 

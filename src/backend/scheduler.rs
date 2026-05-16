@@ -17,6 +17,7 @@ use crate::{
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
+use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 /// Scheduling policy for request admission
@@ -87,6 +88,14 @@ impl ContinuousBatchScheduler {
         memory_pool: Arc<RwLock<MemoryPool>>,
         tokenizer: Arc<Tokenizer>,
     ) -> Self {
+        debug!(
+            policy = ?policy,
+            max_prefill_batch = config.max_prefill_batch,
+            max_decode_batch = config.max_decode_batch,
+            max_prefill_tokens = config.max_prefill_tokens,
+            max_decode_tokens = config.max_decode_tokens,
+            "Creating continuous batch scheduler"
+        );
         Self {
             batch_manager: BatchManager::new(config.max_prefill_batch, config.max_decode_batch),
             policy,
@@ -133,14 +142,26 @@ impl ContinuousBatchScheduler {
                 if let Some(request) = self.batch_manager.admit_request() {
                     // Track allocated blocks for this request
                     self.allocated_blocks.insert(request.id, required_blocks);
+                    trace!(
+                        request_id = %request.id,
+                        required_blocks,
+                        "Allocated memory blocks for request"
+                    );
                     admitted.push(request.id);
                 } else {
                     break;
                 }
             } else {
-                // No more memory available
+                warn!("Memory exhausted, cannot admit more requests");
                 break;
             }
+        }
+
+        if !admitted.is_empty() {
+            debug!(
+                admitted_count = admitted.len(),
+                "Admitted requests to scheduler"
+            );
         }
 
         Ok(admitted)
@@ -159,6 +180,11 @@ impl ContinuousBatchScheduler {
                 total_tokens += request.seq_len();
             }
         }
+
+        trace!(
+            batch_size = prefill_ids.len(),
+            total_tokens, "formed prefill batch"
+        );
 
         Some(ExecutionBatch {
             request_ids: prefill_ids,
@@ -180,6 +206,11 @@ impl ContinuousBatchScheduler {
                 total_tokens += request.seq_len();
             }
         }
+
+        trace!(
+            batch_size = decode_ids.len(),
+            total_tokens, "formed decode batch"
+        );
 
         Some(ExecutionBatch {
             request_ids: decode_ids,
@@ -205,6 +236,11 @@ impl ContinuousBatchScheduler {
         if blocks_to_free > 0 {
             let mut pool = self.memory_pool.write();
             pool.free(blocks_to_free);
+            trace!(
+                request_id = %request_id,
+                freed_blocks = blocks_to_free,
+                "freed memory blocks for completed request"
+            );
         }
 
         Ok(tokens)
@@ -222,6 +258,11 @@ impl ContinuousBatchScheduler {
         if blocks_to_free > 0 {
             let mut pool = self.memory_pool.write();
             pool.free(blocks_to_free);
+            trace!(
+                request_id = %request_id,
+                freed_blocks = blocks_to_free,
+                "freed memory blocks for failed request"
+            );
         }
 
         Ok(())
@@ -289,7 +330,7 @@ impl ContinuousBatchScheduler {
         &mut self,
         engine: &mut crate::backend::engine::InferenceEngine<T>,
     ) -> Result<Vec<(Uuid, Vec<u32>)>> {
-        use tracing::debug;
+        trace!("Starting scheduler iteration");
 
         // 1. Admit new requests from queue
         let admitted = self.admit_requests()?;

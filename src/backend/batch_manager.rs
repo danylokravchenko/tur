@@ -7,6 +7,7 @@ use crate::{Result, TurError, models::kv_cache::BlockId};
 use ahash::AHashMap;
 use std::collections::VecDeque;
 use std::time::Instant;
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 /// Phase of request execution
@@ -117,6 +118,10 @@ pub struct BatchManager {
 impl BatchManager {
     /// Create a new batch manager
     pub fn new(max_prefill_batch: usize, max_decode_batch: usize) -> Self {
+        debug!(
+            max_prefill_batch,
+            max_decode_batch, "Creating batch manager"
+        );
         Self {
             active_requests: AHashMap::new(),
             request_queue: VecDeque::new(),
@@ -128,6 +133,14 @@ impl BatchManager {
 
     /// Enqueue a new request
     pub fn enqueue_request(&mut self, request: RequestState) {
+        trace!(
+            request_id = %request.id,
+            prompt_tokens = request.prompt_tokens.len(),
+            max_tokens = request.max_tokens,
+            priority = request.priority,
+            queue_size = self.request_queue.len() + 1,
+            "enqueuing request"
+        );
         self.request_queue.push_back(request);
     }
 
@@ -141,6 +154,13 @@ impl BatchManager {
         if let Some(mut request) = self.request_queue.pop_front() {
             request.phase = RequestPhase::Prefilling;
             let id = request.id;
+            debug!(
+                request_id = %id,
+                prompt_tokens = request.prompt_tokens.len(),
+                active_requests = self.active_requests.len() + 1,
+                queued_requests = self.request_queue.len(),
+                "Admitted request to active set"
+            );
             self.active_requests.insert(id, request.clone());
             Some(request)
         } else {
@@ -178,18 +198,38 @@ impl BatchManager {
 
     /// Form a prefill batch (up to max_prefill_batch requests)
     pub fn form_prefill_batch(&self) -> Vec<Uuid> {
-        self.get_prefill_requests()
+        let batch: Vec<Uuid> = self
+            .get_prefill_requests()
             .into_iter()
             .take(self.max_prefill_batch)
-            .collect()
+            .collect();
+
+        if !batch.is_empty() {
+            trace!(
+                batch_size = batch.len(),
+                max_batch_size = self.max_prefill_batch,
+                "formed prefill batch"
+            );
+        }
+        batch
     }
 
     /// Form a decode batch (up to max_decode_batch requests)
     pub fn form_decode_batch(&self) -> Vec<Uuid> {
-        self.get_decode_requests()
+        let batch: Vec<Uuid> = self
+            .get_decode_requests()
             .into_iter()
             .take(self.max_decode_batch)
-            .collect()
+            .collect();
+
+        if !batch.is_empty() {
+            trace!(
+                batch_size = batch.len(),
+                max_batch_size = self.max_decode_batch,
+                "formed decode batch"
+            );
+        }
+        batch
     }
 
     /// Transition request from prefill to decode phase
@@ -202,6 +242,11 @@ impl BatchManager {
                 )));
             }
             request.phase = RequestPhase::Decoding;
+            trace!(
+                request_id = %id,
+                generated_tokens = request.generated_tokens.len(),
+                "transitioned request to decode phase"
+            );
             Ok(())
         } else {
             Err(TurError::RequestNotFound(id.to_string()))
@@ -213,6 +258,15 @@ impl BatchManager {
         if let Some(mut request) = self.active_requests.remove(id) {
             request.phase = RequestPhase::Completed;
             let tokens = request.all_tokens();
+            let elapsed = request.elapsed();
+            debug!(
+                request_id = %id,
+                generated_tokens = request.generated_tokens.len(),
+                total_tokens = tokens.len(),
+                elapsed_ms = elapsed.as_millis(),
+                active_requests = self.active_requests.len(),
+                "Completed request"
+            );
             self.completed_requests.insert(*id, tokens.clone());
             Ok(tokens)
         } else {
@@ -221,9 +275,15 @@ impl BatchManager {
     }
 
     /// Mark request as failed
-    pub fn fail_request(&mut self, id: &Uuid, _error: String) -> Result<()> {
+    pub fn fail_request(&mut self, id: &Uuid, error: String) -> Result<()> {
         if let Some(request) = self.active_requests.get_mut(id) {
             request.phase = RequestPhase::Failed;
+            debug!(
+                request_id = %id,
+                error = %error,
+                phase = ?request.phase,
+                "Marked request as failed"
+            );
             Ok(())
         } else {
             Err(TurError::RequestNotFound(id.to_string()))

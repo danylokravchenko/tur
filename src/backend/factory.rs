@@ -222,9 +222,9 @@ impl<T: ModelConstructor> ModelFactory<T> {
         let model = T::new_with_progress(config, vb, progress)?;
 
         if gguf {
-            debug!("✓ Loaded quantized model (GGUF format)");
+            debug!("Loaded quantized model (GGUF format)");
         } else {
-            debug!("✓ Loaded full-precision model");
+            debug!("Loaded full-precision model");
         }
 
         trace!("Model instantiated successfully");
