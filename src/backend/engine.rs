@@ -13,7 +13,7 @@ use crate::{
         prefix_cache::{PrefixCache, PrefixCacheEntry, SharedPrefixCache},
         tokenizer::{LogitsSampler, TokenOutputStream},
     },
-    models::{ModelImpl, kv_cache::PagedKvCache},
+    models::{ModelImpl, kv_cache::{KvCacheImpl, PagedKvCache}},
 };
 
 /// Core inference engine without output handling
@@ -268,6 +268,100 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         Ok(())
     }
 
+    /// Try to restore a prefix cache hit into per-layer paged KV caches.
+    ///
+    /// Mirrors `try_restore_from_cache` but writes the cached K/V tensors directly
+    /// into the request's `PagedKvCache` layers via `set_state`, which resets each
+    /// layer and re-populates it via `PagedKvCache::append`.  The same full-hit
+    /// trimming logic applies: if the cached entry covers all N prompt tokens we
+    /// trim it to N-1 so the final token is re-processed against the correct history.
+    ///
+    /// Returns (cache_hit, cached_token_count).
+    fn try_restore_paged(
+        &mut self,
+        tokens: &[u32],
+        req_caches: &mut Vec<PagedKvCache>,
+    ) -> Result<(bool, usize)> {
+        let Some(cache) = &self.prefix_cache else { return Ok((false, 0)) };
+        let mut cache = cache.write();
+
+        let Some((key, match_len)) = cache.find_longest_prefix(tokens) else {
+            cache.record_miss();
+            return Ok((false, 0));
+        };
+
+        let entry = match cache.get(key) {
+            Some(e) => e,
+            None => {
+                cache.record_miss();
+                return Ok((false, 0));
+            }
+        };
+
+        if !entry.is_compatible(&self.device, self.model.dtype()) {
+            cache.record_miss();
+            return Ok((false, 0));
+        }
+
+        if entry.kv_states.len() != req_caches.len() {
+            // Layer count mismatch — cached entry is stale; treat as miss.
+            cache.record_miss();
+            return Ok((false, 0));
+        }
+
+        // Full hit: trim last K/V entry to avoid duplicating position N-1.
+        let (states, effective_len) = if match_len == tokens.len() {
+            if match_len == 1 {
+                cache.record_miss();
+                return Ok((false, 0));
+            }
+            let trimmed = entry
+                .kv_states
+                .iter()
+                .map(|(k, v)| {
+                    let s = k.dim(2)?;
+                    candle_core::Result::Ok((k.narrow(2, 0, s - 1)?, v.narrow(2, 0, s - 1)?))
+                })
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            (trimmed, match_len - 1)
+        } else {
+            (entry.kv_states.clone(), match_len)
+        };
+
+        // Inject cached K/V into each layer's paged cache.
+        for (layer_cache, (k, v)) in req_caches.iter_mut().zip(states.iter()) {
+            layer_cache.set_state(k.clone(), v.clone())?;
+        }
+
+        cache.record_hit(effective_len);
+        Ok((true, effective_len))
+    }
+
+    /// Extract per-layer K/V state from paged caches and store in the prefix cache.
+    fn store_paged_to_cache(&mut self, tokens: &[u32], req_caches: &[PagedKvCache]) -> Result<()> {
+        let Some(cache) = &self.prefix_cache else { return Ok(()) };
+
+        let kv_states: Vec<(Tensor, Tensor)> = req_caches
+            .iter()
+            .filter_map(|c| c.get_state())
+            .collect();
+
+        // Only cache if every layer produced a state (partial state would be wrong).
+        if kv_states.len() != req_caches.len() || kv_states.is_empty() {
+            return Ok(());
+        }
+
+        let entry = PrefixCacheEntry::new(
+            tokens.to_vec(),
+            kv_states,
+            self.device.clone(),
+            self.model.dtype(),
+        );
+        cache.write().insert(entry);
+        trace!(tokens = tokens.len(), "Stored batched prompt tokens in prefix cache");
+        Ok(())
+    }
+
     /// Perform prefill: encode full prompt and get first token
     /// Returns (first_token, prefill_duration, cache_hit, cached_tokens)
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<(u32, std::time::Duration, bool, usize)> {
@@ -416,19 +510,36 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         if let Some(caches) = paged_caches {
             let mut results = Vec::with_capacity(batch_tokens.len());
             for ((id, tokens), req_caches) in batch_tokens.iter().zip(caches.iter_mut()) {
-                let input = Tensor::new(tokens.as_slice(), &self.device)?.unsqueeze(0)?;
-                let positions = [0usize];
+                // Attempt to restore a prefix cache hit into this request's paged caches.
+                // On a hit, req_caches are pre-populated with cached_len K/V entries and
+                // only the tail tokens[cached_len..] need a forward pass.
+                let (cache_hit, cached_len) = self.try_restore_paged(tokens, req_caches)?;
+
+                let process_tokens = &tokens[cached_len..];
+                let positions = [cached_len];
+                let input = Tensor::new(process_tokens, &self.device)?.unsqueeze(0)?;
                 let logits = self.model.forward_batch(
                     &input,
                     &positions,
                     Some(std::slice::from_mut(req_caches)),
                 )?;
+
+                if !cache_hit && self.prefix_cache.is_some() {
+                    self.store_paged_to_cache(tokens, req_caches)?;
+                }
+
                 // logits: [1, 1, vocab_size] — squeeze to [vocab_size]
                 let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
                 let logits = self.process_logits(logits, tokens)?;
                 let next_token = self.sampler.sample(&logits)?;
                 results.push((*id, next_token));
-                trace!(request_id = ?id, next_token, "Batched prefill sampled token");
+                trace!(
+                    request_id = ?id,
+                    next_token,
+                    cache_hit,
+                    cached_tokens = cached_len,
+                    "Batched prefill sampled token"
+                );
             }
             return Ok(results);
         }
