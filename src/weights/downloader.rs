@@ -2,11 +2,11 @@ use crate::{Result, TurError};
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::trace;
 
-// File name constants
 mod file_names {
     pub const TOKENIZER: &str = "tokenizer.json";
     pub const TOKENIZER_CONFIG: &str = "tokenizer_config.json";
@@ -17,14 +17,12 @@ mod file_names {
     pub const MODEL_SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
 }
 
-// File extension constants
 mod extensions {
     pub const SAFETENSORS: &str = ".safetensors";
     pub const GGUF: &str = ".gguf";
     pub const INDEX_JSON: &str = ".index.json";
 }
 
-// Repository constants
 mod repos {
     pub const DEFAULT_ORG: &str = "Qwen";
     pub const GGUF_ORG: &str = "unsloth";
@@ -32,7 +30,6 @@ mod repos {
     pub const DEFAULT_REVISION: &str = "main";
 }
 
-// Retry configuration constants
 mod retry {
     pub const MAX_RETRIES: u32 = 5;
     pub const BASE_DELAY_SECS: u64 = 5;
@@ -40,49 +37,53 @@ mod retry {
 
 #[derive(Debug, Clone)]
 pub struct Downloader {
-    pub model_id: Option<String>,
-    pub weight_path: Option<String>,
-    pub quantization: Option<String>,
+    model_id: Option<String>,
+    weight_path: Option<String>,
+    quantization: Option<String>,
 }
 
+/// Resolved paths to all files needed to load a model.
+///
+/// Optional files (`tokenizer_config_filename`, `generation_config_filename`,
+/// `chat_template_filename`) are `None` when the model doesn't provide them.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ModelPaths {
     pub tokenizer_filename: PathBuf,
-    pub tokenizer_config_filename: PathBuf,
+    pub tokenizer_config_filename: Option<PathBuf>,
     pub config_filename: PathBuf,
-    pub generation_config_filename: PathBuf,
+    pub generation_config_filename: Option<PathBuf>,
     pub filenames: Vec<PathBuf>,
     pub auxiliary_filenames: Vec<PathBuf>,
     pub chat_template_filename: Option<PathBuf>,
 }
 
 impl ModelPaths {
-    pub fn get_config_filename(&self) -> PathBuf {
-        self.config_filename.clone()
+    pub fn config_filename(&self) -> &Path {
+        &self.config_filename
     }
 
-    pub fn get_tokenizer_filename(&self) -> PathBuf {
-        self.tokenizer_filename.clone()
+    pub fn tokenizer_filename(&self) -> &Path {
+        &self.tokenizer_filename
     }
 
-    pub fn get_tokenizer_config_filename(&self) -> PathBuf {
-        self.tokenizer_config_filename.clone()
+    pub fn tokenizer_config_filename(&self) -> Option<&Path> {
+        self.tokenizer_config_filename.as_deref()
     }
 
-    pub fn get_weight_filenames(&self) -> Vec<PathBuf> {
-        self.filenames.clone()
+    pub fn weight_filenames(&self) -> &[PathBuf] {
+        &self.filenames
     }
 
-    pub fn get_auxiliary_filenames(&self) -> Vec<PathBuf> {
-        self.auxiliary_filenames.clone()
+    pub fn auxiliary_filenames(&self) -> &[PathBuf] {
+        &self.auxiliary_filenames
     }
 
-    pub fn get_generation_config_filename(&self) -> PathBuf {
-        self.generation_config_filename.clone()
+    pub fn generation_config_filename(&self) -> Option<&Path> {
+        self.generation_config_filename.as_deref()
     }
 
-    pub fn get_chat_template_filename(&self) -> Option<PathBuf> {
-        self.chat_template_filename.clone()
+    pub fn chat_template_filename(&self) -> Option<&Path> {
+        self.chat_template_filename.as_deref()
     }
 }
 
@@ -100,11 +101,7 @@ impl Downloader {
     }
 
     pub fn prepare_model_weights(&self) -> Result<(ModelPaths, bool)> {
-        let (paths, gguf): (ModelPaths, bool) = match (
-            &self.model_id,
-            &self.weight_path,
-            &self.quantization,
-        ) {
+        match (&self.model_id, &self.weight_path, &self.quantization) {
             (None, Some(path), None) => {
                 if !Path::new(path).is_dir() {
                     return Err(TurError::HfHub(
@@ -112,52 +109,43 @@ impl Downloader {
                     ));
                 }
 
-                let mut filenames = vec![];
-                let index_path = Path::new(path).join(file_names::MODEL_SAFETENSORS_INDEX);
-                if index_path.exists() {
-                    filenames = load_local_safetensors(path, file_names::MODEL_SAFETENSORS_INDEX)?;
+                let base = Path::new(path);
+                let filenames = if base.join(file_names::MODEL_SAFETENSORS_INDEX).exists() {
+                    load_local_safetensors(path)?
                 } else {
-                    filenames.push(Path::new(path).join(file_names::MODEL_SAFETENSORS));
-                }
+                    vec![base.join(file_names::MODEL_SAFETENSORS)]
+                };
 
-                (
-                    ModelPaths {
-                        tokenizer_filename: Path::new(path).join(file_names::TOKENIZER),
-                        tokenizer_config_filename: Path::new(path)
-                            .join(file_names::TOKENIZER_CONFIG),
-                        config_filename: Path::new(path).join(file_names::CONFIG),
-                        generation_config_filename: if Path::new(path)
-                            .join(file_names::GENERATION_CONFIG)
-                            .exists()
-                        {
-                            Path::new(path).join(file_names::GENERATION_CONFIG)
-                        } else {
-                            PathBuf::new()
-                        },
-                        filenames,
-                        auxiliary_filenames: Vec::new(),
-                        chat_template_filename: if Path::new(path)
-                            .join(file_names::CHAT_TEMPLATE)
-                            .exists()
-                        {
-                            Some(Path::new(path).join(file_names::CHAT_TEMPLATE))
-                        } else {
-                            None
-                        },
+                let paths = ModelPaths {
+                    tokenizer_filename: base.join(file_names::TOKENIZER),
+                    tokenizer_config_filename: Some(base.join(file_names::TOKENIZER_CONFIG)),
+                    config_filename: base.join(file_names::CONFIG),
+                    generation_config_filename: {
+                        let p = base.join(file_names::GENERATION_CONFIG);
+                        p.exists().then_some(p)
                     },
-                    false,
-                )
+                    filenames,
+                    auxiliary_filenames: Vec::new(),
+                    chat_template_filename: {
+                        let p = base.join(file_names::CHAT_TEMPLATE);
+                        p.exists().then_some(p)
+                    },
+                };
+                Ok((paths, false))
             }
-            (Some(_), None, Some(_)) => (self.download_gguf_model()?, true),
-            (Some(_), None, None) => (self.download_safetensors_model()?, false),
-            _ => {
-                return Err(TurError::HfHub(
-                    "Invalid configuration!\n***Tips***: \n \t For local model weights: --weight-path <path/to/folder>\n \t For remote SafeTensors: --model-id Qwen3-0.6B\n \t For remote GGUF: --model-id Qwen3-0.6B --quantization Q4_K_M".to_string(),
-                ));
-            }
-        };
+            (Some(_), None, Some(_)) => Ok((self.download_gguf_model()?, true)),
+            (Some(_), None, None) => Ok((self.download_safetensors_model()?, false)),
+            _ => Err(TurError::HfHub(
+                "Invalid configuration!\n***Tips***: \n \t For local model weights: --weight-path <path/to/folder>\n \t For remote SafeTensors: --model-id Qwen3-0.6B\n \t For remote GGUF: --model-id Qwen3-0.6B --quantization Q4_K_M".to_string(),
+            )),
+        }
+    }
 
-        Ok((paths, gguf))
+    fn build_api(&self) -> Result<hf_hub::api::sync::Api> {
+        Ok(ApiBuilder::new()
+            .with_progress(true)
+            .build()
+            .map_err(candle_core::Error::wrap)?)
     }
 
     fn hf_get_with_retry(
@@ -182,28 +170,18 @@ impl Downloader {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| {
-            TurError::HfHub(
-                format!(
-                    "Failed downloading {} after {} attempts",
-                    rfilename, retries
-                )
-                .to_string(),
-            )
-        }))
+        Err(last_err.expect("loop ran at least once since retries > 0"))
     }
 
     fn download_safetensors_model(&self) -> Result<ModelPaths> {
         let model_id = self.model_id.as_ref().unwrap();
-        let full_repo = resolve_model_repo(model_id)?;
+        let full_repo = resolve_model_repo(model_id);
 
         trace!("Downloading SafeTensors model from {}", full_repo);
 
-        let builder = ApiBuilder::new().with_progress(true);
-
-        let api = builder.build().map_err(candle_core::Error::wrap)?;
+        let api = self.build_api()?;
         let repo = api.repo(Repo::with_revision(
-            full_repo.clone(),
+            full_repo,
             RepoType::Model,
             repos::DEFAULT_REVISION.to_string(),
         ));
@@ -215,15 +193,8 @@ impl Downloader {
             .get(file_names::CONFIG)
             .map_err(candle_core::Error::wrap)?;
 
-        let tokenizer_config_filename = match repo.get(file_names::TOKENIZER_CONFIG) {
-            Ok(f) => f,
-            _ => PathBuf::new(),
-        };
-
-        let generation_config_filename = match repo.get(file_names::GENERATION_CONFIG) {
-            Ok(f) => f,
-            _ => PathBuf::new(),
-        };
+        let tokenizer_config_filename = repo.get(file_names::TOKENIZER_CONFIG).ok();
+        let generation_config_filename = repo.get(file_names::GENERATION_CONFIG).ok();
 
         let mut filenames = Vec::new();
         for rfilename in repo
@@ -233,7 +204,6 @@ impl Downloader {
             .iter()
             .map(|x| x.rfilename.clone())
             .filter(|x| {
-                // Include .safetensors files but exclude the index file
                 x.ends_with(extensions::SAFETENSORS) && !x.contains(extensions::INDEX_JSON)
             })
         {
@@ -263,8 +233,7 @@ impl Downloader {
         let model_id = self.model_id.as_ref().unwrap();
         let quantization = self.quantization.as_ref().unwrap();
 
-        // Resolve repos: config from main repo, weights from unsloth GGUF repo
-        let (config_repo, gguf_repo) = resolve_gguf_repos(model_id)?;
+        let (config_repo, gguf_repo) = resolve_gguf_repos(model_id);
         let gguf_filename = format!(
             "{}-{}{}",
             model_id.split('/').next_back().unwrap_or(model_id),
@@ -277,13 +246,10 @@ impl Downloader {
             config_repo, gguf_repo, gguf_filename
         );
 
-        let builder = ApiBuilder::new().with_progress(true);
+        let api = self.build_api()?;
 
-        let api = builder.build().map_err(candle_core::Error::wrap)?;
-
-        // Download config and tokenizer from main repo
         let config_repo_api = api.repo(Repo::with_revision(
-            config_repo.clone(),
+            config_repo,
             RepoType::Model,
             repos::DEFAULT_REVISION.to_string(),
         ));
@@ -291,26 +257,16 @@ impl Downloader {
         let tokenizer_filename = config_repo_api
             .get(file_names::TOKENIZER)
             .map_err(candle_core::Error::wrap)?;
-
         let config_filename = config_repo_api
             .get(file_names::CONFIG)
             .map_err(candle_core::Error::wrap)?;
 
-        let tokenizer_config_filename = match config_repo_api.get(file_names::TOKENIZER_CONFIG) {
-            Ok(f) => f,
-            _ => PathBuf::new(),
-        };
-
-        let generation_config_filename = match config_repo_api.get(file_names::GENERATION_CONFIG) {
-            Ok(f) => f,
-            _ => PathBuf::new(),
-        };
-
+        let tokenizer_config_filename = config_repo_api.get(file_names::TOKENIZER_CONFIG).ok();
+        let generation_config_filename = config_repo_api.get(file_names::GENERATION_CONFIG).ok();
         let chat_template_filename = config_repo_api.get(file_names::CHAT_TEMPLATE).ok();
 
-        // Download GGUF weight file from unsloth repo
         let gguf_repo_api = api.repo(Repo::with_revision(
-            gguf_repo.clone(),
+            gguf_repo,
             RepoType::Model,
             repos::DEFAULT_REVISION.to_string(),
         ));
@@ -335,8 +291,12 @@ impl Downloader {
     }
 }
 
-fn load_local_safetensors(path: &str, index_name: &str) -> Result<Vec<PathBuf>> {
-    let index_path = Path::new(path).join(index_name);
+/// Load shard filenames from a safetensors index file.
+///
+/// The index maps weight parameter names to shard filenames — we deduplicate
+/// and sort the shard filenames (many parameters share one shard).
+fn load_local_safetensors(path: &str) -> Result<Vec<PathBuf>> {
+    let index_path = Path::new(path).join(file_names::MODEL_SAFETENSORS_INDEX);
     let data = fs::read_to_string(&index_path).map_err(candle_core::Error::wrap)?;
     let value: Value = serde_json::from_str(&data).map_err(candle_core::Error::wrap)?;
     let weight_map = value
@@ -344,39 +304,41 @@ fn load_local_safetensors(path: &str, index_name: &str) -> Result<Vec<PathBuf>> 
         .and_then(|v| v.as_object())
         .ok_or_else(|| candle_core::Error::msg("safetensors index missing weight_map"))?;
 
-    let mut filenames: Vec<PathBuf> = weight_map
-        .keys()
-        .map(|filename| Path::new(path).join(filename))
+    // Keys are parameter names; values are shard filenames. Deduplicate via HashSet
+    // since many parameters share one shard file.
+    let mut dedup: HashSet<&str> = HashSet::new();
+    let mut shards: Vec<PathBuf> = weight_map
+        .values()
+        .filter_map(|v| v.as_str())
+        .filter(|s| dedup.insert(s))
+        .map(|s| Path::new(path).join(s))
         .collect();
-    filenames.sort();
-    Ok(filenames)
+    shards.sort();
+    Ok(shards)
 }
 
-/// Resolve a simplified model ID to full HuggingFace repo path
-/// Examples:
-///   - "Qwen3-0.6B" -> "Qwen/Qwen3-0.6B"
-///   - "Qwen/Qwen3-0.6B" -> "Qwen/Qwen3-0.6B" (already full)
-fn resolve_model_repo(model_id: &str) -> Result<String> {
+/// Resolve a simplified model ID to its full HuggingFace repo path.
+///
+/// - `"Qwen3-0.6B"` → `"Qwen/Qwen3-0.6B"`
+/// - `"Qwen/Qwen3-0.6B"` → `"Qwen/Qwen3-0.6B"` (already qualified)
+fn resolve_model_repo(model_id: &str) -> String {
     if model_id.contains('/') {
-        // Already a full repo path
-        Ok(model_id.to_string())
+        model_id.to_string()
     } else {
-        // Simplified name - assume Qwen org
-        Ok(format!("{}/{}", repos::DEFAULT_ORG, model_id))
+        format!("{}/{}", repos::DEFAULT_ORG, model_id)
     }
 }
 
-/// Resolve repos for GGUF downloads
-/// Returns (config_repo, gguf_repo)
-/// Examples:
-///   - "Qwen3-0.6B" -> ("Qwen/Qwen3-0.6B", "unsloth/Qwen3-0.6B-GGUF")
-///   - "Qwen/Qwen3-0.6B" -> ("Qwen/Qwen3-0.6B", "unsloth/Qwen3-0.6B-GGUF")
-fn resolve_gguf_repos(model_id: &str) -> Result<(String, String)> {
-    let config_repo = resolve_model_repo(model_id)?;
+/// Resolve the two repos needed for a GGUF download.
+///
+/// Returns `(config_repo, gguf_repo)`.
+///
+/// - `"Qwen3-0.6B"` → `("Qwen/Qwen3-0.6B", "unsloth/Qwen3-0.6B-GGUF")`
+fn resolve_gguf_repos(model_id: &str) -> (String, String) {
+    let config_repo = resolve_model_repo(model_id);
     let model_name = config_repo.split('/').next_back().unwrap_or(model_id);
     let gguf_repo = format!("{}/{}{}", repos::GGUF_ORG, model_name, repos::GGUF_SUFFIX);
-
-    Ok((config_repo, gguf_repo))
+    (config_repo, gguf_repo)
 }
 
 #[cfg(test)]
@@ -384,231 +346,146 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    #[test]
-    fn test_downloader_new() {
-        let downloader = Downloader::new(
-            Some("Qwen3-0.6B".to_string()),
-            None,
-            Some("Q4_K_M".to_string()),
-        );
-        assert_eq!(downloader.model_id, Some("Qwen3-0.6B".to_string()));
-        assert_eq!(downloader.weight_path, None);
-        assert_eq!(downloader.quantization, Some("Q4_K_M".to_string()));
-    }
-
-    #[test]
-    fn test_downloader_new_all_none() {
-        let downloader = Downloader::new(None, None, None);
-        assert_eq!(downloader.model_id, None);
-        assert_eq!(downloader.weight_path, None);
-        assert_eq!(downloader.quantization, None);
-    }
-
-    #[test]
-    fn test_downloader_new_with_weight_path() {
-        let downloader = Downloader::new(None, Some("/path/to/weights".to_string()), None);
-        assert_eq!(downloader.model_id, None);
-        assert_eq!(downloader.weight_path, Some("/path/to/weights".to_string()));
-        assert_eq!(downloader.quantization, None);
-    }
-
-    #[test]
-    fn test_model_paths_get_config_filename() {
-        let paths = ModelPaths {
+    fn make_paths() -> ModelPaths {
+        ModelPaths {
             tokenizer_filename: PathBuf::from("tokenizer.json"),
-            tokenizer_config_filename: PathBuf::from("tokenizer_config.json"),
+            tokenizer_config_filename: Some(PathBuf::from("tokenizer_config.json")),
             config_filename: PathBuf::from("config.json"),
-            generation_config_filename: PathBuf::from("generation_config.json"),
+            generation_config_filename: Some(PathBuf::from("generation_config.json")),
             filenames: vec![],
             auxiliary_filenames: vec![],
             chat_template_filename: None,
-        };
-        assert_eq!(paths.get_config_filename(), PathBuf::from("config.json"));
+        }
     }
 
     #[test]
-    fn test_model_paths_get_tokenizer_filename() {
-        let paths = ModelPaths {
-            tokenizer_filename: PathBuf::from("tokenizer.json"),
-            tokenizer_config_filename: PathBuf::from("tokenizer_config.json"),
-            config_filename: PathBuf::from("config.json"),
-            generation_config_filename: PathBuf::from("generation_config.json"),
-            filenames: vec![],
-            auxiliary_filenames: vec![],
-            chat_template_filename: None,
-        };
+    fn test_model_paths_config_filename() {
+        let paths = make_paths();
+        assert_eq!(paths.config_filename(), Path::new("config.json"));
+    }
+
+    #[test]
+    fn test_model_paths_tokenizer_filename() {
+        let paths = make_paths();
+        assert_eq!(paths.tokenizer_filename(), Path::new("tokenizer.json"));
+    }
+
+    #[test]
+    fn test_model_paths_tokenizer_config_filename() {
+        let paths = make_paths();
         assert_eq!(
-            paths.get_tokenizer_filename(),
-            PathBuf::from("tokenizer.json")
+            paths.tokenizer_config_filename(),
+            Some(Path::new("tokenizer_config.json"))
         );
     }
 
     #[test]
-    fn test_model_paths_get_tokenizer_config_filename() {
-        let paths = ModelPaths {
-            tokenizer_filename: PathBuf::from("tokenizer.json"),
-            tokenizer_config_filename: PathBuf::from("tokenizer_config.json"),
-            config_filename: PathBuf::from("config.json"),
-            generation_config_filename: PathBuf::from("generation_config.json"),
-            filenames: vec![],
-            auxiliary_filenames: vec![],
-            chat_template_filename: None,
-        };
-        assert_eq!(
-            paths.get_tokenizer_config_filename(),
-            PathBuf::from("tokenizer_config.json")
-        );
+    fn test_model_paths_tokenizer_config_filename_none() {
+        let mut paths = make_paths();
+        paths.tokenizer_config_filename = None;
+        assert_eq!(paths.tokenizer_config_filename(), None);
     }
 
     #[test]
-    fn test_model_paths_get_weight_filenames() {
+    fn test_model_paths_weight_filenames() {
         let weight_files = vec![
             PathBuf::from("model-00001.safetensors"),
             PathBuf::from("model-00002.safetensors"),
         ];
-        let paths = ModelPaths {
-            tokenizer_filename: PathBuf::from("tokenizer.json"),
-            tokenizer_config_filename: PathBuf::from("tokenizer_config.json"),
-            config_filename: PathBuf::from("config.json"),
-            generation_config_filename: PathBuf::from("generation_config.json"),
-            filenames: weight_files.clone(),
-            auxiliary_filenames: vec![],
-            chat_template_filename: None,
-        };
-        assert_eq!(paths.get_weight_filenames(), weight_files);
+        let mut paths = make_paths();
+        paths.filenames = weight_files.clone();
+        assert_eq!(paths.weight_filenames(), weight_files.as_slice());
     }
 
     #[test]
-    fn test_model_paths_get_auxiliary_filenames() {
+    fn test_model_paths_auxiliary_filenames() {
         let aux_files = vec![PathBuf::from("auxiliary.bin")];
-        let paths = ModelPaths {
-            tokenizer_filename: PathBuf::from("tokenizer.json"),
-            tokenizer_config_filename: PathBuf::from("tokenizer_config.json"),
-            config_filename: PathBuf::from("config.json"),
-            generation_config_filename: PathBuf::from("generation_config.json"),
-            filenames: vec![],
-            auxiliary_filenames: aux_files.clone(),
-            chat_template_filename: None,
-        };
-        assert_eq!(paths.get_auxiliary_filenames(), aux_files);
+        let mut paths = make_paths();
+        paths.auxiliary_filenames = aux_files.clone();
+        assert_eq!(paths.auxiliary_filenames(), aux_files.as_slice());
     }
 
     #[test]
-    fn test_model_paths_get_generation_config_filename() {
-        let paths = ModelPaths {
-            tokenizer_filename: PathBuf::from("tokenizer.json"),
-            tokenizer_config_filename: PathBuf::from("tokenizer_config.json"),
-            config_filename: PathBuf::from("config.json"),
-            generation_config_filename: PathBuf::from("generation_config.json"),
-            filenames: vec![],
-            auxiliary_filenames: vec![],
-            chat_template_filename: None,
-        };
+    fn test_model_paths_generation_config_filename() {
+        let paths = make_paths();
         assert_eq!(
-            paths.get_generation_config_filename(),
-            PathBuf::from("generation_config.json")
+            paths.generation_config_filename(),
+            Some(Path::new("generation_config.json"))
         );
     }
 
     #[test]
-    fn test_model_paths_get_chat_template_filename_some() {
-        let paths = ModelPaths {
-            tokenizer_filename: PathBuf::from("tokenizer.json"),
-            tokenizer_config_filename: PathBuf::from("tokenizer_config.json"),
-            config_filename: PathBuf::from("config.json"),
-            generation_config_filename: PathBuf::from("generation_config.json"),
-            filenames: vec![],
-            auxiliary_filenames: vec![],
-            chat_template_filename: Some(PathBuf::from("chat_template.json")),
-        };
+    fn test_model_paths_generation_config_filename_none() {
+        let mut paths = make_paths();
+        paths.generation_config_filename = None;
+        assert_eq!(paths.generation_config_filename(), None);
+    }
+
+    #[test]
+    fn test_model_paths_chat_template_filename_some() {
+        let mut paths = make_paths();
+        paths.chat_template_filename = Some(PathBuf::from("chat_template.json"));
         assert_eq!(
-            paths.get_chat_template_filename(),
-            Some(PathBuf::from("chat_template.json"))
+            paths.chat_template_filename(),
+            Some(Path::new("chat_template.json"))
         );
     }
 
     #[test]
-    fn test_model_paths_get_chat_template_filename_none() {
-        let paths = ModelPaths {
-            tokenizer_filename: PathBuf::from("tokenizer.json"),
-            tokenizer_config_filename: PathBuf::from("tokenizer_config.json"),
-            config_filename: PathBuf::from("config.json"),
-            generation_config_filename: PathBuf::from("generation_config.json"),
-            filenames: vec![],
-            auxiliary_filenames: vec![],
-            chat_template_filename: None,
-        };
-        assert_eq!(paths.get_chat_template_filename(), None);
+    fn test_model_paths_chat_template_filename_none() {
+        let paths = make_paths();
+        assert_eq!(paths.chat_template_filename(), None);
+    }
+
+    #[test]
+    fn test_model_paths_clone() {
+        let mut paths = make_paths();
+        paths.filenames = vec![PathBuf::from("model.safetensors")];
+        paths.chat_template_filename = Some(PathBuf::from("chat_template.json"));
+        let cloned = paths.clone();
+        assert_eq!(cloned.tokenizer_filename(), paths.tokenizer_filename());
+        assert_eq!(cloned.config_filename(), paths.config_filename());
+        assert_eq!(cloned.weight_filenames(), paths.weight_filenames());
+        assert_eq!(cloned.chat_template_filename(), paths.chat_template_filename());
     }
 
     #[test]
     fn test_resolve_model_repo_simple_name() {
-        let result = resolve_model_repo("Qwen3-0.6B").unwrap();
-        assert_eq!(result, "Qwen/Qwen3-0.6B");
+        assert_eq!(resolve_model_repo("Qwen3-0.6B"), "Qwen/Qwen3-0.6B");
     }
 
     #[test]
     fn test_resolve_model_repo_full_path() {
-        let result = resolve_model_repo("Qwen/Qwen3-0.6B").unwrap();
-        assert_eq!(result, "Qwen/Qwen3-0.6B");
+        assert_eq!(resolve_model_repo("Qwen/Qwen3-0.6B"), "Qwen/Qwen3-0.6B");
     }
 
     #[test]
     fn test_resolve_model_repo_custom_org() {
-        let result = resolve_model_repo("custom-org/model-name").unwrap();
-        assert_eq!(result, "custom-org/model-name");
+        assert_eq!(
+            resolve_model_repo("custom-org/model-name"),
+            "custom-org/model-name"
+        );
     }
 
     #[test]
     fn test_resolve_gguf_repos_simple_name() {
-        let (config_repo, gguf_repo) = resolve_gguf_repos("Qwen3-0.6B").unwrap();
+        let (config_repo, gguf_repo) = resolve_gguf_repos("Qwen3-0.6B");
         assert_eq!(config_repo, "Qwen/Qwen3-0.6B");
         assert_eq!(gguf_repo, "unsloth/Qwen3-0.6B-GGUF");
     }
 
     #[test]
     fn test_resolve_gguf_repos_full_path() {
-        let (config_repo, gguf_repo) = resolve_gguf_repos("Qwen/Qwen3-0.6B").unwrap();
+        let (config_repo, gguf_repo) = resolve_gguf_repos("Qwen/Qwen3-0.6B");
         assert_eq!(config_repo, "Qwen/Qwen3-0.6B");
         assert_eq!(gguf_repo, "unsloth/Qwen3-0.6B-GGUF");
     }
 
     #[test]
     fn test_resolve_gguf_repos_custom_org() {
-        let (config_repo, gguf_repo) = resolve_gguf_repos("custom-org/model-name").unwrap();
+        let (config_repo, gguf_repo) = resolve_gguf_repos("custom-org/model-name");
         assert_eq!(config_repo, "custom-org/model-name");
         assert_eq!(gguf_repo, "unsloth/model-name-GGUF");
-    }
-
-    #[test]
-    fn test_downloader_clone() {
-        let downloader = Downloader::new(
-            Some("Qwen3-0.6B".to_string()),
-            None,
-            Some("Q4_K_M".to_string()),
-        );
-        let cloned = downloader.clone();
-        assert_eq!(cloned.model_id, downloader.model_id);
-        assert_eq!(cloned.weight_path, downloader.weight_path);
-        assert_eq!(cloned.quantization, downloader.quantization);
-    }
-
-    #[test]
-    fn test_model_paths_clone() {
-        let paths = ModelPaths {
-            tokenizer_filename: PathBuf::from("tokenizer.json"),
-            tokenizer_config_filename: PathBuf::from("tokenizer_config.json"),
-            config_filename: PathBuf::from("config.json"),
-            generation_config_filename: PathBuf::from("generation_config.json"),
-            filenames: vec![PathBuf::from("model.safetensors")],
-            auxiliary_filenames: vec![],
-            chat_template_filename: Some(PathBuf::from("chat_template.json")),
-        };
-        let cloned = paths.clone();
-        assert_eq!(cloned.tokenizer_filename, paths.tokenizer_filename);
-        assert_eq!(cloned.config_filename, paths.config_filename);
-        assert_eq!(cloned.filenames, paths.filenames);
-        assert_eq!(cloned.chat_template_filename, paths.chat_template_filename);
     }
 
     #[test]

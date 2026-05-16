@@ -144,10 +144,10 @@ impl<T: ModelConstructor> ModelFactory<T> {
     fn load_tokenizer(&self, paths: &crate::weights::ModelPaths) -> Result<Tokenizer> {
         trace!("Step 3: Loading tokenizer");
 
-        let tokenizer_path = paths.get_tokenizer_filename();
+        let tokenizer_path = paths.tokenizer_filename();
         trace!(tokenizer_path = %tokenizer_path.display(), "Tokenizer path");
 
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| crate::TurError::Other(format!("Failed to load tokenizer: {}", e)))?;
 
         debug!(tokenizer_path = %tokenizer_path.display(), "Loaded tokenizer");
@@ -162,7 +162,7 @@ impl<T: ModelConstructor> ModelFactory<T> {
     ) -> Result<VarBuilderX<'static>> {
         trace!("Step 4: Creating VarBuilder for model weights");
 
-        let num_files = paths.get_weight_filenames().len();
+        let num_files = paths.weight_filenames().len();
 
         if gguf {
             debug!(num_files, "Loading GGUF quantized model");
@@ -207,10 +207,10 @@ impl ModelConstructor for crate::models::Qwen35ModelForCausalLM {
     fn load_config(paths: &crate::weights::ModelPaths) -> Result<Self::Config> {
         trace!("Loading Qwen3 model configuration");
 
-        let config_path = paths.get_config_filename();
+        let config_path = paths.config_filename();
         trace!(config_path = %config_path.display(), "Config file path");
 
-        let config_content = std::fs::read_to_string(&config_path)?;
+        let config_content = std::fs::read_to_string(config_path)?;
         // Single-pass parse: no intermediate serde_json::Value allocation
         let config: Self::Config = serde_json::from_str(&config_content)?;
 

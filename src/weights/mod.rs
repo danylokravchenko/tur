@@ -41,14 +41,14 @@ impl VarBuilderX<'_> {
         device: &Device,
     ) -> Result<Self> {
         assert!(
-            !model_pathes.get_weight_filenames().is_empty(),
+            !model_pathes.weight_filenames().is_empty(),
             "No weight files found!"
         );
-        let weight_files = model_pathes.get_weight_filenames();
+        let weight_files = model_pathes.weight_filenames();
         if is_gguf {
             let vb = QVarBuilder::from_gguf(weight_files[0].clone(), device)?;
             let auxiliary_vb = model_pathes
-                .get_auxiliary_filenames()
+                .auxiliary_filenames()
                 .first()
                 .map(|path| QVarBuilder::from_gguf(path, device))
                 .transpose()?
@@ -57,7 +57,7 @@ impl VarBuilderX<'_> {
         } else {
             let vb = unsafe {
                 candle_nn::var_builder::ShardedSafeTensors::var_builder(
-                    &weight_files,
+                    weight_files,
                     dtype,
                     device,
                 )?
