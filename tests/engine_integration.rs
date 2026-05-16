@@ -223,13 +223,19 @@ fn test_prefix_cache_single_request_correctness() {
     // Cold run: the cache is empty, no KV state is reused.
     let (token_cold, _, hit_cold, cached_cold) = engine.prefill(&tokens).unwrap();
     assert!(!hit_cold, "first prefill must be a cache miss");
-    assert_eq!(cached_cold, 0, "no tokens should be cached on the first run");
+    assert_eq!(
+        cached_cold, 0,
+        "no tokens should be cached on the first run"
+    );
 
     // Warm run: the engine restores the stored K/V state and re-processes only
     // the final token, so the output must be identical.
     let (token_warm, _, hit_warm, cached_warm) = engine.prefill(&tokens).unwrap();
     assert!(hit_warm, "second prefill must be a cache hit");
-    assert!(cached_warm > 0, "some tokens must be served from cache on second run");
+    assert!(
+        cached_warm > 0,
+        "some tokens must be served from cache on second run"
+    );
 
     assert_eq!(
         token_cold, token_warm,

@@ -1,3 +1,4 @@
+use candle_core::Device;
 use parking_lot::RwLock;
 use std::sync::{Arc, Mutex};
 use tur::ProgressReporter;
@@ -8,7 +9,24 @@ use tur::backend::prefix_cache::PrefixCache;
 use tur::backend::tokenizer::TokenOutputStream;
 
 mod common;
-use common::{build_guidance_factory, create_test_factory};
+use common::create_test_factory;
+
+/// Build a `ParserFactory` for guided-generation tests.
+///
+/// Loads the tokenizer via the engine builder (which also loads the model weights).
+/// Callers should pass the same `factory` to the pipeline builder afterwards; the
+/// model weights will be loaded a second time from the local HuggingFace cache,
+/// which is fast.
+fn build_guidance_factory(
+    factory: &tur::ModelFactory<tur::models::Qwen35ModelForCausalLM>,
+    device: Device,
+) -> Arc<tur::backend::guidance::ParserFactory> {
+    let (_, tokenizer) = InferenceEngine::builder(factory, device)
+        .build()
+        .expect("Failed to build engine to extract tokenizer");
+    tur::backend::guidance::build_llg_factory(tokenizer, None)
+        .expect("Failed to build guidance factory")
+}
 
 #[test]
 fn test_pipeline_end_to_end_generation() {
@@ -493,14 +511,16 @@ fn test_guided_regex_output_is_only_digits() {
         .on_token(move |s| output_clone.lock().unwrap().push_str(s))
         .build();
 
-    let request = GenerationRequest::new(
-        "Reply with one number only: ".to_string(),
-        20,
-    )
-    .with_grammar(TopLevelGrammar::from_regex(r"[0-9]+"));
+    let request = GenerationRequest::new("Reply with one number only: ".to_string(), 20)
+        .with_grammar(TopLevelGrammar::from_regex(r"[0-9]+"));
 
-    let stats = pipeline.run(&request).expect("Guided regex generation failed");
-    assert!(stats.generated_tokens > 0, "Should have generated at least one token");
+    let stats = pipeline
+        .run(&request)
+        .expect("Guided regex generation failed");
+    assert!(
+        stats.generated_tokens > 0,
+        "Should have generated at least one token"
+    );
 
     let generated = output.lock().unwrap().clone();
     assert!(
@@ -534,11 +554,12 @@ fn test_guided_json_schema_output_is_valid_json() {
     });
 
     // Give enough tokens for the grammar to close the JSON object.
-    let request =
-        GenerationRequest::new("Output JSON: ".to_string(), 60)
-            .with_grammar(TopLevelGrammar::from_json_schema(schema));
+    let request = GenerationRequest::new("Output JSON: ".to_string(), 60)
+        .with_grammar(TopLevelGrammar::from_json_schema(schema));
 
-    let stats = pipeline.run(&request).expect("Guided JSON generation failed");
+    let stats = pipeline
+        .run(&request)
+        .expect("Guided JSON generation failed");
     assert!(stats.generated_tokens > 0);
 
     let generated = output.lock().unwrap().clone();
@@ -577,5 +598,7 @@ fn test_guided_grammar_deactivates_between_requests() {
 
     // Second request — no grammar; must not inherit the previous constraint.
     let free = GenerationRequest::new("Say hello: ".to_string(), 10);
-    pipeline.run(&free).expect("Free request after grammar failed");
+    pipeline
+        .run(&free)
+        .expect("Free request after grammar failed");
 }

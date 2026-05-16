@@ -66,6 +66,8 @@ pub struct ExecutionBatch {
     pub total_tokens: usize,
 }
 
+type ScheduleIterationOutput = (Uuid, Vec<u32>, String, std::time::Instant);
+
 /// Continuous batch scheduler
 pub struct ContinuousBatchScheduler {
     batch_manager: BatchManager,
@@ -271,8 +273,7 @@ impl ContinuousBatchScheduler {
     ///
     /// * `FCFS`     — all priorities forced to 0, so insertion order is preserved.
     /// * `Priority` — the caller-supplied `request.priority` is used as-is.
-    /// * `SJF`      — shorter prompts receive a higher effective priority so they
-    ///                are admitted first.
+    /// * `SJF`      — shorter prompts receive a higher effective priority so they are admitted first.
     pub fn enqueue_request(&mut self, mut request: RequestState) {
         match self.policy {
             SchedulingPolicy::FCFS => {
@@ -574,7 +575,7 @@ impl ContinuousBatchScheduler {
     pub fn schedule_iteration<T: ModelConstructor>(
         &mut self,
         engine: &mut crate::backend::engine::InferenceEngine<T>,
-    ) -> Result<Vec<(Uuid, Vec<u32>, String, std::time::Instant)>> {
+    ) -> Result<Vec<ScheduleIterationOutput>> {
         trace!("Starting scheduler iteration");
 
         // 1. Admit new requests from queue

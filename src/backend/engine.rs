@@ -14,7 +14,10 @@ use crate::{
         prefix_cache::{PrefixCache, PrefixCacheEntry, SharedPrefixCache},
         tokenizer::{LogitsSampler, TokenOutputStream},
     },
-    models::{ModelImpl, kv_cache::{KvCacheImpl, PagedKvCache}},
+    models::{
+        ModelImpl,
+        kv_cache::{KvCacheImpl, PagedKvCache},
+    },
 };
 
 /// Core inference engine without output handling
@@ -361,9 +364,11 @@ impl<T: ModelConstructor> InferenceEngine<T> {
     fn try_restore_paged(
         &mut self,
         tokens: &[u32],
-        req_caches: &mut Vec<PagedKvCache>,
+        req_caches: &mut [PagedKvCache],
     ) -> Result<(bool, usize)> {
-        let Some(cache) = &self.prefix_cache else { return Ok((false, 0)) };
+        let Some(cache) = &self.prefix_cache else {
+            return Ok((false, 0));
+        };
         let mut cache = cache.write();
 
         let Some((key, match_len)) = cache.find_longest_prefix(tokens) else {
@@ -420,12 +425,12 @@ impl<T: ModelConstructor> InferenceEngine<T> {
 
     /// Extract per-layer K/V state from paged caches and store in the prefix cache.
     fn store_paged_to_cache(&mut self, tokens: &[u32], req_caches: &[PagedKvCache]) -> Result<()> {
-        let Some(cache) = &self.prefix_cache else { return Ok(()) };
+        let Some(cache) = &self.prefix_cache else {
+            return Ok(());
+        };
 
-        let kv_states: Vec<(Tensor, Tensor)> = req_caches
-            .iter()
-            .filter_map(|c| c.get_state())
-            .collect();
+        let kv_states: Vec<(Tensor, Tensor)> =
+            req_caches.iter().filter_map(|c| c.get_state()).collect();
 
         // Only cache if every layer produced a state (partial state would be wrong).
         if kv_states.len() != req_caches.len() || kv_states.is_empty() {
@@ -439,7 +444,10 @@ impl<T: ModelConstructor> InferenceEngine<T> {
             self.model.dtype(),
         );
         cache.write().insert(entry);
-        trace!(tokens = tokens.len(), "Stored batched prompt tokens in prefix cache");
+        trace!(
+            tokens = tokens.len(),
+            "Stored batched prompt tokens in prefix cache"
+        );
         Ok(())
     }
 
@@ -724,7 +732,6 @@ impl<T: ModelConstructor> InferenceEngine<T> {
 
         Ok(results)
     }
-
 }
 
 /// Detailed statistics separating prefill and decode phases

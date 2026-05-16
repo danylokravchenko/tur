@@ -203,9 +203,7 @@ impl Downloader {
             .siblings
             .iter()
             .map(|x| x.rfilename.clone())
-            .filter(|x| {
-                x.ends_with(extensions::SAFETENSORS) && !x.contains(extensions::INDEX_JSON)
-            })
+            .filter(|x| x.ends_with(extensions::SAFETENSORS) && !x.contains(extensions::INDEX_JSON))
         {
             let filename = self.hf_get_with_retry(
                 &repo,
@@ -446,7 +444,10 @@ mod tests {
         assert_eq!(cloned.tokenizer_filename(), paths.tokenizer_filename());
         assert_eq!(cloned.config_filename(), paths.config_filename());
         assert_eq!(cloned.weight_filenames(), paths.weight_filenames());
-        assert_eq!(cloned.chat_template_filename(), paths.chat_template_filename());
+        assert_eq!(
+            cloned.chat_template_filename(),
+            paths.chat_template_filename()
+        );
     }
 
     #[test]

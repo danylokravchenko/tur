@@ -8,7 +8,6 @@ use ahash::AHashMap;
 use candle_core::{DType, Device, Tensor};
 use parking_lot::RwLock;
 use std::collections::VecDeque;
-use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
 
 /// Statistics for prefix cache operations
@@ -94,9 +93,7 @@ impl PrefixCache {
     }
 
     fn compute_key(&self, tokens: &[u32]) -> u64 {
-        let mut h = self.hasher_state.build_hasher();
-        tokens.hash(&mut h);
-        h.finish()
+        self.hasher_state.hash_one(tokens)
     }
 
     /// Find the longest cached prefix of `tokens`.
@@ -106,10 +103,10 @@ impl PrefixCache {
         for len in (1..=tokens.len().min(self.max_token_length)).rev() {
             let prefix = &tokens[..len];
             let key = self.compute_key(prefix);
-            if let Some(entry) = self.entries.get(&key) {
-                if entry.tokens == prefix {
-                    return Some((key, len));
-                }
+            if let Some(entry) = self.entries.get(&key)
+                && entry.tokens == prefix
+            {
+                return Some((key, len));
             }
         }
         None

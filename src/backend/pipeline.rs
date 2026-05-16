@@ -76,12 +76,14 @@ struct BatchingComponents {
     tokenizer: Arc<Tokenizer>,
 }
 
+pub type OnTokenFn = Box<dyn FnMut(&str)>;
+
 /// High-level text generation pipeline with output handling and continuous batching support
 pub struct TextGeneration<T: ModelConstructor> {
     engine: InferenceEngine<T>,
     tokenizer: TokenOutputStream,
     progress: Option<ProgressReporter>,
-    on_token: Option<Box<dyn FnMut(&str)>>,
+    on_token: Option<OnTokenFn>,
     batching: Option<BatchingComponents>,
     results: Arc<RwLock<HashMap<Uuid, GenerationResult>>>,
     /// Insertion-order tracking for bounded eviction of `results`.
@@ -99,7 +101,7 @@ pub struct TextGenerationBuilder<'a, T: ModelConstructor> {
     repeat_penalty: f32,
     repeat_last_n: usize,
     progress: Option<ProgressReporter>,
-    on_token: Option<Box<dyn FnMut(&str)>>,
+    on_token: Option<OnTokenFn>,
     prefix_cache: Option<super::prefix_cache::SharedPrefixCache>,
     guidance_factory: Option<Arc<ParserFactory>>,
     // Batching configuration
@@ -582,16 +584,16 @@ impl<T: ModelConstructor> TextGeneration<T> {
             };
 
             // Evict oldest result when at capacity.
-            if self.result_order.len() >= self.max_results {
-                if let Some(oldest) = self.result_order.pop_front() {
-                    results.remove(&oldest);
-                    warn!(
-                        evicted_request_id = %oldest,
-                        max_results = self.max_results,
-                        "Results map at capacity; evicted oldest completed result. \
-                         Call clear_results() periodically to avoid this.",
-                    );
-                }
+            if self.result_order.len() >= self.max_results
+                && let Some(oldest) = self.result_order.pop_front()
+            {
+                results.remove(&oldest);
+                warn!(
+                    evicted_request_id = %oldest,
+                    max_results = self.max_results,
+                    "Results map at capacity; evicted oldest completed result. \
+                     Call clear_results() periodically to avoid this.",
+                );
             }
 
             results.insert(request_id, result);

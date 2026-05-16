@@ -1,16 +1,19 @@
 use candle_core::{DType, Device};
-use criterion::{BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main, measurement::WallTime};
+use criterion::{
+    BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+    measurement::WallTime,
+};
 use parking_lot::RwLock;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 use tur::ModelFactory;
 use tur::backend::InferenceEngine;
 use tur::backend::prefix_cache::PrefixCache;
 use tur::backend::tokenizer::TokenOutputStream;
 use tur::models::kv_cache::{BlockAllocator, PagedKvCache};
 use tur::models::{ModelImpl, Qwen35ModelForCausalLM};
+use uuid::Uuid;
 
 const MODEL_ID: &str = "Qwen3-0.6B";
 const QUANTIZATION: &str = "Q4_K_M";
@@ -114,7 +117,12 @@ fn format_prompt(prompt: &str) -> String {
     Qwen35ModelForCausalLM::format_prompt(prompt, false)
 }
 
-fn configure_group(group: &mut BenchmarkGroup<WallTime>, samples: usize, measure_secs: u64, warmup_secs: u64) {
+fn configure_group(
+    group: &mut BenchmarkGroup<WallTime>,
+    samples: usize,
+    measure_secs: u64,
+    warmup_secs: u64,
+) {
     group.sample_size(samples);
     group.measurement_time(Duration::from_secs(measure_secs));
     group.warm_up_time(Duration::from_secs(warmup_secs));
@@ -146,7 +154,11 @@ fn bench_prefill(c: &mut Criterion) {
             .expect("failed to get EOS tokens");
 
         let cold_start = Instant::now();
-        println!("Cold start for '{}': {:.2} ms", prompt_name, cold_start.elapsed().as_secs_f64() * 1000.0);
+        println!(
+            "Cold start for '{}': {:.2} ms",
+            prompt_name,
+            cold_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         // Warmup
         let warmup_tokens = encode_tokens(&ts, &prompt);
@@ -156,18 +168,22 @@ fn bench_prefill(c: &mut Criterion) {
         warmup_stats.report(&format!("{}_warmup", prompt_name));
         group.throughput(Throughput::Elements(warmup_stats.prompt_tokens as u64));
 
-        group.bench_with_input(BenchmarkId::new("prefill", prompt_name), &prompt, |b, prompt| {
-            b.iter_custom(|iters| {
-                let mut total = Duration::ZERO;
-                for _ in 0..iters {
-                    let tokens = encode_tokens(&ts, black_box(prompt.as_str()));
-                    let start = Instant::now();
-                    engine.prefill(&tokens).expect("prefill failed");
-                    total += start.elapsed();
-                }
-                total
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("prefill", prompt_name),
+            &prompt,
+            |b, prompt| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let tokens = encode_tokens(&ts, black_box(prompt.as_str()));
+                        let start = Instant::now();
+                        engine.prefill(&tokens).expect("prefill failed");
+                        total += start.elapsed();
+                    }
+                    total
+                });
+            },
+        );
     }
 
     group.finish();
@@ -189,19 +205,23 @@ fn bench_decode(c: &mut Criterion) {
             .expect("warmup failed");
         group.throughput(Throughput::Elements(warmup_stats.generated_tokens as u64));
 
-        group.bench_with_input(BenchmarkId::new("decode", prompt_name), &prompt, |b, prompt| {
-            b.iter_custom(|iters| {
-                let mut total = Duration::ZERO;
-                for _ in 0..iters {
-                    let tokens = encode_tokens(&ts, black_box(prompt.as_str()));
-                    let stats = engine
-                        .run_separated(&tokens, black_box(SAMPLE_LEN), eos_tokens)
-                        .expect("generation failed");
-                    total += Duration::from_secs_f64(stats.decode_ms / 1000.0);
-                }
-                total
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("decode", prompt_name),
+            &prompt,
+            |b, prompt| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let tokens = encode_tokens(&ts, black_box(prompt.as_str()));
+                        let stats = engine
+                            .run_separated(&tokens, black_box(SAMPLE_LEN), eos_tokens)
+                            .expect("generation failed");
+                        total += Duration::from_secs_f64(stats.decode_ms / 1000.0);
+                    }
+                    total
+                });
+            },
+        );
     }
 
     group.finish();
@@ -214,35 +234,40 @@ fn bench_full_pipeline(c: &mut Criterion) {
     for (prompt_name, prompt_body) in BENCHMARK_PROMPTS {
         let prompt = format_prompt(prompt_body);
 
-        group.bench_with_input(BenchmarkId::new("full", prompt_name), &prompt, |b, prompt| {
-            b.iter_custom(|iters| {
-                let mut total = Duration::ZERO;
-                for _ in 0..iters {
-                    let start = Instant::now();
+        group.bench_with_input(
+            BenchmarkId::new("full", prompt_name),
+            &prompt,
+            |b, prompt| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let start = Instant::now();
 
-                    let factory = create_benchmark_factory();
-                    let (mut engine, tokenizer) =
-                        InferenceEngine::builder(&factory, factory.device().clone())
-                            .seed(BENCHMARK_SEED)
-                            .temperature(TEMPERATURE)
-                            .repeat_penalty(REPEAT_PENALTY)
-                            .repeat_last_n(REPEAT_LAST_N)
-                            .build()
-                            .expect("failed to build engine");
-                    let ts = TokenOutputStream::new(tokenizer);
-                    let tokens = encode_tokens(&ts, black_box(prompt.as_str()));
-                    let eos_tokens = InferenceEngine::<Qwen35ModelForCausalLM>::get_eos_tokens(&ts)
-                        .expect("failed to get EOS tokens");
+                        let factory = create_benchmark_factory();
+                        let (mut engine, tokenizer) =
+                            InferenceEngine::builder(&factory, factory.device().clone())
+                                .seed(BENCHMARK_SEED)
+                                .temperature(TEMPERATURE)
+                                .repeat_penalty(REPEAT_PENALTY)
+                                .repeat_last_n(REPEAT_LAST_N)
+                                .build()
+                                .expect("failed to build engine");
+                        let ts = TokenOutputStream::new(tokenizer);
+                        let tokens = encode_tokens(&ts, black_box(prompt.as_str()));
+                        let eos_tokens =
+                            InferenceEngine::<Qwen35ModelForCausalLM>::get_eos_tokens(&ts)
+                                .expect("failed to get EOS tokens");
 
-                    engine
-                        .run_separated(&tokens, black_box(SAMPLE_LEN), eos_tokens)
-                        .expect("generation failed");
+                        engine
+                            .run_separated(&tokens, black_box(SAMPLE_LEN), eos_tokens)
+                            .expect("generation failed");
 
-                    total += start.elapsed();
-                }
-                total
-            });
-        });
+                        total += start.elapsed();
+                    }
+                    total
+                });
+            },
+        );
     }
 
     group.finish();
@@ -268,7 +293,8 @@ fn bench_prefix_cache(c: &mut Criterion) {
                 let mut total_tokens = 0usize;
 
                 for i in 0..iters {
-                    let (_, prompt) = PREFIX_CACHE_PROMPTS[(i % PREFIX_CACHE_PROMPTS.len() as u64) as usize];
+                    let (_, prompt) =
+                        PREFIX_CACHE_PROMPTS[(i % PREFIX_CACHE_PROMPTS.len() as u64) as usize];
                     let tokens = encode_tokens(&ts, black_box(&format_prompt(prompt)));
                     total_tokens += tokens.len();
 
@@ -304,7 +330,8 @@ fn bench_prefix_cache(c: &mut Criterion) {
                 let mut total_tokens = 0usize;
 
                 for i in 0..iters {
-                    let (_, prompt) = PREFIX_CACHE_PROMPTS[(i % PREFIX_CACHE_PROMPTS.len() as u64) as usize];
+                    let (_, prompt) =
+                        PREFIX_CACHE_PROMPTS[(i % PREFIX_CACHE_PROMPTS.len() as u64) as usize];
                     let tokens = encode_tokens(&ts, black_box(&format_prompt(prompt)));
                     total_tokens += tokens.len();
 
@@ -424,7 +451,8 @@ fn bench_batch_prefill(c: &mut Criterion) {
                         for _ in 0..iters {
                             let batch: Vec<(Uuid, Vec<u32>)> = (0..batch_size)
                                 .map(|i| {
-                                    let (_, prompt) = PREFIX_CACHE_PROMPTS[i % PREFIX_CACHE_PROMPTS.len()];
+                                    let (_, prompt) =
+                                        PREFIX_CACHE_PROMPTS[i % PREFIX_CACHE_PROMPTS.len()];
                                     let text = format_prompt(prompt);
                                     (Uuid::new_v4(), encode_tokens(&ts, black_box(&text)))
                                 })
@@ -432,7 +460,9 @@ fn bench_batch_prefill(c: &mut Criterion) {
                             total_tokens += batch.iter().map(|(_, t)| t.len()).sum::<usize>();
 
                             let start = Instant::now();
-                            engine.prefill_batch(&batch, None).expect("prefill_batch failed");
+                            engine
+                                .prefill_batch(&batch, None)
+                                .expect("prefill_batch failed");
                             total += start.elapsed();
                             engine.model_mut().clear_kv_cache();
                         }

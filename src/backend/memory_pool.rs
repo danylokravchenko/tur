@@ -59,11 +59,7 @@ impl MemoryPool {
             .and_then(|v| v.checked_mul(bytes_per_element))
             .unwrap_or(0);
 
-        let total_blocks = if bytes_per_block > 0 {
-            total_memory_bytes / bytes_per_block
-        } else {
-            0
-        };
+        let total_blocks = total_memory_bytes.checked_div(bytes_per_block).unwrap_or(0);
 
         const DEFAULT_ADMISSION: f32 = 0.9;
         const DEFAULT_EVICTION: f32 = 0.95;

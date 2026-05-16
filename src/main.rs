@@ -201,7 +201,7 @@ fn main() -> Result<()> {
                  - Local weights:\n\
                    --weight-path /path/to/model"
                     .to_string(),
-            ))
+            ));
         }
     };
 
