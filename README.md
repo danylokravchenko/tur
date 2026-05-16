@@ -12,6 +12,7 @@ A high-performance Rust inference engine for transformer models, built on [Candl
 - **Paged KV Cache**: Block-based memory allocator (`BlockAllocator`) isolates KV state per request, enabling true multi-request concurrency without interference
 - **Scheduling Policies**: FCFS (default), Priority, and Shortest-Job-First to control request ordering and reduce average latency
 - **Quantization**: `Q4_K_M`, `Q5_K_M`, `Q8_0`, and other GGUF quantization formats
+- **Guided Generation**: Grammar-constrained decoding via [llguidance](https://github.com/guidance-ai/llguidance); JSON schema, Lark, and regex grammars with ~50 µs per-token overhead
 - **Thinking Mode**: Enable chain-of-thought reasoning
 - **Detailed Statistics**: Per-request prefill/decode timing, cache hit rate, and tokens-per-second reporting
 
@@ -94,6 +95,27 @@ Batch processing amortizes the fixed cost of a forward pass across multiple requ
 - **Throughput**: Near-linear scaling with batch size up to hardware memory limits
 - **Prefill + prefix cache**: Cached prefix tokens are skipped per-request even inside a batch — requests sharing a system prompt pay the prefill cost only for their unique suffix
 - **Decode**: All in-flight requests advance by one token per forward pass
+
+## Guided Generation
+
+Guided generation constrains the output to tokens that are valid under a grammar, guaranteeing syntactically correct structured output without relying on prompt engineering.
+
+### When to use it
+
+| Use case | Grammar type |
+| -------- | ------------ |
+| JSON output parsed by the caller | JSON schema |
+| Enum / classification | Regex or Lark |
+| Tool calls / agent protocols | JSON schema |
+| Domain-specific syntax (SQL, config) | Lark |
+
+Free-text generation, open-ended responses, and any case where the model reliably follows format instructions without enforcement are better served without guidance — it adds ~50 µs of per-token CPU overhead for a 128 k tokenizer.
+
+### Usage
+
+Build a `ParserFactory` once (expensive; tied to tokenizer vocabulary) and share it across requests:
+
+Requests without a grammar run unconstrained regardless of whether a factory is configured.
 
 ## Advanced Configuration
 

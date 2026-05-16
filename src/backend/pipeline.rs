@@ -11,6 +11,7 @@ use crate::{
     backend::{
         engine::InferenceEngine,
         factory::{ModelConstructor, ModelFactory},
+        guidance::{ParserFactory, TopLevelGrammar},
         scheduler::{ContinuousBatchScheduler, SchedulingPolicy},
         tokenizer::TokenOutputStream,
     },
@@ -23,6 +24,9 @@ pub struct GenerationRequest {
     pub id: Uuid,
     pub prompt: String,
     pub sample_len: usize,
+    /// Optional grammar for guided (constrained) generation.
+    /// When set, only tokens valid under the grammar are sampled.
+    pub grammar: Option<TopLevelGrammar>,
 }
 
 impl GenerationRequest {
@@ -32,7 +36,14 @@ impl GenerationRequest {
             id: Uuid::new_v4(),
             prompt,
             sample_len,
+            grammar: None,
         }
+    }
+
+    /// Attach a grammar for guided generation.
+    pub fn with_grammar(mut self, grammar: TopLevelGrammar) -> Self {
+        self.grammar = Some(grammar);
+        self
     }
 }
 
@@ -90,6 +101,7 @@ pub struct TextGenerationBuilder<'a, T: ModelConstructor> {
     progress: Option<ProgressReporter>,
     on_token: Option<Box<dyn FnMut(&str)>>,
     prefix_cache: Option<super::prefix_cache::SharedPrefixCache>,
+    guidance_factory: Option<Arc<ParserFactory>>,
     // Batching configuration
     enable_batching: bool,
     max_batch_size: usize,
@@ -112,6 +124,7 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             progress: None,
             on_token: None,
             prefix_cache: None,
+            guidance_factory: None,
             enable_batching: false,
             max_batch_size: 16,
             max_prefill_batch: 8,
@@ -203,6 +216,13 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
         self
     }
 
+    /// Enable guided (constrained) generation using the given parser factory.
+    /// Build the factory with `guidance::build_llg_factory`.
+    pub fn with_guidance_factory(mut self, factory: Arc<ParserFactory>) -> Self {
+        self.guidance_factory = Some(factory);
+        self
+    }
+
     pub fn build(self) -> TextGeneration<T> {
         debug!(
             seed = self.seed,
@@ -236,6 +256,9 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
         }
         if let Some(prefix_cache) = &self.prefix_cache {
             engine_builder = engine_builder.with_shared_prefix_cache(prefix_cache.clone());
+        }
+        if let Some(guidance_factory) = self.guidance_factory {
+            engine_builder = engine_builder.with_guidance_factory(guidance_factory);
         }
 
         let (batching, engine, tokenizer) = if self.enable_batching {
@@ -347,6 +370,15 @@ impl<T: ModelConstructor> TextGeneration<T> {
     }
 
     pub fn run(&mut self, request: &GenerationRequest) -> Result<GenerationStats> {
+        if let Some(grammar) = request.grammar.clone() {
+            self.engine.activate_grammar(grammar)?;
+        }
+        let result = self.run_inner(request);
+        self.engine.deactivate_grammar();
+        result
+    }
+
+    fn run_inner(&mut self, request: &GenerationRequest) -> Result<GenerationStats> {
         let sample_len = request.sample_len;
         self.tokenizer.clear();
         trace!(
