@@ -980,6 +980,10 @@ impl super::ModelImpl for ModelForCausalLM {
         self.base.clear_kv_cache();
     }
 
+    fn num_layers(&self) -> usize {
+        self.base.layers.len()
+    }
+
     fn name(&self) -> &'static str {
         "Qwen3"
     }

@@ -17,7 +17,6 @@ use crate::{
 };
 use parking_lot::RwLock;
 use std::sync::Arc;
-use tokenizers::Tokenizer;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
@@ -70,13 +69,9 @@ pub struct ExecutionBatch {
 /// Continuous batch scheduler
 pub struct ContinuousBatchScheduler {
     batch_manager: BatchManager,
-    #[allow(dead_code)]
     policy: SchedulingPolicy,
-    #[allow(dead_code)]
     config: BatchConfig,
     memory_pool: Arc<RwLock<MemoryPool>>,
-    #[allow(dead_code)]
-    tokenizer: Arc<Tokenizer>,
     /// Track allocated blocks per request (request_id -> num_blocks)
     allocated_blocks: ahash::AHashMap<uuid::Uuid, usize>,
     /// Block allocator for paged KV cache (shared across all requests)
@@ -86,17 +81,24 @@ pub struct ContinuousBatchScheduler {
     paged_caches: ahash::AHashMap<Uuid, Vec<PagedKvCache>>,
     /// Number of model layers (needed for PagedKvCache initialization)
     num_layers: usize,
+    /// EOS token IDs derived from the model's tokenizer at construction time.
+    eos_token: u32,
+    im_end_token: u32,
 }
 
 impl ContinuousBatchScheduler {
-    /// Create a new scheduler
+    /// Create a new scheduler.
+    ///
+    /// `eos_tokens` should be `(eos_token_id, im_end_token_id)` looked up from the
+    /// model's tokenizer by the caller so generation stops on the correct tokens for
+    /// every model family, not just Qwen.
     pub fn new(
         policy: SchedulingPolicy,
         config: BatchConfig,
         memory_pool: Arc<RwLock<MemoryPool>>,
-        tokenizer: Arc<Tokenizer>,
         allocator: Arc<RwLock<BlockAllocator>>,
         num_layers: usize,
+        eos_tokens: (u32, u32),
     ) -> Self {
         debug!(
             policy = ?policy,
@@ -104,6 +106,8 @@ impl ContinuousBatchScheduler {
             max_decode_batch = config.max_decode_batch,
             max_prefill_tokens = config.max_prefill_tokens,
             max_decode_tokens = config.max_decode_tokens,
+            eos_token = eos_tokens.0,
+            im_end_token = eos_tokens.1,
             "Creating continuous batch scheduler"
         );
 
@@ -120,11 +124,12 @@ impl ContinuousBatchScheduler {
             policy,
             config,
             memory_pool,
-            tokenizer,
             allocated_blocks: ahash::AHashMap::new(),
             block_allocator: allocator,
             paged_caches: ahash::AHashMap::new(),
             num_layers,
+            eos_token: eos_tokens.0,
+            im_end_token: eos_tokens.1,
         }
     }
 
@@ -258,8 +263,30 @@ impl ContinuousBatchScheduler {
         }
     }
 
-    /// Enqueue a new request
-    pub fn enqueue_request(&mut self, request: RequestState) {
+    /// Enqueue a new request.
+    ///
+    /// The request's priority is normalised based on the scheduler's policy before
+    /// it is handed to `BatchManager`, which inserts it in priority order.  This
+    /// means `BatchManager`'s sorted queue naturally implements all three policies:
+    ///
+    /// * `FCFS`     — all priorities forced to 0, so insertion order is preserved.
+    /// * `Priority` — the caller-supplied `request.priority` is used as-is.
+    /// * `SJF`      — shorter prompts receive a higher effective priority so they
+    ///                are admitted first.
+    pub fn enqueue_request(&mut self, mut request: RequestState) {
+        match self.policy {
+            SchedulingPolicy::FCFS => {
+                request.priority = 0;
+            }
+            SchedulingPolicy::Priority => {
+                // Use the request's own priority as-is.
+            }
+            SchedulingPolicy::SJF => {
+                // Shorter prompts → higher effective priority.
+                // Saturating_sub prevents overflow for very long prompts.
+                request.priority = u32::MAX.saturating_sub(request.prompt_tokens.len() as u32);
+            }
+        }
         self.batch_manager.enqueue_request(request)
     }
 
@@ -336,53 +363,91 @@ impl ContinuousBatchScheduler {
         Ok(admitted)
     }
 
-    /// Form a prefill batch from admitted requests
+    /// Form a prefill batch from admitted requests.
+    ///
+    /// Respects both `config.max_prefill_batch` (request count, enforced by
+    /// `BatchManager`) and `config.max_prefill_tokens` (total token budget,
+    /// enforced here by stopping early once the budget would be exceeded).
     pub fn form_prefill_batch(&self) -> Option<ExecutionBatch> {
-        let prefill_ids = self.batch_manager.form_prefill_batch();
-        if prefill_ids.is_empty() {
+        let candidates = self.batch_manager.form_prefill_batch();
+        if candidates.is_empty() {
             return None;
         }
 
-        let mut total_tokens = 0;
-        for id in &prefill_ids {
+        let mut selected = Vec::with_capacity(candidates.len());
+        let mut total_tokens = 0usize;
+
+        for id in &candidates {
             if let Some(request) = self.batch_manager.get_request(id) {
-                total_tokens += request.seq_len();
+                let req_tokens = request.seq_len();
+                // Always include the first request even if it alone exceeds the budget;
+                // refusing a single oversized request would stall the scheduler forever.
+                if !selected.is_empty()
+                    && total_tokens + req_tokens > self.config.max_prefill_tokens
+                {
+                    break;
+                }
+                total_tokens += req_tokens;
+                selected.push(*id);
             }
         }
 
+        if selected.is_empty() {
+            return None;
+        }
+
         trace!(
-            batch_size = prefill_ids.len(),
-            total_tokens, "Formed prefill batch"
+            batch_size = selected.len(),
+            total_tokens,
+            max_prefill_tokens = self.config.max_prefill_tokens,
+            "Formed prefill batch"
         );
 
         Some(ExecutionBatch {
-            request_ids: prefill_ids,
+            request_ids: selected,
             phase: RequestPhase::Prefilling,
             total_tokens,
         })
     }
 
-    /// Form a decode batch from decoding requests
+    /// Form a decode batch from decoding requests.
+    ///
+    /// Respects both `config.max_decode_batch` (request count) and
+    /// `config.max_decode_tokens` (total token budget).
     pub fn form_decode_batch(&self) -> Option<ExecutionBatch> {
-        let decode_ids = self.batch_manager.form_decode_batch();
-        if decode_ids.is_empty() {
+        let candidates = self.batch_manager.form_decode_batch();
+        if candidates.is_empty() {
             return None;
         }
 
-        let mut total_tokens = 0;
-        for id in &decode_ids {
+        let mut selected = Vec::with_capacity(candidates.len());
+        let mut total_tokens = 0usize;
+
+        for id in &candidates {
             if let Some(request) = self.batch_manager.get_request(id) {
-                total_tokens += request.seq_len();
+                let req_tokens = request.seq_len();
+                if !selected.is_empty() && total_tokens + req_tokens > self.config.max_decode_tokens
+                {
+                    break;
+                }
+                total_tokens += req_tokens;
+                selected.push(*id);
             }
         }
 
+        if selected.is_empty() {
+            return None;
+        }
+
         trace!(
-            batch_size = decode_ids.len(),
-            total_tokens, "Formed decode batch"
+            batch_size = selected.len(),
+            total_tokens,
+            max_decode_tokens = self.config.max_decode_tokens,
+            "Formed decode batch"
         );
 
         Some(ExecutionBatch {
-            request_ids: decode_ids,
+            request_ids: selected,
             phase: RequestPhase::Decoding,
             total_tokens,
         })
@@ -482,6 +547,11 @@ impl ContinuousBatchScheduler {
     /// Check if there are any queued requests
     pub fn has_queued_requests(&self) -> bool {
         self.batch_manager.num_queued_requests() > 0
+    }
+
+    /// True when there is any work to do (active or queued).
+    pub fn has_pending_work(&self) -> bool {
+        self.has_active_requests() || self.has_queued_requests()
     }
 
     /// Get number of active requests
@@ -609,8 +679,8 @@ impl ContinuousBatchScheduler {
 
                     // Check if request should stop
                     request.should_stop()
-                        || next_token == 151643 // EOS token for Qwen
-                        || next_token == 151645 // Alternative EOS
+                        || next_token == self.eos_token
+                        || next_token == self.im_end_token
                 } else {
                     false
                 };
@@ -651,35 +721,17 @@ pub struct SchedulerStats {
 mod tests {
     use super::*;
     fn create_test_scheduler(policy: SchedulingPolicy) -> ContinuousBatchScheduler {
-        // Create a simple memory pool for testing
         let memory_pool = Arc::new(RwLock::new(MemoryPool::new(
             1024 * 1024 * 100, // 100MB
             16,
             32,
             32,
             128,
-            2, // 2 bytes (BF16)
+            2,
         )));
-
-        // Create a simple tokenizer for testing
-        let tokenizer = Arc::new(Tokenizer::from_file("tokenizer.json").unwrap_or_else(|_| {
-            // Fallback: create a minimal tokenizer
-            tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
-        }));
-
-        // Create block allocator for paged KV cache
         let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(1000, 16)));
-
         let config = BatchConfig::default();
-        let num_layers = 32;
-        ContinuousBatchScheduler::new(
-            policy,
-            config,
-            memory_pool,
-            tokenizer,
-            block_allocator,
-            num_layers,
-        )
+        ContinuousBatchScheduler::new(policy, config, memory_pool, block_allocator, 32, (0, 0))
     }
 
     fn create_test_request(prompt_len: usize, max_tokens: usize, priority: u32) -> RequestState {
@@ -859,18 +911,15 @@ mod tests {
             128,
             2,
         )));
-        let tokenizer = Arc::new(Tokenizer::from_file("tokenizer.json").unwrap_or_else(|_| {
-            tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
-        }));
         let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(100, 16)));
         let config = BatchConfig::default();
         let mut scheduler = ContinuousBatchScheduler::new(
             SchedulingPolicy::FCFS,
             config,
             memory_pool,
-            tokenizer,
             block_allocator,
             32,
+            (0, 0),
         );
 
         // Enqueue many large requests
@@ -1228,18 +1277,15 @@ mod tests {
             64,
             2,
         )));
-        let tokenizer = Arc::new(Tokenizer::from_file("tokenizer.json").unwrap_or_else(|_| {
-            tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
-        }));
         let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(500, 16)));
         let config = BatchConfig::default();
         let mut scheduler = ContinuousBatchScheduler::new(
             SchedulingPolicy::FCFS,
             config,
             memory_pool,
-            tokenizer,
             block_allocator,
             32,
+            (0, 0),
         );
 
         // Enqueue many requests with larger size to exceed memory

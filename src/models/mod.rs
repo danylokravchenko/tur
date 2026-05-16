@@ -9,6 +9,9 @@ pub use qwen3::{Config, Model, ModelForCausalLM as Qwen35ModelForCausalLM};
 pub trait ModelImpl {
     fn name(&self) -> &'static str;
 
+    /// Returns the number of transformer layers in this model.
+    fn num_layers(&self) -> usize;
+
     /// Returns the dtype used for KV cache tensors.
     fn dtype(&self) -> DType;
 
