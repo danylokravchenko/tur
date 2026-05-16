@@ -168,8 +168,7 @@ impl ContinuousBatchScheduler {
         // For efficiency, we only check if the new request's tokens are a prefix of an existing request
         // or if an existing request's tokens are a prefix of the new request
 
-        const MIN_PREFIX_LENGTH: usize = 10; // Minimum prefix length to consider sharing
-
+        const MIN_PREFIX_LENGTH: usize = 10;
         if tokens.len() < MIN_PREFIX_LENGTH {
             return None;
         }
@@ -346,7 +345,7 @@ impl ContinuousBatchScheduler {
 
         trace!(
             batch_size = prefill_ids.len(),
-            total_tokens, "formed prefill batch"
+            total_tokens, "Formed prefill batch"
         );
 
         Some(ExecutionBatch {
@@ -372,7 +371,7 @@ impl ContinuousBatchScheduler {
 
         trace!(
             batch_size = decode_ids.len(),
-            total_tokens, "formed decode batch"
+            total_tokens, "Formed decode batch"
         );
 
         Some(ExecutionBatch {

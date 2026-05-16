@@ -405,10 +405,38 @@ impl<T: ModelConstructor> InferenceEngine<T> {
             return Ok(Vec::new());
         }
 
-        // Clear KV cache only if not using paged cache
-        if paged_caches.is_none() {
-            self.model.clear_kv_cache();
+        // When paged KV caches are in use we must prefill each request individually.
+        //
+        // Batched prefill pads shorter sequences to max_len with zeros.  The paged
+        // cache blindly stores all max_len K/V entries — including the garbage padding
+        // tokens — and ModelForCausalLM::forward_batch extracts logits from the last
+        // padded position rather than the last real token.  Both corrupt decode quality.
+        //
+        // Per-request prefill avoids padding entirely: each forward pass sees only the
+        // real prompt tokens, stores exactly the right K/V entries, and extracts the
+        // logit at the correct final position.
+        if let Some(caches) = paged_caches {
+            let mut results = Vec::with_capacity(batch_tokens.len());
+            for ((id, tokens), req_caches) in batch_tokens.iter().zip(caches.iter_mut()) {
+                let input = Tensor::new(tokens.as_slice(), &self.device)?.unsqueeze(0)?;
+                let positions = [0usize];
+                let logits = self.model.forward_batch(
+                    &input,
+                    &positions,
+                    Some(std::slice::from_mut(req_caches)),
+                )?;
+                // logits: [1, 1, vocab_size] — squeeze to [vocab_size]
+                let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+                let logits = self.process_logits(logits, tokens)?;
+                let next_token = self.sampler.sample(&logits)?;
+                results.push((*id, next_token));
+                trace!(request_id = ?id, next_token, "Batched prefill sampled token");
+            }
+            return Ok(results);
         }
+
+        // No paged caches: use the shared model KV cache and a single padded batch.
+        self.model.clear_kv_cache();
 
         // Find max length in batch
         let max_len = batch_tokens
@@ -417,15 +445,12 @@ impl<T: ModelConstructor> InferenceEngine<T> {
             .max()
             .unwrap_or(0);
 
-        // Prepare batched input
         let batch_size = batch_tokens.len();
         let mut input_data = Vec::with_capacity(batch_size * max_len);
-        let positions = vec![0; batch_size]; // All start at position 0 for prefill
+        let positions = vec![0usize; batch_size];
 
-        // Pad sequences to max length
         for (_, tokens) in batch_tokens.iter() {
             input_data.extend_from_slice(tokens);
-            // Pad with zeros if needed (will be masked in attention)
             input_data.extend(std::iter::repeat_n(0, max_len.saturating_sub(tokens.len())));
         }
 
@@ -433,16 +458,14 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         trace!(
             batch_size,
             max_len,
-            has_paged_caches = paged_caches.is_some(),
+            has_paged_caches = false,
             "Running batched prefill forward pass"
         );
 
-        let logits = self.model.forward_batch(&input, &positions, paged_caches)?;
+        let logits = self.model.forward_batch(&input, &positions, None)?;
 
-        // Sample next token for each request
         let mut results = Vec::with_capacity(batch_size);
         for (idx, (id, tokens)) in batch_tokens.iter().enumerate() {
-            // Extract logits for this request: [1, 1, vocab_size]
             let request_logits = logits
                 .narrow(0, idx, 1)?
                 .squeeze(0)?
