@@ -10,6 +10,7 @@ use crate::{
     ProgressReporter, Result, TurError,
     backend::{
         factory::{ModelConstructor, ModelFactory},
+        guidance::{GuidanceControl, ParserFactory, TopLevelGrammar},
         prefix_cache::{PrefixCache, PrefixCacheEntry, SharedPrefixCache},
         tokenizer::{LogitsSampler, TokenOutputStream},
     },
@@ -25,6 +26,11 @@ pub struct InferenceEngine<T: ModelImpl> {
     repeat_penalty: f32,
     repeat_last_n: usize,
     prefix_cache: Option<SharedPrefixCache>,
+    /// Optional per-request grammar constraint for guided generation.
+    guidance: Option<GuidanceControl>,
+    /// EOS token IDs detected at build time; used by `sample_guided` to force
+    /// termination when the grammar signals stop.
+    eos_tokens: Option<(u32, u32)>,
 }
 
 /// Builder for InferenceEngine
@@ -39,6 +45,7 @@ pub struct InferenceEngineBuilder<'a, T: ModelConstructor> {
     repeat_last_n: usize,
     prefix_cache: Option<SharedPrefixCache>,
     progress: Option<ProgressReporter>,
+    guidance_factory: Option<Arc<ParserFactory>>,
 }
 
 impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
@@ -54,6 +61,7 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
             repeat_last_n: 64,
             prefix_cache: None,
             progress: None,
+            guidance_factory: None,
         }
     }
 
@@ -109,6 +117,13 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
         self
     }
 
+    /// Enable guided generation with the given parser factory.
+    /// The factory is typically built once via `guidance::build_llg_factory`.
+    pub fn with_guidance_factory(mut self, factory: Arc<ParserFactory>) -> Self {
+        self.guidance_factory = Some(factory);
+        self
+    }
+
     pub fn build(self) -> Result<(InferenceEngine<T>, Tokenizer)> {
         // Log engine configuration
         debug!(
@@ -134,6 +149,12 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
             model_name = model.name(),
             "Created inference engine for model",
         );
+        let guidance = self.guidance_factory.map(GuidanceControl::new);
+
+        let eos_tokens = tokenizer
+            .token_to_id("<|endoftext|>")
+            .zip(tokenizer.token_to_id("<|im_end|>"));
+
         let engine = InferenceEngine {
             model,
             device: self.device,
@@ -141,6 +162,8 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
             repeat_penalty: self.repeat_penalty,
             repeat_last_n: self.repeat_last_n,
             prefix_cache: self.prefix_cache,
+            guidance,
+            eos_tokens,
         };
         Ok((engine, tokenizer))
     }
@@ -150,6 +173,64 @@ impl<T: ModelConstructor> InferenceEngine<T> {
     /// Create a new builder for InferenceEngine from factory
     pub fn builder(factory: &'_ ModelFactory<T>, device: Device) -> InferenceEngineBuilder<'_, T> {
         InferenceEngineBuilder::new(factory, device)
+    }
+
+    /// Activate guided generation for the next request. Requires a guidance factory
+    /// configured on the builder (`with_guidance_factory`).
+    pub fn activate_grammar(&mut self, grammar: TopLevelGrammar) -> Result<()> {
+        self.guidance
+            .as_mut()
+            .ok_or_else(|| {
+                TurError::Guidance(
+                    "Guidance not configured. Use builder.with_guidance_factory()".to_string(),
+                )
+            })?
+            .activate(grammar)
+    }
+
+    /// Deactivate guided generation. Call after each request completes or errors.
+    pub fn deactivate_grammar(&mut self) {
+        if let Some(g) = self.guidance.as_mut() {
+            g.deactivate();
+        }
+    }
+
+    /// Apply repeat penalty + optional guidance mask, then sample. Commits guidance state.
+    fn sample_guided(&mut self, logits: Tensor, tokens: &[u32]) -> Result<u32> {
+        // Apply repeat penalty and sampler constraints.
+        let logits = self.process_logits(logits, tokens)?;
+
+        // Apply grammar mask when guidance is active.
+        let logits = if let Some(ref mut guidance) = self.guidance {
+            if guidance.is_active() {
+                let mut logits_vec = logits.to_vec1::<f32>()?;
+                let stop = guidance.apply_mask(&mut logits_vec)?;
+                if stop {
+                    // Grammar reached a terminal state — force EOS so the pipeline
+                    // decode loop terminates cleanly without additional sampling.
+                    if let Some((eos, _)) = self.eos_tokens {
+                        return Ok(eos);
+                    }
+                    // No known EOS token; fall through to unconstrained sampling
+                    // and rely on the pipeline's EOS check.
+                    return self.sampler.sample(&logits);
+                }
+                Tensor::from_vec(logits_vec, logits.shape().clone(), logits.device())?
+            } else {
+                logits
+            }
+        } else {
+            logits
+        };
+
+        let token = self.sampler.sample(&logits)?;
+
+        // Advance grammar state.
+        if let Some(ref mut guidance) = self.guidance {
+            guidance.commit(token)?;
+        }
+
+        Ok(token)
     }
 
     /// Get EOS tokens from tokenizer
@@ -398,8 +479,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         }
 
         let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-        let logits = self.process_logits(logits, tokens)?;
-        let next_token = self.sampler.sample(&logits)?;
+        let next_token = self.sample_guided(logits, tokens)?;
         trace!(
             next_token,
             cache_hit,
@@ -422,9 +502,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         );
         let logits = self.model.forward(&input, start_pos)?;
         let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-        let logits = self.process_logits(logits, tokens)?;
-
-        let next_token = self.sampler.sample(&logits)?;
+        let next_token = self.sample_guided(logits, tokens)?;
         trace!(next_token, "Decode step sampled token");
         Ok(next_token)
     }

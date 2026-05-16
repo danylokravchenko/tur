@@ -1,13 +1,14 @@
 use parking_lot::RwLock;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tur::ProgressReporter;
 use tur::backend::InferenceEngine;
+use tur::backend::guidance::TopLevelGrammar;
 use tur::backend::pipeline::{GenerationRequest, TextGeneration};
 use tur::backend::prefix_cache::PrefixCache;
 use tur::backend::tokenizer::TokenOutputStream;
 
 mod common;
-use common::create_test_factory;
+use common::{build_guidance_factory, create_test_factory};
 
 #[test]
 fn test_pipeline_end_to_end_generation() {
@@ -450,4 +451,131 @@ fn test_continuous_batching_result_management() {
     pipeline.clear_results();
     let all_results_after = pipeline.get_all_results();
     assert_eq!(all_results_after.len(), 0);
+}
+
+// ── Guided generation ──────────────────────────────────────────────────────
+
+/// Pipeline built without a guidance factory must return an error when a
+/// request carries a grammar — not a panic or silent ignore.
+#[test]
+fn test_guided_no_factory_returns_error() {
+    let (factory, device, _) = create_test_factory();
+
+    let mut pipeline = TextGeneration::builder(&factory, device)
+        .seed(299792458)
+        .build();
+
+    let request = GenerationRequest::new("Hello".to_string(), 5)
+        .with_grammar(TopLevelGrammar::from_regex(r"[0-9]+"));
+
+    let result = pipeline.run(&request);
+    assert!(result.is_err(), "Expected error without guidance factory");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("Guidance") || msg.contains("guidance"),
+        "Error should mention guidance, got: {msg}"
+    );
+}
+
+/// A regex grammar `[0-9]+` must restrict the sampled tokens so that every
+/// character in the streamed output is an ASCII digit.
+#[test]
+fn test_guided_regex_output_is_only_digits() {
+    let (factory, device, _) = create_test_factory();
+    let guidance_factory = build_guidance_factory(&factory, device.clone());
+
+    let output = Arc::new(Mutex::new(String::new()));
+    let output_clone = output.clone();
+
+    let mut pipeline = TextGeneration::builder(&factory, device)
+        .seed(299792458)
+        .with_guidance_factory(guidance_factory)
+        .on_token(move |s| output_clone.lock().unwrap().push_str(s))
+        .build();
+
+    let request = GenerationRequest::new(
+        "Reply with one number only: ".to_string(),
+        20,
+    )
+    .with_grammar(TopLevelGrammar::from_regex(r"[0-9]+"));
+
+    let stats = pipeline.run(&request).expect("Guided regex generation failed");
+    assert!(stats.generated_tokens > 0, "Should have generated at least one token");
+
+    let generated = output.lock().unwrap().clone();
+    assert!(
+        generated.chars().all(|c| c.is_ascii_digit()),
+        "All characters must be digits under [0-9]+ grammar, got: {generated:?}"
+    );
+}
+
+/// A JSON-schema grammar must produce a complete, parse-able JSON object.
+/// We use a tight schema so the model closes the object quickly.
+#[test]
+fn test_guided_json_schema_output_is_valid_json() {
+    let (factory, device, _) = create_test_factory();
+    let guidance_factory = build_guidance_factory(&factory, device.clone());
+
+    let output = Arc::new(Mutex::new(String::new()));
+    let output_clone = output.clone();
+
+    let mut pipeline = TextGeneration::builder(&factory, device)
+        .seed(299792458)
+        .with_guidance_factory(guidance_factory)
+        .on_token(move |s| output_clone.lock().unwrap().push_str(s))
+        .build();
+
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "value": { "type": "integer" }
+        },
+        "required": ["value"]
+    });
+
+    // Give enough tokens for the grammar to close the JSON object.
+    let request =
+        GenerationRequest::new("Output JSON: ".to_string(), 60)
+            .with_grammar(TopLevelGrammar::from_json_schema(schema));
+
+    let stats = pipeline.run(&request).expect("Guided JSON generation failed");
+    assert!(stats.generated_tokens > 0);
+
+    let generated = output.lock().unwrap().clone();
+    let parsed = serde_json::from_str::<serde_json::Value>(&generated);
+    assert!(
+        parsed.is_ok(),
+        "Output must be valid JSON under schema, got: {generated:?}"
+    );
+    let obj = parsed.unwrap();
+    assert!(
+        obj.get("value").is_some(),
+        "JSON must contain required field 'value', got: {obj}"
+    );
+}
+
+/// After a grammar-constrained request the constraint must be cleared so that
+/// the next request (without a grammar) runs freely — no bleed-over and no
+/// error.
+#[test]
+fn test_guided_grammar_deactivates_between_requests() {
+    let (factory, device, _) = create_test_factory();
+    let guidance_factory = build_guidance_factory(&factory, device.clone());
+
+    let mut pipeline = TextGeneration::builder(&factory, device)
+        .seed(299792458)
+        .temperature(0.1)
+        .with_guidance_factory(guidance_factory)
+        .build();
+
+    // First request — constrained to digits.
+    let constrained = GenerationRequest::new("A number: ".to_string(), 10)
+        .with_grammar(TopLevelGrammar::from_regex(r"[0-9]+"));
+    pipeline
+        .run(&constrained)
+        .expect("Constrained request failed");
+
+    // Second request — no grammar; must not inherit the previous constraint.
+    let free = GenerationRequest::new("Say hello: ".to_string(), 10);
+    pipeline.run(&free).expect("Free request after grammar failed");
 }
