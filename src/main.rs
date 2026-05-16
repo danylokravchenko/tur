@@ -187,27 +187,30 @@ fn main() -> Result<()> {
         candle_core::utils::with_f16c()
     );
 
-    if args.model_id.is_none() && args.weight_path.is_none() {
-        return Err(TurError::Other(
-            "Please provide a weight source:\n\
-             Examples:\n\
-             - Full precision SafeTensors:\n\
-               --model-id Qwen3-0.6B\n\
-             - Quantized GGUF (auto-downloads from unsloth):\n\
-               --model-id Qwen3-0.6B --quantization Q4_K_M\n\
-             - Local weights:\n\
-               --weight-path /path/to/model"
-                .to_string(),
-        ));
-    }
+    let source = match (args.model_id, args.weight_path) {
+        (Some(model_id), _) => tur::ModelSource::HuggingFace(model_id),
+        (None, Some(path)) => tur::ModelSource::LocalPath(path),
+        (None, None) => {
+            return Err(TurError::Other(
+                "Please provide a weight source:\n\
+                 Examples:\n\
+                 - Full precision SafeTensors:\n\
+                   --model-id Qwen3-0.6B\n\
+                 - Quantized GGUF (auto-downloads from unsloth):\n\
+                   --model-id Qwen3-0.6B --quantization Q4_K_M\n\
+                 - Local weights:\n\
+                   --weight-path /path/to/model"
+                    .to_string(),
+            ))
+        }
+    };
 
     // Create progress reporter
     let progress = ProgressReporter::new();
 
     // Use ModelFactory to create the model and tokenizer
     let factory = tur::ModelFactory::<tur::models::Qwen35ModelForCausalLM>::new(
-        args.model_id,
-        args.weight_path,
+        source,
         args.quantization,
         device.clone(),
         dtype,

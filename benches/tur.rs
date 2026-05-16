@@ -75,8 +75,7 @@ fn create_benchmark_factory() -> ModelFactory<Qwen35ModelForCausalLM> {
     let dtype = DType::F32;
 
     ModelFactory::new(
-        Some(MODEL_ID.to_string()),
-        None,
+        tur::ModelSource::HuggingFace(MODEL_ID.to_string()),
         Some(QUANTIZATION.to_string()),
         device,
         dtype,
