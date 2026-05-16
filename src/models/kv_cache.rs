@@ -5,7 +5,7 @@
 //! - `PagedKvCache`: Block-based memory, optimal for batching and prefix sharing
 
 use ahash::AHashMap;
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{Result, Tensor};
 use candle_nn::kv_cache::ConcatKvCache;
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -138,38 +138,34 @@ pub type KvCache = SimpleKvCache;
 pub type BlockId = usize;
 
 /// Physical memory block storing KV tensors for a fixed number of tokens
+///
+/// Tensors are `None` until the first write so that the block can be created
+/// without knowing the per-layer shape (batch, num_heads, block_size, head_dim).
+/// The first call to `PagedKvCache::append` that touches this block will
+/// allocate tensors with the correct shape — avoiding the shape-mismatch
+/// re-initialization that occurred when a global `num_heads`/`head_dim` was
+/// baked in at construction time.
 #[derive(Debug, Clone)]
 pub struct KvBlock {
     /// Unique block identifier
     pub id: BlockId,
-    /// K tensor: [batch, num_heads, block_size, head_dim]
-    pub k: Tensor,
-    /// V tensor: [batch, num_heads, block_size, head_dim]
-    pub v: Tensor,
+    /// K tensor: [batch, num_heads, block_size, head_dim] — None until first write
+    pub k: Option<Tensor>,
+    /// V tensor: [batch, num_heads, block_size, head_dim] — None until first write
+    pub v: Option<Tensor>,
     /// Reference count for copy-on-write sharing
     pub ref_count: usize,
 }
 
 impl KvBlock {
-    /// Create a new KV block with zero-initialized tensors
-    pub fn new(
-        id: BlockId,
-        batch_size: usize,
-        num_heads: usize,
-        block_size: usize,
-        head_dim: usize,
-        device: &Device,
-        dtype: DType,
-    ) -> Result<Self> {
-        let k = Tensor::zeros((batch_size, num_heads, block_size, head_dim), dtype, device)?;
-        let v = Tensor::zeros((batch_size, num_heads, block_size, head_dim), dtype, device)?;
-
-        Ok(Self {
+    /// Create a new KV block. Tensors are allocated lazily on the first write.
+    pub fn new(id: BlockId) -> Self {
+        Self {
             id,
-            k,
-            v,
+            k: None,
+            v: None,
             ref_count: 1,
-        })
+        }
     }
 }
 
@@ -184,41 +180,19 @@ pub struct BlockAllocator {
     next_block_id: BlockId,
     /// Block size (tokens per block)
     block_size: usize,
-    /// Batch size
-    batch_size: usize,
-    /// Number of attention heads
-    num_heads: usize,
-    /// Head dimension
-    head_dim: usize,
-    /// Device for tensor allocation
-    device: Device,
-    /// Data type
-    dtype: DType,
+
     /// Total number of blocks in pool
     total_blocks: usize,
 }
 
 impl BlockAllocator {
     /// Create a new block allocator
-    pub fn new(
-        total_blocks: usize,
-        block_size: usize,
-        batch_size: usize,
-        num_heads: usize,
-        head_dim: usize,
-        device: Device,
-        dtype: DType,
-    ) -> Self {
+    pub fn new(total_blocks: usize, block_size: usize) -> Self {
         Self {
             free_blocks: Vec::with_capacity(total_blocks),
             allocated_blocks: AHashMap::new(),
             next_block_id: 0,
             block_size,
-            batch_size,
-            num_heads,
-            head_dim,
-            device,
-            dtype,
             total_blocks,
         }
     }
@@ -230,6 +204,10 @@ impl BlockAllocator {
             && let Some(block) = self.allocated_blocks.get_mut(&block_id)
         {
             block.ref_count = 1;
+            // Clear stale tensors so a reused block doesn't carry data from a
+            // previous request into a new one.
+            block.k = None;
+            block.v = None;
             return Ok(block_id);
         }
 
@@ -241,17 +219,8 @@ impl BlockAllocator {
         let block_id = self.next_block_id;
         self.next_block_id += 1;
 
-        let block = KvBlock::new(
-            block_id,
-            self.batch_size,
-            self.num_heads,
-            self.block_size,
-            self.head_dim,
-            &self.device,
-            self.dtype,
-        )?;
-
-        self.allocated_blocks.insert(block_id, block);
+        self.allocated_blocks
+            .insert(block_id, KvBlock::new(block_id));
         Ok(block_id)
     }
 
@@ -454,24 +423,31 @@ impl KvCacheImpl for PagedKvCache {
             let mut allocator = self.allocator.write();
             let block = allocator.get_block_mut(block_id)?;
 
-            // Reinitialize the block if its shape doesn't match the incoming tensor.
-            // KvBlock is pre-allocated with the BlockAllocator's global num_heads / head_dim,
-            // which won't match the actual model kv-head count on first write.
+            // Lazily initialize block tensors to the correct shape on first write.
+            // Using zeros as padding for positions not yet written in this block.
             let expected_shape = [b, h, self.block_size, d];
-            if block.k.dims() != expected_shape {
-                block.k = Tensor::zeros(&expected_shape, k.dtype(), k.device())?;
-                block.v = Tensor::zeros(&expected_shape, v.dtype(), v.device())?;
+            if block
+                .k
+                .as_ref()
+                .map(|t| t.dims() != expected_shape)
+                .unwrap_or(true)
+            {
+                block.k = Some(Tensor::zeros(&expected_shape, k.dtype(), k.device())?);
+                block.v = Some(Tensor::zeros(&expected_shape, v.dtype(), v.device())?);
             }
 
-            // Reconstruct block tensor with new data
-            // (candle doesn't have in-place slice assignment)
+            // Reconstruct block tensor with new data.
+            // (candle has no in-place slice assignment)
+            let block_k = block.k.as_ref().unwrap();
+            let block_v = block.v.as_ref().unwrap();
+
             let k_before = if pos_in_block > 0 {
-                Some(block.k.narrow(self.concat_dim, 0, pos_in_block)?)
+                Some(block_k.narrow(self.concat_dim, 0, pos_in_block)?)
             } else {
                 None
             };
             let k_after = if pos_in_block + tokens_in_block < self.block_size {
-                Some(block.k.narrow(
+                Some(block_k.narrow(
                     self.concat_dim,
                     pos_in_block + tokens_in_block,
                     self.block_size - pos_in_block - tokens_in_block,
@@ -488,16 +464,16 @@ impl KvCacheImpl for PagedKvCache {
             if let Some(after) = k_after {
                 k_parts.push(after);
             }
-            block.k = Tensor::cat(&k_parts, self.concat_dim)?;
+            block.k = Some(Tensor::cat(&k_parts, self.concat_dim)?);
 
             // Same for v
             let v_before = if pos_in_block > 0 {
-                Some(block.v.narrow(self.concat_dim, 0, pos_in_block)?)
+                Some(block_v.narrow(self.concat_dim, 0, pos_in_block)?)
             } else {
                 None
             };
             let v_after = if pos_in_block + tokens_in_block < self.block_size {
-                Some(block.v.narrow(
+                Some(block_v.narrow(
                     self.concat_dim,
                     pos_in_block + tokens_in_block,
                     self.block_size - pos_in_block - tokens_in_block,
@@ -514,7 +490,7 @@ impl KvCacheImpl for PagedKvCache {
             if let Some(after) = v_after {
                 v_parts.push(after);
             }
-            block.v = Tensor::cat(&v_parts, self.concat_dim)?;
+            block.v = Some(Tensor::cat(&v_parts, self.concat_dim)?);
 
             token_offset += tokens_in_block;
         }
@@ -538,8 +514,9 @@ impl KvCacheImpl for PagedKvCache {
         // Collect all blocks
         for &block_id in &self.block_table {
             if let Ok(block) = allocator.get_block(block_id) {
-                k_blocks.push(block.k.clone());
-                v_blocks.push(block.v.clone());
+                // A block that has never been written has no tensors yet.
+                k_blocks.push(block.k.clone()?);
+                v_blocks.push(block.v.clone()?);
             } else {
                 return None;
             }
@@ -622,7 +599,7 @@ mod tests {
     #[test]
     fn test_block_allocator_basic() -> Result<()> {
         let device = Device::Cpu;
-        let mut allocator = BlockAllocator::new(10, 64, 1, 32, 128, device, DType::F32);
+        let mut allocator = BlockAllocator::new(10, 64);
 
         let block_id = allocator.allocate()?;
         assert_eq!(allocator.num_allocated(), 1);
@@ -639,15 +616,7 @@ mod tests {
     #[test]
     fn test_paged_kv_cache_basic() -> Result<()> {
         let device = Device::Cpu;
-        let allocator = Arc::new(RwLock::new(BlockAllocator::new(
-            10,
-            64,
-            1,   // batch_size
-            32,  // num_heads
-            128, // head_dim
-            device.clone(),
-            DType::F32,
-        )));
+        let allocator = Arc::new(RwLock::new(BlockAllocator::new(10, 64)));
 
         let cache = PagedKvCache::new(allocator, 2);
         assert!(cache.is_empty());
@@ -659,15 +628,7 @@ mod tests {
     #[test]
     fn test_paged_kv_cache_fork_independent_growth() -> Result<()> {
         let device = Device::Cpu;
-        let allocator = Arc::new(RwLock::new(BlockAllocator::new(
-            10,
-            4, // Small block size for testing
-            1, // batch_size
-            2, // num_heads
-            4, // head_dim
-            device.clone(),
-            DType::F32,
-        )));
+        let allocator = Arc::new(RwLock::new(BlockAllocator::new(10, 4)));
 
         // Create initial cache and add prefix
         let mut cache1 = PagedKvCache::new(allocator.clone(), 2);
@@ -782,15 +743,7 @@ mod tests {
     #[test]
     fn test_paged_kv_cache_fork_ref_counting() -> Result<()> {
         let device = Device::Cpu;
-        let allocator = Arc::new(RwLock::new(BlockAllocator::new(
-            10,
-            4,
-            1, // batch_size
-            2, // num_heads
-            4, // head_dim
-            device.clone(),
-            DType::F32,
-        )));
+        let allocator = Arc::new(RwLock::new(BlockAllocator::new(10, 4)));
 
         // Create and populate cache
         let mut cache1 = PagedKvCache::new(allocator.clone(), 2);
@@ -833,15 +786,7 @@ mod tests {
     #[test]
     fn test_paged_kv_cache_fork_memory_sharing() -> Result<()> {
         let device = Device::Cpu;
-        let allocator = Arc::new(RwLock::new(BlockAllocator::new(
-            10,
-            4,
-            1, // batch_size
-            2, // num_heads
-            4, // head_dim
-            device.clone(),
-            DType::F32,
-        )));
+        let allocator = Arc::new(RwLock::new(BlockAllocator::new(10, 4)));
 
         // Create cache with prefix
         let mut cache1 = PagedKvCache::new(allocator.clone(), 2);
@@ -885,7 +830,7 @@ mod tests {
     #[test]
     fn test_block_allocator_ref_counting() -> Result<()> {
         let device = Device::Cpu;
-        let mut allocator = BlockAllocator::new(10, 64, 1, 32, 128, device, DType::F32);
+        let mut allocator = BlockAllocator::new(10, 64);
 
         let block_id = allocator.allocate()?;
         assert_eq!(allocator.get_block(block_id)?.ref_count, 1);

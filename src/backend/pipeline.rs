@@ -255,11 +255,6 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(
                 total_blocks,
                 block_size,
-                batch_size,
-                num_heads,
-                head_dim,
-                self.device.clone(),
-                dtype,
             )));
 
             // Build engine with block allocator

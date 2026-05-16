@@ -106,6 +106,15 @@ impl ContinuousBatchScheduler {
             max_decode_tokens = config.max_decode_tokens,
             "Creating continuous batch scheduler"
         );
+
+        // MemoryPool and BlockAllocator must agree on block_size; a mismatch means the
+        // admission-control estimate and the actual physical allocation use different units.
+        debug_assert_eq!(
+            memory_pool.read().block_size,
+            allocator.read().block_size(),
+            "MemoryPool block_size must equal BlockAllocator block_size"
+        );
+
         Self {
             batch_manager: BatchManager::new(config.max_prefill_batch, config.max_decode_batch),
             policy,
@@ -209,17 +218,24 @@ impl ContinuousBatchScheduler {
         }
     }
 
-    /// Get block tables for a batch of requests
+    /// Get block tables for a batch of requests.
+    ///
+    /// Returns the first layer's block table for each request as a representative.
+    /// Block IDs are sourced directly from the live `PagedKvCache` — not from
+    /// `RequestState::block_table`, which is no longer populated.
     pub fn get_block_tables(
         &self,
         request_ids: &[Uuid],
     ) -> Option<Vec<Vec<crate::models::kv_cache::BlockId>>> {
         let mut block_tables = Vec::with_capacity(request_ids.len());
         for id in request_ids {
-            if let Some(request) = self.batch_manager.get_request(id) {
-                block_tables.push(request.block_table.clone());
+            if let Some(caches) = self.paged_caches.get(id) {
+                let table = caches
+                    .first()
+                    .map(|c| c.block_table().to_vec())
+                    .unwrap_or_default();
+                block_tables.push(table);
             } else {
-                // If any request is missing, return None
                 return None;
             }
         }
@@ -275,39 +291,24 @@ impl ContinuousBatchScheduler {
                 drop(pool); // Release lock before calling batch_manager
 
                 // Admit the request (removes from queue, adds to active)
-                if let Some(mut request) = self.batch_manager.admit_request() {
+                if let Some(request) = self.batch_manager.admit_request() {
                     let request_id = request.id;
-
-                    // Allocate blocks from BlockAllocator for this request
-                    let mut allocator = self.block_allocator.write();
-                    let mut block_ids = Vec::new();
-                    for _ in 0..required_blocks {
-                        let block_id = allocator.allocate()?;
-                        block_ids.push(block_id);
-                    }
-                    drop(allocator);
-
-                    // Store block table in request
-                    request.block_table = block_ids;
-
-                    // Update the request in batch_manager
-                    if let Some(req_mut) = self.batch_manager.get_request_mut(&request_id) {
-                        req_mut.block_table = request.block_table.clone();
-                    }
 
                     // Check for prefix match for potential cache sharing
                     let prefix_match = self.find_prefix_match(&request.prompt_tokens);
 
-                    // Initialize PagedKvCache for this request (with optional prefix sharing via fork)
+                    // Initialize PagedKvCache for this request (with optional prefix sharing via fork).
+                    // PagedKvCache owns its own block table and allocates blocks lazily as tokens
+                    // are written — do NOT pre-allocate blocks here as well (that would cause
+                    // double allocation from the same BlockAllocator).
                     self.initialize_paged_cache(&request_id, prefix_match.as_ref())?;
 
-                    // Track allocated blocks for this request
+                    // Track how many MemoryPool blocks were reserved for admission control.
                     self.allocated_blocks.insert(request_id, required_blocks);
                     trace!(
                         request_id = %request_id,
                         required_blocks,
-                        allocated_block_ids = ?request.block_table,
-                        "Allocated memory blocks and initialized PagedKvCache for request"
+                        "Reserved MemoryPool blocks and initialized PagedKvCache for request"
                     );
                     admitted.push(request_id);
                 } else {
@@ -388,44 +389,24 @@ impl ContinuousBatchScheduler {
 
     /// Mark a request as completed and free its memory
     pub fn complete_request(&mut self, request_id: &Uuid) -> Result<Vec<u32>> {
-        // Get block table for this request before completing
-        let block_table = if let Some(request) = self.batch_manager.get_request(request_id) {
-            request.block_table.clone()
-        } else {
-            Vec::new()
-        };
-
-        // Get allocated blocks for this request
+        // Get allocated MemoryPool blocks for this request
         let blocks_to_free = self.allocated_blocks.remove(request_id).unwrap_or(0);
 
         // Complete the request in batch manager
         let tokens = self.batch_manager.complete_request(request_id)?;
 
-        // Free blocks from BlockAllocator
-        if !block_table.is_empty() {
-            let mut allocator = self.block_allocator.write();
-            for block_id in &block_table {
-                allocator.free(*block_id)?;
-            }
-            trace!(
-                request_id = %request_id,
-                freed_block_ids = ?block_table,
-                "Freed BlockAllocator blocks for completed request"
-            );
-        }
-
-        // Free memory pool blocks
+        // Free memory pool reservation
         if blocks_to_free > 0 {
             let mut pool = self.memory_pool.write();
             pool.free(blocks_to_free);
             trace!(
                 request_id = %request_id,
                 freed_blocks = blocks_to_free,
-                "Freed memory pool blocks for completed request"
+                "Freed MemoryPool reservation for completed request"
             );
         }
 
-        // Clean up PagedKvCache instances
+        // Drop PagedKvCache — its Drop impl calls reset() which frees all BlockAllocator blocks.
         self.paged_caches.remove(request_id);
 
         Ok(tokens)
@@ -433,44 +414,24 @@ impl ContinuousBatchScheduler {
 
     /// Mark a request as failed and free its memory
     pub fn fail_request(&mut self, request_id: &Uuid, error: String) -> Result<()> {
-        // Get block table for this request before failing
-        let block_table = if let Some(request) = self.batch_manager.get_request(request_id) {
-            request.block_table.clone()
-        } else {
-            Vec::new()
-        };
-
-        // Get allocated blocks for this request
+        // Get allocated MemoryPool blocks for this request
         let blocks_to_free = self.allocated_blocks.remove(request_id).unwrap_or(0);
 
         // Fail the request in batch manager
         self.batch_manager.fail_request(request_id, error)?;
 
-        // Free blocks from BlockAllocator
-        if !block_table.is_empty() {
-            let mut allocator = self.block_allocator.write();
-            for block_id in &block_table {
-                allocator.free(*block_id)?;
-            }
-            trace!(
-                request_id = %request_id,
-                freed_block_ids = ?block_table,
-                "Freed BlockAllocator blocks for failed request"
-            );
-        }
-
-        // Free memory pool blocks
+        // Free memory pool reservation
         if blocks_to_free > 0 {
             let mut pool = self.memory_pool.write();
             pool.free(blocks_to_free);
             trace!(
                 request_id = %request_id,
                 freed_blocks = blocks_to_free,
-                "Freed memory pool blocks for failed request"
+                "Freed MemoryPool reservation for failed request"
             );
         }
 
-        // Clean up PagedKvCache instances
+        // Drop PagedKvCache — its Drop impl calls reset() which frees all BlockAllocator blocks.
         self.paged_caches.remove(request_id);
 
         Ok(())
@@ -704,15 +665,7 @@ mod tests {
         }));
 
         // Create block allocator for paged KV cache
-        let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(
-            1000,
-            16,
-            1,
-            32,
-            128,
-            Device::Cpu,
-            candle_core::DType::BF16,
-        )));
+        let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(1000, 16)));
 
         let config = BatchConfig::default();
         let num_layers = 32;
@@ -908,15 +861,7 @@ mod tests {
         let tokenizer = Arc::new(Tokenizer::from_file("tokenizer.json").unwrap_or_else(|_| {
             tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
         }));
-        let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(
-            100,
-            16,
-            1,
-            32,
-            128,
-            Device::Cpu,
-            candle_core::DType::BF16,
-        )));
+        let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(100, 16)));
         let config = BatchConfig::default();
         let mut scheduler = ContinuousBatchScheduler::new(
             SchedulingPolicy::FCFS,
@@ -1287,15 +1232,7 @@ mod tests {
         let tokenizer = Arc::new(Tokenizer::from_file("tokenizer.json").unwrap_or_else(|_| {
             tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
         }));
-        let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(
-            500,
-            16,
-            1,
-            8,
-            64,
-            candle_core::Device::Cpu,
-            candle_core::DType::BF16,
-        )));
+        let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(500, 16)));
         let config = BatchConfig::default();
         let mut scheduler = ContinuousBatchScheduler::new(
             SchedulingPolicy::FCFS,
