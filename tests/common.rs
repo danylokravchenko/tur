@@ -1,19 +1,15 @@
 use candle_core::{DType, Device};
-/// Create a test model and tokenizer using the ModelFactory
+/// Create a test model factory
 use tur::{ModelFactory, models::qwen3::ModelForCausalLM};
 
-pub fn create_test_model() -> candle_core::Result<(ModelForCausalLM, tokenizers::Tokenizer, Device)>
-{
+pub fn create_test_factory() -> (ModelFactory<ModelForCausalLM>, Device, DType) {
     let device = Device::Cpu;
     let dtype = DType::F32;
 
     let model_id = Some("Qwen3-0.6B".to_string());
     let quantization = Some("Q4_K_M".to_string());
 
-    let factory = ModelFactory::new(model_id, None, quantization, device.clone(), dtype);
-    let (model, tokenizer) = factory
-        .create_model(None)
-        .map_err(|e| candle_core::Error::Msg(format!("Failed to create model: {}", e)))?;
-
-    Ok((model, tokenizer, device))
+    let factory =
+        ModelFactory::<ModelForCausalLM>::new(model_id, None, quantization, device.clone(), dtype);
+    (factory, device, dtype)
 }

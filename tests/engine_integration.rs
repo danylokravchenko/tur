@@ -3,12 +3,12 @@ use tur::backend::engine::InferenceEngine;
 use uuid::Uuid;
 
 mod common;
-use common::create_test_model;
+use common::create_test_factory;
 
 #[test]
 fn test_inference_engine_prefill_batch() {
-    let (model, _tokenizer, device) = create_test_model().unwrap();
-    let mut engine = InferenceEngine::builder(model, device).build();
+    let (factory, device, _) = create_test_factory();
+    let (mut engine, _tokenizer) = InferenceEngine::builder(&factory, device).build().unwrap();
 
     // Create batch of 3 requests with different prompts
     let batch_tokens = vec![
@@ -35,8 +35,8 @@ fn test_inference_engine_prefill_batch() {
 
 #[test]
 fn test_inference_engine_decode_batch() {
-    let (model, _tokenizer, device) = create_test_model().unwrap();
-    let mut engine = InferenceEngine::builder(model, device).build();
+    let (factory, device, _) = create_test_factory();
+    let (mut engine, _tokenizer) = InferenceEngine::builder(&factory, device).build().unwrap();
 
     // First do prefill to populate KV cache
     let id1 = Uuid::new_v4();
@@ -78,17 +78,20 @@ fn test_inference_engine_decode_batch() {
 
 #[test]
 fn test_inference_engine_batch_consistency() {
-    let (model1, _tokenizer, device) = create_test_model().unwrap();
+    let (factory, device, _) = create_test_factory();
 
     // Single request
     let tokens = vec![1u32, 2, 3, 4, 5];
-    let mut engine1 = InferenceEngine::builder(model1, device.clone()).build();
+    let (mut engine1, _tokenizer) = InferenceEngine::builder(&factory, device.clone())
+        .build()
+        .unwrap();
     let (single_token, _, _, _) = engine1.prefill(&tokens).unwrap();
 
     // Same request in batch
     let id = Uuid::new_v4();
-    let (model2, _tokenizer, device) = create_test_model().unwrap();
-    let mut engine2 = InferenceEngine::builder(model2, device).build();
+    let (mut engine2, _tokenizer) = InferenceEngine::builder(&factory, device.clone())
+        .build()
+        .unwrap();
     let batch_results = engine2.prefill_batch(&[(id, tokens.clone())]).unwrap();
 
     assert_eq!(batch_results.len(), 1);
@@ -104,8 +107,8 @@ fn test_inference_engine_batch_consistency() {
 
 #[test]
 fn test_inference_engine_empty_batch() {
-    let (model, _tokenizer, device) = create_test_model().unwrap();
-    let mut engine = InferenceEngine::builder(model, device).build();
+    let (factory, device, _) = create_test_factory();
+    let (mut engine, _tokenizer) = InferenceEngine::builder(&factory, device).build().unwrap();
 
     // Empty batch should return empty results
     let result = engine.prefill_batch(&[]);
@@ -119,8 +122,8 @@ fn test_inference_engine_empty_batch() {
 
 #[test]
 fn test_inference_engine_large_batch() {
-    let (model, _tokenizer, device) = create_test_model().unwrap();
-    let mut engine = InferenceEngine::builder(model, device).build();
+    let (factory, device, _) = create_test_factory();
+    let (mut engine, _) = InferenceEngine::builder(&factory, device).build().unwrap();
 
     // Create larger batch (8 requests)
     let batch_size = 8;
@@ -149,8 +152,8 @@ fn test_inference_engine_large_batch() {
 
 #[test]
 fn test_inference_engine_variable_length_batch() {
-    let (model, _tokenizer, device) = create_test_model().unwrap();
-    let mut engine = InferenceEngine::builder(model, device).build();
+    let (factory, device, _) = create_test_factory();
+    let (mut engine, _) = InferenceEngine::builder(&factory, device).build().unwrap();
 
     // Create batch with very different sequence lengths
     let batch_tokens = vec![

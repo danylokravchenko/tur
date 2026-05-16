@@ -10,6 +10,7 @@ use crate::{
     Result, TurError,
     backend::{
         batch_manager::{BatchManager, RequestPhase, RequestState},
+        factory::ModelConstructor,
         memory_pool::MemoryPool,
     },
 };
@@ -284,7 +285,7 @@ impl ContinuousBatchScheduler {
 
     /// Main scheduling iteration - admits requests, forms batches, and executes them
     /// Returns list of completed requests with their generated tokens
-    pub fn schedule_iteration<T: crate::models::ModelImpl>(
+    pub fn schedule_iteration<T: ModelConstructor>(
         &mut self,
         engine: &mut crate::backend::engine::InferenceEngine<T>,
     ) -> Result<Vec<(Uuid, Vec<u32>)>> {

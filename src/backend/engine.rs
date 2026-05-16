@@ -2,13 +2,17 @@ use candle_core::{DType, Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
 use parking_lot::RwLock;
 use std::sync::Arc;
+use tokenizers::Tokenizer;
 use tracing::{debug, trace};
 use uuid::Uuid;
 
 use crate::{
-    Result, TurError,
-    backend::prefix_cache::{PrefixCache, PrefixCacheEntry, SharedPrefixCache},
-    backend::tokenizer::{LogitsSampler, TokenOutputStream},
+    ProgressReporter, Result, TurError,
+    backend::{
+        factory::{ModelConstructor, ModelFactory},
+        prefix_cache::{PrefixCache, PrefixCacheEntry, SharedPrefixCache},
+        tokenizer::{LogitsSampler, TokenOutputStream},
+    },
     models::ModelImpl,
 };
 
@@ -24,8 +28,8 @@ pub struct InferenceEngine<T: ModelImpl> {
 }
 
 /// Builder for InferenceEngine
-pub struct InferenceEngineBuilder<T: ModelImpl> {
-    model: T,
+pub struct InferenceEngineBuilder<'a, T: ModelConstructor> {
+    factory: &'a ModelFactory<T>,
     device: Device,
     sampler: Option<Box<dyn LogitsSampler>>,
     seed: u64,
@@ -34,12 +38,13 @@ pub struct InferenceEngineBuilder<T: ModelImpl> {
     repeat_penalty: f32,
     repeat_last_n: usize,
     prefix_cache: Option<SharedPrefixCache>,
+    progress: Option<ProgressReporter>,
 }
 
-impl<T: ModelImpl> InferenceEngineBuilder<T> {
-    pub fn new(model: T, device: Device) -> Self {
+impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
+    pub fn new(factory: &'a ModelFactory<T>, device: Device) -> Self {
         Self {
-            model,
+            factory,
             device,
             sampler: None,
             seed: 299_792_458, // Default seed
@@ -48,6 +53,7 @@ impl<T: ModelImpl> InferenceEngineBuilder<T> {
             repeat_penalty: 1.0,
             repeat_last_n: 64,
             prefix_cache: None,
+            progress: None,
         }
     }
 
@@ -97,31 +103,53 @@ impl<T: ModelImpl> InferenceEngineBuilder<T> {
         self
     }
 
-    pub fn build(self) -> InferenceEngine<T> {
+    /// Set progress reporter for model loading
+    pub fn with_progress(mut self, progress: ProgressReporter) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    pub fn build(self) -> Result<(InferenceEngine<T>, Tokenizer)> {
+        // Log engine configuration
+        debug!(
+            seed = self.seed,
+            temp = ?self.temp,
+            top_p = ?self.top_p,
+            repeat_penalty = self.repeat_penalty,
+            repeat_last_n = self.repeat_last_n,
+            prefix_cache = ?self.prefix_cache,
+            has_custom_sampler = self.sampler.is_some(),
+            "building inference engine with configuration"
+        );
+
+        // Create model using factory
+        let (model, tokenizer) = self.factory.create_model(self.progress.as_ref())?;
+
         let sampler: Box<dyn LogitsSampler> = if let Some(sampler) = self.sampler {
             sampler
         } else {
             Box::new(LogitsProcessor::new(self.seed, self.temp, self.top_p))
         };
         debug!(
-            model_name = self.model.name(),
-            "Created a new inference engine for model",
+            model_name = model.name(),
+            "created inference engine for model",
         );
-        InferenceEngine {
-            model: self.model,
+        let engine = InferenceEngine {
+            model,
             device: self.device,
             sampler,
             repeat_penalty: self.repeat_penalty,
             repeat_last_n: self.repeat_last_n,
             prefix_cache: self.prefix_cache,
-        }
+        };
+        Ok((engine, tokenizer))
     }
 }
 
-impl<T: ModelImpl> InferenceEngine<T> {
-    /// Create a new builder for InferenceEngine
-    pub fn builder(model: T, device: Device) -> InferenceEngineBuilder<T> {
-        InferenceEngineBuilder::new(model, device)
+impl<T: ModelConstructor> InferenceEngine<T> {
+    /// Create a new builder for InferenceEngine from factory
+    pub fn builder(factory: &'_ ModelFactory<T>, device: Device) -> InferenceEngineBuilder<'_, T> {
+        InferenceEngineBuilder::new(factory, device)
     }
 
     /// Get EOS tokens from tokenizer

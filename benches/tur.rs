@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 use tur::Downloader;
+use tur::ModelFactory;
 use tur::backend::InferenceEngine;
 use tur::backend::prefix_cache::PrefixCache;
 use tur::backend::tokenizer::TokenOutputStream;
 use tur::models::{ModelImpl, Qwen35ModelForCausalLM};
-use tur::weights::VarBuilderX;
 
 const MODEL_ID: &str = "Qwen3-0.6B";
 const QUANTIZATION: &str = "Q4_K_M";
@@ -69,36 +69,18 @@ fn benchmark_prompt<T: ModelImpl>(prompt: &str) -> String {
     T::format_prompt(prompt, false)
 }
 
-/// Load model and tokenizer (cold start measurement)
-fn load_model_and_tokenizer() -> (Qwen35ModelForCausalLM, Tokenizer, Device) {
+/// Create a model factory for benchmarking
+fn create_benchmark_factory() -> ModelFactory<Qwen35ModelForCausalLM> {
     let device = Device::Cpu;
     let dtype = DType::F32;
 
-    let downloader = Downloader::new(
+    ModelFactory::new(
         Some(MODEL_ID.to_string()),
         None,
         Some(QUANTIZATION.to_string()),
-    );
-    let (paths, gguf) = downloader
-        .prepare_model_weights()
-        .expect("failed to prepare model weights for benchmark");
-
-    let config_path = paths.get_config_filename();
-    let config_content =
-        std::fs::read_to_string(&config_path).expect("failed to read benchmark model config");
-    let config: tur::models::qwen3::Config =
-        serde_json::from_str(&config_content).expect("failed to parse benchmark model config");
-
-    let tokenizer_path = paths.get_tokenizer_filename();
-    let tokenizer =
-        Tokenizer::from_file(&tokenizer_path).expect("failed to load benchmark tokenizer");
-
-    let vb = VarBuilderX::new(&paths, gguf, dtype, &device)
-        .expect("failed to create benchmark var builder");
-    let model =
-        Qwen35ModelForCausalLM::new(&config, vb).expect("failed to initialize benchmark model");
-
-    (model, tokenizer, device)
+        device,
+        dtype,
+    )
 }
 
 /// Benchmark prefill phase: prompt encoding + first forward pass
@@ -113,17 +95,17 @@ fn bench_prefill(c: &mut Criterion) {
 
         // Measure cold start (model loading)
         let cold_start = Instant::now();
-        let (model, tokenizer, device) = load_model_and_tokenizer();
-        let cold_start_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
-        println!("Cold start for '{}': {:.2} ms", prompt_name, cold_start_ms);
-
-        let mut engine = InferenceEngine::builder(model, device)
+        let factory = create_benchmark_factory();
+        let (mut engine, tokenizer) = InferenceEngine::builder(&factory, factory.device().clone())
             .seed(BENCHMARK_SEED)
             .temperature(TEMPERATURE.unwrap_or(0.0))
             .top_p(TOP_P.unwrap_or(1.0))
             .repeat_penalty(REPEAT_PENALTY)
             .repeat_last_n(REPEAT_LAST_N)
-            .build();
+            .build()
+            .expect("failed to build engine");
+        let cold_start_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
+        println!("Cold start for '{}': {:.2} ms", prompt_name, cold_start_ms);
 
         let tokenizer_stream = TokenOutputStream::new(tokenizer);
 
@@ -186,14 +168,15 @@ fn bench_decode(c: &mut Criterion) {
     for (prompt_name, prompt_body) in BENCHMARK_PROMPTS {
         let prompt = benchmark_prompt::<Qwen35ModelForCausalLM>(prompt_body);
 
-        let (model, tokenizer, device) = load_model_and_tokenizer();
-        let mut engine = InferenceEngine::builder(model, device)
+        let factory = create_benchmark_factory();
+        let (mut engine, tokenizer) = InferenceEngine::builder(&factory, factory.device().clone())
             .seed(BENCHMARK_SEED)
             .temperature(TEMPERATURE.unwrap_or(0.0))
             .top_p(TOP_P.unwrap_or(1.0))
             .repeat_penalty(REPEAT_PENALTY)
             .repeat_last_n(REPEAT_LAST_N)
-            .build();
+            .build()
+            .expect("failed to build engine");
 
         let tokenizer_stream = TokenOutputStream::new(tokenizer);
         let tokens = tokenizer_stream
@@ -265,14 +248,16 @@ fn bench_full_pipeline(c: &mut Criterion) {
                         let start = Instant::now();
 
                         // Cold start
-                        let (model, tokenizer, device) = load_model_and_tokenizer();
-                        let mut engine = InferenceEngine::builder(model, device)
-                            .seed(BENCHMARK_SEED)
-                            .temperature(TEMPERATURE.unwrap_or(0.0))
-                            .top_p(TOP_P.unwrap_or(1.0))
-                            .repeat_penalty(REPEAT_PENALTY)
-                            .repeat_last_n(REPEAT_LAST_N)
-                            .build();
+                        let factory = create_benchmark_factory();
+                        let (mut engine, tokenizer) =
+                            InferenceEngine::builder(&factory, factory.device().clone())
+                                .seed(BENCHMARK_SEED)
+                                .temperature(TEMPERATURE.unwrap_or(0.0))
+                                .top_p(TOP_P.unwrap_or(1.0))
+                                .repeat_penalty(REPEAT_PENALTY)
+                                .repeat_last_n(REPEAT_LAST_N)
+                                .build()
+                                .expect("failed to build engine");
 
                         let tokenizer_stream = TokenOutputStream::new(tokenizer);
                         let tokens = tokenizer_stream
@@ -342,13 +327,14 @@ fn bench_prefix_cache(c: &mut Criterion) {
 
     // Benchmark without cache (baseline)
     {
-        let (model, tokenizer, device) = load_model_and_tokenizer();
-        let mut engine = InferenceEngine::builder(model, device)
+        let factory = create_benchmark_factory();
+        let (mut engine, tokenizer) = InferenceEngine::builder(&factory, factory.device().clone())
             .seed(BENCHMARK_SEED)
             .temperature(TEMPERATURE.unwrap_or(0.0))
             .repeat_penalty(REPEAT_PENALTY)
             .repeat_last_n(REPEAT_LAST_N)
-            .build();
+            .build()
+            .expect("failed to build engine");
 
         let tokenizer_stream = TokenOutputStream::new(tokenizer);
 
@@ -400,15 +386,16 @@ fn bench_prefix_cache(c: &mut Criterion) {
 
     // Benchmark with cache (optimized)
     {
-        let (model, tokenizer, device) = load_model_and_tokenizer();
+        let factory = create_benchmark_factory();
         let cache = Arc::new(RwLock::new(PrefixCache::new(100, 2048)));
-        let mut engine = InferenceEngine::builder(model, device)
+        let (mut engine, tokenizer) = InferenceEngine::builder(&factory, factory.device().clone())
             .seed(BENCHMARK_SEED)
             .temperature(TEMPERATURE.unwrap_or(0.0))
             .repeat_penalty(REPEAT_PENALTY)
             .repeat_last_n(REPEAT_LAST_N)
             .with_shared_prefix_cache(cache.clone())
-            .build();
+            .build()
+            .expect("failed to build engine");
 
         let tokenizer_stream = TokenOutputStream::new(tokenizer);
 
@@ -504,15 +491,16 @@ fn bench_prefix_cache_lengths(c: &mut Criterion) {
     let prefix_lengths = [10, 25, 50, 75, 100];
 
     for &prefix_len in &prefix_lengths {
-        let (model, tokenizer, device) = load_model_and_tokenizer();
+        let factory = create_benchmark_factory();
         let cache = Arc::new(RwLock::new(PrefixCache::new(100, 2048)));
-        let mut engine = InferenceEngine::builder(model, device)
+        let (mut engine, tokenizer) = InferenceEngine::builder(&factory, factory.device().clone())
             .seed(BENCHMARK_SEED)
             .temperature(TEMPERATURE.unwrap_or(0.0))
             .repeat_penalty(REPEAT_PENALTY)
             .repeat_last_n(REPEAT_LAST_N)
             .with_shared_prefix_cache(cache)
-            .build();
+            .build()
+            .expect("failed to build engine");
 
         let tokenizer_stream = TokenOutputStream::new(tokenizer);
 

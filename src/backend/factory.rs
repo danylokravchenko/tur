@@ -2,8 +2,7 @@ use candle_core::{DType, Device};
 use tokenizers::Tokenizer;
 use tracing::{debug, trace};
 
-use crate::models::Qwen35ModelForCausalLM;
-use crate::models::qwen3::Config;
+use crate::models::ModelImpl;
 use crate::weights::{Downloader, VarBuilderX};
 use crate::{ProgressReporter, Result};
 
@@ -15,15 +14,35 @@ use crate::{ProgressReporter, Result};
 /// - Loading tokenizers
 /// - Creating VarBuilders for different quantization formats
 /// - Instantiating the model
-pub struct ModelFactory {
+///
+/// # Type Parameters
+/// * `T` - The model type implementing [`ModelImpl`] trait
+pub struct ModelFactory<T: ModelImpl> {
     model_id: Option<String>,
     weight_path: Option<String>,
     quantization: Option<String>,
     device: Device,
     dtype: DType,
+    _phantom: std::marker::PhantomData<T>,
 }
 
-impl ModelFactory {
+/// Trait for model constructors that can be instantiated from configuration and weights
+pub trait ModelConstructor: ModelImpl + Sized {
+    /// The configuration type for this model
+    type Config;
+
+    /// Create a new model instance with progress reporting
+    fn new_with_progress(
+        config: &Self::Config,
+        vb: VarBuilderX,
+        progress: Option<&ProgressReporter>,
+    ) -> Result<Self>;
+
+    /// Load the model configuration from file paths
+    fn load_config(paths: &crate::weights::ModelPaths) -> Result<Self::Config>;
+}
+
+impl<T: ModelConstructor> ModelFactory<T> {
     /// Creates a new ModelFactory with the specified configuration.
     ///
     /// # Arguments
@@ -54,7 +73,13 @@ impl ModelFactory {
             quantization,
             device,
             dtype,
+            _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Returns a reference to the device used by this factory.
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     /// Creates and loads a model with its tokenizer.
@@ -71,10 +96,7 @@ impl ModelFactory {
     ///
     /// # Returns
     /// A tuple containing the loaded model and tokenizer
-    pub fn create_model(
-        &self,
-        progress: Option<&ProgressReporter>,
-    ) -> Result<(Qwen35ModelForCausalLM, Tokenizer)> {
+    pub fn create_model(&self, progress: Option<&ProgressReporter>) -> Result<(T, Tokenizer)> {
         debug!(
             device = ?self.device,
             dtype = ?self.dtype,
@@ -126,26 +148,9 @@ impl ModelFactory {
     }
 
     /// Loads and parses the model configuration.
-    fn load_config(&self, paths: &crate::weights::ModelPaths) -> Result<Config> {
+    fn load_config(&self, paths: &crate::weights::ModelPaths) -> Result<T::Config> {
         trace!("Step 2: Loading model configuration");
-
-        let config_path = paths.get_config_filename();
-        trace!(config_path = %config_path.display(), "Config file path");
-
-        let config_content = std::fs::read_to_string(&config_path)?;
-        trace!("Config file read successfully");
-
-        let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
-        let config: Config = serde_json::from_value(config_json)?;
-
-        debug!(
-            num_layers = config.num_hidden_layers,
-            hidden_size = config.hidden_size,
-            "Model Config loaded"
-        );
-        trace!("Configuration loaded successfully");
-
-        Ok(config)
+        T::load_config(paths)
     }
 
     /// Loads the tokenizer from the prepared weights.
@@ -207,14 +212,14 @@ impl ModelFactory {
     /// Instantiates the model from the VarBuilder.
     fn instantiate_model(
         &self,
-        config: &Config,
+        config: &T::Config,
         vb: VarBuilderX,
         progress: Option<&ProgressReporter>,
         gguf: bool,
-    ) -> Result<Qwen35ModelForCausalLM> {
+    ) -> Result<T> {
         trace!("Step 5: Instantiating model");
 
-        let model = Qwen35ModelForCausalLM::new_with_progress(config, vb, progress)?;
+        let model = T::new_with_progress(config, vb, progress)?;
 
         if gguf {
             debug!("✓ Loaded quantized model (GGUF format)");
@@ -227,6 +232,42 @@ impl ModelFactory {
     }
 }
 
+// Implement ModelConstructor for Qwen35ModelForCausalLM
+impl ModelConstructor for crate::models::Qwen35ModelForCausalLM {
+    type Config = crate::models::qwen3::Config;
+
+    fn new_with_progress(
+        config: &Self::Config,
+        vb: VarBuilderX,
+        progress: Option<&ProgressReporter>,
+    ) -> Result<Self> {
+        crate::models::Qwen35ModelForCausalLM::new_with_progress(config, vb, progress)
+            .map_err(|e| e.into())
+    }
+
+    fn load_config(paths: &crate::weights::ModelPaths) -> Result<Self::Config> {
+        trace!("Loading Qwen3 model configuration");
+
+        let config_path = paths.get_config_filename();
+        trace!(config_path = %config_path.display(), "Config file path");
+
+        let config_content = std::fs::read_to_string(&config_path)?;
+        trace!("Config file read successfully");
+
+        let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
+        let config: Self::Config = serde_json::from_value(config_json)?;
+
+        debug!(
+            num_layers = config.num_hidden_layers,
+            hidden_size = config.hidden_size,
+            "Model Config loaded"
+        );
+        trace!("Configuration loaded successfully");
+
+        Ok(config)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,7 +275,7 @@ mod tests {
     #[test]
     fn test_model_factory_creation() {
         let device = Device::Cpu;
-        let factory = ModelFactory::new(
+        let factory = ModelFactory::<crate::models::Qwen35ModelForCausalLM>::new(
             Some("Qwen3-0.6B".to_string()),
             None,
             Some("Q4_K_M".to_string()),

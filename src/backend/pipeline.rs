@@ -3,17 +3,18 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 use uuid::Uuid;
 
 use crate::{
     ProgressReporter, Result, TurError,
     backend::{
         engine::InferenceEngine,
+        factory::{ModelConstructor, ModelFactory},
         scheduler::{ContinuousBatchScheduler, SchedulingPolicy},
         tokenizer::TokenOutputStream,
     },
-    models::{ModelImpl, kv_cache::BlockAllocator},
+    models::kv_cache::BlockAllocator,
 };
 
 /// Request struct for text generation, suitable for scheduling and prefix-caching
@@ -59,7 +60,7 @@ pub struct GenerationResult {
 }
 
 /// High-level text generation pipeline with output handling and continuous batching support
-pub struct TextGeneration<T: ModelImpl> {
+pub struct TextGeneration<T: ModelConstructor> {
     engine: InferenceEngine<T>,
     tokenizer: TokenOutputStream,
     progress: Option<ProgressReporter>,
@@ -71,9 +72,8 @@ pub struct TextGeneration<T: ModelImpl> {
 }
 
 /// Builder for TextGeneration
-pub struct TextGenerationBuilder<T: ModelImpl> {
-    model: T,
-    tokenizer: Tokenizer,
+pub struct TextGenerationBuilder<'a, T: ModelConstructor> {
+    factory: &'a ModelFactory<T>,
     device: Device,
     seed: u64,
     temp: Option<f64>,
@@ -82,6 +82,7 @@ pub struct TextGenerationBuilder<T: ModelImpl> {
     repeat_last_n: usize,
     progress: Option<ProgressReporter>,
     emit_output: bool,
+    prefix_cache: Option<super::prefix_cache::SharedPrefixCache>,
     // Batching configuration
     enable_batching: bool,
     max_batch_size: usize,
@@ -90,11 +91,10 @@ pub struct TextGenerationBuilder<T: ModelImpl> {
     scheduling_policy: SchedulingPolicy,
 }
 
-impl<T: ModelImpl> TextGenerationBuilder<T> {
-    pub fn new(model: T, tokenizer: Tokenizer, device: Device) -> Self {
+impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
+    pub fn new(factory: &'a ModelFactory<T>, device: Device) -> Self {
         Self {
-            model,
-            tokenizer,
+            factory,
             device,
             seed: 299_792_458,
             temp: None,
@@ -103,6 +103,7 @@ impl<T: ModelImpl> TextGenerationBuilder<T> {
             repeat_last_n: 64,
             progress: None,
             emit_output: true,
+            prefix_cache: None,
             enable_batching: false,
             max_batch_size: 16,
             max_prefill_batch: 8,
@@ -146,6 +147,22 @@ impl<T: ModelImpl> TextGenerationBuilder<T> {
         self
     }
 
+    pub fn with_prefix_cache(mut self, max_entries: usize, max_token_length: usize) -> Self {
+        self.prefix_cache = Some(Arc::new(RwLock::new(
+            super::prefix_cache::PrefixCache::new(max_entries, max_token_length),
+        )));
+        self
+    }
+
+    /// Use a shared prefix cache instance
+    pub fn with_shared_prefix_cache(
+        mut self,
+        cache: super::prefix_cache::SharedPrefixCache,
+    ) -> Self {
+        self.prefix_cache = Some(cache);
+        self
+    }
+
     pub fn enable_batching(mut self, enable: bool) -> Self {
         self.enable_batching = enable;
         self
@@ -172,18 +189,71 @@ impl<T: ModelImpl> TextGenerationBuilder<T> {
     }
 
     pub fn build(self) -> TextGeneration<T> {
+        // Log pipeline configuration
+        debug!(
+            seed = self.seed,
+            temp = ?self.temp,
+            top_p = ?self.top_p,
+            repeat_penalty = self.repeat_penalty,
+            repeat_last_n = self.repeat_last_n,
+            emit_output = self.emit_output,
+            has_prefix_cache = ?self.prefix_cache,
+            enable_batching = self.enable_batching,
+            max_batch_size = self.max_batch_size,
+            max_prefill_batch = self.max_prefill_batch,
+            max_decode_batch = self.max_decode_batch,
+            scheduling_policy = ?self.scheduling_policy,
+            "building text generation pipeline with configuration"
+        );
+
+        let mut engine_builder = InferenceEngine::builder(self.factory, self.device.clone())
+            .seed(self.seed)
+            .repeat_penalty(self.repeat_penalty)
+            .repeat_last_n(self.repeat_last_n);
+
+        if let Some(temp) = self.temp {
+            engine_builder = engine_builder.temperature(temp);
+        }
+        if let Some(top_p) = self.top_p {
+            engine_builder = engine_builder.top_p(top_p);
+        }
+        if let Some(progress) = &self.progress {
+            engine_builder = engine_builder.with_progress(progress.clone());
+        }
+        if let Some(prefix_cache) = &self.prefix_cache {
+            engine_builder = engine_builder.with_shared_prefix_cache(prefix_cache.clone());
+        }
+
+        let (engine, tokenizer) = engine_builder.build().expect("Failed to build engine");
+
         // Initialize batching components if enabled
         let (scheduler, tokenizer_arc, _block_allocator) = if self.enable_batching {
-            let tokenizer_arc = Arc::new(self.tokenizer.clone());
+            let tokenizer_arc = Arc::new(tokenizer.clone());
 
             // Create BlockAllocator for paged KV cache
             // TODO: Make these configurable - should match model architecture
-            let total_blocks = 1024; // Number of blocks
-            let block_size = 64; // Tokens per block
-            let batch_size = 1; // Batch size for KV tensors
-            let num_heads = 32; // Number of attention heads
-            let head_dim = 128; // Head dimension
-            let dtype = DType::BF16; // Data type
+            let total_blocks = 1024;
+            let block_size = 64;
+            let batch_size = 1;
+            let num_heads = 32;
+            let head_dim = 128;
+            let dtype = DType::BF16;
+            let max_decode_tokens = 4096;
+            let max_prefill_tokens = 2048;
+            let memory_pool_size_bytes = 8 * 1024 * 1024 * 1024;
+
+            debug!(
+                total_blocks,
+                block_size,
+                batch_size,
+                num_heads,
+                head_dim,
+                dtype = ?dtype,
+                memory_pool_size_bytes,
+                max_prefill_tokens,
+                max_decode_tokens,
+                "initializing continuous batching components"
+            );
 
             let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(
                 total_blocks,
@@ -198,11 +268,11 @@ impl<T: ModelImpl> TextGenerationBuilder<T> {
             // Create a simple memory pool for batching
             // TODO: Make these configurable
             let memory_pool = Arc::new(RwLock::new(crate::backend::memory_pool::MemoryPool::new(
-                8 * 1024 * 1024 * 1024, // 8GB
-                64,
+                memory_pool_size_bytes, // 8GB
+                block_size,
                 32,
-                32,
-                128,
+                num_heads,
+                head_dim,
                 2,
                 self.device.clone(),
             )));
@@ -210,8 +280,8 @@ impl<T: ModelImpl> TextGenerationBuilder<T> {
             let batch_config = crate::backend::scheduler::BatchConfig {
                 max_prefill_batch: self.max_prefill_batch,
                 max_decode_batch: self.max_decode_batch,
-                max_prefill_tokens: 2048,
-                max_decode_tokens: 4096,
+                max_prefill_tokens,
+                max_decode_tokens,
             };
 
             let scheduler = ContinuousBatchScheduler::new(
@@ -227,27 +297,15 @@ impl<T: ModelImpl> TextGenerationBuilder<T> {
                 Some(block_allocator.clone()),
             )
         } else {
+            debug!("batching disabled, using single-request mode");
             (None, None, None)
         };
 
-        // Build engine with model factory and optional block allocator
-        let mut engine_builder = InferenceEngine::builder(self.model, self.device.clone())
-            .seed(self.seed)
-            .repeat_penalty(self.repeat_penalty)
-            .repeat_last_n(self.repeat_last_n);
-
-        if let Some(temp) = self.temp {
-            engine_builder = engine_builder.temperature(temp);
-        }
-        if let Some(top_p) = self.top_p {
-            engine_builder = engine_builder.top_p(top_p);
-        }
-
-        let engine = engine_builder.build();
+        debug!("text generation pipeline built successfully");
 
         TextGeneration {
             engine,
-            tokenizer: TokenOutputStream::new(self.tokenizer),
+            tokenizer: TokenOutputStream::new(tokenizer),
             progress: self.progress,
             emit_output: self.emit_output,
             scheduler,
@@ -257,27 +315,10 @@ impl<T: ModelImpl> TextGenerationBuilder<T> {
     }
 }
 
-impl<T: ModelImpl> TextGeneration<T> {
-    /// Create a new builder for TextGeneration
-    pub fn builder(model: T, tokenizer: Tokenizer, device: Device) -> TextGenerationBuilder<T> {
-        TextGenerationBuilder::new(model, tokenizer, device)
-    }
-
-    /// Create from an existing inference engine (without batching)
-    pub fn from_engine(
-        engine: InferenceEngine<T>,
-        tokenizer: Tokenizer,
-        progress: Option<ProgressReporter>,
-    ) -> Self {
-        Self {
-            engine,
-            tokenizer: TokenOutputStream::new(tokenizer),
-            progress,
-            emit_output: true,
-            scheduler: None,
-            tokenizer_arc: None,
-            results: Arc::new(RwLock::new(HashMap::new())),
-        }
+impl<T: ModelConstructor> TextGeneration<T> {
+    /// Create a builder for TextGeneration from factory
+    pub fn builder(factory: &'_ ModelFactory<T>, device: Device) -> TextGenerationBuilder<'_, T> {
+        TextGenerationBuilder::new(factory, device)
     }
 
     /// Access the underlying inference engine

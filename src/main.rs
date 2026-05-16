@@ -1,14 +1,11 @@
 use candle_core::{DType, Device};
 use clap::Parser;
-use parking_lot::RwLock;
-use std::sync::Arc;
 use tracing::level_filters::LevelFilter;
 use tracing::{debug, info, trace};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
 use tur::backend::pipeline::GenerationRequest;
-use tur::backend::prefix_cache::PrefixCache;
 use tur::{ProgressReporter, Result, TextGeneration, TurError};
 
 const DEFAULT_PROMPT: &str = "Who are you?";
@@ -168,6 +165,26 @@ struct Args {
     /// Maximum token length for cached prefixes (default: 2048)
     #[arg(long, default_value_t = 2048)]
     cache_max_tokens: usize,
+
+    /// Enable continuous batching for concurrent request processing
+    #[arg(long)]
+    enable_batching: bool,
+
+    /// Maximum batch size for concurrent requests (default: 16)
+    #[arg(long, default_value_t = 16)]
+    max_batch_size: usize,
+
+    /// Maximum prefill batch size (default: 8)
+    #[arg(long, default_value_t = 8)]
+    max_prefill_batch: usize,
+
+    /// Maximum decode batch size (default: 16)
+    #[arg(long, default_value_t = 16)]
+    max_decode_batch: usize,
+
+    /// Scheduling policy: fcfs, priority, or shortest_job_first (default: fcfs)
+    #[arg(long, default_value = "fcfs")]
+    scheduling_policy: String,
 }
 
 fn main() -> Result<()> {
@@ -215,45 +232,68 @@ fn main() -> Result<()> {
     let progress = ProgressReporter::new();
 
     // Use ModelFactory to create the model and tokenizer
-    let factory = tur::ModelFactory::new(
+    let factory = tur::ModelFactory::<tur::models::Qwen35ModelForCausalLM>::new(
         args.model_id,
         args.weight_path,
         args.quantization,
         device.clone(),
         dtype,
     );
-    let (model, tokenizer) = factory.create_model(Some(&progress))?;
 
     // Build inference engine with all parameters
-    let mut engine_builder = tur::backend::InferenceEngine::builder(model, device.clone())
+    let mut pipeline_builder = TextGeneration::builder(&factory, device.clone())
+        .progress(progress.clone())
         .seed(args.seed)
         .repeat_penalty(args.repeat_penalty)
         .repeat_last_n(args.repeat_last_n);
 
     if let Some(temp) = args.temperature {
-        engine_builder = engine_builder.temperature(temp);
+        pipeline_builder = pipeline_builder.temperature(temp);
     }
     if let Some(top_p) = args.top_p {
-        engine_builder = engine_builder.top_p(top_p);
+        pipeline_builder = pipeline_builder.top_p(top_p);
     }
 
     // Enable prefix cache if requested
     if args.prefix_cache {
-        let cache = Arc::new(RwLock::new(PrefixCache::new(
-            args.cache_max_entries,
-            args.cache_max_tokens,
-        )));
         info!(
             "✓ Prefix cache enabled (max_entries: {}, max_tokens: {})",
             args.cache_max_entries, args.cache_max_tokens
         );
-        engine_builder = engine_builder.with_shared_prefix_cache(cache);
+        pipeline_builder =
+            pipeline_builder.with_prefix_cache(args.cache_max_entries, args.cache_max_tokens);
     }
 
-    let engine = engine_builder.build();
+    // Enable batching if requested
+    if args.enable_batching {
+        use tur::backend::scheduler::SchedulingPolicy;
 
-    // Create text generation pipeline from engine
-    let mut pipeline = TextGeneration::from_engine(engine, tokenizer, Some(progress));
+        let policy = match args.scheduling_policy.to_lowercase().as_str() {
+            "fcfs" => SchedulingPolicy::FCFS,
+            "priority" => SchedulingPolicy::Priority,
+            "shortest_job_first" | "sjf" => SchedulingPolicy::SJF,
+            _ => {
+                return Err(TurError::Other(format!(
+                    "Invalid scheduling policy: {}. Use 'fcfs', 'priority', or 'sjf'",
+                    args.scheduling_policy
+                )));
+            }
+        };
+
+        info!(
+            "✓ Continuous batching enabled (max_batch: {}, prefill: {}, decode: {}, policy: {:?})",
+            args.max_batch_size, args.max_prefill_batch, args.max_decode_batch, policy
+        );
+
+        pipeline_builder = pipeline_builder
+            .enable_batching(true)
+            .max_batch_size(args.max_batch_size)
+            .max_prefill_batch(args.max_prefill_batch)
+            .max_decode_batch(args.max_decode_batch)
+            .scheduling_policy(policy);
+    }
+
+    let mut pipeline = pipeline_builder.build();
     debug!("✓ Model is initialized and ready for inference");
 
     let prompt = pipeline.format_prompt(DEFAULT_PROMPT, args.thinking);

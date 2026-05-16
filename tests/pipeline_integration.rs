@@ -7,13 +7,13 @@ use tur::backend::prefix_cache::PrefixCache;
 use tur::backend::tokenizer::TokenOutputStream;
 
 mod common;
-use common::create_test_model;
+use common::create_test_factory;
 
 #[test]
 fn test_pipeline_end_to_end_generation() {
-    let (model, tokenizer, device) = create_test_model().unwrap();
+    let (factory, device, _) = create_test_factory();
 
-    let mut pipeline = TextGeneration::builder(model, tokenizer, device.clone())
+    let mut pipeline = TextGeneration::builder(&factory, device.clone())
         .seed(299792458)
         .temperature(0.8)
         .top_p(0.9)
@@ -34,10 +34,8 @@ fn test_pipeline_end_to_end_generation() {
     }
 
     // Test with progress reporter
-    let (model, tokenizer, device) = create_test_model().unwrap();
     let progress = ProgressReporter::new();
-
-    let mut pipeline_with_progress = TextGeneration::builder(model, tokenizer, device)
+    let mut pipeline_with_progress = TextGeneration::builder(&factory, device)
         .seed(299792458)
         .temperature(0.8)
         .top_p(0.9)
@@ -68,9 +66,10 @@ fn test_pipeline_parameter_variations() {
         (Some(0.8), Some(0.9), 2.0, "High penalty"),
     ];
 
+    let (factory, device, _) = create_test_factory();
+
     for (temp, top_p, penalty, desc) in test_cases {
-        let (model, tokenizer, device) = create_test_model().unwrap();
-        let mut builder = TextGeneration::builder(model, tokenizer, device)
+        let mut builder = TextGeneration::builder(&factory, device.clone())
             .seed(299792458)
             .repeat_penalty(penalty)
             .repeat_last_n(64);
@@ -93,17 +92,18 @@ fn test_pipeline_parameter_variations() {
 #[test]
 fn test_prefix_cache_full_hit() {
     // Test the edge case where all tokens are cached
-    let (model, tokenizer, device) = create_test_model().unwrap();
+    let (factory, device, _) = create_test_factory();
 
     // Create prefix cache
     let cache = Arc::new(RwLock::new(PrefixCache::new(10, 100)));
 
     // Build engine with cache
-    let mut engine = InferenceEngine::builder(model, device)
+    let (mut engine, tokenizer) = InferenceEngine::builder(&factory, device)
         .seed(299792458)
         .temperature(0.8)
         .with_shared_prefix_cache(cache.clone())
-        .build();
+        .build()
+        .unwrap();
 
     let tokenizer_stream = TokenOutputStream::new(tokenizer);
     let prompt = "Hello, world!";
@@ -156,13 +156,14 @@ fn test_prefix_cache_full_hit() {
 #[test]
 fn test_prefix_cache_partial_hit() {
     // Test partial cache hits with shared prefix
-    let (model, tokenizer, device) = create_test_model().unwrap();
+    let (factory, device, _) = create_test_factory();
 
     let cache = Arc::new(RwLock::new(PrefixCache::new(10, 100)));
-    let mut engine = InferenceEngine::builder(model, device)
+    let (mut engine, tokenizer) = InferenceEngine::builder(&factory, device)
         .seed(299792458)
         .with_shared_prefix_cache(cache.clone())
-        .build();
+        .build()
+        .unwrap();
 
     let tokenizer_stream = TokenOutputStream::new(tokenizer);
 
@@ -213,16 +214,14 @@ fn test_prefix_cache_partial_hit() {
 #[test]
 fn test_prefix_cache_with_pipeline() {
     // Test prefix cache integration with full TextGeneration pipeline
-    let (model, tokenizer, device) = create_test_model().unwrap();
+    let (factory, device, _) = create_test_factory();
 
     let cache = Arc::new(RwLock::new(PrefixCache::new(10, 100)));
-    let engine = InferenceEngine::builder(model, device.clone())
+    let mut pipeline = TextGeneration::builder(&factory, device)
         .seed(299792458)
         .temperature(0.8)
         .with_shared_prefix_cache(cache.clone())
         .build();
-
-    let mut pipeline = TextGeneration::from_engine(engine, tokenizer, None);
 
     // Run multiple generations with similar prompts
     let prompts = vec!["Hello", "Hello, world", "Hello, how are you?"];
@@ -252,10 +251,10 @@ fn test_prefix_cache_with_pipeline() {
 #[test]
 fn test_continuous_batching_basic() {
     // Test basic continuous batching setup and usage
-    let (model, tokenizer, device) = create_test_model().unwrap();
+    let (factory, device, _) = create_test_factory();
 
     // Enable batching with builder
-    let mut pipeline = TextGeneration::builder(model, tokenizer, device.clone())
+    let mut pipeline = TextGeneration::builder(&factory, device)
         .seed(299792458)
         .temperature(0.8)
         .enable_batching(true)
@@ -306,9 +305,8 @@ fn test_continuous_batching_basic() {
 #[test]
 fn test_continuous_batching_step_by_step() {
     // Test manual step-by-step execution for fine-grained control
-    let (model, tokenizer, device) = create_test_model().unwrap();
-
-    let mut pipeline = TextGeneration::builder(model, tokenizer, device)
+    let (factory, device, _) = create_test_factory();
+    let mut pipeline = TextGeneration::builder(&factory, device)
         .seed(299792458)
         .enable_batching(true)
         .max_batch_size(2)
@@ -349,9 +347,8 @@ fn test_continuous_batching_step_by_step() {
 #[test]
 fn test_continuous_batching_blocking_get() {
     // Test blocking result retrieval
-    let (model, tokenizer, device) = create_test_model().unwrap();
-
-    let mut pipeline = TextGeneration::builder(model, tokenizer, device)
+    let (factory, device, _) = create_test_factory();
+    let mut pipeline = TextGeneration::builder(&factory, device)
         .seed(299792458)
         .enable_batching(true)
         .build();
@@ -370,9 +367,8 @@ fn test_continuous_batching_blocking_get() {
 #[test]
 fn test_continuous_batching_mixed_lengths() {
     // Test handling requests with different generation lengths
-    let (model, tokenizer, device) = create_test_model().unwrap();
-
-    let mut pipeline = TextGeneration::builder(model, tokenizer, device)
+    let (factory, device, _) = create_test_factory();
+    let mut pipeline = TextGeneration::builder(&factory, device)
         .seed(299792458)
         .enable_batching(true)
         .max_batch_size(3)
@@ -399,9 +395,8 @@ fn test_continuous_batching_mixed_lengths() {
 #[test]
 fn test_continuous_batching_sequential_submission() {
     // Test submitting requests while others are processing
-    let (model, tokenizer, device) = create_test_model().unwrap();
-
-    let mut pipeline = TextGeneration::builder(model, tokenizer, device)
+    let (factory, device, _) = create_test_factory();
+    let mut pipeline = TextGeneration::builder(&factory, device)
         .seed(299792458)
         .enable_batching(true)
         .build();
@@ -433,9 +428,8 @@ fn test_continuous_batching_sequential_submission() {
 #[test]
 fn test_continuous_batching_result_management() {
     // Test result storage and retrieval
-    let (model, tokenizer, device) = create_test_model().unwrap();
-
-    let mut pipeline = TextGeneration::builder(model, tokenizer, device)
+    let (factory, device, _) = create_test_factory();
+    let mut pipeline = TextGeneration::builder(&factory, device)
         .seed(299792458)
         .enable_batching(true)
         .build();

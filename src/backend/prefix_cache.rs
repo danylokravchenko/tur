@@ -96,6 +96,7 @@ impl PrefixCacheEntry {
 }
 
 /// Prefix cache for storing and reusing KV cache states
+#[derive(Debug)]
 pub struct PrefixCache {
     /// Cache storage: hash(tokens) -> entry
     entries: AHashMap<u64, PrefixCacheEntry>,
