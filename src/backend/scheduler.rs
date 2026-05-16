@@ -239,7 +239,7 @@ impl ContinuousBatchScheduler {
             trace!(
                 request_id = %request_id,
                 freed_blocks = blocks_to_free,
-                "freed memory blocks for completed request"
+                "Freed memory blocks for completed request"
             );
         }
 
@@ -325,11 +325,11 @@ impl ContinuousBatchScheduler {
     }
 
     /// Main scheduling iteration - admits requests, forms batches, and executes them
-    /// Returns list of completed requests with their generated tokens
+    /// Returns list of completed requests with their generated tokens, prompt, and arrival time
     pub fn schedule_iteration<T: ModelConstructor>(
         &mut self,
         engine: &mut crate::backend::engine::InferenceEngine<T>,
-    ) -> Result<Vec<(Uuid, Vec<u32>)>> {
+    ) -> Result<Vec<(Uuid, Vec<u32>, String, std::time::Instant)>> {
         trace!("Starting scheduler iteration");
 
         // 1. Admit new requests from queue
@@ -410,8 +410,15 @@ impl ContinuousBatchScheduler {
 
                 // Complete request if needed
                 if should_complete {
+                    // Get request info BEFORE completing (which removes it)
+                    let (prompt, arrival_time) = if let Some(req) = self.get_request(&request_id) {
+                        (req.prompt.clone(), req.arrival_time)
+                    } else {
+                        continue;
+                    };
+
                     let tokens = self.complete_request(&request_id)?;
-                    completed.push((request_id, tokens));
+                    completed.push((request_id, tokens, prompt, arrival_time));
                     debug!("Request {} completed", request_id);
                 }
             }

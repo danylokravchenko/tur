@@ -292,6 +292,7 @@ fn test_continuous_batching_basic() {
             !result.generated_text.is_empty(),
             "Should have generated text"
         );
+        println!("Generated result: {:?}", result);
         assert!(
             !result.generated_tokens.is_empty(),
             "Should have generated tokens"

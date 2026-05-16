@@ -25,6 +25,7 @@ pub struct InferenceEngine<T: ModelImpl> {
     repeat_penalty: f32,
     repeat_last_n: usize,
     prefix_cache: Option<SharedPrefixCache>,
+    block_allocator: Option<Arc<RwLock<crate::models::kv_cache::BlockAllocator>>>,
 }
 
 /// Builder for InferenceEngine
@@ -39,6 +40,7 @@ pub struct InferenceEngineBuilder<'a, T: ModelConstructor> {
     repeat_last_n: usize,
     prefix_cache: Option<SharedPrefixCache>,
     progress: Option<ProgressReporter>,
+    block_allocator: Option<Arc<RwLock<crate::models::kv_cache::BlockAllocator>>>,
 }
 
 impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
@@ -54,6 +56,7 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
             repeat_last_n: 64,
             prefix_cache: None,
             progress: None,
+            block_allocator: None,
         }
     }
 
@@ -94,6 +97,15 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
     /// Use a shared prefix cache instance
     pub fn with_shared_prefix_cache(mut self, cache: SharedPrefixCache) -> Self {
         self.prefix_cache = Some(cache);
+        self
+    }
+
+    /// Use a block allocator for paged KV cache (batching mode)
+    pub fn with_block_allocator(
+        mut self,
+        allocator: Arc<RwLock<crate::models::kv_cache::BlockAllocator>>,
+    ) -> Self {
+        self.block_allocator = Some(allocator);
         self
     }
 
@@ -141,6 +153,7 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
             repeat_penalty: self.repeat_penalty,
             repeat_last_n: self.repeat_last_n,
             prefix_cache: self.prefix_cache,
+            block_allocator: self.block_allocator,
         };
         Ok((engine, tokenizer))
     }
@@ -401,6 +414,13 @@ impl<T: ModelConstructor> InferenceEngine<T> {
             return Ok(Vec::new());
         }
 
+        // CRITICAL: Clear KV cache before each batch execution
+        // Each batch contains different requests and may have different batch_size.
+        // The current SimpleKvCache accumulates state, causing shape mismatches
+        // when batch sizes change (e.g., batch_size=2 then batch_size=1).
+        // TODO: Implement proper PagedKvCache with per-request block tables
+        self.model.clear_kv_cache();
+
         // Find max length in batch
         let max_len = batch_tokens
             .iter()
@@ -452,6 +472,10 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         if batch_data.is_empty() {
             return Ok(Vec::new());
         }
+
+        // CRITICAL: Clear KV cache before each batch execution
+        // Same reasoning as prefill_batch - prevents shape mismatches
+        self.model.clear_kv_cache();
 
         let batch_size = batch_data.len();
 

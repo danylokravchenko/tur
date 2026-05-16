@@ -206,6 +206,7 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             "Building text generation pipeline with configuration"
         );
 
+        // Build engine first (before batching setup)
         let mut engine_builder = InferenceEngine::builder(self.factory, self.device.clone())
             .seed(self.seed)
             .repeat_penalty(self.repeat_penalty)
@@ -224,12 +225,8 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             engine_builder = engine_builder.with_shared_prefix_cache(prefix_cache.clone());
         }
 
-        let (engine, tokenizer) = engine_builder.build().expect("Failed to build engine");
-
         // Initialize batching components if enabled
-        let (scheduler, tokenizer_arc, _block_allocator) = if self.enable_batching {
-            let tokenizer_arc = Arc::new(tokenizer.clone());
-
+        let (scheduler, tokenizer_arc, engine, tokenizer) = if self.enable_batching {
             // Create BlockAllocator for paged KV cache
             // TODO: Make these configurable - should match model architecture
             let total_blocks = 1024;
@@ -265,6 +262,13 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
                 dtype,
             )));
 
+            // Pass block allocator to engine for paged KV cache
+            engine_builder = engine_builder.with_block_allocator(block_allocator.clone());
+
+            // Build engine with block allocator
+            let (engine, tokenizer) = engine_builder.build().expect("Failed to build engine");
+            let tokenizer_arc = Arc::new(tokenizer.clone());
+
             // Create a simple memory pool for batching
             // TODO: Make these configurable
             let memory_pool = Arc::new(RwLock::new(crate::backend::memory_pool::MemoryPool::new(
@@ -291,14 +295,11 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
                 tokenizer_arc.clone(),
             );
 
-            (
-                Some(scheduler),
-                Some(tokenizer_arc),
-                Some(block_allocator.clone()),
-            )
+            (Some(scheduler), Some(tokenizer_arc), engine, tokenizer)
         } else {
             debug!("Batching disabled, using single-request mode");
-            (None, None, None)
+            let (engine, tokenizer) = engine_builder.build().expect("Failed to build engine");
+            (None, None, engine, tokenizer)
         };
 
         debug!("Text generation pipeline built successfully");
@@ -552,32 +553,29 @@ impl<T: ModelConstructor> TextGeneration<T> {
             .ok_or_else(|| TurError::Other("Tokenizer not available".to_string()))?;
 
         // Process completed requests
-        for (request_id, tokens) in completed {
+        for (request_id, tokens, prompt, arrival_time) in completed {
             let generated_text = tokenizer
                 .decode(&tokens, true)
                 .map_err(|e| TurError::Tokenizer(e.to_string()))?;
 
-            // Get request info from scheduler
-            if let Some(state) = scheduler.get_request_state(&request_id) {
-                let result = GenerationResult {
-                    request_id,
-                    prompt: state.prompt.clone(),
-                    generated_text,
-                    generated_tokens: tokens.clone(),
-                    stats: GenerationStats {
-                        generated_tokens: tokens.len(),
-                        elapsed: state.arrival_time.elapsed(),
-                    },
-                };
+            let result = GenerationResult {
+                request_id,
+                prompt,
+                generated_text,
+                generated_tokens: tokens.clone(),
+                stats: GenerationStats {
+                    generated_tokens: tokens.len(),
+                    elapsed: arrival_time.elapsed(),
+                },
+            };
 
-                self.results.write().insert(request_id, result);
+            self.results.write().insert(request_id, result);
 
-                trace!(
-                    request_id = %request_id,
-                    generated_tokens = tokens.len(),
-                    "Request completed"
-                );
-            }
+            trace!(
+                request_id = %request_id,
+                generated_tokens = tokens.len(),
+                "Request completed and result stored"
+            );
         }
 
         Ok(scheduler.active_request_count())
