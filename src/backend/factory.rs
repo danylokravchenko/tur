@@ -15,19 +15,6 @@ use crate::{ProgressReporter, Result};
 /// - Loading tokenizers
 /// - Creating VarBuilders for different quantization formats
 /// - Instantiating the model
-///
-/// # Example
-/// ```ignore
-/// let factory = ModelFactory::new(
-///     Some("Qwen3-0.6B".to_string()),
-///     None,
-///     Some("Q4_K_M".to_string()),
-///     device,
-///     DType::BF16,
-/// );
-///
-/// let (model, tokenizer) = factory.create_model(None)?;
-/// ```
 pub struct ModelFactory {
     model_id: Option<String>,
     weight_path: Option<String>,
@@ -96,18 +83,10 @@ impl ModelFactory {
 
         // Step 1: Download and prepare weights
         self.prepare_weights().and_then(|(paths, gguf)| {
-            // Step 2: Load configuration
             let config = self.load_config(&paths)?;
-
-            // Step 3: Load tokenizer
             let tokenizer = self.load_tokenizer(&paths)?;
-
-            // Step 4: Create VarBuilder
             let vb = self.create_var_builder(&paths, gguf)?;
-
-            // Step 5: Create model
             let model = self.instantiate_model(&config, vb, progress, gguf)?;
-
             debug!("Model creation completed successfully");
             Ok((model, tokenizer))
         })
@@ -213,8 +192,8 @@ impl ModelFactory {
             debug!(dtype = ?self.dtype, "Embeddings and norms will use");
         } else {
             debug!(
-                "Loading full-precision SafeTensors model from {} files",
-                weight_files.len()
+                num_files = weight_files.len(),
+                "Loading full-precision SafeTensors model",
             );
             debug!(dtype = ?self.dtype, "All operations will use");
         }

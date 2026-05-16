@@ -87,7 +87,7 @@ fn init_tracing() {
     let registry = tracing_subscriber::registry();
 
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(LevelFilter::TRACE.to_string()))
+        .unwrap_or_else(|_| EnvFilter::new(LevelFilter::DEBUG.to_string()))
         .add_directive("ureq=error".parse().unwrap())
         .add_directive("tokenizers=error".parse().unwrap())
         .add_directive("rustls=error".parse().unwrap());
