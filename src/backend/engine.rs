@@ -2,12 +2,18 @@ use candle_core::{DType, Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
 use parking_lot::RwLock;
 use std::sync::Arc;
+use tokenizers::Tokenizer;
+use tracing::{debug, trace};
+use uuid::Uuid;
 
 use crate::{
-    Result, TurError,
-    backend::prefix_cache::{PrefixCache, PrefixCacheEntry, SharedPrefixCache},
-    backend::tokenizer::{LogitsSampler, TokenOutputStream},
-    models::ModelImpl,
+    ProgressReporter, Result, TurError,
+    backend::{
+        factory::{ModelConstructor, ModelFactory},
+        prefix_cache::{PrefixCache, PrefixCacheEntry, SharedPrefixCache},
+        tokenizer::{LogitsSampler, TokenOutputStream},
+    },
+    models::{ModelImpl, kv_cache::{KvCacheImpl, PagedKvCache}},
 };
 
 /// Core inference engine without output handling
@@ -22,8 +28,8 @@ pub struct InferenceEngine<T: ModelImpl> {
 }
 
 /// Builder for InferenceEngine
-pub struct InferenceEngineBuilder<T: ModelImpl> {
-    model: T,
+pub struct InferenceEngineBuilder<'a, T: ModelConstructor> {
+    factory: &'a ModelFactory<T>,
     device: Device,
     sampler: Option<Box<dyn LogitsSampler>>,
     seed: u64,
@@ -32,12 +38,13 @@ pub struct InferenceEngineBuilder<T: ModelImpl> {
     repeat_penalty: f32,
     repeat_last_n: usize,
     prefix_cache: Option<SharedPrefixCache>,
+    progress: Option<ProgressReporter>,
 }
 
-impl<T: ModelImpl> InferenceEngineBuilder<T> {
-    pub fn new(model: T, device: Device) -> Self {
+impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
+    pub fn new(factory: &'a ModelFactory<T>, device: Device) -> Self {
         Self {
-            model,
+            factory,
             device,
             sampler: None,
             seed: 299_792_458, // Default seed
@@ -46,6 +53,7 @@ impl<T: ModelImpl> InferenceEngineBuilder<T> {
             repeat_penalty: 1.0,
             repeat_last_n: 64,
             prefix_cache: None,
+            progress: None,
         }
     }
 
@@ -95,27 +103,53 @@ impl<T: ModelImpl> InferenceEngineBuilder<T> {
         self
     }
 
-    pub fn build(self) -> InferenceEngine<T> {
+    /// Set progress reporter for model loading
+    pub fn with_progress(mut self, progress: ProgressReporter) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    pub fn build(self) -> Result<(InferenceEngine<T>, Tokenizer)> {
+        // Log engine configuration
+        debug!(
+            seed = self.seed,
+            temp = ?self.temp,
+            top_p = ?self.top_p,
+            repeat_penalty = self.repeat_penalty,
+            repeat_last_n = self.repeat_last_n,
+            prefix_cache = ?self.prefix_cache,
+            has_custom_sampler = self.sampler.is_some(),
+            "Building inference engine with configuration"
+        );
+
+        // Create model using factory
+        let (model, tokenizer) = self.factory.create_model(self.progress.as_ref())?;
+
         let sampler: Box<dyn LogitsSampler> = if let Some(sampler) = self.sampler {
             sampler
         } else {
             Box::new(LogitsProcessor::new(self.seed, self.temp, self.top_p))
         };
-        InferenceEngine {
-            model: self.model,
+        debug!(
+            model_name = model.name(),
+            "Created inference engine for model",
+        );
+        let engine = InferenceEngine {
+            model,
             device: self.device,
             sampler,
             repeat_penalty: self.repeat_penalty,
             repeat_last_n: self.repeat_last_n,
             prefix_cache: self.prefix_cache,
-        }
+        };
+        Ok((engine, tokenizer))
     }
 }
 
-impl<T: ModelImpl> InferenceEngine<T> {
-    /// Create a new builder for InferenceEngine
-    pub fn builder(model: T, device: Device) -> InferenceEngineBuilder<T> {
-        InferenceEngineBuilder::new(model, device)
+impl<T: ModelConstructor> InferenceEngine<T> {
+    /// Create a new builder for InferenceEngine from factory
+    pub fn builder(factory: &'_ ModelFactory<T>, device: Device) -> InferenceEngineBuilder<'_, T> {
+        InferenceEngineBuilder::new(factory, device)
     }
 
     /// Get EOS tokens from tokenizer
@@ -143,33 +177,25 @@ impl<T: ModelImpl> InferenceEngine<T> {
             )?
         };
 
-        // Apply guidance constraints if any
-        if let Some(constrained) = self.sampler.apply_constraints(&logits, tokens)? {
-            Ok(constrained)
-        } else {
-            Ok(logits)
-        }
+        Ok(self
+            .sampler
+            .apply_constraints(&logits, tokens)?
+            .unwrap_or(logits))
     }
 
     /// Try to restore KV cache state from prefix cache
     /// Returns (cache_hit, cached_token_count)
     fn try_restore_from_cache(&mut self, tokens: &[u32]) -> Result<(bool, usize)> {
-        let cache = match &self.prefix_cache {
-            Some(c) => c,
-            None => return Ok((false, 0)),
+        let Some(cache) = &self.prefix_cache else {
+            return Ok((false, 0));
         };
-
         let mut cache = cache.write();
 
-        // Find longest matching prefix
-        let (key, match_len) = cache.find_longest_prefix(tokens);
-
-        if match_len == 0 {
+        let Some((key, match_len)) = cache.find_longest_prefix(tokens) else {
             cache.record_miss();
             return Ok((false, 0));
-        }
+        };
 
-        // Get the cached entry
         let entry = match cache.get(key) {
             Some(e) => e,
             None => {
@@ -178,55 +204,161 @@ impl<T: ModelImpl> InferenceEngine<T> {
             }
         };
 
-        // Validate compatibility
-        if !entry.is_compatible(
-            &self.device,
-            self.model
-                .get_kv_cache_state()?
-                .first()
-                .map(|(k, _)| k.dtype())
-                .unwrap_or(DType::F32),
-        ) {
+        if !entry.is_compatible(&self.device, self.model.dtype()) {
             cache.record_miss();
             return Ok((false, 0));
         }
 
-        // Restore KV cache state
+        // Full cache hit: the stored K/V covers all N prompt tokens.  If we
+        // restore all N entries and then re-process the last token in prefill,
+        // the KV cache appends a duplicate entry at position N-1.  Trim to N-1
+        // so prefill re-processes the final token against the correct history.
+        if match_len == tokens.len() {
+            if match_len == 1 {
+                // Cannot narrow to zero-length tensors safely; treat as miss.
+                cache.record_miss();
+                return Ok((false, 0));
+            }
+            let trimmed = entry
+                .kv_states
+                .iter()
+                .map(|(k, v)| {
+                    let s = k.dim(2)?;
+                    candle_core::Result::Ok((k.narrow(2, 0, s - 1)?, v.narrow(2, 0, s - 1)?))
+                })
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            self.model.set_kv_cache_state(trimmed)?;
+            cache.record_hit(match_len - 1);
+            return Ok((true, match_len - 1));
+        }
+
         self.model.set_kv_cache_state(entry.kv_states.clone())?;
-
-        // Update stats
         cache.record_hit(match_len);
-
         Ok((true, match_len))
     }
 
     /// Store current KV cache state to prefix cache
     fn store_to_cache(&mut self, tokens: &[u32]) -> Result<()> {
-        let cache = match &self.prefix_cache {
-            Some(c) => c,
-            None => return Ok(()),
+        let Some(cache) = &self.prefix_cache else {
+            return Ok(());
         };
 
         // Extract current KV cache state
         let kv_states = self.model.get_kv_cache_state()?;
 
-        // Don't cache if no state
         if kv_states.is_empty() {
             return Ok(());
         }
 
-        // Get dtype from first tensor
-        let dtype = kv_states
-            .first()
-            .map(|(k, _)| k.dtype())
-            .unwrap_or(DType::F32);
-        // Create cache entry
-        let entry = PrefixCacheEntry::new(tokens.to_vec(), kv_states, self.device.clone(), dtype);
+        let entry = PrefixCacheEntry::new(
+            tokens.to_vec(),
+            kv_states,
+            self.device.clone(),
+            self.model.dtype(),
+        );
 
         // Insert into cache
         let mut cache = cache.write();
         cache.insert(entry);
+        trace!(
+            tokens = tokens.len(),
+            "Stored prompt tokens in prefix cache",
+        );
 
+        Ok(())
+    }
+
+    /// Try to restore a prefix cache hit into per-layer paged KV caches.
+    ///
+    /// Mirrors `try_restore_from_cache` but writes the cached K/V tensors directly
+    /// into the request's `PagedKvCache` layers via `set_state`, which resets each
+    /// layer and re-populates it via `PagedKvCache::append`.  The same full-hit
+    /// trimming logic applies: if the cached entry covers all N prompt tokens we
+    /// trim it to N-1 so the final token is re-processed against the correct history.
+    ///
+    /// Returns (cache_hit, cached_token_count).
+    fn try_restore_paged(
+        &mut self,
+        tokens: &[u32],
+        req_caches: &mut Vec<PagedKvCache>,
+    ) -> Result<(bool, usize)> {
+        let Some(cache) = &self.prefix_cache else { return Ok((false, 0)) };
+        let mut cache = cache.write();
+
+        let Some((key, match_len)) = cache.find_longest_prefix(tokens) else {
+            cache.record_miss();
+            return Ok((false, 0));
+        };
+
+        let entry = match cache.get(key) {
+            Some(e) => e,
+            None => {
+                cache.record_miss();
+                return Ok((false, 0));
+            }
+        };
+
+        if !entry.is_compatible(&self.device, self.model.dtype()) {
+            cache.record_miss();
+            return Ok((false, 0));
+        }
+
+        if entry.kv_states.len() != req_caches.len() {
+            // Layer count mismatch — cached entry is stale; treat as miss.
+            cache.record_miss();
+            return Ok((false, 0));
+        }
+
+        // Full hit: trim last K/V entry to avoid duplicating position N-1.
+        let (states, effective_len) = if match_len == tokens.len() {
+            if match_len == 1 {
+                cache.record_miss();
+                return Ok((false, 0));
+            }
+            let trimmed = entry
+                .kv_states
+                .iter()
+                .map(|(k, v)| {
+                    let s = k.dim(2)?;
+                    candle_core::Result::Ok((k.narrow(2, 0, s - 1)?, v.narrow(2, 0, s - 1)?))
+                })
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            (trimmed, match_len - 1)
+        } else {
+            (entry.kv_states.clone(), match_len)
+        };
+
+        // Inject cached K/V into each layer's paged cache.
+        for (layer_cache, (k, v)) in req_caches.iter_mut().zip(states.iter()) {
+            layer_cache.set_state(k.clone(), v.clone())?;
+        }
+
+        cache.record_hit(effective_len);
+        Ok((true, effective_len))
+    }
+
+    /// Extract per-layer K/V state from paged caches and store in the prefix cache.
+    fn store_paged_to_cache(&mut self, tokens: &[u32], req_caches: &[PagedKvCache]) -> Result<()> {
+        let Some(cache) = &self.prefix_cache else { return Ok(()) };
+
+        let kv_states: Vec<(Tensor, Tensor)> = req_caches
+            .iter()
+            .filter_map(|c| c.get_state())
+            .collect();
+
+        // Only cache if every layer produced a state (partial state would be wrong).
+        if kv_states.len() != req_caches.len() || kv_states.is_empty() {
+            return Ok(());
+        }
+
+        let entry = PrefixCacheEntry::new(
+            tokens.to_vec(),
+            kv_states,
+            self.device.clone(),
+            self.model.dtype(),
+        );
+        cache.write().insert(entry);
+        trace!(tokens = tokens.len(), "Stored batched prompt tokens in prefix cache");
         Ok(())
     }
 
@@ -254,6 +386,10 @@ impl<T: ModelImpl> InferenceEngine<T> {
         };
 
         let input = Tensor::new(process_tokens, &self.device)?.unsqueeze(0)?;
+        trace!(
+            processed_tokens = process_tokens.len(),
+            process_offset, "Running prefill forward pass on tokens",
+        );
         let logits = self.model.forward(&input, process_offset)?;
 
         // Store to cache if enabled and not already cached
@@ -264,6 +400,12 @@ impl<T: ModelImpl> InferenceEngine<T> {
         let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
         let logits = self.process_logits(logits, tokens)?;
         let next_token = self.sampler.sample(&logits)?;
+        trace!(
+            next_token,
+            cache_hit,
+            cached_tokens = cached_len,
+            "Prefill sampled first token"
+        );
 
         Ok((next_token, start.elapsed(), cache_hit, cached_len))
     }
@@ -271,16 +413,20 @@ impl<T: ModelImpl> InferenceEngine<T> {
     /// Perform single decode step with KV cache reuse
     /// Returns next token
     pub fn decode_step(&mut self, tokens: &[u32], start_pos: usize) -> Result<u32> {
-        let context_size = 1;
-        let pos = tokens.len().saturating_sub(context_size);
-        let ctxt = &tokens[pos..];
+        let ctxt = &tokens[tokens.len().saturating_sub(1)..];
 
         let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
+        trace!(
+            tokens = ctxt.len(),
+            start_pos, "Decoding next token from context",
+        );
         let logits = self.model.forward(&input, start_pos)?;
         let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
         let logits = self.process_logits(logits, tokens)?;
 
-        self.sampler.sample(&logits)
+        let next_token = self.sampler.sample(&logits)?;
+        trace!(next_token, "Decode step sampled token");
+        Ok(next_token)
     }
 
     /// Run separated inference: prefill + decode with detailed stats
@@ -339,6 +485,168 @@ impl<T: ModelImpl> InferenceEngine<T> {
     pub fn model_mut(&mut self) -> &mut T {
         &mut self.model
     }
+
+    /// Perform batched prefill: encode multiple prompts and get first tokens
+    /// Returns vector of (first_token, request_id) pairs
+    pub fn prefill_batch(
+        &mut self,
+        batch_tokens: &[(Uuid, Vec<u32>)],
+        paged_caches: Option<&mut [Vec<PagedKvCache>]>,
+    ) -> Result<Vec<(Uuid, u32)>> {
+        if batch_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // When paged KV caches are in use we must prefill each request individually.
+        //
+        // Batched prefill pads shorter sequences to max_len with zeros.  The paged
+        // cache blindly stores all max_len K/V entries — including the garbage padding
+        // tokens — and ModelForCausalLM::forward_batch extracts logits from the last
+        // padded position rather than the last real token.  Both corrupt decode quality.
+        //
+        // Per-request prefill avoids padding entirely: each forward pass sees only the
+        // real prompt tokens, stores exactly the right K/V entries, and extracts the
+        // logit at the correct final position.
+        if let Some(caches) = paged_caches {
+            let mut results = Vec::with_capacity(batch_tokens.len());
+            for ((id, tokens), req_caches) in batch_tokens.iter().zip(caches.iter_mut()) {
+                // Attempt to restore a prefix cache hit into this request's paged caches.
+                // On a hit, req_caches are pre-populated with cached_len K/V entries and
+                // only the tail tokens[cached_len..] need a forward pass.
+                let (cache_hit, cached_len) = self.try_restore_paged(tokens, req_caches)?;
+
+                let process_tokens = &tokens[cached_len..];
+                let positions = [cached_len];
+                let input = Tensor::new(process_tokens, &self.device)?.unsqueeze(0)?;
+                let logits = self.model.forward_batch(
+                    &input,
+                    &positions,
+                    Some(std::slice::from_mut(req_caches)),
+                )?;
+
+                if !cache_hit && self.prefix_cache.is_some() {
+                    self.store_paged_to_cache(tokens, req_caches)?;
+                }
+
+                // logits: [1, 1, vocab_size] — squeeze to [vocab_size]
+                let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+                let logits = self.process_logits(logits, tokens)?;
+                let next_token = self.sampler.sample(&logits)?;
+                results.push((*id, next_token));
+                trace!(
+                    request_id = ?id,
+                    next_token,
+                    cache_hit,
+                    cached_tokens = cached_len,
+                    "Batched prefill sampled token"
+                );
+            }
+            return Ok(results);
+        }
+
+        // No paged caches: use the shared model KV cache and a single padded batch.
+        self.model.clear_kv_cache();
+
+        // Find max length in batch
+        let max_len = batch_tokens
+            .iter()
+            .map(|(_, tokens)| tokens.len())
+            .max()
+            .unwrap_or(0);
+
+        let batch_size = batch_tokens.len();
+        let mut input_data = Vec::with_capacity(batch_size * max_len);
+        let positions = vec![0usize; batch_size];
+
+        for (_, tokens) in batch_tokens.iter() {
+            input_data.extend_from_slice(tokens);
+            input_data.extend(std::iter::repeat_n(0, max_len.saturating_sub(tokens.len())));
+        }
+
+        let input = Tensor::from_vec(input_data, (batch_size, max_len), &self.device)?;
+        trace!(
+            batch_size,
+            max_len,
+            has_paged_caches = false,
+            "Running batched prefill forward pass"
+        );
+
+        let logits = self.model.forward_batch(&input, &positions, None)?;
+
+        let mut results = Vec::with_capacity(batch_size);
+        for (idx, (id, tokens)) in batch_tokens.iter().enumerate() {
+            let request_logits = logits
+                .narrow(0, idx, 1)?
+                .squeeze(0)?
+                .squeeze(0)?
+                .to_dtype(DType::F32)?;
+            let processed_logits = self.process_logits(request_logits, tokens)?;
+            let next_token = self.sampler.sample(&processed_logits)?;
+            results.push((*id, next_token));
+            trace!(request_id = ?id, next_token, "Batched prefill sampled token");
+        }
+
+        Ok(results)
+    }
+
+    /// Perform batched decode step: process one token per request
+    /// Returns vector of (next_token, request_id) pairs
+    pub fn decode_batch(
+        &mut self,
+        batch_data: &[(Uuid, Vec<u32>, usize)], // (id, all_tokens, position)
+        paged_caches: Option<&mut [Vec<PagedKvCache>]>,
+    ) -> Result<Vec<(Uuid, u32)>> {
+        if batch_data.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let batch_size = batch_data.len();
+
+        // Non-paged decode relies on the model's shared SimpleKvCache accumulating state
+        // from the preceding prefill — do NOT clear it here.  The shared cache cannot
+        // serve multiple concurrent requests correctly, so only batch_size == 1 is valid
+        // on this path; use paged caches for true multi-request batching.
+        debug_assert!(
+            paged_caches.is_some() || batch_size == 1,
+            "non-paged batched decode requires batch_size == 1; use paged caches for multi-request batching"
+        );
+
+        // Prepare batched input - last token from each request
+        let mut input_data = Vec::with_capacity(batch_size);
+        let mut positions = Vec::with_capacity(batch_size);
+
+        for (_, tokens, pos) in batch_data.iter() {
+            input_data.push(*tokens.last().unwrap_or(&0));
+            positions.push(*pos);
+        }
+
+        let input = Tensor::from_vec(input_data, (batch_size, 1), &self.device)?;
+        trace!(
+            batch_size,
+            has_paged_caches = paged_caches.is_some(),
+            "Running batched decode forward pass"
+        );
+
+        let logits = self.model.forward_batch(&input, &positions, paged_caches)?;
+
+        // Sample next token for each request
+        let mut results = Vec::with_capacity(batch_size);
+        for (idx, (id, tokens, _)) in batch_data.iter().enumerate() {
+            // Extract logits for this request: [1, 1, vocab_size]
+            let request_logits = logits
+                .narrow(0, idx, 1)?
+                .squeeze(0)?
+                .squeeze(0)?
+                .to_dtype(DType::F32)?;
+            let processed_logits = self.process_logits(request_logits, tokens)?;
+            let next_token = self.sampler.sample(&processed_logits)?;
+            results.push((*id, next_token));
+            trace!(request_id = ?id, next_token, "Batched decode sampled token");
+        }
+
+        Ok(results)
+    }
+
 }
 
 /// Detailed statistics separating prefill and decode phases

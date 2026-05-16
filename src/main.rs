@@ -1,18 +1,8 @@
 use candle_core::{DType, Device};
 use clap::Parser;
-use parking_lot::RwLock;
-use std::sync::Arc;
-use tokenizers::Tokenizer;
-use tracing::level_filters::LevelFilter;
 use tracing::{debug, info, trace};
-use tracing_subscriber::layer::SubscriberExt as _;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer, fmt};
 use tur::backend::pipeline::GenerationRequest;
-use tur::backend::prefix_cache::PrefixCache;
-use tur::models::Qwen35ModelForCausalLM;
-use tur::weights::VarBuilderX;
-use tur::{Downloader, ProgressReporter, Result, TextGeneration, TurError};
+use tur::{ProgressReporter, Result, TextGeneration, TurError};
 
 const DEFAULT_PROMPT: &str = "Who are you?";
 
@@ -86,29 +76,6 @@ fn print_bunner() {
     }
 }
 
-fn init_tracing() {
-    let registry = tracing_subscriber::registry();
-
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(LevelFilter::TRACE.to_string()))
-        .add_directive("ureq=error".parse().unwrap())
-        .add_directive("tokenizers=error".parse().unwrap())
-        .add_directive("rustls=error".parse().unwrap());
-
-    let console_layer = fmt::layer()
-        .compact()
-        .with_file(false)
-        .with_line_number(false)
-        .with_thread_names(true)
-        .with_thread_ids(true)
-        .with_target(true)
-        .with_filter(env_filter.clone());
-
-    let subscriber = registry.with(console_layer);
-
-    subscriber.try_init().unwrap();
-}
-
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Qwen 3.5 Model - Clean Implementation", long_about = None)]
 struct Args {
@@ -171,10 +138,30 @@ struct Args {
     /// Maximum token length for cached prefixes (default: 2048)
     #[arg(long, default_value_t = 2048)]
     cache_max_tokens: usize,
+
+    /// Enable continuous batching for concurrent request processing
+    #[arg(long)]
+    enable_batching: bool,
+
+    /// Maximum batch size for concurrent requests (default: 16)
+    #[arg(long, default_value_t = 16)]
+    max_batch_size: usize,
+
+    /// Maximum prefill batch size (default: 8)
+    #[arg(long, default_value_t = 8)]
+    max_prefill_batch: usize,
+
+    /// Maximum decode batch size (default: 16)
+    #[arg(long, default_value_t = 16)]
+    max_decode_batch: usize,
+
+    /// Scheduling policy: fcfs, priority, or shortest_job_first (default: fcfs)
+    #[arg(long, default_value = "fcfs")]
+    scheduling_policy: String,
 }
 
 fn main() -> Result<()> {
-    init_tracing();
+    tur::shared::init_tracing();
     let args = Args::parse();
     print_bunner();
 
@@ -200,122 +187,89 @@ fn main() -> Result<()> {
         candle_core::utils::with_f16c()
     );
 
-    if args.model_id.is_none() && args.weight_path.is_none() {
-        return Err(TurError::Other(
-            "Please provide a weight source:\n\
-             Examples:\n\
-             - Full precision SafeTensors:\n\
-               --model-id Qwen3-0.6B\n\
-             - Quantized GGUF (auto-downloads from unsloth):\n\
-               --model-id Qwen3-0.6B --quantization Q4_K_M\n\
-             - Local weights:\n\
-               --weight-path /path/to/model"
-                .to_string(),
-        ));
-    }
-
-    // Log download strategy
-    if let Some(ref model_id) = args.model_id {
-        let model_name = model_id.split('/').next_back().unwrap_or(model_id);
-        if let Some(ref quant) = args.quantization {
-            info!("Downloading quantized GGUF model:");
-            info!("  - Model: {}", model_name);
-            info!("  - Quantization: {}", quant);
-            info!("  - Config/tokenizer from: Qwen/{}", model_name);
-            info!("  - GGUF weights from: unsloth/{}-GGUF", model_name);
-        } else {
-            info!("Downloading full-precision SafeTensors model:");
-            info!("  - Model: {}", model_name);
-            info!("  - Repo: Qwen/{}", model_name);
+    let source = match (args.model_id, args.weight_path) {
+        (Some(model_id), _) => tur::ModelSource::HuggingFace(model_id),
+        (None, Some(path)) => tur::ModelSource::LocalPath(path),
+        (None, None) => {
+            return Err(TurError::Other(
+                "Please provide a weight source:\n\
+                 Examples:\n\
+                 - Full precision SafeTensors:\n\
+                   --model-id Qwen3-0.6B\n\
+                 - Quantized GGUF (auto-downloads from unsloth):\n\
+                   --model-id Qwen3-0.6B --quantization Q4_K_M\n\
+                 - Local weights:\n\
+                   --weight-path /path/to/model"
+                    .to_string(),
+            ))
         }
-    }
-
-    let downloader = Downloader::new(args.model_id, args.weight_path, args.quantization);
-    let (paths, gguf) = downloader.prepare_model_weights()?;
-
-    // Load config from downloaded config.json
-    let config_path = paths.get_config_filename();
-    trace!("Reading config file: {}", config_path.display());
-    let config_content = std::fs::read_to_string(&config_path)?;
-
-    // Parse the JSON and extract text_config
-    let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
-    let config: tur::models::qwen3::Config = serde_json::from_value(config_json.clone())?;
-
-    debug!("Model Config: {:?}", config);
-
-    let weight_files = paths.get_weight_filenames();
-    if gguf {
-        debug!("Loading GGUF quantized model from: {:?}", weight_files);
-        if device.is_cpu() {
-            debug!(
-                "CPU mode: Linear layers will use quantized weights (QMatMul) for memory efficiency"
-            );
-        } else {
-            debug!(
-                "GPU/Metal mode: Dequantizing linear layers to {:?} for better performance",
-                dtype
-            );
-        }
-        debug!("Embeddings and norms will use {:?}", dtype);
-    } else {
-        debug!(
-            "Loading full-precision SafeTensors model from: {:?}",
-            weight_files
-        );
-        debug!("All operations will use {:?}", dtype);
-    }
-
-    let tokenizer_path = paths.get_tokenizer_filename();
-    let tokenizer = Tokenizer::from_file(&tokenizer_path).unwrap();
-    debug!("Loaded Tokenizer from: {:?}", tokenizer_path);
+    };
 
     // Create progress reporter
     let progress = ProgressReporter::new();
 
-    // VarBuilderX automatically handles both quantized (GGUF) and full-precision (SafeTensors)
-    let vb = VarBuilderX::new(&paths, gguf, dtype, &device)?;
-    let model = Qwen35ModelForCausalLM::new_with_progress(&config, vb, Some(&progress))?;
-
-    if gguf {
-        debug!("✓ Loaded quantized Qwen 3.5 model (GGUF format)");
-    } else {
-        debug!(
-            "✓ Loaded full-precision Qwen 3.5 with {} safetensor shard(s)",
-            weight_files.len()
-        );
-    }
+    // Use ModelFactory to create the model and tokenizer
+    let factory = tur::ModelFactory::<tur::models::Qwen35ModelForCausalLM>::new(
+        source,
+        args.quantization,
+        device.clone(),
+        dtype,
+    );
 
     // Build inference engine with all parameters
-    let mut engine_builder = tur::backend::InferenceEngine::builder(model, device.clone())
+    let mut pipeline_builder = TextGeneration::builder(&factory, device.clone())
+        .progress(progress.clone())
         .seed(args.seed)
         .repeat_penalty(args.repeat_penalty)
         .repeat_last_n(args.repeat_last_n);
 
     if let Some(temp) = args.temperature {
-        engine_builder = engine_builder.temperature(temp);
+        pipeline_builder = pipeline_builder.temperature(temp);
     }
     if let Some(top_p) = args.top_p {
-        engine_builder = engine_builder.top_p(top_p);
+        pipeline_builder = pipeline_builder.top_p(top_p);
     }
 
     // Enable prefix cache if requested
     if args.prefix_cache {
-        let cache = Arc::new(RwLock::new(PrefixCache::new(
-            args.cache_max_entries,
-            args.cache_max_tokens,
-        )));
         info!(
             "✓ Prefix cache enabled (max_entries: {}, max_tokens: {})",
             args.cache_max_entries, args.cache_max_tokens
         );
-        engine_builder = engine_builder.with_shared_prefix_cache(cache);
+        pipeline_builder =
+            pipeline_builder.with_prefix_cache(args.cache_max_entries, args.cache_max_tokens);
     }
 
-    let engine = engine_builder.build();
+    // Enable batching if requested
+    if args.enable_batching {
+        use tur::backend::scheduler::SchedulingPolicy;
 
-    // Create text generation pipeline from engine
-    let mut pipeline = TextGeneration::from_engine(engine, tokenizer, Some(progress));
+        let policy = match args.scheduling_policy.to_lowercase().as_str() {
+            "fcfs" => SchedulingPolicy::FCFS,
+            "priority" => SchedulingPolicy::Priority,
+            "shortest_job_first" | "sjf" => SchedulingPolicy::SJF,
+            _ => {
+                return Err(TurError::Other(format!(
+                    "Invalid scheduling policy: {}. Use 'fcfs', 'priority', or 'sjf'",
+                    args.scheduling_policy
+                )));
+            }
+        };
+
+        info!(
+            "✓ Continuous batching enabled (max_batch: {}, prefill: {}, decode: {}, policy: {:?})",
+            args.max_batch_size, args.max_prefill_batch, args.max_decode_batch, policy
+        );
+
+        pipeline_builder = pipeline_builder
+            .enable_batching(true)
+            .max_batch_size(args.max_batch_size)
+            .max_prefill_batch(args.max_prefill_batch)
+            .max_decode_batch(args.max_decode_batch)
+            .scheduling_policy(policy);
+    }
+
+    let mut pipeline = pipeline_builder.build();
     debug!("✓ Model is initialized and ready for inference");
 
     let prompt = pipeline.format_prompt(DEFAULT_PROMPT, args.thinking);
