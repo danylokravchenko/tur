@@ -1,4 +1,3 @@
-use candle_core::Device;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tur::ProgressReporter;
@@ -6,50 +5,13 @@ use tur::backend::InferenceEngine;
 use tur::backend::pipeline::{GenerationRequest, TextGeneration};
 use tur::backend::prefix_cache::PrefixCache;
 use tur::backend::tokenizer::TokenOutputStream;
-use tur::models::qwen3::{Config, ModelForCausalLM};
-use tur::weights::{Downloader, VarBuilderX};
 
-/// Download a real small model for testing
-fn download_test_model() -> candle_core::Result<(VarBuilderX<'static>, Config, Device)> {
-    let device = Device::Cpu;
-    let dtype = candle_core::DType::F32;
-
-    let model_id = Some("Qwen3-0.6B".to_string());
-    let quantization = Some("Q4_K_M".to_string());
-
-    let downloader = Downloader::new(model_id, None, quantization);
-    let (paths, is_gguf) = downloader
-        .prepare_model_weights()
-        .map_err(|e| candle_core::Error::Msg(format!("Failed to prepare model: {}", e)))?;
-
-    let config_path = paths.get_config_filename();
-    let config_content = std::fs::read_to_string(&config_path)?;
-    let config: Config = serde_json::from_str(&config_content)
-        .map_err(|e| candle_core::Error::Msg(format!("Failed to parse config: {}", e)))?;
-
-    let vb = VarBuilderX::new(&paths, is_gguf, dtype, &device)?;
-
-    Ok((vb, config, device))
-}
-
-/// Load tokenizer for testing
-fn load_tokenizer() -> candle_core::Result<tokenizers::Tokenizer> {
-    let model_id = Some("Qwen3-0.6B".to_string());
-    let downloader = Downloader::new(model_id, None, None);
-    let (paths, _) = downloader
-        .prepare_model_weights()
-        .map_err(|e| candle_core::Error::Msg(format!("Failed to prepare model: {}", e)))?;
-
-    let tokenizer_path = paths.get_tokenizer_filename();
-    tokenizers::Tokenizer::from_file(tokenizer_path)
-        .map_err(|e| candle_core::Error::Msg(format!("Failed to load tokenizer: {}", e)))
-}
+mod common;
+use common::create_test_model;
 
 #[test]
 fn test_pipeline_end_to_end_generation() {
-    let (vb, config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&config, vb).unwrap();
-    let tokenizer = load_tokenizer().unwrap();
+    let (model, tokenizer, device) = create_test_model().unwrap();
 
     let mut pipeline = TextGeneration::builder(model, tokenizer, device.clone())
         .seed(299792458)
@@ -72,9 +34,7 @@ fn test_pipeline_end_to_end_generation() {
     }
 
     // Test with progress reporter
-    let (vb, config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&config, vb).unwrap();
-    let tokenizer = load_tokenizer().unwrap();
+    let (model, tokenizer, device) = create_test_model().unwrap();
     let progress = ProgressReporter::new();
 
     let mut pipeline_with_progress = TextGeneration::builder(model, tokenizer, device)
@@ -97,9 +57,6 @@ fn test_pipeline_end_to_end_generation() {
 
 #[test]
 fn test_pipeline_parameter_variations() {
-    let (vb, config, device) = download_test_model().unwrap();
-    let tokenizer = load_tokenizer().unwrap();
-
     // Test extreme temperature values affect generation
     let test_cases = [
         (Some(0.1), Some(0.9), 1.1, "Low temp"),
@@ -112,8 +69,8 @@ fn test_pipeline_parameter_variations() {
     ];
 
     for (temp, top_p, penalty, desc) in test_cases {
-        let model = ModelForCausalLM::new(&config, vb.clone()).unwrap();
-        let mut builder = TextGeneration::builder(model, tokenizer.clone(), device.clone())
+        let (model, tokenizer, device) = create_test_model().unwrap();
+        let mut builder = TextGeneration::builder(model, tokenizer, device)
             .seed(299792458)
             .repeat_penalty(penalty)
             .repeat_last_n(64);
@@ -136,9 +93,7 @@ fn test_pipeline_parameter_variations() {
 #[test]
 fn test_prefix_cache_full_hit() {
     // Test the edge case where all tokens are cached
-    let (vb, config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&config, vb).unwrap();
-    let tokenizer = load_tokenizer().unwrap();
+    let (model, tokenizer, device) = create_test_model().unwrap();
 
     // Create prefix cache
     let cache = Arc::new(RwLock::new(PrefixCache::new(10, 100)));
@@ -201,9 +156,7 @@ fn test_prefix_cache_full_hit() {
 #[test]
 fn test_prefix_cache_partial_hit() {
     // Test partial cache hits with shared prefix
-    let (vb, config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&config, vb).unwrap();
-    let tokenizer = load_tokenizer().unwrap();
+    let (model, tokenizer, device) = create_test_model().unwrap();
 
     let cache = Arc::new(RwLock::new(PrefixCache::new(10, 100)));
     let mut engine = InferenceEngine::builder(model, device)
@@ -260,9 +213,7 @@ fn test_prefix_cache_partial_hit() {
 #[test]
 fn test_prefix_cache_with_pipeline() {
     // Test prefix cache integration with full TextGeneration pipeline
-    let (vb, config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&config, vb).unwrap();
-    let tokenizer = load_tokenizer().unwrap();
+    let (model, tokenizer, device) = create_test_model().unwrap();
 
     let cache = Arc::new(RwLock::new(PrefixCache::new(10, 100)));
     let engine = InferenceEngine::builder(model, device.clone())
@@ -301,9 +252,7 @@ fn test_prefix_cache_with_pipeline() {
 #[test]
 fn test_continuous_batching_basic() {
     // Test basic continuous batching setup and usage
-    let (vb, config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&config, vb).unwrap();
-    let tokenizer = load_tokenizer().unwrap();
+    let (model, tokenizer, device) = create_test_model().unwrap();
 
     // Enable batching with builder
     let mut pipeline = TextGeneration::builder(model, tokenizer, device.clone())
@@ -357,9 +306,7 @@ fn test_continuous_batching_basic() {
 #[test]
 fn test_continuous_batching_step_by_step() {
     // Test manual step-by-step execution for fine-grained control
-    let (vb, config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&config, vb).unwrap();
-    let tokenizer = load_tokenizer().unwrap();
+    let (model, tokenizer, device) = create_test_model().unwrap();
 
     let mut pipeline = TextGeneration::builder(model, tokenizer, device)
         .seed(299792458)
@@ -402,9 +349,7 @@ fn test_continuous_batching_step_by_step() {
 #[test]
 fn test_continuous_batching_blocking_get() {
     // Test blocking result retrieval
-    let (vb, config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&config, vb).unwrap();
-    let tokenizer = load_tokenizer().unwrap();
+    let (model, tokenizer, device) = create_test_model().unwrap();
 
     let mut pipeline = TextGeneration::builder(model, tokenizer, device)
         .seed(299792458)
@@ -425,9 +370,7 @@ fn test_continuous_batching_blocking_get() {
 #[test]
 fn test_continuous_batching_mixed_lengths() {
     // Test handling requests with different generation lengths
-    let (vb, config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&config, vb).unwrap();
-    let tokenizer = load_tokenizer().unwrap();
+    let (model, tokenizer, device) = create_test_model().unwrap();
 
     let mut pipeline = TextGeneration::builder(model, tokenizer, device)
         .seed(299792458)
@@ -456,9 +399,7 @@ fn test_continuous_batching_mixed_lengths() {
 #[test]
 fn test_continuous_batching_sequential_submission() {
     // Test submitting requests while others are processing
-    let (vb, config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&config, vb).unwrap();
-    let tokenizer = load_tokenizer().unwrap();
+    let (model, tokenizer, device) = create_test_model().unwrap();
 
     let mut pipeline = TextGeneration::builder(model, tokenizer, device)
         .seed(299792458)
@@ -492,9 +433,7 @@ fn test_continuous_batching_sequential_submission() {
 #[test]
 fn test_continuous_batching_result_management() {
     // Test result storage and retrieval
-    let (vb, config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&config, vb).unwrap();
-    let tokenizer = load_tokenizer().unwrap();
+    let (model, tokenizer, device) = create_test_model().unwrap();
 
     let mut pipeline = TextGeneration::builder(model, tokenizer, device)
         .seed(299792458)

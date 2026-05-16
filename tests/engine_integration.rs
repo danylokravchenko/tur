@@ -1,36 +1,13 @@
-use candle_core::{DType, Device, Result};
 use tur::backend::engine::InferenceEngine;
-use tur::models::qwen3::{Config, ModelForCausalLM};
-use tur::weights::{Downloader, VarBuilderX};
+
 use uuid::Uuid;
 
-/// Download a real small model for testing
-fn download_test_model() -> Result<(VarBuilderX<'static>, Config, Device)> {
-    let device = Device::Cpu;
-    let dtype = DType::F32;
-
-    let model_id = Some("Qwen3-0.6B".to_string());
-    let quantization = Some("Q4_K_M".to_string());
-
-    let downloader = Downloader::new(model_id, None, quantization);
-    let (paths, is_gguf) = downloader
-        .prepare_model_weights()
-        .map_err(|e| candle_core::Error::Msg(format!("Failed to prepare model: {}", e)))?;
-
-    let config_path = paths.get_config_filename();
-    let config_content = std::fs::read_to_string(&config_path)?;
-    let config: Config = serde_json::from_str(&config_content)
-        .map_err(|e| candle_core::Error::Msg(format!("Failed to parse config: {}", e)))?;
-
-    let vb = VarBuilderX::new(&paths, is_gguf, dtype, &device)?;
-
-    Ok((vb, config, device))
-}
+mod common;
+use common::create_test_model;
 
 #[test]
 fn test_inference_engine_prefill_batch() {
-    let (vb, _config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&_config, vb).unwrap();
+    let (model, _tokenizer, device) = create_test_model().unwrap();
     let mut engine = InferenceEngine::builder(model, device).build();
 
     // Create batch of 3 requests with different prompts
@@ -58,8 +35,7 @@ fn test_inference_engine_prefill_batch() {
 
 #[test]
 fn test_inference_engine_decode_batch() {
-    let (vb, _config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&_config, vb).unwrap();
+    let (model, _tokenizer, device) = create_test_model().unwrap();
     let mut engine = InferenceEngine::builder(model, device).build();
 
     // First do prefill to populate KV cache
@@ -102,17 +78,16 @@ fn test_inference_engine_decode_batch() {
 
 #[test]
 fn test_inference_engine_batch_consistency() {
-    let (vb, _config, device) = download_test_model().unwrap();
+    let (model1, _tokenizer, device) = create_test_model().unwrap();
 
     // Single request
     let tokens = vec![1u32, 2, 3, 4, 5];
-    let model1 = ModelForCausalLM::new(&_config, vb.clone()).unwrap();
     let mut engine1 = InferenceEngine::builder(model1, device.clone()).build();
     let (single_token, _, _, _) = engine1.prefill(&tokens).unwrap();
 
     // Same request in batch
     let id = Uuid::new_v4();
-    let model2 = ModelForCausalLM::new(&_config, vb).unwrap();
+    let (model2, _tokenizer, device) = create_test_model().unwrap();
     let mut engine2 = InferenceEngine::builder(model2, device).build();
     let batch_results = engine2.prefill_batch(&[(id, tokens.clone())]).unwrap();
 
@@ -129,8 +104,7 @@ fn test_inference_engine_batch_consistency() {
 
 #[test]
 fn test_inference_engine_empty_batch() {
-    let (vb, _config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&_config, vb).unwrap();
+    let (model, _tokenizer, device) = create_test_model().unwrap();
     let mut engine = InferenceEngine::builder(model, device).build();
 
     // Empty batch should return empty results
@@ -145,8 +119,7 @@ fn test_inference_engine_empty_batch() {
 
 #[test]
 fn test_inference_engine_large_batch() {
-    let (vb, _config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&_config, vb).unwrap();
+    let (model, _tokenizer, device) = create_test_model().unwrap();
     let mut engine = InferenceEngine::builder(model, device).build();
 
     // Create larger batch (8 requests)
@@ -176,8 +149,7 @@ fn test_inference_engine_large_batch() {
 
 #[test]
 fn test_inference_engine_variable_length_batch() {
-    let (vb, _config, device) = download_test_model().unwrap();
-    let model = ModelForCausalLM::new(&_config, vb).unwrap();
+    let (model, _tokenizer, device) = create_test_model().unwrap();
     let mut engine = InferenceEngine::builder(model, device).build();
 
     // Create batch with very different sequence lengths
