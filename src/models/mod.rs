@@ -12,15 +12,33 @@ pub trait ModelImpl {
     /// Forward pass for single request (existing)
     fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor>;
 
+    // /// Forward pass for batched requests with variable positions
+    // ///
+    // /// # Arguments
+    // /// * `input` - Batched input tensor of shape [batch_size, seq_len]
+    // /// * `positions` - Position offset for each request in the batch
+    // /// * `block_tables` - Optional block tables for PagedKvCache, one per request
+    // ///
+    // /// # Returns
+    // /// Tensor of shape [batch_size, seq_len, vocab_size] with logits for each position
+    // fn forward_batch(&mut self, input: &Tensor, positions: &[usize]) -> Result<Tensor>;
+
     /// Forward pass for batched requests with variable positions
     ///
     /// # Arguments
     /// * `input` - Batched input tensor of shape [batch_size, seq_len]
     /// * `positions` - Position offset for each request in the batch
+    /// * `paged_caches` - Optional paged KV caches per request per layer
+    ///   Format: Vec<Vec<PagedKvCache>> where outer vec is per-request, inner vec is per-layer
     ///
     /// # Returns
     /// Tensor of shape [batch_size, seq_len, vocab_size] with logits for each position
-    fn forward_batch(&mut self, input: &Tensor, positions: &[usize]) -> Result<Tensor>;
+    fn forward_batch(
+        &mut self,
+        input: &Tensor,
+        positions: &[usize],
+        paged_caches: Option<&mut [Vec<kv_cache::PagedKvCache>]>,
+    ) -> Result<Tensor>;
 
     fn format_prompt(prompt: &str, thinking: bool) -> String;
 

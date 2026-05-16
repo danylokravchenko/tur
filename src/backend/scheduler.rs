@@ -13,6 +13,7 @@ use crate::{
         factory::ModelConstructor,
         memory_pool::MemoryPool,
     },
+    models::kv_cache::{BlockAllocator, PagedKvCache},
 };
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -78,6 +79,13 @@ pub struct ContinuousBatchScheduler {
     tokenizer: Arc<Tokenizer>,
     /// Track allocated blocks per request (request_id -> num_blocks)
     allocated_blocks: ahash::AHashMap<uuid::Uuid, usize>,
+    /// Block allocator for paged KV cache (shared across all requests)
+    block_allocator: Arc<RwLock<BlockAllocator>>,
+    /// PagedKvCache instances per request (one per layer per request)
+    /// Map: request_id -> Vec<PagedKvCache> (one cache per model layer)
+    paged_caches: ahash::AHashMap<Uuid, Vec<PagedKvCache>>,
+    /// Number of model layers (needed for PagedKvCache initialization)
+    num_layers: usize,
 }
 
 impl ContinuousBatchScheduler {
@@ -87,6 +95,8 @@ impl ContinuousBatchScheduler {
         config: BatchConfig,
         memory_pool: Arc<RwLock<MemoryPool>>,
         tokenizer: Arc<Tokenizer>,
+        allocator: Arc<RwLock<BlockAllocator>>,
+        num_layers: usize,
     ) -> Self {
         debug!(
             policy = ?policy,
@@ -103,6 +113,135 @@ impl ContinuousBatchScheduler {
             memory_pool,
             tokenizer,
             allocated_blocks: ahash::AHashMap::new(),
+            block_allocator: allocator,
+            paged_caches: ahash::AHashMap::new(),
+            num_layers,
+        }
+    }
+
+    /// Initialize PagedKvCache for a request (one cache per model layer)
+    /// If a prefix_request_id is provided, fork from that request's caches for prefix sharing
+    fn initialize_paged_cache(
+        &mut self,
+        request_id: &Uuid,
+        prefix_request_id: Option<&Uuid>,
+    ) -> Result<()> {
+        let caches: Vec<PagedKvCache> = if let Some(prefix_id) = prefix_request_id {
+            // Fork from existing request's caches for prefix sharing
+            if let Some(prefix_caches) = self.paged_caches.get(prefix_id) {
+                let forked_caches: candle_core::Result<Vec<_>> =
+                    prefix_caches.iter().map(|cache| cache.fork()).collect();
+                trace!(
+                    request_id = %request_id,
+                    prefix_request_id = %prefix_id,
+                    num_layers = self.num_layers,
+                    "Forked PagedKvCache from prefix request for sharing"
+                );
+                forked_caches?
+            } else {
+                // Prefix request not found, create new caches
+                trace!(
+                    request_id = %request_id,
+                    prefix_request_id = %prefix_id,
+                    "Prefix request not found, creating new caches"
+                );
+                (0..self.num_layers)
+                    .map(|_| PagedKvCache::new(self.block_allocator.clone(), 2))
+                    .collect()
+            }
+        } else {
+            // No prefix sharing, create new caches
+            trace!(request_id = %request_id, num_layers = self.num_layers, "Initialized new PagedKvCache for request");
+            (0..self.num_layers)
+                .map(|_| PagedKvCache::new(self.block_allocator.clone(), 2))
+                .collect()
+        };
+
+        self.paged_caches.insert(*request_id, caches);
+        Ok(())
+    }
+
+    /// Find a request with matching prefix for potential cache sharing
+    /// Returns the request ID if a suitable prefix match is found
+    fn find_prefix_match(&self, tokens: &[u32]) -> Option<Uuid> {
+        // Simple prefix matching: find any active request that shares a prefix
+        // For efficiency, we only check if the new request's tokens are a prefix of an existing request
+        // or if an existing request's tokens are a prefix of the new request
+
+        const MIN_PREFIX_LENGTH: usize = 10; // Minimum prefix length to consider sharing
+
+        if tokens.len() < MIN_PREFIX_LENGTH {
+            return None;
+        }
+
+        let mut best_match: Option<(Uuid, usize)> = None;
+
+        // Check all active requests with paged caches
+        for (request_id, _) in &self.paged_caches {
+            if let Some(request) = self.batch_manager.get_request(request_id) {
+                let request_tokens = &request.prompt_tokens;
+
+                // Find common prefix length
+                let common_len = tokens
+                    .iter()
+                    .zip(request_tokens.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+
+                // Only consider if common prefix is significant
+                if common_len >= MIN_PREFIX_LENGTH {
+                    // Update best match if this is longer
+                    if best_match.is_none_or(|(_, len)| common_len > len) {
+                        best_match = Some((*request_id, common_len));
+                    }
+                }
+            }
+        }
+
+        if let Some((id, len)) = best_match {
+            trace!(
+                prefix_request_id = %id,
+                common_prefix_length = len,
+                "Found prefix match for cache sharing"
+            );
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    /// Get block tables for a batch of requests
+    pub fn get_block_tables(
+        &self,
+        request_ids: &[Uuid],
+    ) -> Option<Vec<Vec<crate::models::kv_cache::BlockId>>> {
+        let mut block_tables = Vec::with_capacity(request_ids.len());
+        for id in request_ids {
+            if let Some(request) = self.batch_manager.get_request(id) {
+                block_tables.push(request.block_table.clone());
+            } else {
+                // If any request is missing, return None
+                return None;
+            }
+        }
+        Some(block_tables)
+    }
+
+    /// Get mutable paged caches for a batch of requests
+    /// Temporarily removes them from the scheduler - caller must put them back!
+    pub fn get_paged_caches_mut(&mut self, request_ids: &[Uuid]) -> Vec<Vec<PagedKvCache>> {
+        request_ids
+            .iter()
+            .filter_map(|id| self.paged_caches.remove(id))
+            .collect()
+    }
+
+    /// Put paged caches back into the scheduler after use
+    pub fn put_paged_caches(&mut self, request_ids: &[Uuid], mut caches: Vec<Vec<PagedKvCache>>) {
+        for (idx, id) in request_ids.iter().enumerate() {
+            if idx < caches.len() {
+                self.paged_caches.insert(*id, caches.swap_remove(0));
+            }
         }
     }
 
@@ -139,15 +278,41 @@ impl ContinuousBatchScheduler {
                 drop(pool); // Release lock before calling batch_manager
 
                 // Admit the request (removes from queue, adds to active)
-                if let Some(request) = self.batch_manager.admit_request() {
+                if let Some(mut request) = self.batch_manager.admit_request() {
+                    let request_id = request.id;
+
+                    // Allocate blocks from BlockAllocator for this request
+                    let mut allocator = self.block_allocator.write();
+                    let mut block_ids = Vec::new();
+                    for _ in 0..required_blocks {
+                        let block_id = allocator.allocate()?;
+                        block_ids.push(block_id);
+                    }
+                    drop(allocator);
+
+                    // Store block table in request
+                    request.block_table = block_ids;
+
+                    // Update the request in batch_manager
+                    if let Some(req_mut) = self.batch_manager.get_request_mut(&request_id) {
+                        req_mut.block_table = request.block_table.clone();
+                    }
+
+                    // Check for prefix match for potential cache sharing
+                    let prefix_match = self.find_prefix_match(&request.prompt_tokens);
+
+                    // Initialize PagedKvCache for this request (with optional prefix sharing via fork)
+                    self.initialize_paged_cache(&request_id, prefix_match.as_ref())?;
+
                     // Track allocated blocks for this request
-                    self.allocated_blocks.insert(request.id, required_blocks);
+                    self.allocated_blocks.insert(request_id, required_blocks);
                     trace!(
-                        request_id = %request.id,
+                        request_id = %request_id,
                         required_blocks,
-                        "Allocated memory blocks for request"
+                        allocated_block_ids = ?request.block_table,
+                        "Allocated memory blocks and initialized PagedKvCache for request"
                     );
-                    admitted.push(request.id);
+                    admitted.push(request_id);
                 } else {
                     break;
                 }
@@ -226,44 +391,90 @@ impl ContinuousBatchScheduler {
 
     /// Mark a request as completed and free its memory
     pub fn complete_request(&mut self, request_id: &Uuid) -> Result<Vec<u32>> {
+        // Get block table for this request before completing
+        let block_table = if let Some(request) = self.batch_manager.get_request(request_id) {
+            request.block_table.clone()
+        } else {
+            Vec::new()
+        };
+
         // Get allocated blocks for this request
         let blocks_to_free = self.allocated_blocks.remove(request_id).unwrap_or(0);
 
         // Complete the request in batch manager
         let tokens = self.batch_manager.complete_request(request_id)?;
 
-        // Free memory blocks
+        // Free blocks from BlockAllocator
+        if !block_table.is_empty() {
+            let mut allocator = self.block_allocator.write();
+            for block_id in &block_table {
+                allocator.free(*block_id)?;
+            }
+            trace!(
+                request_id = %request_id,
+                freed_block_ids = ?block_table,
+                "Freed BlockAllocator blocks for completed request"
+            );
+        }
+
+        // Free memory pool blocks
         if blocks_to_free > 0 {
             let mut pool = self.memory_pool.write();
             pool.free(blocks_to_free);
             trace!(
                 request_id = %request_id,
                 freed_blocks = blocks_to_free,
-                "Freed memory blocks for completed request"
+                "Freed memory pool blocks for completed request"
             );
         }
+
+        // Clean up PagedKvCache instances
+        self.paged_caches.remove(request_id);
 
         Ok(tokens)
     }
 
     /// Mark a request as failed and free its memory
     pub fn fail_request(&mut self, request_id: &Uuid, error: String) -> Result<()> {
+        // Get block table for this request before failing
+        let block_table = if let Some(request) = self.batch_manager.get_request(request_id) {
+            request.block_table.clone()
+        } else {
+            Vec::new()
+        };
+
         // Get allocated blocks for this request
         let blocks_to_free = self.allocated_blocks.remove(request_id).unwrap_or(0);
 
         // Fail the request in batch manager
         self.batch_manager.fail_request(request_id, error)?;
 
-        // Free memory blocks
+        // Free blocks from BlockAllocator
+        if !block_table.is_empty() {
+            let mut allocator = self.block_allocator.write();
+            for block_id in &block_table {
+                allocator.free(*block_id)?;
+            }
+            trace!(
+                request_id = %request_id,
+                freed_block_ids = ?block_table,
+                "Freed BlockAllocator blocks for failed request"
+            );
+        }
+
+        // Free memory pool blocks
         if blocks_to_free > 0 {
             let mut pool = self.memory_pool.write();
             pool.free(blocks_to_free);
             trace!(
                 request_id = %request_id,
                 freed_blocks = blocks_to_free,
-                "freed memory blocks for failed request"
+                "Freed memory pool blocks for failed request"
             );
         }
+
+        // Clean up PagedKvCache instances
+        self.paged_caches.remove(request_id);
 
         Ok(())
     }
@@ -358,8 +569,27 @@ impl ContinuousBatchScheduler {
                 })
                 .collect();
 
+            // Collect mutable references to paged caches for the batch
+            let request_ids_vec: Vec<Uuid> = prefill_batch.request_ids.clone();
+            let mut paged_caches_vec: Vec<Vec<PagedKvCache>> = request_ids_vec
+                .iter()
+                .filter_map(|id| self.paged_caches.remove(id))
+                .collect();
+
             // Execute prefill batch
-            let results = engine.prefill_batch(&batch_tokens)?;
+            let results = if !paged_caches_vec.is_empty() {
+                engine.prefill_batch(&batch_tokens, Some(&mut paged_caches_vec))?
+            } else {
+                engine.prefill_batch(&batch_tokens, None)?
+            };
+
+            // Put paged caches back to scheduler (they were modified during forward pass)
+            for (idx, id) in request_ids_vec.iter().enumerate() {
+                if idx < paged_caches_vec.len() {
+                    self.paged_caches
+                        .insert(*id, paged_caches_vec.swap_remove(0));
+                }
+            }
 
             // Update request states with first generated token
             for (request_id, first_token) in results {
@@ -391,8 +621,27 @@ impl ContinuousBatchScheduler {
                 })
                 .collect();
 
+            // Collect mutable references to paged caches for the batch
+            let request_ids_vec: Vec<Uuid> = decode_batch.request_ids.clone();
+            let mut paged_caches_vec: Vec<Vec<PagedKvCache>> = request_ids_vec
+                .iter()
+                .filter_map(|id| self.paged_caches.remove(id))
+                .collect();
+
             // Execute decode batch
-            let results = engine.decode_batch(&batch_data)?;
+            let results = if !paged_caches_vec.is_empty() {
+                engine.decode_batch(&batch_data, Some(&mut paged_caches_vec))?
+            } else {
+                engine.decode_batch(&batch_data, None)?
+            };
+
+            // Put paged caches back to scheduler (they were modified during forward pass)
+            for (idx, id) in request_ids_vec.iter().enumerate() {
+                if idx < paged_caches_vec.len() {
+                    self.paged_caches
+                        .insert(*id, paged_caches_vec.swap_remove(0));
+                }
+            }
 
             // Update request states and check for completion
             for (request_id, next_token) in results {
@@ -449,11 +698,11 @@ mod tests {
         // Create a simple memory pool for testing
         let memory_pool = Arc::new(RwLock::new(MemoryPool::new(
             1024 * 1024 * 100, // 100MB
-            16,                // 16 tokens per block
-            32,                // 32 layers
-            32,                // 32 heads
-            128,               // 128 head_dim
-            2,                 // 2 bytes (BF16)
+            16,
+            32,
+            32,
+            128,
+            2, // 2 bytes (BF16)
             Device::Cpu,
         )));
 
@@ -463,8 +712,27 @@ mod tests {
             tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
         }));
 
+        // Create block allocator for paged KV cache
+        let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(
+            1000,
+            16,
+            1,
+            32,
+            128,
+            Device::Cpu,
+            candle_core::DType::BF16,
+        )));
+
         let config = BatchConfig::default();
-        ContinuousBatchScheduler::new(policy, config, memory_pool, tokenizer)
+        let num_layers = 32;
+        ContinuousBatchScheduler::new(
+            policy,
+            config,
+            memory_pool,
+            tokenizer,
+            block_allocator,
+            num_layers,
+        )
     }
 
     fn create_test_request(prompt_len: usize, max_tokens: usize, priority: u32) -> RequestState {
@@ -649,9 +917,24 @@ mod tests {
         let tokenizer = Arc::new(Tokenizer::from_file("tokenizer.json").unwrap_or_else(|_| {
             tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
         }));
+        let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(
+            100,
+            16,
+            1,
+            32,
+            128,
+            Device::Cpu,
+            candle_core::DType::BF16,
+        )));
         let config = BatchConfig::default();
-        let mut scheduler =
-            ContinuousBatchScheduler::new(SchedulingPolicy::FCFS, config, memory_pool, tokenizer);
+        let mut scheduler = ContinuousBatchScheduler::new(
+            SchedulingPolicy::FCFS,
+            config,
+            memory_pool,
+            tokenizer,
+            block_allocator,
+            32,
+        );
 
         // Enqueue many large requests
         for _ in 0..10 {
@@ -1013,9 +1296,24 @@ mod tests {
         let tokenizer = Arc::new(Tokenizer::from_file("tokenizer.json").unwrap_or_else(|_| {
             tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
         }));
+        let block_allocator = Arc::new(RwLock::new(BlockAllocator::new(
+            500,
+            16,
+            1,
+            8,
+            64,
+            candle_core::Device::Cpu,
+            candle_core::DType::BF16,
+        )));
         let config = BatchConfig::default();
-        let mut scheduler =
-            ContinuousBatchScheduler::new(SchedulingPolicy::FCFS, config, memory_pool, tokenizer);
+        let mut scheduler = ContinuousBatchScheduler::new(
+            SchedulingPolicy::FCFS,
+            config,
+            memory_pool,
+            tokenizer,
+            block_allocator,
+            32,
+        );
 
         // Enqueue many requests with larger size to exceed memory
         let mut ids = Vec::new();

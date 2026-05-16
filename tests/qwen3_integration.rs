@@ -283,7 +283,7 @@ fn test_qwen3_forward_batch_with_variable_positions() {
     let input_ids = Tensor::new(&[[10u32], [20u32], [30u32]], &device).unwrap();
     let positions = vec![5, 10, 15]; // Each sequence at different position
 
-    let result = model.forward_batch(&input_ids, &positions);
+    let result = model.forward_batch(&input_ids, &positions, None);
     assert!(
         result.is_ok(),
         "Batched forward with variable positions failed: {:?}",
@@ -310,7 +310,9 @@ fn test_qwen3_forward_batch_consistency_with_single_forward() {
     // Batched forward with same inputs
     let mut model2 = ModelForCausalLM::new(&config, vb).unwrap();
     let positions = vec![0, 0];
-    let output_batch = model2.forward_batch(&input_ids_batch, &positions).unwrap();
+    let output_batch = model2
+        .forward_batch(&input_ids_batch, &positions, None)
+        .unwrap();
 
     // Check shapes
     assert_eq!(output_single.dims(), &[1, 1, config.vocab_size]);
@@ -360,7 +362,7 @@ fn test_qwen3_forward_batch_prefill_phase() {
     // All starting from position 0 (prefill phase)
     let positions = vec![0, 0, 0];
 
-    let result = model.forward_batch(&input_ids, &positions);
+    let result = model.forward_batch(&input_ids, &positions, None);
     assert!(result.is_ok(), "Batched prefill failed: {:?}", result.err());
 
     let output = result.unwrap();
@@ -380,14 +382,14 @@ fn test_qwen3_forward_batch_decode_phase() {
     .unwrap();
     let prefill_positions = vec![0, 0, 0];
     let _ = model
-        .forward_batch(&prefill_ids, &prefill_positions)
+        .forward_batch(&prefill_ids, &prefill_positions, None)
         .unwrap();
 
     // Now simulate decode phase - each sequence generates next token
     let decode_ids = Tensor::new(&[[10u32], [11u32], [12u32]], &device).unwrap();
     let decode_positions = vec![3, 3, 3]; // All at position 3 after prefill
 
-    let result = model.forward_batch(&decode_ids, &decode_positions);
+    let result = model.forward_batch(&decode_ids, &decode_positions, None);
     assert!(result.is_ok(), "Batched decode failed: {:?}", result.err());
 
     let output = result.unwrap();
@@ -406,7 +408,7 @@ fn test_qwen3_forward_batch_mixed_positions() {
     let input_ids = Tensor::new(&[[100u32], [200u32], [300u32]], &device).unwrap();
     let positions = vec![10, 3, 20];
 
-    let result = model.forward_batch(&input_ids, &positions);
+    let result = model.forward_batch(&input_ids, &positions, None);
     assert!(
         result.is_ok(),
         "Batched forward with mixed positions failed: {:?}",
@@ -425,7 +427,7 @@ fn test_qwen3_forward_batch_position_mismatch_error() {
     let input_ids = Tensor::new(&[[1u32], [2u32], [3u32]], &device).unwrap();
     let positions = vec![0, 5]; // Wrong length - should be 3, not 2
 
-    let result = model.forward_batch(&input_ids, &positions);
+    let result = model.forward_batch(&input_ids, &positions, None);
     assert!(
         result.is_err(),
         "Should fail when positions length doesn't match batch size"
@@ -446,7 +448,7 @@ fn test_qwen3_forward_batch_large_batch() {
     let flat_data: Vec<u32> = input_data.iter().flatten().copied().collect();
     let input_ids = Tensor::from_vec(flat_data, (batch_size, 1), &device).unwrap();
 
-    let result = model.forward_batch(&input_ids, &positions);
+    let result = model.forward_batch(&input_ids, &positions, None);
     assert!(
         result.is_ok(),
         "Large batch forward failed: {:?}",

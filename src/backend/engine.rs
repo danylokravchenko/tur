@@ -13,7 +13,7 @@ use crate::{
         prefix_cache::{PrefixCache, PrefixCacheEntry, SharedPrefixCache},
         tokenizer::{LogitsSampler, TokenOutputStream},
     },
-    models::ModelImpl,
+    models::{ModelImpl, kv_cache::PagedKvCache},
 };
 
 /// Core inference engine without output handling
@@ -25,7 +25,6 @@ pub struct InferenceEngine<T: ModelImpl> {
     repeat_penalty: f32,
     repeat_last_n: usize,
     prefix_cache: Option<SharedPrefixCache>,
-    block_allocator: Option<Arc<RwLock<crate::models::kv_cache::BlockAllocator>>>,
 }
 
 /// Builder for InferenceEngine
@@ -40,7 +39,6 @@ pub struct InferenceEngineBuilder<'a, T: ModelConstructor> {
     repeat_last_n: usize,
     prefix_cache: Option<SharedPrefixCache>,
     progress: Option<ProgressReporter>,
-    block_allocator: Option<Arc<RwLock<crate::models::kv_cache::BlockAllocator>>>,
 }
 
 impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
@@ -56,7 +54,6 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
             repeat_last_n: 64,
             prefix_cache: None,
             progress: None,
-            block_allocator: None,
         }
     }
 
@@ -97,15 +94,6 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
     /// Use a shared prefix cache instance
     pub fn with_shared_prefix_cache(mut self, cache: SharedPrefixCache) -> Self {
         self.prefix_cache = Some(cache);
-        self
-    }
-
-    /// Use a block allocator for paged KV cache (batching mode)
-    pub fn with_block_allocator(
-        mut self,
-        allocator: Arc<RwLock<crate::models::kv_cache::BlockAllocator>>,
-    ) -> Self {
-        self.block_allocator = Some(allocator);
         self
     }
 
@@ -153,7 +141,6 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
             repeat_penalty: self.repeat_penalty,
             repeat_last_n: self.repeat_last_n,
             prefix_cache: self.prefix_cache,
-            block_allocator: self.block_allocator,
         };
         Ok((engine, tokenizer))
     }
@@ -409,17 +396,19 @@ impl<T: ModelConstructor> InferenceEngine<T> {
 
     /// Perform batched prefill: encode multiple prompts and get first tokens
     /// Returns vector of (first_token, request_id) pairs
-    pub fn prefill_batch(&mut self, batch_tokens: &[(Uuid, Vec<u32>)]) -> Result<Vec<(Uuid, u32)>> {
+    pub fn prefill_batch(
+        &mut self,
+        batch_tokens: &[(Uuid, Vec<u32>)],
+        paged_caches: Option<&mut [Vec<PagedKvCache>]>,
+    ) -> Result<Vec<(Uuid, u32)>> {
         if batch_tokens.is_empty() {
             return Ok(Vec::new());
         }
 
-        // CRITICAL: Clear KV cache before each batch execution
-        // Each batch contains different requests and may have different batch_size.
-        // The current SimpleKvCache accumulates state, causing shape mismatches
-        // when batch sizes change (e.g., batch_size=2 then batch_size=1).
-        // TODO: Implement proper PagedKvCache with per-request block tables
-        self.model.clear_kv_cache();
+        // Clear KV cache only if not using paged cache
+        if paged_caches.is_none() {
+            self.model.clear_kv_cache();
+        }
 
         // Find max length in batch
         let max_len = batch_tokens
@@ -441,9 +430,14 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         }
 
         let input = Tensor::from_vec(input_data, (batch_size, max_len), &self.device)?;
-        trace!(batch_size, max_len, "Running batched prefill forward pass");
+        trace!(
+            batch_size,
+            max_len,
+            has_paged_caches = paged_caches.is_some(),
+            "Running batched prefill forward pass"
+        );
 
-        let logits = self.model.forward_batch(&input, &positions)?;
+        let logits = self.model.forward_batch(&input, &positions, paged_caches)?;
 
         // Sample next token for each request
         let mut results = Vec::with_capacity(batch_size);
@@ -468,14 +462,16 @@ impl<T: ModelConstructor> InferenceEngine<T> {
     pub fn decode_batch(
         &mut self,
         batch_data: &[(Uuid, Vec<u32>, usize)], // (id, all_tokens, position)
+        paged_caches: Option<&mut [Vec<PagedKvCache>]>,
     ) -> Result<Vec<(Uuid, u32)>> {
         if batch_data.is_empty() {
             return Ok(Vec::new());
         }
 
-        // CRITICAL: Clear KV cache before each batch execution
-        // Same reasoning as prefill_batch - prevents shape mismatches
-        self.model.clear_kv_cache();
+        // Clear KV cache only if not using paged cache
+        if paged_caches.is_none() {
+            self.model.clear_kv_cache();
+        }
 
         let batch_size = batch_data.len();
 
@@ -489,9 +485,13 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         }
 
         let input = Tensor::from_vec(input_data, (batch_size, 1), &self.device)?;
-        trace!(batch_size, "Running batched decode forward pass");
+        trace!(
+            batch_size,
+            has_paged_caches = paged_caches.is_some(),
+            "Running batched decode forward pass"
+        );
 
-        let logits = self.model.forward_batch(&input, &positions)?;
+        let logits = self.model.forward_batch(&input, &positions, paged_caches)?;
 
         // Sample next token for each request
         let mut results = Vec::with_capacity(batch_size);
@@ -538,8 +538,18 @@ impl<T: ModelConstructor> InferenceEngine<T> {
                 }
             }
 
-            // Execute batched prefill
-            let results = self.prefill_batch(&batch_tokens)?;
+            // Get paged caches from scheduler
+            let mut paged_caches = scheduler.get_paged_caches_mut(&prefill_batch.request_ids);
+
+            // Execute batched prefill with paged caches
+            let results = if !paged_caches.is_empty() {
+                self.prefill_batch(&batch_tokens, Some(&mut paged_caches))?
+            } else {
+                self.prefill_batch(&batch_tokens, None)?
+            };
+
+            // Put paged caches back to scheduler
+            scheduler.put_paged_caches(&prefill_batch.request_ids, paged_caches);
 
             // Update requests with first generated tokens and transition to decode
             for (id, next_token) in results {
@@ -570,8 +580,18 @@ impl<T: ModelConstructor> InferenceEngine<T> {
                 }
             }
 
-            // Execute batched decode
-            let results = self.decode_batch(&batch_data)?;
+            // Get paged caches from scheduler
+            let mut paged_caches = scheduler.get_paged_caches_mut(&decode_batch.request_ids);
+
+            // Execute batched decode with paged caches
+            let results = if !paged_caches.is_empty() {
+                self.decode_batch(&batch_data, Some(&mut paged_caches))?
+            } else {
+                self.decode_batch(&batch_data, None)?
+            };
+
+            // Put paged caches back to scheduler
+            scheduler.put_paged_caches(&decode_batch.request_ids, paged_caches);
 
             // Update requests with new tokens
             for (id, next_token) in results {

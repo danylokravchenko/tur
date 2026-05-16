@@ -1,5 +1,5 @@
 use crate::backend::progress::ProgressReporter;
-use crate::models::kv_cache::{KvCache, KvCacheImpl};
+use crate::models::kv_cache::{KvCache, KvCacheImpl, PagedKvCache};
 use crate::models::layers;
 use crate::weights::VarBuilderX;
 use candle_core::{DType, Device, Module, Result, Tensor};
@@ -303,11 +303,13 @@ impl Qwen3Attention {
     /// * `x` - Input tensor of shape [batch_size, seq_len, hidden_size]
     /// * `attn_mask` - Optional attention mask
     /// * `positions` - Position offset for each batch element
+    /// * `paged_caches` - Optional paged KV caches (one per request in batch)
     pub(crate) fn forward_batch(
         &mut self,
         x: &Tensor,
         attn_mask: Option<&Tensor>,
         positions: &[usize],
+        paged_caches: Option<Vec<&mut PagedKvCache>>,
     ) -> Result<Tensor> {
         let (b, l, _) = x.dims3()?;
 
@@ -347,7 +349,29 @@ impl Qwen3Attention {
         let (q, k) = self.rotary_emb.apply_batch(&q, &k, positions)?;
 
         // 5. Accumulate KV cache
-        let (k, v) = self.kv_cache.append(&k, &v)?;
+        let (k, v) = if let Some(mut caches) = paged_caches {
+            // Use PagedKvCache for batched inference
+            // Each request has its own cache
+            let mut k_parts = Vec::with_capacity(caches.len());
+            let mut v_parts = Vec::with_capacity(caches.len());
+
+            for (batch_idx, cache) in caches.iter_mut().enumerate() {
+                // Extract K, V for this request
+                let k_req = k.narrow(0, batch_idx, 1)?;
+                let v_req = v.narrow(0, batch_idx, 1)?;
+
+                // Append to paged cache and get full KV
+                let (k_full, v_full) = cache.append(&k_req, &v_req)?;
+                k_parts.push(k_full);
+                v_parts.push(v_full);
+            }
+
+            // Concatenate along batch dimension
+            (Tensor::cat(&k_parts, 0)?, Tensor::cat(&v_parts, 0)?)
+        } else {
+            // Use SimpleKvCache for single request
+            self.kv_cache.append(&k, &v)?
+        };
 
         // 6. Attention dispatch
         let on_cpu = x.device().is_cpu();
@@ -581,9 +605,12 @@ impl DecoderLayer {
         x: &Tensor,
         mask: Option<&Tensor>,
         positions: &[usize],
+        paged_caches: Option<Vec<&mut PagedKvCache>>,
     ) -> Result<Tensor> {
         let h = self.ln1.forward(x)?;
-        let h = self.self_attn.forward_batch(&h, mask, positions)?;
+        let h = self
+            .self_attn
+            .forward_batch(&h, mask, positions, paged_caches)?;
         let x = (x + h)?;
         let h2 = self.ln2.forward(&x)?;
         let h2 = h2.apply(&self.mlp)?;
@@ -778,7 +805,12 @@ impl Model {
     ///
     /// # Returns
     /// Hidden states tensor of shape [batch_size, seq_len, hidden_size]
-    pub fn forward_batch(&mut self, input: &Tensor, positions: &[usize]) -> Result<Tensor> {
+    pub fn forward_batch(
+        &mut self,
+        input: &Tensor,
+        positions: &[usize],
+        mut paged_caches: Option<&mut [Vec<PagedKvCache>]>,
+    ) -> Result<Tensor> {
         let (b, l) = input.dims2()?;
 
         if positions.len() != b {
@@ -806,8 +838,14 @@ impl Model {
             None
         };
 
-        for layer in &mut self.layers {
-            h = layer.forward_batch(&h, causal.as_ref(), positions)?;
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let layer_caches = paged_caches.as_mut().map(|caches| {
+                caches
+                    .iter_mut()
+                    .map(|req_caches| &mut req_caches[layer_idx])
+                    .collect::<Vec<_>>()
+            });
+            h = layer.forward_batch(&h, causal.as_ref(), positions, layer_caches)?;
         }
         self.norm.forward(&h)
     }
@@ -869,7 +907,12 @@ impl super::ModelImpl for ModelForCausalLM {
             .apply(&self.lm_head)
     }
 
-    fn forward_batch(&mut self, input: &Tensor, positions: &[usize]) -> Result<Tensor> {
+    fn forward_batch(
+        &mut self,
+        input: &Tensor,
+        positions: &[usize],
+        paged_caches: Option<&mut [Vec<PagedKvCache>]>,
+    ) -> Result<Tensor> {
         let (b, l) = input.dims2()?;
 
         if positions.len() != b {
@@ -881,7 +924,7 @@ impl super::ModelImpl for ModelForCausalLM {
         }
 
         // Get hidden states for all positions
-        let hidden_states = self.base.forward_batch(input, positions)?;
+        let hidden_states = self.base.forward_batch(input, positions, paged_caches)?;
 
         // For each batch element, extract the last token's logits
         // hidden_states shape: [batch_size, seq_len, hidden_size]

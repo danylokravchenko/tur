@@ -17,7 +17,7 @@ fn test_inference_engine_prefill_batch() {
         (Uuid::new_v4(), vec![8u32, 9, 10, 11, 12]),
     ];
 
-    let result = engine.prefill_batch(&batch_tokens);
+    let result = engine.prefill_batch(&batch_tokens, None);
     assert!(result.is_ok(), "Batched prefill failed: {:?}", result.err());
 
     let results = result.unwrap();
@@ -49,7 +49,7 @@ fn test_inference_engine_decode_batch() {
         (id3, vec![8u32, 9]),
     ];
 
-    let prefill_results = engine.prefill_batch(&prefill_batch).unwrap();
+    let prefill_results = engine.prefill_batch(&prefill_batch, None).unwrap();
 
     // Now do decode with variable positions
     let mut decode_batch = Vec::new();
@@ -60,7 +60,7 @@ fn test_inference_engine_decode_batch() {
         decode_batch.push((id, tokens, position));
     }
 
-    let result = engine.decode_batch(&decode_batch);
+    let result = engine.decode_batch(&decode_batch, None);
     assert!(result.is_ok(), "Batched decode failed: {:?}", result.err());
 
     let results = result.unwrap();
@@ -92,7 +92,9 @@ fn test_inference_engine_batch_consistency() {
     let (mut engine2, _tokenizer) = InferenceEngine::builder(&factory, device.clone())
         .build()
         .unwrap();
-    let batch_results = engine2.prefill_batch(&[(id, tokens.clone())]).unwrap();
+    let batch_results = engine2
+        .prefill_batch(&[(id, tokens.clone())], None)
+        .unwrap();
 
     assert_eq!(batch_results.len(), 1);
     let (result_id, batch_token) = batch_results[0];
@@ -111,11 +113,11 @@ fn test_inference_engine_empty_batch() {
     let (mut engine, _tokenizer) = InferenceEngine::builder(&factory, device).build().unwrap();
 
     // Empty batch should return empty results
-    let result = engine.prefill_batch(&[]);
+    let result = engine.prefill_batch(&[], None);
     assert!(result.is_ok());
     assert_eq!(result.unwrap().len(), 0);
 
-    let result = engine.decode_batch(&[]);
+    let result = engine.decode_batch(&[], None);
     assert!(result.is_ok());
     assert_eq!(result.unwrap().len(), 0);
 }
@@ -134,7 +136,7 @@ fn test_inference_engine_large_batch() {
         })
         .collect();
 
-    let result = engine.prefill_batch(&batch_tokens);
+    let result = engine.prefill_batch(&batch_tokens, None);
     assert!(
         result.is_ok(),
         "Large batch prefill failed: {:?}",
@@ -166,7 +168,7 @@ fn test_inference_engine_variable_length_batch() {
         ), // Length 10
     ];
 
-    let result = engine.prefill_batch(&batch_tokens);
+    let result = engine.prefill_batch(&batch_tokens, None);
     assert!(
         result.is_ok(),
         "Variable length batch failed: {:?}",

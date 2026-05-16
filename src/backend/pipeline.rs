@@ -262,9 +262,6 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
                 dtype,
             )));
 
-            // Pass block allocator to engine for paged KV cache
-            engine_builder = engine_builder.with_block_allocator(block_allocator.clone());
-
             // Build engine with block allocator
             let (engine, tokenizer) = engine_builder.build().expect("Failed to build engine");
             let tokenizer_arc = Arc::new(tokenizer.clone());
@@ -288,11 +285,17 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
                 max_decode_tokens,
             };
 
+            // TODO: Get num_layers from model config via factory
+            // For now, use a reasonable default (32 layers for Qwen3-0.5B/1.5B)
+            let num_layers = 32;
+
             let scheduler = ContinuousBatchScheduler::new(
                 self.scheduling_policy,
                 batch_config,
                 memory_pool,
                 tokenizer_arc.clone(),
+                block_allocator,
+                num_layers,
             );
 
             (Some(scheduler), Some(tokenizer_arc), engine, tokenizer)
