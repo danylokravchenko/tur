@@ -304,7 +304,7 @@ fn bench_prefix_cache(c: &mut Criterion) {
         .prepare_model_weights()
         .expect("failed to prepare model weights")
         .0
-        .get_tokenizer_filename(),
+        .tokenizer_filename(),
     )
     .expect("failed to load tokenizer");
 

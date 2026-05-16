@@ -19,7 +19,7 @@ fn download_test_model() -> Result<(VarBuilderX<'static>, Config, Device)> {
         .map_err(|e| candle_core::Error::Msg(format!("Failed to prepare model: {}", e)))?;
 
     // Load config
-    let config_path = paths.get_config_filename();
+    let config_path = paths.config_filename();
     let config_content = std::fs::read_to_string(&config_path)?;
     let config: Config = serde_json::from_str(&config_content)
         .map_err(|e| candle_core::Error::Msg(format!("Failed to parse config: {}", e)))?;

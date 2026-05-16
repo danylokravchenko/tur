@@ -177,33 +177,25 @@ impl<T: ModelConstructor> InferenceEngine<T> {
             )?
         };
 
-        // Apply guidance constraints if any
-        if let Some(constrained) = self.sampler.apply_constraints(&logits, tokens)? {
-            Ok(constrained)
-        } else {
-            Ok(logits)
-        }
+        Ok(self
+            .sampler
+            .apply_constraints(&logits, tokens)?
+            .unwrap_or(logits))
     }
 
     /// Try to restore KV cache state from prefix cache
     /// Returns (cache_hit, cached_token_count)
     fn try_restore_from_cache(&mut self, tokens: &[u32]) -> Result<(bool, usize)> {
-        let cache = match &self.prefix_cache {
-            Some(c) => c,
-            None => return Ok((false, 0)),
+        let Some(cache) = &self.prefix_cache else {
+            return Ok((false, 0));
         };
-
         let mut cache = cache.write();
 
-        // Find longest matching prefix
-        let (key, match_len) = cache.find_longest_prefix(tokens);
-
-        if match_len == 0 {
+        let Some((key, match_len)) = cache.find_longest_prefix(tokens) else {
             cache.record_miss();
             return Ok((false, 0));
-        }
+        };
 
-        // Get the cached entry
         let entry = match cache.get(key) {
             Some(e) => e,
             None => {
@@ -212,50 +204,58 @@ impl<T: ModelConstructor> InferenceEngine<T> {
             }
         };
 
-        // Validate compatibility
-        if !entry.is_compatible(
-            &self.device,
-            self.model
-                .get_kv_cache_state()?
-                .first()
-                .map(|(k, _)| k.dtype())
-                .unwrap_or(DType::F32),
-        ) {
+        if !entry.is_compatible(&self.device, self.model.dtype()) {
             cache.record_miss();
             return Ok((false, 0));
         }
 
-        // Restore KV cache state
+        // Full cache hit: the stored K/V covers all N prompt tokens.  If we
+        // restore all N entries and then re-process the last token in prefill,
+        // the KV cache appends a duplicate entry at position N-1.  Trim to N-1
+        // so prefill re-processes the final token against the correct history.
+        if match_len == tokens.len() {
+            if match_len == 1 {
+                // Cannot narrow to zero-length tensors safely; treat as miss.
+                cache.record_miss();
+                return Ok((false, 0));
+            }
+            let trimmed = entry
+                .kv_states
+                .iter()
+                .map(|(k, v)| {
+                    let s = k.dim(2)?;
+                    candle_core::Result::Ok((k.narrow(2, 0, s - 1)?, v.narrow(2, 0, s - 1)?))
+                })
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            self.model.set_kv_cache_state(trimmed)?;
+            cache.record_hit(match_len - 1);
+            return Ok((true, match_len - 1));
+        }
+
         self.model.set_kv_cache_state(entry.kv_states.clone())?;
-
-        // Update stats
         cache.record_hit(match_len);
-
         Ok((true, match_len))
     }
 
     /// Store current KV cache state to prefix cache
     fn store_to_cache(&mut self, tokens: &[u32]) -> Result<()> {
-        let cache = match &self.prefix_cache {
-            Some(c) => c,
-            None => return Ok(()),
+        let Some(cache) = &self.prefix_cache else {
+            return Ok(());
         };
 
         // Extract current KV cache state
         let kv_states = self.model.get_kv_cache_state()?;
 
-        // Don't cache if no state
         if kv_states.is_empty() {
             return Ok(());
         }
 
-        // Get dtype from first tensor
-        let dtype = kv_states
-            .first()
-            .map(|(k, _)| k.dtype())
-            .unwrap_or(DType::F32);
-        // Create cache entry
-        let entry = PrefixCacheEntry::new(tokens.to_vec(), kv_states, self.device.clone(), dtype);
+        let entry = PrefixCacheEntry::new(
+            tokens.to_vec(),
+            kv_states,
+            self.device.clone(),
+            self.model.dtype(),
+        );
 
         // Insert into cache
         let mut cache = cache.write();
@@ -319,9 +319,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
     /// Perform single decode step with KV cache reuse
     /// Returns next token
     pub fn decode_step(&mut self, tokens: &[u32], start_pos: usize) -> Result<u32> {
-        let context_size = 1;
-        let pos = tokens.len().saturating_sub(context_size);
-        let ctxt = &tokens[pos..];
+        let ctxt = &tokens[tokens.len().saturating_sub(1)..];
 
         let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
         trace!(
@@ -491,12 +489,16 @@ impl<T: ModelConstructor> InferenceEngine<T> {
             return Ok(Vec::new());
         }
 
-        // Clear KV cache only if not using paged cache
-        if paged_caches.is_none() {
-            self.model.clear_kv_cache();
-        }
-
         let batch_size = batch_data.len();
+
+        // Non-paged decode relies on the model's shared SimpleKvCache accumulating state
+        // from the preceding prefill — do NOT clear it here.  The shared cache cannot
+        // serve multiple concurrent requests correctly, so only batch_size == 1 is valid
+        // on this path; use paged caches for true multi-request batching.
+        debug_assert!(
+            paged_caches.is_some() || batch_size == 1,
+            "non-paged batched decode requires batch_size == 1; use paged caches for multi-request batching"
+        );
 
         // Prepare batched input - last token from each request
         let mut input_data = Vec::with_capacity(batch_size);
@@ -564,12 +566,8 @@ impl<T: ModelConstructor> InferenceEngine<T> {
             // Get paged caches from scheduler
             let mut paged_caches = scheduler.get_paged_caches_mut(&prefill_batch.request_ids);
 
-            // Execute batched prefill with paged caches
-            let results = if !paged_caches.is_empty() {
-                self.prefill_batch(&batch_tokens, Some(&mut paged_caches))?
-            } else {
-                self.prefill_batch(&batch_tokens, None)?
-            };
+            let caches_opt = (!paged_caches.is_empty()).then(|| paged_caches.as_mut_slice());
+            let results = self.prefill_batch(&batch_tokens, caches_opt)?;
 
             // Put paged caches back to scheduler
             scheduler.put_paged_caches(&prefill_batch.request_ids, paged_caches);
@@ -606,12 +604,8 @@ impl<T: ModelConstructor> InferenceEngine<T> {
             // Get paged caches from scheduler
             let mut paged_caches = scheduler.get_paged_caches_mut(&decode_batch.request_ids);
 
-            // Execute batched decode with paged caches
-            let results = if !paged_caches.is_empty() {
-                self.decode_batch(&batch_data, Some(&mut paged_caches))?
-            } else {
-                self.decode_batch(&batch_data, None)?
-            };
+            let caches_opt = (!paged_caches.is_empty()).then(|| paged_caches.as_mut_slice());
+            let results = self.decode_batch(&batch_data, caches_opt)?;
 
             // Put paged caches back to scheduler
             scheduler.put_paged_caches(&decode_batch.request_ids, paged_caches);

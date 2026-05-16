@@ -3,11 +3,14 @@ pub mod kv_cache;
 pub mod layers;
 pub mod qwen3;
 
-use candle_core::{Result, Tensor};
+use candle_core::{DType, Result, Tensor};
 pub use qwen3::{Config, Model, ModelForCausalLM as Qwen35ModelForCausalLM};
 
 pub trait ModelImpl {
     fn name(&self) -> &'static str;
+
+    /// Returns the dtype used for KV cache tensors.
+    fn dtype(&self) -> DType;
 
     /// Forward pass for single request (existing)
     fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor>;

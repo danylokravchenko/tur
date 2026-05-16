@@ -983,4 +983,8 @@ impl super::ModelImpl for ModelForCausalLM {
     fn name(&self) -> &'static str {
         "Qwen3"
     }
+
+    fn dtype(&self) -> candle_core::DType {
+        self.base.dtype
+    }
 }
