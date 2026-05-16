@@ -348,32 +348,34 @@ impl Qwen3Attention {
         // 4. RoPE with variable positions
         let (q, k) = self.rotary_emb.apply_batch(&q, &k, positions)?;
 
-        // 5. Accumulate KV cache
-        let (k, v) = if let Some(mut caches) = paged_caches {
-            // Use PagedKvCache for batched inference
-            // Each request has its own cache
-            let mut k_parts = Vec::with_capacity(caches.len());
-            let mut v_parts = Vec::with_capacity(caches.len());
+        // 5 & 6. KV cache accumulation + attention dispatch.
+        //
+        // With paged caches each request has its own history of a different length, so we
+        // cannot concatenate their K/V tensors along the batch dimension before running
+        // attention.  Instead, compute attention independently per request and cat the
+        // outputs (which all share the query sequence length `l`).
+        if let Some(mut caches) = paged_caches {
+            let mut output_parts = Vec::with_capacity(b);
 
             for (batch_idx, cache) in caches.iter_mut().enumerate() {
-                // Extract K, V for this request
-                let k_req = k.narrow(0, batch_idx, 1)?;
-                let v_req = v.narrow(0, batch_idx, 1)?;
+                let q_req = q.narrow(0, batch_idx, 1)?; // [1, H,    l,         D]
+                let k_req = k.narrow(0, batch_idx, 1)?; // [1, kv_H, l,         D]
+                let v_req = v.narrow(0, batch_idx, 1)?; // [1, kv_H, l,         D]
 
-                // Append to paged cache and get full KV
-                let (k_full, v_full) = cache.append(&k_req, &v_req)?;
-                k_parts.push(k_full);
-                v_parts.push(v_full);
+                let (k_full, v_full) = cache.append(&k_req, &v_req)?; // [1, kv_H, total, D]
+                let offset = positions[batch_idx];
+
+                let out = self.single_request_attn(&q_req, &k_full, &v_full, attn_mask, offset, l)?;
+                output_parts.push(out); // [1, l, hidden_size]
             }
 
-            // Concatenate along batch dimension
-            (Tensor::cat(&k_parts, 0)?, Tensor::cat(&v_parts, 0)?)
-        } else {
-            // Use SimpleKvCache for single request
-            self.kv_cache.append(&k, &v)?
-        };
+            // All outputs share the same shape → safe to cat along the batch dim.
+            return Tensor::cat(&output_parts, 0); // [B, l, hidden_size]
+        }
 
-        // 6. Attention dispatch
+        // Without paged caches: accumulate into the shared (single-request) KV cache.
+        let (k, v) = self.kv_cache.append(&k, &v)?;
+
         let on_cpu = x.device().is_cpu();
 
         #[cfg(not(feature = "flash-attn"))]
@@ -518,6 +520,31 @@ impl Qwen3Attention {
         ctx.transpose(1, 2)?
             .reshape((b, l, self.hidden_size))?
             .apply(&self.o_proj)
+    }
+
+    /// Compute attention for a single request (b=1).  Used by `forward_batch` when paged
+    /// caches are active so each request is processed with its own variable-length KV.
+    fn single_request_attn(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        attn_mask: Option<&Tensor>,
+        offset: usize,
+        l: usize,
+    ) -> Result<Tensor> {
+        let on_cpu = q.device().is_cpu();
+
+        #[cfg(not(feature = "flash-attn"))]
+        if on_cpu {
+            return self.forward_cpu_flash_attn(q, k, v, offset, 1, l);
+        }
+        #[cfg(feature = "flash-attn")]
+        if !on_cpu {
+            return self.forward_flash_attn(q, k, v, offset, 1, l);
+        }
+
+        self.forward_standard_attn(q, k, v, attn_mask, 1, l)
     }
 
     pub(crate) fn clear_kv_cache(&mut self) {

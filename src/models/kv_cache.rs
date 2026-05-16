@@ -454,10 +454,13 @@ impl KvCacheImpl for PagedKvCache {
             let mut allocator = self.allocator.write();
             let block = allocator.get_block_mut(block_id)?;
 
-            // If this is the first write to the block, initialize with zeros
-            if block.k.dims()[self.concat_dim] == 0 {
-                block.k = Tensor::zeros((b, h, self.block_size, d), k.dtype(), k.device())?;
-                block.v = Tensor::zeros((b, h, self.block_size, d), v.dtype(), v.device())?;
+            // Reinitialize the block if its shape doesn't match the incoming tensor.
+            // KvBlock is pre-allocated with the BlockAllocator's global num_heads / head_dim,
+            // which won't match the actual model kv-head count on first write.
+            let expected_shape = [b, h, self.block_size, d];
+            if block.k.dims() != expected_shape {
+                block.k = Tensor::zeros(&expected_shape, k.dtype(), k.device())?;
+                block.v = Tensor::zeros(&expected_shape, v.dtype(), v.device())?;
             }
 
             // Reconstruct block tensor with new data

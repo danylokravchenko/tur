@@ -238,10 +238,8 @@ impl ContinuousBatchScheduler {
 
     /// Put paged caches back into the scheduler after use
     pub fn put_paged_caches(&mut self, request_ids: &[Uuid], mut caches: Vec<Vec<PagedKvCache>>) {
-        for (idx, id) in request_ids.iter().enumerate() {
-            if idx < caches.len() {
-                self.paged_caches.insert(*id, caches.swap_remove(0));
-            }
+        for (id, cache) in request_ids.iter().zip(caches.drain(..)) {
+            self.paged_caches.insert(*id, cache);
         }
     }
 
@@ -584,11 +582,8 @@ impl ContinuousBatchScheduler {
             };
 
             // Put paged caches back to scheduler (they were modified during forward pass)
-            for (idx, id) in request_ids_vec.iter().enumerate() {
-                if idx < paged_caches_vec.len() {
-                    self.paged_caches
-                        .insert(*id, paged_caches_vec.swap_remove(0));
-                }
+            for (id, cache) in request_ids_vec.iter().zip(paged_caches_vec.drain(..)) {
+                self.paged_caches.insert(*id, cache);
             }
 
             // Update request states with first generated token
@@ -636,11 +631,8 @@ impl ContinuousBatchScheduler {
             };
 
             // Put paged caches back to scheduler (they were modified during forward pass)
-            for (idx, id) in request_ids_vec.iter().enumerate() {
-                if idx < paged_caches_vec.len() {
-                    self.paged_caches
-                        .insert(*id, paged_caches_vec.swap_remove(0));
-                }
+            for (id, cache) in request_ids_vec.iter().zip(paged_caches_vec.drain(..)) {
+                self.paged_caches.insert(*id, cache);
             }
 
             // Update request states and check for completion
