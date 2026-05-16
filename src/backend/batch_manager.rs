@@ -80,7 +80,8 @@ impl RequestState {
 
     /// Get all tokens (prompt + generated)
     pub fn all_tokens(&self) -> Vec<u32> {
-        let mut tokens = self.prompt_tokens.clone();
+        let mut tokens = Vec::with_capacity(self.seq_len());
+        tokens.extend_from_slice(&self.prompt_tokens);
         tokens.extend_from_slice(&self.generated_tokens);
         tokens
     }
@@ -105,10 +106,12 @@ impl RequestState {
 pub struct BatchManager {
     /// Active requests being processed
     active_requests: AHashMap<Uuid, RequestState>,
-    /// Queue of requests waiting to be admitted
+    /// Queue of requests waiting to be admitted, maintained in priority order
     request_queue: VecDeque<RequestState>,
     /// Completed requests (stored temporarily for result retrieval)
     completed_requests: AHashMap<Uuid, Vec<u32>>,
+    /// Failed requests: partial generated tokens + error message
+    failed_requests: AHashMap<Uuid, (Vec<u32>, String)>,
     /// Maximum batch size for prefill
     max_prefill_batch: usize,
     /// Maximum batch size for decode
@@ -126,12 +129,14 @@ impl BatchManager {
             active_requests: AHashMap::new(),
             request_queue: VecDeque::new(),
             completed_requests: AHashMap::new(),
+            failed_requests: AHashMap::new(),
             max_prefill_batch,
             max_decode_batch,
         }
     }
 
-    /// Enqueue a new request
+    /// Enqueue a new request, inserting in priority order (higher priority closer to front).
+    /// Requests with equal priority are ordered FIFO.
     pub fn enqueue_request(&mut self, request: RequestState) {
         trace!(
             request_id = %request.id,
@@ -139,9 +144,15 @@ impl BatchManager {
             max_tokens = request.max_tokens,
             priority = request.priority,
             queue_size = self.request_queue.len() + 1,
-            "enqueuing request"
+            "Enqueuing request"
         );
-        self.request_queue.push_back(request);
+        // Insert before the first entry with strictly lower priority to preserve FIFO within a tier
+        let insert_pos = self
+            .request_queue
+            .iter()
+            .position(|r| r.priority < request.priority)
+            .unwrap_or(self.request_queue.len());
+        self.request_queue.insert(insert_pos, request);
     }
 
     /// Get the next request from queue (without removing)
@@ -149,8 +160,11 @@ impl BatchManager {
         self.request_queue.front()
     }
 
-    /// Admit a request from queue to active set
-    pub fn admit_request(&mut self) -> Option<RequestState> {
+    /// Admit the highest-priority request from the queue to the active set.
+    /// Returns the admitted request's `Uuid`; use `get_request` / `get_request_mut`
+    /// to access or mutate it. Returning a `Uuid` instead of a cloned `RequestState`
+    /// ensures there is exactly one copy of the request, preventing silent mutation loss.
+    pub fn admit_request(&mut self) -> Option<Uuid> {
         if let Some(mut request) = self.request_queue.pop_front() {
             request.phase = RequestPhase::Prefilling;
             let id = request.id;
@@ -161,8 +175,8 @@ impl BatchManager {
                 queued_requests = self.request_queue.len(),
                 "Admitted request to active set"
             );
-            self.active_requests.insert(id, request.clone());
-            Some(request)
+            self.active_requests.insert(id, request);
+            Some(id)
         } else {
             None
         }
@@ -178,55 +192,47 @@ impl BatchManager {
         self.active_requests.get_mut(id)
     }
 
-    /// Get all active requests in prefill phase
-    pub fn get_prefill_requests(&self) -> Vec<Uuid> {
-        self.active_requests
-            .iter()
-            .filter(|(_, req)| req.phase == RequestPhase::Prefilling)
-            .map(|(id, _)| *id)
-            .collect()
-    }
-
-    /// Get all active requests in decode phase
-    pub fn get_decode_requests(&self) -> Vec<Uuid> {
-        self.active_requests
-            .iter()
-            .filter(|(_, req)| req.phase == RequestPhase::Decoding)
-            .map(|(id, _)| *id)
-            .collect()
-    }
-
-    /// Form a prefill batch (up to max_prefill_batch requests)
+    /// Form a prefill batch (up to max_prefill_batch requests), ordered by arrival time.
     pub fn form_prefill_batch(&self) -> Vec<Uuid> {
-        let batch: Vec<Uuid> = self
-            .get_prefill_requests()
+        let mut candidates: Vec<&RequestState> = self
+            .active_requests
+            .values()
+            .filter(|r| r.phase == RequestPhase::Prefilling)
+            .collect();
+        candidates.sort_unstable_by_key(|r| r.arrival_time);
+        let batch: Vec<Uuid> = candidates
             .into_iter()
             .take(self.max_prefill_batch)
+            .map(|r| r.id)
             .collect();
-
         if !batch.is_empty() {
             trace!(
                 batch_size = batch.len(),
                 max_batch_size = self.max_prefill_batch,
-                "formed prefill batch"
+                "Formed prefill batch"
             );
         }
         batch
     }
 
-    /// Form a decode batch (up to max_decode_batch requests)
+    /// Form a decode batch (up to max_decode_batch requests), ordered by arrival time.
     pub fn form_decode_batch(&self) -> Vec<Uuid> {
-        let batch: Vec<Uuid> = self
-            .get_decode_requests()
+        let mut candidates: Vec<&RequestState> = self
+            .active_requests
+            .values()
+            .filter(|r| r.phase == RequestPhase::Decoding)
+            .collect();
+        candidates.sort_unstable_by_key(|r| r.arrival_time);
+        let batch: Vec<Uuid> = candidates
             .into_iter()
             .take(self.max_decode_batch)
+            .map(|r| r.id)
             .collect();
-
         if !batch.is_empty() {
             trace!(
                 batch_size = batch.len(),
                 max_batch_size = self.max_decode_batch,
-                "formed decode batch"
+                "Formed decode batch"
             );
         }
         batch
@@ -245,7 +251,7 @@ impl BatchManager {
             trace!(
                 request_id = %id,
                 generated_tokens = request.generated_tokens.len(),
-                "transitioned request to decode phase"
+                "Transitioned request to decode phase"
             );
             Ok(())
         } else {
@@ -274,16 +280,19 @@ impl BatchManager {
         }
     }
 
-    /// Mark request as failed
+    /// Mark request as failed, removing it from the active set.
+    /// Partial generated tokens and the error reason are stored and retrievable
+    /// via `get_failed_result` / `remove_failed_result`.
     pub fn fail_request(&mut self, id: &Uuid, error: String) -> Result<()> {
-        if let Some(request) = self.active_requests.get_mut(id) {
-            request.phase = RequestPhase::Failed;
+        if let Some(request) = self.active_requests.remove(id) {
             debug!(
                 request_id = %id,
                 error = %error,
-                phase = ?request.phase,
-                "Marked request as failed"
+                generated_tokens = request.generated_tokens.len(),
+                "Request failed"
             );
+            self.failed_requests
+                .insert(*id, (request.generated_tokens, error));
             Ok(())
         } else {
             Err(TurError::RequestNotFound(id.to_string()))
@@ -298,6 +307,18 @@ impl BatchManager {
     /// Remove completed request result
     pub fn remove_completed_result(&mut self, id: &Uuid) -> Option<Vec<u32>> {
         self.completed_requests.remove(id)
+    }
+
+    /// Get partial generated tokens and error reason for a failed request
+    pub fn get_failed_result(&self, id: &Uuid) -> Option<(&Vec<u32>, &str)> {
+        self.failed_requests
+            .get(id)
+            .map(|(tokens, err)| (tokens, err.as_str()))
+    }
+
+    /// Remove and return the failed request's partial tokens and error reason
+    pub fn remove_failed_result(&mut self, id: &Uuid) -> Option<(Vec<u32>, String)> {
+        self.failed_requests.remove(id)
     }
 
     /// Get number of active requests
@@ -331,14 +352,24 @@ impl BatchManager {
         self.completed_requests.clear();
     }
 
-    /// Get statistics
+    /// Get statistics in a single pass over active_requests
     pub fn stats(&self) -> BatchManagerStats {
+        let mut prefill_requests = 0usize;
+        let mut decode_requests = 0usize;
+        for req in self.active_requests.values() {
+            match req.phase {
+                RequestPhase::Prefilling => prefill_requests += 1,
+                RequestPhase::Decoding => decode_requests += 1,
+                _ => {}
+            }
+        }
         BatchManagerStats {
-            active_requests: self.num_active_requests(),
-            queued_requests: self.num_queued_requests(),
-            prefill_requests: self.num_prefill_requests(),
-            decode_requests: self.num_decode_requests(),
+            active_requests: self.active_requests.len(),
+            queued_requests: self.request_queue.len(),
+            prefill_requests,
+            decode_requests,
             completed_requests: self.completed_requests.len(),
+            failed_requests: self.failed_requests.len(),
         }
     }
 }
@@ -351,6 +382,7 @@ pub struct BatchManagerStats {
     pub prefill_requests: usize,
     pub decode_requests: usize,
     pub completed_requests: usize,
+    pub failed_requests: usize,
 }
 
 #[cfg(test)]
@@ -393,16 +425,41 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_manager_enqueue_priority_order() {
+        let mut manager = BatchManager::new(4, 8);
+
+        let low = RequestState::new(Uuid::new_v4(), "low".to_string(), vec![1], 10, 1);
+        let high = RequestState::new(Uuid::new_v4(), "high".to_string(), vec![2], 10, 5);
+        let mid = RequestState::new(Uuid::new_v4(), "mid".to_string(), vec![3], 10, 3);
+
+        manager.enqueue_request(low);
+        manager.enqueue_request(high);
+        manager.enqueue_request(mid);
+
+        // Queue front should be the highest-priority request
+        assert_eq!(manager.peek_next_request().unwrap().priority, 5);
+        let id1 = manager.admit_request().unwrap();
+        assert_eq!(manager.get_request(&id1).unwrap().priority, 5);
+        let id2 = manager.admit_request().unwrap();
+        assert_eq!(manager.get_request(&id2).unwrap().priority, 3);
+        let id3 = manager.admit_request().unwrap();
+        assert_eq!(manager.get_request(&id3).unwrap().priority, 1);
+    }
+
+    #[test]
     fn test_batch_manager_admit() {
         let mut manager = BatchManager::new(4, 8);
         let id = Uuid::new_v4();
         let request = RequestState::new(id, "test".to_string(), vec![1, 2, 3], 10, 1);
 
         manager.enqueue_request(request);
-        let admitted = manager.admit_request().unwrap();
+        let admitted_id = manager.admit_request().unwrap();
 
-        assert_eq!(admitted.id, id);
-        assert_eq!(admitted.phase, RequestPhase::Prefilling);
+        assert_eq!(admitted_id, id);
+        assert_eq!(
+            manager.get_request(&admitted_id).unwrap().phase,
+            RequestPhase::Prefilling
+        );
         assert_eq!(manager.num_queued_requests(), 0);
         assert_eq!(manager.num_active_requests(), 1);
         assert_eq!(manager.num_prefill_requests(), 1);
@@ -440,6 +497,33 @@ mod tests {
         assert_eq!(tokens, vec![1, 2, 3, 4, 5, 6]);
         assert_eq!(manager.num_active_requests(), 0);
         assert_eq!(manager.completed_requests.len(), 1);
+    }
+
+    #[test]
+    fn test_batch_manager_fail_request() {
+        let mut manager = BatchManager::new(4, 8);
+        let id = Uuid::new_v4();
+        let mut request = RequestState::new(id, "test".to_string(), vec![1, 2, 3], 10, 1);
+        request.generated_tokens = vec![4, 5];
+
+        manager.enqueue_request(request);
+        manager.admit_request().unwrap();
+        assert_eq!(manager.num_active_requests(), 1);
+
+        manager.fail_request(&id, "OOM".to_string()).unwrap();
+
+        // Request must be removed from active set
+        assert_eq!(manager.num_active_requests(), 0);
+
+        // Partial tokens and error reason must be retrievable
+        let (tokens, err) = manager.get_failed_result(&id).unwrap();
+        assert_eq!(*tokens, vec![4, 5]);
+        assert_eq!(err, "OOM");
+
+        let (tokens, err) = manager.remove_failed_result(&id).unwrap();
+        assert_eq!(tokens, vec![4, 5]);
+        assert_eq!(err, "OOM");
+        assert!(manager.get_failed_result(&id).is_none());
     }
 
     #[test]
@@ -481,7 +565,7 @@ mod tests {
 
         // Admit 2
         manager.admit_request().unwrap();
-        let id2 = manager.admit_request().unwrap().id;
+        let id2 = manager.admit_request().unwrap();
 
         // Transition one to decode
         manager.transition_to_decode(&id2).unwrap();
@@ -491,5 +575,6 @@ mod tests {
         assert_eq!(stats.active_requests, 2);
         assert_eq!(stats.prefill_requests, 1);
         assert_eq!(stats.decode_requests, 1);
+        assert_eq!(stats.failed_requests, 0);
     }
 }

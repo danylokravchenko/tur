@@ -573,6 +573,8 @@ impl Drop for PagedKvCache {
 
 #[cfg(test)]
 mod tests {
+    use candle_core::{DType, Device};
+
     use super::*;
 
     #[test]
@@ -598,7 +600,6 @@ mod tests {
 
     #[test]
     fn test_block_allocator_basic() -> Result<()> {
-        let device = Device::Cpu;
         let mut allocator = BlockAllocator::new(10, 64);
 
         let block_id = allocator.allocate()?;
@@ -615,7 +616,6 @@ mod tests {
 
     #[test]
     fn test_paged_kv_cache_basic() -> Result<()> {
-        let device = Device::Cpu;
         let allocator = Arc::new(RwLock::new(BlockAllocator::new(10, 64)));
 
         let cache = PagedKvCache::new(allocator, 2);
@@ -829,7 +829,6 @@ mod tests {
 
     #[test]
     fn test_block_allocator_ref_counting() -> Result<()> {
-        let device = Device::Cpu;
         let mut allocator = BlockAllocator::new(10, 64);
 
         let block_id = allocator.allocate()?;

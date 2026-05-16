@@ -291,11 +291,17 @@ impl ContinuousBatchScheduler {
                 drop(pool); // Release lock before calling batch_manager
 
                 // Admit the request (removes from queue, adds to active)
-                if let Some(request) = self.batch_manager.admit_request() {
-                    let request_id = request.id;
+                if let Some(request_id) = self.batch_manager.admit_request() {
+                    // Clone prompt tokens before calling find_prefix_match to avoid
+                    // holding a reference into batch_manager across the &self borrow.
+                    let prompt_tokens = self
+                        .batch_manager
+                        .get_request(&request_id)
+                        .map(|r| r.prompt_tokens.clone())
+                        .unwrap_or_default();
 
                     // Check for prefix match for potential cache sharing
-                    let prefix_match = self.find_prefix_match(&request.prompt_tokens);
+                    let prefix_match = self.find_prefix_match(&prompt_tokens);
 
                     // Initialize PagedKvCache for this request (with optional prefix sharing via fork).
                     // PagedKvCache owns its own block table and allocates blocks lazily as tokens
@@ -644,8 +650,6 @@ pub struct SchedulerStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
-
     fn create_test_scheduler(policy: SchedulingPolicy) -> ContinuousBatchScheduler {
         // Create a simple memory pool for testing
         let memory_pool = Arc::new(RwLock::new(MemoryPool::new(
@@ -655,7 +659,6 @@ mod tests {
             32,
             128,
             2, // 2 bytes (BF16)
-            Device::Cpu,
         )));
 
         // Create a simple tokenizer for testing
@@ -847,7 +850,6 @@ mod tests {
 
     #[test]
     fn test_scheduler_memory_limit() {
-        use candle_core::Device;
         // Create scheduler with very limited memory
         let memory_pool = Arc::new(RwLock::new(MemoryPool::new(
             1024 * 10, // Very small: 10KB
@@ -856,7 +858,6 @@ mod tests {
             32,
             128,
             2,
-            Device::Cpu,
         )));
         let tokenizer = Arc::new(Tokenizer::from_file("tokenizer.json").unwrap_or_else(|_| {
             tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
@@ -901,11 +902,10 @@ mod tests {
             .fail_request(&request_id, "Test error".to_string())
             .unwrap();
 
-        // Request should still be in active set but marked as failed
-        assert_eq!(
-            scheduler.get_request(&request_id).unwrap().phase,
-            RequestPhase::Failed
-        );
+        // Request must be removed from the active set after failure
+        assert!(scheduler.get_request(&request_id).is_none());
+        let stats = scheduler.get_stats();
+        assert_eq!(stats.prefilling_requests + stats.decoding_requests, 0);
     }
 
     #[test]
@@ -1227,7 +1227,6 @@ mod tests {
             8,
             64,
             2,
-            candle_core::Device::Cpu,
         )));
         let tokenizer = Arc::new(Tokenizer::from_file("tokenizer.json").unwrap_or_else(|_| {
             tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())

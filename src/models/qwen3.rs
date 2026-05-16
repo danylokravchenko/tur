@@ -365,7 +365,8 @@ impl Qwen3Attention {
                 let (k_full, v_full) = cache.append(&k_req, &v_req)?; // [1, kv_H, total, D]
                 let offset = positions[batch_idx];
 
-                let out = self.single_request_attn(&q_req, &k_full, &v_full, attn_mask, offset, l)?;
+                let out =
+                    self.single_request_attn(&q_req, &k_full, &v_full, attn_mask, offset, l)?;
                 output_parts.push(out); // [1, l, hidden_size]
             }
 
