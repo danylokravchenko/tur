@@ -213,8 +213,38 @@ impl<T: ModelConstructor> ModelFactory<T> {
     }
 }
 
-impl ModelConstructor for crate::models::Qwen35ModelForCausalLM {
+impl ModelConstructor for crate::models::Qwen3ModelForCausalLM {
     type Config = crate::models::qwen3::Config;
+
+    fn new_with_progress(
+        config: &Self::Config,
+        vb: VarBuilderX,
+        progress: Option<&ProgressReporter>,
+    ) -> Result<Self> {
+        crate::models::Qwen3ModelForCausalLM::new_with_progress(config, vb, progress)
+            .map_err(|e| e.into())
+    }
+
+    fn load_config(paths: &crate::weights::ModelPaths) -> Result<Self::Config> {
+        trace!("Loading Qwen3 model configuration");
+
+        let config_path = paths.config_filename();
+        trace!(config_path = %config_path.display(), "Config file path");
+
+        let config_content = std::fs::read_to_string(config_path)?;
+        let config: Self::Config = serde_json::from_str(&config_content)?;
+
+        debug!(
+            num_layers = config.num_hidden_layers,
+            hidden_size = config.hidden_size,
+            "Model config loaded"
+        );
+        Ok(config)
+    }
+}
+
+impl ModelConstructor for crate::models::Qwen35ModelForCausalLM {
+    type Config = crate::models::qwen35::Config;
 
     fn new_with_progress(
         config: &Self::Config,
@@ -226,19 +256,18 @@ impl ModelConstructor for crate::models::Qwen35ModelForCausalLM {
     }
 
     fn load_config(paths: &crate::weights::ModelPaths) -> Result<Self::Config> {
-        trace!("Loading Qwen3 model configuration");
+        trace!("Loading Qwen3.5 model configuration");
 
         let config_path = paths.config_filename();
         trace!(config_path = %config_path.display(), "Config file path");
 
         let config_content = std::fs::read_to_string(config_path)?;
-        // Single-pass parse: no intermediate serde_json::Value allocation
         let config: Self::Config = serde_json::from_str(&config_content)?;
 
         debug!(
-            num_layers = config.num_hidden_layers,
-            hidden_size = config.hidden_size,
-            "Model config loaded"
+            num_layers = config.text_config.num_hidden_layers,
+            hidden_size = config.text_config.hidden_size,
+            "Qwen3.5 model config loaded"
         );
         Ok(config)
     }
@@ -254,13 +283,15 @@ impl ModelConstructor for crate::models::Qwen35ModelForCausalLM {
 pub enum ModelKind {
     /// Qwen3 / Qwen2 family — shares the same architecture in this codebase.
     Qwen3,
-    // Future: Llama3, Mistral, Phi3, …
+    /// Qwen3.5 multimodal family (hybrid linear + full attention + vision encoder).
+    Qwen35,
 }
 
 impl ModelKind {
     /// Recognise the model kind from the `model_type` field in `config.json`.
     fn from_config_type(model_type: &str) -> Option<Self> {
         match model_type {
+            "qwen3_5" => Some(Self::Qwen35),
             "qwen3" | "qwen2" => Some(Self::Qwen3),
             _ => None,
         }
@@ -270,6 +301,10 @@ impl ModelKind {
     /// when `config.json` is absent or its `model_type` field is unknown.
     fn from_name_hint(name: &str) -> Option<Self> {
         let lower = name.to_lowercase();
+        // Check qwen3.5 / qwen35 before qwen3 — "qwen3.5" contains "qwen3".
+        if lower.contains("qwen3.5") || lower.contains("qwen35") || lower.contains("qwen3.6") || lower.contains("qwen36") {
+            return Some(Self::Qwen35);
+        }
         if lower.contains("qwen3") || lower.contains("qwen2") {
             return Some(Self::Qwen3);
         }
@@ -317,7 +352,7 @@ impl ModelKind {
 /// One variant per [`ModelKind`].
 pub enum AnyModelConfig {
     Qwen3(crate::models::qwen3::Config),
-    // Future: Qwen36(crate::models::qwen36::Config),
+    Qwen35(crate::models::qwen35::Config),
 }
 
 // ─── AnyModel ─────────────────────────────────────────────────────────────────
@@ -334,38 +369,43 @@ pub enum AnyModelConfig {
 /// 2. Add matching arms to every `match self` block below.
 /// 3. Register the new `model_type` string(s) in `ModelKind::from_config_type`.
 pub enum AnyModel {
-    Qwen3(crate::models::Qwen35ModelForCausalLM),
-    // Future: Qwen36(crate::models::qwen36::ModelForCausalLM),
+    Qwen3(crate::models::Qwen3ModelForCausalLM),
+    Qwen35(crate::models::Qwen35ModelForCausalLM),
 }
 
 impl ModelImpl for AnyModel {
     fn name(&self) -> &'static str {
         match self {
             Self::Qwen3(m) => m.name(),
+            Self::Qwen35(m) => m.name(),
         }
     }
 
     fn num_layers(&self) -> usize {
         match self {
             Self::Qwen3(m) => m.num_layers(),
+            Self::Qwen35(m) => m.num_layers(),
         }
     }
 
     fn dtype(&self) -> DType {
         match self {
             Self::Qwen3(m) => m.dtype(),
+            Self::Qwen35(m) => m.dtype(),
         }
     }
 
     fn forward(&mut self, input: &Tensor, offset: usize) -> candle_core::Result<Tensor> {
         match self {
             Self::Qwen3(m) => m.forward(input, offset),
+            Self::Qwen35(m) => m.forward(input, offset),
         }
     }
 
     fn forward_modal(&mut self, input: ModelInput) -> candle_core::Result<Tensor> {
         match self {
             Self::Qwen3(m) => m.forward_modal(input),
+            Self::Qwen35(m) => m.forward_modal(input),
         }
     }
 
@@ -377,12 +417,14 @@ impl ModelImpl for AnyModel {
     ) -> candle_core::Result<Tensor> {
         match self {
             Self::Qwen3(m) => m.forward_batch(input, positions, paged_caches),
+            Self::Qwen35(m) => m.forward_batch(input, positions, paged_caches),
         }
     }
 
     fn format_prompt(&self, prompt: &str, thinking: bool) -> String {
         match self {
             Self::Qwen3(m) => m.format_prompt(prompt, thinking),
+            Self::Qwen35(m) => m.format_prompt(prompt, thinking),
         }
     }
 
@@ -394,24 +436,28 @@ impl ModelImpl for AnyModel {
     ) -> String {
         match self {
             Self::Qwen3(m) => m.format_prompt_with_tools(prompt, tools, thinking),
+            Self::Qwen35(m) => m.format_prompt_with_tools(prompt, tools, thinking),
         }
     }
 
     fn get_kv_cache_state(&self) -> candle_core::Result<Vec<(Tensor, Tensor)>> {
         match self {
             Self::Qwen3(m) => m.get_kv_cache_state(),
+            Self::Qwen35(m) => m.get_kv_cache_state(),
         }
     }
 
     fn set_kv_cache_state(&mut self, state: Vec<(Tensor, Tensor)>) -> candle_core::Result<()> {
         match self {
             Self::Qwen3(m) => m.set_kv_cache_state(state),
+            Self::Qwen35(m) => m.set_kv_cache_state(state),
         }
     }
 
     fn clear_kv_cache(&mut self) {
         match self {
             Self::Qwen3(m) => m.clear_kv_cache(),
+            Self::Qwen35(m) => m.clear_kv_cache(),
         }
     }
 }
@@ -425,8 +471,6 @@ impl ModelConstructor for AnyModel {
         let config_path = paths.config_filename();
         let content = std::fs::read_to_string(config_path)?;
 
-        // Parse once into a Value so we can both detect `model_type` and
-        // deserialise into the typed struct without a second file read.
         let raw: serde_json::Value = serde_json::from_str(&content)?;
 
         let model_type = raw["model_type"].as_str().ok_or_else(|| {
@@ -447,6 +491,10 @@ impl ModelConstructor for AnyModel {
                 let cfg: crate::models::qwen3::Config = serde_json::from_value(raw)?;
                 Ok(AnyModelConfig::Qwen3(cfg))
             }
+            ModelKind::Qwen35 => {
+                let cfg: crate::models::qwen35::Config = serde_json::from_value(raw)?;
+                Ok(AnyModelConfig::Qwen35(cfg))
+            }
         }
     }
 
@@ -457,10 +505,14 @@ impl ModelConstructor for AnyModel {
     ) -> Result<Self> {
         match config {
             AnyModelConfig::Qwen3(cfg) => {
-                let model =
-                    crate::models::Qwen35ModelForCausalLM::new_with_progress(cfg, vb, progress)
-                        .map_err(TurError::from)?;
+                let model = crate::models::Qwen3ModelForCausalLM::new_with_progress(cfg, vb, progress)
+                    .map_err(TurError::from)?;
                 Ok(AnyModel::Qwen3(model))
+            }
+            AnyModelConfig::Qwen35(cfg) => {
+                let model = crate::models::Qwen35ModelForCausalLM::new_with_progress(cfg, vb, progress)
+                    .map_err(TurError::from)?;
+                Ok(AnyModel::Qwen35(model))
             }
         }
     }

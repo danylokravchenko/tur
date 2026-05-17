@@ -19,7 +19,7 @@ use common::create_test_factory;
 /// model weights will be loaded a second time from the local HuggingFace cache,
 /// which is fast.
 fn build_guidance_factory(
-    factory: &tur::ModelFactory<tur::models::Qwen35ModelForCausalLM>,
+    factory: &tur::ModelFactory<tur::models::Qwen3ModelForCausalLM>,
     device: Device,
 ) -> Arc<tur::backend::guidance::ParserFactory> {
     let (_, tokenizer, _) = InferenceEngine::builder(factory, device)

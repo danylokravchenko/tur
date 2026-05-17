@@ -2,9 +2,11 @@ pub mod attention;
 pub mod kv_cache;
 pub mod layers;
 pub mod qwen3;
+pub mod qwen35;
 
 use candle_core::{DType, Result, Tensor};
-pub use qwen3::{Config, Model, ModelForCausalLM as Qwen35ModelForCausalLM};
+pub use qwen3::{Config, Model, ModelForCausalLM as Qwen3ModelForCausalLM};
+pub use qwen35::ModelForCausalLM as Qwen35ModelForCausalLM;
 
 /// Input to [`ModelImpl::forward_modal`] for multimodal inference.
 ///
