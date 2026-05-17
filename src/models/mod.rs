@@ -48,6 +48,26 @@ pub trait ModelImpl {
 
     fn format_prompt(prompt: &str, thinking: bool) -> String;
 
+    /// Format a prompt with tool definitions injected as a system message.
+    ///
+    /// The default falls back to [`format_prompt`] (no tool information).
+    /// Models that support function calling override this to emit the
+    /// model-specific system-prompt+tools template.
+    ///
+    /// `prompt` should be the raw user message, not yet wrapped in a chat
+    /// template — this method applies the full template including tools.
+    fn format_prompt_with_tools(
+        prompt: &str,
+        tools: &[crate::backend::tools::ToolDefinition],
+        thinking: bool,
+    ) -> String
+    where
+        Self: Sized,
+    {
+        let _ = tools;
+        Self::format_prompt(prompt, thinking)
+    }
+
     /// Extract current KV cache state from all layers
     /// Returns Vec<(K, V)> where index corresponds to layer index
     fn get_kv_cache_state(&self) -> Result<Vec<(Tensor, Tensor)>>;

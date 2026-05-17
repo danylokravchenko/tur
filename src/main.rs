@@ -1,7 +1,8 @@
 use candle_core::{DType, Device};
 use clap::Parser;
-use tracing::{debug, info, trace};
+use tracing::{debug, info};
 use tur::backend::pipeline::GenerationRequest;
+use tur::backend::tools::ToolDefinition;
 use tur::{ProgressReporter, Result, TextGeneration, TurError};
 
 const DEFAULT_PROMPT: &str = "Who are you?";
@@ -77,7 +78,7 @@ fn print_bunner() {
 }
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Qwen 3.5 Model - Clean Implementation", long_about = None)]
+#[command(author, version, about = "Tur - a strong inference engine", long_about = None)]
 struct Args {
     /// Simplified model ID (e.g., "Qwen3-0.6B" or full "Qwen/Qwen3-0.6B").
     /// Config and tokenizer are always downloaded from the main repo.
@@ -127,6 +128,15 @@ struct Args {
     #[arg(long)]
     thinking: bool,
 
+    /// Path to a JSON file containing tool definitions.
+    /// The file must be a JSON array of objects with "name", "description",
+    /// and "parameters" (JSON Schema) fields.
+    ///
+    /// Example file content:
+    ///   [{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}]
+    #[arg(long, value_name = "FILE")]
+    tools: Option<String>,
+
     /// Enable prefix cache optimization
     #[arg(long)]
     prefix_cache: bool,
@@ -173,7 +183,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     print_bunner();
 
-    info!("Qwen 3.5 Model - Clean Implementation");
+    info!("Tur - a strong inference engine");
 
     let device = Device::new_metal(0)?;
 
@@ -290,11 +300,41 @@ fn main() -> Result<()> {
     let mut pipeline = pipeline_builder.build();
     debug!("✓ Model is initialized and ready for inference");
 
-    let prompt = pipeline.format_prompt(DEFAULT_PROMPT, args.thinking);
-    trace!("formatted prompt: {}", &prompt);
+    // Load tool definitions from file if provided.
+    let tools = match args.tools {
+        Some(ref path) => {
+            let json = std::fs::read_to_string(path)
+                .map_err(|e| TurError::Other(format!("Failed to read tools file '{path}': {e}")))?;
+            let defs: Vec<ToolDefinition> = serde_json::from_str(&json).map_err(|e| {
+                TurError::Other(format!("Failed to parse tools file '{path}': {e}"))
+            })?;
+            info!("✓ Loaded {} tool(s) from {path}", defs.len());
+            defs
+        }
+        None => Vec::new(),
+    };
 
-    let request = GenerationRequest::new(prompt, args.sample_len);
-    pipeline.run(&request)?;
+    // Build the request.
+    let mut request = GenerationRequest::new(DEFAULT_PROMPT.to_string(), args.sample_len);
+    if args.thinking {
+        request = request.with_thinking(args.thinking);
+    }
+    if !tools.is_empty() {
+        request = request.with_tools(tools);
+    }
+
+    let stats = pipeline.run(&request)?;
+
+    if !stats.tool_calls.is_empty() {
+        info!("\n--- Tool calls ({}) ---", stats.tool_calls.len());
+        for call in &stats.tool_calls {
+            info!(
+                "  {} ({})",
+                call.name,
+                serde_json::to_string(&call.arguments).unwrap_or_default()
+            );
+        }
+    }
 
     Ok(())
 }

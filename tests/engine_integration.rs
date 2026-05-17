@@ -33,7 +33,7 @@ fn make_paged_caches(
 #[test]
 fn test_inference_engine_prefill_batch() {
     let (factory, device, _) = create_test_factory();
-    let (mut engine, _tokenizer) = InferenceEngine::builder(&factory, device).build().unwrap();
+    let (mut engine, _tokenizer, _) = InferenceEngine::builder(&factory, device).build().unwrap();
 
     // Create batch of 3 requests with different prompts
     let batch_tokens = vec![
@@ -61,7 +61,7 @@ fn test_inference_engine_prefill_batch() {
 #[test]
 fn test_inference_engine_decode_batch() {
     let (factory, device, _) = create_test_factory();
-    let (mut engine, _tokenizer) = InferenceEngine::builder(&factory, device).build().unwrap();
+    let (mut engine, _tokenizer, _) = InferenceEngine::builder(&factory, device).build().unwrap();
 
     // First do prefill to populate KV cache
     let id1 = Uuid::new_v4();
@@ -108,14 +108,14 @@ fn test_inference_engine_batch_consistency() {
 
     // Single request
     let tokens = vec![1u32, 2, 3, 4, 5];
-    let (mut engine1, _tokenizer) = InferenceEngine::builder(&factory, device.clone())
+    let (mut engine1, _tokenizer, _) = InferenceEngine::builder(&factory, device.clone())
         .build()
         .unwrap();
     let (single_token, _, _, _) = engine1.prefill(&tokens).unwrap();
 
     // Same request in batch
     let id = Uuid::new_v4();
-    let (mut engine2, _tokenizer) = InferenceEngine::builder(&factory, device.clone())
+    let (mut engine2, _tokenizer, _) = InferenceEngine::builder(&factory, device.clone())
         .build()
         .unwrap();
     let batch_results = engine2
@@ -136,7 +136,7 @@ fn test_inference_engine_batch_consistency() {
 #[test]
 fn test_inference_engine_empty_batch() {
     let (factory, device, _) = create_test_factory();
-    let (mut engine, _tokenizer) = InferenceEngine::builder(&factory, device).build().unwrap();
+    let (mut engine, _tokenizer, _) = InferenceEngine::builder(&factory, device).build().unwrap();
 
     // Empty batch should return empty results
     let result = engine.prefill_batch(&[], None);
@@ -151,7 +151,7 @@ fn test_inference_engine_empty_batch() {
 #[test]
 fn test_inference_engine_large_batch() {
     let (factory, device, _) = create_test_factory();
-    let (mut engine, _) = InferenceEngine::builder(&factory, device).build().unwrap();
+    let (mut engine, _, _) = InferenceEngine::builder(&factory, device).build().unwrap();
 
     // Create larger batch (8 requests)
     let batch_size = 8;
@@ -181,7 +181,7 @@ fn test_inference_engine_large_batch() {
 #[test]
 fn test_inference_engine_variable_length_batch() {
     let (factory, device, _) = create_test_factory();
-    let (mut engine, _) = InferenceEngine::builder(&factory, device).build().unwrap();
+    let (mut engine, _, _) = InferenceEngine::builder(&factory, device).build().unwrap();
 
     // Create batch with very different sequence lengths
     let batch_tokens = vec![
@@ -215,7 +215,7 @@ fn test_inference_engine_variable_length_batch() {
 #[test]
 fn test_prefix_cache_single_request_correctness() {
     let (factory, device, _) = create_test_factory();
-    let (mut engine, _) = InferenceEngine::builder(&factory, device)
+    let (mut engine, _, _) = InferenceEngine::builder(&factory, device)
         .with_prefix_cache(10, 512)
         .build()
         .unwrap();
@@ -251,7 +251,7 @@ fn test_prefix_cache_single_request_correctness() {
 fn test_prefix_cache_paged_batch_correctness() {
     let (factory, device, _) = create_test_factory();
     let shared_cache: SharedPrefixCache = Arc::new(RwLock::new(PrefixCache::new(10, 512)));
-    let (mut engine, _) = InferenceEngine::builder(&factory, device)
+    let (mut engine, _, _) = InferenceEngine::builder(&factory, device)
         .with_shared_prefix_cache(shared_cache.clone())
         .build()
         .unwrap();
@@ -300,7 +300,7 @@ fn test_prefix_cache_paged_batch_correctness() {
 fn test_prefix_cache_paged_partial_prefix_hit() {
     let (factory, device, _) = create_test_factory();
     let shared_cache: SharedPrefixCache = Arc::new(RwLock::new(PrefixCache::new(10, 512)));
-    let (mut engine, _) = InferenceEngine::builder(&factory, device)
+    let (mut engine, _, _) = InferenceEngine::builder(&factory, device)
         .with_shared_prefix_cache(shared_cache.clone())
         .build()
         .unwrap();

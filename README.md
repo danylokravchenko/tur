@@ -16,6 +16,7 @@ A high-performance Rust inference engine for transformer models, built on [Candl
 - **Guided Generation**: Grammar-constrained decoding via [llguidance](https://github.com/guidance-ai/llguidance); JSON schema, Lark, and regex grammars with ~50 µs per-token overhead
 - **Thinking Mode**: Enable chain-of-thought reasoning
 - **Detailed Statistics**: Per-request prefill/decode timing, cache hit rate, and tokens-per-second reporting
+- **Tooling Support**: Define your tools which a model can call
 
 ## Quick Start
 
@@ -140,13 +141,67 @@ Guided generation constrains the output to tokens that are valid under a grammar
 | Tool calls / agent protocols | JSON schema |
 | Domain-specific syntax (SQL, config) | Lark |
 
-Free-text generation, open-ended responses, and any case where the model reliably follows format instructions without enforcement are better served without guidance — it adds ~50 µs of per-token CPU overhead for a 128 k tokenizer.
+Free-text generation, open-ended responses, and any case where the model reliably follows format instructions without enforcement are better served without guidance.
 
 ### Usage
 
-Build a `ParserFactory` once (expensive; tied to tokenizer vocabulary) and share it across requests:
+Build a `ParserFactory` once (expensive; tied to tokenizer vocabulary) and share it across requests. Requests without a grammar run unconstrained regardless of whether a factory is configured.
 
-Requests without a grammar run unconstrained regardless of whether a factory is configured.
+## Tool Calling
+
+Tool calling lets the model invoke external functions by emitting structured `<tool_call>` blocks in its output. The pipeline injects the tool schema into the prompt automatically and parses any calls from the generated text, returning them in a response.
+
+### How it works
+
+1. You define tools with a name, description, and JSON Schema parameters.
+2. Attach them to a `GenerationRequest` via `.with_tools(…)`.
+3. The pipeline formats the raw user message with the Qwen3 tool-calling system prompt template (tools injected in `<tools>` XML tags).
+4. After generation, the pipeline scans the output for `<tool_call>…</tool_call>` blocks and deserialises each one into a `ToolCall`.
+
+### API example
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "location": {
+      "type": "string",
+      "description": "City and country, e.g. Paris, France"
+    },
+    "unit": {
+      "type": "string",
+      "enum": ["celsius", "fahrenheit"]
+    }
+  },
+  "required": ["location"]
+}
+
+// 2. Attach tools to the request (raw user message — no chat template needed)
+let request = GenerationRequest::new(
+    "What is the current weather in Paris?".to_string(),
+    200,
+)
+.with_tools(vec![get_weather]);
+
+// 3. Run and inspect parsed tool calls
+let stats = pipeline.run(&request)?;
+for call in &stats.tool_calls {
+    println!("Tool: {}  Args: {}", call.name, call.arguments);
+    // → Tool: get_weather  Args: {"location": "Paris, France", "unit": "celsius"}
+}
+```
+
+### Prompt formatting
+
+When tools are present, the pipeline formats calls internally — you do **not** need to pre-format the prompt yourself. Pass the raw user message as the `prompt` field.
+
+### Combining with thinking mode
+
+Set `--enable-thinking` on the call to enable chain-of-thought reasoning alongside tool calling (Qwen3 `/think` tag)
+
+### Combining with guided generation
+
+Tool calling and grammar-constrained generation can be used together. Attach both `.with_tools(…)` and `.with_grammar(…)` to the same request to restrict which tokens the model can emit while still parsing tool calls from the output.
 
 ## Advanced Configuration
 
