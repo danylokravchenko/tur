@@ -227,7 +227,7 @@ fn main() -> Result<()> {
     let progress = ProgressReporter::new();
 
     // Use ModelFactory to create the model and tokenizer
-    let factory = tur::ModelFactory::<tur::models::Qwen35ModelForCausalLM>::new(
+    let factory = tur::AutoModelFactory::new(
         source,
         args.quantization,
         device.clone(),
