@@ -31,6 +31,18 @@ impl Module for LinearX {
     }
 }
 
+impl LinearX {
+    /// Returns the weight tensor for standard (non-quantized) layers.
+    /// Returns `None` for quantized layers — the fused kernel cannot be used
+    /// with quantized weights.
+    pub fn weight(&self) -> Option<&Tensor> {
+        match self {
+            Self::Standard(linear) => Some(linear.weight()),
+            Self::Quantized { .. } => None,
+        }
+    }
+}
+
 impl std::fmt::Debug for LinearX {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

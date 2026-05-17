@@ -241,6 +241,101 @@ impl Qwen3Attention {
         })
     }
 
+    /// Returns true when the fused prenorm+QKV path is available.
+    /// Requires standard (non-quantized) weight tensors.
+    pub(crate) fn can_fuse_prenorm(&self) -> bool {
+        self.q_proj.weight().is_some()
+            && self.k_proj.weight().is_some()
+            && self.v_proj.weight().is_some()
+    }
+
+    /// Forward from pre-projected Q/K/V tensors of shape `[B, L, proj_dim]`.
+    /// Skips the linear projections and starts from step 2 (reshape + head norm +
+    /// RoPE + KV cache + attention).  Used by the fused prenorm path.
+    pub(crate) fn forward_with_qkv(
+        &mut self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        attn_mask: Option<&Tensor>,
+        offset: usize,
+    ) -> Result<Tensor> {
+        let b = q.dim(0)?;
+        let l = q.dim(1)?;
+
+        // Reshape: (B, L, H*D) -> (B, H, L, D)
+        let q = q
+            .reshape((b, l, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        // Per-head RMSNorm
+        let q = self.q_norm.forward(&q.contiguous()?)?;
+        let k = self.k_norm.forward(&k.contiguous()?)?;
+
+        // RoPE
+        let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
+
+        // KV cache
+        let (k, v) = self.kv_cache.append(&k, &v)?;
+
+        // Attention dispatch
+        let on_cpu = q.device().is_cpu();
+        #[cfg(not(feature = "flash-attn"))]
+        if on_cpu {
+            return self.forward_cpu_flash_attn(&q, &k, &v, offset, b, l);
+        }
+        #[cfg(feature = "flash-attn")]
+        if !on_cpu {
+            return self.forward_flash_attn(&q, &k, &v, offset, b, l);
+        }
+        self.forward_standard_attn(&q, &k, &v, attn_mask, b, l)
+    }
+
+    /// Fused prenorm + QKV projection + attention (Metal only).
+    ///
+    /// Combines `RMSNorm(x) @ q/k/v_proj` into three fused GPU passes,
+    /// then continues with reshape → head-norm → RoPE → KV-cache → attention.
+    /// Caller must have verified `can_fuse_prenorm()` and `device.is_metal()`.
+    #[cfg(feature = "metal")]
+    pub(crate) fn forward_fused_prenorm(
+        &mut self,
+        x: &Tensor,
+        norm_weight: &Tensor,
+        norm_eps: f64,
+        attn_mask: Option<&Tensor>,
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (b, l, hidden) = x.dims3()?;
+        let x_2d = x.reshape((b * l, hidden))?;
+        let eps = norm_eps as f32;
+
+        let q_w = self.q_proj.weight().ok_or_else(|| {
+            candle_core::Error::Msg("forward_fused_prenorm: q_proj is quantized".to_string())
+        })?;
+        let k_w = self.k_proj.weight().ok_or_else(|| {
+            candle_core::Error::Msg("forward_fused_prenorm: k_proj is quantized".to_string())
+        })?;
+        let v_w = self.v_proj.weight().ok_or_else(|| {
+            candle_core::Error::Msg("forward_fused_prenorm: v_proj is quantized".to_string())
+        })?;
+
+        let q = layers::fused::rms_norm_linear(&x_2d, norm_weight, q_w, eps)?;
+        let k = layers::fused::rms_norm_linear(&x_2d, norm_weight, k_w, eps)?;
+        let v = layers::fused::rms_norm_linear(&x_2d, norm_weight, v_w, eps)?;
+
+        let q = q.reshape((b, l, self.num_heads * self.head_dim))?;
+        let k = k.reshape((b, l, self.num_kv_heads * self.head_dim))?;
+        let v = v.reshape((b, l, self.num_kv_heads * self.head_dim))?;
+
+        self.forward_with_qkv(q, k, v, attn_mask, offset)
+    }
+
     pub(crate) fn forward(
         &mut self,
         x: &Tensor,
@@ -265,13 +360,9 @@ impl Qwen3Attention {
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // 3. Per-head RMSNorm
-        let q_flat = q.flatten(0, 2)?;
-        let k_flat = k.flatten(0, 2)?;
-        let q_flat = self.q_norm.forward(&q_flat)?;
-        let k_flat = self.k_norm.forward(&k_flat)?;
-        let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
-        let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
+        // 3. Per-head RMSNorm — RmsNorm reduces over the last dim, so (B,H,L,D) works directly
+        let q = self.q_norm.forward(&q.contiguous()?)?;
+        let k = self.k_norm.forward(&k.contiguous()?)?;
 
         // 4. RoPE
         let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
@@ -337,13 +428,9 @@ impl Qwen3Attention {
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // 3. Per-head RMSNorm
-        let q_flat = q.flatten(0, 2)?;
-        let k_flat = k.flatten(0, 2)?;
-        let q_flat = self.q_norm.forward(&q_flat)?;
-        let k_flat = self.k_norm.forward(&k_flat)?;
-        let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
-        let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
+        // 3. Per-head RMSNorm — RmsNorm reduces over the last dim, so (B,H,L,D) works directly
+        let q = self.q_norm.forward(&q.contiguous()?)?;
+        let k = self.k_norm.forward(&k.contiguous()?)?;
 
         // 4. RoPE with variable positions
         let (q, k) = self.rotary_emb.apply_batch(&q, &k, positions)?;
@@ -620,6 +707,21 @@ impl DecoderLayer {
     }
 
     fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if x.device().is_metal() && self.self_attn.can_fuse_prenorm() {
+            let h = self.self_attn.forward_fused_prenorm(
+                x,
+                self.ln1.weight(),
+                self.ln1.eps(),
+                mask,
+                offset,
+            )?;
+            let x = (x + h)?;
+            let h2 = self.ln2.forward(&x)?;
+            let h2 = h2.apply(&self.mlp)?;
+            return x + h2;
+        }
+
         let h = self.ln1.forward(x)?;
         let h = self.self_attn.forward(&h, mask, offset)?;
         let x = (x + h)?;

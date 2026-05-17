@@ -4,6 +4,7 @@ use either::Either;
 
 use crate::weights::VarBuilderX;
 
+pub mod fused;
 pub mod linear;
 pub use linear::{LinearX, linear};
 pub mod norm;

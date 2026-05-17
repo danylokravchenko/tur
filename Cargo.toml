@@ -30,6 +30,8 @@ parking_lot = "0.12.5"
 indicatif = "0.18.4"
 uuid = { version = "1.23.1", features = ["v4"] }
 metal = { version = "0.33.0", features = ["mps"], optional = true }
+candle-metal-kernels = { version = "0.10.2", optional = true }
+objc2-metal = { version = "0.3.2", optional = true }
 hf-hub = "0.5.0"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 either = { version = "1.15.0", features = ["serde"] }
@@ -51,7 +53,7 @@ criterion = {version = "0.8.2", features = ["html_reports"]}
 default = ["metal"]
 flash-attn = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal", "dep:metal"]
+metal = ["candle-core/metal", "candle-nn/metal", "dep:metal", "dep:candle-metal-kernels", "dep:objc2-metal"]
 
 [[bench]]
 name = "tur"
