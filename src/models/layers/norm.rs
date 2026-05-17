@@ -32,11 +32,10 @@ impl NormX {
             };
             out.to_dtype(in_dtype)
         } else {
-            let out = match &self.norm {
-                Either::Left(norm) => norm.forward(xs)?,
-                Either::Right(norm) => norm.forward(xs)?,
-            };
-            Ok(out)
+            match &self.norm {
+                Either::Left(norm) => norm.forward(xs),
+                Either::Right(norm) => norm.forward(xs),
+            }
         }
     }
 }
