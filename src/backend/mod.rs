@@ -1,3 +1,4 @@
+pub mod audio_encoder;
 pub mod batch_manager;
 pub mod chat_template;
 pub mod engine;
@@ -11,11 +12,12 @@ pub mod scheduler;
 pub mod tokenizer;
 pub mod tools;
 
+pub use audio_encoder::AudioEncoder;
 pub use engine::{InferenceEngine, InferenceEngineBuilder};
-pub use factory::ModelFactory;
+pub use factory::{AnyModel, AnyModelConfig, AutoModelFactory, ModelFactory, ModelKind};
 pub use pipeline::{
-    GenerationRequest, GenerationResult, GenerationStats, RequestHandle, TextGeneration,
-    TextGenerationBuilder,
+    GenerationRequest, GenerationResult, GenerationStats, ModalInput, RequestHandle, TurPipeline,
+    TurPipelineBuilder,
 };
 pub use scheduler::SchedulingPolicy;
 pub use tools::{ToolCall, ToolDefinition};

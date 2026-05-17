@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::{
     ProgressReporter, Result, TurError,
     backend::{
+        audio_encoder::AudioEncoder,
         chat_template::{ChatTemplate, Message},
         engine::InferenceEngine,
         factory::{ModelConstructor, ModelFactory},
@@ -20,16 +21,22 @@ use crate::{
     models::kv_cache::BlockAllocator,
 };
 
-/// Request struct for text generation, suitable for scheduling and prefix-caching
+/// A single modality input to a generation request.
+#[derive(Debug, Clone)]
+pub enum ModalInput {
+    /// Plain text — the normal prompt string.
+    Text(String),
+    /// Raw PCM audio samples (mono f32) at the given sample rate.
+    Audio { pcm: Vec<f32>, sample_rate: u32 },
+}
+
+/// Request struct for generation, supporting text and audio inputs.
 #[derive(Debug, Clone)]
 pub struct GenerationRequest {
     pub id: Uuid,
-    /// Raw user message **or** a fully pre-formatted prompt.
-    ///
-    /// When [`tools`] is non-empty the pipeline treats this as the raw user
-    /// message and wraps it with the model-specific tool-calling template.
-    /// When [`tools`] is empty the string is encoded as-is (existing behaviour).
-    pub prompt: String,
+    /// Ordered list of inputs.  Use [`GenerationRequest::new`] for text-only
+    /// requests or [`with_audio`] to append audio inputs.
+    pub inputs: Vec<ModalInput>,
     pub sample_len: usize,
     /// Optional grammar for guided (constrained) generation.
     /// When set, only tokens valid under the grammar are sampled.
@@ -46,16 +53,34 @@ pub struct GenerationRequest {
 }
 
 impl GenerationRequest {
-    /// Create a new request with auto-generated UUID
+    /// Create a text-only request with auto-generated UUID.
     pub fn new(prompt: String, sample_len: usize) -> Self {
         Self {
             id: Uuid::new_v4(),
-            prompt,
+            inputs: vec![ModalInput::Text(prompt)],
             sample_len,
             grammar: None,
             tools: Vec::new(),
             thinking: false,
         }
+    }
+
+    /// Return the first text input, or an empty string when there is none.
+    /// Used internally to extract the prompt for template formatting and tokenisation.
+    pub fn text_prompt(&self) -> &str {
+        self.inputs
+            .iter()
+            .find_map(|i| match i {
+                ModalInput::Text(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap_or("")
+    }
+
+    /// Append a PCM audio input (mono f32 at `sample_rate` Hz).
+    pub fn with_audio(mut self, pcm: Vec<f32>, sample_rate: u32) -> Self {
+        self.inputs.push(ModalInput::Audio { pcm, sample_rate });
+        self
     }
 
     /// Attach a grammar for guided generation.
@@ -64,7 +89,7 @@ impl GenerationRequest {
         self
     }
 
-    /// Attach tool definitions.  The prompt is treated as a raw user message
+    /// Attach tool definitions.  The text prompt is treated as a raw user message
     /// and the pipeline formats it with the model's tool-calling template.
     pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
         self.tools = tools;
@@ -113,8 +138,8 @@ struct BatchingComponents {
 
 pub type OnTokenFn = Box<dyn FnMut(&str)>;
 
-/// High-level text generation pipeline with output handling and continuous batching support
-pub struct TextGeneration<T: ModelConstructor> {
+/// High-level generation pipeline with output handling, continuous batching, and multimodal support.
+pub struct TurPipeline<T: ModelConstructor> {
     engine: InferenceEngine<T>,
     tokenizer: TokenOutputStream,
     progress: Option<ProgressReporter>,
@@ -128,10 +153,13 @@ pub struct TextGeneration<T: ModelConstructor> {
     /// When present, `format_prompt` and `format_prompt_with_tools` use it
     /// instead of the hardcoded static fallback on `ModelImpl`.
     chat_template: Option<ChatTemplate>,
+    /// Optional audio encoder for multimodal requests.
+    /// When present, [`ModalInput::Audio`] inputs are encoded before prefill.
+    audio_encoder: Option<Box<dyn AudioEncoder>>,
 }
 
-/// Builder for TextGeneration
-pub struct TextGenerationBuilder<'a, T: ModelConstructor> {
+/// Builder for [`TurPipeline`].
+pub struct TurPipelineBuilder<'a, T: ModelConstructor> {
     factory: &'a ModelFactory<T>,
     device: Device,
     seed: u64,
@@ -143,6 +171,7 @@ pub struct TextGenerationBuilder<'a, T: ModelConstructor> {
     on_token: Option<OnTokenFn>,
     prefix_cache: Option<super::prefix_cache::SharedPrefixCache>,
     guidance_factory: Option<Arc<ParserFactory>>,
+    audio_encoder: Option<Box<dyn AudioEncoder>>,
     // Batching configuration
     enable_batching: bool,
     max_batch_size: usize,
@@ -153,7 +182,7 @@ pub struct TextGenerationBuilder<'a, T: ModelConstructor> {
     prefill_chunk_size: Option<usize>,
 }
 
-impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
+impl<'a, T: ModelConstructor> TurPipelineBuilder<'a, T> {
     pub fn new(factory: &'a ModelFactory<T>, device: Device) -> Self {
         Self {
             factory,
@@ -167,6 +196,7 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             on_token: None,
             prefix_cache: None,
             guidance_factory: None,
+            audio_encoder: None,
             enable_batching: false,
             max_batch_size: 16,
             max_prefill_batch: 8,
@@ -281,7 +311,15 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
         self
     }
 
-    pub fn build(self) -> TextGeneration<T> {
+    /// Attach an audio encoder for multimodal requests.
+    /// When set, [`ModalInput::Audio`] inputs in each request are encoded to
+    /// embeddings before prefill via [`InferenceEngine::prefill_with_audio`].
+    pub fn with_audio_encoder(mut self, encoder: Box<dyn AudioEncoder>) -> Self {
+        self.audio_encoder = Some(encoder);
+        self
+    }
+
+    pub fn build(self) -> TurPipeline<T> {
         debug!(
             seed = self.seed,
             temp = ?self.temp,
@@ -402,7 +440,7 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
 
         debug!("Text generation pipeline built successfully");
 
-        TextGeneration {
+        TurPipeline {
             engine,
             tokenizer: TokenOutputStream::new(tokenizer),
             progress: self.progress,
@@ -412,14 +450,15 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             result_order: VecDeque::new(),
             max_results: self.max_results,
             chat_template,
+            audio_encoder: self.audio_encoder,
         }
     }
 }
 
-impl<T: ModelConstructor> TextGeneration<T> {
-    /// Create a builder for TextGeneration from factory
-    pub fn builder(factory: &'_ ModelFactory<T>, device: Device) -> TextGenerationBuilder<'_, T> {
-        TextGenerationBuilder::new(factory, device)
+impl<T: ModelConstructor> TurPipeline<T> {
+    /// Create a builder for [`TurPipeline`] from factory.
+    pub fn builder(factory: &'_ ModelFactory<T>, device: Device) -> TurPipelineBuilder<'_, T> {
+        TurPipelineBuilder::new(factory, device)
     }
 
     /// Access the underlying inference engine
@@ -446,16 +485,11 @@ impl<T: ModelConstructor> TextGeneration<T> {
         let has_tools = !request.tools.is_empty();
         self.tokenizer.clear();
 
-        // When tools are provided, re-format the (raw) user prompt with the
-        // model-specific tool-calling template.  Otherwise encode as-is.
-        let prompt_str: std::borrow::Cow<str> = if has_tools {
-            std::borrow::Cow::Owned(self.format_prompt_with_tools(
-                &request.prompt,
-                &request.tools,
-                request.thinking,
-            ))
+        let text = request.text_prompt();
+        let prompt_str = if has_tools {
+            self.format_prompt_with_tools(text, &request.tools, request.thinking)
         } else {
-            std::borrow::Cow::Owned(self.format_prompt(&request.prompt, request.thinking))
+            self.format_prompt(text, request.thinking)
         };
 
         trace!(
@@ -463,12 +497,12 @@ impl<T: ModelConstructor> TextGeneration<T> {
             prompt_chars = prompt_str.chars().count(),
             has_tools,
             sample_len,
-            "Starting text generation request",
+            "Starting generation request",
         );
         let mut tokens = self
             .tokenizer
             .tokenizer()
-            .encode(prompt_str.as_ref(), true)
+            .encode(prompt_str.as_str(), true)
             .map_err(|e| TurError::Tokenizer(e.to_string()))?
             .get_ids()
             .to_vec();
@@ -489,8 +523,14 @@ impl<T: ModelConstructor> TextGeneration<T> {
 
         let start_gen = std::time::Instant::now();
 
-        // Prefill phase
-        let (first_token, _, cache_hit, cached_tokens) = self.engine.prefill(&tokens)?;
+        // Encode audio inputs when an encoder is available, then dispatch to the
+        // appropriate prefill path.
+        let audio_embeds = self.encode_audio_inputs(&request.inputs)?;
+        let (first_token, _, cache_hit, cached_tokens) = if audio_embeds.is_empty() {
+            self.engine.prefill(&tokens)?
+        } else {
+            self.engine.prefill_with_audio(&tokens, audio_embeds)?
+        };
         trace!(
             request_id = %request.id,
             first_token,
@@ -612,6 +652,25 @@ impl<T: ModelConstructor> TextGeneration<T> {
         })
     }
 
+    /// Encode all [`ModalInput::Audio`] entries in `inputs` using the pipeline's
+    /// audio encoder.  Returns an empty `Vec` when no encoder is configured or
+    /// when there are no audio inputs, leaving the normal text-only path intact.
+    fn encode_audio_inputs(
+        &self,
+        inputs: &[ModalInput],
+    ) -> Result<Vec<candle_core::Tensor>> {
+        let Some(enc) = &self.audio_encoder else {
+            return Ok(Vec::new());
+        };
+        inputs
+            .iter()
+            .filter_map(|i| match i {
+                ModalInput::Audio { pcm, sample_rate } => Some(enc.encode(pcm, *sample_rate)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Format a raw user message using the loaded Jinja2 chat template when
     /// available, or the model's static `format_prompt` implementation otherwise.
     pub fn format_prompt(&self, prompt: &str, thinking: bool) -> String {
@@ -628,7 +687,7 @@ impl<T: ModelConstructor> TextGeneration<T> {
                     })
                     .ok()
             })
-            .unwrap_or_else(|| T::format_prompt(prompt, thinking))
+            .unwrap_or_else(|| self.engine.model().format_prompt(prompt, thinking))
     }
 
     /// Format a raw user message with tool definitions using the loaded Jinja2
@@ -653,18 +712,20 @@ impl<T: ModelConstructor> TextGeneration<T> {
                     })
                     .ok()
             })
-            .unwrap_or_else(|| T::format_prompt_with_tools(prompt, tools, thinking))
+            .unwrap_or_else(|| self.engine.model().format_prompt_with_tools(prompt, tools, thinking))
     }
 
-    /// Submit a new generation request (batching mode only)
+    /// Submit a new generation request (batching mode only).
+    /// Audio inputs are not supported in batching mode — only the text prompt is used.
     pub fn submit_request(&mut self, request: &GenerationRequest) -> Result<RequestHandle> {
         let batching = self.batching.as_mut().ok_or_else(|| {
             TurError::Other("Batching not enabled. Use builder.enable_batching(true)".to_string())
         })?;
 
+        let prompt = request.text_prompt();
         let tokens = batching
             .tokenizer
-            .encode(request.prompt.as_str(), true)
+            .encode(prompt, true)
             .map_err(|e| TurError::Tokenizer(e.to_string()))?
             .get_ids()
             .to_vec();
@@ -678,7 +739,7 @@ impl<T: ModelConstructor> TextGeneration<T> {
 
         let request_state = crate::backend::batch_manager::RequestState::new(
             request.id,
-            request.prompt.clone(),
+            prompt.to_string(),
             tokens,
             request.sample_len,
             0,

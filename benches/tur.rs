@@ -113,10 +113,6 @@ fn encode_tokens(ts: &TokenOutputStream, text: &str) -> Vec<u32> {
         .to_vec()
 }
 
-fn format_prompt(prompt: &str) -> String {
-    Qwen35ModelForCausalLM::format_prompt(prompt, false)
-}
-
 fn configure_group(
     group: &mut BenchmarkGroup<WallTime>,
     samples: usize,
@@ -148,8 +144,8 @@ fn bench_prefill(c: &mut Criterion) {
     configure_group(&mut group, 10, 30, 3);
 
     for (prompt_name, prompt_body) in BENCHMARK_PROMPTS {
-        let prompt = format_prompt(prompt_body);
         let (mut engine, ts) = build_engine();
+        let prompt = engine.model().format_prompt(prompt_body, false);
         let eos_tokens = InferenceEngine::<Qwen35ModelForCausalLM>::get_eos_tokens(&ts)
             .expect("failed to get EOS tokens");
 
@@ -194,8 +190,8 @@ fn bench_decode(c: &mut Criterion) {
     configure_group(&mut group, 10, 40, 3);
 
     for (prompt_name, prompt_body) in BENCHMARK_PROMPTS {
-        let prompt = format_prompt(prompt_body);
         let (mut engine, ts) = build_engine();
+        let prompt = engine.model().format_prompt(prompt_body, false);
         let eos_tokens = InferenceEngine::<Qwen35ModelForCausalLM>::get_eos_tokens(&ts)
             .expect("failed to get EOS tokens");
 
@@ -232,12 +228,10 @@ fn bench_full_pipeline(c: &mut Criterion) {
     configure_group(&mut group, 10, 50, 5);
 
     for (prompt_name, prompt_body) in BENCHMARK_PROMPTS {
-        let prompt = format_prompt(prompt_body);
-
         group.bench_with_input(
             BenchmarkId::new("full", prompt_name),
-            &prompt,
-            |b, prompt| {
+            &prompt_body,
+            |b, prompt_body| {
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
@@ -252,6 +246,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
                                 .repeat_last_n(REPEAT_LAST_N)
                                 .build()
                                 .expect("failed to build engine");
+                        let prompt = engine.model().format_prompt(prompt_body, false);
                         let ts = TokenOutputStream::new(tokenizer);
                         let tokens = encode_tokens(&ts, black_box(prompt.as_str()));
                         let eos_tokens =
@@ -282,7 +277,9 @@ fn bench_prefix_cache(c: &mut Criterion) {
         let (mut engine, ts) = build_engine();
         let avg_tokens: usize = PREFIX_CACHE_PROMPTS
             .iter()
-            .map(|(_, prompt)| encode_tokens(&ts, &format_prompt(prompt)).len())
+            .map(|(_, prompt)| {
+                encode_tokens(&ts, &engine.model().format_prompt(prompt, false)).len()
+            })
             .sum::<usize>()
             / PREFIX_CACHE_PROMPTS.len();
         group.throughput(Throughput::Elements(avg_tokens as u64));
@@ -295,7 +292,8 @@ fn bench_prefix_cache(c: &mut Criterion) {
                 for i in 0..iters {
                     let (_, prompt) =
                         PREFIX_CACHE_PROMPTS[(i % PREFIX_CACHE_PROMPTS.len() as u64) as usize];
-                    let tokens = encode_tokens(&ts, black_box(&format_prompt(prompt)));
+                    let tokens =
+                        encode_tokens(&ts, black_box(&engine.model().format_prompt(prompt, false)));
                     total_tokens += tokens.len();
 
                     let start = Instant::now();
@@ -332,7 +330,8 @@ fn bench_prefix_cache(c: &mut Criterion) {
                 for i in 0..iters {
                     let (_, prompt) =
                         PREFIX_CACHE_PROMPTS[(i % PREFIX_CACHE_PROMPTS.len() as u64) as usize];
-                    let tokens = encode_tokens(&ts, black_box(&format_prompt(prompt)));
+                    let tokens =
+                        encode_tokens(&ts, black_box(&engine.model().format_prompt(prompt, false)));
                     total_tokens += tokens.len();
 
                     let start = Instant::now();
@@ -387,8 +386,12 @@ fn bench_prefix_cache_lengths(c: &mut Criterion) {
         let (mut engine, ts) = build_engine_with_cache(cache);
 
         let base = "You are a helpful AI assistant. ".repeat(prefix_len / 10);
-        let p1 = format_prompt(&format!("{}Question: What is Rust?", base));
-        let p2 = format_prompt(&format!("{}Question: What is Python?", base));
+        let p1 = engine
+            .model()
+            .format_prompt(&format!("{}Question: What is Rust?", base), false);
+        let p2 = engine
+            .model()
+            .format_prompt(&format!("{}Question: What is Python?", base), false);
 
         group.bench_with_input(
             BenchmarkId::new("cache_hit", prefix_len),
@@ -436,7 +439,7 @@ fn bench_batch_prefill(c: &mut Criterion) {
             let batch_token_count: usize = (0..batch_size)
                 .map(|i| {
                     let (_, prompt) = PREFIX_CACHE_PROMPTS[i % PREFIX_CACHE_PROMPTS.len()];
-                    encode_tokens(&ts, &format_prompt(prompt)).len()
+                    encode_tokens(&ts, &engine.model().format_prompt(prompt, false)).len()
                 })
                 .sum();
             group.throughput(Throughput::Elements(batch_token_count as u64));
@@ -453,7 +456,7 @@ fn bench_batch_prefill(c: &mut Criterion) {
                                 .map(|i| {
                                     let (_, prompt) =
                                         PREFIX_CACHE_PROMPTS[i % PREFIX_CACHE_PROMPTS.len()];
-                                    let text = format_prompt(prompt);
+                                    let text = engine.model().format_prompt(prompt, false);
                                     (Uuid::new_v4(), encode_tokens(&ts, black_box(&text)), 0)
                                 })
                                 .collect();
@@ -490,7 +493,7 @@ fn bench_batch_prefill(c: &mut Criterion) {
 
             // Warm up the prefix cache with all prompt variants
             for (_, prompt) in &PREFIX_CACHE_PROMPTS {
-                let text = format_prompt(prompt);
+                let text = engine.model().format_prompt(prompt, false);
                 let tokens = encode_tokens(&ts, &text);
                 let mut caches = make_paged_caches(&allocator, 1);
                 engine
@@ -501,7 +504,7 @@ fn bench_batch_prefill(c: &mut Criterion) {
             let batch_token_count: usize = (0..batch_size)
                 .map(|i| {
                     let (_, prompt) = PREFIX_CACHE_PROMPTS[i % PREFIX_CACHE_PROMPTS.len()];
-                    encode_tokens(&ts, &format_prompt(prompt)).len()
+                    encode_tokens(&ts, &engine.model().format_prompt(prompt, false)).len()
                 })
                 .sum();
             group.throughput(Throughput::Elements(batch_token_count as u64));
@@ -517,7 +520,7 @@ fn bench_batch_prefill(c: &mut Criterion) {
                             let batch: Vec<(Uuid, Vec<u32>, usize)> = (0..batch_size)
                                 .map(|i| {
                                     let (_, prompt) = PREFIX_CACHE_PROMPTS[i % PREFIX_CACHE_PROMPTS.len()];
-                                    let text = format_prompt(prompt);
+                                    let text = engine.model().format_prompt(prompt, false);
                                     (Uuid::new_v4(), encode_tokens(&ts, black_box(&text)), 0)
                                 })
                                 .collect();
@@ -576,17 +579,18 @@ fn bench_chunked_prefill(c: &mut Criterion) {
 
     for (prompt_name, prompt_body) in BENCHMARK_PROMPTS {
         let factory = create_benchmark_factory();
-        let (mut engine, tokenizer, _) = InferenceEngine::builder(&factory, factory.device().clone())
-            .seed(BENCHMARK_SEED)
-            .temperature(TEMPERATURE)
-            .repeat_penalty(REPEAT_PENALTY)
-            .repeat_last_n(REPEAT_LAST_N)
-            .build()
-            .expect("failed to build engine");
+        let (mut engine, tokenizer, _) =
+            InferenceEngine::builder(&factory, factory.device().clone())
+                .seed(BENCHMARK_SEED)
+                .temperature(TEMPERATURE)
+                .repeat_penalty(REPEAT_PENALTY)
+                .repeat_last_n(REPEAT_LAST_N)
+                .build()
+                .expect("failed to build engine");
         let ts = TokenOutputStream::new(tokenizer);
         let allocator = Arc::new(RwLock::new(BlockAllocator::new(4096, 16)));
 
-        let prompt = format_prompt(prompt_body);
+        let prompt = engine.model().format_prompt(prompt_body, false);
         let tokens = encode_tokens(&ts, &prompt);
         let prompt_len = tokens.len();
 

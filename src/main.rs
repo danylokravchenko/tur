@@ -3,7 +3,7 @@ use clap::Parser;
 use tracing::{debug, info};
 use tur::backend::pipeline::GenerationRequest;
 use tur::backend::tools::ToolDefinition;
-use tur::{ProgressReporter, Result, TextGeneration, TurError};
+use tur::{ProgressReporter, Result, TurPipeline, TurError};
 
 const DEFAULT_PROMPT: &str = "Who are you?";
 
@@ -239,7 +239,7 @@ fn main() -> Result<()> {
     // text is printed above the progress bar. Replace this closure to send tokens
     // elsewhere (e.g. an HTTP stream, a channel, a file).
     let progress_for_tokens = progress.clone();
-    let mut pipeline_builder = TextGeneration::builder(&factory, device.clone())
+    let mut pipeline_builder = TurPipeline::builder(&factory, device.clone())
         .progress(progress.clone())
         .on_token(move |t| progress_for_tokens.print(t))
         .seed(args.seed)
