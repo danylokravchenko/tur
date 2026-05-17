@@ -960,6 +960,51 @@ impl super::ModelImpl for ModelForCausalLM {
         format!("<|im_start|>user\n{prompt}{think_tag}<|im_end|>\n<|im_start|>assistant\n")
     }
 
+    fn format_prompt_with_tools(
+        prompt: &str,
+        tools: &[crate::backend::tools::ToolDefinition],
+        thinking: bool,
+    ) -> String {
+        let think_tag = if thinking { " /think" } else { " /no_think" };
+
+        // Serialise each tool as a JSON object with the "function" wrapper
+        // expected by the Qwen3 tool-calling template.
+        let tools_json = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    }
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "<|im_start|>system\n\
+             You are a helpful assistant.\n\n\
+             # Tools\n\n\
+             You may call one or more functions to assist with the user request.\n\n\
+             You are provided with function signatures within <tools></tools> XML tags:\n\n\
+             <tools>\n\
+             {tools_json}\n\
+             </tools>\n\n\
+             For each function call, return a json object with function name and arguments \
+             within <tool_call></tool_call> XML tags:\n\n\
+             <tool_call>\n\
+             {{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n\
+             </tool_call><|im_end|>\n\
+             <|im_start|>user\n\
+             {prompt}{think_tag}<|im_end|>\n\
+             <|im_start|>assistant\n"
+        )
+    }
+
     fn get_kv_cache_state(&self) -> Result<Vec<(Tensor, Tensor)>> {
         self.base.get_kv_cache_state()
     }

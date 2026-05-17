@@ -7,6 +7,7 @@ use tur::backend::guidance::TopLevelGrammar;
 use tur::backend::pipeline::{GenerationRequest, TextGeneration};
 use tur::backend::prefix_cache::PrefixCache;
 use tur::backend::tokenizer::TokenOutputStream;
+use tur::backend::tools::ToolDefinition;
 
 mod common;
 use common::create_test_factory;
@@ -69,6 +70,11 @@ fn test_pipeline_end_to_end_generation() {
         result.is_ok(),
         "Generation with progress failed: {:?}",
         result.err()
+    );
+    let stats = result.unwrap();
+    assert!(
+        stats.tool_calls.is_empty(),
+        "tool_calls must be empty for requests without tools"
     );
 }
 
@@ -681,6 +687,124 @@ fn test_guided_json_schema_output_is_valid_json() {
     assert!(
         obj.get("value").is_some(),
         "JSON must contain required field 'value', got: {obj}"
+    );
+}
+
+// ── Tool calling ──────────────────────────────────────────────────────────────
+
+fn weather_tool() -> ToolDefinition {
+    ToolDefinition::new(
+        "get_weather",
+        "Get the current weather for a given location.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": "The city and country, e.g. Paris, France"
+                },
+                "unit": {
+                    "type": "string",
+                    "enum": ["celsius", "fahrenheit"],
+                    "description": "Temperature unit"
+                }
+            },
+            "required": ["location"]
+        }),
+    )
+}
+
+/// `format_prompt_with_tools` must inject the tool schema into the prompt
+/// string in the Qwen3 `<tools>` format — verifiable without running inference.
+#[test]
+fn test_tools_format_prompt_contains_schema() {
+    let (factory, device, _) = create_test_factory();
+    let pipeline = TextGeneration::builder(&factory, device).build();
+
+    let formatted = pipeline.format_prompt_with_tools(
+        "What is the weather in Paris?",
+        &[weather_tool()],
+        false,
+    );
+
+    assert!(
+        formatted.contains("<tools>"),
+        "Formatted prompt must contain <tools> block"
+    );
+    assert!(
+        formatted.contains("get_weather"),
+        "Formatted prompt must contain the tool name"
+    );
+    assert!(
+        formatted.contains("location"),
+        "Formatted prompt must contain the 'location' parameter"
+    );
+    assert!(
+        formatted.contains("<tool_call>"),
+        "Formatted prompt must contain the <tool_call> usage example"
+    );
+    assert!(
+        formatted.contains("What is the weather in Paris?"),
+        "Formatted prompt must preserve the user message"
+    );
+}
+
+/// End-to-end tool-call test: with a clear weather question and greedy
+/// sampling the model should emit a `<tool_call>` block that the pipeline
+/// parses into `GenerationStats::tool_calls`.
+#[test]
+fn test_tools_model_emits_and_pipeline_parses_tool_call() {
+    let (factory, device, _) = create_test_factory();
+
+    let output = Arc::new(Mutex::new(String::new()));
+    let output_clone = output.clone();
+
+    // Greedy sampling (no temperature) for deterministic output.
+    let mut pipeline = TextGeneration::builder(&factory, device)
+        .seed(299792458)
+        .on_token(move |s| output_clone.lock().unwrap().push_str(s))
+        .build();
+
+    // 200 tokens is enough for the model to close a <tool_call> block.
+    let request = GenerationRequest::new(
+        "What is the current weather in Paris, France?".to_string(),
+        200,
+    )
+    .with_tools(vec![weather_tool()]);
+
+    let stats = pipeline
+        .run(&request)
+        .expect("Tool-augmented generation failed");
+
+    assert!(
+        stats.generated_tokens > 0,
+        "Should have generated at least one token"
+    );
+
+    // The generated text must reference the tool by name.
+    let generated = output.lock().unwrap().clone();
+    assert!(
+        generated.contains("get_weather"),
+        "Model output must reference the tool name 'get_weather', got: {generated:?}"
+    );
+
+    // The pipeline must have parsed at least one tool call.
+    assert!(
+        !stats.tool_calls.is_empty(),
+        "stats.tool_calls must be non-empty when the model emits a <tool_call> block, \
+         got output: {generated:?}"
+    );
+
+    let call = &stats.tool_calls[0];
+    assert_eq!(
+        call.name, "get_weather",
+        "Parsed tool call must be 'get_weather', got: {:?}",
+        call.name
+    );
+    assert!(
+        call.arguments.get("location").is_some(),
+        "Tool call arguments must include 'location', got: {}",
+        call.arguments
     );
 }
 

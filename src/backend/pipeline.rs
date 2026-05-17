@@ -14,6 +14,7 @@ use crate::{
         guidance::{ParserFactory, TopLevelGrammar},
         scheduler::{ContinuousBatchScheduler, SchedulingPolicy},
         tokenizer::TokenOutputStream,
+        tools::{ToolCall, ToolDefinition},
     },
     models::kv_cache::BlockAllocator,
 };
@@ -22,11 +23,25 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct GenerationRequest {
     pub id: Uuid,
+    /// Raw user message **or** a fully pre-formatted prompt.
+    ///
+    /// When [`tools`] is non-empty the pipeline treats this as the raw user
+    /// message and wraps it with the model-specific tool-calling template.
+    /// When [`tools`] is empty the string is encoded as-is (existing behaviour).
     pub prompt: String,
     pub sample_len: usize,
     /// Optional grammar for guided (constrained) generation.
     /// When set, only tokens valid under the grammar are sampled.
     pub grammar: Option<TopLevelGrammar>,
+    /// Tools available to the model.  When non-empty the pipeline injects them
+    /// into the prompt via the model's `format_prompt_with_tools` and parses
+    /// any [`ToolCall`]s from the generated text, returning them in
+    /// [`GenerationStats::tool_calls`].
+    pub tools: Vec<ToolDefinition>,
+    /// Enable extended thinking (`/think` tag in Qwen3).  Only effective when
+    /// tools are also set; for tool-free requests the caller is responsible for
+    /// pre-formatting the prompt with the appropriate tag.
+    pub thinking: bool,
 }
 
 impl GenerationRequest {
@@ -37,12 +52,27 @@ impl GenerationRequest {
             prompt,
             sample_len,
             grammar: None,
+            tools: Vec::new(),
+            thinking: false,
         }
     }
 
     /// Attach a grammar for guided generation.
     pub fn with_grammar(mut self, grammar: TopLevelGrammar) -> Self {
         self.grammar = Some(grammar);
+        self
+    }
+
+    /// Attach tool definitions.  The prompt is treated as a raw user message
+    /// and the pipeline formats it with the model's tool-calling template.
+    pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// Enable extended thinking mode (Qwen3 `/think` tag).
+    pub fn with_thinking(mut self, thinking: bool) -> Self {
+        self.thinking = thinking;
         self
     }
 }
@@ -52,6 +82,10 @@ impl GenerationRequest {
 pub struct GenerationStats {
     pub generated_tokens: usize,
     pub elapsed: std::time::Duration,
+    /// Tool calls parsed from the generated text.  Non-empty only when the
+    /// request included tool definitions and the model emitted `<tool_call>`
+    /// blocks in its output.
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// Result handle for async request tracking
@@ -401,17 +435,32 @@ impl<T: ModelConstructor> TextGeneration<T> {
 
     fn run_inner(&mut self, request: &GenerationRequest) -> Result<GenerationStats> {
         let sample_len = request.sample_len;
+        let has_tools = !request.tools.is_empty();
         self.tokenizer.clear();
+
+        // When tools are provided, re-format the (raw) user prompt with the
+        // model-specific tool-calling template.  Otherwise encode as-is.
+        let prompt_str: std::borrow::Cow<str> = if has_tools {
+            std::borrow::Cow::Owned(T::format_prompt_with_tools(
+                &request.prompt,
+                &request.tools,
+                request.thinking,
+            ))
+        } else {
+            std::borrow::Cow::Borrowed(request.prompt.as_str())
+        };
+
         trace!(
             request_id = %request.id,
-            prompt_chars = request.prompt.chars().count(),
+            prompt_chars = prompt_str.chars().count(),
+            has_tools,
             sample_len,
             "Starting text generation request",
         );
         let mut tokens = self
             .tokenizer
             .tokenizer()
-            .encode(request.prompt.as_str(), true)
+            .encode(prompt_str.as_ref(), true)
             .map_err(|e| TurError::Tokenizer(e.to_string()))?
             .get_ids()
             .to_vec();
@@ -426,6 +475,8 @@ impl<T: ModelConstructor> TextGeneration<T> {
         }
 
         let mut generated_tokens = 0usize;
+        // Accumulate text for tool-call parsing when tools are active.
+        let mut generated_text: Option<String> = if has_tools { Some(String::new()) } else { None };
         let (eos_token, im_end_token) = InferenceEngine::<T>::get_eos_tokens(&self.tokenizer)?;
 
         let start_gen = std::time::Instant::now();
@@ -455,6 +506,9 @@ impl<T: ModelConstructor> TextGeneration<T> {
                 text_chars = t.chars().count(),
                 "Decoded first token into text chunk",
             );
+            if let Some(ref mut buf) = generated_text {
+                buf.push_str(&t);
+            }
             if let Some(ref mut on_token) = self.on_token {
                 on_token(&t);
             }
@@ -491,6 +545,9 @@ impl<T: ModelConstructor> TextGeneration<T> {
                     text_chars = t.chars().count(),
                     "Decoded token into text chunk",
                 );
+                if let Some(ref mut buf) = generated_text {
+                    buf.push_str(&t);
+                }
                 if let Some(ref mut on_token) = self.on_token {
                     on_token(&t);
                 }
@@ -507,6 +564,9 @@ impl<T: ModelConstructor> TextGeneration<T> {
                 text_chars = rest.chars().count(),
                 "Flushed remaining decoded text",
             );
+            if let Some(ref mut buf) = generated_text {
+                buf.push_str(&rest);
+            }
             if let Some(ref mut on_token) = self.on_token {
                 on_token(&rest);
             }
@@ -531,14 +591,33 @@ impl<T: ModelConstructor> TextGeneration<T> {
                 generated_tokens as f64 / dt.as_secs_f64(),
             );
         }
+
+        let tool_calls = generated_text
+            .as_deref()
+            .map(ToolCall::parse_from_output)
+            .unwrap_or_default();
+
         Ok(GenerationStats {
             generated_tokens,
             elapsed: dt,
+            tool_calls,
         })
     }
 
     pub fn format_prompt(&self, prompt: &str, thinking: bool) -> String {
         T::format_prompt(prompt, thinking)
+    }
+
+    /// Format a raw user message with tool definitions injected as a system
+    /// message, using the model's tool-calling template.  Useful for
+    /// inspecting the formatted prompt before submitting a request.
+    pub fn format_prompt_with_tools(
+        &self,
+        prompt: &str,
+        tools: &[ToolDefinition],
+        thinking: bool,
+    ) -> String {
+        T::format_prompt_with_tools(prompt, tools, thinking)
     }
 
     /// Submit a new generation request (batching mode only)
@@ -599,6 +678,7 @@ impl<T: ModelConstructor> TextGeneration<T> {
                 stats: GenerationStats {
                     generated_tokens: tokens.len(),
                     elapsed: arrival_time.elapsed(),
+                    tool_calls: Vec::new(),
                 },
             };
 
