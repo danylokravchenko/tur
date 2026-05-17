@@ -441,13 +441,13 @@ impl<T: ModelConstructor> TextGeneration<T> {
         // When tools are provided, re-format the (raw) user prompt with the
         // model-specific tool-calling template.  Otherwise encode as-is.
         let prompt_str: std::borrow::Cow<str> = if has_tools {
-            std::borrow::Cow::Owned(T::format_prompt_with_tools(
+            std::borrow::Cow::Owned(self.format_prompt_with_tools(
                 &request.prompt,
                 &request.tools,
                 request.thinking,
             ))
         } else {
-            std::borrow::Cow::Borrowed(request.prompt.as_str())
+            std::borrow::Cow::Owned(self.format_prompt(&request.prompt, request.thinking))
         };
 
         trace!(
