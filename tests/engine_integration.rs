@@ -37,9 +37,9 @@ fn test_inference_engine_prefill_batch() {
 
     // Create batch of 3 requests with different prompts
     let batch_tokens = vec![
-        (Uuid::new_v4(), vec![1u32, 2, 3, 4]),
-        (Uuid::new_v4(), vec![5u32, 6, 7]),
-        (Uuid::new_v4(), vec![8u32, 9, 10, 11, 12]),
+        (Uuid::new_v4(), vec![1u32, 2, 3, 4], 0usize),
+        (Uuid::new_v4(), vec![5u32, 6, 7], 0usize),
+        (Uuid::new_v4(), vec![8u32, 9, 10, 11, 12], 0usize),
     ];
 
     let result = engine.prefill_batch(&batch_tokens, None);
@@ -51,7 +51,7 @@ fn test_inference_engine_prefill_batch() {
     // Verify each request got a token
     for (id, _token) in &results {
         assert!(
-            batch_tokens.iter().any(|(req_id, _)| req_id == id),
+            batch_tokens.iter().any(|(req_id, _, _)| req_id == id),
             "Result ID should match input"
         );
         // Token can be any value including 0 (valid token ID)
@@ -69,16 +69,17 @@ fn test_inference_engine_decode_batch() {
     let id3 = Uuid::new_v4();
 
     let prefill_batch = vec![
-        (id1, vec![1u32, 2, 3]),
-        (id2, vec![4u32, 5, 6, 7]),
-        (id3, vec![8u32, 9]),
+        (id1, vec![1u32, 2, 3], 0usize),
+        (id2, vec![4u32, 5, 6, 7], 0usize),
+        (id3, vec![8u32, 9], 0usize),
     ];
 
     let prefill_results = engine.prefill_batch(&prefill_batch, None).unwrap();
 
     // Now do decode with variable positions
     let mut decode_batch = Vec::new();
-    for ((id, mut tokens), (_, next_token)) in prefill_batch.into_iter().zip(prefill_results.iter())
+    for ((id, mut tokens, _), (_, next_token)) in
+        prefill_batch.into_iter().zip(prefill_results.iter())
     {
         tokens.push(*next_token);
         let position = tokens.len() - 1;
@@ -118,7 +119,7 @@ fn test_inference_engine_batch_consistency() {
         .build()
         .unwrap();
     let batch_results = engine2
-        .prefill_batch(&[(id, tokens.clone())], None)
+        .prefill_batch(&[(id, tokens.clone(), 0usize)], None)
         .unwrap();
 
     assert_eq!(batch_results.len(), 1);
@@ -157,7 +158,7 @@ fn test_inference_engine_large_batch() {
     let batch_tokens: Vec<_> = (0..batch_size)
         .map(|i| {
             let tokens: Vec<u32> = (1..=5).map(|j| (i * 10 + j) as u32).collect();
-            (Uuid::new_v4(), tokens)
+            (Uuid::new_v4(), tokens, 0usize)
         })
         .collect();
 
@@ -184,12 +185,13 @@ fn test_inference_engine_variable_length_batch() {
 
     // Create batch with very different sequence lengths
     let batch_tokens = vec![
-        (Uuid::new_v4(), vec![1u32]),             // Length 1
-        (Uuid::new_v4(), vec![2u32, 3, 4, 5, 6]), // Length 5
-        (Uuid::new_v4(), vec![7u32, 8]),          // Length 2
+        (Uuid::new_v4(), vec![1u32], 0usize),             // Length 1
+        (Uuid::new_v4(), vec![2u32, 3, 4, 5, 6], 0usize), // Length 5
+        (Uuid::new_v4(), vec![7u32, 8], 0usize),          // Length 2
         (
             Uuid::new_v4(),
             vec![9u32, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+            0usize,
         ), // Length 10
     ];
 
@@ -264,7 +266,7 @@ fn test_prefix_cache_paged_batch_correctness() {
     // First paged prefill: cold run.  The engine stores the K/V state in the cache.
     let mut caches1 = make_paged_caches(&allocator, 1);
     let results1 = engine
-        .prefill_batch(&[(id, tokens.clone())], Some(&mut caches1))
+        .prefill_batch(&[(id, tokens.clone(), 0usize)], Some(&mut caches1))
         .unwrap();
     let token_cold = results1[0].1;
 
@@ -278,7 +280,7 @@ fn test_prefix_cache_paged_batch_correctness() {
     let id2 = Uuid::new_v4();
     let mut caches2 = make_paged_caches(&allocator, 1);
     let results2 = engine
-        .prefill_batch(&[(id2, tokens.clone())], Some(&mut caches2))
+        .prefill_batch(&[(id2, tokens.clone(), 0usize)], Some(&mut caches2))
         .unwrap();
     let token_warm = results2[0].1;
 
@@ -310,7 +312,7 @@ fn test_prefix_cache_paged_partial_prefix_hit() {
     let id1 = Uuid::new_v4();
     let mut caches_warm = make_paged_caches(&allocator, 1);
     engine
-        .prefill_batch(&[(id1, short_tokens)], Some(&mut caches_warm))
+        .prefill_batch(&[(id1, short_tokens, 0usize)], Some(&mut caches_warm))
         .unwrap();
 
     // Cold run with a longer prompt that extends the cached prefix.
@@ -319,7 +321,7 @@ fn test_prefix_cache_paged_partial_prefix_hit() {
     let id2 = Uuid::new_v4();
     let mut caches_cold = make_paged_caches(&allocator, 1);
     let results_cold = engine
-        .prefill_batch(&[(id2, long_tokens.clone())], Some(&mut caches_cold))
+        .prefill_batch(&[(id2, long_tokens.clone(), 0usize)], Some(&mut caches_cold))
         .unwrap();
 
     // Reset stats to isolate the hit below from the one above.
@@ -329,7 +331,7 @@ fn test_prefix_cache_paged_partial_prefix_hit() {
     let id3 = Uuid::new_v4();
     let mut caches_hit = make_paged_caches(&allocator, 1);
     let results_hit = engine
-        .prefill_batch(&[(id3, long_tokens)], Some(&mut caches_hit))
+        .prefill_batch(&[(id3, long_tokens, 0usize)], Some(&mut caches_hit))
         .unwrap();
 
     assert!(

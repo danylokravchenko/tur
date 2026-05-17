@@ -572,11 +572,24 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         &mut self.model
     }
 
-    /// Perform batched prefill: encode multiple prompts and get first tokens
-    /// Returns vector of (first_token, request_id) pairs
+    /// Perform batched prefill: encode prompt tokens and return the next token.
+    ///
+    /// Each entry in `batch_tokens` is `(request_id, chunk_tokens, kv_start_pos)`:
+    /// - `chunk_tokens`: the tokens to process this call (may be a subset of the
+    ///   full prompt when chunked prefill is enabled).
+    /// - `kv_start_pos`: the position in the KV cache where `chunk_tokens` begin.
+    ///   Pass `0` for the first (or only) chunk; pass the number of tokens already
+    ///   processed for subsequent chunks.
+    ///
+    /// The prefix cache is consulted only when `kv_start_pos == 0`; intermediate
+    /// chunks skip it because their tokens cannot match a full-prompt cache entry.
+    ///
+    /// Returns `(request_id, sampled_token)` pairs.  For intermediate prefill chunks
+    /// the caller should discard the sampled token — it is the model's prediction at
+    /// the end of that chunk, not the first generated token.
     pub fn prefill_batch(
         &mut self,
-        batch_tokens: &[(Uuid, Vec<u32>)],
+        batch_tokens: &[(Uuid, Vec<u32>, usize)],
         paged_caches: Option<&mut [Vec<PagedKvCache>]>,
     ) -> Result<Vec<(Uuid, u32)>> {
         if batch_tokens.is_empty() {
@@ -595,14 +608,22 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         // logit at the correct final position.
         if let Some(caches) = paged_caches {
             let mut results = Vec::with_capacity(batch_tokens.len());
-            for ((id, tokens), req_caches) in batch_tokens.iter().zip(caches.iter_mut()) {
-                // Attempt to restore a prefix cache hit into this request's paged caches.
-                // On a hit, req_caches are pre-populated with cached_len K/V entries and
-                // only the tail tokens[cached_len..] need a forward pass.
-                let (cache_hit, cached_len) = self.try_restore_paged(tokens, req_caches)?;
+            for ((id, tokens, kv_start_pos), req_caches) in
+                batch_tokens.iter().zip(caches.iter_mut())
+            {
+                // Prefix-cache restore is only meaningful for the first chunk
+                // (kv_start_pos == 0).  Intermediate chunks arrive with KV already
+                // populated for earlier positions, so a prefix lookup would try to
+                // overwrite already-written entries with mismatched state.
+                let (cache_hit, cached_len) = if *kv_start_pos == 0 {
+                    self.try_restore_paged(tokens, req_caches)?
+                } else {
+                    (false, 0)
+                };
 
                 let process_tokens = &tokens[cached_len..];
-                let positions = [cached_len];
+                let effective_pos = kv_start_pos + cached_len;
+                let positions = [effective_pos];
                 let input = Tensor::new(process_tokens, &self.device)?.unsqueeze(0)?;
                 let logits = self.model.forward_batch(
                     &input,
@@ -610,7 +631,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
                     Some(std::slice::from_mut(req_caches)),
                 )?;
 
-                if !cache_hit && self.prefix_cache.is_some() {
+                if !cache_hit && self.prefix_cache.is_some() && *kv_start_pos == 0 {
                     self.store_paged_to_cache(tokens, req_caches)?;
                 }
 
@@ -622,6 +643,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
                 trace!(
                     request_id = ?id,
                     next_token,
+                    kv_start_pos,
                     cache_hit,
                     cached_tokens = cached_len,
                     "Batched prefill sampled token"
@@ -631,12 +653,14 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         }
 
         // No paged caches: use the shared model KV cache and a single padded batch.
+        // Chunked prefill is not supported on this path (it requires per-request
+        // paged caches to hold intermediate KV state between chunks).
         self.model.clear_kv_cache();
 
         // Find max length in batch
         let max_len = batch_tokens
             .iter()
-            .map(|(_, tokens)| tokens.len())
+            .map(|(_, tokens, _)| tokens.len())
             .max()
             .unwrap_or(0);
 
@@ -644,7 +668,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         let mut input_data = Vec::with_capacity(batch_size * max_len);
         let positions = vec![0usize; batch_size];
 
-        for (_, tokens) in batch_tokens.iter() {
+        for (_, tokens, _) in batch_tokens.iter() {
             input_data.extend_from_slice(tokens);
             input_data.extend(std::iter::repeat_n(0, max_len.saturating_sub(tokens.len())));
         }
@@ -660,7 +684,7 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         let logits = self.model.forward_batch(&input, &positions, None)?;
 
         let mut results = Vec::with_capacity(batch_size);
-        for (idx, (id, tokens)) in batch_tokens.iter().enumerate() {
+        for (idx, (id, tokens, _)) in batch_tokens.iter().enumerate() {
             let request_logits = logits
                 .narrow(0, idx, 1)?
                 .squeeze(0)?

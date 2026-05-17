@@ -42,6 +42,12 @@ pub struct BatchConfig {
     pub max_prefill_tokens: usize,
     /// Maximum total tokens in a decode batch
     pub max_decode_tokens: usize,
+    /// Split each prompt into chunks of this many tokens for prefill.
+    /// `None` sends the whole prompt in one shot (legacy behaviour).
+    /// When set, each scheduler iteration processes at most `prefill_chunk_size`
+    /// new prompt tokens per request, keeping per-iteration memory bounded and
+    /// allowing decode requests to interleave with in-progress prefills.
+    pub prefill_chunk_size: Option<usize>,
 }
 
 impl Default for BatchConfig {
@@ -51,6 +57,7 @@ impl Default for BatchConfig {
             max_decode_batch: 64,
             max_prefill_tokens: 2048,
             max_decode_tokens: 4096,
+            prefill_chunk_size: None,
         }
     }
 }
@@ -380,9 +387,19 @@ impl ContinuousBatchScheduler {
 
         for id in &candidates {
             if let Some(request) = self.batch_manager.get_request(id) {
-                let req_tokens = request.seq_len();
-                // Always include the first request even if it alone exceeds the budget;
-                // refusing a single oversized request would stall the scheduler forever.
+                // With chunked prefill, count only the tokens that will actually be
+                // processed this iteration (the upcoming chunk), not the full prompt.
+                let req_tokens = if let Some(chunk_size) = self.config.prefill_chunk_size {
+                    let remaining = request
+                        .prompt_tokens
+                        .len()
+                        .saturating_sub(request.prefill_offset);
+                    chunk_size.min(remaining).max(1)
+                } else {
+                    request.seq_len()
+                };
+                // Always include the first request even if its chunk alone exceeds the
+                // budget; refusing it would stall the scheduler forever.
                 if !selected.is_empty()
                     && total_tokens + req_tokens > self.config.max_prefill_tokens
                 {
@@ -594,13 +611,25 @@ impl ContinuousBatchScheduler {
                 prefill_batch.total_tokens
             );
 
-            // Collect tokens for each request in the batch
-            let batch_tokens: Vec<(Uuid, Vec<u32>)> = prefill_batch
+            // Collect chunk tokens for each request.
+            // With chunked prefill each entry carries only the slice
+            // [prefill_offset .. prefill_offset + chunk_size] and the KV start
+            // position so the engine writes KV entries at the correct offsets.
+            let prefill_chunk_size = self.config.prefill_chunk_size;
+            let batch_tokens: Vec<(Uuid, Vec<u32>, usize)> = prefill_batch
                 .request_ids
                 .iter()
                 .filter_map(|id| {
-                    self.get_request(id)
-                        .map(|req| (*id, req.prompt_tokens.clone()))
+                    self.get_request(id).map(|req| {
+                        let offset = req.prefill_offset;
+                        let chunk_tokens = if let Some(chunk_size) = prefill_chunk_size {
+                            let end = (offset + chunk_size).min(req.prompt_tokens.len());
+                            req.prompt_tokens[offset..end].to_vec()
+                        } else {
+                            req.prompt_tokens.clone()
+                        };
+                        (*id, chunk_tokens, offset)
+                    })
                 })
                 .collect();
 
@@ -623,14 +652,48 @@ impl ContinuousBatchScheduler {
                 self.paged_caches.insert(*id, cache);
             }
 
-            // Update request states with first generated token
+            // Update request states after a prefill chunk (or full prefill).
+            // For intermediate chunks the returned token is discarded — it is
+            // only the model's prediction at the last position of that chunk,
+            // not a token we want to emit.  Only the final chunk produces the
+            // true first generated token and triggers the Prefilling→Decoding
+            // transition.
             for (request_id, first_token) in results {
-                if let Some(request) = self.get_request_mut(&request_id) {
-                    request.generated_tokens.push(first_token);
-                    request.position = request.prompt_tokens.len();
+                let should_transition = if let Some(request) = self.get_request_mut(&request_id) {
+                    if let Some(chunk_size) = prefill_chunk_size {
+                        let offset = request.prefill_offset;
+                        let prompt_len = request.prompt_tokens.len();
+                        let chunk_end = (offset + chunk_size).min(prompt_len);
+                        request.prefill_offset = chunk_end;
+
+                        if chunk_end >= prompt_len {
+                            // Final chunk — the returned token is the first generated token.
+                            request.generated_tokens.push(first_token);
+                            request.position = prompt_len;
+                            true
+                        } else {
+                            // Intermediate chunk — stay in Prefilling for the next iteration.
+                            trace!(
+                                request_id = %request_id,
+                                prefill_offset = chunk_end,
+                                prompt_len,
+                                "Prefill chunk complete, continuing in Prefilling phase"
+                            );
+                            false
+                        }
+                    } else {
+                        // No chunking — existing single-shot behaviour.
+                        request.generated_tokens.push(first_token);
+                        request.position = request.prompt_tokens.len();
+                        true
+                    }
+                } else {
+                    false
+                };
+
+                if should_transition {
+                    self.transition_to_decode(&request_id)?;
                 }
-                // Transition to decode phase
-                self.transition_to_decode(&request_id)?;
             }
         }
 

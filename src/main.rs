@@ -158,6 +158,14 @@ struct Args {
     /// Scheduling policy: fcfs, priority, or shortest_job_first (default: fcfs)
     #[arg(long, default_value = "fcfs")]
     scheduling_policy: String,
+
+    /// Split each prompt into chunks of this many tokens during prefill.
+    /// Caps per-iteration attention memory from O(prompt²) to O(chunk²) and
+    /// allows decode requests to interleave with in-progress prefills.
+    /// Only effective when --enable-batching is set.
+    /// Omit to process the full prompt in one shot (default behaviour).
+    #[arg(long)]
+    prefill_chunk_size: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -272,6 +280,11 @@ fn main() -> Result<()> {
             .max_prefill_batch(args.max_prefill_batch)
             .max_decode_batch(args.max_decode_batch)
             .scheduling_policy(policy);
+
+        if let Some(chunk_size) = args.prefill_chunk_size {
+            info!("✓ Chunked prefill enabled (chunk_size: {chunk_size} tokens)");
+            pipeline_builder = pipeline_builder.prefill_chunk_size(chunk_size);
+        }
     }
 
     let mut pipeline = pipeline_builder.build();

@@ -48,6 +48,9 @@ pub struct RequestState {
     pub arrival_time: Instant,
     /// Priority (higher = more important)
     pub priority: u32,
+    /// Number of prompt tokens already written into the KV cache (chunked prefill cursor).
+    /// Zero when chunking is disabled or before the first prefill chunk executes.
+    pub prefill_offset: usize,
 }
 
 impl RequestState {
@@ -70,6 +73,7 @@ impl RequestState {
             arrival_time: Instant::now(),
             max_tokens,
             priority,
+            prefill_offset: 0,
         }
     }
 
