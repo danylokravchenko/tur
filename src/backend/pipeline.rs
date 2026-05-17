@@ -111,6 +111,7 @@ pub struct TextGenerationBuilder<'a, T: ModelConstructor> {
     max_decode_batch: usize,
     scheduling_policy: SchedulingPolicy,
     max_results: usize,
+    prefill_chunk_size: Option<usize>,
 }
 
 impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
@@ -133,6 +134,7 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             max_decode_batch: 16,
             scheduling_policy: SchedulingPolicy::FCFS,
             max_results: 10_000,
+            prefill_chunk_size: None,
         }
     }
 
@@ -218,6 +220,21 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
         self
     }
 
+    /// Split each prompt into chunks of `chunk_size` tokens during prefill.
+    ///
+    /// Each scheduler iteration processes at most `chunk_size` new prompt tokens
+    /// per request.  This bounds per-iteration memory (attention is O(chunk²) not
+    /// O(prompt²)) and lets decode-phase requests interleave with in-progress
+    /// prefills instead of waiting for a full long-prompt prefill to complete.
+    ///
+    /// Only effective when batching is enabled (paged KV caches are required to
+    /// hold intermediate KV state between chunks).  Setting `chunk_size` larger
+    /// than any prompt degrades gracefully to the single-shot behaviour.
+    pub fn prefill_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.prefill_chunk_size = Some(chunk_size);
+        self
+    }
+
     /// Enable guided (constrained) generation using the given parser factory.
     /// Build the factory with `guidance::build_llg_factory`.
     pub fn with_guidance_factory(mut self, factory: Arc<ParserFactory>) -> Self {
@@ -239,6 +256,7 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             max_prefill_batch = self.max_prefill_batch,
             max_decode_batch = self.max_decode_batch,
             scheduling_policy = ?self.scheduling_policy,
+            prefill_chunk_size = ?self.prefill_chunk_size,
             "Building text generation pipeline with configuration"
         );
 
@@ -318,6 +336,7 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
                 max_decode_batch: self.max_decode_batch,
                 max_prefill_tokens,
                 max_decode_tokens,
+                prefill_chunk_size: self.prefill_chunk_size,
             };
 
             let scheduler = ContinuousBatchScheduler::new(

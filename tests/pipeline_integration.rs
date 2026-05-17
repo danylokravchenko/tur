@@ -270,57 +270,97 @@ fn test_prefix_cache_with_pipeline() {
 #[test]
 fn test_continuous_batching_basic() {
     tur::shared::init_tracing();
-    // Test basic continuous batching setup and usage
     let (factory, device, _) = create_test_factory();
 
-    // Enable batching with builder
-    let mut pipeline = TextGeneration::builder(&factory, device)
-        .seed(299792458)
-        .temperature(0.8)
-        .enable_batching(true)
-        .max_batch_size(4)
-        .max_prefill_batch(2)
-        .max_decode_batch(4)
-        .build();
+    // Use greedy sampling (no .temperature() call → LogitsProcessor argmax) and
+    // the default repeat_penalty=1.0 so process_logits is a no-op.  This makes
+    // both the baseline and the chunked run fully deterministic: the generated
+    // token sequence depends only on the model weights and the KV cache state,
+    // neither of which is affected by how many tokens we process per forward pass.
+    let make_pipeline = |chunk_size: Option<usize>| {
+        let mut b = TextGeneration::builder(&factory, device.clone())
+            .seed(299792458)
+            .enable_batching(true)
+            .max_batch_size(4)
+            .max_prefill_batch(2)
+            .max_decode_batch(4);
+        if let Some(sz) = chunk_size {
+            b = b.prefill_chunk_size(sz);
+        }
+        b.build()
+    };
 
-    assert!(pipeline.is_batching_enabled(), "Batching should be enabled");
+    let prompts = ["Hello", "How are you?", "What is Rust?"];
+    let sample_len = 5;
 
-    // Submit multiple requests
-    let requests = vec![
-        GenerationRequest::new("Hello".to_string(), 5),
-        GenerationRequest::new("How are you?".to_string(), 5),
-        GenerationRequest::new("What is Rust?".to_string(), 5),
-    ];
+    let make_requests = || {
+        prompts
+            .iter()
+            .map(|p| GenerationRequest::new(p.to_string(), sample_len))
+            .collect::<Vec<_>>()
+    };
 
-    let mut handles = Vec::new();
-    for request in &requests {
-        let handle = pipeline.submit_request(request).unwrap();
-        handles.push(handle);
+    // ── Baseline: single-shot prefill ─────────────────────────────────────
+    let mut baseline = make_pipeline(None);
+    assert!(baseline.is_batching_enabled(), "Batching should be enabled");
+
+    for req in make_requests().iter() {
+        baseline.submit_request(req).unwrap();
     }
+    baseline.run_until_complete().unwrap();
 
-    // Process all requests until completion
-    pipeline.run_until_complete().unwrap();
+    // Collect baseline results keyed by prompt for later comparison.
+    let baseline_results: std::collections::HashMap<String, Vec<u32>> = baseline
+        .get_all_results()
+        .into_values()
+        .map(|r| (r.prompt.clone(), r.generated_tokens))
+        .collect();
 
-    // Retrieve results
-    for handle in &handles {
-        let result = pipeline.try_get_result(handle);
-        assert!(result.is_some(), "Result should be available");
+    for prompt in prompts {
+        let tokens = baseline_results
+            .get(prompt)
+            .unwrap_or_else(|| panic!("Baseline missing result for '{prompt}'"));
+        assert!(
+            !tokens.is_empty(),
+            "Baseline '{prompt}': expected non-empty generated tokens"
+        );
+    }
+    assert_eq!(baseline.active_request_count(), 0);
+    assert_eq!(baseline.queued_request_count(), 0);
 
-        let result = result.unwrap();
+    // ── Chunked prefill (chunk_size = 2) ──────────────────────────────────
+    // chunk_size = 2 guarantees multiple forward passes during prefill for
+    // every prompt above (each is longer than 2 tokens after tokenisation).
+    // The KV cache state at the end of prefill must be identical to the
+    // single-shot run, so the decode phase produces the exact same tokens.
+    let mut chunked = make_pipeline(Some(2));
+    assert!(chunked.is_batching_enabled());
+
+    for req in make_requests().iter() {
+        chunked.submit_request(req).unwrap();
+    }
+    chunked.run_until_complete().unwrap();
+
+    assert_eq!(chunked.active_request_count(), 0);
+    assert_eq!(chunked.queued_request_count(), 0);
+
+    for result in chunked.get_all_results().into_values() {
         assert!(
             !result.generated_text.is_empty(),
-            "Should have generated text"
+            "Chunked '{}': expected non-empty generated text",
+            result.prompt
         );
-        println!("Generated result: {:?}", result);
-        assert!(
-            !result.generated_tokens.is_empty(),
-            "Should have generated tokens"
+
+        let baseline_tokens = baseline_results
+            .get(&result.prompt)
+            .unwrap_or_else(|| panic!("Chunked: no baseline for '{}'", result.prompt));
+
+        assert_eq!(
+            result.generated_tokens, *baseline_tokens,
+            "Chunked prefill must produce identical tokens to single-shot for prompt '{}'",
+            result.prompt
         );
     }
-
-    // Verify all requests completed
-    assert_eq!(pipeline.active_request_count(), 0);
-    assert_eq!(pipeline.queued_request_count(), 0);
 }
 
 #[test]
@@ -448,27 +488,96 @@ fn test_continuous_batching_sequential_submission() {
 
 #[test]
 fn test_continuous_batching_result_management() {
-    // Test result storage and retrieval
+    tur::shared::init_tracing();
+    // Verify that result management, prefix caching, and chunked prefill
+    // work correctly together in the continuous-batching pipeline.
     let (factory, device, _) = create_test_factory();
-    let mut pipeline = TextGeneration::builder(&factory, device)
-        .seed(299792458)
-        .enable_batching(true)
-        .build();
 
-    let req = GenerationRequest::new("Test".to_string(), 3);
-    let handle = pipeline.submit_request(&req).unwrap();
+    // Shared prefix cache so we can inspect hit/miss stats across both pipeline runs.
+    let shared_cache = Arc::new(RwLock::new(PrefixCache::new(10, 512)));
 
-    pipeline.run_until_complete().unwrap();
+    // Build a pipeline with both features enabled.
+    // chunk_size=2 forces multiple forward passes during prefill for any prompt
+    // longer than 2 tokens, exercising the chunked-prefill code path.
+    let make_pipeline = || {
+        TextGeneration::builder(&factory, device.clone())
+            .seed(299792458)
+            .enable_batching(true)
+            .with_shared_prefix_cache(shared_cache.clone())
+            .prefill_chunk_size(2)
+            .build()
+    };
 
-    // Get all results
-    let all_results = pipeline.get_all_results();
-    assert_eq!(all_results.len(), 1);
-    assert!(all_results.contains_key(&handle.id));
+    let prompt = "Hello, world!";
+    let sample_len = 5;
 
-    // Clear results
-    pipeline.clear_results();
-    let all_results_after = pipeline.get_all_results();
-    assert_eq!(all_results_after.len(), 0);
+    // ── Cold run ──────────────────────────────────────────────────────────
+    // Cache is empty; the engine computes all tokens and stores the first-chunk
+    // KV state for future requests sharing this prompt prefix.
+    let mut pipeline1 = make_pipeline();
+    let handle1 = pipeline1
+        .submit_request(&GenerationRequest::new(prompt.to_string(), sample_len))
+        .unwrap();
+    pipeline1.run_until_complete().unwrap();
+
+    // Result is stored and accessible by handle.
+    let all_results1 = pipeline1.get_all_results();
+    assert_eq!(all_results1.len(), 1);
+    assert!(all_results1.contains_key(&handle1.id));
+    let cold_tokens = all_results1[&handle1.id].generated_tokens.clone();
+    assert!(
+        !cold_tokens.is_empty(),
+        "cold run must generate at least one token"
+    );
+
+    // Cold run: exactly one miss, zero hits.
+    {
+        let guard = shared_cache.read();
+        let stats = guard.stats();
+        assert_eq!(stats.misses, 1, "cold run must register a cache miss");
+        assert_eq!(stats.hits, 0, "cold run must not register any hits");
+    }
+
+    // Results must be empty after clear.
+    pipeline1.clear_results();
+    assert_eq!(pipeline1.get_all_results().len(), 0);
+
+    // ── Warm run (same prompt, shared cache) ──────────────────────────────
+    // The cache now holds the KV state from the first chunk of the cold run.
+    // Submitting the same prompt must produce a cache hit for that chunk and
+    // yield identical generated tokens (deterministic sampler, same KV state).
+    let mut pipeline2 = make_pipeline();
+    let handle2 = pipeline2
+        .submit_request(&GenerationRequest::new(prompt.to_string(), sample_len))
+        .unwrap();
+    pipeline2.run_until_complete().unwrap();
+
+    let all_results2 = pipeline2.get_all_results();
+    assert_eq!(all_results2.len(), 1);
+    assert!(all_results2.contains_key(&handle2.id));
+    let warm_tokens = all_results2[&handle2.id].generated_tokens.clone();
+    assert!(
+        !warm_tokens.is_empty(),
+        "warm run must generate at least one token"
+    );
+
+    // Prefix cache must record at least one hit on the warm run.
+    assert!(
+        shared_cache.read().stats().hits > 0,
+        "warm run with the same prompt must hit the prefix cache",
+    );
+
+    // Chunked prefill + prefix cache must reproduce the exact same generated tokens.
+    // This confirms that restoring cached KV state yields the same computation as
+    // computing from scratch via chunked prefill.
+    assert_eq!(
+        cold_tokens, warm_tokens,
+        "prefix cache + chunked prefill must reproduce identical tokens on the warm run",
+    );
+
+    // Results management API still works after the warm run.
+    pipeline2.clear_results();
+    assert_eq!(pipeline2.get_all_results().len(), 0);
 }
 
 // ── Guided generation ──────────────────────────────────────────────────────

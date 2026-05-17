@@ -9,6 +9,7 @@ A high-performance Rust inference engine for transformer models, built on [Candl
 - **Fast Inference**: Optimized CPU flash attention and GPU flash attention kernels; BF16 on Metal/CUDA, F32 on CPU
 - **Prefix Caching**: Automatic KV cache reuse for common prompt prefixes, with per-request paged cache support in batch mode
 - **Continuous Batching**: Process multiple concurrent requests together via batched prefill and decode; up to `max_batch_size` requests in flight at once
+- **Chunked Prefill**: Split long prompts into fixed-size chunks processed across scheduler iterations, bounding peak attention-matrix memory and letting decode requests interleave with in-progress prefills
 - **Paged KV Cache**: Block-based memory allocator (`BlockAllocator`) isolates KV state per request, enabling true multi-request concurrency without interference
 - **Scheduling Policies**: FCFS (default), Priority, and Shortest-Job-First to control request ordering and reduce average latency
 - **Quantization**: `Q4_K_M`, `Q5_K_M`, `Q8_0`, and other GGUF quantization formats
@@ -96,6 +97,36 @@ Batch processing amortizes the fixed cost of a forward pass across multiple requ
 - **Prefill + prefix cache**: Cached prefix tokens are skipped per-request even inside a batch — requests sharing a system prompt pay the prefill cost only for their unique suffix
 - **Decode**: All in-flight requests advance by one token per forward pass
 
+## Chunked Prefill
+
+Without chunked prefill, a request with a long prompt monopolises the GPU for the entire duration of its prefill forward pass. Every decode-phase request in the same batch stalls and waits, increasing their time-to-next-token proportionally to the long prompt's length.
+
+Chunked prefill breaks the prompt into slices of at most `chunk_size` tokens. Each scheduler iteration processes one chunk, then immediately runs the pending decode batch. Decode latency is bounded by `chunk_size` rather than the full prompt length, and peak attention-matrix memory per iteration drops from O(prompt²) to O(chunk²).
+
+### Enabling Chunked Prefill
+
+Chunked prefill is a batching-mode feature — paged KV caches are required to hold intermediate KV state between chunks.
+
+```bash
+--prefill-chunk-size=512 # process at most 512 prompt tokens per scheduler iteration
+```
+
+Setting `prefill-chunk-size` larger than any prompt in the workload degrades gracefully to single-shot prefill with no behavioural change.
+
+### Choosing a Chunk Size
+
+| Chunk size | Effect |
+| ---------- | ------ |
+| Small (≤ 64) | Very low per-iteration prefill cost; more scheduler iterations needed per prompt; best for latency-sensitive workloads with many concurrent decode requests |
+| Medium (128–512) | Balanced trade-off; recommended starting point |
+| Large (≥ 1024) | Similar to single-shot; useful mainly to cap memory spikes on extremely long prompts |
+
+### How it interacts with other features
+
+- **Prefix cache**: The first chunk (`kv_start_pos = 0`) checks the prefix cache normally. Subsequent chunks skip the cache lookup and write new KV entries at their respective offsets.
+- **Scheduling policy**: All three policies (FCFS, Priority, SJF) work unchanged; chunked prefill only affects how many tokens of each selected request are processed per iteration.
+- **Token budget**: `max_prefill_tokens` is enforced against the chunk size, not the full prompt length, so oversized prompts no longer bypass the token budget guard.
+
 ## Guided Generation
 
 Guided generation constrains the output to tokens that are valid under a grammar, guaranteeing syntactically correct structured output without relying on prompt engineering.
@@ -162,6 +193,7 @@ Available benchmark groups:
 | `prefix_cache` | Prefill with vs. without prefix cache on repeated prefixes |
 | `prefix_cache_lengths` | Cache hit speedup across varying prefix lengths |
 | `batch_prefill` | Batched prefill throughput (batch sizes 1/2/4), no-cache vs. with paged prefix cache |
+| `chunked_prefill` | Single-shot vs. chunked prefill (chunk sizes 16/32/64) for each prompt length; shows total overhead and per-chunk latency |
 
 ### Documentation
 

@@ -449,15 +449,15 @@ fn bench_batch_prefill(c: &mut Criterion) {
                         let mut total = Duration::ZERO;
                         let mut total_tokens = 0usize;
                         for _ in 0..iters {
-                            let batch: Vec<(Uuid, Vec<u32>)> = (0..batch_size)
+                            let batch: Vec<(Uuid, Vec<u32>, usize)> = (0..batch_size)
                                 .map(|i| {
                                     let (_, prompt) =
                                         PREFIX_CACHE_PROMPTS[i % PREFIX_CACHE_PROMPTS.len()];
                                     let text = format_prompt(prompt);
-                                    (Uuid::new_v4(), encode_tokens(&ts, black_box(&text)))
+                                    (Uuid::new_v4(), encode_tokens(&ts, black_box(&text)), 0)
                                 })
                                 .collect();
-                            total_tokens += batch.iter().map(|(_, t)| t.len()).sum::<usize>();
+                            total_tokens += batch.iter().map(|(_, t, _)| t.len()).sum::<usize>();
 
                             let start = Instant::now();
                             engine
@@ -494,7 +494,7 @@ fn bench_batch_prefill(c: &mut Criterion) {
                 let tokens = encode_tokens(&ts, &text);
                 let mut caches = make_paged_caches(&allocator, 1);
                 engine
-                    .prefill_batch(&[(Uuid::new_v4(), tokens)], Some(&mut caches))
+                    .prefill_batch(&[(Uuid::new_v4(), tokens, 0)], Some(&mut caches))
                     .expect("cache warmup failed");
             }
 
@@ -514,14 +514,14 @@ fn bench_batch_prefill(c: &mut Criterion) {
                         let mut total = Duration::ZERO;
                         let mut total_tokens = 0usize;
                         for _ in 0..iters {
-                            let batch: Vec<(Uuid, Vec<u32>)> = (0..batch_size)
+                            let batch: Vec<(Uuid, Vec<u32>, usize)> = (0..batch_size)
                                 .map(|i| {
                                     let (_, prompt) = PREFIX_CACHE_PROMPTS[i % PREFIX_CACHE_PROMPTS.len()];
                                     let text = format_prompt(prompt);
-                                    (Uuid::new_v4(), encode_tokens(&ts, black_box(&text)))
+                                    (Uuid::new_v4(), encode_tokens(&ts, black_box(&text)), 0)
                                 })
                                 .collect();
-                            total_tokens += batch.iter().map(|(_, t)| t.len()).sum::<usize>();
+                            total_tokens += batch.iter().map(|(_, t, _)| t.len()).sum::<usize>();
 
                             let mut paged = make_paged_caches(&allocator, batch_size);
                             let start = Instant::now();
@@ -552,6 +552,124 @@ fn bench_batch_prefill(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark chunked prefill against single-shot prefill.
+///
+/// For each prompt, this benchmark measures:
+/// - `single_shot`: one `prefill_batch` call with all prompt tokens at once.
+/// - `chunk_N`: N tokens per forward pass, multiple calls to complete the prompt.
+///
+/// The meaningful comparison is **total time to finish the full prefill**.
+/// Chunking adds a small dispatch overhead (O(prompt_len/chunk_size) extra
+/// calls) but caps the per-iteration attention matrix at O(chunk²) instead of
+/// O(prompt²), which reduces peak memory and lets decode requests interleave.
+///
+/// Expect total chunked time to be within ~5–15 % of single-shot; if it is,
+/// chunked prefill is a safe trade-off for the batching workload.
+fn bench_chunked_prefill(c: &mut Criterion) {
+    let mut group = c.benchmark_group("chunked_prefill");
+    configure_group(&mut group, 10, 40, 3);
+
+    // Chunk sizes to compare.  Values smaller than the prompt force real chunking;
+    // a value larger than any prompt is equivalent to single-shot and acts as a
+    // sanity check that overhead is negligible at large chunk sizes.
+    const CHUNK_SIZES: [usize; 3] = [16, 32, 64];
+
+    for (prompt_name, prompt_body) in BENCHMARK_PROMPTS {
+        let factory = create_benchmark_factory();
+        let (mut engine, tokenizer) = InferenceEngine::builder(&factory, factory.device().clone())
+            .seed(BENCHMARK_SEED)
+            .temperature(TEMPERATURE)
+            .repeat_penalty(REPEAT_PENALTY)
+            .repeat_last_n(REPEAT_LAST_N)
+            .build()
+            .expect("failed to build engine");
+        let ts = TokenOutputStream::new(tokenizer);
+        let allocator = Arc::new(RwLock::new(BlockAllocator::new(4096, 16)));
+
+        let prompt = format_prompt(prompt_body);
+        let tokens = encode_tokens(&ts, &prompt);
+        let prompt_len = tokens.len();
+
+        // Warmup: one full run so model internals reach steady state.
+        {
+            let mut caches = make_paged_caches(&allocator, 1);
+            engine
+                .prefill_batch(&[(Uuid::new_v4(), tokens.clone(), 0)], Some(&mut caches))
+                .expect("warmup failed");
+        }
+
+        group.throughput(Throughput::Elements(prompt_len as u64));
+
+        // ── Single-shot baseline ─────────────────────────────────────────────
+        group.bench_with_input(
+            BenchmarkId::new(prompt_name, "single_shot"),
+            &tokens,
+            |b, tokens| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let mut caches = make_paged_caches(&allocator, 1);
+                        let start = Instant::now();
+                        engine
+                            .prefill_batch(
+                                &[(Uuid::new_v4(), tokens.clone(), 0)],
+                                Some(&mut caches),
+                            )
+                            .expect("single-shot prefill failed");
+                        total += start.elapsed();
+                        // caches drop here, freeing paged blocks back to allocator
+                    }
+                    total
+                });
+            },
+        );
+
+        // ── Chunked variants ─────────────────────────────────────────────────
+        for &chunk_size in &CHUNK_SIZES {
+            let n_chunks = prompt_len.div_ceil(chunk_size);
+            let label = format!("chunk_{chunk_size}");
+
+            group.bench_with_input(
+                BenchmarkId::new(prompt_name, &label),
+                tokens.as_slice(),
+                |b, tokens| {
+                    b.iter_custom(|iters| {
+                        let mut total = Duration::ZERO;
+                        for _ in 0..iters {
+                            let id = Uuid::new_v4();
+                            let mut caches = make_paged_caches(&allocator, 1);
+                            let start = Instant::now();
+                            let mut offset = 0;
+                            while offset < tokens.len() {
+                                let end = (offset + chunk_size).min(tokens.len());
+                                let chunk = tokens[offset..end].to_vec();
+                                engine
+                                    .prefill_batch(&[(id, chunk, offset)], Some(&mut caches))
+                                    .expect("chunk prefill failed");
+                                offset = end;
+                            }
+                            total += start.elapsed();
+                        }
+
+                        // Print overhead summary on last call to help read results.
+                        if iters > 0 && total.as_secs_f64() > 0.0 {
+                            println!(
+                                "\n{prompt_name} chunk_{chunk_size}: \
+                                 {n_chunks} chunks × {chunk_size} tok, \
+                                 {:.2} ms/iter",
+                                total.as_secs_f64() * 1000.0 / iters as f64,
+                            );
+                        }
+                        total
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_prefill,
@@ -560,5 +678,6 @@ criterion_group!(
     bench_prefix_cache,
     bench_prefix_cache_lengths,
     bench_batch_prefill,
+    bench_chunked_prefill,
 );
 criterion_main!(benches);
