@@ -101,7 +101,7 @@ fn build_engine_inner(
     if let Some(c) = cache {
         builder = builder.with_shared_prefix_cache(c);
     }
-    let (engine, tokenizer) = builder.build().expect("failed to build engine");
+    let (engine, tokenizer, _) = builder.build().expect("failed to build engine");
     (engine, TokenOutputStream::new(tokenizer))
 }
 
@@ -244,7 +244,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
                         let start = Instant::now();
 
                         let factory = create_benchmark_factory();
-                        let (mut engine, tokenizer) =
+                        let (mut engine, tokenizer, _) =
                             InferenceEngine::builder(&factory, factory.device().clone())
                                 .seed(BENCHMARK_SEED)
                                 .temperature(TEMPERATURE)
@@ -576,7 +576,7 @@ fn bench_chunked_prefill(c: &mut Criterion) {
 
     for (prompt_name, prompt_body) in BENCHMARK_PROMPTS {
         let factory = create_benchmark_factory();
-        let (mut engine, tokenizer) = InferenceEngine::builder(&factory, factory.device().clone())
+        let (mut engine, tokenizer, _) = InferenceEngine::builder(&factory, factory.device().clone())
             .seed(BENCHMARK_SEED)
             .temperature(TEMPERATURE)
             .repeat_penalty(REPEAT_PENALTY)

@@ -2,6 +2,7 @@ use candle_core::{DType, Device};
 use tokenizers::Tokenizer;
 use tracing::{debug, trace};
 
+use crate::backend::chat_template::ChatTemplate;
 use crate::models::ModelImpl;
 use crate::weights::{Downloader, VarBuilderX};
 use crate::{ProgressReporter, Result};
@@ -47,6 +48,19 @@ pub trait ModelConstructor: ModelImpl + Sized {
 }
 
 impl<T: ModelConstructor> ModelFactory<T> {
+    fn load_chat_template_from_paths(
+        paths: &crate::weights::ModelPaths,
+    ) -> Option<ChatTemplate> {
+        let config_path = paths.tokenizer_config_filename()?;
+        match ChatTemplate::from_tokenizer_config(config_path) {
+            Ok(ct) => Some(ct),
+            Err(e) => {
+                tracing::warn!("Could not load chat template from tokenizer_config.json: {e}");
+                None
+            }
+        }
+    }
+
     /// Creates a new `ModelFactory`.
     ///
     /// # Arguments
@@ -82,8 +96,16 @@ impl<T: ModelConstructor> ModelFactory<T> {
         &self.device
     }
 
-    /// Creates and loads a model with its tokenizer.
-    pub fn create_model(&self, progress: Option<&ProgressReporter>) -> Result<(T, Tokenizer)> {
+    /// Creates and loads a model with its tokenizer and chat template.
+    ///
+    /// The chat template is loaded from `tokenizer_config.json` in the same
+    /// weight-preparation pass, so `prepare_weights` is called only once.
+    /// Returns `None` for the template when the file is absent or has no
+    /// `chat_template` field.
+    pub fn create_model(
+        &self,
+        progress: Option<&ProgressReporter>,
+    ) -> Result<(T, Tokenizer, Option<ChatTemplate>)> {
         debug!(
             device = ?self.device,
             dtype = ?self.dtype,
@@ -95,6 +117,7 @@ impl<T: ModelConstructor> ModelFactory<T> {
         let tokenizer = self.load_tokenizer(&paths)?;
         let vb = self.create_var_builder(&paths, gguf)?;
         let model = self.instantiate_model(&config, vb, progress)?;
+        let chat_template = Self::load_chat_template_from_paths(&paths);
 
         if gguf {
             debug!("Loaded quantized model (GGUF format)");
@@ -102,7 +125,7 @@ impl<T: ModelConstructor> ModelFactory<T> {
             debug!("Loaded full-precision model");
         }
         debug!("Model creation completed successfully");
-        Ok((model, tokenizer))
+        Ok((model, tokenizer, chat_template))
     }
 
     /// Prepares and downloads model weights.

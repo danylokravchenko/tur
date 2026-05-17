@@ -22,7 +22,7 @@ fn build_guidance_factory(
     factory: &tur::ModelFactory<tur::models::Qwen35ModelForCausalLM>,
     device: Device,
 ) -> Arc<tur::backend::guidance::ParserFactory> {
-    let (_, tokenizer) = InferenceEngine::builder(factory, device)
+    let (_, tokenizer, _) = InferenceEngine::builder(factory, device)
         .build()
         .expect("Failed to build engine to extract tokenizer");
     tur::backend::guidance::build_llg_factory(tokenizer, None)
@@ -123,7 +123,7 @@ fn test_prefix_cache_full_hit() {
     let cache = Arc::new(RwLock::new(PrefixCache::new(10, 100)));
 
     // Build engine with cache
-    let (mut engine, tokenizer) = InferenceEngine::builder(&factory, device)
+    let (mut engine, tokenizer, _) = InferenceEngine::builder(&factory, device)
         .seed(299792458)
         .temperature(0.8)
         .with_shared_prefix_cache(cache.clone())
@@ -184,7 +184,7 @@ fn test_prefix_cache_partial_hit() {
     let (factory, device, _) = create_test_factory();
 
     let cache = Arc::new(RwLock::new(PrefixCache::new(10, 100)));
-    let (mut engine, tokenizer) = InferenceEngine::builder(&factory, device)
+    let (mut engine, tokenizer, _) = InferenceEngine::builder(&factory, device)
         .seed(299792458)
         .with_shared_prefix_cache(cache.clone())
         .build()

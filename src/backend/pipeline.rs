@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::{
     ProgressReporter, Result, TurError,
     backend::{
+        chat_template::{ChatTemplate, Message},
         engine::InferenceEngine,
         factory::{ModelConstructor, ModelFactory},
         guidance::{ParserFactory, TopLevelGrammar},
@@ -123,6 +124,10 @@ pub struct TextGeneration<T: ModelConstructor> {
     /// Insertion-order tracking for bounded eviction of `results`.
     result_order: VecDeque<Uuid>,
     max_results: usize,
+    /// Jinja2 chat template loaded from the model's `tokenizer_config.json`.
+    /// When present, `format_prompt` and `format_prompt_with_tools` use it
+    /// instead of the hardcoded static fallback on `ModelImpl`.
+    chat_template: Option<ChatTemplate>,
 }
 
 /// Builder for TextGeneration
@@ -315,7 +320,7 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             engine_builder = engine_builder.with_guidance_factory(guidance_factory);
         }
 
-        let (batching, engine, tokenizer) = if self.enable_batching {
+        let (batching, engine, tokenizer, chat_template) = if self.enable_batching {
             let block_size = 64;
             let num_heads = 32;
             let head_dim = 128;
@@ -328,7 +333,8 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             let block_allocator =
                 Arc::new(RwLock::new(BlockAllocator::new(total_blocks, block_size)));
 
-            let (engine, tokenizer) = engine_builder.build().expect("Failed to build engine");
+            let (engine, tokenizer, chat_template) =
+                engine_builder.build().expect("Failed to build engine");
             let tokenizer_arc = Arc::new(tokenizer.clone());
 
             // Derive num_layers and EOS tokens from the just-built model/tokenizer so
@@ -386,11 +392,12 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
                 scheduler,
                 tokenizer: tokenizer_arc,
             });
-            (batching, engine, tokenizer)
+            (batching, engine, tokenizer, chat_template)
         } else {
             debug!("Batching disabled, using single-request mode");
-            let (engine, tokenizer) = engine_builder.build().expect("Failed to build engine");
-            (None, engine, tokenizer)
+            let (engine, tokenizer, chat_template) =
+                engine_builder.build().expect("Failed to build engine");
+            (None, engine, tokenizer, chat_template)
         };
 
         debug!("Text generation pipeline built successfully");
@@ -404,6 +411,7 @@ impl<'a, T: ModelConstructor> TextGenerationBuilder<'a, T> {
             results: Arc::new(RwLock::new(HashMap::new())),
             result_order: VecDeque::new(),
             max_results: self.max_results,
+            chat_template,
         }
     }
 }
@@ -604,20 +612,48 @@ impl<T: ModelConstructor> TextGeneration<T> {
         })
     }
 
+    /// Format a raw user message using the loaded Jinja2 chat template when
+    /// available, or the model's static `format_prompt` implementation otherwise.
     pub fn format_prompt(&self, prompt: &str, thinking: bool) -> String {
-        T::format_prompt(prompt, thinking)
+        self.chat_template
+            .as_ref()
+            .and_then(|ct| {
+                ct.format(&[Message::user(prompt)], None, true, thinking)
+                    .map_err(|e| {
+                        tracing::warn!(
+                            "Chat template render error in format_prompt: {e}; \
+                             falling back to static format"
+                        );
+                        e
+                    })
+                    .ok()
+            })
+            .unwrap_or_else(|| T::format_prompt(prompt, thinking))
     }
 
-    /// Format a raw user message with tool definitions injected as a system
-    /// message, using the model's tool-calling template.  Useful for
-    /// inspecting the formatted prompt before submitting a request.
+    /// Format a raw user message with tool definitions using the loaded Jinja2
+    /// chat template when available, or the static `format_prompt_with_tools`
+    /// otherwise.  Useful for inspecting the prompt before submitting a request.
     pub fn format_prompt_with_tools(
         &self,
         prompt: &str,
         tools: &[ToolDefinition],
         thinking: bool,
     ) -> String {
-        T::format_prompt_with_tools(prompt, tools, thinking)
+        self.chat_template
+            .as_ref()
+            .and_then(|ct| {
+                ct.format(&[Message::user(prompt)], Some(tools), true, thinking)
+                    .map_err(|e| {
+                        tracing::warn!(
+                            "Chat template render error in format_prompt_with_tools: {e}; \
+                             falling back to static format"
+                        );
+                        e
+                    })
+                    .ok()
+            })
+            .unwrap_or_else(|| T::format_prompt_with_tools(prompt, tools, thinking))
     }
 
     /// Submit a new generation request (batching mode only)

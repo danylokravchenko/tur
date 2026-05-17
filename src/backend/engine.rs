@@ -127,7 +127,10 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
         self
     }
 
-    pub fn build(self) -> Result<(InferenceEngine<T>, Tokenizer)> {
+    pub fn build(
+        self,
+    ) -> Result<(InferenceEngine<T>, Tokenizer, Option<crate::backend::chat_template::ChatTemplate>)>
+    {
         // Log engine configuration
         debug!(
             seed = self.seed,
@@ -140,8 +143,10 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
             "Building inference engine with configuration"
         );
 
-        // Create model using factory
-        let (model, tokenizer) = self.factory.create_model(self.progress.as_ref())?;
+        // Create model using factory — weights are prepared once; chat template
+        // piggybacks on the same ModelPaths so there is no second HF download.
+        let (model, tokenizer, chat_template) =
+            self.factory.create_model(self.progress.as_ref())?;
 
         let sampler: Box<dyn LogitsSampler> = if let Some(sampler) = self.sampler {
             sampler
@@ -168,7 +173,7 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
             guidance,
             eos_tokens,
         };
-        Ok((engine, tokenizer))
+        Ok((engine, tokenizer, chat_template))
     }
 }
 

@@ -1,4 +1,5 @@
 pub mod batch_manager;
+pub mod chat_template;
 pub mod engine;
 pub mod factory;
 pub mod guidance;
