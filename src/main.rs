@@ -3,7 +3,7 @@ use clap::Parser;
 use tracing::{debug, info};
 use tur::backend::pipeline::GenerationRequest;
 use tur::backend::tools::ToolDefinition;
-use tur::{ProgressReporter, Result, TextGeneration, TurError};
+use tur::{InferencePipeline, ProgressReporter, Result, TurError};
 
 const DEFAULT_PROMPT: &str = "Who are you?";
 
@@ -227,19 +227,14 @@ fn main() -> Result<()> {
     let progress = ProgressReporter::new();
 
     // Use ModelFactory to create the model and tokenizer
-    let factory = tur::ModelFactory::<tur::models::Qwen35ModelForCausalLM>::new(
-        source,
-        args.quantization,
-        device.clone(),
-        dtype,
-    );
+    let factory = tur::AutoModelFactory::new(source, args.quantization, device.clone(), dtype);
 
     // Build inference engine with all parameters.
     // on_token streams each decoded token; here we route it through ProgressReporter so
     // text is printed above the progress bar. Replace this closure to send tokens
     // elsewhere (e.g. an HTTP stream, a channel, a file).
     let progress_for_tokens = progress.clone();
-    let mut pipeline_builder = TextGeneration::builder(&factory, device.clone())
+    let mut pipeline_builder = InferencePipeline::builder(&factory, device.clone())
         .progress(progress.clone())
         .on_token(move |t| progress_for_tokens.print(t))
         .seed(args.seed)

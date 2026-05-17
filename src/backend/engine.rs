@@ -15,7 +15,7 @@ use crate::{
         tokenizer::{LogitsSampler, TokenOutputStream},
     },
     models::{
-        ModelImpl,
+        ModelImpl, ModelInput,
         kv_cache::{KvCacheImpl, PagedKvCache},
     },
 };
@@ -501,6 +501,36 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         );
 
         Ok((next_token, start.elapsed(), cache_hit, cached_len))
+    }
+
+    /// Prefill with audio embeddings merged alongside token IDs.
+    ///
+    /// Builds a [`ModelInput::Mixed`] and calls [`ModelImpl::forward_modal`].
+    /// Models that only support text will return an error from `forward_modal`.
+    /// Prefix caching is skipped on this path (audio inputs are not yet cacheable).
+    ///
+    /// Returns `(first_token, duration, cache_hit=false, cached_tokens=0)`.
+    pub fn prefill_with_audio(
+        &mut self,
+        tokens: &[u32],
+        audio_embeds: Vec<Tensor>,
+    ) -> Result<(u32, std::time::Duration, bool, usize)> {
+        let start = std::time::Instant::now();
+        let token_tensor = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
+        trace!(
+            token_count = tokens.len(),
+            audio_chunks = audio_embeds.len(),
+            "Running modal prefill forward pass",
+        );
+        let logits = self.model.forward_modal(ModelInput::Mixed {
+            token_ids: token_tensor,
+            audio_embeds,
+            offset: 0,
+        })?;
+        let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+        let next_token = self.sample_guided(logits, tokens)?;
+        trace!(next_token, "Modal prefill sampled first token");
+        Ok((next_token, start.elapsed(), false, 0))
     }
 
     /// Perform single decode step with KV cache reuse

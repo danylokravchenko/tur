@@ -4,8 +4,9 @@ pub mod shared;
 pub mod weights;
 
 pub use backend::{
-    factory::{ModelFactory, ModelSource},
-    pipeline::TextGeneration,
+    audio_encoder::AudioEncoder,
+    factory::{AnyModel, AutoModelFactory, ModelFactory, ModelKind, ModelSource},
+    pipeline::{ModalInput, InferencePipeline},
     progress::ProgressReporter,
 };
 pub use shared::{Result, TurError};

@@ -955,12 +955,13 @@ impl super::ModelImpl for ModelForCausalLM {
     }
 
     #[inline]
-    fn format_prompt(prompt: &str, thinking: bool) -> String {
+    fn format_prompt(&self, prompt: &str, thinking: bool) -> String {
         let think_tag = if thinking { " /think" } else { " /no_think" };
         format!("<|im_start|>user\n{prompt}{think_tag}<|im_end|>\n<|im_start|>assistant\n")
     }
 
     fn format_prompt_with_tools(
+        &self,
         prompt: &str,
         tools: &[crate::backend::tools::ToolDefinition],
         thinking: bool,
