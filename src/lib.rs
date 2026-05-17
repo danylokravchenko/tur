@@ -6,7 +6,7 @@ pub mod weights;
 pub use backend::{
     audio_encoder::AudioEncoder,
     factory::{AnyModel, AutoModelFactory, ModelFactory, ModelKind, ModelSource},
-    pipeline::{ModalInput, TurPipeline},
+    pipeline::{ModalInput, InferencePipeline},
     progress::ProgressReporter,
 };
 pub use shared::{Result, TurError};

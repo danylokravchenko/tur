@@ -139,7 +139,7 @@ struct BatchingComponents {
 pub type OnTokenFn = Box<dyn FnMut(&str)>;
 
 /// High-level generation pipeline with output handling, continuous batching, and multimodal support.
-pub struct TurPipeline<T: ModelConstructor> {
+pub struct InferencePipeline<T: ModelConstructor> {
     engine: InferenceEngine<T>,
     tokenizer: TokenOutputStream,
     progress: Option<ProgressReporter>,
@@ -158,8 +158,8 @@ pub struct TurPipeline<T: ModelConstructor> {
     audio_encoder: Option<Box<dyn AudioEncoder>>,
 }
 
-/// Builder for [`TurPipeline`].
-pub struct TurPipelineBuilder<'a, T: ModelConstructor> {
+/// Builder for [`InferencePipeline`].
+pub struct InferencePipelineBuilder<'a, T: ModelConstructor> {
     factory: &'a ModelFactory<T>,
     device: Device,
     seed: u64,
@@ -182,7 +182,7 @@ pub struct TurPipelineBuilder<'a, T: ModelConstructor> {
     prefill_chunk_size: Option<usize>,
 }
 
-impl<'a, T: ModelConstructor> TurPipelineBuilder<'a, T> {
+impl<'a, T: ModelConstructor> InferencePipelineBuilder<'a, T> {
     pub fn new(factory: &'a ModelFactory<T>, device: Device) -> Self {
         Self {
             factory,
@@ -319,7 +319,7 @@ impl<'a, T: ModelConstructor> TurPipelineBuilder<'a, T> {
         self
     }
 
-    pub fn build(self) -> TurPipeline<T> {
+    pub fn build(self) -> InferencePipeline<T> {
         debug!(
             seed = self.seed,
             temp = ?self.temp,
@@ -440,7 +440,7 @@ impl<'a, T: ModelConstructor> TurPipelineBuilder<'a, T> {
 
         debug!("Text generation pipeline built successfully");
 
-        TurPipeline {
+        InferencePipeline {
             engine,
             tokenizer: TokenOutputStream::new(tokenizer),
             progress: self.progress,
@@ -455,10 +455,13 @@ impl<'a, T: ModelConstructor> TurPipelineBuilder<'a, T> {
     }
 }
 
-impl<T: ModelConstructor> TurPipeline<T> {
-    /// Create a builder for [`TurPipeline`] from factory.
-    pub fn builder(factory: &'_ ModelFactory<T>, device: Device) -> TurPipelineBuilder<'_, T> {
-        TurPipelineBuilder::new(factory, device)
+impl<T: ModelConstructor> InferencePipeline<T> {
+    /// Create a builder for [`InferencePipeline`] from factory.
+    pub fn builder(
+        factory: &'_ ModelFactory<T>,
+        device: Device,
+    ) -> InferencePipelineBuilder<'_, T> {
+        InferencePipelineBuilder::new(factory, device)
     }
 
     /// Access the underlying inference engine
@@ -655,10 +658,7 @@ impl<T: ModelConstructor> TurPipeline<T> {
     /// Encode all [`ModalInput::Audio`] entries in `inputs` using the pipeline's
     /// audio encoder.  Returns an empty `Vec` when no encoder is configured or
     /// when there are no audio inputs, leaving the normal text-only path intact.
-    fn encode_audio_inputs(
-        &self,
-        inputs: &[ModalInput],
-    ) -> Result<Vec<candle_core::Tensor>> {
+    fn encode_audio_inputs(&self, inputs: &[ModalInput]) -> Result<Vec<candle_core::Tensor>> {
         let Some(enc) = &self.audio_encoder else {
             return Ok(Vec::new());
         };
@@ -712,7 +712,11 @@ impl<T: ModelConstructor> TurPipeline<T> {
                     })
                     .ok()
             })
-            .unwrap_or_else(|| self.engine.model().format_prompt_with_tools(prompt, tools, thinking))
+            .unwrap_or_else(|| {
+                self.engine
+                    .model()
+                    .format_prompt_with_tools(prompt, tools, thinking)
+            })
     }
 
     /// Submit a new generation request (batching mode only).

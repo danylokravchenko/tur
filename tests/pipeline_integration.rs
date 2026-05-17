@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use tur::ProgressReporter;
 use tur::backend::InferenceEngine;
 use tur::backend::guidance::TopLevelGrammar;
-use tur::backend::pipeline::{GenerationRequest, TurPipeline};
+use tur::backend::pipeline::{GenerationRequest, InferencePipeline};
 use tur::backend::prefix_cache::PrefixCache;
 use tur::backend::tokenizer::TokenOutputStream;
 use tur::backend::tools::ToolDefinition;
@@ -33,7 +33,7 @@ fn build_guidance_factory(
 fn test_pipeline_end_to_end_generation() {
     let (factory, device, _) = create_test_factory();
 
-    let mut pipeline = TurPipeline::builder(&factory, device.clone())
+    let mut pipeline = InferencePipeline::builder(&factory, device.clone())
         .seed(299792458)
         .temperature(0.8)
         .top_p(0.9)
@@ -55,7 +55,7 @@ fn test_pipeline_end_to_end_generation() {
 
     // Test with progress reporter
     let progress = ProgressReporter::new();
-    let mut pipeline_with_progress = TurPipeline::builder(&factory, device)
+    let mut pipeline_with_progress = InferencePipeline::builder(&factory, device)
         .seed(299792458)
         .temperature(0.8)
         .top_p(0.9)
@@ -94,7 +94,7 @@ fn test_pipeline_parameter_variations() {
     let (factory, device, _) = create_test_factory();
 
     for (temp, top_p, penalty, desc) in test_cases {
-        let mut builder = TurPipeline::builder(&factory, device.clone())
+        let mut builder = InferencePipeline::builder(&factory, device.clone())
             .seed(299792458)
             .repeat_penalty(penalty)
             .repeat_last_n(64);
@@ -242,7 +242,7 @@ fn test_prefix_cache_with_pipeline() {
     let (factory, device, _) = create_test_factory();
 
     let cache = Arc::new(RwLock::new(PrefixCache::new(10, 100)));
-    let mut pipeline = TurPipeline::builder(&factory, device)
+    let mut pipeline = InferencePipeline::builder(&factory, device)
         .seed(299792458)
         .temperature(0.8)
         .with_shared_prefix_cache(cache.clone())
@@ -284,7 +284,7 @@ fn test_continuous_batching_basic() {
     // token sequence depends only on the model weights and the KV cache state,
     // neither of which is affected by how many tokens we process per forward pass.
     let make_pipeline = |chunk_size: Option<usize>| {
-        let mut b = TurPipeline::builder(&factory, device.clone())
+        let mut b = InferencePipeline::builder(&factory, device.clone())
             .seed(299792458)
             .enable_batching(true)
             .max_batch_size(4)
@@ -373,7 +373,7 @@ fn test_continuous_batching_basic() {
 fn test_continuous_batching_step_by_step() {
     // Test manual step-by-step execution for fine-grained control
     let (factory, device, _) = create_test_factory();
-    let mut pipeline = TurPipeline::builder(&factory, device)
+    let mut pipeline = InferencePipeline::builder(&factory, device)
         .seed(299792458)
         .enable_batching(true)
         .max_batch_size(2)
@@ -415,7 +415,7 @@ fn test_continuous_batching_step_by_step() {
 fn test_continuous_batching_blocking_get() {
     // Test blocking result retrieval
     let (factory, device, _) = create_test_factory();
-    let mut pipeline = TurPipeline::builder(&factory, device)
+    let mut pipeline = InferencePipeline::builder(&factory, device)
         .seed(299792458)
         .enable_batching(true)
         .build();
@@ -435,7 +435,7 @@ fn test_continuous_batching_blocking_get() {
 fn test_continuous_batching_mixed_lengths() {
     // Test handling requests with different generation lengths
     let (factory, device, _) = create_test_factory();
-    let mut pipeline = TurPipeline::builder(&factory, device)
+    let mut pipeline = InferencePipeline::builder(&factory, device)
         .seed(299792458)
         .enable_batching(true)
         .max_batch_size(3)
@@ -463,7 +463,7 @@ fn test_continuous_batching_mixed_lengths() {
 fn test_continuous_batching_sequential_submission() {
     // Test submitting requests while others are processing
     let (factory, device, _) = create_test_factory();
-    let mut pipeline = TurPipeline::builder(&factory, device)
+    let mut pipeline = InferencePipeline::builder(&factory, device)
         .seed(299792458)
         .enable_batching(true)
         .build();
@@ -506,7 +506,7 @@ fn test_continuous_batching_result_management() {
     // chunk_size=2 forces multiple forward passes during prefill for any prompt
     // longer than 2 tokens, exercising the chunked-prefill code path.
     let make_pipeline = || {
-        TurPipeline::builder(&factory, device.clone())
+        InferencePipeline::builder(&factory, device.clone())
             .seed(299792458)
             .enable_batching(true)
             .with_shared_prefix_cache(shared_cache.clone())
@@ -594,7 +594,7 @@ fn test_continuous_batching_result_management() {
 fn test_guided_no_factory_returns_error() {
     let (factory, device, _) = create_test_factory();
 
-    let mut pipeline = TurPipeline::builder(&factory, device)
+    let mut pipeline = InferencePipeline::builder(&factory, device)
         .seed(299792458)
         .build();
 
@@ -620,7 +620,7 @@ fn test_guided_regex_output_is_only_digits() {
     let output = Arc::new(Mutex::new(String::new()));
     let output_clone = output.clone();
 
-    let mut pipeline = TurPipeline::builder(&factory, device)
+    let mut pipeline = InferencePipeline::builder(&factory, device)
         .seed(299792458)
         .with_guidance_factory(guidance_factory)
         .on_token(move |s| output_clone.lock().unwrap().push_str(s))
@@ -654,7 +654,7 @@ fn test_guided_json_schema_output_is_valid_json() {
     let output = Arc::new(Mutex::new(String::new()));
     let output_clone = output.clone();
 
-    let mut pipeline = TurPipeline::builder(&factory, device)
+    let mut pipeline = InferencePipeline::builder(&factory, device)
         .seed(299792458)
         .with_guidance_factory(guidance_factory)
         .on_token(move |s| output_clone.lock().unwrap().push_str(s))
@@ -719,7 +719,7 @@ fn weather_tool() -> ToolDefinition {
 #[test]
 fn test_tools_format_prompt_contains_schema() {
     let (factory, device, _) = create_test_factory();
-    let pipeline = TurPipeline::builder(&factory, device).build();
+    let pipeline = InferencePipeline::builder(&factory, device).build();
 
     let formatted = pipeline.format_prompt_with_tools(
         "What is the weather in Paris?",
@@ -760,7 +760,7 @@ fn test_tools_model_emits_and_pipeline_parses_tool_call() {
     let output_clone = output.clone();
 
     // Greedy sampling (no temperature) for deterministic output.
-    let mut pipeline = TurPipeline::builder(&factory, device)
+    let mut pipeline = InferencePipeline::builder(&factory, device)
         .seed(299792458)
         .on_token(move |s| output_clone.lock().unwrap().push_str(s))
         .build();
@@ -816,7 +816,7 @@ fn test_guided_grammar_deactivates_between_requests() {
     let (factory, device, _) = create_test_factory();
     let guidance_factory = build_guidance_factory(&factory, device.clone());
 
-    let mut pipeline = TurPipeline::builder(&factory, device)
+    let mut pipeline = InferencePipeline::builder(&factory, device)
         .seed(299792458)
         .temperature(0.1)
         .with_guidance_factory(guidance_factory)
