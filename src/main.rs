@@ -78,7 +78,7 @@ fn print_bunner() {
 }
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Qwen 3.5 Model - Clean Implementation", long_about = None)]
+#[command(author, version, about = "Tur - a strong inference engine", long_about = None)]
 struct Args {
     /// Simplified model ID (e.g., "Qwen3-0.6B" or full "Qwen/Qwen3-0.6B").
     /// Config and tokenizer are always downloaded from the main repo.
@@ -183,7 +183,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     print_bunner();
 
-    info!("Qwen 3.5 Model - Clean Implementation");
+    info!("Tur - a strong inference engine");
 
     let device = Device::new_metal(0)?;
 
