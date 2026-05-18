@@ -13,23 +13,6 @@ use candle_flash_attn;
 #[cfg(not(feature = "flash-attn"))]
 use crate::models::attention::{AttnMask, flash_attn};
 
-fn deserialize_eos_ids<'de, D>(d: D) -> std::result::Result<Vec<u32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany {
-        One(u32),
-        Many(Vec<u32>),
-    }
-    Ok(match OneOrMany::deserialize(d)? {
-        OneOrMany::One(n) => vec![n],
-        OneOrMany::Many(v) => v,
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Config {
     pub vocab_size: usize,
@@ -37,30 +20,40 @@ pub struct Config {
     pub intermediate_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
-    pub head_dim: usize,
-    pub attention_bias: bool,
     pub num_key_value_heads: usize,
     pub max_position_embeddings: usize,
-    pub sliding_window: Option<usize>,
-    pub max_window_layers: usize,
     pub tie_word_embeddings: bool,
     pub rope_theta: f64,
     pub rms_norm_eps: f64,
-    pub use_sliding_window: bool,
     pub hidden_act: Activation,
-    #[serde(default, deserialize_with = "deserialize_eos_ids")]
-    pub eos_token_id: Vec<u32>,
+    pub attention_bias: bool,
+    pub mlp_bias: bool,
+    /// Multiplier applied to attention scores (replaces 1/sqrt(head_dim)).
+    pub attention_multiplier: f64,
+    /// Multiplier applied to token embeddings after lookup.
+    pub embedding_multiplier: f64,
+    /// Scale applied to logits before returning from the LM head.
+    pub logits_scaling: f64,
+    /// Scale applied to residual additions: x + residual_multiplier * h.
+    pub residual_multiplier: f64,
+    pub eos_token_id: u32,
+}
+
+impl Config {
+    pub fn head_dim(&self) -> usize {
+        self.hidden_size / self.num_attention_heads
+    }
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Qwen3RotaryEmbedding {
+pub(crate) struct GraniteRotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
 }
 
-impl Qwen3RotaryEmbedding {
+impl GraniteRotaryEmbedding {
     pub(crate) fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
-        let dim = cfg.head_dim;
+        let dim = cfg.head_dim();
         let max_seq_len = cfg.max_position_embeddings;
         let inv_freq: Vec<_> = (0..dim)
             .step_by(2)
@@ -89,7 +82,6 @@ impl Qwen3RotaryEmbedding {
     }
 
     /// Apply RoPE with variable positions per batch element (q, k shape: B x H x L x D)
-    /// positions[i] is the starting position for batch element i
     pub(crate) fn apply_batch(
         &self,
         q: &Tensor,
@@ -106,13 +98,12 @@ impl Qwen3RotaryEmbedding {
             );
         }
 
-        // For each batch element, apply RoPE with its specific position offset
         let mut q_embeds = Vec::with_capacity(batch_size);
         let mut k_embeds = Vec::with_capacity(batch_size);
 
         for (b_idx, &offset) in positions.iter().enumerate() {
-            let q_b = q.narrow(0, b_idx, 1)?; // [1, H, L, D]
-            let k_b = k.narrow(0, b_idx, 1)?; // [1, H, L, D]
+            let q_b = q.narrow(0, b_idx, 1)?;
+            let k_b = k.narrow(0, b_idx, 1)?;
 
             let cos = self.cos.narrow(0, offset, seq_len)?;
             let sin = self.sin.narrow(0, offset, seq_len)?;
@@ -124,7 +115,6 @@ impl Qwen3RotaryEmbedding {
             k_embeds.push(k_embed);
         }
 
-        // Concatenate along batch dimension
         let q_result = Tensor::cat(&q_embeds, 0)?;
         let k_result = Tensor::cat(&k_embeds, 0)?;
 
@@ -133,16 +123,15 @@ impl Qwen3RotaryEmbedding {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Qwen3MLP {
+pub(crate) struct GraniteMLP {
     gate_proj: layers::LinearX,
     up_proj: layers::LinearX,
     down_proj: layers::LinearX,
     act_fn: Activation,
 }
 
-impl Qwen3MLP {
+impl GraniteMLP {
     pub(crate) fn new(cfg: &Config, vb: VarBuilderX) -> Result<Self> {
-        // GGUF models use "ffn_gate", "ffn_up", "ffn_down" instead of "gate_proj", "up_proj", "down_proj"
         let (gate_name, up_name, down_name) = if vb.is_qvar_builder() {
             ("ffn_gate", "ffn_up", "ffn_down")
         } else {
@@ -158,7 +147,7 @@ impl Qwen3MLP {
     }
 }
 
-impl Module for Qwen3MLP {
+impl Module for GraniteMLP {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let lhs = x.apply(&self.gate_proj)?.apply(&self.act_fn)?;
         let rhs = x.apply(&self.up_proj)?;
@@ -167,42 +156,33 @@ impl Module for Qwen3MLP {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Qwen3Attention {
-    // projections
+pub(crate) struct GraniteAttention {
     q_proj: layers::LinearX,
     k_proj: layers::LinearX,
     v_proj: layers::LinearX,
     o_proj: layers::LinearX,
-    // norms
-    q_norm: layers::norm::NormX,
-    k_norm: layers::norm::NormX,
-    // hyper params
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
     head_dim: usize,
     hidden_size: usize,
-    // utils
-    rotary_emb: Arc<Qwen3RotaryEmbedding>,
+    /// Attention score multiplier (replaces 1/sqrt(head_dim)).
+    attention_multiplier: f64,
+    rotary_emb: Arc<GraniteRotaryEmbedding>,
     kv_cache: KvCache,
 }
 
-impl Qwen3Attention {
+impl GraniteAttention {
     pub(crate) fn new(
         cfg: &Config,
-        rotary_emb: Arc<Qwen3RotaryEmbedding>,
+        rotary_emb: Arc<GraniteRotaryEmbedding>,
         vb: VarBuilderX,
     ) -> Result<Self> {
-        if cfg.use_sliding_window {
-            candle_core::bail!("sliding window is not supported")
-        }
-
-        let head_dim = cfg.head_dim;
+        let head_dim = cfg.head_dim();
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let num_kv_groups = num_heads / num_kv_heads;
 
-        // GGUF models use "attn_q", "attn_k", "attn_v", "attn_output" instead of "*_proj"
         let (q_name, k_name, v_name, o_name) = if vb.is_qvar_builder() {
             ("attn_q", "attn_k", "attn_v", "attn_output")
         } else {
@@ -214,33 +194,7 @@ impl Qwen3Attention {
         let v_proj = layers::linear(cfg.hidden_size, num_kv_heads * head_dim, vb.pp(v_name))?;
         let o_proj = layers::linear(num_heads * head_dim, cfg.hidden_size, vb.pp(o_name))?;
 
-        // GGUF models use "attn_q_norm" and "attn_k_norm"
-        let (q_norm_name, k_norm_name) = if vb.is_qvar_builder() {
-            ("attn_q_norm", "attn_k_norm")
-        } else {
-            ("q_norm", "k_norm")
-        };
-
-        let q_norm = layers::norm::rms_norm(
-            head_dim,
-            cfg.rms_norm_eps,
-            vb.pp(q_norm_name),
-            vb.dtype(),
-            false,
-        )?;
-        let k_norm = layers::norm::rms_norm(
-            head_dim,
-            cfg.rms_norm_eps,
-            vb.pp(k_norm_name),
-            vb.dtype(),
-            false,
-        )?;
-
-        // Necessary because the hidden_size in the config isn't always accurate
-        let hidden_size = head_dim * cfg.num_attention_heads;
-
-        // dim=2 because we concatenate along the sequence dimension
-        // For tensors of shape [batch, heads, seq, head_dim]
+        let hidden_size = head_dim * num_heads;
         let kv_cache = KvCache::new(2);
 
         Ok(Self {
@@ -248,13 +202,12 @@ impl Qwen3Attention {
             k_proj,
             v_proj,
             o_proj,
-            q_norm,
-            k_norm,
             num_heads,
             num_kv_heads,
             num_kv_groups,
             head_dim,
             hidden_size,
+            attention_multiplier: cfg.attention_multiplier,
             rotary_emb,
             kv_cache,
         })
@@ -268,12 +221,10 @@ impl Qwen3Attention {
     ) -> Result<Tensor> {
         let (b, l, _) = x.dims3()?;
 
-        // 1. Proj
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        // 2. Reshape: (B, L, H, D) -> (B, H, L, D)
         let q = q
             .reshape((b, l, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
@@ -284,20 +235,9 @@ impl Qwen3Attention {
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // 3. Per-head RMSNorm — RmsNorm reduces over the last dim, so (B,H,L,D) works directly
-        let q = self.q_norm.forward(&q.contiguous()?)?;
-        let k = self.k_norm.forward(&k.contiguous()?)?;
-
-        // 4. RoPE
         let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
-
-        // 5. Accumulate KV cache
         let (k, v) = self.kv_cache.append(&k, &v)?;
 
-        // 6. Attention dispatch: auto-select best available path
-        //    - CPU (no flash-attn feature): fused CPU flash kernel
-        //    - GPU (flash-attn feature):    CUDA flash attention
-        //    - Fallback:                    standard matmul attention
         let on_cpu = x.device().is_cpu();
 
         #[cfg(not(feature = "flash-attn"))]
@@ -312,13 +252,6 @@ impl Qwen3Attention {
         self.forward_standard_attn(&q, &k, &v, attn_mask, b, l)
     }
 
-    /// Batched forward pass with variable positions per request
-    ///
-    /// # Arguments
-    /// * `x` - Input tensor of shape [batch_size, seq_len, hidden_size]
-    /// * `attn_mask` - Optional attention mask
-    /// * `positions` - Position offset for each batch element
-    /// * `paged_caches` - Optional paged KV caches (one per request in batch)
     pub(crate) fn forward_batch(
         &mut self,
         x: &Tensor,
@@ -336,12 +269,10 @@ impl Qwen3Attention {
             );
         }
 
-        // 1. Proj
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        // 2. Reshape: (B, L, H, D) -> (B, H, L, D)
         let q = q
             .reshape((b, l, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
@@ -352,40 +283,27 @@ impl Qwen3Attention {
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // 3. Per-head RMSNorm — RmsNorm reduces over the last dim, so (B,H,L,D) works directly
-        let q = self.q_norm.forward(&q.contiguous()?)?;
-        let k = self.k_norm.forward(&k.contiguous()?)?;
-
-        // 4. RoPE with variable positions
         let (q, k) = self.rotary_emb.apply_batch(&q, &k, positions)?;
 
-        // 5 & 6. KV cache accumulation + attention dispatch.
-        //
-        // With paged caches each request has its own history of a different length, so we
-        // cannot concatenate their K/V tensors along the batch dimension before running
-        // attention.  Instead, compute attention independently per request and cat the
-        // outputs (which all share the query sequence length `l`).
         if let Some(mut caches) = paged_caches {
             let mut output_parts = Vec::with_capacity(b);
 
             for (batch_idx, cache) in caches.iter_mut().enumerate() {
-                let q_req = q.narrow(0, batch_idx, 1)?; // [1, H,    l,         D]
-                let k_req = k.narrow(0, batch_idx, 1)?; // [1, kv_H, l,         D]
-                let v_req = v.narrow(0, batch_idx, 1)?; // [1, kv_H, l,         D]
+                let q_req = q.narrow(0, batch_idx, 1)?;
+                let k_req = k.narrow(0, batch_idx, 1)?;
+                let v_req = v.narrow(0, batch_idx, 1)?;
 
-                let (k_full, v_full) = cache.append(&k_req, &v_req)?; // [1, kv_H, total, D]
+                let (k_full, v_full) = cache.append(&k_req, &v_req)?;
                 let offset = positions[batch_idx];
 
                 let out =
                     self.single_request_attn(&q_req, &k_full, &v_full, attn_mask, offset, l)?;
-                output_parts.push(out); // [1, l, hidden_size]
+                output_parts.push(out);
             }
 
-            // All outputs share the same shape → safe to cat along the batch dim.
-            return Tensor::cat(&output_parts, 0); // [B, l, hidden_size]
+            return Tensor::cat(&output_parts, 0);
         }
 
-        // Without paged caches: accumulate into the shared (single-request) KV cache.
         let (k, v) = self.kv_cache.append(&k, &v)?;
 
         let on_cpu = x.device().is_cpu();
@@ -416,7 +334,6 @@ impl Qwen3Attention {
         self.forward_standard_attn(&q, &k, &v, attn_mask, b, l)
     }
 
-    /// GPU flash attention path (requires flash-attn feature)
     #[cfg(feature = "flash-attn")]
     fn forward_flash_attn(
         &self,
@@ -427,24 +344,17 @@ impl Qwen3Attention {
         b: usize,
         l: usize,
     ) -> Result<Tensor> {
-        // Flash attention expects (B, S, H, D) format
         let q = q.transpose(1, 2)?.contiguous()?;
         let k = k.transpose(1, 2)?.contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let scale = self.attention_multiplier as f32;
         let causal = l > 1;
         let ctx = candle_flash_attn::flash_attn(&q, &k, &v, scale, causal)?;
 
-        // Output: (B, S, H, D) -> (B, L, hidden_size)
         ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
     }
 
-    /// CPU flash attention - optimized fused kernel for CPU
-    ///
-    /// The `flash_attn` dispatcher in candle-nn automatically selects:
-    /// - B=1: single-batch optimized kernels (direct slice access)
-    /// - B>1: packed varlen path (avoids batch-dim stride overhead)
     #[cfg(not(feature = "flash-attn"))]
     fn forward_cpu_flash_attn(
         &self,
@@ -455,12 +365,11 @@ impl Qwen3Attention {
         b: usize,
         l: usize,
     ) -> Result<Tensor> {
-        // CPU flash attention expects (B, S, H, D) format
         let q = q.transpose(1, 2)?.contiguous()?;
         let k = k.transpose(1, 2)?.contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let scale = self.attention_multiplier as f32;
 
         let ctx = match q.dtype() {
             DType::F32 => flash_attn::<f32>(
@@ -501,11 +410,9 @@ impl Qwen3Attention {
 
         // Output from CPU flash attention is (B, H, S, D), transpose to (B, S, H, D)
         let ctx = ctx.transpose(1, 2)?;
-
         ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
     }
 
-    /// Standard matmul-based attention (works on any device)
     fn forward_standard_attn(
         &self,
         q: &Tensor,
@@ -515,27 +422,21 @@ impl Qwen3Attention {
         b: usize,
         l: usize,
     ) -> Result<Tensor> {
-        // GQA repeat_kv
         let k = repeat_kv(k.clone(), self.num_kv_groups)?.contiguous()?;
         let v = repeat_kv(v.clone(), self.num_kv_groups)?.contiguous()?;
 
-        // Attention score
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * self.attention_multiplier)?;
         if let Some(m) = attn_mask {
             scores = scores.broadcast_add(m)?;
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?; // (B, H, L, D)
+        let ctx = probs.matmul(&v)?;
 
-        // Output proj
         ctx.transpose(1, 2)?
             .reshape((b, l, self.hidden_size))?
             .apply(&self.o_proj)
     }
 
-    /// Compute attention for a single request (b=1).  Used by `forward_batch` when paged
-    /// caches are active so each request is processed with its own variable-length KV.
     fn single_request_attn(
         &self,
         q: &Tensor,
@@ -563,12 +464,10 @@ impl Qwen3Attention {
         self.kv_cache.reset();
     }
 
-    /// Get current KV cache state for this attention layer
     pub(crate) fn get_kv_state(&self) -> Option<(Tensor, Tensor)> {
         self.kv_cache.get_state()
     }
 
-    /// Restore KV cache state for this attention layer
     pub(crate) fn set_kv_state(&mut self, k: Tensor, v: Tensor) -> Result<()> {
         self.kv_cache.set_state(k, v)
     }
@@ -576,32 +475,27 @@ impl Qwen3Attention {
 
 #[derive(Debug, Clone)]
 struct DecoderLayer {
-    self_attn: Qwen3Attention,
-    mlp: Qwen3MLP,
+    self_attn: GraniteAttention,
+    mlp: GraniteMLP,
     ln1: layers::norm::NormX,
     ln2: layers::norm::NormX,
+    residual_multiplier: f64,
 }
 
 impl DecoderLayer {
-    fn new(cfg: &Config, rotary: Arc<Qwen3RotaryEmbedding>, vb: VarBuilderX) -> Result<Self> {
-        // GGUF models don't have "self_attn" or "mlp" prefixes - components are directly under the block
-        // SafeTensors: layers.0.self_attn.q_proj.weight
-        // GGUF: blk.0.attn_q.weight
+    fn new(cfg: &Config, rotary: Arc<GraniteRotaryEmbedding>, vb: VarBuilderX) -> Result<Self> {
         let self_attn = if vb.is_qvar_builder() {
-            Qwen3Attention::new(cfg, rotary, vb.clone())?
+            GraniteAttention::new(cfg, rotary, vb.clone())?
         } else {
-            Qwen3Attention::new(cfg, rotary, vb.pp("self_attn"))?
+            GraniteAttention::new(cfg, rotary, vb.pp("self_attn"))?
         };
 
-        // SafeTensors: blk.0.mlp.gate_proj.weight
-        // GGUF: blk.0.ffn_gate.weight
         let mlp = if vb.is_qvar_builder() {
-            Qwen3MLP::new(cfg, vb.clone())?
+            GraniteMLP::new(cfg, vb.clone())?
         } else {
-            Qwen3MLP::new(cfg, vb.pp("mlp"))?
+            GraniteMLP::new(cfg, vb.pp("mlp"))?
         };
 
-        // GGUF models use "attn_norm" and "ffn_norm" instead of "input_layernorm" and "post_attention_layernorm"
         let (ln1_name, ln2_name) = if vb.is_qvar_builder() {
             ("attn_norm", "ffn_norm")
         } else {
@@ -622,21 +516,23 @@ impl DecoderLayer {
             vb.dtype(),
             false,
         )?;
+
         Ok(Self {
             self_attn,
             mlp,
             ln1,
             ln2,
+            residual_multiplier: cfg.residual_multiplier,
         })
     }
 
     fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let h = self.ln1.forward(x)?;
         let h = self.self_attn.forward(&h, mask, offset)?;
-        let x = (x + h)?;
+        let x = (x + (h * self.residual_multiplier)?)?;
         let h2 = self.ln2.forward(&x)?;
         let h2 = h2.apply(&self.mlp)?;
-        x + h2
+        x + (h2 * self.residual_multiplier)?
     }
 
     fn forward_batch(
@@ -650,10 +546,10 @@ impl DecoderLayer {
         let h = self
             .self_attn
             .forward_batch(&h, mask, positions, paged_caches)?;
-        let x = (x + h)?;
+        let x = (x + (h * self.residual_multiplier)?)?;
         let h2 = self.ln2.forward(&x)?;
         let h2 = h2.apply(&self.mlp)?;
-        x + h2
+        x + (h2 * self.residual_multiplier)?
     }
 
     fn clear_kv_cache(&mut self) {
@@ -676,6 +572,7 @@ pub struct Model {
     norm: layers::norm::NormX,
     device: Device,
     dtype: DType,
+    embedding_multiplier: f64,
 }
 
 impl Model {
@@ -688,7 +585,6 @@ impl Model {
         vb: VarBuilderX,
         progress: Option<&ProgressReporter>,
     ) -> Result<Self> {
-        // GGUF models use "token_embd" instead of "model.embed_tokens"
         let embed_path = if vb.is_qvar_builder() {
             "token_embd"
         } else {
@@ -700,15 +596,13 @@ impl Model {
             vb.pp(embed_path),
             vb.dtype(),
         )?;
-        let rotary = Arc::new(Qwen3RotaryEmbedding::new(vb.dtype(), cfg, &vb.device())?);
+        let rotary = Arc::new(GraniteRotaryEmbedding::new(vb.dtype(), cfg, &vb.device())?);
 
-        // Initialize progress bar for layer loading
         if let Some(p) = progress {
             p.init_loading(cfg.num_hidden_layers);
         }
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        // GGUF models use "blk" instead of "model.layers"
         let layers_path = if vb.is_qvar_builder() {
             "blk"
         } else {
@@ -722,13 +616,11 @@ impl Model {
                 vb_l.pp(&i.to_string()),
             )?);
 
-            // Report progress after each layer is loaded
             if let Some(p) = progress {
                 p.inc_loading();
             }
         }
 
-        // Finish loading progress
         if let Some(p) = progress {
             p.finish_loading();
         }
@@ -737,7 +629,6 @@ impl Model {
             embed_tokens,
             layers,
             norm: {
-                // GGUF models use "output_norm" instead of "model.norm"
                 let norm_path = if vb.is_qvar_builder() {
                     "output_norm"
                 } else {
@@ -753,6 +644,7 @@ impl Model {
             },
             device: vb.device(),
             dtype: vb.dtype(),
+            embedding_multiplier: cfg.embedding_multiplier,
         })
     }
 
@@ -762,21 +654,18 @@ impl Model {
         }
     }
 
-    /// Get KV cache state from all layers
     fn get_kv_cache_state(&self) -> Result<Vec<(Tensor, Tensor)>> {
         let mut states = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             if let Some((k, v)) = layer.get_kv_state() {
                 states.push((k, v));
             } else {
-                // If any layer has no state, return empty vec
                 return Ok(Vec::new());
             }
         }
         Ok(states)
     }
 
-    /// Restore KV cache state to all layers
     fn set_kv_cache_state(&mut self, states: Vec<(Tensor, Tensor)>) -> Result<()> {
         if states.len() != self.layers.len() {
             candle_core::bail!(
@@ -816,10 +705,8 @@ impl Model {
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (b, l) = input.dims2()?;
-        let mut h = self.embed_tokens.forward(input)?;
+        let mut h = (self.embed_tokens.forward(input)? * self.embedding_multiplier)?;
 
-        // Build causal mask only for the standard attention fallback path.
-        // Both CPU flash and GPU flash handle masking internally.
         #[cfg(not(feature = "flash-attn"))]
         let needs_mask = !self.device.is_cpu() && l > 1;
         #[cfg(feature = "flash-attn")]
@@ -836,14 +723,6 @@ impl Model {
         self.norm.forward(&h)
     }
 
-    /// Batched forward pass with variable positions per request
-    ///
-    /// # Arguments
-    /// * `input` - Batched input tensor of shape [batch_size, seq_len]
-    /// * `positions` - Position offset for each batch element
-    ///
-    /// # Returns
-    /// Hidden states tensor of shape [batch_size, seq_len, hidden_size]
     pub fn forward_batch(
         &mut self,
         input: &Tensor,
@@ -860,16 +739,13 @@ impl Model {
             );
         }
 
-        let mut h = self.embed_tokens.forward(input)?;
+        let mut h = (self.embed_tokens.forward(input)? * self.embedding_multiplier)?;
 
-        // Build causal mask only for the standard attention fallback path.
-        // Both CPU flash and GPU flash handle masking internally.
         #[cfg(not(feature = "flash-attn"))]
         let needs_mask = !self.device.is_cpu() && l > 1;
         #[cfg(feature = "flash-attn")]
         let needs_mask = self.device.is_cpu() && l > 1;
 
-        // For batched execution with variable positions, use minimum offset for mask
         let min_offset = *positions.iter().min().unwrap_or(&0);
         let causal = if needs_mask {
             Some(self.causal_mask(b, l, min_offset, None)?)
@@ -894,6 +770,7 @@ impl Model {
 pub struct ModelForCausalLM {
     base: Model,
     lm_head: layers::LinearX,
+    logits_scaling: f64,
     eos_token_ids: Vec<u32>,
 }
 
@@ -914,7 +791,6 @@ impl ModelForCausalLM {
                 None,
             ))
         } else {
-            // GGUF models use "output" instead of "lm_head"
             let lm_head_name = if vb.is_qvar_builder() {
                 "output"
             } else {
@@ -925,16 +801,9 @@ impl ModelForCausalLM {
         Ok(Self {
             base,
             lm_head,
-            eos_token_ids: cfg.eos_token_id.clone(),
+            logits_scaling: cfg.logits_scaling,
+            eos_token_ids: vec![cfg.eos_token_id],
         })
-    }
-
-    pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
-        let (_, l) = input.dims2()?;
-        self.base
-            .forward(input, offset)?
-            .narrow(1, l - 1, 1)?
-            .apply(&self.lm_head)
     }
 
     pub fn clear_kv_cache(&mut self) {
@@ -945,10 +814,12 @@ impl ModelForCausalLM {
 impl super::ModelImpl for ModelForCausalLM {
     fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (_, l) = input.dims2()?;
-        self.base
+        let logits = self
+            .base
             .forward(input, offset)?
             .narrow(1, l - 1, 1)?
-            .apply(&self.lm_head)
+            .apply(&self.lm_head)?;
+        logits * self.logits_scaling
     }
 
     fn forward_batch(
@@ -967,33 +838,29 @@ impl super::ModelImpl for ModelForCausalLM {
             );
         }
 
-        // Get hidden states for all positions
         let hidden_states = self.base.forward_batch(input, positions, paged_caches)?;
-
-        // For each batch element, extract the last token's logits
-        // hidden_states shape: [batch_size, seq_len, hidden_size]
         let last_hidden = hidden_states.narrow(1, l - 1, 1)?;
-
-        // Apply language model head
-        last_hidden.apply(&self.lm_head)
+        let logits = last_hidden.apply(&self.lm_head)?;
+        logits * self.logits_scaling
     }
 
-    #[inline]
-    fn format_prompt(&self, prompt: &str, thinking: bool) -> String {
-        let think_tag = if thinking { " /think" } else { " /no_think" };
-        format!("<|im_start|>user\n{prompt}{think_tag}<|im_end|>\n<|im_start|>assistant\n")
+    fn format_prompt(&self, prompt: &str, _thinking: bool) -> String {
+        // Thinking in Granite 4.1 is inherent model behaviour, not controlled by
+        // a prompt flag — the _thinking parameter is intentionally ignored.
+        format!(
+            "<|start_of_role|>user<|end_of_role|>{prompt}<|end_of_text|>\n\
+             <|start_of_role|>assistant<|end_of_role|>"
+        )
     }
 
     fn format_prompt_with_tools(
         &self,
         prompt: &str,
         tools: &[crate::backend::tools::ToolDefinition],
-        thinking: bool,
+        _thinking: bool,
     ) -> String {
-        let think_tag = if thinking { " /think" } else { " /no_think" };
-
-        // Serialise each tool as a JSON object with the "function" wrapper
-        // expected by the Qwen3 tool-calling template.
+        // Mirror the system-message structure from chat_template.jinja so the
+        // offline fallback produces the same format as the Jinja2 path.
         let tools_json = tools
             .iter()
             .map(|t| {
@@ -1011,22 +878,20 @@ impl super::ModelImpl for ModelForCausalLM {
             .join("\n");
 
         format!(
-            "<|im_start|>system\n\
-             You are a helpful assistant.\n\n\
-             # Tools\n\n\
-             You may call one or more functions to assist with the user request.\n\n\
-             You are provided with function signatures within <tools></tools> XML tags:\n\n\
+            "<|start_of_role|>system<|end_of_role|>\
+             You are a helpful assistant with access to the following tools. \
+             You may call one or more tools to assist with the user query.\n\n\
+             You are provided with function signatures within <tools></tools> XML tags:\n\
              <tools>\n\
              {tools_json}\n\
              </tools>\n\n\
-             For each function call, return a json object with function name and arguments \
-             within <tool_call></tool_call> XML tags:\n\n\
+             For each tool call, return a json object with function name and arguments \
+             within <tool_call></tool_call> XML tags:\n\
              <tool_call>\n\
              {{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n\
-             </tool_call><|im_end|>\n\
-             <|im_start|>user\n\
-             {prompt}{think_tag}<|im_end|>\n\
-             <|im_start|>assistant\n"
+             </tool_call>.<|end_of_text|>\n\
+             <|start_of_role|>user<|end_of_role|>{prompt}<|end_of_text|>\n\
+             <|start_of_role|>assistant<|end_of_role|>"
         )
     }
 
@@ -1047,7 +912,7 @@ impl super::ModelImpl for ModelForCausalLM {
     }
 
     fn name(&self) -> &'static str {
-        "Qwen3"
+        "Granite4.1"
     }
 
     fn dtype(&self) -> candle_core::DType {

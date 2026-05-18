@@ -18,6 +18,15 @@ A high-performance Rust inference engine for transformer models, built on [Candl
 - **Detailed Statistics**: Per-request prefill/decode timing, cache hit rate, and tokens-per-second reporting
 - **Tooling Support**: Define your tools which a model can call
 
+## Supported Models
+
+| Family | HuggingFace ID examples | Quantization | Thinking | Tools |
+| ------ | ----------------------- | ------------ | -------- | ----- |
+| **Qwen3** | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-4B`, `Qwen/Qwen3-8B` | SafeTensors (BF16) or GGUF (`Q4_K_M`, `Q8_0`, …) | ✅ `--thinking` flag injects `/think` tag | ✅ `<tool_call>` blocks |
+| **Granite 4.1** | `ibm-granite/granite-4.1-3b` | SafeTensors (F32 on CPU) | ⚠️ inherent model behaviour; `--thinking` flag ignored | ✅ `<tool_call>` blocks via chat template |
+
+Auto-detection reads `model_type` from `config.json` (`"qwen3"`, `"granite"`), so passing the HuggingFace repo ID is enough — no extra flags required.
+
 ## Quick Start
 
 ### Basic Usage
@@ -155,7 +164,7 @@ Tool calling lets the model invoke external functions by emitting structured `<t
 
 1. You define tools with a name, description, and JSON Schema parameters.
 2. Attach them to a `GenerationRequest` via `.with_tools(…)`.
-3. The pipeline formats the raw user message with the Qwen3 tool-calling system prompt template (tools injected in `<tools>` XML tags).
+3. The pipeline formats the raw user message using the model's chat template with tools injected in `<tools>` XML tags (Qwen3 format).
 4. After generation, the pipeline scans the output for `<tool_call>…</tool_call>` blocks and deserialises each one into a `ToolCall`.
 
 ### API example
@@ -197,7 +206,7 @@ When tools are present, the pipeline formats calls internally — you do **not**
 
 ### Combining with thinking mode
 
-Set `--enable-thinking` on the call to enable chain-of-thought reasoning alongside tool calling (Qwen3 `/think` tag)
+Set `--enable-thinking` on the call to enable chain-of-thought reasoning alongside tool calling (supported on Qwen3 via the `/think` tag)
 
 ### Combining with guided generation
 
