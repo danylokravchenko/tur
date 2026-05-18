@@ -129,8 +129,11 @@ impl<'a, T: ModelConstructor> InferenceEngineBuilder<'a, T> {
 
     pub fn build(
         self,
-    ) -> Result<(InferenceEngine<T>, Tokenizer, Option<crate::backend::chat_template::ChatTemplate>)>
-    {
+    ) -> Result<(
+        InferenceEngine<T>,
+        Tokenizer,
+        Option<crate::backend::chat_template::ChatTemplate>,
+    )> {
         // Log engine configuration
         debug!(
             seed = self.seed,
@@ -243,13 +246,36 @@ impl<T: ModelConstructor> InferenceEngine<T> {
 
     /// Get EOS tokens from tokenizer
     pub fn get_eos_tokens(tokenizer: &TokenOutputStream) -> Result<(u32, u32)> {
+        // Try common primary EOS token names across model families.
         let eos_token = tokenizer
             .get_token("<|endoftext|>")
-            .ok_or_else(|| TurError::Tokenizer("cannot find <|endoftext|> token".to_string()))?;
+            .or_else(|| tokenizer.get_token("<|end_of_text|>"))
+            .ok_or_else(|| {
+                TurError::Tokenizer(
+                    "cannot find EOS token (<|endoftext|> or <|end_of_text|>)".to_string(),
+                )
+            })?;
+        // Try common chat-turn-end tokens; fall back to the primary EOS when absent.
         let eos_token2 = tokenizer
             .get_token("<|im_end|>")
-            .ok_or_else(|| TurError::Tokenizer("cannot find <|im_end|> token".to_string()))?;
+            .or_else(|| tokenizer.get_token("<|end_of_role|>"))
+            .unwrap_or(eos_token);
         Ok((eos_token, eos_token2))
+    }
+
+    /// Convert a model's `eos_token_ids()` slice into the `(primary, secondary)` pair
+    /// used throughout the generation loop.  When only one ID is present both slots
+    /// hold the same value.  Falls back to the tokenizer-string lookup when the
+    /// model config did not supply any IDs.
+    pub fn resolve_eos_tokens(
+        model_ids: &[u32],
+        tokenizer: &TokenOutputStream,
+    ) -> Result<(u32, u32)> {
+        match model_ids {
+            [] => Self::get_eos_tokens(tokenizer),
+            [a] => Ok((*a, *a)),
+            [a, b, ..] => Ok((*a, *b)),
+        }
     }
 
     /// Apply repeat penalty and optional guidance constraints to logits

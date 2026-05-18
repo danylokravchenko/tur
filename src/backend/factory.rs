@@ -49,14 +49,41 @@ pub trait ModelConstructor: ModelImpl + Sized {
 
 impl<T: ModelConstructor> ModelFactory<T> {
     fn load_chat_template_from_paths(paths: &crate::weights::ModelPaths) -> Option<ChatTemplate> {
-        let config_path = paths.tokenizer_config_filename()?;
-        match ChatTemplate::from_tokenizer_config(config_path) {
-            Ok(ct) => Some(ct),
-            Err(e) => {
-                tracing::warn!("Could not load chat template from tokenizer_config.json: {e}");
-                None
+        // Primary: inline `chat_template` field inside tokenizer_config.json.
+        if let Some(config_path) = paths.tokenizer_config_filename() {
+            match ChatTemplate::from_tokenizer_config(config_path) {
+                Ok(ct) => return Some(ct),
+                Err(e) => tracing::debug!(
+                    "No inline chat_template in tokenizer_config.json ({e}); \
+                     trying standalone file"
+                ),
             }
         }
+
+        // Fallback: standalone chat_template.jinja / chat_template.json file.
+        if let Some(jinja_path) = paths.chat_template_filename() {
+            match std::fs::read_to_string(jinja_path) {
+                Ok(raw) => match ChatTemplate::from_template(raw) {
+                    Ok(ct) => {
+                        tracing::debug!(
+                            path = %jinja_path.display(),
+                            "Loaded chat template from standalone file"
+                        );
+                        return Some(ct);
+                    }
+                    Err(e) => tracing::warn!(
+                        path = %jinja_path.display(),
+                        "Failed to parse standalone chat template: {e}"
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    path = %jinja_path.display(),
+                    "Failed to read standalone chat template: {e}"
+                ),
+            }
+        }
+
+        None
     }
 
     /// Creates a new `ModelFactory`.
@@ -253,6 +280,34 @@ impl ModelConstructor for crate::models::Qwen35ModelForCausalLM {
     }
 }
 
+impl ModelConstructor for crate::models::Granite41ModelForCausalLM {
+    type Config = crate::models::granite_41::Config;
+
+    fn new_with_progress(
+        config: &Self::Config,
+        vb: VarBuilderX,
+        progress: Option<&ProgressReporter>,
+    ) -> Result<Self> {
+        crate::models::Granite41ModelForCausalLM::new_with_progress(config, vb, progress)
+            .map_err(|e| e.into())
+    }
+
+    fn load_config(paths: &crate::weights::ModelPaths) -> Result<Self::Config> {
+        trace!("Loading Granite 4.1 model configuration");
+
+        let config_path = paths.config_filename();
+        let config_content = std::fs::read_to_string(config_path)?;
+        let config: Self::Config = serde_json::from_str(&config_content)?;
+
+        debug!(
+            num_layers = config.num_hidden_layers,
+            hidden_size = config.hidden_size,
+            "Model config loaded"
+        );
+        Ok(config)
+    }
+}
+
 // ─── Model detection ──────────────────────────────────────────────────────────
 
 /// Identifies which model architecture is present in a weight directory.
@@ -263,7 +318,8 @@ impl ModelConstructor for crate::models::Qwen35ModelForCausalLM {
 pub enum ModelKind {
     /// Qwen3 / Qwen2 family — shares the same architecture in this codebase.
     Qwen3,
-    // Future: Llama3, Mistral, Phi3, …
+    /// IBM Granite 4.1 Dense.
+    Granite41,
 }
 
 impl ModelKind {
@@ -271,6 +327,7 @@ impl ModelKind {
     fn from_config_type(model_type: &str) -> Option<Self> {
         match model_type {
             "qwen3" | "qwen2" => Some(Self::Qwen3),
+            "granite" => Some(Self::Granite41),
             _ => None,
         }
     }
@@ -281,6 +338,9 @@ impl ModelKind {
         let lower = name.to_lowercase();
         if lower.contains("qwen3") || lower.contains("qwen2") {
             return Some(Self::Qwen3);
+        }
+        if lower.contains("granite") {
+            return Some(Self::Granite41);
         }
         None
     }
@@ -295,16 +355,17 @@ impl ModelKind {
         let config_path = paths.config_filename();
         if let Ok(content) = std::fs::read_to_string(config_path)
             && let Ok(raw) = serde_json::from_str::<serde_json::Value>(&content)
-                && let Some(mt) = raw["model_type"].as_str() {
-                    if let Some(kind) = Self::from_config_type(mt) {
-                        debug!(model_type = mt, kind = ?kind, "Detected model kind from config.json");
-                        return Ok(kind);
-                    }
-                    trace!(
-                        model_type = mt,
-                        "config.json model_type not recognised; falling back to name hint"
-                    );
-                }
+            && let Some(mt) = raw["model_type"].as_str()
+        {
+            if let Some(kind) = Self::from_config_type(mt) {
+                debug!(model_type = mt, kind = ?kind, "Detected model kind from config.json");
+                return Ok(kind);
+            }
+            trace!(
+                model_type = mt,
+                "config.json model_type not recognised; falling back to name hint"
+            );
+        }
 
         let hint = match source {
             ModelSource::HuggingFace(id) => id.as_str(),
@@ -326,7 +387,7 @@ impl ModelKind {
 /// One variant per [`ModelKind`].
 pub enum AnyModelConfig {
     Qwen3(crate::models::qwen3::Config),
-    // Future: Qwen36(crate::models::qwen36::Config),
+    Granite41(crate::models::granite_41::Config),
 }
 
 // ─── AnyModel ─────────────────────────────────────────────────────────────────
@@ -344,37 +405,42 @@ pub enum AnyModelConfig {
 /// 3. Register the new `model_type` string(s) in `ModelKind::from_config_type`.
 pub enum AnyModel {
     Qwen3(crate::models::Qwen35ModelForCausalLM),
-    // Future: Qwen36(crate::models::qwen36::ModelForCausalLM),
+    Granite41(crate::models::Granite41ModelForCausalLM),
 }
 
 impl ModelImpl for AnyModel {
     fn name(&self) -> &'static str {
         match self {
             Self::Qwen3(m) => m.name(),
+            Self::Granite41(m) => m.name(),
         }
     }
 
     fn num_layers(&self) -> usize {
         match self {
             Self::Qwen3(m) => m.num_layers(),
+            Self::Granite41(m) => m.num_layers(),
         }
     }
 
     fn dtype(&self) -> DType {
         match self {
             Self::Qwen3(m) => m.dtype(),
+            Self::Granite41(m) => m.dtype(),
         }
     }
 
     fn forward(&mut self, input: &Tensor, offset: usize) -> candle_core::Result<Tensor> {
         match self {
             Self::Qwen3(m) => m.forward(input, offset),
+            Self::Granite41(m) => m.forward(input, offset),
         }
     }
 
     fn forward_modal(&mut self, input: ModelInput) -> candle_core::Result<Tensor> {
         match self {
             Self::Qwen3(m) => m.forward_modal(input),
+            Self::Granite41(m) => m.forward_modal(input),
         }
     }
 
@@ -386,12 +452,14 @@ impl ModelImpl for AnyModel {
     ) -> candle_core::Result<Tensor> {
         match self {
             Self::Qwen3(m) => m.forward_batch(input, positions, paged_caches),
+            Self::Granite41(m) => m.forward_batch(input, positions, paged_caches),
         }
     }
 
     fn format_prompt(&self, prompt: &str, thinking: bool) -> String {
         match self {
             Self::Qwen3(m) => m.format_prompt(prompt, thinking),
+            Self::Granite41(m) => m.format_prompt(prompt, thinking),
         }
     }
 
@@ -403,24 +471,35 @@ impl ModelImpl for AnyModel {
     ) -> String {
         match self {
             Self::Qwen3(m) => m.format_prompt_with_tools(prompt, tools, thinking),
+            Self::Granite41(m) => m.format_prompt_with_tools(prompt, tools, thinking),
         }
     }
 
     fn get_kv_cache_state(&self) -> candle_core::Result<Vec<(Tensor, Tensor)>> {
         match self {
             Self::Qwen3(m) => m.get_kv_cache_state(),
+            Self::Granite41(m) => m.get_kv_cache_state(),
         }
     }
 
     fn set_kv_cache_state(&mut self, state: Vec<(Tensor, Tensor)>) -> candle_core::Result<()> {
         match self {
             Self::Qwen3(m) => m.set_kv_cache_state(state),
+            Self::Granite41(m) => m.set_kv_cache_state(state),
         }
     }
 
     fn clear_kv_cache(&mut self) {
         match self {
             Self::Qwen3(m) => m.clear_kv_cache(),
+            Self::Granite41(m) => m.clear_kv_cache(),
+        }
+    }
+
+    fn eos_token_ids(&self) -> Vec<u32> {
+        match self {
+            Self::Qwen3(m) => m.eos_token_ids(),
+            Self::Granite41(m) => m.eos_token_ids(),
         }
     }
 }
@@ -456,6 +535,10 @@ impl ModelConstructor for AnyModel {
                 let cfg: crate::models::qwen3::Config = serde_json::from_value(raw)?;
                 Ok(AnyModelConfig::Qwen3(cfg))
             }
+            ModelKind::Granite41 => {
+                let cfg: crate::models::granite_41::Config = serde_json::from_value(raw)?;
+                Ok(AnyModelConfig::Granite41(cfg))
+            }
         }
     }
 
@@ -470,6 +553,12 @@ impl ModelConstructor for AnyModel {
                     crate::models::Qwen35ModelForCausalLM::new_with_progress(cfg, vb, progress)
                         .map_err(TurError::from)?;
                 Ok(AnyModel::Qwen3(model))
+            }
+            AnyModelConfig::Granite41(cfg) => {
+                let model =
+                    crate::models::Granite41ModelForCausalLM::new_with_progress(cfg, vb, progress)
+                        .map_err(TurError::from)?;
+                Ok(AnyModel::Granite41(model))
             }
         }
     }

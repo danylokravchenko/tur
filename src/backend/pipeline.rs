@@ -378,12 +378,23 @@ impl<'a, T: ModelConstructor> InferencePipelineBuilder<'a, T> {
             // Derive num_layers and EOS tokens from the just-built model/tokenizer so
             // they always agree with the actual model, never with hardcoded constants.
             let num_layers = engine.model().num_layers();
-            let eos_token = tokenizer_arc
-                .token_to_id("<|endoftext|>")
-                .expect("tokenizer missing <|endoftext|>");
-            let im_end_token = tokenizer_arc
-                .token_to_id("<|im_end|>")
-                .expect("tokenizer missing <|im_end|>");
+            let model_eos_ids = engine.model().eos_token_ids();
+            let (eos_token, im_end_token) = match model_eos_ids.as_slice() {
+                [] => (
+                    tokenizer_arc
+                        .token_to_id("<|endoftext|>")
+                        .or_else(|| tokenizer_arc.token_to_id("<|end_of_text|>"))
+                        .expect("cannot find EOS token"),
+                    tokenizer_arc
+                        .token_to_id("<|im_end|>")
+                        .or_else(|| tokenizer_arc.token_to_id("<|end_of_role|>"))
+                        .or_else(|| tokenizer_arc.token_to_id("<|endoftext|>"))
+                        .or_else(|| tokenizer_arc.token_to_id("<|end_of_text|>"))
+                        .expect("cannot find secondary EOS token"),
+                ),
+                [a] => (*a, *a),
+                [a, b, ..] => (*a, *b),
+            };
 
             debug!(
                 total_blocks,
@@ -522,7 +533,9 @@ impl<T: ModelConstructor> InferencePipeline<T> {
         let mut generated_tokens = 0usize;
         // Accumulate text for tool-call parsing when tools are active.
         let mut generated_text: Option<String> = if has_tools { Some(String::new()) } else { None };
-        let (eos_token, im_end_token) = InferenceEngine::<T>::get_eos_tokens(&self.tokenizer)?;
+        let model_eos_ids = self.engine.model().eos_token_ids();
+        let (eos_token, im_end_token) =
+            InferenceEngine::<T>::resolve_eos_tokens(&model_eos_ids, &self.tokenizer)?;
 
         let start_gen = std::time::Instant::now();
 

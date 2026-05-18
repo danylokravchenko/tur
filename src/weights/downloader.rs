@@ -12,7 +12,8 @@ mod file_names {
     pub const TOKENIZER_CONFIG: &str = "tokenizer_config.json";
     pub const CONFIG: &str = "config.json";
     pub const GENERATION_CONFIG: &str = "generation_config.json";
-    pub const CHAT_TEMPLATE: &str = "chat_template.json";
+    pub const CHAT_TEMPLATE_JSON: &str = "chat_template.json";
+    pub const CHAT_TEMPLATE_JINJA: &str = "chat_template.jinja";
     pub const MODEL_SAFETENSORS: &str = "model.safetensors";
     pub const MODEL_SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
 }
@@ -127,8 +128,9 @@ impl Downloader {
                     filenames,
                     auxiliary_filenames: Vec::new(),
                     chat_template_filename: {
-                        let p = base.join(file_names::CHAT_TEMPLATE);
-                        p.exists().then_some(p)
+                        let jinja = base.join(file_names::CHAT_TEMPLATE_JINJA);
+                        let json = base.join(file_names::CHAT_TEMPLATE_JSON);
+                        if jinja.exists() { Some(jinja) } else if json.exists() { Some(json) } else { None }
                     },
                 };
                 Ok((paths, false))
@@ -195,6 +197,10 @@ impl Downloader {
 
         let tokenizer_config_filename = repo.get(file_names::TOKENIZER_CONFIG).ok();
         let generation_config_filename = repo.get(file_names::GENERATION_CONFIG).ok();
+        let chat_template_filename = repo
+            .get(file_names::CHAT_TEMPLATE_JINJA)
+            .ok()
+            .or_else(|| repo.get(file_names::CHAT_TEMPLATE_JSON).ok());
 
         let mut filenames = Vec::new();
         for rfilename in repo
@@ -223,7 +229,7 @@ impl Downloader {
             generation_config_filename,
             filenames,
             auxiliary_filenames: Vec::new(),
-            chat_template_filename: None,
+            chat_template_filename,
         })
     }
 
@@ -261,7 +267,10 @@ impl Downloader {
 
         let tokenizer_config_filename = config_repo_api.get(file_names::TOKENIZER_CONFIG).ok();
         let generation_config_filename = config_repo_api.get(file_names::GENERATION_CONFIG).ok();
-        let chat_template_filename = config_repo_api.get(file_names::CHAT_TEMPLATE).ok();
+        let chat_template_filename = config_repo_api
+            .get(file_names::CHAT_TEMPLATE_JINJA)
+            .ok()
+            .or_else(|| config_repo_api.get(file_names::CHAT_TEMPLATE_JSON).ok());
 
         let gguf_repo_api = api.repo(Repo::with_revision(
             gguf_repo,
@@ -420,12 +429,22 @@ mod tests {
     }
 
     #[test]
-    fn test_model_paths_chat_template_filename_some() {
+    fn test_model_paths_chat_template_filename_json() {
         let mut paths = make_paths();
         paths.chat_template_filename = Some(PathBuf::from("chat_template.json"));
         assert_eq!(
             paths.chat_template_filename(),
             Some(Path::new("chat_template.json"))
+        );
+    }
+
+    #[test]
+    fn test_model_paths_chat_template_filename_jinja() {
+        let mut paths = make_paths();
+        paths.chat_template_filename = Some(PathBuf::from("chat_template.jinja"));
+        assert_eq!(
+            paths.chat_template_filename(),
+            Some(Path::new("chat_template.jinja"))
         );
     }
 
@@ -439,7 +458,7 @@ mod tests {
     fn test_model_paths_clone() {
         let mut paths = make_paths();
         paths.filenames = vec![PathBuf::from("model.safetensors")];
-        paths.chat_template_filename = Some(PathBuf::from("chat_template.json"));
+        paths.chat_template_filename = Some(PathBuf::from("chat_template.jinja"));
         let cloned = paths.clone();
         assert_eq!(cloned.tokenizer_filename(), paths.tokenizer_filename());
         assert_eq!(cloned.config_filename(), paths.config_filename());
@@ -448,6 +467,71 @@ mod tests {
             cloned.chat_template_filename(),
             paths.chat_template_filename()
         );
+    }
+
+    // ── file_names constants ─────────────────────────────────────────────────
+
+    #[test]
+    fn file_names_chat_template_jinja_constant() {
+        assert_eq!(file_names::CHAT_TEMPLATE_JINJA, "chat_template.jinja");
+    }
+
+    #[test]
+    fn file_names_chat_template_json_constant() {
+        assert_eq!(file_names::CHAT_TEMPLATE_JSON, "chat_template.json");
+    }
+
+    // ── local-path chat template probe ───────────────────────────────────────
+
+    fn chat_template_probe(base: &Path) -> Option<PathBuf> {
+        let jinja = base.join(file_names::CHAT_TEMPLATE_JINJA);
+        let json = base.join(file_names::CHAT_TEMPLATE_JSON);
+        if jinja.exists() {
+            Some(jinja)
+        } else if json.exists() {
+            Some(json)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn local_path_prefers_jinja_over_json() {
+        let base = std::env::temp_dir().join("tur_test_jinja_over_json");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("chat_template.jinja"), "jinja").unwrap();
+        std::fs::write(base.join("chat_template.json"), "json").unwrap();
+
+        let result = chat_template_probe(&base);
+        assert_eq!(result, Some(base.join("chat_template.jinja")));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn local_path_falls_back_to_json_when_no_jinja() {
+        let base = std::env::temp_dir().join("tur_test_json_fallback");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("chat_template.json"), "json").unwrap();
+
+        let result = chat_template_probe(&base);
+        assert_eq!(result, Some(base.join("chat_template.json")));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn local_path_returns_none_when_no_chat_template_files() {
+        let base = std::env::temp_dir().join("tur_test_no_chat_template");
+        std::fs::create_dir_all(&base).unwrap();
+        // Ensure neither file exists in this fresh dir
+        let _ = std::fs::remove_file(base.join("chat_template.jinja"));
+        let _ = std::fs::remove_file(base.join("chat_template.json"));
+
+        let result = chat_template_probe(&base);
+        assert_eq!(result, None);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -1,9 +1,11 @@
 pub mod attention;
+pub mod granite_41;
 pub mod kv_cache;
 pub mod layers;
 pub mod qwen3;
 
 use candle_core::{DType, Result, Tensor};
+pub use granite_41::ModelForCausalLM as Granite41ModelForCausalLM;
 pub use qwen3::{Config, Model, ModelForCausalLM as Qwen35ModelForCausalLM};
 
 /// Input to [`ModelImpl::forward_modal`] for multimodal inference.
@@ -82,7 +84,15 @@ pub trait ModelImpl {
         paged_caches: Option<&mut [Vec<kv_cache::PagedKvCache>]>,
     ) -> Result<Tensor>;
 
-    fn format_prompt(&self, prompt: &str, thinking: bool) -> String;
+    /// Fallback prompt formatter used only when no chat template is loaded.
+    ///
+    /// In normal operation the pipeline renders prompts via the Jinja2 chat
+    /// template from `tokenizer_config.json` / `chat_template.jinja` and never
+    /// reaches this method.  Override only when the model ships without a
+    /// tokenizer config and needs a hardcoded offline fallback.
+    fn format_prompt(&self, prompt: &str, _thinking: bool) -> String {
+        prompt.to_string()
+    }
 
     /// Format a prompt with tool definitions injected as a system message.
     ///
@@ -112,4 +122,11 @@ pub trait ModelImpl {
 
     /// Clear KV cache in all layers
     fn clear_kv_cache(&mut self);
+
+    /// EOS token IDs from the model config.
+    /// Used to detect end-of-sequence without relying on hardcoded token strings.
+    /// Returns an empty vec when the config does not specify EOS IDs.
+    fn eos_token_ids(&self) -> Vec<u32> {
+        vec![]
+    }
 }
