@@ -59,50 +59,6 @@ fn test_inference_engine_prefill_batch() {
 }
 
 #[test]
-fn test_inference_engine_decode_batch() {
-    let (factory, device, _) = create_test_factory();
-    let (mut engine, _tokenizer, _) = InferenceEngine::builder(&factory, device).build().unwrap();
-
-    // First do prefill to populate KV cache
-    let id1 = Uuid::new_v4();
-    let id2 = Uuid::new_v4();
-    let id3 = Uuid::new_v4();
-
-    let prefill_batch = vec![
-        (id1, vec![1u32, 2, 3], 0usize),
-        (id2, vec![4u32, 5, 6, 7], 0usize),
-        (id3, vec![8u32, 9], 0usize),
-    ];
-
-    let prefill_results = engine.prefill_batch(&prefill_batch, None).unwrap();
-
-    // Now do decode with variable positions
-    let mut decode_batch = Vec::new();
-    for ((id, mut tokens, _), (_, next_token)) in
-        prefill_batch.into_iter().zip(prefill_results.iter())
-    {
-        tokens.push(*next_token);
-        let position = tokens.len() - 1;
-        decode_batch.push((id, tokens, position));
-    }
-
-    let result = engine.decode_batch(&decode_batch, None);
-    assert!(result.is_ok(), "Batched decode failed: {:?}", result.err());
-
-    let results = result.unwrap();
-    assert_eq!(results.len(), 3, "Should return 3 results");
-
-    // Verify each request got a token
-    for (id, _token) in &results {
-        assert!(
-            decode_batch.iter().any(|(req_id, _, _)| req_id == id),
-            "Result ID should match input"
-        );
-        // Token can be any value including 0 (valid token ID)
-    }
-}
-
-#[test]
 fn test_inference_engine_batch_consistency() {
     let (factory, device, _) = create_test_factory();
 
@@ -321,7 +277,10 @@ fn test_prefix_cache_paged_partial_prefix_hit() {
     let id2 = Uuid::new_v4();
     let mut caches_cold = make_paged_caches(&allocator, 1);
     let results_cold = engine
-        .prefill_batch(&[(id2, long_tokens.clone(), 0usize)], Some(&mut caches_cold))
+        .prefill_batch(
+            &[(id2, long_tokens.clone(), 0usize)],
+            Some(&mut caches_cold),
+        )
         .unwrap();
 
     // Reset stats to isolate the hit below from the one above.

@@ -116,6 +116,7 @@ fn test_pipeline_parameter_variations() {
 
 #[test]
 fn test_prefix_cache_full_hit() {
+    tur::shared::init_tracing();
     // Test the edge case where all tokens are cached
     let (factory, device, _) = create_test_factory();
 
