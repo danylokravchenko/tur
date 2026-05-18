@@ -184,20 +184,6 @@ Tool calling lets the model invoke external functions by emitting structured `<t
   },
   "required": ["location"]
 }
-
-// 2. Attach tools to the request (raw user message — no chat template needed)
-let request = GenerationRequest::new(
-    "What is the current weather in Paris?".to_string(),
-    200,
-)
-.with_tools(vec![get_weather]);
-
-// 3. Run and inspect parsed tool calls
-let stats = pipeline.run(&request)?;
-for call in &stats.tool_calls {
-    println!("Tool: {}  Args: {}", call.name, call.arguments);
-    // → Tool: get_weather  Args: {"location": "Paris, France", "unit": "celsius"}
-}
 ```
 
 ### Prompt formatting
