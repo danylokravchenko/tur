@@ -14,17 +14,15 @@ use common::create_test_factory;
 
 /// Build a `ParserFactory` for guided-generation tests.
 ///
-/// Loads the tokenizer via the engine builder (which also loads the model weights).
-/// Callers should pass the same `factory` to the pipeline builder afterwards; the
-/// model weights will be loaded a second time from the local HuggingFace cache,
-/// which is fast.
+/// Loads only the tokenizer from the factory — no model weights are
+/// instantiated — so the subsequent pipeline build does not load them twice.
 fn build_guidance_factory(
     factory: &tur::ModelFactory<tur::models::Qwen3ModelForCausalLM>,
-    device: Device,
+    _device: Device,
 ) -> Arc<tur::backend::guidance::ParserFactory> {
-    let (_, tokenizer, _) = InferenceEngine::builder(factory, device)
-        .build()
-        .expect("Failed to build engine to extract tokenizer");
+    let tokenizer = factory
+        .load_tokenizer_only()
+        .expect("Failed to load tokenizer");
     tur::backend::guidance::build_llg_factory(tokenizer, None)
         .expect("Failed to build guidance factory")
 }
@@ -116,6 +114,7 @@ fn test_pipeline_parameter_variations() {
 
 #[test]
 fn test_prefix_cache_full_hit() {
+    tur::shared::init_tracing();
     // Test the edge case where all tokens are cached
     let (factory, device, _) = create_test_factory();
 
@@ -648,6 +647,7 @@ fn test_guided_regex_output_is_only_digits() {
 /// We use a tight schema so the model closes the object quickly.
 #[test]
 fn test_guided_json_schema_output_is_valid_json() {
+    tur::shared::init_tracing();
     let (factory, device, _) = create_test_factory();
     let guidance_factory = build_guidance_factory(&factory, device.clone());
 
@@ -660,16 +660,19 @@ fn test_guided_json_schema_output_is_valid_json() {
         .on_token(move |s| output_clone.lock().unwrap().push_str(s))
         .build();
 
+    // additionalProperties: false + bounded integer keeps the output to
+    // {"value": <1-4 digit int>} so the grammar closes within the token budget.
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "value": { "type": "integer" }
+            "value": { "type": "integer", "minimum": 0, "maximum": 9999 }
         },
-        "required": ["value"]
+        "required": ["value"],
+        "additionalProperties": false
     });
 
     // Give enough tokens for the grammar to close the JSON object.
-    let request = GenerationRequest::new("Output JSON: ".to_string(), 60)
+    let request = GenerationRequest::new("Output JSON: ".to_string(), 30)
         .with_grammar(TopLevelGrammar::from_json_schema(schema));
 
     let stats = pipeline
