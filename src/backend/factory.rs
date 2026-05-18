@@ -94,6 +94,15 @@ impl<T: ModelConstructor> ModelFactory<T> {
         &self.device
     }
 
+    /// Loads only the tokenizer without instantiating the model weights.
+    ///
+    /// Useful when only the tokenizer is needed (e.g. building a guidance
+    /// factory) and loading the full model would be wasteful.
+    pub fn load_tokenizer_only(&self) -> Result<Tokenizer> {
+        let (paths, _gguf) = self.prepare_weights()?;
+        self.load_tokenizer(&paths)
+    }
+
     /// Creates and loads a model with its tokenizer and chat template.
     ///
     /// The chat template is loaded from `tokenizer_config.json` in the same

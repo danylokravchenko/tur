@@ -302,6 +302,8 @@ impl<T: ModelConstructor> InferenceEngine<T> {
         // restore all N entries and then re-process the last token in prefill,
         // the KV cache appends a duplicate entry at position N-1.  Trim to N-1
         // so prefill re-processes the final token against the correct history.
+        // We still report match_len as the cached count — all N tokens were
+        // available in cache; the trim is an implementation detail.
         if match_len == tokens.len() {
             if match_len == 1 {
                 // Cannot narrow to zero-length tensors safely; treat as miss.
@@ -317,8 +319,8 @@ impl<T: ModelConstructor> InferenceEngine<T> {
                 })
                 .collect::<candle_core::Result<Vec<_>>>()?;
             self.model.set_kv_cache_state(trimmed)?;
-            cache.record_hit(match_len - 1);
-            return Ok((true, match_len - 1));
+            cache.record_hit(match_len);
+            return Ok((true, match_len));
         }
 
         self.model.set_kv_cache_state(entry.kv_states.clone())?;
