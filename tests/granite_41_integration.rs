@@ -14,8 +14,8 @@ fn download_test_model() -> Result<(VarBuilderX<'static>, Config, Device)> {
     let dtype = DType::F32;
 
     let model_id = Some("ibm-granite/granite-4.1-3b".to_string());
-
-    let downloader = Downloader::new(model_id, None, None);
+    let quantization = Some("Q4_K_M".to_string());
+    let downloader = Downloader::new(model_id, None, quantization);
     let (paths, is_gguf) = downloader
         .prepare_model_weights()
         .map_err(|e| candle_core::Error::Msg(format!("Failed to prepare model: {}", e)))?;

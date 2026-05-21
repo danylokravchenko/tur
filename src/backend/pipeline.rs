@@ -50,6 +50,10 @@ pub struct GenerationRequest {
     /// tools are also set; for tool-free requests the caller is responsible for
     /// pre-formatting the prompt with the appropriate tag.
     pub thinking: bool,
+    /// When `true`, skip chat-template formatting and pass the text prompt
+    /// directly to the tokeniser.  Used by the OpenAI-compatible server after
+    /// it has already formatted the full conversation via `format_messages`.
+    pub raw: bool,
 }
 
 impl GenerationRequest {
@@ -62,6 +66,7 @@ impl GenerationRequest {
             grammar: None,
             tools: Vec::new(),
             thinking: false,
+            raw: false,
         }
     }
 
@@ -99,6 +104,15 @@ impl GenerationRequest {
     /// Enable extended thinking mode (Qwen3 `/think` tag).
     pub fn with_thinking(mut self, thinking: bool) -> Self {
         self.thinking = thinking;
+        self
+    }
+
+    /// Skip chat-template formatting and pass the text prompt directly to the
+    /// tokeniser.  Use this when the caller has already formatted the full
+    /// conversation (e.g. the OpenAI-compatible server pre-formats multi-turn
+    /// chats via [`InferencePipeline::format_messages`]).
+    pub fn with_raw(mut self, raw: bool) -> Self {
+        self.raw = raw;
         self
     }
 }
@@ -500,7 +514,9 @@ impl<T: ModelConstructor> InferencePipeline<T> {
         self.tokenizer.clear();
 
         let text = request.text_prompt();
-        let prompt_str = if has_tools {
+        let prompt_str = if request.raw {
+            text.to_string()
+        } else if has_tools {
             self.format_prompt_with_tools(text, &request.tools, request.thinking)
         } else {
             self.format_prompt(text, request.thinking)
@@ -701,6 +717,42 @@ impl<T: ModelConstructor> InferencePipeline<T> {
                     .ok()
             })
             .unwrap_or_else(|| self.engine.model().format_prompt(prompt, thinking))
+    }
+
+    /// Format a full multi-turn conversation using the loaded Jinja2 chat
+    /// template.  Falls back to formatting only the last user message through
+    /// the model's static `format_prompt` when no template is available.
+    ///
+    /// Pair with [`GenerationRequest::with_raw`] so `run` does not re-wrap the
+    /// already-formatted prompt in another user turn.
+    pub fn format_messages(
+        &self,
+        messages: &[crate::backend::chat_template::Message],
+        tools: Option<&[crate::backend::tools::ToolDefinition]>,
+        thinking: bool,
+    ) -> String {
+        let non_empty_tools = tools.filter(|t| !t.is_empty());
+        if let Some(ct) = &self.chat_template {
+            match ct.format(messages, non_empty_tools, true, thinking) {
+                Ok(s) => return s,
+                Err(e) => {
+                    tracing::warn!(
+                        "Chat template render error in format_messages: {e}; falling back"
+                    );
+                }
+            }
+        }
+        // Full ChatML fallback: format every message so context is preserved.
+        let mut prompt = String::new();
+        for msg in messages {
+            prompt.push_str("<|im_start|>");
+            prompt.push_str(&msg.role);
+            prompt.push('\n');
+            prompt.push_str(&msg.content);
+            prompt.push_str("<|im_end|>\n");
+        }
+        prompt.push_str("<|im_start|>assistant\n");
+        prompt
     }
 
     /// Format a raw user message with tool definitions using the loaded Jinja2

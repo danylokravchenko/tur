@@ -85,7 +85,7 @@ impl ChatTemplate {
     /// The template is validated at construction time; returns an error if
     /// the syntax is invalid.
     pub fn from_template(template: impl Into<String>) -> Result<Self> {
-        let template_str = template.into();
+        let template_str = preprocess_template(&template.into());
         // Validate syntax eagerly so callers get a clear error at load time
         // rather than at the first render call.
         let mut env = minijinja::Environment::new();
@@ -117,6 +117,31 @@ impl ChatTemplate {
         // `raise_exception` is called by some HuggingFace templates to reject
         // unsupported configurations (e.g. system messages in tool-call mode).
         env.add_function("raise_exception", raise_exception);
+
+        // Python string methods that HuggingFace templates rely on but minijinja
+        // does not provide natively.  The template preprocessor rewrites method
+        // call syntax (`.startswith(…)`) to filter syntax (`| startswith(…)`)
+        // so these filters are always registered.
+        env.add_filter("startswith", |s: &str, prefix: &str| s.starts_with(prefix));
+        env.add_filter("endswith", |s: &str, suffix: &str| s.ends_with(suffix));
+        env.add_filter("split_first", |s: &str, sep: &str| {
+            s.split(sep).next().unwrap_or(s).to_string()
+        });
+        env.add_filter("split_last", |s: &str, sep: &str| {
+            s.rsplit(sep).next().unwrap_or(s).to_string()
+        });
+        env.add_filter("py_rstrip", |s: &str, chars: &str| -> String {
+            let set: Vec<char> = chars.chars().collect();
+            s.trim_end_matches(|c| set.contains(&c)).to_string()
+        });
+        env.add_filter("py_lstrip", |s: &str, chars: &str| -> String {
+            let set: Vec<char> = chars.chars().collect();
+            s.trim_start_matches(|c| set.contains(&c)).to_string()
+        });
+        env.add_filter("py_strip", |s: &str, chars: &str| -> String {
+            let set: Vec<char> = chars.chars().collect();
+            s.trim_matches(|c| set.contains(&c)).to_string()
+        });
 
         env.add_template("chat", &self.template_str)
             .map_err(|e| TurError::Other(format!("chat template compile error: {e}")))?;
@@ -176,6 +201,40 @@ fn raise_exception(msg: String) -> std::result::Result<minijinja::Value, minijin
         minijinja::ErrorKind::InvalidOperation,
         msg,
     ))
+}
+
+/// Convert Python string method calls to equivalent minijinja filter chains.
+///
+/// HuggingFace Jinja2 templates use Python-style methods (`.startswith()`,
+/// `.split()[0]`, `.rstrip()`, etc.) that minijinja does not support on plain
+/// string values.  This function rewrites those method calls to the registered
+/// custom filters, which minijinja evaluates correctly.
+///
+/// Ordering matters: longer/overlapping patterns are replaced before shorter
+/// ones to avoid partial matches (e.g. `.rstrip` before `.strip`).
+fn preprocess_template(template: &str) -> String {
+    // Replace .split('X')[0] and .split('X')[-1] before the simpler strip
+    // variants so that the chain A.split(X)[0].rstrip(Y) becomes
+    // A | split_first(X) | py_rstrip(Y) after all passes.
+    //
+    // Pass order:
+    //   1. rstrip / lstrip (before plain strip to avoid substring collision)
+    //   2. strip
+    //   3. split(…)[-1]  (before split(…)[0] so [-1] is handled first)
+    //   4. split(…)[0]
+    //   5. startswith / endswith
+    template
+        .replace(".rstrip(", " | py_rstrip(")
+        .replace(".lstrip(", " | py_lstrip(")
+        .replace(".strip(", " | py_strip(")
+        .replace(".split('</think>')[0]", " | split_first('</think>')")
+        .replace(".split('</think>')[-1]", " | split_last('</think>')")
+        .replace(".split('<think>')[-1]", " | split_last('<think>')")
+        .replace(".split(\"</think>\")[0]", " | split_first('</think>')")
+        .replace(".split(\"</think>\")[-1]", " | split_last('</think>')")
+        .replace(".split(\"<think>\")[-1]", " | split_last('<think>')")
+        .replace(".startswith(", " | startswith(")
+        .replace(".endswith(", " | endswith(")
 }
 
 #[cfg(test)]
@@ -239,5 +298,66 @@ mod tests {
             ct.format(&msgs, None, false, false).expect("ok").trim(),
             "nothink"
         );
+    }
+
+    #[test]
+    fn python_string_methods_work_in_template() {
+        // The Qwen3 template uses .startswith() and .endswith() on message content.
+        let template =
+            "{% if messages[0].content | startswith('Hello') %}yes{% else %}no{% endif %}";
+        let ct = ChatTemplate::from_template(
+            "{% if messages[0].content.startswith('Hello') %}yes{% else %}no{% endif %}",
+        )
+        .expect("valid template");
+        let msgs = vec![Message::user("Hello world")];
+        assert_eq!(ct.format(&msgs, None, false, false).expect("ok"), "yes");
+        let msgs2 = vec![Message::user("Goodbye")];
+        assert_eq!(ct.format(&msgs2, None, false, false).expect("ok"), "no");
+
+        // Verify the preprocessed form also works directly.
+        let ct2 = ChatTemplate::from_template(template).expect("valid template");
+        assert_eq!(ct2.format(&msgs, None, false, false).expect("ok"), "yes");
+    }
+
+    #[test]
+    fn split_first_and_last_filters_work() {
+        let template = concat!(
+            "{%- set before = text | split_first('</think>') %}\n",
+            "{%- set after = text | split_last('</think>') %}\n",
+            "before={{ before }},after={{ after }}"
+        );
+        let _ct = ChatTemplate::from_template(template).expect("valid template");
+        let mut ctx = serde_json::Map::new();
+        ctx.insert(
+            "text".to_string(),
+            serde_json::Value::String("think\n<think>content</think>\nresult".to_string()),
+        );
+        ctx.insert("messages".to_string(), serde_json::Value::Array(vec![]));
+        ctx.insert(
+            "add_generation_prompt".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        ctx.insert(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        // Use format directly with a custom context to test the filters.
+        let mut env = minijinja::Environment::new();
+        env.add_filter("split_first", |s: &str, sep: &str| {
+            s.split(sep).next().unwrap_or(s).to_string()
+        });
+        env.add_filter("split_last", |s: &str, sep: &str| {
+            s.rsplit(sep).next().unwrap_or(s).to_string()
+        });
+        env.add_template("t", template).expect("ok");
+        let out = env
+            .get_template("t")
+            .expect("ok")
+            .render(minijinja::Value::from_serialize(serde_json::Value::Object(
+                ctx,
+            )))
+            .expect("render ok");
+        assert!(out.contains("before=think\n<think>content"), "got: {out}");
+        assert!(out.contains("after=\nresult"), "got: {out}");
     }
 }

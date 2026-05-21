@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod models;
+pub mod server;
 pub mod shared;
 pub mod weights;
 
