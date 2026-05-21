@@ -25,7 +25,8 @@ mod extensions {
 }
 
 mod repos {
-    pub const DEFAULT_ORG: &str = "Qwen";
+    pub const QWEN_ORG: &str = "Qwen";
+    pub const GRANITE_ORG: &str = "ibm-granite";
     pub const GGUF_ORG: &str = "unsloth";
     pub const GGUF_SUFFIX: &str = "-GGUF";
     pub const DEFAULT_REVISION: &str = "main";
@@ -327,12 +328,15 @@ fn load_local_safetensors(path: &str) -> Result<Vec<PathBuf>> {
 /// Resolve a simplified model ID to its full HuggingFace repo path.
 ///
 /// - `"Qwen3-0.6B"` → `"Qwen/Qwen3-0.6B"`
+/// - `"granite-4.1-8b-instruct"` → `"ibm-granite/granite-4.1-8b-instruct"`
 /// - `"Qwen/Qwen3-0.6B"` → `"Qwen/Qwen3-0.6B"` (already qualified)
 fn resolve_model_repo(model_id: &str) -> String {
     if model_id.contains('/') {
         model_id.to_string()
+    } else if model_id.to_lowercase().contains("granite") {
+        format!("{}/{}", repos::GRANITE_ORG, model_id)
     } else {
-        format!("{}/{}", repos::DEFAULT_ORG, model_id)
+        format!("{}/{}", repos::QWEN_ORG, model_id)
     }
 }
 
@@ -553,6 +557,22 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_model_repo_granite_shorthand() {
+        assert_eq!(
+            resolve_model_repo("granite-4.1-8b-instruct"),
+            "ibm-granite/granite-4.1-8b-instruct"
+        );
+    }
+
+    #[test]
+    fn test_resolve_model_repo_granite_full_path() {
+        assert_eq!(
+            resolve_model_repo("ibm-granite/granite-4.1-8b-instruct"),
+            "ibm-granite/granite-4.1-8b-instruct"
+        );
+    }
+
+    #[test]
     fn test_resolve_gguf_repos_simple_name() {
         let (config_repo, gguf_repo) = resolve_gguf_repos("Qwen3-0.6B");
         assert_eq!(config_repo, "Qwen/Qwen3-0.6B");
@@ -571,6 +591,20 @@ mod tests {
         let (config_repo, gguf_repo) = resolve_gguf_repos("custom-org/model-name");
         assert_eq!(config_repo, "custom-org/model-name");
         assert_eq!(gguf_repo, "unsloth/model-name-GGUF");
+    }
+
+    #[test]
+    fn test_resolve_gguf_repos_granite_shorthand() {
+        let (config_repo, gguf_repo) = resolve_gguf_repos("granite-4.1-8b-instruct");
+        assert_eq!(config_repo, "ibm-granite/granite-4.1-8b-instruct");
+        assert_eq!(gguf_repo, "unsloth/granite-4.1-8b-instruct-GGUF");
+    }
+
+    #[test]
+    fn test_resolve_gguf_repos_granite_full_path() {
+        let (config_repo, gguf_repo) = resolve_gguf_repos("ibm-granite/granite-4.1-8b-instruct");
+        assert_eq!(config_repo, "ibm-granite/granite-4.1-8b-instruct");
+        assert_eq!(gguf_repo, "unsloth/granite-4.1-8b-instruct-GGUF");
     }
 
     #[test]

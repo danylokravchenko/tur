@@ -23,7 +23,7 @@ A high-performance Rust inference engine for transformer models, built on [Candl
 | Family | HuggingFace ID examples | Quantization | Thinking | Tools |
 | ------ | ----------------------- | ------------ | -------- | ----- |
 | **Qwen3** | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-4B`, `Qwen/Qwen3-8B` | SafeTensors (BF16) or GGUF (`Q4_K_M`, `Q8_0`, …) | ✅ `--thinking` flag injects `/think` tag | ✅ `<tool_call>` blocks |
-| **Granite 4.1** | `ibm-granite/granite-4.1-3b` | SafeTensors (F32 on CPU) | ⚠️ inherent model behaviour; `--thinking` flag ignored | ✅ `<tool_call>` blocks via chat template |
+| **Granite 4.1** | `ibm-granite/granite-4.1-3b` | SafeTensors (BF16) or GGUF (`Q4_K_M`, `Q8_0`, …) | ⚠️ inherent model behaviour; `--thinking` flag ignored | ✅ `<tool_call>` blocks via chat template |
 
 Auto-detection reads `model_type` from `config.json` (`"qwen3"`, `"granite"`), so passing the HuggingFace repo ID is enough — no extra flags required.
 
