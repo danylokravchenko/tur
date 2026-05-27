@@ -16,7 +16,7 @@ pub use audio_encoder::AudioEncoder;
 pub use engine::{InferenceEngine, InferenceEngineBuilder};
 pub use factory::{AnyModel, AnyModelConfig, AutoModelFactory, ModelFactory, ModelKind};
 pub use pipeline::{
-    GenerationRequest, GenerationResult, GenerationStats, InferencePipeline,
+    BatchStepOutput, GenerationRequest, GenerationResult, GenerationStats, InferencePipeline,
     InferencePipelineBuilder, ModalInput, RequestHandle,
 };
 pub use scheduler::SchedulingPolicy;

@@ -489,6 +489,12 @@ impl<T: ModelConstructor> InferenceEngine<T> {
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<(u32, std::time::Duration, bool, usize)> {
         let start = std::time::Instant::now();
 
+        // Clear stale KV state from the previous request before restoring from
+        // the prefix cache (which may overwrite it) or running a cold prefill.
+        // Without this, leftover entries from a prior generation corrupt the
+        // attention scores for the new prompt.
+        self.model.clear_kv_cache();
+
         // Try to restore from cache
         let (cache_hit, cached_len) = self.try_restore_from_cache(tokens)?;
 

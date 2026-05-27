@@ -198,6 +198,191 @@ Set `--enable-thinking` on the call to enable chain-of-thought reasoning alongsi
 
 Tool calling and grammar-constrained generation can be used together. Attach both `.with_tools(…)` and `.with_grammar(…)` to the same request to restrict which tokens the model can emit while still parsing tool calls from the output.
 
+## OpenAI-Compatible Server
+
+Tur ships a web server (`src/bin/server.rs`) that exposes an OpenAI-compatible REST API.  Any client that speaks the OpenAI Chat Completions protocol — `curl`, the `openai` Python SDK, LangChain, LlamaIndex, etc. — works without modification.
+
+### Starting the server
+
+```bash
+# Minimal — load a model from HuggingFace and listen on 127.0.0.1:8080
+cargo run --bin server -- --model-id Qwen/Qwen3-0.6B
+
+# Quantized model, custom host/port, and larger batch size
+cargo run --bin server -- \
+  --model-id Qwen/Qwen3-0.6B \
+  --quantization Q4_K_M \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --max-batch-size 16
+```
+
+### Chat completions — non-streaming
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-0.6B",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user",   "content": "What is the capital of France?"}
+    ]
+  }'
+```
+
+Response:
+
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": 1748000000,
+  "model": "Qwen/Qwen3-0.6B",
+  "choices": [{
+    "index": 0,
+    "message": {"role": "assistant", "content": "The capital of France is Paris."},
+    "finish_reason": "stop"
+  }],
+  "usage": {"prompt_tokens": 0, "completion_tokens": 9, "total_tokens": 9}
+}
+```
+
+### Chat completions — streaming (SSE)
+
+Add `"stream": true` to receive tokens as Server-Sent Events as they are generated:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  --no-buffer \
+  -d '{
+    "model": "Qwen/Qwen3-0.6B",
+    "messages": [{"role": "user", "content": "Count to five."}],
+    "stream": true
+  }'
+```
+
+Each SSE event carries a `chat.completion.chunk` object.  The stream ends with `data: [DONE]`.
+
+### Tool calling
+
+Define tools in your request; the server injects the schema into the prompt and parses `<tool_call>` blocks from the model output:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-0.6B",
+    "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {"type": "string", "description": "City name"},
+            "unit":     {"type": "string", "enum": ["celsius", "fahrenheit"]}
+          },
+          "required": ["location"]
+        }
+      }
+    }]
+  }'
+```
+
+When the model decides to call a tool the response looks like:
+
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_abc123",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"location\": \"Tokyo\", \"unit\": \"celsius\"}"
+        }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+### Extended thinking (Qwen3)
+
+Pass `"thinking": true` to enable chain-of-thought reasoning before the final answer:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-0.6B",
+    "messages": [{"role": "user", "content": "Solve: if 2x + 3 = 11, what is x?"}],
+    "thinking": true
+  }'
+```
+
+### Parallel request processing and continuous batching
+
+The server uses **continuous batching**: instead of processing requests one at a time, every incoming request is submitted to a shared `ContinuousBatchScheduler`. Each scheduler iteration:
+
+1. **Admits** any newly queued requests (memory-permitting).
+2. **Prefills** a batch of admitted requests in a single GPU forward pass.
+3. **Decodes** all in-progress requests together, advancing every sequence by one token per iteration.
+4. **Streams** each new token to its originating HTTP response immediately.
+5. **Completes** requests that hit EOS or `max_tokens`, freeing their paged KV cache blocks.
+
+This means `N` concurrent clients each get tokens interleaved in real time rather than waiting for the previous client to finish.  Throughput scales near-linearly with batch size up to the VRAM limit.
+
+**Firing parallel requests with curl:**
+
+```bash
+# Launch four simultaneous requests in the background
+for i in 1 2 3 4; do
+  curl -s http://localhost:8080/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"model\": \"Qwen/Qwen3-0.6B\",
+      \"messages\": [{\"role\": \"user\", \"content\": \"Tell me a fact number $i\"}]
+    }" &
+done
+wait
+```
+
+**Streaming four responses in parallel:**
+
+```bash
+for i in 1 2 3 4; do
+  curl -s http://localhost:8080/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    --no-buffer \
+    -d "{
+      \"model\": \"Qwen/Qwen3-0.6B\",
+      \"messages\": [{\"role\": \"user\", \"content\": \"Fact $i\"}],
+      \"stream\": true
+    }" > /tmp/stream_$i.txt &
+done
+wait
+grep -h "content" /tmp/stream_*.txt | head -20
+```
+
+**Tuning `--max-batch-size`:**
+
+| Workload | Recommendation |
+| --- | --- |
+| Single user / interactive | `4` — low latency, minimal overhead |
+| Multi-user API server | `8`–`16` — default; good throughput/latency balance |
+| Batch inference / offline | `32`+ — maximise GPU utilisation; needs more VRAM |
+
+The scheduler's memory-based admission control prevents OOM: requests that would exceed available KV cache memory are queued until earlier requests complete and free their blocks.
+
 ## Advanced Configuration
 
 ### Sampling Parameters
@@ -244,12 +429,6 @@ Available benchmark groups:
 | `prefix_cache_lengths` | Cache hit speedup across varying prefix lengths |
 | `batch_prefill` | Batched prefill throughput (batch sizes 1/2/4), no-cache vs. with paged prefix cache |
 | `chunked_prefill` | Single-shot vs. chunked prefill (chunk sizes 16/32/64) for each prompt length; shows total overhead and per-chunk latency |
-
-### Documentation
-
-```bash
-cargo doc --open
-```
 
 ## License
 
