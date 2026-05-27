@@ -1,9 +1,16 @@
 /// Integration tests for the OpenAI-compatible HTTP server.
 ///
-/// All tests use a mock `PipelineWorker` so no model weights are needed.
-/// The axum router is exercised via `tower::ServiceExt::oneshot`, which
-/// dispatches a single request without binding a TCP socket.
-use std::time::Duration;
+/// All tests use a mock `PipelineWorker` (via `PipelineWorker::from_sender`)
+/// so no model weights are needed.  The mock task simulates the contract that
+/// the real continuous-batching worker upholds:
+///   1. Drain `WorkerMsg`s from the channel concurrently.
+///   2. Stream tokens via `token_tx` for each request independently.
+///   3. Close `token_tx` and send `GenerationStats` via `result_tx` when done.
+///
+/// The axum router is exercised via `tower::ServiceExt::oneshot` (no TCP
+/// socket needed) for single-request tests, and via a shared `axum::Router`
+/// clone for concurrent-request tests.
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -24,19 +31,25 @@ use tur::{
 
 /// Spawn a Tokio task that acts as the pipeline backend, replying to every
 /// generation request with `response_text` split into words.
+///
+/// The channel capacity matches the real worker (256) so concurrent tests
+/// don't block on enqueue.
 fn mock_worker(response_text: &'static str) -> PipelineWorker {
-    let (tx, mut rx) = mpsc::channel::<WorkerMsg>(4);
+    let (tx, mut rx) = mpsc::channel::<WorkerMsg>(256);
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
+            // Stream words via token_tx (for SSE/streaming consumers).
             for word in response_text.split_whitespace() {
                 let _ = msg.token_tx.send(word.to_string());
                 let _ = msg.token_tx.send(" ".to_string());
             }
             drop(msg.token_tx);
+            // generated_text is used by the non-streaming path in blocking_response.
             let _ = msg.result_tx.send(Ok(GenerationStats {
                 generated_tokens: response_text.split_whitespace().count(),
                 elapsed: Duration::from_millis(1),
                 tool_calls: vec![],
+                generated_text: response_text.to_string(),
             }));
         }
     });
@@ -45,7 +58,7 @@ fn mock_worker(response_text: &'static str) -> PipelineWorker {
 
 /// Spawn a mock that returns a single tool call instead of text.
 fn mock_tool_call_worker(tool_name: &'static str, args_json: &'static str) -> PipelineWorker {
-    let (tx, mut rx) = mpsc::channel::<WorkerMsg>(4);
+    let (tx, mut rx) = mpsc::channel::<WorkerMsg>(256);
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             drop(msg.token_tx);
@@ -57,6 +70,7 @@ fn mock_tool_call_worker(tool_name: &'static str, args_json: &'static str) -> Pi
                 generated_tokens: 1,
                 elapsed: Duration::from_millis(1),
                 tool_calls: vec![tc],
+                generated_text: String::new(),
             }));
         }
     });
@@ -386,4 +400,204 @@ async fn chat_streaming_first_chunk_has_role() {
         chunk["choices"][0]["delta"]["role"], "assistant",
         "first chunk must establish role"
     );
+}
+
+// ── Concurrent / batching behaviour ──────────────────────────────────────────
+
+/// Send N non-streaming requests simultaneously and assert every one
+/// returns 200 with an assistant message.  This validates that the HTTP layer
+/// and mock worker correctly handle multiple in-flight requests — the same
+/// contract the continuous-batch worker upholds for real model requests.
+#[tokio::test]
+async fn concurrent_non_streaming_requests_all_complete() {
+    const N: usize = 8;
+
+    // axum::Router is cheaply clone-able — each `oneshot` call consumes a clone.
+    let router = Arc::new(build_router(test_state("parallel answer")));
+
+    let handles: Vec<_> = (0..N)
+        .map(|i| {
+            let router = Arc::clone(&router);
+            tokio::spawn(async move {
+                let app = (*router).clone();
+                let resp = app
+                    .oneshot(json_request(
+                        "/v1/chat/completions",
+                        "POST",
+                        json!({
+                            "model": "test-model",
+                            "messages": [{"role": "user", "content": format!("msg {i}")}]
+                        }),
+                    ))
+                    .await
+                    .expect("response");
+
+                let status = resp.status();
+                let json = body_json(resp.into_body()).await;
+                (status, json)
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let (status, json) = handle.await.expect("task");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+        let content = json["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content string");
+        assert!(
+            content.contains("parallel"),
+            "unexpected content: {content}"
+        );
+    }
+}
+
+/// Same as above but with streaming.  Every SSE stream must terminate with
+/// `[DONE]` and carry at least one `chat.completion.chunk` event, even when
+/// multiple streams are open at the same time.
+#[tokio::test]
+async fn concurrent_streaming_requests_all_complete() {
+    const N: usize = 8;
+
+    let router = Arc::new(build_router(test_state("streamed token")));
+
+    let handles: Vec<_> = (0..N)
+        .map(|i| {
+            let router = Arc::clone(&router);
+            tokio::spawn(async move {
+                let app = (*router).clone();
+                let resp = app
+                    .oneshot(json_request(
+                        "/v1/chat/completions",
+                        "POST",
+                        json!({
+                            "model": "test-model",
+                            "messages": [{"role": "user", "content": format!("stream {i}")}],
+                            "stream": true
+                        }),
+                    ))
+                    .await
+                    .expect("response");
+
+                assert_eq!(resp.status(), StatusCode::OK);
+
+                let bytes = resp
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("collect")
+                    .to_bytes();
+
+                std::str::from_utf8(&bytes).expect("utf8").to_string()
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let body = handle.await.expect("task");
+        assert!(body.contains("[DONE]"), "stream must end with [DONE]");
+        assert!(
+            body.contains("chat.completion.chunk"),
+            "stream must contain chunk objects"
+        );
+    }
+}
+
+/// Verify that a mix of streaming and non-streaming requests in-flight at the
+/// same time all receive correct responses — this mirrors real usage where
+/// different clients use different modes simultaneously.
+#[tokio::test]
+async fn mixed_streaming_and_non_streaming_concurrent() {
+    let router = Arc::new(build_router(test_state("mixed result")));
+
+    let non_stream_handle = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move {
+            (*router)
+                .clone()
+                .oneshot(json_request(
+                    "/v1/chat/completions",
+                    "POST",
+                    json!({
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "blocking"}]
+                    }),
+                ))
+                .await
+                .expect("response")
+        })
+    };
+
+    let stream_handle = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move {
+            (*router)
+                .clone()
+                .oneshot(json_request(
+                    "/v1/chat/completions",
+                    "POST",
+                    json!({
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "streaming"}],
+                        "stream": true
+                    }),
+                ))
+                .await
+                .expect("response")
+        })
+    };
+
+    let (non_stream_resp, stream_resp) = tokio::join!(non_stream_handle, stream_handle);
+
+    let ns = non_stream_resp.expect("non-stream task");
+    assert_eq!(ns.status(), StatusCode::OK);
+    let json = body_json(ns.into_body()).await;
+    assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+
+    let ss = stream_resp.expect("stream task");
+    assert_eq!(ss.status(), StatusCode::OK);
+    let bytes = ss.into_body().collect().await.expect("collect").to_bytes();
+    let body = std::str::from_utf8(&bytes).expect("utf8");
+    assert!(body.contains("[DONE]"));
+}
+
+/// The worker channel has capacity 256.  Enqueuing more requests than the old
+/// capacity (4) must never return 503 — all requests must eventually complete.
+#[tokio::test]
+async fn large_burst_of_requests_does_not_return_503() {
+    const N: usize = 32;
+
+    let router = Arc::new(build_router(test_state("burst ok")));
+
+    let handles: Vec<_> = (0..N)
+        .map(|_| {
+            let router = Arc::clone(&router);
+            tokio::spawn(async move {
+                (*router)
+                    .clone()
+                    .oneshot(json_request(
+                        "/v1/chat/completions",
+                        "POST",
+                        json!({
+                            "model": "test-model",
+                            "messages": [{"role": "user", "content": "burst"}]
+                        }),
+                    ))
+                    .await
+                    .expect("response")
+                    .status()
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let status = handle.await.expect("task");
+        assert_ne!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no request in a burst of {N} should return 503"
+        );
+        assert_eq!(status, StatusCode::OK);
+    }
 }

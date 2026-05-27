@@ -58,6 +58,12 @@ struct Args {
     /// Context window for repetition penalty.
     #[arg(long, default_value_t = 64)]
     repeat_last_n: usize,
+
+    /// Maximum number of requests processed in parallel by the continuous
+    /// batch scheduler.  Higher values increase GPU utilisation but require
+    /// more VRAM.
+    #[arg(long, default_value_t = 8, env = "MAX_BATCH_SIZE")]
+    max_batch_size: usize,
 }
 
 #[tokio::main]
@@ -96,7 +102,10 @@ async fn main() -> Result<()> {
         dtype,
     ));
 
-    info!("Spawning pipeline worker (model loading happens here)…");
+    info!(
+        max_batch_size = args.max_batch_size,
+        "Spawning pipeline worker with continuous batching…"
+    );
     let worker = PipelineWorker::spawn(WorkerConfig {
         factory,
         seed: args.seed,
@@ -104,6 +113,7 @@ async fn main() -> Result<()> {
         top_p: args.top_p,
         repeat_penalty: args.repeat_penalty,
         repeat_last_n: args.repeat_last_n,
+        max_batch_size: args.max_batch_size,
     })?;
 
     let state = AppState { worker, model_id };

@@ -267,18 +267,17 @@ impl BatchManager {
     pub fn complete_request(&mut self, id: &Uuid) -> Result<Vec<u32>> {
         if let Some(mut request) = self.active_requests.remove(id) {
             request.phase = RequestPhase::Completed;
-            let tokens = request.all_tokens();
+            let generated = request.generated_tokens.clone();
             let elapsed = request.elapsed();
             debug!(
                 request_id = %id,
-                generated_tokens = request.generated_tokens.len(),
-                total_tokens = tokens.len(),
+                generated_tokens = generated.len(),
                 elapsed_ms = elapsed.as_millis(),
                 active_requests = self.active_requests.len(),
                 "Completed request"
             );
-            self.completed_requests.insert(*id, tokens.clone());
-            Ok(tokens)
+            self.completed_requests.insert(*id, generated.clone());
+            Ok(generated)
         } else {
             Err(TurError::RequestNotFound(id.to_string()))
         }
@@ -498,7 +497,7 @@ mod tests {
         manager.admit_request().unwrap();
 
         let tokens = manager.complete_request(&id).unwrap();
-        assert_eq!(tokens, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(tokens, vec![4, 5, 6]);
         assert_eq!(manager.num_active_requests(), 0);
         assert_eq!(manager.completed_requests.len(), 1);
     }

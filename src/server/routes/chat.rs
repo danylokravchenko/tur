@@ -131,10 +131,11 @@ async fn blocking_response(
         }
     };
 
-    let mut full_text = String::new();
-    while let Ok(t) = token_rx.try_recv() {
-        full_text.push_str(&t);
-    }
+    // Drain the token channel (it will be closed by this point) but rely on
+    // stats.generated_text for the actual response content — individual tokens
+    // decoded per-step may be incomplete for BPE tokenizers.
+    while token_rx.try_recv().is_ok() {}
+    let full_text = stats.generated_text.clone();
 
     let (content, response_tool_calls) = if stats.tool_calls.is_empty() {
         (Some(full_text), vec![])

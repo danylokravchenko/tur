@@ -73,7 +73,17 @@ pub struct ExecutionBatch {
     pub total_tokens: usize,
 }
 
-type ScheduleIterationOutput = (Uuid, Vec<u32>, String, std::time::Instant);
+type CompletedRequest = (Uuid, Vec<u32>, String, std::time::Instant);
+
+/// Output of a single scheduling iteration.
+pub struct IterationOutput {
+    /// Requests that finished this iteration: (id, generated_tokens, prompt, arrival_time).
+    pub completed: Vec<CompletedRequest>,
+    /// Tokens produced by the decode step for requests that are still in progress.
+    /// Each entry is `(request_id, token_id)`.  EOS/im_end tokens are excluded —
+    /// only real content tokens are included here.
+    pub new_tokens: Vec<(Uuid, u32)>,
+}
 
 /// Continuous batch scheduler
 pub struct ContinuousBatchScheduler {
@@ -587,12 +597,13 @@ impl ContinuousBatchScheduler {
         self.batch_manager.get_request(request_id)
     }
 
-    /// Main scheduling iteration - admits requests, forms batches, and executes them
-    /// Returns list of completed requests with their generated tokens, prompt, and arrival time
+    /// Main scheduling iteration - admits requests, forms batches, and executes them.
+    /// Returns an [`IterationOutput`] with completed requests and the new token emitted
+    /// by each still-active request during the decode step.
     pub fn schedule_iteration<T: ModelConstructor>(
         &mut self,
         engine: &mut crate::backend::engine::InferenceEngine<T>,
-    ) -> Result<Vec<ScheduleIterationOutput>> {
+    ) -> Result<IterationOutput> {
         trace!("Starting scheduler iteration");
 
         // 1. Admit new requests from queue
@@ -602,6 +613,7 @@ impl ContinuousBatchScheduler {
         }
 
         let mut completed = Vec::new();
+        let mut new_tokens: Vec<(Uuid, u32)> = Vec::new();
 
         // 2. Form and execute prefill batch
         if let Some(prefill_batch) = self.form_prefill_batch() {
@@ -670,6 +682,7 @@ impl ContinuousBatchScheduler {
                             // Final chunk — the returned token is the first generated token.
                             request.generated_tokens.push(first_token);
                             request.position = prompt_len;
+                            new_tokens.push((request_id, first_token));
                             true
                         } else {
                             // Intermediate chunk — stay in Prefilling for the next iteration.
@@ -685,6 +698,7 @@ impl ContinuousBatchScheduler {
                         // No chunking — existing single-shot behaviour.
                         request.generated_tokens.push(first_token);
                         request.position = request.prompt_tokens.len();
+                        new_tokens.push((request_id, first_token));
                         true
                     }
                 } else {
@@ -737,17 +751,22 @@ impl ContinuousBatchScheduler {
 
             // Update request states and check for completion
             for (request_id, next_token) in results {
+                let is_eos = next_token == self.eos_token || next_token == self.im_end_token;
+
                 let should_complete = if let Some(request) = self.get_request_mut(&request_id) {
                     request.generated_tokens.push(next_token);
                     request.position += 1;
 
                     // Check if request should stop
-                    request.should_stop()
-                        || next_token == self.eos_token
-                        || next_token == self.im_end_token
+                    request.should_stop() || is_eos
                 } else {
                     false
                 };
+
+                // Stream real content tokens to callers; skip EOS/im_end.
+                if !is_eos {
+                    new_tokens.push((request_id, next_token));
+                }
 
                 // Complete request if needed
                 if should_complete {
@@ -765,7 +784,10 @@ impl ContinuousBatchScheduler {
             }
         }
 
-        Ok(completed)
+        Ok(IterationOutput {
+            completed,
+            new_tokens,
+        })
     }
 }
 
@@ -929,9 +951,9 @@ mod tests {
         scheduler.enqueue_request(request);
         scheduler.admit_requests().unwrap();
 
-        // Complete request
-        let tokens = scheduler.complete_request(&request_id).unwrap();
-        assert!(!tokens.is_empty());
+        // Complete request — no generated tokens were pushed so the slice is empty,
+        // but the call must succeed and remove the request.
+        let _tokens = scheduler.complete_request(&request_id).unwrap();
 
         // Request should no longer be active
         assert!(scheduler.get_request(&request_id).is_none());
@@ -1152,8 +1174,7 @@ mod tests {
         assert_eq!(batch.phase, RequestPhase::Decoding);
 
         // 6. Complete
-        let tokens = scheduler.complete_request(&request_id).unwrap();
-        assert!(!tokens.is_empty());
+        let _tokens = scheduler.complete_request(&request_id).unwrap();
         assert!(scheduler.get_request(&request_id).is_none());
     }
 
@@ -1202,10 +1223,8 @@ mod tests {
         assert_eq!(batch.request_ids.len(), 2);
 
         // 5. Simulate completion
-        let tokens1 = scheduler.complete_request(&id1).unwrap();
-        let tokens2 = scheduler.complete_request(&id2).unwrap();
-        assert!(!tokens1.is_empty());
-        assert!(!tokens2.is_empty());
+        let _tokens1 = scheduler.complete_request(&id1).unwrap();
+        let _tokens2 = scheduler.complete_request(&id2).unwrap();
 
         // Verify final state
         assert_eq!(scheduler.active_request_count(), 0);
@@ -1263,17 +1282,15 @@ mod tests {
             RequestPhase::Decoding
         );
 
-        // Step 5: Complete short request first
-        let short_tokens = scheduler.complete_request(&short_id).unwrap();
-        assert_eq!(short_tokens.len(), 3); // Original prompt tokens
+        // Step 5: Complete short request first (no generated tokens pushed in this unit test)
+        let _short_tokens = scheduler.complete_request(&short_id).unwrap();
 
         // Long request should still be active
         assert!(scheduler.get_request(&long_id).is_some());
         assert_eq!(scheduler.active_request_count(), 1);
 
         // Step 6: Complete long request
-        let long_tokens = scheduler.complete_request(&long_id).unwrap();
-        assert_eq!(long_tokens.len(), 10);
+        let _long_tokens = scheduler.complete_request(&long_id).unwrap();
 
         // All requests completed
         assert_eq!(scheduler.active_request_count(), 0);

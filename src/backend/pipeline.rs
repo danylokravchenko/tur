@@ -126,6 +126,10 @@ pub struct GenerationStats {
     /// request included tool definitions and the model emitted `<tool_call>`
     /// blocks in its output.
     pub tool_calls: Vec<ToolCall>,
+    /// Full decoded generated text.  Populated by the batching worker path
+    /// (`step_streaming`) so the non-streaming HTTP handler can use it directly
+    /// instead of assembling text from per-step streaming tokens.
+    pub generated_text: String,
 }
 
 /// Result handle for async request tracking
@@ -142,6 +146,18 @@ pub struct GenerationResult {
     pub generated_text: String,
     pub generated_tokens: Vec<u32>,
     pub stats: GenerationStats,
+}
+
+/// Output of [`InferencePipeline::step_streaming`].
+pub struct BatchStepOutput {
+    /// Requests that completed this iteration.  Each entry carries the
+    /// `GenerationResult` (with `generated_text` populated) ready to be
+    /// returned to the caller.
+    pub completed: Vec<(Uuid, GenerationResult)>,
+    /// One `(request_id, decoded_text)` pair per token emitted during the
+    /// decode step.  EOS tokens are excluded.  The decoded string may be
+    /// empty for byte-fallback tokens; callers should skip empty strings.
+    pub new_tokens: Vec<(Uuid, String)>,
 }
 
 /// Components that are only present when batching is enabled.
@@ -163,6 +179,9 @@ pub struct InferencePipeline<T: ModelConstructor> {
     /// Insertion-order tracking for bounded eviction of `results`.
     result_order: VecDeque<Uuid>,
     max_results: usize,
+    /// Per-request incremental tokenizer state for streaming decode.
+    /// Created in `submit_request`, consumed (removed) in `step_streaming`.
+    streaming_decoders: HashMap<Uuid, TokenOutputStream>,
     /// Jinja2 chat template loaded from the model's `tokenizer_config.json`.
     /// When present, `format_prompt` and `format_prompt_with_tools` use it
     /// instead of the hardcoded static fallback on `ModelImpl`.
@@ -476,6 +495,7 @@ impl<'a, T: ModelConstructor> InferencePipelineBuilder<'a, T> {
             max_results: self.max_results,
             chat_template,
             audio_encoder: self.audio_encoder,
+            streaming_decoders: HashMap::new(),
         }
     }
 }
@@ -681,6 +701,7 @@ impl<T: ModelConstructor> InferencePipeline<T> {
             generated_tokens,
             elapsed: dt,
             tool_calls,
+            generated_text: String::new(),
         })
     }
 
@@ -816,6 +837,10 @@ impl<T: ModelConstructor> InferencePipeline<T> {
 
         batching.scheduler.enqueue_request(request_state);
 
+        // Create a per-request incremental decoder for streaming.
+        let decoder = TokenOutputStream::new((*batching.tokenizer).clone());
+        self.streaming_decoders.insert(request.id, decoder);
+
         Ok(RequestHandle { id: request.id })
     }
 
@@ -827,10 +852,10 @@ impl<T: ModelConstructor> InferencePipeline<T> {
             .as_mut()
             .ok_or_else(|| TurError::Other("Batching not enabled".to_string()))?;
 
-        let completed = batching.scheduler.schedule_iteration(&mut self.engine)?;
+        let output = batching.scheduler.schedule_iteration(&mut self.engine)?;
 
         let mut results = self.results.write();
-        for (request_id, tokens, prompt, arrival_time) in completed {
+        for (request_id, tokens, prompt, arrival_time) in output.completed {
             let generated_text = batching
                 .tokenizer
                 .decode(&tokens, true)
@@ -845,6 +870,7 @@ impl<T: ModelConstructor> InferencePipeline<T> {
                     generated_tokens: tokens.len(),
                     elapsed: arrival_time.elapsed(),
                     tool_calls: Vec::new(),
+                    generated_text: String::new(),
                 },
             };
 
@@ -877,6 +903,78 @@ impl<T: ModelConstructor> InferencePipeline<T> {
             .map(|b| b.scheduler.active_request_count())
             .unwrap_or(0);
         Ok(active)
+    }
+
+    /// Like [`step`] but also returns per-request streaming tokens and the
+    /// completed [`GenerationResult`]s directly (instead of only storing them
+    /// in the internal results map).
+    ///
+    /// Intended for use by the server worker that needs to fan-out tokens to
+    /// per-request SSE streams and send final stats when a request finishes.
+    pub fn step_streaming(&mut self) -> Result<BatchStepOutput> {
+        let batching = self
+            .batching
+            .as_mut()
+            .ok_or_else(|| TurError::Other("Batching not enabled".to_string()))?;
+
+        let output = batching.scheduler.schedule_iteration(&mut self.engine)?;
+
+        // Use per-request TokenOutputStream for correct incremental BPE decoding.
+        // This handles multi-byte/multi-token sequences that decode to empty strings
+        // when processed individually.
+        let new_tokens: Vec<(Uuid, String)> = output
+            .new_tokens
+            .iter()
+            .filter_map(|(id, token)| {
+                let decoder = self.streaming_decoders.get_mut(id)?;
+                let text = decoder.next_token(*token).ok()??;
+                Some((*id, text))
+            })
+            .collect();
+
+        // Build GenerationResults for completed requests and store them.
+        let mut completed = Vec::with_capacity(output.completed.len());
+        {
+            let mut results = self.results.write();
+            for (request_id, tokens, prompt, arrival_time) in output.completed {
+                let generated_text = batching
+                    .tokenizer
+                    .decode(&tokens, true)
+                    .map_err(|e| TurError::Tokenizer(e.to_string()))?;
+
+                let result = GenerationResult {
+                    request_id,
+                    prompt,
+                    generated_text: generated_text.clone(),
+                    generated_tokens: tokens.clone(),
+                    stats: GenerationStats {
+                        generated_tokens: tokens.len(),
+                        elapsed: arrival_time.elapsed(),
+                        // Tool calls are parsed by the caller (the worker knows
+                        // which requests had tool definitions).
+                        tool_calls: Vec::new(),
+                        generated_text,
+                    },
+                };
+
+                // Remove the per-request streaming decoder now that it's done.
+                self.streaming_decoders.remove(&request_id);
+
+                if self.result_order.len() >= self.max_results
+                    && let Some(oldest) = self.result_order.pop_front()
+                {
+                    results.remove(&oldest);
+                }
+                results.insert(request_id, result.clone());
+                self.result_order.push_back(request_id);
+                completed.push((request_id, result));
+            }
+        }
+
+        Ok(BatchStepOutput {
+            completed,
+            new_tokens,
+        })
     }
 
     /// Run continuous batching until all requests are completed (batching mode only)
