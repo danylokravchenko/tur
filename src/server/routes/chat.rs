@@ -42,7 +42,7 @@ fn to_internal_messages(msgs: &[crate::server::types::ChatMessage]) -> Vec<Messa
     msgs.iter()
         .map(|m| Message {
             role: m.role.clone(),
-            content: m.content.clone().unwrap_or_default(),
+            content: m.content.as_ref().map(|c| c.as_text()).unwrap_or_default(),
         })
         .collect()
 }

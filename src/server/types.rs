@@ -1,5 +1,35 @@
 use serde::{Deserialize, Serialize};
 
+/// Represents either a plain string or a typed content-part array,
+/// matching the OpenAI spec's two allowed forms for message content.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    pub fn as_text(&self) -> String {
+        match self {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+}
+
 // ── Request ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -21,10 +51,9 @@ pub struct ChatCompletionRequest {
 #[derive(Debug, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    /// Content is a string for user/system/assistant text turns, null for
-    /// assistant messages that only emit tool_calls.
-    #[serde(default)]
-    pub content: Option<String>,
+    /// Content is a string or typed part array for user/system/assistant text
+    /// turns, null for assistant messages that only emit tool_calls.
+    pub content: Option<MessageContent>,
     pub tool_call_id: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<AssistantToolCall>,
