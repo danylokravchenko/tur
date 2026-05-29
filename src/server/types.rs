@@ -44,7 +44,7 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub tools: Vec<OpenAITool>,
     pub tool_choice: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, alias = "enable_thinking")]
     pub thinking: bool,
 }
 
