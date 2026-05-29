@@ -160,6 +160,7 @@ async fn blocking_response(
     } else {
         "tool_calls"
     };
+    let prompt_tokens = stats.prompt_tokens as u32;
     let completion_tokens = stats.generated_tokens as u32;
 
     Json(ChatCompletionResponse {
@@ -187,9 +188,9 @@ async fn blocking_response(
             finish_reason,
         }],
         usage: Usage {
-            prompt_tokens: 0,
+            prompt_tokens,
             completion_tokens,
-            total_tokens: completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
         },
     })
     .into_response()
@@ -217,6 +218,7 @@ fn stream_response(
                 delta: DeltaMessage { role: Some("assistant"), content: None, tool_calls: vec![] },
                 finish_reason: None,
             }],
+            usage: None,
         };
         match serde_json::to_string(&first) {
             Ok(data) => yield Ok::<Event, String>(Event::default().data(data)),
@@ -234,6 +236,7 @@ fn stream_response(
                     delta: DeltaMessage { role: None, content: Some(token), tool_calls: vec![] },
                     finish_reason: None,
                 }],
+                usage: None,
             };
             match serde_json::to_string(&chunk) {
                 Ok(data) => yield Ok(Event::default().data(data)),
@@ -273,6 +276,7 @@ fn stream_response(
                     },
                     finish_reason: None,
                 }],
+                usage: None,
             };
             match serde_json::to_string(&call_chunk) {
                 Ok(data) => yield Ok(Event::default().data(data)),
@@ -280,6 +284,8 @@ fn stream_response(
             }
         }
 
+        let prompt_tokens = stats.prompt_tokens as u32;
+        let completion_tokens = stats.generated_tokens as u32;
         let finish_reason = if stats.tool_calls.is_empty() { "stop" } else { "tool_calls" };
         let final_chunk = ChatCompletionChunk {
             id: id.clone(),
@@ -291,6 +297,11 @@ fn stream_response(
                 delta: DeltaMessage { role: None, content: None, tool_calls: vec![] },
                 finish_reason: Some(finish_reason),
             }],
+            usage: Some(Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+            }),
         };
         match serde_json::to_string(&final_chunk) {
             Ok(data) => yield Ok(Event::default().data(data)),

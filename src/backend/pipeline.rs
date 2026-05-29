@@ -121,6 +121,7 @@ impl GenerationRequest {
 #[derive(Debug, Clone)]
 pub struct GenerationStats {
     pub generated_tokens: usize,
+    pub prompt_tokens: usize,
     pub elapsed: std::time::Duration,
     /// Tool calls parsed from the generated text.  Non-empty only when the
     /// request included tool definitions and the model emitted `<tool_call>`
@@ -699,6 +700,7 @@ impl<T: ModelConstructor> InferencePipeline<T> {
 
         Ok(GenerationStats {
             generated_tokens,
+            prompt_tokens: tokens.len(),
             elapsed: dt,
             tool_calls,
             generated_text: String::new(),
@@ -855,7 +857,7 @@ impl<T: ModelConstructor> InferencePipeline<T> {
         let output = batching.scheduler.schedule_iteration(&mut self.engine)?;
 
         let mut results = self.results.write();
-        for (request_id, tokens, prompt, arrival_time) in output.completed {
+        for (request_id, tokens, prompt, arrival_time, prompt_len) in output.completed {
             let generated_text = batching
                 .tokenizer
                 .decode(&tokens, true)
@@ -868,6 +870,7 @@ impl<T: ModelConstructor> InferencePipeline<T> {
                 generated_tokens: tokens.clone(),
                 stats: GenerationStats {
                     generated_tokens: tokens.len(),
+                    prompt_tokens: prompt_len,
                     elapsed: arrival_time.elapsed(),
                     tool_calls: Vec::new(),
                     generated_text: String::new(),
@@ -936,7 +939,7 @@ impl<T: ModelConstructor> InferencePipeline<T> {
         let mut completed = Vec::with_capacity(output.completed.len());
         {
             let mut results = self.results.write();
-            for (request_id, tokens, prompt, arrival_time) in output.completed {
+            for (request_id, tokens, prompt, arrival_time, prompt_len) in output.completed {
                 let generated_text = batching
                     .tokenizer
                     .decode(&tokens, true)
@@ -949,6 +952,7 @@ impl<T: ModelConstructor> InferencePipeline<T> {
                     generated_tokens: tokens.clone(),
                     stats: GenerationStats {
                         generated_tokens: tokens.len(),
+                        prompt_tokens: prompt_len,
                         elapsed: arrival_time.elapsed(),
                         // Tool calls are parsed by the caller (the worker knows
                         // which requests had tool definitions).

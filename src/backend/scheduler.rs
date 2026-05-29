@@ -73,11 +73,11 @@ pub struct ExecutionBatch {
     pub total_tokens: usize,
 }
 
-type CompletedRequest = (Uuid, Vec<u32>, String, std::time::Instant);
+type CompletedRequest = (Uuid, Vec<u32>, String, std::time::Instant, usize);
 
 /// Output of a single scheduling iteration.
 pub struct IterationOutput {
-    /// Requests that finished this iteration: (id, generated_tokens, prompt, arrival_time).
+    /// Requests that finished this iteration: (id, generated_tokens, prompt, arrival_time, prompt_tokens).
     pub completed: Vec<CompletedRequest>,
     /// Tokens produced by the decode step for requests that are still in progress.
     /// Each entry is `(request_id, token_id)`.  EOS/im_end tokens are excluded —
@@ -771,14 +771,14 @@ impl ContinuousBatchScheduler {
                 // Complete request if needed
                 if should_complete {
                     // Get request info BEFORE completing (which removes it)
-                    let (prompt, arrival_time) = if let Some(req) = self.get_request(&request_id) {
-                        (req.prompt.clone(), req.arrival_time)
+                    let (prompt, arrival_time, prompt_len) = if let Some(req) = self.get_request(&request_id) {
+                        (req.prompt.clone(), req.arrival_time, req.prompt_tokens.len())
                     } else {
                         continue;
                     };
 
                     let tokens = self.complete_request(&request_id)?;
-                    completed.push((request_id, tokens, prompt, arrival_time));
+                    completed.push((request_id, tokens, prompt, arrival_time, prompt_len));
                     debug!("Request {} completed", request_id);
                 }
             }
