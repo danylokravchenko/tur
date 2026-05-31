@@ -70,10 +70,30 @@ pub async fn chat_completions(
             .into_response();
     }
 
+    let model_id = if req.model.is_empty() {
+        state.default_model.clone()
+    } else {
+        req.model.clone()
+    };
+
+    let worker = match state.workers.get(&model_id) {
+        Some(w) => w.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiErrorResponse::bad_request(format!(
+                    "model '{}' not found; available: {}",
+                    model_id,
+                    state.workers.keys().cloned().collect::<Vec<_>>().join(", ")
+                ))),
+            )
+                .into_response();
+        }
+    };
+
     let messages = to_internal_messages(&req.messages);
     let tools = to_internal_tools(&req.tools);
     let max_tokens = req.max_tokens.unwrap_or(1024);
-    let model_id = req.model.clone();
 
     let (token_tx, token_rx) = mpsc::unbounded_channel::<String>();
     let (result_tx, result_rx) = oneshot::channel();
@@ -87,7 +107,7 @@ pub async fn chat_completions(
         result_tx,
     };
 
-    if let Err(e) = state.worker.send(worker_msg).await {
+    if let Err(e) = worker.send(worker_msg).await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiErrorResponse::internal(e.to_string())),

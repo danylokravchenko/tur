@@ -47,6 +47,7 @@ fn mock_worker(response_text: &'static str) -> PipelineWorker {
             // generated_text is used by the non-streaming path in blocking_response.
             let _ = msg.result_tx.send(Ok(GenerationStats {
                 generated_tokens: response_text.split_whitespace().count(),
+                prompt_tokens: 0,
                 elapsed: Duration::from_millis(1),
                 tool_calls: vec![],
                 generated_text: response_text.to_string(),
@@ -68,6 +69,7 @@ fn mock_tool_call_worker(tool_name: &'static str, args_json: &'static str) -> Pi
             };
             let _ = msg.result_tx.send(Ok(GenerationStats {
                 generated_tokens: 1,
+                prompt_tokens: 0,
                 elapsed: Duration::from_millis(1),
                 tool_calls: vec![tc],
                 generated_text: String::new(),
@@ -78,9 +80,11 @@ fn mock_tool_call_worker(tool_name: &'static str, args_json: &'static str) -> Pi
 }
 
 fn test_state(response_text: &'static str) -> AppState {
+    let mut workers = std::collections::HashMap::new();
+    workers.insert("test-model".to_string(), mock_worker(response_text));
     AppState {
-        worker: mock_worker(response_text),
-        model_id: "test-model".to_string(),
+        workers,
+        default_model: "test-model".to_string(),
     }
 }
 
@@ -248,9 +252,14 @@ async fn chat_max_tokens_field_accepted() {
 
 #[tokio::test]
 async fn tool_call_response_has_correct_structure() {
+    let mut workers = std::collections::HashMap::new();
+    workers.insert(
+        "test-model".to_string(),
+        mock_tool_call_worker("get_weather", r#"{"location": "Paris", "unit": "celsius"}"#),
+    );
     let app = build_router(AppState {
-        worker: mock_tool_call_worker("get_weather", r#"{"location": "Paris", "unit": "celsius"}"#),
-        model_id: "test-model".to_string(),
+        workers,
+        default_model: "test-model".to_string(),
     });
 
     let response = app

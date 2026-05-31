@@ -394,8 +394,6 @@ impl<'a, T: ModelConstructor> InferencePipelineBuilder<'a, T> {
 
         let (batching, engine, tokenizer, chat_template) = if self.enable_batching {
             let block_size = 64;
-            let num_heads = 32;
-            let head_dim = 128;
             let dtype = DType::BF16;
             let max_decode_tokens = 4096;
             let max_prefill_tokens = 2048;
@@ -409,9 +407,12 @@ impl<'a, T: ModelConstructor> InferencePipelineBuilder<'a, T> {
                 engine_builder.build().expect("Failed to build engine");
             let tokenizer_arc = Arc::new(tokenizer.clone());
 
-            // Derive num_layers and EOS tokens from the just-built model/tokenizer so
-            // they always agree with the actual model, never with hardcoded constants.
+            // Derive all structural parameters from the actual model so this
+            // works correctly for any architecture (e.g. Granite head_dim=64
+            // vs Qwen3 head_dim=128) without hardcoded constants.
             let num_layers = engine.model().num_layers();
+            let num_heads = engine.model().num_kv_heads();
+            let head_dim = engine.model().head_dim();
             let model_eos_ids = engine.model().eos_token_ids();
             let (eos_token, im_end_token) = match model_eos_ids.as_slice() {
                 [] => (
@@ -448,7 +449,7 @@ impl<'a, T: ModelConstructor> InferencePipelineBuilder<'a, T> {
             let memory_pool = Arc::new(RwLock::new(crate::backend::memory_pool::MemoryPool::new(
                 memory_pool_size_bytes,
                 block_size,
-                32,
+                num_layers,
                 num_heads,
                 head_dim,
                 2,

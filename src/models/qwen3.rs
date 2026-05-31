@@ -895,6 +895,8 @@ pub struct ModelForCausalLM {
     base: Model,
     lm_head: layers::LinearX,
     eos_token_ids: Vec<u32>,
+    num_kv_heads: usize,
+    head_dim: usize,
 }
 
 impl ModelForCausalLM {
@@ -926,6 +928,8 @@ impl ModelForCausalLM {
             base,
             lm_head,
             eos_token_ids: cfg.eos_token_id.clone(),
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
         })
     }
 
@@ -1044,6 +1048,14 @@ impl super::ModelImpl for ModelForCausalLM {
 
     fn num_layers(&self) -> usize {
         self.base.layers.len()
+    }
+
+    fn num_kv_heads(&self) -> usize {
+        self.num_kv_heads
+    }
+
+    fn head_dim(&self) -> usize {
+        self.head_dim
     }
 
     fn name(&self) -> &'static str {

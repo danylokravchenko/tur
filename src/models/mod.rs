@@ -34,6 +34,12 @@ pub trait ModelImpl {
     /// Returns the number of transformer layers in this model.
     fn num_layers(&self) -> usize;
 
+    /// Returns the number of KV heads (after GQA, if any).
+    fn num_kv_heads(&self) -> usize;
+
+    /// Returns the per-head dimension (hidden_size / num_attention_heads).
+    fn head_dim(&self) -> usize;
+
     /// Returns the dtype used for KV cache tensors.
     fn dtype(&self) -> DType;
 

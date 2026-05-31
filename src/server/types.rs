@@ -15,8 +15,8 @@ impl MessageContent {
             MessageContent::Text(s) => s.clone(),
             MessageContent::Parts(parts) => parts
                 .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text { text } => Some(text.as_str()),
+                .map(|p| match p {
+                    ContentPart::Text { text } => text.as_str(),
                 })
                 .collect::<Vec<_>>()
                 .join(""),

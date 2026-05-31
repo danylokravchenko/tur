@@ -10,14 +10,16 @@ use std::net::SocketAddr;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
+use std::collections::HashMap;
 use worker::PipelineWorker;
 
 /// Shared state injected into every request handler.
 #[derive(Clone)]
 pub struct AppState {
-    pub worker: PipelineWorker,
-    /// Model identifier echoed back in API responses.
-    pub model_id: String,
+    /// Workers keyed by model ID (e.g. "qwen3-0.6b", "granite4.1-3b").
+    pub workers: HashMap<String, PipelineWorker>,
+    /// The model used when the client omits the `model` field.
+    pub default_model: String,
 }
 
 pub fn build_router(state: AppState) -> Router {

@@ -297,6 +297,12 @@ pub struct PagedKvCache {
     block_size: usize,
     /// Concatenation dimension (typically 2 for sequence dimension)
     concat_dim: usize,
+    /// Running accumulated K tensor — grown by a single `cat` per `append` call.
+    /// Avoids the O(n_blocks) re-concatenation that `get_state` previously performed
+    /// on every decode step (which caused ~67 s/token regressions at 1500+ tokens).
+    k_full: Option<Tensor>,
+    /// Running accumulated V tensor — same rationale as `k_full`.
+    v_full: Option<Tensor>,
 }
 
 impl PagedKvCache {
@@ -309,7 +315,97 @@ impl PagedKvCache {
             seq_len: 0,
             block_size,
             concat_dim,
+            k_full: None,
+            v_full: None,
         }
+    }
+
+    /// Write `new_tokens` from `k`/`v` into the physical block table.
+    /// Called by `append` to keep the block table in sync for prefix-cache
+    /// restore; the hot path for attention uses `k_full`/`v_full` directly.
+    fn write_to_blocks(&mut self, k: &Tensor, v: &Tensor, new_tokens: usize) -> Result<()> {
+        let (b, h, _, d) = k.dims4()?;
+        let mut token_offset = 0;
+        while token_offset < new_tokens {
+            let current_pos = self.seq_len + token_offset;
+            let block_idx = current_pos / self.block_size;
+            let pos_in_block = current_pos % self.block_size;
+            let tokens_in_block = (self.block_size - pos_in_block).min(new_tokens - token_offset);
+
+            let k_slice = k.narrow(self.concat_dim, token_offset, tokens_in_block)?;
+            let v_slice = v.narrow(self.concat_dim, token_offset, tokens_in_block)?;
+
+            // Copy-on-write: if this block is shared, fork it before writing.
+            let block_id = {
+                let allocator = self.allocator.read();
+                let current_block_id = self.block_table[block_idx];
+                let ref_count = allocator.get_block(current_block_id)?.ref_count;
+                if ref_count > 1 {
+                    drop(allocator);
+                    let mut allocator = self.allocator.write();
+                    let old_block = allocator.get_block(current_block_id)?;
+                    let old_k = old_block.k.clone();
+                    let old_v = old_block.v.clone();
+                    let new_block_id = allocator.allocate()?;
+                    let new_block = allocator.get_block_mut(new_block_id)?;
+                    new_block.k = old_k;
+                    new_block.v = old_v;
+                    allocator.free(current_block_id)?;
+                    self.block_table[block_idx] = new_block_id;
+                    new_block_id
+                } else {
+                    current_block_id
+                }
+            };
+
+            let mut allocator = self.allocator.write();
+            let block = allocator.get_block_mut(block_id)?;
+
+            let expected_shape = [b, h, self.block_size, d];
+            if block
+                .k
+                .as_ref()
+                .map(|t| t.dims() != expected_shape)
+                .unwrap_or(true)
+            {
+                block.k = Some(Tensor::zeros(&expected_shape, k.dtype(), k.device())?);
+                block.v = Some(Tensor::zeros(&expected_shape, v.dtype(), v.device())?);
+            }
+
+            let block_k = block.k.as_ref().unwrap();
+            let block_v = block.v.as_ref().unwrap();
+
+            let mut k_parts = Vec::new();
+            if pos_in_block > 0 {
+                k_parts.push(block_k.narrow(self.concat_dim, 0, pos_in_block)?);
+            }
+            k_parts.push(k_slice.clone());
+            if pos_in_block + tokens_in_block < self.block_size {
+                k_parts.push(block_k.narrow(
+                    self.concat_dim,
+                    pos_in_block + tokens_in_block,
+                    self.block_size - pos_in_block - tokens_in_block,
+                )?);
+            }
+            block.k = Some(Tensor::cat(&k_parts, self.concat_dim)?);
+
+            let mut v_parts = Vec::new();
+            if pos_in_block > 0 {
+                v_parts.push(block_v.narrow(self.concat_dim, 0, pos_in_block)?);
+            }
+            v_parts.push(v_slice.clone());
+            if pos_in_block + tokens_in_block < self.block_size {
+                v_parts.push(block_v.narrow(
+                    self.concat_dim,
+                    pos_in_block + tokens_in_block,
+                    self.block_size - pos_in_block - tokens_in_block,
+                )?);
+            }
+            block.v = Some(Tensor::cat(&v_parts, self.concat_dim)?);
+
+            token_offset += tokens_in_block;
+        }
+        Ok(())
     }
 
     /// Allocate blocks for new tokens
@@ -345,6 +441,9 @@ impl PagedKvCache {
             seq_len: self.seq_len,
             block_size: self.block_size,
             concat_dim: self.concat_dim,
+            // Tensor::clone is Arc-based — no GPU memory is copied here.
+            k_full: self.k_full.clone(),
+            v_full: self.v_full.clone(),
         })
     }
 
@@ -366,188 +465,39 @@ impl PagedKvCache {
 
 impl KvCacheImpl for PagedKvCache {
     fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (b, h, new_tokens, d) = k.dims4()?;
+        let (_, _, new_tokens, _) = k.dims4()?;
 
-        // Allocate blocks if needed
+        // Update block table for prefix-sharing metadata (lightweight bookkeeping).
         self.allocate_blocks(new_tokens)?;
+        // Write new tokens into their physical blocks so prefix-cache restore works.
+        self.write_to_blocks(k, v, new_tokens)?;
 
-        // Write tokens to blocks with proper block-level granularity
-        let mut token_offset = 0;
-        while token_offset < new_tokens {
-            let current_pos = self.seq_len + token_offset;
-            let block_idx = current_pos / self.block_size;
-            let pos_in_block = current_pos % self.block_size;
-            let tokens_in_block = (self.block_size - pos_in_block).min(new_tokens - token_offset);
+        // Grow the running full-sequence tensor with a single cat.
+        // This replaces the previous O(n_blocks) reassembly in get_state that ran
+        // every decode step and caused ~67 s/token at 1500+ token sequences.
+        let k_out = match &self.k_full {
+            None => k.clone(),
+            Some(prev) => Tensor::cat(&[prev, k], self.concat_dim)?,
+        };
+        let v_out = match &self.v_full {
+            None => v.clone(),
+            Some(prev) => Tensor::cat(&[prev, v], self.concat_dim)?,
+        };
 
-            // Extract slice for this block
-            let k_slice = k.narrow(self.concat_dim, token_offset, tokens_in_block)?;
-            let v_slice = v.narrow(self.concat_dim, token_offset, tokens_in_block)?;
-
-            // Copy-on-write: if block is shared (ref_count > 1), allocate new block
-            let block_id = {
-                let allocator = self.allocator.read();
-                let current_block_id = self.block_table[block_idx];
-                let ref_count = allocator.get_block(current_block_id)?.ref_count;
-
-                if ref_count > 1 {
-                    // Need to copy the block
-                    drop(allocator);
-                    let mut allocator = self.allocator.write();
-
-                    // Get old block data
-                    let old_block = allocator.get_block(current_block_id)?;
-                    let old_k = old_block.k.clone();
-                    let old_v = old_block.v.clone();
-
-                    // Allocate new block
-                    let new_block_id = allocator.allocate()?;
-
-                    // Copy old data to new block
-                    let new_block = allocator.get_block_mut(new_block_id)?;
-                    new_block.k = old_k;
-                    new_block.v = old_v;
-
-                    // Decrement ref count on old block
-                    allocator.free(current_block_id)?;
-
-                    // Update block table
-                    self.block_table[block_idx] = new_block_id;
-
-                    new_block_id
-                } else {
-                    current_block_id
-                }
-            };
-
-            // Write to block
-            let mut allocator = self.allocator.write();
-            let block = allocator.get_block_mut(block_id)?;
-
-            // Lazily initialize block tensors to the correct shape on first write.
-            // Using zeros as padding for positions not yet written in this block.
-            let expected_shape = [b, h, self.block_size, d];
-            if block
-                .k
-                .as_ref()
-                .map(|t| t.dims() != expected_shape)
-                .unwrap_or(true)
-            {
-                block.k = Some(Tensor::zeros(&expected_shape, k.dtype(), k.device())?);
-                block.v = Some(Tensor::zeros(&expected_shape, v.dtype(), v.device())?);
-            }
-
-            // Reconstruct block tensor with new data.
-            // (candle has no in-place slice assignment)
-            let block_k = block.k.as_ref().unwrap();
-            let block_v = block.v.as_ref().unwrap();
-
-            let k_before = if pos_in_block > 0 {
-                Some(block_k.narrow(self.concat_dim, 0, pos_in_block)?)
-            } else {
-                None
-            };
-            let k_after = if pos_in_block + tokens_in_block < self.block_size {
-                Some(block_k.narrow(
-                    self.concat_dim,
-                    pos_in_block + tokens_in_block,
-                    self.block_size - pos_in_block - tokens_in_block,
-                )?)
-            } else {
-                None
-            };
-
-            let mut k_parts = Vec::new();
-            if let Some(before) = k_before {
-                k_parts.push(before);
-            }
-            k_parts.push(k_slice.clone());
-            if let Some(after) = k_after {
-                k_parts.push(after);
-            }
-            block.k = Some(Tensor::cat(&k_parts, self.concat_dim)?);
-
-            // Same for v
-            let v_before = if pos_in_block > 0 {
-                Some(block_v.narrow(self.concat_dim, 0, pos_in_block)?)
-            } else {
-                None
-            };
-            let v_after = if pos_in_block + tokens_in_block < self.block_size {
-                Some(block_v.narrow(
-                    self.concat_dim,
-                    pos_in_block + tokens_in_block,
-                    self.block_size - pos_in_block - tokens_in_block,
-                )?)
-            } else {
-                None
-            };
-
-            let mut v_parts = Vec::new();
-            if let Some(before) = v_before {
-                v_parts.push(before);
-            }
-            v_parts.push(v_slice.clone());
-            if let Some(after) = v_after {
-                v_parts.push(after);
-            }
-            block.v = Some(Tensor::cat(&v_parts, self.concat_dim)?);
-
-            token_offset += tokens_in_block;
-        }
-
+        self.k_full = Some(k_out.clone());
+        self.v_full = Some(v_out.clone());
         self.seq_len += new_tokens;
 
-        // Gather and return full KV
-        self.get_state()
-            .ok_or_else(|| candle_core::Error::Msg("Failed to get state after append".to_string()))
+        Ok((k_out, v_out))
     }
 
     fn get_state(&self) -> Option<(Tensor, Tensor)> {
-        if self.block_table.is_empty() {
-            return None;
-        }
-
-        let allocator = self.allocator.read();
-        let mut k_blocks = Vec::new();
-        let mut v_blocks = Vec::new();
-
-        // Collect all blocks
-        for &block_id in &self.block_table {
-            if let Ok(block) = allocator.get_block(block_id) {
-                // A block that has never been written has no tensors yet.
-                k_blocks.push(block.k.clone()?);
-                v_blocks.push(block.v.clone()?);
-            } else {
-                return None;
-            }
-        }
-
-        // Concatenate blocks
-        if let (Ok(k_full), Ok(v_full)) = (
-            Tensor::cat(&k_blocks, self.concat_dim),
-            Tensor::cat(&v_blocks, self.concat_dim),
-        ) {
-            // Slice to actual sequence length
-            if let (Ok(k), Ok(v)) = (
-                k_full.narrow(self.concat_dim, 0, self.seq_len),
-                v_full.narrow(self.concat_dim, 0, self.seq_len),
-            ) {
-                Some((k, v))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        Some((self.k_full.clone()?, self.v_full.clone()?))
     }
 
     fn set_state(&mut self, k: Tensor, v: Tensor) -> Result<()> {
-        // Reset first
         self.reset();
-
-        // Append the state
         self.append(&k, &v)?;
-
         Ok(())
     }
 
@@ -558,6 +508,8 @@ impl KvCacheImpl for PagedKvCache {
         }
         self.block_table.clear();
         self.seq_len = 0;
+        self.k_full = None;
+        self.v_full = None;
     }
 
     fn is_empty(&self) -> bool {

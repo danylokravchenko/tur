@@ -771,11 +771,16 @@ impl ContinuousBatchScheduler {
                 // Complete request if needed
                 if should_complete {
                     // Get request info BEFORE completing (which removes it)
-                    let (prompt, arrival_time, prompt_len) = if let Some(req) = self.get_request(&request_id) {
-                        (req.prompt.clone(), req.arrival_time, req.prompt_tokens.len())
-                    } else {
-                        continue;
-                    };
+                    let (prompt, arrival_time, prompt_len) =
+                        if let Some(req) = self.get_request(&request_id) {
+                            (
+                                req.prompt.clone(),
+                                req.arrival_time,
+                                req.prompt_tokens.len(),
+                            )
+                        } else {
+                            continue;
+                        };
 
                     let tokens = self.complete_request(&request_id)?;
                     completed.push((request_id, tokens, prompt, arrival_time, prompt_len));

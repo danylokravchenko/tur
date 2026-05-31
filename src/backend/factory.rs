@@ -423,6 +423,20 @@ impl ModelImpl for AnyModel {
         }
     }
 
+    fn num_kv_heads(&self) -> usize {
+        match self {
+            Self::Qwen3(m) => m.num_kv_heads(),
+            Self::Granite41(m) => m.num_kv_heads(),
+        }
+    }
+
+    fn head_dim(&self) -> usize {
+        match self {
+            Self::Qwen3(m) => m.head_dim(),
+            Self::Granite41(m) => m.head_dim(),
+        }
+    }
+
     fn dtype(&self) -> DType {
         match self {
             Self::Qwen3(m) => m.dtype(),
