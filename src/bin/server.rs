@@ -102,6 +102,18 @@ struct Args {
     /// continuous batch scheduler.
     #[arg(long, default_value_t = 8, env = "MAX_BATCH_SIZE")]
     max_batch_size: usize,
+
+    /// Enable prefix KV-cache to reuse prompt tokens across turns.
+    #[arg(long)]
+    prefix_cache: bool,
+
+    /// Maximum number of cached prefixes.
+    #[arg(long, default_value_t = 100)]
+    prefix_cache_max_entries: usize,
+
+    /// Maximum token length eligible for prefix caching.
+    #[arg(long, default_value_t = 4096)]
+    prefix_cache_max_tokens: usize,
 }
 
 #[tokio::main]
@@ -175,6 +187,9 @@ async fn main() -> Result<()> {
             repeat_penalty: args.repeat_penalty,
             repeat_last_n: args.repeat_last_n,
             max_batch_size: args.max_batch_size,
+            prefix_cache: args.prefix_cache,
+            prefix_cache_max_entries: args.prefix_cache_max_entries,
+            prefix_cache_max_tokens: args.prefix_cache_max_tokens,
         })?;
 
         info!(model_id = %spec.id, "Worker ready");

@@ -35,6 +35,12 @@ pub struct WorkerConfig {
     pub repeat_last_n: usize,
     /// Maximum number of requests to process simultaneously in the decode step.
     pub max_batch_size: usize,
+    /// Enable prefix KV-cache to reuse prompt tokens across turns.
+    pub prefix_cache: bool,
+    /// Maximum number of cached prefixes.
+    pub prefix_cache_max_entries: usize,
+    /// Maximum token length eligible for prefix caching.
+    pub prefix_cache_max_tokens: usize,
 }
 
 /// Per-request state kept in the worker while a request is in-flight.
@@ -77,6 +83,9 @@ impl PipelineWorker {
                     repeat_penalty,
                     repeat_last_n,
                     max_batch_size,
+                    prefix_cache,
+                    prefix_cache_max_entries,
+                    prefix_cache_max_tokens,
                 } = config;
 
                 let device = factory.device().clone();
@@ -95,6 +104,9 @@ impl PipelineWorker {
                 }
                 if let Some(tp) = top_p {
                     builder = builder.top_p(tp);
+                }
+                if prefix_cache {
+                    builder = builder.with_prefix_cache(prefix_cache_max_entries, prefix_cache_max_tokens);
                 }
 
                 let mut pipeline = builder.build();
