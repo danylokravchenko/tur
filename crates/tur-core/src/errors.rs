@@ -24,6 +24,8 @@ pub enum TurError {
     RequestNotFound(String),
     #[error("Invalid request phase: {0}")]
     InvalidPhase(String),
+    #[error("Invalid execution or state transition: {0}")]
+    InvalidExecution(String),
     #[error("Memory allocation error: {0}")]
     MemoryAllocation(String),
     #[error("Block not found: {0}")]

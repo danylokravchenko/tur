@@ -3,6 +3,7 @@ pub mod granite_41;
 pub use tur_metal::kv_cache;
 pub mod layers;
 pub mod qwen3;
+pub mod qwen3_5;
 
 use candle_core::{DType, Result, Tensor};
 pub use granite_41::ModelForCausalLM as Granite41ModelForCausalLM;

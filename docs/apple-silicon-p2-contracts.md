@@ -1,220 +1,211 @@
 # P2 ownership and hybrid state contracts
 
-Status: implemented on 2026-10-21; targeted validation is recorded below. The user
-explicitly authorized completely breaking Rust changes on 2026-10-21 after the
-initial request. No further approval
-is required for this package. Wire behavior and existing decoder mathematics are
-outside this contract change. This is not Qwen3.8 support.
+Status: implemented on 2026-10-21 and revised the same day after review. The revision
+replaces the per-token `step` contract with packed execution, isolates per-request
+failures, removes per-token snapshot retention, moves sampling behind the completion
+fence, makes the engine decide speculative acceptance, and adds state dtypes, input
+modalities and model workspace. Breaking changes are authorized (see
+[legacy removal](apple-silicon-redesign.md#breaking-changes-and-legacy-removal)).
+This is not Qwen3.8 support.
 
-## Extraction and compatibility
+## Crate ownership
 
-| Owner | Extracted implementation | Compatibility exports |
-| --- | --- | --- |
-| `tur-core` | Existing `TurError` and `Result`, unchanged variants and conversions | `tur::{TurError, Result}`, `tur::shared::{errors, TurError, Result}` |
-| `tur-metal` | Existing KV caches, block allocator, memory pool; new immutable hybrid storage and completion ownership | `tur::models::kv_cache`, `tur::backend::memory_pool`, `tur::runtime` |
-| `tur-models` | Models, layers, attention, weight loading, model factory, templates, tool types and loading progress | `tur::{models, weights, VarBuilderX, ModelFactory, AutoModelFactory, ProgressReporter}`, existing `tur::backend` module paths |
-| `tur-engine` | Engine, pipeline, scheduler, batch manager, prefix cache, guidance, tokenizer/sampler and audio interface | `tur::backend`, existing root engine/pipeline exports; new `tur::hybrid` |
-| `tur` | Compatibility facade and HTTP library pending later adapter migration | Existing CLI/server imports remain valid |
+| Owner | Contents |
+| --- | --- |
+| `tur-core` | `TurError`/`Result` and checked execution descriptors (`execution`) |
+| `tur-metal` | Immutable hybrid state and staged updates (`state`), completion fences and per-owner quarantine (`completion`); legacy KV cache and memory pool pending deletion |
+| `tur-models` | `HybridModel` packed contract (`hybrid`); legacy models, loading and templates pending deletion |
+| `tur-engine` | Single-owner `HybridEngine` (`hybrid`); legacy engine, scheduler and pipeline pending deletion |
+| `tur` | Facade and HTTP library until the server adapter moves to `tur-server` |
 
 The graph is `tur-core → tur-metal → tur-models → tur-engine → tur → adapters`.
-Higher layers also use core/runtime directly. Templates and progress move with the
-model factory because existing constructors depend on them; moving them into the
-engine would create an upward dependency. No new configuration or error hierarchy
-is introduced. Existing dependency versions remain unchanged.
+No new configuration or error hierarchy exists; invalid descriptors and state
+transitions use `TurError::InvalidExecution`. No third-party dependency was added.
 
-## Exact execution contracts
+The legacy `ModelImpl`/`KvCacheImpl` decoders, their re-exports and the CLI/server
+paths built on them are not a compatibility commitment. P3 deletes them first and
+rewires the adapters onto `HybridEngine`.
 
-The legacy `ModelImpl` and `KvCacheImpl` signatures remain available, including:
+## Model description
 
-```rust
-fn forward(&mut self, input: &Tensor, offset: usize) -> candle_core::Result<Tensor>;
-fn forward_batch(&mut self, input: &Tensor, positions: &[usize],
-    paged_caches: Option<&mut [Vec<PagedKvCache>]>) -> candle_core::Result<Tensor>;
-fn get_kv_cache_state(&self) -> candle_core::Result<Vec<(Tensor, Tensor)>>;
-fn set_kv_cache_state(&mut self, state: Vec<(Tensor, Tensor)>) -> candle_core::Result<()>;
-```
+`ModelDescription` declares identity (`revision`, `state_format`), per-layer
+`LayerStateKind`, supported `modalities`, vocabulary and exclusive positional limit.
+The revision must identify the exact checkpoint, quantization, adapters, positional
+settings and isolation namespace. Attention layers declare KV heads, head dimension,
+page token capacity and storage dtype; recurrent layers declare convolution
+width/channels, recurrent heads/key/value dimensions and dtype. State dtypes are F32,
+F16 or BF16. Packed execution carries text tokens, so a description must include
+`Modality::Text`; other modalities are declared but not yet executable. Logits are F32.
 
-These are compatibility APIs for ordinary attention decoders, not hybrid state.
-Their constructors, cache ownership and sampling behavior are not silently adapted.
-New models implement this explicit-state contract in `tur_models::hybrid`:
+## Packed model contract
 
 ```rust
 pub trait HybridModel: Send + Sync + 'static {
     fn description(&self) -> ModelDescription;
-    fn step(&self, token: u32, position: usize, state: &[LayerRead]) -> Result<TokenStep>;
+    fn workspace_bytes(&self, batch: &PackedForward<'_>) -> Result<usize> { Ok(0) }
+    fn forward(&self, batch: &PackedForward<'_>) -> Result<Vec<Result<SequenceStep>>>;
 }
-pub struct TokenStep { pub layers: Vec<LayerUpdate>, pub logits: Tensor }
+pub struct PackedForward<'a> {
+    pub tokens: &'a [u32],
+    pub positions: &'a [usize],
+    pub sequences: &'a [SequenceForward<'a>],
+}
+pub struct SequenceForward<'a> {
+    pub tokens: Range<usize>,      // into the packed arrays
+    pub state: &'a [LayerRead],    // committed state, shared storage, read-only
+    pub logits: &'a [usize],       // packed positions needing logits
+    pub boundaries: Boundaries,    // Final or EveryToken
+}
+pub struct SequenceStep { pub layers: Vec<LayerUpdate>, pub logits: Tensor }
 ```
 
-`ModelDescription` declares identity (`revision`, `state_format`), per-layer
-`LayerStateKind`, vocabulary and exclusive positional limit. The revision string
-must identify the exact checkpoint, quantization, adapters, positional settings
-and isolation namespace; a display model name is insufficient. Attention declares
-KV heads, head dimension and page token capacity. Recurrent layers declare
-convolution width/channels and recurrent heads/key/value dimensions. P2 supports
-text tokens and F32 state/logits only. Model-specific `Config` stays with its model.
+One call covers every request in the batch with no padding, so a model can run
+chunked prefill and batched decode as single passes. Per sequence it returns:
 
-`ModelState::allocate(Arc<ModelDescription>, &Device) -> Result<ModelState>`
-creates empty attention tables and zero convolution/recurrent tensors.
-`ModelState::advance(&self, updates: &[LayerUpdate]) -> Result<ModelState>` checks
-every layer's kind, shape, dtype, device and position before constructing a new
-whole-model snapshot. Attention updates contain one `[kv_heads, head_dim]` K/V
-pair; recurrent updates replace the entire `[conv_width, conv_channels]` history
-and `[heads, key_dim, value_dim]` matrix. Recurrent history is never KV-truncated.
+- attention: `[tokens, kv_heads, head_dim]` K and V for every new token;
+- recurrent: `[b, conv_width, conv_channels]` history and `[b, heads, key, value]` matrix,
+  where `b = 1` for `Boundaries::Final` and `b = tokens` for `Boundaries::EveryToken`;
+- logits: F32 `[logits.len(), vocab]`, rows in output order.
 
-The engine owns one live request entry. Weights are held by `Arc<M>` and `step`
-receives `&self`; implementations must keep weights immutable and cannot hide
-sequence state. Internal snapshot buffers are private and never mutated. Full
-attention pages share `Arc`s; appending replaces a partial tail. Model input and
-output boundaries use detached tensor copies because Candle supports in-place
-mutation through shared tensor references. Checkpoint inspection also returns
-copies, so external writes cannot mutate a snapshot.
+The outer error fails the whole batch (one shared dispatch). Each inner result is one
+sequence, so a model can isolate a per-request failure. `forward` should only enqueue
+device work; the engine reads nothing until after the fence.
+
+Inputs are zero-copy: `LayerRead` tensors share storage with live state and
+checkpoints, and models must not mutate them in place. Outputs are validated for
+kind, shape, dtype, device and position, then copied once into private storage
+(`ModelState::stage`). Public inspection through `ModelState::read_layers` returns
+detached copies.
+
+## State storage and memory
+
+`ModelState` is an immutable whole-model snapshot at one token boundary. Full pages
+are shared through `Arc`. Appending fills the tail page and then opens new pages.
+`ModelState::apply(staged, accepted)` builds the snapshot after the first `accepted`
+tokens. Attention needs nothing extra for a prefix because pages are append-only.
+Recurrent state selects the exact saved boundary and is never truncated like KV.
+A partial prefix therefore requires `EveryToken`.
+
+Ordinary sequences request `Final` and retain one recurrent boundary per layer.
+Only speculative sequences request `EveryToken`. No snapshot is kept per token:
+the base state and the staged outputs are held until the accepted boundary is
+materialized once, at `finish`.
+
+`ExecutionRequirements` (returned by `submit`) reports checked packed-input, logits
+(requested outputs only), state-update and model-workspace bytes. `total_bytes()` is
+the admission figure.
+
+## Engine
 
 ```rust
 HybridEngine::new(Arc<M>, Device) -> Result<HybridEngine<M>>;
 allocate(&mut self, seed: u64, options: SamplingOptions,
     guidance: Option<GuidanceControl>) -> Result<StateHandle>;
-metadata(&self, request: Uuid) -> Result<StateMetadata>;
-submit(&mut self, plan: PackedExecution) -> Result<()>;
-finish(&mut self) -> Result<Vec<TokenOutput>>;
-commit(&mut self, accepted: &[(Uuid, usize)]) -> Result<Vec<TokenOutput>>;
-checkpoint(&self, handle: StateHandle) -> Result<Checkpoint>;
-fork(&mut self, checkpoint: &Checkpoint) -> Result<StateHandle>;
-restore(&mut self, handle: StateHandle, checkpoint: &Checkpoint) -> Result<StateHandle>;
-cancel(&mut self, handle: StateHandle) -> Result<()>;
+metadata(&self, request: Uuid) -> Result<StateMetadata>;     // handle, position, finished
+submit(&mut self, plan: PackedExecution) -> Result<ExecutionRequirements>;
+finish(&mut self) -> Result<Vec<SequenceResult>>;
+checkpoint / fork / restore / cancel / retry_quarantined
 ```
 
-## Validation, completion and publication
+`PackedExecution { tokens, positions, sequences }` has one position per token.
+`SequenceDescriptor { state, tokens, outputs, speculative }` names a request handle,
+a nonempty contiguous range and strictly increasing output positions within it.
+Ranges partition the input, and each request appears at most once. Positions must
+continue from the committed boundary. Stale, cancelled and foreign handles are rejected.
+Validation is all-or-nothing and happens before any model work. A speculative
+sequence must request an output at every token.
 
-`PackedExecution { tokens, positions, sequences }` has one position per packed
-token. Each `SequenceDescriptor { state, tokens: Range<usize>, outputs }` names a
-request UUID/revision, a nonempty contiguous range and optional output positions
-within that range. Ranges partition the input in descriptor order; sequences may
-be reordered by repacking. Every request appears at most once. Tokens, output
-indices, dimensions, byte products, sequence ends and revisions are validated
-with checked arithmetic before model execution. Positions must continue from the
-current committed boundary. Handles from other engines, cancelled requests or
-prior revisions are rejected. UUIDs are never intentionally reused.
+`submit` validates, binds committed state, asks the model for workspace and enqueues
+one packed pass. At most one batch is pending. `finish` waits on the fence, then for
+each request in order:
 
-`PackedExecution::validate(self, &ModelDescription, &[StateMetadata]) ->
-Result<ValidatedExecution>` returns private immutable input. The engine validates
-against its own current metadata at submission, rather than trusting caller-supplied
-validation or an old plan. `ValidatedExecution::requirements()` records checked
-packed input bytes, retained token logits and a conservative bound for retained
-reference state tensors. Layer totals and batch totals are also checked. These
-exclude backend temporary allocations and grammar/allocator overhead; they are not
-admission budgets. Custom kernel/workspace selection is deferred because P2 does
-not dispatch custom packed kernels.
+1. If the model or output validation failed, return that request's error; its state is unchanged.
+2. Otherwise read logits and sample each output in order, applying the grammar mask.
+3. Select the accepted boundary, publish model state, RNG and grammar together, and
+   bump the revision.
 
-At most one batch is pending. Submission owns weights, base state, exact per-token
-boundaries, detached input bindings and model outputs through `Completion<Batch>`.
-Live requests remain at the previous committed boundary. Model errors are saved
-and reported by `finish`/`commit` after the fence; no partial request state is
-published. Cancellation marks an in-flight request and suppresses its publication;
-other requests may finish independently. Non-flight cancellation releases immediately.
-Restore while that request is in flight is rejected. Checkpointing while in flight
-observes the prior committed state.
+A sampling error part-way through (non-finite logits, a grammar that allows no
+token) rolls back that request's RNG counter, sampled history and parser, using a
+parser copy taken only when a grammar is active. Other requests still publish.
+A fence error keeps the batch pending for retry. A whole-batch model error is
+returned once and leaves every request unchanged.
 
-`Completion::wait(&mut self) -> Result<()>` uses `Device::synchronize`; extraction
-is possible only after success. Drop also waits. If drop cannot synchronize,
-resources enter a process-wide quarantine and are retried at later submissions
-or by `retry_retired()`. New engine submissions refuse a still-unresolved quarantine. This deliberately retains memory on persistent device
-failure rather than recycling live bindings. Explicit waits retain their resources
-on failure and can be retried. The failure queue is exceptional-path storage,
-not a general resource pool. There is no new unsafe Rust.
+A grammar reaching its terminal state is a normal stop, not an error: later outputs
+are not sampled, `SequenceCommit::finished` and `StateMetadata::finished` are set,
+and other requests in the batch are unaffected.
 
-## Checkpoints and speculation
+### Speculation
 
-A checkpoint contains every layer, position, exact model/layout/device identity,
-seed and draw counter, sampling options, sampled history and a deep clone of the
-existing llguidance parser/stopped state. Fork shares private immutable buffers;
-parser branches are independent. Restore validates before publication and bumps
-the request revision rather than restoring an old revision. Wrong-model/layout/
-device restores leave the original untouched.
+A speculative sequence is `[next token, draft_1, …, draft_m]`. The engine samples the
+target at each position in order. It stops after the first output that disagrees
+with the next draft, and also stops if the grammar finishes. Accepted inputs are the
+outputs produced so far; the last output is the correction or bonus token. Sampling
+from the target and accepting a draft only if it matches the sample keeps the target
+distribution for deterministic proposals (n-gram, greedy draft). Probabilistic
+draft-model correction is P8 work. The caller cannot choose an acceptance length,
+so model, RNG and grammar state can never disagree with the published tokens.
+Rejected drafts never reach the parser.
 
-Every candidate token boundary has a complete snapshot. `commit` requires exactly
-one accepted length per submitted request, from zero through submitted length.
-Only the selected boundary and its outputs become visible, once. A zero-length
-acceptance restores the base. Rejected model, convolution, RNG and grammar changes
-are discarded together. Invalid acceptance descriptors retain the pending batch
-for correction. Errors discard the entire candidate batch. A later speculation
-algorithm can replace the retained intermediate snapshots with bounded recomputation;
-P2 does not implement draft generation or target/proposal correction.
+### RNG
 
-RNG bookkeeping is request-owned. Each draw derives a deterministic SplitMix64 seed
-from the request seed/counter, then uses the existing Candle temperature/top-p
-sampler. Only the mathematical seed mixer wraps; positions, sizes and counters
-are checked. This intentionally defines a new stream, not bitwise compatibility
-with the legacy long-lived Candle RNG. Batch ordering does not enter the stream.
-Grammar commits and RNG draws occur only for requested output positions.
-Admission validates grammar/model vocabulary equality and rejects parser capabilities
-requiring multi-token splices/backtracking. This prevents masks or implicit grammar
-transitions from escaping the declared token/state boundaries; the legacy guidance
-path is unchanged. A terminal grammar refuses another output; EOS policy/stream delivery remains with later serving
-integration. `GuidanceControl::fork(&self) -> Self` uses `Constraint::deep_clone`.
-`GuidanceControl::validate_token_contract(&self, vocab_size: usize) -> Result<()>`
-checks admission compatibility.
+RNG bookkeeping belongs to each request. Each draw derives a SplitMix64 seed from the
+request seed and draw counter, then uses the existing Candle temperature/top-p sampler
+on the host. Batch order does not enter the stream. Grammar commits and draws happen
+only at requested outputs. Admission rejects grammars whose vocabulary differs from
+the model's or that need multi-token splices or backtracking.
 
-## Migration steps and limits
+## Completion
 
-1. Existing adapters can keep importing `tur`; errors and compatibility types are
-   re-exports of the same definitions, not wrapper types.
-2. New model code implements `HybridModel`, declares exact state dimensions and
-   returns complete per-layer token updates. It must not use legacy internal KV.
-3. Callers allocate request handles, pack tokens/positions, submit and finish or
-   accept a speculative prefix; use returned metadata after every commit/restore.
-4. Serving migration must move grammar activation, output delivery and scheduler
-   state onto these request handles. The current CLI/server still execute the
-   extracted legacy engine and do not acquire hybrid guarantees by re-export.
-5. Replace the reference token loop/copies and full per-token checkpoints only
-   after P3 math and later runtime/scheduler validation. No Qwen hybrid model,
-   custom kernel optimization or model-quality claim is part of P2.
+`Completion<T>` owns every buffer referenced by enqueued work: weights, bound
+inputs, staged outputs and logits. `Completion::wait` uses `Device::synchronize`,
+which waits for all work submitted through that device handle and its clones.
+An engine that needs independent completion must own its own `Device`. Extraction is
+possible only after a successful wait. Drop also waits. If that wait fails, the
+resources go into the owner's `Quarantine`, not a process-wide queue, so one engine's
+device fault cannot block other engines. Publishing at `finish` enqueues
+materialization work, so its buffers are retained by a trailing completion that the
+next `submit` waits on.
 
-Inherited unsafe/panic paths remain confined to extracted legacy code. P2 adds
-safe modules and deterministic offline fixtures; it does not fix the retained
-baseline guided-JSON failure. CPU fixtures validate ownership/state semantics,
-not Metal numerical accuracy or production memory bounds. Persistent fence-error
-quarantine and unbounded per-submission snapshot retention are explicit limitations.
+## Limits
 
-## Targeted validation
+- Model inputs are shared, so read-only use of `LayerRead` is a contract, not enforced by types.
+- Fence granularity is the device queue; per-batch events need APIs Candle does not expose safely.
+- Pages are per-request `Arc` tensors, not a pooled physical page table (P5).
+- Sampling and grammar run on the host after the fence (GPU sampling is P7).
+- Per-boundary recurrent retention for speculation grows with draft length; bounded
+  checkpoints or recompute come with P8.
+- No Qwen hybrid model, custom kernel or model-quality claim is part of P2.
 
-Commands run from the workspace root, using only cached dependencies and small
-fixtures. No checkpoint suite or benchmark suite was rerun for P2.
+## Validation
+
+Run from the workspace root with cached dependencies:
 
 ```sh
-cargo test --offline -p tur-core -p tur-metal -p tur-models -p tur-engine \
-  --no-default-features --lib
-cargo test --locked --offline -p tur-engine --no-default-features --test hybrid_contracts
-cargo test --locked --offline -p tur-metal --no-default-features --lib completion::tests
-cargo test --locked --offline -p tur --no-default-features --test server_integration
-cargo test --locked --offline -p tur-models --no-default-features --doc
-cargo check --locked --offline --workspace --all-targets
-cargo check --locked --offline --workspace --all-targets --no-default-features
-cargo fmt --all -- --check
-git diff --check
+cargo test --offline -p tur-core -p tur-metal -p tur-engine --no-default-features
+cargo test --offline -p tur --no-default-features --test server_integration
+cargo clippy --offline -p tur-core -p tur-metal -p tur-engine --no-default-features --tests
 ```
-
-All listed checks pass:
 
 | Selection | Result |
 | --- | --- |
-| Extracted library unit tests | 159 passed: core 2, Metal/storage 22, models 88, engine 47 |
-| Hybrid contract integration fixtures | 15 passed; includes exact mixed-layer state values and real llguidance branches |
-| Completion tests, targeted rerun | 5 passed, including injected failed fences and drop quarantine; included in the 22 above |
-| Existing HTTP/server integration tests | 14 passed |
-| Model factory doctest | 1 passed |
-| Workspace all-targets checks | Passed with default Metal features and with no default features |
-| Formatting and diff whitespace | Passed |
-| Dependency audit | All third-party lockfile packages, versions and checksums unchanged |
+| `tur-core` unit tests | 4 passed |
+| `tur-metal` unit tests (state staging, packed append, boundary selection, quarantine isolation) | 26 passed |
+| `tur-engine` unit tests | 48 passed |
+| Hybrid contract fixtures | 19 passed |
+| HTTP/server integration | 14 passed |
+| Clippy on new modules | No warnings |
 
-The move preserves 26 source files byte-for-byte; the other moved files only
-change module re-exports, factory documentation, or add parser fork/admission
-methods. The original errors are moved unchanged. The facade's unused inference
-dependencies were removed or moved to development dependencies. Root default
-commands now select all seven workspace members, including relocated unit tests.
+The contract fixtures cover:
 
-Existing deprecated constants in CPU attention and the upstream `block`
-future-compatibility warning are inherited. New modules forbid unsafe Rust;
-source inspection found no newly added unsafe blocks, unwrap/expect calls or
-panic macros. P0's retained guided-JSON failure is unchanged and outside this
-package. No checkpoint/GPU numerical run or benchmark was performed for P2.
+- packed prefill matching incremental decode;
+- batch reordering;
+- partial-page forks and atomic restore;
+- final-only boundary retention and requirement accounting;
+- engine-decided speculative acceptance, rejection and bonus tokens;
+- per-request model, update-validation and grammar-terminal isolation;
+- whole-batch failure;
+- cancellation, stale and foreign handles, and invalid descriptors;
+- overflow and positional limits.
+
+New modules forbid unsafe Rust and contain no `unwrap`, `expect` or panics. No
+checkpoint, GPU numerical run or benchmark was performed.

@@ -1,15 +1,20 @@
 #![forbid(unsafe_code)]
 //! Completion ownership around Candle's safe device synchronization.
+//!
+//! The fence is `Device::synchronize`, which waits for all work submitted through that
+//! device handle and its clones. Engines that need independent completion must own
+//! separate devices.
 
 use candle_core::Device;
-use std::sync::Mutex;
+use parking_lot::Mutex;
+use std::sync::Arc;
 use tur_core::Result;
 
 #[derive(Clone)]
 enum Fence {
     Device(Device),
     #[cfg(test)]
-    Controlled(std::sync::Arc<std::sync::atomic::AtomicUsize>),
+    Controlled(Arc<std::sync::atomic::AtomicUsize>),
 }
 
 impl Fence {
@@ -39,45 +44,47 @@ struct Retired {
     _resources: Box<dyn Send>,
 }
 
-// Only failed synchronization on drop uses this queue. A device error must never
-// return possibly in-flight resources to an allocator. Retry on the next submission.
-static RETIRED: Mutex<Vec<Retired>> = Mutex::new(Vec::new());
+/// Resources whose completion fence failed on drop. A device error must never return
+/// possibly in-flight resources to an allocator, so they wait here for a successful retry.
+/// Each execution owner has its own quarantine; one device failure cannot block other owners.
+#[derive(Clone, Default)]
+pub struct Quarantine(Arc<Mutex<Vec<Retired>>>);
 
-/// Retry fences for abandoned submissions. Failed entries remain retained.
-pub fn retry_retired() -> usize {
-    let entries = {
-        let mut retired = match RETIRED.lock() {
-            Ok(guard) => guard,
-            Err(error) => error.into_inner(),
-        };
-        std::mem::take(&mut *retired)
-    };
-    // Device waits and arbitrary resource destructors must run outside the queue lock.
-    let pending = entries
-        .into_iter()
-        .filter(|entry| entry.fence.wait().is_err());
-    let pending: Vec<_> = pending.collect();
-    let mut retired = match RETIRED.lock() {
-        Ok(guard) => guard,
-        Err(error) => error.into_inner(),
-    };
-    retired.extend(pending);
-    retired.len()
+impl Quarantine {
+    /// Create an empty quarantine.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Retry every retained fence and release completed resources; returns entries still held.
+    pub fn retry(&self) -> usize {
+        let entries = std::mem::take(&mut *self.0.lock());
+        // Device waits and arbitrary resource destructors run outside the lock.
+        let pending: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| entry.fence.wait().is_err())
+            .collect();
+        let mut retired = self.0.lock();
+        retired.extend(pending);
+        retired.len()
+    }
 }
 
 /// Retains weights, state, outputs and scratch until a successful completion fence.
 /// Dropping an unfinished completion waits; a failed fence quarantines its resources.
 pub struct Completion<T: Send + 'static> {
     fence: Fence,
+    quarantine: Quarantine,
     resources: Option<T>,
     completed: bool,
 }
 
 impl<T: Send + 'static> Completion<T> {
     /// Begin ownership before encoding any work that references these resources.
-    pub fn new(device: Device, resources: T) -> Self {
+    pub fn new(device: Device, quarantine: &Quarantine, resources: T) -> Self {
         Self {
             fence: Fence::Device(device),
+            quarantine: quarantine.clone(),
             resources: Some(resources),
             completed: false,
         }
@@ -109,17 +116,14 @@ impl<T: Send + 'static> Completion<T> {
 
 impl<T: Send + 'static> Drop for Completion<T> {
     fn drop(&mut self) {
-        if !self.completed && self.fence.wait().is_err() {
-            if let Some(resources) = self.resources.take() {
-                let mut retired = match RETIRED.lock() {
-                    Ok(guard) => guard,
-                    Err(error) => error.into_inner(),
-                };
-                retired.push(Retired {
-                    fence: self.fence.clone(),
-                    _resources: Box::new(resources),
-                });
-            }
+        if !self.completed
+            && self.fence.wait().is_err()
+            && let Some(resources) = self.resources.take()
+        {
+            self.quarantine.0.lock().push(Retired {
+                fence: self.fence.clone(),
+                _resources: Box::new(resources),
+            });
         }
     }
 }
@@ -127,10 +131,7 @@ impl<T: Send + 'static> Drop for Completion<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Resource(Arc<AtomicUsize>);
     impl Drop for Resource {
@@ -139,10 +140,27 @@ mod tests {
         }
     }
 
+    fn controlled<T: Send + 'static>(
+        failures: usize,
+        quarantine: &Quarantine,
+        resources: T,
+    ) -> Completion<T> {
+        Completion {
+            fence: Fence::Controlled(Arc::new(AtomicUsize::new(failures))),
+            quarantine: quarantine.clone(),
+            resources: Some(resources),
+            completed: false,
+        }
+    }
+
     #[test]
     fn test_completion_retains_resources_until_fence() -> Result<()> {
         let drops = Arc::new(AtomicUsize::new(0));
-        let mut completion = Completion::new(Device::Cpu, Resource(Arc::clone(&drops)));
+        let mut completion = Completion::new(
+            Device::Cpu,
+            &Quarantine::new(),
+            Resource(Arc::clone(&drops)),
+        );
         assert!(completion.take().is_none());
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         completion.wait()?;
@@ -154,18 +172,18 @@ mod tests {
     #[test]
     fn test_dropped_completion_releases_after_wait() {
         let drops = Arc::new(AtomicUsize::new(0));
-        drop(Completion::new(Device::Cpu, Resource(Arc::clone(&drops))));
+        drop(Completion::new(
+            Device::Cpu,
+            &Quarantine::new(),
+            Resource(Arc::clone(&drops)),
+        ));
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn test_failed_wait_keeps_resources_until_successful_retry() -> Result<()> {
         let drops = Arc::new(AtomicUsize::new(0));
-        let mut completion = Completion {
-            fence: Fence::Controlled(Arc::new(AtomicUsize::new(1))),
-            resources: Some(Resource(Arc::clone(&drops))),
-            completed: false,
-        };
+        let mut completion = controlled(1, &Quarantine::new(), Resource(Arc::clone(&drops)));
         assert!(completion.wait().is_err());
         assert!(completion.take().is_none());
         assert_eq!(drops.load(Ordering::SeqCst), 0);
@@ -178,20 +196,27 @@ mod tests {
     #[test]
     fn test_failed_drop_quarantines_resources_until_fence_retry() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let failures = Arc::new(AtomicUsize::new(1));
-        drop(Completion {
-            fence: Fence::Controlled(Arc::clone(&failures)),
-            resources: Some(Resource(Arc::clone(&drops))),
-            completed: false,
-        });
+        let quarantine = Quarantine::new();
+        drop(controlled(2, &quarantine, Resource(Arc::clone(&drops))));
         assert_eq!(drops.load(Ordering::SeqCst), 0);
-        retry_retired();
+        assert_eq!(quarantine.retry(), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(quarantine.retry(), 0);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
+    fn test_quarantine_is_isolated_per_owner() {
+        let failed = Quarantine::new();
+        let healthy = Quarantine::new();
+        drop(controlled(usize::MAX, &failed, 0u8));
+        assert_eq!(failed.retry(), 1);
+        assert_eq!(healthy.retry(), 0);
+    }
+
+    #[test]
     fn test_mutation_after_fence_requires_another_wait() -> Result<()> {
-        let mut completion = Completion::new(Device::Cpu, 1u32);
+        let mut completion = Completion::new(Device::Cpu, &Quarantine::new(), 1u32);
         completion.wait()?;
         if let Some(value) = completion.resources_mut() {
             *value = 2;

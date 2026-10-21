@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Single-owner hybrid request execution with completion-gated transactions.
+//! Single-owner hybrid request execution with completion-gated publication.
 
 use crate::backend::guidance::GuidanceControl;
 use candle_core::{DType, Device, Tensor};
@@ -10,13 +10,18 @@ use std::{
 };
 use tur_core::{
     Result, TurError,
-    execution::{ModelDescription, PackedExecution, StateHandle, StateMetadata, invalid},
+    execution::{
+        ExecutionRequirements, ModelDescription, PackedExecution, SequenceDescriptor, StateHandle,
+        StateMetadata, invalid,
+    },
 };
 use tur_metal::{
-    completion::{Completion, retry_retired},
-    state::{LayerRead, ModelState},
+    completion::{Completion, Quarantine},
+    state::{ModelState, StagedUpdate},
 };
-pub use tur_models::hybrid::{HybridModel, TokenStep};
+pub use tur_models::hybrid::{
+    Boundaries, HybridModel, LayerRead, PackedForward, SequenceForward, SequenceStep,
+};
 use uuid::Uuid;
 
 /// Per-request sampling policy using the existing Candle sampler.
@@ -32,6 +37,15 @@ struct SamplingState {
     options: SamplingOptions,
     guidance: Option<GuidanceControl>,
     tokens: Vec<u32>,
+    finished: bool,
+}
+
+/// Bookkeeping needed to undo one request's sampling after a mid-sequence error.
+struct SamplingMark {
+    draws: u64,
+    tokens: usize,
+    finished: bool,
+    guidance: Option<GuidanceControl>,
 }
 
 impl SamplingState {
@@ -42,12 +56,40 @@ impl SamplingState {
             options: self.options,
             guidance: self.guidance.as_ref().map(GuidanceControl::fork),
             tokens: self.tokens.clone(),
+            finished: self.finished,
         }
     }
 
-    fn sample(&mut self, logits: &Tensor, vocab: usize) -> Result<u32> {
-        if logits.dtype() != DType::F32 || logits.dims() != [vocab] {
-            return Err(invalid("model logits must be F32 vocabulary vector"));
+    /// Only an active grammar needs a parser copy; history rolls back by truncation.
+    fn mark(&self) -> SamplingMark {
+        SamplingMark {
+            draws: self.draws,
+            tokens: self.tokens.len(),
+            finished: self.finished,
+            guidance: self
+                .guidance
+                .as_ref()
+                .filter(|g| g.is_active())
+                .map(GuidanceControl::fork),
+        }
+    }
+
+    fn rollback(&mut self, mark: SamplingMark) {
+        self.draws = mark.draws;
+        self.tokens.truncate(mark.tokens);
+        self.finished = mark.finished;
+        if let Some(guidance) = mark.guidance {
+            self.guidance = Some(guidance);
+        }
+    }
+
+    /// Sample one output, or `None` once the grammar has reached a terminal state.
+    fn sample(&mut self, logits: &[f32]) -> Result<Option<u32>> {
+        if self.finished {
+            return Ok(None);
+        }
+        if logits.iter().any(|value| !value.is_finite()) {
+            return Err(invalid("nonfinite model logits"));
         }
         let next_draw = self
             .draws
@@ -61,27 +103,28 @@ impl SamplingState {
         seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
         seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d049bb133111eb);
         seed ^= seed >> 31;
-        let mut values = logits.to_vec1::<f32>()?;
-        if values.iter().any(|value| !value.is_finite()) {
-            return Err(invalid("nonfinite model logits"));
-        }
-        if let Some(guidance) = &mut self.guidance {
-            if guidance.apply_mask(&mut values)? {
-                return Err(TurError::Guidance("grammar has stopped".into()));
-            }
+        let mut values = logits.to_vec();
+        if let Some(guidance) = &mut self.guidance
+            && guidance.apply_mask(&mut values)?
+        {
+            self.finished = true;
+            return Ok(None);
         }
         if !values.iter().any(|v| v.is_finite()) {
             return Err(TurError::Guidance("grammar disallows every token".into()));
         }
-        let masked = Tensor::from_vec(values, vocab, logits.device())?;
+        let vocab = values.len();
+        let masked = Tensor::from_vec(values, vocab, &Device::Cpu)?;
         let mut sampler = LogitsProcessor::new(seed, self.options.temperature, self.options.top_p);
         let token = sampler.sample(&masked)?;
-        if let Some(guidance) = &mut self.guidance {
-            guidance.commit(token)?;
+        if let Some(guidance) = &mut self.guidance
+            && guidance.commit(token)?
+        {
+            self.finished = true;
         }
         self.draws = next_draw;
         self.tokens.push(token);
-        Ok(token)
+        Ok(Some(token))
     }
 }
 
@@ -124,6 +167,10 @@ impl Checkpoint {
     pub fn sampled_tokens(&self) -> &[u32] {
         &self.0.sampling.tokens
     }
+    /// Whether the grammar had reached a terminal state.
+    pub fn finished(&self) -> bool {
+        self.0.sampling.finished
+    }
 }
 
 struct Request {
@@ -140,41 +187,169 @@ pub struct TokenOutput {
     pub token: u32,
 }
 
-struct Work {
-    handle: StateHandle,
-    base: Snapshot,
-    boundaries: Vec<Snapshot>,
-    outputs: Vec<(usize, TokenOutput)>,
+/// What one request published from a completed batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequenceCommit {
+    /// New handle; descriptors built from the previous revision are rejected.
+    pub handle: StateHandle,
+    /// Input tokens consumed into model state. Speculative sequences stop after the first
+    /// draft that disagrees with the sampled target token.
+    pub accepted_tokens: usize,
+    pub outputs: Vec<TokenOutput>,
+    /// The grammar reached a terminal state; later outputs will not be sampled.
+    pub finished: bool,
 }
 
-struct StepResources {
-    inputs: Vec<LayerRead>,
-    output: Option<TokenStep>,
+/// Per-request outcome. An error leaves that request's committed state unchanged.
+#[derive(Debug)]
+pub struct SequenceResult {
+    pub request: Uuid,
+    pub outcome: Result<SequenceCommit>,
 }
 
 struct Batch<M> {
+    // Weights, committed inputs and model outputs stay alive across the completion fence.
     model: Arc<M>,
-    work: Vec<Work>,
-    // Keep detached input and output bindings alive across the completion fence.
-    scratch: Vec<StepResources>,
-    candidates: Vec<ModelState>,
+    plan: PackedExecution,
+    bases: Vec<ModelState>,
+    inputs: Vec<Vec<LayerRead>>,
+    staged: Vec<Result<(StagedUpdate, Tensor)>>,
     error: Option<TurError>,
 }
 
+/// Device work enqueued while publishing accepted boundaries reads these buffers.
+type Trailing = (
+    Vec<ModelState>,
+    Vec<Vec<LayerRead>>,
+    Vec<(StagedUpdate, Tensor)>,
+);
+
 /// One execution owner with at most one in-flight batch. No locks are held during execution.
-/// `submit` stages updates; `commit` fences and publishes accepted boundaries exactly once.
+/// `submit` validates and enqueues one packed pass; `finish` fences, samples and publishes.
 pub struct HybridEngine<M: HybridModel> {
     model: Arc<M>,
     description: Arc<ModelDescription>,
     device: Device,
+    quarantine: Quarantine,
     requests: HashMap<Uuid, Request>,
     pending: Option<Completion<Batch<M>>>,
     pending_handles: HashSet<Uuid>,
-    pending_lengths: Vec<(Uuid, usize)>,
+    trailing: Option<Completion<Trailing>>,
+}
+
+fn validate_logits(logits: &Tensor, rows: usize, vocab: usize, device: &Device) -> Result<()> {
+    if logits.dims() != [rows, vocab]
+        || logits.dtype() != DType::F32
+        || !logits.device().same_device(device)
+    {
+        return Err(invalid("model logits must be F32 [outputs, vocabulary]"));
+    }
+    Ok(())
+}
+
+/// Sample in order and decide how many inputs are accepted.
+fn sample_sequence(
+    sampling: &mut SamplingState,
+    sequence: &SequenceDescriptor,
+    tokens: &[u32],
+    rows: &[Vec<f32>],
+) -> Result<(usize, Vec<TokenOutput>)> {
+    let length = sequence.tokens.len();
+    let mut outputs = Vec::with_capacity(sequence.outputs.len());
+    for (index, (&position, row)) in sequence.outputs.iter().zip(rows).enumerate() {
+        let Some(token) = sampling.sample(row)? else {
+            return Ok((
+                if sequence.speculative {
+                    index + 1
+                } else {
+                    length
+                },
+                outputs,
+            ));
+        };
+        outputs.push(TokenOutput {
+            request: sequence.state.request,
+            packed_position: position,
+            token,
+        });
+        if sequence.speculative {
+            let draft = tokens
+                .get(position + 1)
+                .filter(|_| position + 1 < sequence.tokens.end);
+            if sampling.finished || draft != Some(&token) {
+                return Ok((index + 1, outputs));
+            }
+        }
+    }
+    Ok((length, outputs))
+}
+
+fn boundaries(sequence: &SequenceDescriptor) -> Boundaries {
+    if sequence.speculative {
+        Boundaries::EveryToken
+    } else {
+        Boundaries::Final
+    }
+}
+
+fn forwards<'a>(
+    plan: &'a PackedExecution,
+    inputs: &'a [Vec<LayerRead>],
+) -> Vec<SequenceForward<'a>> {
+    plan.sequences
+        .iter()
+        .zip(inputs)
+        .map(|(sequence, state)| SequenceForward {
+            tokens: sequence.tokens.clone(),
+            state,
+            logits: &sequence.outputs,
+            boundaries: boundaries(sequence),
+        })
+        .collect()
+}
+
+/// Sample, select the accepted boundary and publish one request; on error nothing changes.
+fn publish(
+    request: &mut Request,
+    sequence: &SequenceDescriptor,
+    tokens: &[u32],
+    base: &ModelState,
+    (update, logits): &(StagedUpdate, Tensor),
+) -> Result<SequenceCommit> {
+    let rows: Vec<Vec<f32>> = if sequence.outputs.is_empty() {
+        Vec::new()
+    } else {
+        logits.to_vec2()?
+    };
+    let revision = request
+        .handle
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| invalid("request revision overflow"))?;
+    let sampling = &mut request.snapshot.sampling;
+    let mark = sampling.mark();
+    let published = sample_sequence(sampling, sequence, tokens, &rows)
+        .and_then(|(accepted, outputs)| Ok((base.apply(update, accepted)?, accepted, outputs)));
+    let (model, accepted, outputs) = match published {
+        Ok(published) => published,
+        Err(error) => {
+            sampling.rollback(mark);
+            return Err(error);
+        }
+    };
+    request.snapshot.model = model;
+    request.handle.revision = revision;
+    Ok(SequenceCommit {
+        handle: request.handle,
+        accepted_tokens: accepted,
+        outputs,
+        finished: request.snapshot.sampling.finished,
+    })
 }
 
 impl<M: HybridModel> HybridEngine<M> {
     /// Validate the model description before allocating any request resources.
+    /// Completion fences wait on `device`; give each engine its own device for isolation.
     pub fn new(model: Arc<M>, device: Device) -> Result<Self> {
         let description = model.description();
         description.validate()?;
@@ -182,10 +357,11 @@ impl<M: HybridModel> HybridEngine<M> {
             model,
             description: Arc::new(description),
             device,
+            quarantine: Quarantine::new(),
             requests: HashMap::new(),
             pending: None,
             pending_handles: HashSet::new(),
-            pending_lengths: Vec::new(),
+            trailing: None,
         })
     }
 
@@ -216,6 +392,7 @@ impl<M: HybridModel> HybridEngine<M> {
                 options,
                 guidance,
                 tokens: Vec::new(),
+                finished: false,
             },
         };
         self.insert(snapshot)
@@ -252,7 +429,7 @@ impl<M: HybridModel> HybridEngine<M> {
         Ok(request)
     }
 
-    /// Current handle and sequence position for descriptor construction.
+    /// Current handle, sequence position and grammar status for descriptor construction.
     pub fn metadata(&self, request: Uuid) -> Result<StateMetadata> {
         let state = self
             .requests
@@ -264,6 +441,7 @@ impl<M: HybridModel> HybridEngine<M> {
         Ok(StateMetadata {
             handle: state.handle,
             position: state.snapshot.model.position(),
+            finished: state.snapshot.sampling.finished,
         })
     }
 
@@ -323,13 +501,25 @@ impl<M: HybridModel> HybridEngine<M> {
         Ok(())
     }
 
-    /// Validate the complete packed descriptor before any model work, then stage private updates.
-    /// Execution errors are reported by `commit` after the completion fence.
-    pub fn submit(&mut self, plan: PackedExecution) -> Result<()> {
+    /// Retry this engine's failed fences; returns the number still quarantined.
+    pub fn retry_quarantined(&self) -> usize {
+        self.quarantine.retry()
+    }
+
+    /// Validate the complete packed descriptor, then enqueue one packed model pass.
+    /// Returns the checked payload this submission retains, including model workspace.
+    /// Per-request execution errors are reported by `finish`.
+    pub fn submit(&mut self, plan: PackedExecution) -> Result<ExecutionRequirements> {
         if self.pending.is_some() {
             return Err(invalid("one batch is already in flight"));
         }
-        if retry_retired() != 0 {
+        if let Some(mut trailing) = self.trailing.take()
+            && let Err(error) = trailing.wait()
+        {
+            self.trailing = Some(trailing);
+            return Err(error);
+        }
+        if self.quarantine.retry() != 0 {
             return Err(invalid("retired submissions still await device completion"));
         }
         let states: Vec<_> = self
@@ -339,193 +529,139 @@ impl<M: HybridModel> HybridEngine<M> {
             .map(|r| StateMetadata {
                 handle: r.handle,
                 position: r.snapshot.model.position(),
+                finished: r.snapshot.sampling.finished,
             })
             .collect();
-        let validated = plan.validate(&self.description, &states)?;
-        let plan = validated.packed();
-        let mut work = Vec::with_capacity(plan.sequences.len());
+        let (plan, mut requirements) = plan.validate(&self.description, &states)?.into_parts();
+        let mut bases = Vec::with_capacity(plan.sequences.len());
         for sequence in &plan.sequences {
             sequence
                 .state
                 .revision
                 .checked_add(1)
                 .ok_or_else(|| invalid("request revision overflow"))?;
-            work.push(Work {
-                handle: sequence.state,
-                base: self.request(sequence.state)?.snapshot.fork(),
-                boundaries: Vec::new(),
-                outputs: Vec::new(),
-            });
+            bases.push(self.request(sequence.state)?.snapshot.model.clone());
         }
+        let inputs: Vec<_> = bases.iter().map(ModelState::bind_layers).collect();
+        requirements.workspace_bytes = self.model.workspace_bytes(&PackedForward {
+            tokens: &plan.tokens,
+            positions: &plan.positions,
+            sequences: &forwards(&plan, &inputs),
+        })?;
+        requirements.total_bytes()?;
         let mut completion = Completion::new(
             self.device.clone(),
+            &self.quarantine,
             Batch {
                 model: Arc::clone(&self.model),
-                work,
-                scratch: Vec::new(),
-                candidates: Vec::new(),
+                plan,
+                bases,
+                inputs,
+                staged: Vec::new(),
                 error: None,
             },
         );
         let batch = completion
             .resources_mut()
             .ok_or_else(|| invalid("missing submission resources"))?;
-        let result = (|| -> Result<()> {
-            for (sequence, work) in plan.sequences.iter().zip(&mut batch.work) {
-                let mut state = work.base.fork();
-                for packed_position in sequence.tokens.clone() {
-                    let token = *plan
-                        .tokens
-                        .get(packed_position)
-                        .ok_or_else(|| invalid("packed token out of bounds"))?;
-                    // Own inputs before calling the model: it may encode work and then fail.
-                    batch.scratch.push(StepResources {
-                        inputs: state.model.read_layers()?,
-                        output: None,
-                    });
-                    let bindings = batch
-                        .scratch
-                        .last_mut()
-                        .ok_or_else(|| invalid("missing step resources"))?;
-                    bindings.output = Some(batch.model.step(
-                        token,
-                        state.model.position(),
-                        &bindings.inputs,
-                    )?);
-                    let step = bindings
-                        .output
-                        .as_ref()
-                        .ok_or_else(|| invalid("missing step output"))?;
-                    state.model = state.model.advance(&step.layers)?;
-                    batch.candidates.push(state.model.clone());
-                    if !step.logits.device().same_device(&self.device)
-                        || step.logits.dims() != [self.description.vocab_size]
-                        || step.logits.dtype() != DType::F32
-                    {
-                        return Err(invalid("invalid output logits"));
-                    }
-                    if sequence.outputs.contains(&packed_position) {
-                        let token = state
-                            .sampling
-                            .sample(&step.logits, self.description.vocab_size)?;
-                        work.outputs.push((
-                            work.boundaries.len(),
-                            TokenOutput {
-                                request: sequence.state.request,
-                                packed_position,
-                                token,
-                            },
-                        ));
-                    }
-                    work.boundaries.push(state.fork());
+        let result = batch.model.forward(&PackedForward {
+            tokens: &batch.plan.tokens,
+            positions: &batch.plan.positions,
+            sequences: &forwards(&batch.plan, &batch.inputs),
+        });
+        match result {
+            Ok(steps) if steps.len() == batch.plan.sequences.len() => {
+                for ((sequence, base), step) in
+                    batch.plan.sequences.iter().zip(&batch.bases).zip(steps)
+                {
+                    batch.staged.push(step.and_then(|step| {
+                        validate_logits(
+                            &step.logits,
+                            sequence.outputs.len(),
+                            self.description.vocab_size,
+                            &self.device,
+                        )?;
+                        let staged =
+                            base.stage(step.layers, sequence.tokens.len(), boundaries(sequence))?;
+                        Ok((staged, step.logits))
+                    }));
                 }
             }
-            Ok(())
-        })();
-        batch.error = result.err();
-        self.pending_handles = plan.sequences.iter().map(|s| s.state.request).collect();
-        self.pending_lengths = plan
+            Ok(_) => batch.error = Some(invalid("model returned wrong number of sequences")),
+            Err(error) => batch.error = Some(error),
+        }
+        self.pending_handles = batch
+            .plan
             .sequences
             .iter()
-            .map(|s| (s.state.request, s.tokens.len()))
+            .map(|s| s.state.request)
             .collect();
         self.pending = Some(completion);
-        Ok(())
+        Ok(requirements)
     }
 
-    /// Accept all staged tokens after completion, publishing each request atomically.
-    pub fn finish(&mut self) -> Result<Vec<TokenOutput>> {
-        let accepted = self.pending_lengths.clone();
-        self.commit(&accepted)
-    }
-
-    /// Commit exactly one accepted token prefix per request, including zero for full rollback.
-    /// Rejected suffixes roll back model state, position, RNG, sampled history and grammar together.
-    /// A rejected recurrent suffix selects its exact saved boundary; it is never truncated.
-    pub fn commit(&mut self, accepted: &[(Uuid, usize)]) -> Result<Vec<TokenOutput>> {
-        if self.pending.is_none() {
-            return Err(invalid("no batch in flight"));
-        }
-        let mut counts = HashMap::new();
-        for &(request, count) in accepted {
-            let length = self
-                .pending_lengths
-                .iter()
-                .find(|(id, _)| *id == request)
-                .map(|(_, len)| *len)
-                .ok_or_else(|| invalid("unknown acceptance request"))?;
-            if count > length || counts.insert(request, count).is_some() {
-                return Err(invalid("invalid accepted prefix"));
-            }
-        }
-        if counts.len() != self.pending_lengths.len() {
-            return Err(invalid("missing accepted prefix"));
-        }
+    /// Fence the pending batch, then sample and publish each request independently.
+    /// A fence error keeps the batch pending for retry; a whole-batch model error is
+    /// returned once and leaves every request unchanged.
+    pub fn finish(&mut self) -> Result<Vec<SequenceResult>> {
         let completion = self
             .pending
             .as_mut()
-            .ok_or_else(|| invalid("missing completion"))?;
+            .ok_or_else(|| invalid("no batch in flight"))?;
         completion.wait()?;
         let batch = completion
             .take()
             .ok_or_else(|| invalid("incomplete submission"))?;
         self.pending = None;
         self.pending_handles.clear();
-        self.pending_lengths.clear();
-        if let Some(error) = batch.error {
+        let Batch {
+            plan,
+            bases,
+            inputs,
+            staged,
+            error,
+            ..
+        } = batch;
+        if let Some(error) = error {
             self.requests.retain(|_, request| !request.cancelled);
             return Err(error);
         }
-        // Prepare all publications before mutating any live request.
-        let mut publications = Vec::with_capacity(batch.work.len());
-        let mut outputs = Vec::new();
-        for work in batch.work {
-            let count = *counts
-                .get(&work.handle.request)
-                .ok_or_else(|| invalid("missing acceptance count"))?;
-            let request = self
-                .requests
-                .get(&work.handle.request)
-                .ok_or_else(|| invalid("in-flight request disappeared"))?;
-            if request.cancelled {
-                continue;
-            }
-            let revision = request
-                .handle
-                .revision
-                .checked_add(1)
-                .ok_or_else(|| invalid("request revision overflow"))?;
-            let snapshot = if count == 0 {
-                work.base
-            } else {
-                work.boundaries
-                    .into_iter()
-                    .nth(count - 1)
-                    .ok_or_else(|| invalid("missing accepted boundary"))?
+        let mut results = Vec::with_capacity(plan.sequences.len());
+        let mut retained = Vec::with_capacity(staged.len());
+        for ((sequence, base), staged) in plan.sequences.iter().zip(&bases).zip(staged) {
+            let id = sequence.state.request;
+            let live = self.requests.get_mut(&id).filter(|r| !r.cancelled);
+            let outcome = match (live, staged) {
+                (None, staged) => {
+                    retained.extend(staged.ok());
+                    continue;
+                }
+                (Some(_), Err(error)) => Err(error),
+                (Some(request), Ok(staged)) => {
+                    let outcome = publish(request, sequence, &plan.tokens, base, &staged);
+                    retained.push(staged);
+                    outcome
+                }
             };
-            outputs.extend(
-                work.outputs
-                    .into_iter()
-                    .filter(|(boundary, _)| *boundary < count)
-                    .map(|(_, output)| output),
-            );
-            publications.push((work.handle.request, revision, snapshot));
-        }
-        for (id, revision, snapshot) in publications {
-            if let Some(request) = self.requests.get_mut(&id) {
-                request.snapshot = snapshot;
-                request.handle.revision = revision;
-            }
+            results.push(SequenceResult {
+                request: id,
+                outcome,
+            });
         }
         self.requests.retain(|_, request| !request.cancelled);
-        Ok(outputs)
+        self.trailing = Some(Completion::new(
+            self.device.clone(),
+            &self.quarantine,
+            (bases, inputs, retained),
+        ));
+        Ok(results)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tur_core::execution::{LayerStateKind, ModelIdentity, SequenceDescriptor};
+    use tur_core::execution::{LayerStateKind, Modality, ModelIdentity, SequenceDescriptor};
 
     struct UnusedModel;
     impl HybridModel for UnusedModel {
@@ -539,33 +675,31 @@ mod tests {
                     kv_heads: 1,
                     head_dim: 1,
                     page_tokens: 2,
+                    dtype: DType::F32,
                 }],
+                modalities: vec![Modality::Text],
                 vocab_size: 2,
                 max_position: 4,
             }
         }
-        fn step(&self, _: u32, _: usize, _: &[LayerRead]) -> Result<TokenStep> {
+        fn forward(&self, _: &PackedForward<'_>) -> Result<Vec<Result<SequenceStep>>> {
             Err(invalid("unexpected dispatch"))
         }
     }
 
     #[test]
-    fn test_rng_counter_overflow_leaves_bookkeeping_unchanged() -> Result<()> {
+    fn test_rng_counter_overflow_leaves_bookkeeping_unchanged() {
         let mut state = SamplingState {
             seed: 1,
             draws: u64::MAX,
             options: SamplingOptions::default(),
             guidance: None,
             tokens: vec![],
+            finished: false,
         };
-        assert!(
-            state
-                .sample(&Tensor::new(&[1.0f32, 2.0], &Device::Cpu)?, 2)
-                .is_err()
-        );
+        assert!(state.sample(&[1.0, 2.0]).is_err());
         assert_eq!(state.draws, u64::MAX);
         assert!(state.tokens.is_empty());
-        Ok(())
     }
 
     #[test]
@@ -586,6 +720,7 @@ mod tests {
                 state: handle,
                 tokens: 0..1,
                 outputs: vec![0],
+                speculative: false,
             }],
         };
         assert!(engine.submit(plan).is_err());
@@ -621,5 +756,23 @@ mod tests {
         }
         assert!(engine.requests.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn test_rollback_restores_history_and_draws() {
+        let mut state = SamplingState {
+            seed: 3,
+            draws: 0,
+            options: SamplingOptions::default(),
+            guidance: None,
+            tokens: vec![],
+            finished: false,
+        };
+        let mark = state.mark();
+        assert!(matches!(state.sample(&[0.0, 1.0]), Ok(Some(1))));
+        assert!(state.sample(&[f32::NAN, 1.0]).is_err());
+        state.rollback(mark);
+        assert_eq!(state.draws, 0);
+        assert!(state.tokens.is_empty());
     }
 }

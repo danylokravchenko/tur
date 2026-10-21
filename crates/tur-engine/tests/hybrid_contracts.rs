@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
+use parking_lot::Mutex;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -8,22 +9,145 @@ use std::sync::{
 use tur_core::{
     Result, TurError,
     execution::{
-        LayerStateKind, ModelDescription, ModelIdentity, PackedExecution, SequenceDescriptor,
-        StateHandle, StateMetadata, invalid,
+        LayerStateKind, Modality, ModelDescription, ModelIdentity, PackedExecution,
+        SequenceDescriptor, StateHandle, StateMetadata, invalid,
     },
 };
 use tur_engine::{
     backend::guidance::{GuidanceControl, TopLevelGrammar, build_llg_factory},
-    hybrid::{Checkpoint, HybridEngine, SamplingOptions, TokenOutput},
+    hybrid::{
+        Boundaries, Checkpoint, HybridEngine, HybridModel, LayerRead, PackedForward,
+        SamplingOptions, SequenceCommit, SequenceResult, SequenceStep, TokenOutput,
+    },
 };
-use tur_metal::state::{LayerRead, LayerUpdate};
-use tur_models::hybrid::{HybridModel, TokenStep};
+use tur_metal::state::LayerUpdate;
 
+const LOGITS: [f32; 8] = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4];
+
+#[derive(Default)]
 struct Fixture {
-    calls: Arc<AtomicUsize>,
+    calls: AtomicUsize,
+    boundaries: Mutex<Vec<Boundaries>>,
     revision: &'static str,
+    /// Fails only the sequence containing this token.
     fault: Option<u32>,
+    /// Fails the whole forward pass when any sequence contains this token.
+    batch_fault: Option<u32>,
+    /// Turns `fault` into a malformed recurrent update instead of an error.
     invalid_update: bool,
+}
+
+fn fixture() -> Fixture {
+    Fixture {
+        revision: "fixture-v1",
+        ..Default::default()
+    }
+}
+
+fn attention(page_tokens: usize) -> LayerStateKind {
+    LayerStateKind::Attention {
+        kv_heads: 1,
+        head_dim: 1,
+        page_tokens,
+        dtype: DType::F32,
+    }
+}
+
+fn recurrent() -> LayerStateKind {
+    LayerStateKind::Recurrent {
+        conv_channels: 1,
+        conv_width: 2,
+        heads: 1,
+        key_dim: 1,
+        value_dim: 1,
+        dtype: DType::F32,
+    }
+}
+
+fn scalars(tensor: &Tensor) -> Result<Vec<f32>> {
+    Ok(tensor.flatten_all()?.to_vec1::<f32>()?)
+}
+
+impl Fixture {
+    /// Sequential reference math: each attention key adds the token, its position and all
+    /// prior keys; recurrent state doubles and adds the token and previous token.
+    fn sequence(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        state: &[LayerRead],
+        logits: usize,
+        boundaries: Boundaries,
+    ) -> Result<SequenceStep> {
+        if self.fault.is_some_and(|f| tokens.contains(&f)) && !self.invalid_update {
+            return Err(invalid("injected sequence failure"));
+        }
+        let n = tokens.len();
+        let mut layers = Vec::new();
+        for (index, layer) in state.iter().enumerate() {
+            layers.push(match layer {
+                LayerRead::Attention { pages } => {
+                    let mut sum = 0.0;
+                    for (key, _) in pages {
+                        sum += scalars(key)?.iter().sum::<f32>();
+                    }
+                    let mut keys = Vec::with_capacity(n);
+                    for (&token, &position) in tokens.iter().zip(positions) {
+                        let key = token as f32 + position as f32 + sum;
+                        sum += key;
+                        keys.push(key);
+                    }
+                    let values: Vec<f32> = keys.iter().map(|k| k + index as f32).collect();
+                    LayerUpdate::Attention {
+                        key: Tensor::from_vec(keys, (n, 1, 1), &Device::Cpu)?,
+                        value: Tensor::from_vec(values, (n, 1, 1), &Device::Cpu)?,
+                    }
+                }
+                LayerRead::Recurrent {
+                    convolution,
+                    recurrent,
+                } => {
+                    let mut last = scalars(convolution)?
+                        .last()
+                        .copied()
+                        .ok_or_else(|| invalid("missing convolution history"))?;
+                    let mut value = scalars(recurrent)?
+                        .first()
+                        .copied()
+                        .ok_or_else(|| invalid("missing recurrent state"))?;
+                    let mut history = Vec::new();
+                    let mut matrices = Vec::new();
+                    for &token in tokens {
+                        value = 2.0 * value + token as f32 + last;
+                        history.extend([last, token as f32]);
+                        matrices.push(value);
+                        last = token as f32;
+                    }
+                    let keep = match boundaries {
+                        Boundaries::Final => 1,
+                        Boundaries::EveryToken => n,
+                    };
+                    let history = history.split_off(2 * (n - keep));
+                    let matrices = matrices.split_off(n - keep);
+                    let recurrent =
+                        if self.invalid_update && self.fault.is_some_and(|f| tokens.contains(&f)) {
+                            Tensor::new(&[1.0f32], &Device::Cpu)?
+                        } else {
+                            Tensor::from_vec(matrices, (keep, 1, 1, 1), &Device::Cpu)?
+                        };
+                    LayerUpdate::Recurrent {
+                        convolution: Tensor::from_vec(history, (keep, 2, 1), &Device::Cpu)?,
+                        recurrent,
+                    }
+                }
+            });
+        }
+        let rows = LOGITS.repeat(logits);
+        Ok(SequenceStep {
+            layers,
+            logits: Tensor::from_vec(rows, (logits, LOGITS.len()), &Device::Cpu)?,
+        })
+    }
 }
 
 impl HybridModel for Fixture {
@@ -33,94 +157,44 @@ impl HybridModel for Fixture {
                 revision: self.revision.into(),
                 state_format: 1,
             },
-            layers: vec![
-                LayerStateKind::Attention {
-                    kv_heads: 1,
-                    head_dim: 1,
-                    page_tokens: 2,
-                },
-                LayerStateKind::Recurrent {
-                    conv_channels: 1,
-                    conv_width: 2,
-                    heads: 1,
-                    key_dim: 1,
-                    value_dim: 1,
-                },
-                LayerStateKind::Attention {
-                    kv_heads: 1,
-                    head_dim: 1,
-                    page_tokens: 3,
-                },
-                LayerStateKind::Recurrent {
-                    conv_channels: 1,
-                    conv_width: 2,
-                    heads: 1,
-                    key_dim: 1,
-                    value_dim: 1,
-                },
-            ],
+            layers: vec![attention(2), recurrent(), attention(3), recurrent()],
+            modalities: vec![Modality::Text],
             vocab_size: 8,
             max_position: 16,
         }
     }
 
-    fn step(&self, token: u32, position: usize, state: &[LayerRead]) -> Result<TokenStep> {
+    fn workspace_bytes(&self, batch: &PackedForward<'_>) -> Result<usize> {
+        Ok(batch.tokens.len() * 16)
+    }
+
+    fn forward(&self, batch: &PackedForward<'_>) -> Result<Vec<Result<SequenceStep>>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        if self.fault == Some(token) && !self.invalid_update {
-            return Err(invalid("injected execution failure"));
+        if self.batch_fault.is_some_and(|f| batch.tokens.contains(&f)) {
+            return Err(invalid("injected batch failure"));
         }
-        let mut layers = Vec::new();
-        for (index, layer) in state.iter().enumerate() {
-            layers.push(match layer {
-                LayerRead::Attention { pages } => {
-                    let mut sum = token as f32 + position as f32;
-                    for (key, _) in pages {
-                        sum += key.flatten_all()?.to_vec1::<f32>()?.iter().sum::<f32>();
-                    }
-                    LayerUpdate::Attention {
-                        key: Tensor::new(&[[sum]], &Device::Cpu)?,
-                        value: Tensor::new(&[[sum + index as f32]], &Device::Cpu)?,
-                    }
-                }
-                LayerRead::Recurrent {
-                    convolution,
-                    recurrent,
-                } => {
-                    let history = convolution.flatten_all()?.to_vec1::<f32>()?;
-                    let last = history
-                        .last()
-                        .copied()
-                        .ok_or_else(|| invalid("missing convolution history"))?;
-                    let convolution = Tensor::new(&[[last], [token as f32]], &Device::Cpu)?;
-                    let recurrent = if self.invalid_update && self.fault == Some(token) {
-                        Tensor::new(&[1.0f32], &Device::Cpu)?
-                    } else {
-                        recurrent.affine(2.0, f64::from(token) + f64::from(last))?
-                    };
-                    LayerUpdate::Recurrent {
-                        convolution,
-                        recurrent,
-                    }
-                }
-            });
-        }
-        let logits = Tensor::new(&[0.0f32, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4], &Device::Cpu)?;
-        Ok(TokenStep { layers, logits })
+        let mut recorded = self.boundaries.lock();
+        Ok(batch
+            .sequences
+            .iter()
+            .map(|sequence| {
+                recorded.push(sequence.boundaries);
+                let range = sequence.tokens.clone();
+                self.sequence(
+                    batch.tokens.get(range.clone()).unwrap_or_default(),
+                    batch.positions.get(range).unwrap_or_default(),
+                    sequence.state,
+                    sequence.logits.len(),
+                    sequence.boundaries,
+                )
+            })
+            .collect())
     }
 }
 
-fn engine(
-    fault: Option<u32>,
-    invalid_update: bool,
-) -> Result<(HybridEngine<Fixture>, Arc<AtomicUsize>)> {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let model = Arc::new(Fixture {
-        calls: Arc::clone(&calls),
-        revision: "fixture-v1",
-        fault,
-        invalid_update,
-    });
-    Ok((HybridEngine::new(model, Device::Cpu)?, calls))
+fn engine(model: Fixture) -> Result<(HybridEngine<Fixture>, Arc<Fixture>)> {
+    let model = Arc::new(model);
+    Ok((HybridEngine::new(Arc::clone(&model), Device::Cpu)?, model))
 }
 
 fn allocate(engine: &mut HybridEngine<Fixture>, seed: u64) -> Result<StateHandle> {
@@ -134,9 +208,14 @@ fn allocate(engine: &mut HybridEngine<Fixture>, seed: u64) -> Result<StateHandle
     )
 }
 
-fn plan(
+fn greedy(engine: &mut HybridEngine<Fixture>) -> Result<StateHandle> {
+    engine.allocate(1, SamplingOptions::default(), None)
+}
+
+fn packed(
     engine: &HybridEngine<Fixture>,
     sequences: &[(StateHandle, &[u32])],
+    speculative: bool,
 ) -> Result<PackedExecution> {
     let mut packed = PackedExecution {
         tokens: Vec::new(),
@@ -147,22 +226,37 @@ fn plan(
         let metadata = engine.metadata(handle.request)?;
         let start = packed.tokens.len();
         packed.tokens.extend_from_slice(tokens);
-        for offset in 0..tokens.len() {
-            packed.positions.push(
-                metadata
-                    .position
-                    .checked_add(offset)
-                    .ok_or_else(|| invalid("fixture position overflow"))?,
-            );
-        }
+        packed
+            .positions
+            .extend((0..tokens.len()).map(|offset| metadata.position + offset));
         let end = packed.tokens.len();
         packed.sequences.push(SequenceDescriptor {
-            state: handle,
+            state: metadata.handle,
             tokens: start..end,
             outputs: (start..end).collect(),
+            speculative,
         });
     }
     Ok(packed)
+}
+
+fn plan(
+    engine: &HybridEngine<Fixture>,
+    sequences: &[(StateHandle, &[u32])],
+) -> Result<PackedExecution> {
+    packed(engine, sequences, false)
+}
+
+fn submit_all(
+    engine: &mut HybridEngine<Fixture>,
+    input: PackedExecution,
+) -> Result<Vec<SequenceResult>> {
+    engine.submit(input)?;
+    engine.finish()
+}
+
+fn commits(results: Vec<SequenceResult>) -> Result<Vec<SequenceCommit>> {
+    results.into_iter().map(|r| r.outcome).collect()
 }
 
 fn run(
@@ -170,8 +264,22 @@ fn run(
     sequences: &[(StateHandle, &[u32])],
 ) -> Result<Vec<TokenOutput>> {
     let input = plan(engine, sequences)?;
-    engine.submit(input)?;
-    engine.finish()
+    Ok(commits(submit_all(engine, input)?)?
+        .into_iter()
+        .flat_map(|c| c.outputs)
+        .collect())
+}
+
+fn outcome(results: &[SequenceResult], handle: StateHandle) -> Result<&Result<SequenceCommit>> {
+    results
+        .iter()
+        .find(|r| r.request == handle.request)
+        .map(|r| &r.outcome)
+        .ok_or_else(|| invalid("missing request result"))
+}
+
+fn tokens(outputs: &[TokenOutput]) -> Vec<u32> {
+    outputs.iter().map(|o| o.token).collect()
 }
 
 fn checkpoint(engine: &HybridEngine<Fixture>, handle: StateHandle) -> Result<Checkpoint> {
@@ -188,16 +296,16 @@ fn values(checkpoint: &Checkpoint) -> Result<Vec<Vec<f32>>> {
         match layer {
             LayerRead::Attention { pages } => {
                 for (key, value) in pages {
-                    values.push(key.flatten_all()?.to_vec1::<f32>()?);
-                    values.push(value.flatten_all()?.to_vec1::<f32>()?);
+                    values.push(scalars(&key)?);
+                    values.push(scalars(&value)?);
                 }
             }
             LayerRead::Recurrent {
                 convolution,
                 recurrent,
             } => {
-                values.push(convolution.flatten_all()?.to_vec1::<f32>()?);
-                values.push(recurrent.flatten_all()?.to_vec1::<f32>()?);
+                values.push(scalars(&convolution)?);
+                values.push(scalars(&recurrent)?);
             }
         }
     }
@@ -208,14 +316,15 @@ fn equivalent(left: &Checkpoint, right: &Checkpoint) -> Result<()> {
     assert_eq!(left.position(), right.position());
     assert_eq!(left.rng_draws(), right.rng_draws());
     assert_eq!(left.sampled_tokens(), right.sampled_tokens());
+    assert_eq!(left.finished(), right.finished());
     assert_eq!(values(left)?, values(right)?);
     Ok(())
 }
 
 #[test]
 fn test_independent_requests_match_single_execution_after_batch_reordering() -> Result<()> {
-    let (mut batched, _) = engine(None, false)?;
-    let (mut single, _) = engine(None, false)?;
+    let (mut batched, _) = engine(fixture())?;
+    let (mut single, _) = engine(fixture())?;
     let a = allocate(&mut batched, 123)?;
     let b = allocate(&mut batched, 456)?;
     let control_a = allocate(&mut single, 123)?;
@@ -236,9 +345,27 @@ fn test_independent_requests_match_single_execution_after_batch_reordering() -> 
 }
 
 #[test]
+fn test_packed_prefill_matches_incremental_decode() -> Result<()> {
+    let (mut packed_engine, model) = engine(fixture())?;
+    let (mut incremental, _) = engine(fixture())?;
+    let a = allocate(&mut packed_engine, 5)?;
+    let b = allocate(&mut incremental, 5)?;
+    run(&mut packed_engine, &[(a, &[1, 2, 3, 4, 5])])?;
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    for token in 1..=5 {
+        let current = handle(&incremental, b)?;
+        run(&mut incremental, &[(current, &[token])])?;
+    }
+    equivalent(
+        &checkpoint(&packed_engine, a)?,
+        &checkpoint(&incremental, b)?,
+    )
+}
+
+#[test]
 fn test_checkpoint_fork_restore_crosses_partial_attention_pages_and_all_recurrent_layers()
 -> Result<()> {
-    let (mut engine, _) = engine(None, false)?;
+    let (mut engine, _) = engine(fixture())?;
     let a = allocate(&mut engine, 1)?;
     run(&mut engine, &[(a, &[1, 2, 3])])?;
     let saved = checkpoint(&engine, a)?;
@@ -271,69 +398,99 @@ fn test_checkpoint_fork_restore_crosses_partial_attention_pages_and_all_recurren
     equivalent(&checkpoint(&engine, restored)?, &saved)?;
     let replay = run(&mut engine, &[(restored, &[4, 5])])?;
     assert_eq!(
-        first
-            .iter()
-            .filter(|o| o.request == a.request)
-            .map(|o| o.token)
-            .collect::<Vec<_>>(),
-        replay.iter().map(|o| o.token).collect::<Vec<_>>()
+        tokens(
+            &first
+                .into_iter()
+                .filter(|o| o.request == a.request)
+                .collect::<Vec<_>>()
+        ),
+        tokens(&replay)
     );
     Ok(())
 }
 
 #[test]
-fn test_speculative_prefix_commit_restores_rng_and_every_layer() -> Result<()> {
-    let (mut speculative, _) = engine(None, false)?;
-    let (mut direct, _) = engine(None, false)?;
-    let a = allocate(&mut speculative, 777)?;
-    let b = allocate(&mut direct, 777)?;
-    let input = plan(&speculative, &[(a, &[1, 2, 3, 4])])?;
-    speculative.submit(input)?;
-    assert_eq!(checkpoint(&speculative, a)?.position(), 0);
-    let outputs = speculative.commit(&[(a.request, 1)])?;
-    assert_eq!(outputs.len(), 1);
-    run(&mut direct, &[(b, &[1])])?;
-    equivalent(&checkpoint(&speculative, a)?, &checkpoint(&direct, b)?)?;
-    let ah = handle(&speculative, a)?;
-    let bh = handle(&direct, b)?;
-    run(&mut speculative, &[(ah, &[2, 3, 4])])?;
-    run(&mut direct, &[(bh, &[2, 3, 4])])?;
-    equivalent(&checkpoint(&speculative, a)?, &checkpoint(&direct, b)?)?;
-    assert!(speculative.finish().is_err());
+fn test_ordinary_execution_retains_only_final_recurrent_boundary() -> Result<()> {
+    let (mut engine, model) = engine(fixture())?;
+    let a = greedy(&mut engine)?;
+    let ordinary = engine.submit(plan(&engine, &[(a, &[1, 2, 3])])?)?;
+    engine.finish()?;
+    let speculative = engine.submit(packed(&engine, &[(a, &[7, 7, 7])], true)?)?;
+    engine.finish()?;
+    assert_eq!(
+        *model.boundaries.lock(),
+        vec![Boundaries::Final, Boundaries::EveryToken]
+    );
+    // Two attention layers × 3 tokens × 8 bytes, plus two recurrent layers × 12 bytes
+    // per retained boundary.
+    assert_eq!(ordinary.state_update_bytes, 48 + 24);
+    assert_eq!(speculative.state_update_bytes, 48 + 72);
+    assert_eq!(ordinary.logits_bytes, 3 * 8 * 4);
+    assert_eq!(ordinary.workspace_bytes, 48);
+    assert_eq!(
+        ordinary.total_bytes()?,
+        ordinary.packed_input_bytes + 72 + 96 + 48
+    );
     Ok(())
 }
 
 #[test]
-fn test_zero_acceptance_rolls_back_and_invalidates_old_descriptors() -> Result<()> {
-    let (mut engine, _) = engine(None, false)?;
+fn test_speculative_acceptance_follows_sampled_tokens() -> Result<()> {
+    let (mut speculative, _) = engine(fixture())?;
+    let (mut direct, _) = engine(fixture())?;
+    let a = greedy(&mut speculative)?;
+    let b = greedy(&mut direct)?;
+    // Greedy target always samples 7: drafts 7, 7 are accepted, 3 is rejected.
+    let input = packed(&speculative, &[(a, &[1, 7, 7, 3])], true)?;
+    let commit = commits(submit_all(&mut speculative, input)?)?
+        .pop()
+        .ok_or_else(|| invalid("missing commit"))?;
+    assert_eq!(commit.accepted_tokens, 3);
+    assert_eq!(tokens(&commit.outputs), vec![7, 7, 7]);
+    run(&mut direct, &[(b, &[1, 7, 7])])?;
+    equivalent(&checkpoint(&speculative, a)?, &checkpoint(&direct, b)?)?;
+
+    // Every draft matches: the final output is the bonus token.
+    let input = packed(&speculative, &[(a, &[7, 7])], true)?;
+    let commit = commits(submit_all(&mut speculative, input)?)?
+        .pop()
+        .ok_or_else(|| invalid("missing commit"))?;
+    assert_eq!(commit.accepted_tokens, 2);
+    assert_eq!(tokens(&commit.outputs), vec![7, 7]);
+    let bh = handle(&direct, b)?;
+    run(&mut direct, &[(bh, &[7, 7])])?;
+    equivalent(&checkpoint(&speculative, a)?, &checkpoint(&direct, b)?)
+}
+
+#[test]
+fn test_speculative_rejection_keeps_only_the_verified_token() -> Result<()> {
+    let (mut speculative, _) = engine(fixture())?;
+    let (mut direct, _) = engine(fixture())?;
+    let a = greedy(&mut speculative)?;
+    let b = greedy(&mut direct)?;
+    let input = packed(&speculative, &[(a, &[1, 2, 3])], true)?;
+    let commit = commits(submit_all(&mut speculative, input)?)?
+        .pop()
+        .ok_or_else(|| invalid("missing commit"))?;
+    assert_eq!(commit.accepted_tokens, 1);
+    assert_eq!(tokens(&commit.outputs), vec![7]);
+    run(&mut direct, &[(b, &[1])])?;
+    equivalent(&checkpoint(&speculative, a)?, &checkpoint(&direct, b)?)
+}
+
+#[test]
+fn test_published_descriptors_are_invalidated() -> Result<()> {
+    let (mut engine, _) = engine(fixture())?;
     let a = allocate(&mut engine, 99)?;
-    let before = checkpoint(&engine, a)?;
     let input = plan(&engine, &[(a, &[1, 2])])?;
-    engine.submit(input.clone())?;
-    assert!(engine.commit(&[(a.request, 0)])?.is_empty());
-    equivalent(&checkpoint(&engine, a)?, &before)?;
+    submit_all(&mut engine, input.clone())?;
     assert!(engine.submit(input).is_err());
     Ok(())
 }
 
 #[test]
-fn test_invalid_acceptance_keeps_pending_state_for_correction() -> Result<()> {
-    let (mut engine, _) = engine(None, false)?;
-    let a = allocate(&mut engine, 99)?;
-    let input = plan(&engine, &[(a, &[1, 2])])?;
-    engine.submit(input)?;
-    assert!(engine.commit(&[]).is_err());
-    assert!(engine.commit(&[(a.request, 3)]).is_err());
-    assert!(engine.commit(&[(a.request, 1), (a.request, 1)]).is_err());
-    assert_eq!(checkpoint(&engine, a)?.position(), 0);
-    assert_eq!(engine.commit(&[(a.request, 1)])?.len(), 1);
-    assert_eq!(checkpoint(&engine, a)?.position(), 1);
-    Ok(())
-}
-
-#[test]
 fn test_cancellation_retains_inflight_state_and_does_not_publish_outputs() -> Result<()> {
-    let (mut engine, _) = engine(None, false)?;
+    let (mut engine, _) = engine(fixture())?;
     let a = allocate(&mut engine, 11)?;
     let b = allocate(&mut engine, 12)?;
     let saved = checkpoint(&engine, b)?;
@@ -342,9 +499,10 @@ fn test_cancellation_retains_inflight_state_and_does_not_publish_outputs() -> Re
     assert!(engine.restore(a, &saved).is_err());
     engine.cancel(b)?;
     assert!(engine.metadata(b.request).is_err());
-    let output = engine.finish()?;
-    assert_eq!(output.len(), 2);
-    assert!(output.iter().all(|o| o.request == a.request));
+    let results = commits(engine.finish()?)?;
+    assert_eq!(results.len(), 1);
+    assert!(results.iter().all(|c| c.handle.request == a.request));
+    assert_eq!(results.iter().map(|c| c.outputs.len()).sum::<usize>(), 2);
     assert_eq!(checkpoint(&engine, a)?.position(), 2);
     assert_eq!(saved.position(), 0);
     assert!(engine.metadata(b.request).is_err());
@@ -355,14 +513,41 @@ fn test_cancellation_retains_inflight_state_and_does_not_publish_outputs() -> Re
 }
 
 #[test]
-fn test_execution_error_discards_all_candidates_and_allows_retry() -> Result<()> {
-    let (mut engine, _) = engine(Some(7), false)?;
+fn test_one_request_failure_does_not_affect_others() -> Result<()> {
+    let (mut engine, _) = engine(Fixture {
+        fault: Some(7),
+        ..fixture()
+    })?;
+    let a = allocate(&mut engine, 11)?;
+    let b = allocate(&mut engine, 12)?;
+    let before_b = checkpoint(&engine, b)?;
+    let input = plan(&engine, &[(a, &[1, 2]), (b, &[3, 7])])?;
+    let results = submit_all(&mut engine, input)?;
+    let a_commit = outcome(&results, a)?
+        .as_ref()
+        .map_err(|e| invalid(e.to_string()))?;
+    assert_eq!(a_commit.outputs.len(), 2);
+    assert!(outcome(&results, b)?.is_err());
+    assert_eq!(checkpoint(&engine, a)?.position(), 2);
+    equivalent(&checkpoint(&engine, b)?, &before_b)?;
+    let a = handle(&engine, a)?;
+    run(&mut engine, &[(a, &[1]), (b, &[2])])?;
+    Ok(())
+}
+
+#[test]
+fn test_whole_batch_model_error_leaves_every_request_unchanged() -> Result<()> {
+    let (mut engine, _) = engine(Fixture {
+        batch_fault: Some(6),
+        ..fixture()
+    })?;
     let a = allocate(&mut engine, 11)?;
     let b = allocate(&mut engine, 12)?;
     let before_a = checkpoint(&engine, a)?;
     let before_b = checkpoint(&engine, b)?;
-    let input = plan(&engine, &[(a, &[1, 2]), (b, &[3, 7])])?;
+    let input = plan(&engine, &[(a, &[1, 2]), (b, &[3, 6])])?;
     engine.submit(input)?;
+    assert!(engine.finish().is_err());
     assert!(engine.finish().is_err());
     equivalent(&checkpoint(&engine, a)?, &before_a)?;
     equivalent(&checkpoint(&engine, b)?, &before_b)?;
@@ -371,19 +556,25 @@ fn test_execution_error_discards_all_candidates_and_allows_retry() -> Result<()>
 }
 
 #[test]
-fn test_invalid_layer_update_never_publishes_partial_state() -> Result<()> {
-    let (mut engine, _) = engine(Some(6), true)?;
+fn test_invalid_layer_update_is_isolated_and_never_published() -> Result<()> {
+    let (mut engine, _) = engine(Fixture {
+        fault: Some(6),
+        invalid_update: true,
+        ..fixture()
+    })?;
     let a = allocate(&mut engine, 11)?;
+    let b = allocate(&mut engine, 12)?;
     let before = checkpoint(&engine, a)?;
-    let input = plan(&engine, &[(a, &[1, 6])])?;
-    engine.submit(input)?;
-    assert!(engine.finish().is_err());
+    let input = plan(&engine, &[(a, &[1, 6]), (b, &[2])])?;
+    let results = submit_all(&mut engine, input)?;
+    assert!(outcome(&results, a)?.is_err());
+    assert!(outcome(&results, b)?.is_ok());
     equivalent(&checkpoint(&engine, a)?, &before)
 }
 
 #[test]
 fn test_checkpoint_tensor_inspection_cannot_mutate_shared_state() -> Result<()> {
-    let (mut engine, _) = engine(None, false)?;
+    let (mut engine, _) = engine(fixture())?;
     let a = allocate(&mut engine, 1)?;
     run(&mut engine, &[(a, &[1, 2, 3])])?;
     let saved = checkpoint(&engine, a)?;
@@ -411,16 +602,13 @@ fn test_checkpoint_tensor_inspection_cannot_mutate_shared_state() -> Result<()> 
 
 #[test]
 fn test_incompatible_restore_and_foreign_handles_leave_state_unchanged() -> Result<()> {
-    let (mut engine, _) = engine(None, false)?;
+    let (mut engine, _) = engine(fixture())?;
     let a = allocate(&mut engine, 1)?;
     let before = checkpoint(&engine, a)?;
-    let other_model = Arc::new(Fixture {
-        calls: Arc::new(AtomicUsize::new(0)),
+    let (mut other, _) = self::engine(Fixture {
         revision: "different-model",
-        fault: None,
-        invalid_update: false,
-    });
-    let mut other = HybridEngine::new(other_model, Device::Cpu)?;
+        ..Default::default()
+    })?;
     let foreign = allocate(&mut other, 1)?;
     let saved = checkpoint(&other, foreign)?;
     assert!(engine.restore(a, &saved).is_err());
@@ -437,7 +625,7 @@ fn test_incompatible_restore_and_foreign_handles_leave_state_unchanged() -> Resu
 
 #[test]
 fn test_invalid_descriptors_are_rejected_before_model_execution() -> Result<()> {
-    let (mut engine, calls) = engine(None, false)?;
+    let (mut engine, model) = engine(fixture())?;
     let a = allocate(&mut engine, 1)?;
     let b = allocate(&mut engine, 2)?;
     let input = plan(&engine, &[(a, &[1, 2]), (b, &[3])])?;
@@ -467,6 +655,13 @@ fn test_invalid_descriptors_are_rejected_before_model_execution() -> Result<()> 
     value.sequences[0].outputs = vec![0, 0];
     cases.push(value);
     let mut value = input.clone();
+    value.sequences[0].outputs = vec![1, 0];
+    cases.push(value);
+    let mut value = input.clone();
+    value.sequences[0].speculative = true;
+    value.sequences[0].outputs = vec![1];
+    cases.push(value);
+    let mut value = input.clone();
     value.sequences[0].state.revision = 1;
     cases.push(value);
     let mut value = input.clone();
@@ -481,22 +676,15 @@ fn test_invalid_descriptors_are_rejected_before_model_execution() -> Result<()> 
     for invalid in cases {
         assert!(engine.submit(invalid).is_err());
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
     assert_eq!(checkpoint(&engine, a)?.position(), 0);
     Ok(())
 }
 
 #[test]
 fn test_position_overflow_and_limit_are_checked() -> Result<()> {
-    let (mut engine, calls) = engine(None, false)?;
+    let (mut engine, model) = engine(fixture())?;
     let a = allocate(&mut engine, 1)?;
-    let model = Fixture {
-        calls,
-        revision: "fixture-v1",
-        fault: None,
-        invalid_update: false,
-    }
-    .description();
     let input = PackedExecution {
         tokens: vec![1],
         positions: vec![usize::MAX],
@@ -504,15 +692,17 @@ fn test_position_overflow_and_limit_are_checked() -> Result<()> {
             state: a,
             tokens: 0..1,
             outputs: vec![0],
+            speculative: false,
         }],
     };
     assert!(
         input
             .validate(
-                &model,
+                &model.description(),
                 &[StateMetadata {
                     handle: a,
-                    position: usize::MAX
+                    position: usize::MAX,
+                    finished: false,
                 }]
             )
             .is_err()
@@ -539,51 +729,65 @@ fn grammar() -> Result<GuidanceControl> {
 }
 
 #[test]
-fn test_grammar_parser_fork_rollback_restore_and_terminal_state_are_atomic() -> Result<()> {
-    let (mut engine, _) = engine(None, false)?;
+fn test_grammar_parser_fork_speculation_restore_and_terminal_state_are_atomic() -> Result<()> {
+    let (mut engine, _) = engine(fixture())?;
     let a = engine.allocate(42, SamplingOptions::default(), Some(grammar()?))?;
-    assert_eq!(
-        run(&mut engine, &[(a, &[1])])?.first().map(|o| o.token),
-        Some(1)
-    );
+    assert_eq!(tokens(&run(&mut engine, &[(a, &[1])])?), vec![1]);
     let saved = checkpoint(&engine, a)?;
     let b = engine.fork(&saved)?;
+    // The grammar forces 'b' (2), so the draft 3 is rejected and never reaches the parser.
+    let input = packed(&engine, &[(a, &[2, 3])], true)?;
+    let commit = commits(submit_all(&mut engine, input)?)?
+        .pop()
+        .ok_or_else(|| invalid("missing commit"))?;
+    assert_eq!(commit.accepted_tokens, 1);
+    assert_eq!(tokens(&commit.outputs), vec![2]);
     let a = handle(&engine, a)?;
-    let input = plan(&engine, &[(a, &[2, 3])])?;
-    engine.submit(input)?;
-    assert_eq!(
-        engine.commit(&[(a.request, 1)])?.first().map(|o| o.token),
-        Some(2)
-    );
-    let a = handle(&engine, a)?;
-    assert_eq!(
-        run(&mut engine, &[(a, &[3])])?.first().map(|o| o.token),
-        Some(3)
-    );
-    let output = run(&mut engine, &[(b, &[2, 3])])?;
-    assert_eq!(
-        output.iter().map(|o| o.token).collect::<Vec<_>>(),
-        vec![2, 3]
-    );
+    assert_eq!(tokens(&run(&mut engine, &[(a, &[3])])?), vec![3]);
+    assert_eq!(tokens(&run(&mut engine, &[(b, &[2, 3])])?), vec![2, 3]);
     equivalent(&checkpoint(&engine, a)?, &checkpoint(&engine, b)?)?;
-    let terminal = checkpoint(&engine, a)?;
     let a = handle(&engine, a)?;
-    assert!(run(&mut engine, &[(a, &[4])]).is_err());
-    equivalent(&checkpoint(&engine, a)?, &terminal)?;
+    let input = plan(&engine, &[(a, &[4])])?;
+    let terminal = commits(submit_all(&mut engine, input)?)?;
+    assert!(terminal.iter().all(|c| c.finished && c.outputs.is_empty()));
+    assert!(engine.metadata(a.request)?.finished);
+    let a = handle(&engine, a)?;
     let restored = engine.restore(a, &saved)?;
+    assert!(!engine.metadata(restored.request)?.finished);
     assert_eq!(
-        run(&mut engine, &[(restored, &[2, 3])])?
-            .iter()
-            .map(|o| o.token)
-            .collect::<Vec<_>>(),
+        tokens(&run(&mut engine, &[(restored, &[2, 3])])?),
         vec![2, 3]
     );
     Ok(())
 }
 
 #[test]
+fn test_terminal_grammar_does_not_fail_other_requests() -> Result<()> {
+    let (mut engine, _) = engine(fixture())?;
+    let a = engine.allocate(42, SamplingOptions::default(), Some(grammar()?))?;
+    run(&mut engine, &[(a, &[1])])?;
+    let a = handle(&engine, a)?;
+    run(&mut engine, &[(a, &[2, 3])])?;
+    let a = handle(&engine, a)?;
+    let b = greedy(&mut engine)?;
+    let input = plan(&engine, &[(b, &[1]), (a, &[4])])?;
+    let results = commits(submit_all(&mut engine, input)?)?;
+    assert_eq!(results.len(), 2);
+    let (finished, open): (Vec<_>, Vec<_>) = results.into_iter().partition(|c| c.finished);
+    assert!(finished.iter().all(|c| c.outputs.is_empty()));
+    assert_eq!(
+        open.iter()
+            .flat_map(|c| tokens(&c.outputs))
+            .collect::<Vec<_>>(),
+        vec![7]
+    );
+    assert_eq!(engine.metadata(b.request)?.position, 1);
+    Ok(())
+}
+
+#[test]
 fn test_no_output_positions_advance_only_model_state() -> Result<()> {
-    let (mut engine, _) = engine(None, false)?;
+    let (mut engine, _) = engine(fixture())?;
     assert!(grammar()?.validate_token_contract(7).is_err());
     let a = engine.allocate(42, SamplingOptions::default(), Some(grammar()?))?;
     let mut input = plan(&engine, &[(a, &[1, 2])])?;
@@ -593,29 +797,20 @@ fn test_no_output_positions_advance_only_model_state() -> Result<()> {
         .ok_or_else(|| invalid("missing descriptor"))?
         .outputs
         .clear();
-    engine.submit(input)?;
-    assert!(engine.finish()?.is_empty());
+    let results = commits(submit_all(&mut engine, input)?)?;
+    assert!(results.iter().all(|c| c.outputs.is_empty()));
     let saved = checkpoint(&engine, a)?;
     assert_eq!(saved.position(), 2);
     assert_eq!(saved.rng_draws(), 0);
     assert!(saved.sampled_tokens().is_empty());
     let a = handle(&engine, a)?;
-    assert_eq!(
-        run(&mut engine, &[(a, &[3])])?.first().map(|o| o.token),
-        Some(1)
-    );
+    assert_eq!(tokens(&run(&mut engine, &[(a, &[3])])?), vec![1]);
     Ok(())
 }
 
 #[test]
 fn test_cancellation_holds_shared_model_until_completion() -> Result<()> {
-    let model = Arc::new(Fixture {
-        calls: Arc::new(AtomicUsize::new(0)),
-        revision: "fixture-v1",
-        fault: None,
-        invalid_update: false,
-    });
-    let mut engine = HybridEngine::new(Arc::clone(&model), Device::Cpu)?;
+    let (mut engine, model) = engine(fixture())?;
     let a = allocate(&mut engine, 1)?;
     assert_eq!(Arc::strong_count(&model), 2);
     let input = plan(&engine, &[(a, &[1, 2])])?;

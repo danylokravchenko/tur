@@ -1,6 +1,6 @@
 # Tur: Apple Silicon inference redesign
 
-Status: P0's development-Mac evidence/capability gate and P1's workspace move are complete (2026-10-21). P2's four-crate extraction and explicit hybrid state/reference execution contracts are implemented; see [P2 contracts and validation](apple-silicon-p2-contracts.md). Safe dispatch and pinned model/HTTP evidence remain in [the baseline report](apple-silicon-baseline.md). The baseline checkpoint suite retains its guided-JSON failure (68/69 pass); it was not rerun or fixed in P2. Existing models (ordinary Qwen3, Granite 4.1) are scheduled for removal rather than retained as regression references; see [Breaking changes and legacy removal](#breaking-changes-and-legacy-removal). P3 hybrid mathematics, serving integration, production performance and quality gates remain open; Qwen3.8 is not supported.
+Status: P0's development-Mac evidence/capability gate and P1's workspace move are complete (2026-10-21). P2's four-crate extraction and explicit hybrid state and packed execution contracts are implemented (revised after review); see [P2 contracts and validation](apple-silicon-p2-contracts.md). Safe dispatch and pinned model/HTTP evidence remain in [the baseline report](apple-silicon-baseline.md). The baseline checkpoint suite retains its guided-JSON failure (68/69 pass); it was not rerun or fixed in P2. Existing models (ordinary Qwen3, Granite 4.1) are scheduled for removal rather than retained as regression references; see [Breaking changes and legacy removal](#breaking-changes-and-legacy-removal). P3 hybrid mathematics, serving integration, production performance and quality gates remain open; Qwen3.8 is not supported.
 
 ## Product and platform
 
@@ -97,7 +97,7 @@ Replace the assumption that every layer owns K/V with model-declared state kinds
 
 Prefix entries must associate an exact token boundary with both attention pages and a recurrent snapshot. A recurrent state cannot be truncated as if it were a KV array. Share immutable checkpoints; copy writable recurrent state when branching. Namespace entries by model revision, quantization, adapters, positional settings and tenant policy. Verify tokens on hash hits. Release GPU resources only after all referencing commands complete.
 
-Wire-level chat/streaming behavior may change freely; redesign it where the current shape costs latency or complicates batching. `ModelImpl`, `KvCacheImpl` and the old paged-state arguments are deleted rather than adapted; prefix snapshots and engine/model construction are redesigned around hybrid state. The user explicitly authorized breaking changes on 2026-10-21, satisfying the AGENTS.md confirmation gate. Implemented signatures, ownership rules, compatibility exports and migration steps are in [the P2 contract report](apple-silicon-p2-contracts.md).
+Wire-level chat/streaming behavior may change freely; redesign it where the current shape costs latency or complicates batching. `ModelImpl`, `KvCacheImpl` and the old paged-state arguments are deleted rather than adapted; prefix snapshots and engine/model construction are redesigned around hybrid state. The user explicitly authorized breaking changes on 2026-10-21, satisfying the AGENTS.md confirmation gate. Implemented signatures and ownership rules are in [the P2 contract report](apple-silicon-p2-contracts.md).
 
 ## Quantization and kernels
 
@@ -195,22 +195,28 @@ models/loading and the immutable-weight `HybridModel` contract; `tur-engine` own
 extracted generation code and a single-owner `HybridEngine`. `tur` retains facade
 exports and its HTTP library. No third-party package/version was added.
 
-The new path owns attention pages, convolution/recurrent snapshots, positions,
-independent sampling counters and deep-copied llguidance state per request. It
-validates descriptors before execution and publishes only complete accepted
-boundaries after device completion. Fork/restore/zero acceptance/partial acceptance
-cover every layer and RNG/grammar state together. Cancellation suppresses outputs
-while retaining in-flight bindings. Failed fences retain resources for retry;
-failed drop fences quarantine resources instead of recycling them.
+Revised after review on 2026-10-21. `HybridModel::forward` takes one packed batch
+(tokens, positions, per-sequence ranges, committed state, requested logits and
+recurrent boundaries) and returns one result per sequence. A model can therefore
+implement chunked prefill and batched decode directly. The engine validates
+descriptors before execution, enqueues one pass, and fences before reading logits.
+It then samples, selects the accepted boundary and publishes each request
+independently: one request's model error, invalid update, sampling error or finished
+grammar never fails the others. Model inputs are zero-copy; outputs are copied once.
+Ordinary sequences retain only the final recurrent boundary, and no per-token
+snapshots exist. For speculative sequences the engine samples the target at every
+position and accepts drafts while they match, so acceptance cannot disagree with
+published tokens. State layers declare dtype (F32/F16/BF16), descriptions declare
+modalities, and `submit` returns checked payload requirements including model
+workspace. Failed-fence quarantine is per engine.
 
-Deterministic offline tests exercise mixed four-layer fixtures, request reordering,
-exact page/recurrent values, partial-page forks, atomic restore, RNG/parser rollback,
-cancellation, stale handles, shape failures, arithmetic overflow and invalid plans.
-The implementation uses F32 state and detached tensor boundaries for isolation;
-its token loop and per-token snapshots are a reference contract implementation,
-not optimized packed GPU execution. CLI/server still use the extracted ordinary
-attention engine; P3 deletes it and its compatibility exports. Exact signatures, migration steps, targeted commands and remaining
-limits are in [the P2 contract document](apple-silicon-p2-contracts.md).
+Deterministic offline tests cover packed-versus-incremental agreement, request
+reordering, exact page/recurrent values, partial-page forks, atomic restore,
+speculative acceptance/rejection, per-request failure isolation, whole-batch failure,
+cancellation, stale handles, shape/dtype failures, overflow and invalid plans.
+CLI/server still use the extracted ordinary attention engine; P3 deletes it. Exact
+signatures, ownership rules, commands and remaining limits are in
+[the P2 contract document](apple-silicon-p2-contracts.md).
 
 The implemented boundaries and original package requirements follow. Move existing shared functionality into these crates; retain `tur` as a facade. The dependency graph is:
 
