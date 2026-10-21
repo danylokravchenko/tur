@@ -9,10 +9,7 @@ const DEFAULT_PROMPT: &str = "Who are you?";
 
 #[allow(clippy::print_stdout)]
 fn print_bunner() {
-    let banner = match std::fs::read_to_string("assets/banner.txt") {
-        Ok(banner) => banner,
-        Err(_) => return,
-    };
+    let banner = include_str!("../../../assets/banner.txt");
 
     // Electric Blue Neon
     // let colors = [

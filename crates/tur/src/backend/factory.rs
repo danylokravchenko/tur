@@ -222,12 +222,7 @@ impl<T: ModelConstructor> ModelFactory<T> {
         let num_files = paths.weight_filenames().len();
 
         if gguf {
-            debug!(num_files, "Loading GGUF quantized model");
-            if self.device.is_cpu() {
-                debug!("CPU mode: linear layers use quantized weights (QMatMul)");
-            } else {
-                debug!(dtype = ?self.dtype, "GPU/Metal mode: dequantizing linear layers");
-            }
+            debug!(num_files, dtype = ?self.dtype, "Loading GGUF model; quantized linear layers use QMatMul");
         } else {
             debug!(num_files, dtype = ?self.dtype, "Loading full-precision SafeTensors model");
         }

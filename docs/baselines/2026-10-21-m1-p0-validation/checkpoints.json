@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "repositories": [
+    {
+      "repo": "Qwen/Qwen3-0.6B",
+      "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+      "files": [
+        {
+          "name": "config.json",
+          "bytes": 726,
+          "sha256": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd"
+        },
+        {
+          "name": "generation_config.json",
+          "bytes": 239,
+          "sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2"
+        },
+        {
+          "name": "tokenizer.json",
+          "bytes": 11422654,
+          "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+        },
+        {
+          "name": "tokenizer_config.json",
+          "bytes": 9732,
+          "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+        },
+        {
+          "name": "model.safetensors",
+          "bytes": 1503300328,
+          "sha256": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b"
+        }
+      ]
+    },
+    {
+      "repo": "unsloth/Qwen3-0.6B-GGUF",
+      "revision": "50968a4468ef4233ed78cd7c3de230dd1d61a56b",
+      "files": [
+        {
+          "name": "Qwen3-0.6B-Q4_K_M.gguf",
+          "bytes": 396705472,
+          "sha256": "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a"
+        }
+      ]
+    },
+    {
+      "repo": "ibm-granite/granite-4.1-3b",
+      "revision": "c0650403e44e78ec0262dab1c90914c65b196c4e",
+      "files": [
+        {
+          "name": "config.json",
+          "bytes": 801,
+          "sha256": "9a0e589b69e7d3ad9fb9fb2c844aa7d7156e052cb7ea4211de7de48ab7c8525c"
+        },
+        {
+          "name": "generation_config.json",
+          "bytes": 147,
+          "sha256": "9117fb03fed79dbb459373edeef9a3eec966bce52a1842e03a6716e83117f0d1"
+        },
+        {
+          "name": "tokenizer.json",
+          "bytes": 7153421,
+          "sha256": "e2bad66439538cb4d5a7580680932432ed9ece9d3b8577e675512bdf11599253"
+        },
+        {
+          "name": "tokenizer_config.json",
+          "bytes": 17659,
+          "sha256": "a5ec5daab12ba090a90f3dd169c8f9c275557013a87b9c1258dc7cb497a35c86"
+        },
+        {
+          "name": "chat_template.jinja",
+          "bytes": 6099,
+          "sha256": "fed2756d2d24e127b951dcf139d0b03ab7db8ef23a456128ebc9c2db4901d476"
+        }
+      ]
+    },
+    {
+      "repo": "unsloth/granite-4.1-3b-GGUF",
+      "revision": "5b88826e4b80789548180f8faab39c5cf68772c9",
+      "files": [
+        {
+          "name": "granite-4.1-3b-Q4_K_M.gguf",
+          "bytes": 2099502400,
+          "sha256": "ac08a622126e1feec0e3ae6b08505c8ecdd90d9d4002f07ac8820fd6169eb979"
+        }
+      ]
+    }
+  ],
+  "qwen_chat_template_sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
+  "quantization": "upstream GGUF Q4_K_M; imported unchanged; no local requantization",
+  "hf_home": "/Users/danylokravchenko/Projects/tur/target/p0-hf"
+}

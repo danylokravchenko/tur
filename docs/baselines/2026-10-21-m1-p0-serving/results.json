@@ -1,0 +1,1153 @@
+{
+  "schema_version": 1,
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "/Users/danylokravchenko/Projects/tur/target/pre-release/server",
+    "--model",
+    "p0:Qwen/Qwen3-0.6B:Q4_K_M",
+    "--port",
+    "19841",
+    "--temperature",
+    "0",
+    "--seed",
+    "299792458",
+    "--repeat-penalty",
+    "1",
+    "--max-batch-size",
+    "4"
+  ],
+  "prefix_cache": false,
+  "binary_sha256": "bd368129f934ea88357076faa63744940f6b8e2f5b6245296e659f6f8390c72b",
+  "script_sha256": "2aa06157f6e26c120977a0be8c73b23e3badd554e1671f83d72f64905875dadd",
+  "checkpoint_manifest": {
+    "schema_version": 1,
+    "repositories": [
+      {
+        "repo": "Qwen/Qwen3-0.6B",
+        "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+        "files": [
+          {
+            "name": "config.json",
+            "bytes": 726,
+            "sha256": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd"
+          },
+          {
+            "name": "generation_config.json",
+            "bytes": 239,
+            "sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2"
+          },
+          {
+            "name": "tokenizer.json",
+            "bytes": 11422654,
+            "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+          },
+          {
+            "name": "tokenizer_config.json",
+            "bytes": 9732,
+            "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+          },
+          {
+            "name": "model.safetensors",
+            "bytes": 1503300328,
+            "sha256": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b"
+          }
+        ]
+      },
+      {
+        "repo": "unsloth/Qwen3-0.6B-GGUF",
+        "revision": "50968a4468ef4233ed78cd7c3de230dd1d61a56b",
+        "files": [
+          {
+            "name": "Qwen3-0.6B-Q4_K_M.gguf",
+            "bytes": 396705472,
+            "sha256": "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a"
+          }
+        ]
+      },
+      {
+        "repo": "ibm-granite/granite-4.1-3b",
+        "revision": "c0650403e44e78ec0262dab1c90914c65b196c4e",
+        "files": [
+          {
+            "name": "config.json",
+            "bytes": 801,
+            "sha256": "9a0e589b69e7d3ad9fb9fb2c844aa7d7156e052cb7ea4211de7de48ab7c8525c"
+          },
+          {
+            "name": "generation_config.json",
+            "bytes": 147,
+            "sha256": "9117fb03fed79dbb459373edeef9a3eec966bce52a1842e03a6716e83117f0d1"
+          },
+          {
+            "name": "tokenizer.json",
+            "bytes": 7153421,
+            "sha256": "e2bad66439538cb4d5a7580680932432ed9ece9d3b8577e675512bdf11599253"
+          },
+          {
+            "name": "tokenizer_config.json",
+            "bytes": 17659,
+            "sha256": "a5ec5daab12ba090a90f3dd169c8f9c275557013a87b9c1258dc7cb497a35c86"
+          },
+          {
+            "name": "chat_template.jinja",
+            "bytes": 6099,
+            "sha256": "fed2756d2d24e127b951dcf139d0b03ab7db8ef23a456128ebc9c2db4901d476"
+          }
+        ]
+      },
+      {
+        "repo": "unsloth/granite-4.1-3b-GGUF",
+        "revision": "5b88826e4b80789548180f8faab39c5cf68772c9",
+        "files": [
+          {
+            "name": "granite-4.1-3b-Q4_K_M.gguf",
+            "bytes": 2099502400,
+            "sha256": "ac08a622126e1feec0e3ae6b08505c8ecdd90d9d4002f07ac8820fd6169eb979"
+          }
+        ]
+      }
+    ],
+    "qwen_chat_template_sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
+    "quantization": "upstream GGUF Q4_K_M; imported unchanged; no local requantization",
+    "hf_home": "/Users/danylokravchenko/Projects/tur/target/p0-hf"
+  },
+  "activation_dtype": "server default BF16",
+  "seed": 299792458,
+  "temperature": 0,
+  "repeat_penalty": 1,
+  "queueing": "included in client latency; not separately exposed",
+  "interval_semantics": "SSE text-event intervals; events can contain several tokens",
+  "runs": [
+    {
+      "concurrency": 1,
+      "iteration": 0,
+      "elapsed_seconds": 0.5228897089982638,
+      "successful_requests": 1,
+      "completion_tokens_per_second": 30.599187026748552,
+      "ttft_seconds": {
+        "p50": 0.11795179100590758,
+        "p95": 0.11795179100590758,
+        "p99": 0.11795179100590758
+      },
+      "text_event_intervals_seconds": {
+        "p50": 0.028742188005708158,
+        "p95": 0.06779780654615022,
+        "p99": 0.0791128285045852
+      },
+      "requests": [
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain Rust ownership briefly."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.11795179100590758,
+            0.11796704100561328,
+            0.19990862499980722,
+            0.25613424999755807,
+            0.2844657079986064,
+            0.31238012500398327,
+            0.34073075000196695,
+            0.37363991599704605,
+            0.4023112080030842,
+            0.43119266600115225,
+            0.459436541001196,
+            0.4882496250065742,
+            0.5225373749999562
+          ],
+          "text": "In Rust, **ownership** is a fundamental concept that governs how data and",
+          "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 16,
+            "total_tokens": 34
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 0.5225618330005091
+        }
+      ]
+    },
+    {
+      "concurrency": 1,
+      "iteration": 1,
+      "elapsed_seconds": 0.49575212500349153,
+      "successful_requests": 1,
+      "completion_tokens_per_second": 32.27419347902405,
+      "ttft_seconds": {
+        "p50": 0.09340987500036135,
+        "p95": 0.09340987500036135,
+        "p99": 0.09340987500036135
+      },
+      "text_event_intervals_seconds": {
+        "p50": 0.027844249998452142,
+        "p95": 0.06834705814908373,
+        "p99": 0.08188021162190127
+      },
+      "requests": [
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain Rust ownership briefly."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.09340987500036135,
+            0.09342637500958517,
+            0.1786898749996908,
+            0.2331962080061203,
+            0.2604430420033168,
+            0.2880621670046821,
+            0.31564720800088253,
+            0.3436368330003461,
+            0.3712709579995135,
+            0.3989698329969542,
+            0.42711425000743475,
+            0.4568947079969803,
+            0.49545950000174344
+          ],
+          "text": "In Rust, **ownership** is a fundamental concept that governs how data and",
+          "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 16,
+            "total_tokens": 34
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 0.49548958300147206
+        }
+      ]
+    },
+    {
+      "concurrency": 1,
+      "iteration": 2,
+      "elapsed_seconds": 0.492500457999995,
+      "successful_requests": 1,
+      "completion_tokens_per_second": 32.48727943314961,
+      "ttft_seconds": {
+        "p50": 0.09944104199530557,
+        "p95": 0.09944104199530557,
+        "p99": 0.09944104199530557
+      },
+      "text_event_intervals_seconds": {
+        "p50": 0.027616624996881,
+        "p95": 0.06589251660188891,
+        "p99": 0.07726087052637014
+      },
+      "requests": [
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain Rust ownership briefly."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.09944104199530557,
+            0.09946095799386967,
+            0.1795639170013601,
+            0.23382970799866598,
+            0.2614362500025891,
+            0.2888474170031259,
+            0.3160877500049537,
+            0.34366829200007487,
+            0.3713527920044726,
+            0.3989794999943115,
+            0.4268720830004895,
+            0.45373529200151097,
+            0.49214204199961387
+          ],
+          "text": "In Rust, **ownership** is a fundamental concept that governs how data and",
+          "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 16,
+            "total_tokens": 34
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 0.49217916699126363
+        }
+      ]
+    },
+    {
+      "concurrency": 2,
+      "iteration": 0,
+      "elapsed_seconds": 1.0493862079893006,
+      "successful_requests": 2,
+      "completion_tokens_per_second": 30.49401617476401,
+      "ttft_seconds": {
+        "p50": 0.2996329585002968,
+        "p95": 0.299749021155003,
+        "p99": 0.2997593378354213
+      },
+      "text_event_intervals_seconds": {
+        "p50": 0.05267829199146945,
+        "p95": 0.10362637499929406,
+        "p99": 0.13931776308279942
+      },
+      "requests": [
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain Rust ownership briefly."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.2995039999950677,
+            0.2995424589898903,
+            0.45013004199427087,
+            0.5537419169995701,
+            0.6063899589935318,
+            0.6576846669922816,
+            0.7105420000007143,
+            0.7619192919955822,
+            0.812739374989178,
+            0.8639626249932917,
+            0.9242487500014249,
+            0.9769270419928944,
+            1.0468185839999933
+          ],
+          "text": "In Rust, **ownership** is a fundamental concept that governs how data and",
+          "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 16,
+            "total_tokens": 34
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.046845167002175
+        },
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Explain ownership."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.2997619170055259,
+            0.2997931670106482,
+            0.349501999997301,
+            0.4502071250026347,
+            0.5538371250004275,
+            0.606563916997402,
+            0.6577855840005213,
+            0.7106397500028834,
+            0.7619644590013195,
+            0.8129130419983994,
+            0.8640597500052536,
+            0.9243492500099819,
+            0.9770317920047091,
+            1.0473107500001788
+          ],
+          "text": "The concept of **ownership** in Rust is a fundamental part of the language and",
+          "usage": {
+            "prompt_tokens": 116,
+            "completion_tokens": 16,
+            "total_tokens": 132
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.0473709170037182
+        }
+      ]
+    },
+    {
+      "concurrency": 2,
+      "iteration": 1,
+      "elapsed_seconds": 1.3597897919971729,
+      "successful_requests": 2,
+      "completion_tokens_per_second": 23.533049143574193,
+      "ttft_seconds": {
+        "p50": 0.3580968540045433,
+        "p95": 0.35869747260876467,
+        "p99": 0.3587508609291399
+      },
+      "text_event_intervals_seconds": {
+        "p50": 0.0641088749980554,
+        "p95": 0.18879536659514978,
+        "p99": 0.25007769191230167
+      },
+      "requests": [
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain Rust ownership briefly."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.35742949999985285,
+            0.3574445830017794,
+            0.6227383749937871,
+            0.759141707996605,
+            0.8222148750064662,
+            0.8884173330006888,
+            0.9517370829998981,
+            1.0134608749940526,
+            1.074438249997911,
+            1.1391640829970129,
+            1.213727750000544,
+            1.2763355409988435,
+            1.357437041006051
+          ],
+          "text": "In Rust, **ownership** is a fundamental concept that governs how data and",
+          "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 16,
+            "total_tokens": 34
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.3574945000000298
+        },
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Explain ownership."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.3587642080092337,
+            0.35882245800166856,
+            0.42280445800861344,
+            0.6246978330018464,
+            0.7606023749976885,
+            0.8237139999982901,
+            0.8898357500002021,
+            0.9525471660017502,
+            1.014918957996997,
+            1.0762898329994641,
+            1.1406628749973606,
+            1.2136647910083411,
+            1.2777736660063965,
+            1.3591421660094056
+          ],
+          "text": "The concept of **ownership** in Rust is a fundamental part of the language and",
+          "usage": {
+            "prompt_tokens": 116,
+            "completion_tokens": 16,
+            "total_tokens": 132
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.3591765830060467
+        }
+      ]
+    },
+    {
+      "concurrency": 2,
+      "iteration": 2,
+      "elapsed_seconds": 1.1481832080025924,
+      "successful_requests": 2,
+      "completion_tokens_per_second": 27.870116699989005,
+      "ttft_seconds": {
+        "p50": 0.31478416649770224,
+        "p95": 0.3148085794520739,
+        "p99": 0.3148107494924625
+      },
+      "text_event_intervals_seconds": {
+        "p50": 0.06065970800409559,
+        "p95": 0.11119684139557648,
+        "p99": 0.14633366299967737
+      },
+      "requests": [
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain Rust ownership briefly."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.31475704099284485,
+            0.3147630829917034,
+            0.47219191599288024,
+            0.5833802909910446,
+            0.6727242499910062,
+            0.7338062499911757,
+            0.7892663749953499,
+            0.8477555829886114,
+            0.908415290992707,
+            0.9631174999958603,
+            1.0242467499920167,
+            1.0794294579973212,
+            1.1476556659908965
+          ],
+          "text": "In Rust, **ownership** is a fundamental concept that governs how data and",
+          "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 16,
+            "total_tokens": 34
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.1476786249986617
+        },
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Explain ownership."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.31481129200255964,
+            0.3148260829912033,
+            0.3674756249965867,
+            0.4723455420025857,
+            0.5835444999975152,
+            0.681605457997648,
+            0.7339333749987418,
+            0.7893148329894757,
+            0.8478993329918012,
+            0.9086112079967279,
+            0.9631730830005836,
+            1.0242634579917649,
+            1.079489707990433,
+            1.1478149999893503
+          ],
+          "text": "The concept of **ownership** in Rust is a fundamental part of the language and",
+          "usage": {
+            "prompt_tokens": 116,
+            "completion_tokens": 16,
+            "total_tokens": 132
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.1478334580024239
+        }
+      ]
+    },
+    {
+      "concurrency": 4,
+      "iteration": 0,
+      "elapsed_seconds": 1.8897282919933787,
+      "successful_requests": 4,
+      "completion_tokens_per_second": 33.867302654652875,
+      "ttft_seconds": {
+        "p50": 0.579159291999531,
+        "p95": 0.579337231242971,
+        "p99": 0.579361846241809
+      },
+      "text_event_intervals_seconds": {
+        "p50": 0.08983045800414402,
+        "p95": 0.19421973780481494,
+        "p99": 0.2840610389232461
+      },
+      "requests": [
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain Rust ownership briefly."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.5791628750012023,
+            0.579179791995557,
+            0.8632335419970332,
+            1.0429333749925718,
+            1.1322212499944726,
+            1.2203396249969956,
+            1.3103833749919431,
+            1.399429416997009,
+            1.489646542002447,
+            1.5743070419994183,
+            1.6763824999943608,
+            1.7622792920010397,
+            1.8891377499967348
+          ],
+          "text": "In Rust, **ownership** is a fundamental concept that governs how data and",
+          "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 16,
+            "total_tokens": 34
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.8891516250005225
+        },
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Explain ownership."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.5791144170070766,
+            0.5791214589989977,
+            0.6689902500074822,
+            0.8632064590055961,
+            1.0428409169981023,
+            1.1322241250018124,
+            1.2203359999984968,
+            1.310223667009268,
+            1.3993420420010807,
+            1.4895884590077912,
+            1.574234667001292,
+            1.6762779590062564,
+            1.7622059999994235,
+            1.8889668750052806
+          ],
+          "text": "The concept of **ownership** in Rust is a fundamental part of the language and",
+          "usage": {
+            "prompt_tokens": 116,
+            "completion_tokens": 16,
+            "total_tokens": 132
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.8889821250049863
+        },
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain Rust ownership briefly."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.5791557089978596,
+            0.5791626249992987,
+            0.8632306670042453,
+            1.04293312500522,
+            1.1319958749954822,
+            1.2203215839981567,
+            1.3102265839988831,
+            1.3993963749962859,
+            1.4896412499947473,
+            1.574234333995264,
+            1.676273624994792,
+            1.762259625000297,
+            1.8889270840008976
+          ],
+          "text": "In Rust, **ownership** is a fundamental concept that governs how data and",
+          "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 16,
+            "total_tokens": 34
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.8889515420014504
+        },
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Explain ownership."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.5793679999915184,
+            0.5793808329908643,
+            0.6691729579906678,
+            0.8633955830009654,
+            1.0431144169997424,
+            1.1324058749887627,
+            1.2205190829990897,
+            1.3105122080014553,
+            1.3994742919894634,
+            1.4898154999973485,
+            1.5743386249960167,
+            1.6764478749973932,
+            1.7623101249919273,
+            1.8891256249917205
+          ],
+          "text": "The concept of **ownership** in Rust is a fundamental part of the language and",
+          "usage": {
+            "prompt_tokens": 116,
+            "completion_tokens": 16,
+            "total_tokens": 132
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.8891469169902848
+        }
+      ]
+    },
+    {
+      "concurrency": 4,
+      "iteration": 1,
+      "elapsed_seconds": 1.8186231660074554,
+      "successful_requests": 4,
+      "completion_tokens_per_second": 35.19145757969391,
+      "ttft_seconds": {
+        "p50": 0.556459896004526,
+        "p95": 0.5565610669546004,
+        "p99": 0.5565704469940101
+      },
+      "text_event_intervals_seconds": {
+        "p50": 0.08610745800251607,
+        "p95": 0.1688135686046735,
+        "p99": 0.250505377331865
+      },
+      "requests": [
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain Rust ownership briefly."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.5565727920038626,
+            0.5565858339978149,
+            0.8070485839998582,
+            0.9731770420039538,
+            1.0579264169937233,
+            1.1420105839933967,
+            1.2274199170060456,
+            1.3127449169987813,
+            1.3988994999963325,
+            1.485451208995073,
+            1.5848960419971263,
+            1.6724205420032376,
+            1.8180310839961749
+          ],
+          "text": "In Rust, **ownership** is a fundamental concept that governs how data and",
+          "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 16,
+            "total_tokens": 34
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.818048083994654
+        },
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Explain ownership."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.5564251670002704,
+            0.55643916700501,
+            0.6380999579996569,
+            0.8069199580058921,
+            0.9731603330001235,
+            1.0577150830067694,
+            1.1420841250073863,
+            1.2272164169989992,
+            1.3128307500010123,
+            1.398754417008604,
+            1.4854243330046302,
+            1.584889417004888,
+            1.672165625001071,
+            1.8181050830025924
+          ],
+          "text": "The concept of **ownership** in Rust is a fundamental part of the language and",
+          "usage": {
+            "prompt_tokens": 116,
+            "completion_tokens": 16,
+            "total_tokens": 132
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.8181164999987232
+        },
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain Rust ownership briefly."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.5564067500090459,
+            0.5564197500061709,
+            0.8069660830078647,
+            0.9731564579997212,
+            1.0577790829993319,
+            1.1419834999978775,
+            1.2274162079993403,
+            1.3128616250032792,
+            1.3988369580038125,
+            1.4853847500053234,
+            1.584870332997525,
+            1.672398875001818,
+            1.8179449580056826
+          ],
+          "text": "In Rust, **ownership** is a fundamental concept that governs how data and",
+          "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 16,
+            "total_tokens": 34
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.8179563750018133
+        },
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Explain ownership."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.5564946250087814,
+            0.5565242080047028,
+            0.6382917500013718,
+            0.8070974580041366,
+            0.9732224160106853,
+            1.0579527500085533,
+            1.1421515000110958,
+            1.227421083007357,
+            1.312893583002733,
+            1.398953916010214,
+            1.4855015000066487,
+            1.5850155410007574,
+            1.6723518330109073,
+            1.8180455830006395
+          ],
+          "text": "The concept of **ownership** in Rust is a fundamental part of the language and",
+          "usage": {
+            "prompt_tokens": 116,
+            "completion_tokens": 16,
+            "total_tokens": 132
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.8180657500051893
+        }
+      ]
+    },
+    {
+      "concurrency": 4,
+      "iteration": 2,
+      "elapsed_seconds": 1.9072054580028635,
+      "successful_requests": 4,
+      "completion_tokens_per_second": 33.556950946972336,
+      "ttft_seconds": {
+        "p50": 0.6628176039957907,
+        "p95": 0.6629746625083499,
+        "p99": 0.662995932509657
+      },
+      "text_event_intervals_seconds": {
+        "p50": 0.0857349375000922,
+        "p95": 0.1660599186026957,
+        "p99": 0.25083196791078083
+      },
+      "requests": [
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain Rust ownership briefly."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.6625639999983832,
+            0.6625895830075024,
+            0.9135884160059504,
+            1.0794757499970729,
+            1.1653319580073003,
+            1.2503665830008686,
+            1.3339552499965066,
+            1.4172401249961695,
+            1.50395045800542,
+            1.5886506660026498,
+            1.6877428750012768,
+            1.7741199160082033,
+            1.9066926250088727
+          ],
+          "text": "In Rust, **ownership** is a fundamental concept that governs how data and",
+          "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 16,
+            "total_tokens": 34
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.9067112500051735
+        },
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Explain ownership."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.6628112079924904,
+            0.6628177499951562,
+            0.748287333000917,
+            0.9135530829953495,
+            1.079511249990901,
+            1.1654122909967555,
+            1.250122540994198,
+            1.3339584159984952,
+            1.4170667079888517,
+            1.5037086660013301,
+            1.588659707995248,
+            1.6882836659933673,
+            1.773926957990625,
+            1.906279832997825
+          ],
+          "text": "The concept of **ownership** in Rust is a fundamental part of the language and",
+          "usage": {
+            "prompt_tokens": 116,
+            "completion_tokens": 16,
+            "total_tokens": 132
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.9063132500014035
+        },
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain Rust ownership briefly."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.662823999999091,
+            0.6628324999910546,
+            0.9134907919942634,
+            1.0794853749976028,
+            1.1654296670021722,
+            1.2501247079926543,
+            1.3339608749956824,
+            1.4170143749943236,
+            1.503839875003905,
+            1.58866887500335,
+            1.688396792000276,
+            1.773853249993408,
+            1.9065039580018492
+          ],
+          "text": "In Rust, **ownership** is a fundamental concept that governs how data and",
+          "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 16,
+            "total_tokens": 34
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.906521166994935
+        },
+        {
+          "request": {
+            "model": "p0",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Rust Explain ownership."
+              }
+            ],
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": false
+          },
+          "text_events_seconds": [
+            0.6630012500099838,
+            0.663008625007933,
+            0.7484719589992892,
+            0.91357791700284,
+            1.079691292005009,
+            1.1655178750079358,
+            1.2503748340095626,
+            1.3341471669991734,
+            1.417240334005328,
+            1.5038477089983644,
+            1.5889262499986216,
+            1.6884310840105172,
+            1.7740677090041572,
+            1.9065865840093466
+          ],
+          "text": "The concept of **ownership** in Rust is a fundamental part of the language and",
+          "usage": {
+            "prompt_tokens": 116,
+            "completion_tokens": 16,
+            "total_tokens": 132
+          },
+          "done": true,
+          "status": 200,
+          "finish_reason": "stop",
+          "elapsed_seconds": 1.906613125000149
+        }
+      ]
+    }
+  ],
+  "listen_seconds": 0.5290094170049997,
+  "warmup": {
+    "request": {
+      "model": "p0",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Explain Rust ownership briefly."
+        }
+      ],
+      "stream": true,
+      "max_tokens": 2,
+      "thinking": false
+    },
+    "text_events_seconds": [
+      12.319349915997009,
+      12.319368583004689
+    ],
+    "text": "In Rust",
+    "usage": {
+      "prompt_tokens": 18,
+      "completion_tokens": 2,
+      "total_tokens": 20
+    },
+    "done": true,
+    "status": 200,
+    "finish_reason": "stop",
+    "elapsed_seconds": 12.319384457994602
+  },
+  "server_exit_code": -2,
+  "elapsed_seconds": 23.572086749991286
+}

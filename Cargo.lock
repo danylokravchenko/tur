@@ -3721,6 +3721,7 @@ dependencies = [
  "axum",
  "bytemuck",
  "candle-core",
+ "candle-metal-kernels",
  "candle-nn",
  "candle-transformers",
  "clap",
@@ -3735,6 +3736,8 @@ dependencies = [
  "metal 0.33.0",
  "minijinja",
  "num-traits",
+ "objc2-foundation",
+ "objc2-metal",
  "parking_lot",
  "rayon",
  "safetensors 0.7.0",
@@ -3751,6 +3754,28 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "tur-cli"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "clap",
+ "serde_json",
+ "tracing",
+ "tur",
+]
+
+[[package]]
+name = "tur-server"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "clap",
+ "tokio",
+ "tracing",
+ "tur",
 ]
 
 [[package]]

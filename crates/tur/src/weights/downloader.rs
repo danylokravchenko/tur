@@ -145,7 +145,7 @@ impl Downloader {
     }
 
     fn build_api(&self) -> Result<hf_hub::api::sync::Api> {
-        Ok(ApiBuilder::new()
+        Ok(ApiBuilder::from_env()
             .with_progress(true)
             .build()
             .map_err(candle_core::Error::wrap)?)

@@ -7,8 +7,7 @@ use tur::models::granite_41::{Config, ModelForCausalLM};
 use tur::weights::{Downloader, VarBuilderX};
 
 /// Download the smallest available Granite 4.1 model for testing.
-/// Uses ibm-granite/granite-4.1-3b; weights are cast to F32 because candle's
-/// CPU backend does not support BF16 matmul.
+/// Uses GGUF Q4_K_M with F32 activations for the CPU reference backend.
 fn download_test_model() -> Result<(VarBuilderX<'static>, Config, Device)> {
     let device = Device::Cpu;
     let dtype = DType::F32;
@@ -31,27 +30,20 @@ fn download_test_model() -> Result<(VarBuilderX<'static>, Config, Device)> {
 }
 
 #[test]
-fn test_varbuilderx_with_real_safetensors_model() {
-    let result = download_test_model();
+fn test_varbuilderx_with_real_gguf_model() -> Result<()> {
+    let (vb, _config, _device) = download_test_model()?;
+    assert!(vb.is_qvar_builder(), "GGUF fixture should use QVarBuilder");
     assert!(
-        result.is_ok(),
-        "Failed to download model: {:?}",
-        result.err()
+        !vb.is_var_builder(),
+        "GGUF fixture should not use SafeTensors"
     );
-
-    let (vb, _config, _device) = result.unwrap();
-
-    assert!(
-        !vb.is_qvar_builder(),
-        "SafeTensors model should not be QVarBuilder"
-    );
-    assert!(vb.is_var_builder(), "Should be SafeTensors VarBuilder");
     assert!(vb.device().is_cpu());
+    Ok(())
 }
 
 #[test]
-fn test_varbuilderx_operations_with_real_model() {
-    let (vb, config, _device) = download_test_model().unwrap();
+fn test_varbuilderx_operations_with_real_model() -> Result<()> {
+    let (vb, config, _device) = download_test_model()?;
 
     let vb_model = vb.pp("model");
     assert_eq!(vb_model.module_path(), "model");
@@ -62,26 +54,18 @@ fn test_varbuilderx_operations_with_real_model() {
     let vb_layer0 = vb_layers.pp("0");
     assert_eq!(vb_layer0.module_path(), "model.layers.0");
 
-    // SafeTensors models use "model.embed_tokens"
-    let vb_embed = vb.pp("model.embed_tokens");
+    let vb_embed = vb.pp("token_embd");
     assert!(vb_embed.has_key("weight"), "Should have embedding weight");
 
-    // SafeTensors models use "model.norm"
-    let vb_norm = vb.pp("model.norm");
+    let vb_norm = vb.pp("output_norm");
     assert!(vb_norm.has_key("weight"), "Should have norm weight");
 
     assert!(!vb.has_key("nonexistent_key"));
 
-    let result = vb_embed.get((config.vocab_size, config.hidden_size), "weight");
-    assert!(
-        result.is_ok(),
-        "Failed to get embedding weight: {:?}",
-        result.err()
-    );
-
-    let tensor = result.unwrap();
+    let tensor = vb_embed.get((config.vocab_size, config.hidden_size), "weight")?;
     assert_eq!(tensor.dims()[0], config.vocab_size);
     assert_eq!(tensor.dims()[1], config.hidden_size);
+    Ok(())
 }
 
 #[test]
@@ -455,7 +439,7 @@ fn test_granite_kv_cache_state_save_and_restore() {
 fn make_granite_pipeline() -> InferencePipeline<tur::models::Granite41ModelForCausalLM> {
     let factory = tur::ModelFactory::<tur::models::Granite41ModelForCausalLM>::new(
         ModelSource::HuggingFace("ibm-granite/granite-4.1-3b".to_string()),
-        None,
+        Some("Q4_K_M".to_string()),
         Device::Cpu,
         DType::F32,
     );

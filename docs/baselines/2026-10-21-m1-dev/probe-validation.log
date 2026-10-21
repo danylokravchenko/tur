@@ -1,0 +1,39 @@
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> crates/tur/src/models/attention/cpu_flash/standard.rs:240:34
+    |
+240 |                 let mut m = f32::NEG_INFINITY;
+    |                                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> crates/tur/src/models/attention/cpu_flash/standard.rs:250:35
+    |
+250 |                     if mv == f32::NEG_INFINITY {
+    |                                   ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> crates/tur/src/models/attention/cpu_flash/standard.rs:366:38
+    |
+366 |                     let mut m = f32::NEG_INFINITY;
+    |                                      ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> crates/tur/src/models/attention/cpu_flash/standard.rs:378:39
+    |
+378 |                         if mv == f32::NEG_INFINITY {
+    |                                       ^^^^^^^^^^^^
+
+warning: `tur` (lib) generated 4 warnings
+   Compiling tur v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.45s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests examples/metal_baseline.rs (target/debug/examples/metal_baseline-1fd8157cf45f6952)
+
+running 2 tests
+test tests::test_validation_checks_length_and_accepts_reference ... ok
+test tests::test_validation_rejects_nonfinite_and_incorrect_values ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

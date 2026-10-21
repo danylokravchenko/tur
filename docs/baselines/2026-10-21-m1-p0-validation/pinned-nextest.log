@@ -1,0 +1,142 @@
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> crates/tur/src/models/attention/cpu_flash/standard.rs:240:34
+    |
+240 |                 let mut m = f32::NEG_INFINITY;
+    |                                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> crates/tur/src/models/attention/cpu_flash/standard.rs:250:35
+    |
+250 |                     if mv == f32::NEG_INFINITY {
+    |                                   ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> crates/tur/src/models/attention/cpu_flash/standard.rs:366:38
+    |
+366 |                     let mut m = f32::NEG_INFINITY;
+    |                                      ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> crates/tur/src/models/attention/cpu_flash/standard.rs:378:39
+    |
+378 |                         if mv == f32::NEG_INFINITY {
+    |                                       ^^^^^^^^^^^^
+
+warning: `tur` (lib) generated 4 warnings
+    Finished `pre-release` profile [optimized] target(s) in 0.28s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+────────────
+ Nextest run ID 4eaf6261-d3e2-4ae7-9cbc-6c78c5fd692c with nextest profile: default
+    Starting 69 tests across 4 binaries
+        PASS [   1.733s] ( 1/69) tur::engine_integration test_inference_engine_batch_consistency
+        PASS [   0.749s] ( 2/69) tur::engine_integration test_inference_engine_empty_batch
+        PASS [   1.458s] ( 3/69) tur::engine_integration test_inference_engine_large_batch
+        PASS [   1.082s] ( 4/69) tur::engine_integration test_inference_engine_prefill_batch
+        PASS [   1.450s] ( 5/69) tur::engine_integration test_inference_engine_variable_length_batch
+        PASS [   1.005s] ( 6/69) tur::engine_integration test_prefix_cache_paged_batch_correctness
+        PASS [   1.142s] ( 7/69) tur::engine_integration test_prefix_cache_paged_partial_prefix_hit
+        PASS [   1.067s] ( 8/69) tur::engine_integration test_prefix_cache_single_request_correctness
+        PASS [   4.048s] ( 9/69) tur::granite_41_integration test_granite_autoregressive_generation_simulation_real_model
+        PASS [   1.381s] (10/69) tur::granite_41_integration test_granite_chat_template_tool_formatting
+        PASS [   1.168s] (11/69) tur::granite_41_integration test_granite_chat_template_was_loaded
+        PASS [   0.265s] (12/69) tur::granite_41_integration test_granite_config_values
+        PASS [   4.317s] (13/69) tur::granite_41_integration test_granite_forward_batch_consistency_with_single_forward
+        PASS [   2.507s] (14/69) tur::granite_41_integration test_granite_forward_batch_decode_phase
+        PASS [   2.083s] (15/69) tur::granite_41_integration test_granite_forward_batch_large_batch
+        PASS [   1.250s] (16/69) tur::granite_41_integration test_granite_forward_batch_mixed_positions
+        PASS [   1.134s] (17/69) tur::granite_41_integration test_granite_forward_batch_position_mismatch_error
+        PASS [   1.932s] (18/69) tur::granite_41_integration test_granite_forward_batch_prefill_phase
+        PASS [   1.414s] (19/69) tur::granite_41_integration test_granite_forward_batch_with_variable_positions
+        PASS [   1.520s] (20/69) tur::granite_41_integration test_granite_kv_cache_state_save_and_restore
+        PASS [   1.467s] (21/69) tur::granite_41_integration test_granite_model_batch_processing_real_model
+        PASS [   1.625s] (22/69) tur::granite_41_integration test_granite_model_clear_kv_cache_real_model
+        PASS [   1.068s] (23/69) tur::granite_41_integration test_granite_model_creation_with_real_safetensors
+        PASS [   3.149s] (24/69) tur::granite_41_integration test_granite_model_different_sequence_lengths_real_model
+        PASS [   1.049s] (25/69) tur::granite_41_integration test_granite_model_eos_token_ids
+        PASS [   1.372s] (26/69) tur::granite_41_integration test_granite_model_forward_pass_with_real_model
+        PASS [   1.435s] (27/69) tur::granite_41_integration test_granite_model_forward_with_offset_real_model
+        PASS [   1.033s] (28/69) tur::granite_41_integration test_granite_model_name
+        PASS [   1.032s] (29/69) tur::granite_41_integration test_granite_model_num_layers
+        PASS [   1.338s] (30/69) tur::granite_41_integration test_granite_model_numerical_stability_real_model
+        PASS [   1.120s] (31/69) tur::granite_41_integration test_granite_thinking_flag_is_noop
+        PASS [   0.486s] (32/69) tur::granite_41_integration test_varbuilderx_operations_with_real_model
+        PASS [   0.249s] (33/69) tur::granite_41_integration test_varbuilderx_with_real_gguf_model
+        PASS [   2.889s] (34/69) tur::pipeline_integration test_continuous_batching_basic
+        PASS [   0.966s] (35/69) tur::pipeline_integration test_continuous_batching_blocking_get
+        PASS [   1.418s] (36/69) tur::pipeline_integration test_continuous_batching_mixed_lengths
+        PASS [   2.030s] (37/69) tur::pipeline_integration test_continuous_batching_result_management
+        PASS [   1.318s] (38/69) tur::pipeline_integration test_continuous_batching_sequential_submission
+        PASS [   1.035s] (39/69) tur::pipeline_integration test_continuous_batching_step_by_step
+        PASS [   2.422s] (40/69) tur::pipeline_integration test_guided_grammar_deactivates_between_requests
+        FAIL [   2.064s] (41/69) tur::pipeline_integration test_guided_json_schema_output_is_valid_json
+  stdout ───
+
+    running 1 test
+    test test_guided_json_schema_output_is_valid_json ... FAILED
+
+    failures:
+
+    failures:
+        test_guided_json_schema_output_is_valid_json
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out; finished in 2.02s
+
+  stderr ───
+
+    thread 'test_guided_json_schema_output_is_valid_json' (4774748) panicked at crates/tur/tests/pipeline_integration.rs:685:5:
+    Output must be valid JSON under schema, got: "{\n  \"value\": 1234\n}#"
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        PASS [   0.735s] (42/69) tur::pipeline_integration test_guided_no_factory_returns_error
+        PASS [   2.287s] (43/69) tur::pipeline_integration test_guided_regex_output_is_only_digits
+        PASS [   3.613s] (44/69) tur::pipeline_integration test_pipeline_end_to_end_generation
+        PASS [   9.620s] (45/69) tur::pipeline_integration test_pipeline_parameter_variations
+        PASS [   0.972s] (46/69) tur::pipeline_integration test_prefix_cache_full_hit
+        PASS [   1.357s] (47/69) tur::pipeline_integration test_prefix_cache_partial_hit
+        PASS [   2.995s] (48/69) tur::pipeline_integration test_prefix_cache_with_pipeline
+        PASS [   0.831s] (49/69) tur::pipeline_integration test_tools_format_prompt_contains_schema
+        PASS [   4.303s] (50/69) tur::pipeline_integration test_tools_model_emits_and_pipeline_parses_tool_call
+        PASS [   0.829s] (51/69) tur::qwen3_integration test_qwen3_autoregressive_generation_simulation_real_model
+        PASS [   1.112s] (52/69) tur::qwen3_integration test_qwen3_forward_batch_consistency_with_single_forward
+        PASS [   0.928s] (53/69) tur::qwen3_integration test_qwen3_forward_batch_decode_phase
+        PASS [   0.762s] (54/69) tur::qwen3_integration test_qwen3_forward_batch_large_batch
+        PASS [   0.691s] (55/69) tur::qwen3_integration test_qwen3_forward_batch_mixed_positions
+        PASS [   0.606s] (56/69) tur::qwen3_integration test_qwen3_forward_batch_position_mismatch_error
+        PASS [   0.858s] (57/69) tur::qwen3_integration test_qwen3_forward_batch_prefill_phase
+        PASS [   0.735s] (58/69) tur::qwen3_integration test_qwen3_forward_batch_with_variable_positions
+        PASS [   0.756s] (59/69) tur::qwen3_integration test_qwen3_model_batch_processing_real_model
+        PASS [   0.742s] (60/69) tur::qwen3_integration test_qwen3_model_clear_kv_cache_real_model
+        PASS [   0.609s] (61/69) tur::qwen3_integration test_qwen3_model_creation_with_real_gguf
+        PASS [   1.284s] (62/69) tur::qwen3_integration test_qwen3_model_different_sequence_lengths_real_model
+        PASS [   0.776s] (63/69) tur::qwen3_integration test_qwen3_model_forward_pass_with_real_model
+        PASS [   0.718s] (64/69) tur::qwen3_integration test_qwen3_model_forward_with_offset_real_model
+        PASS [   0.680s] (65/69) tur::qwen3_integration test_qwen3_model_numerical_stability_real_model
+        PASS [   0.363s] (66/69) tur::qwen3_integration test_varbuilderx_all_keys_real_model
+        PASS [   0.366s] (67/69) tur::qwen3_integration test_varbuilderx_module_path_tracking_real_model
+        PASS [   0.516s] (68/69) tur::qwen3_integration test_varbuilderx_operations_with_real_model
+        PASS [   0.375s] (69/69) tur::qwen3_integration test_varbuilderx_with_real_gguf_model
+────────────
+     Summary [ 103.695s] 69 tests run: 68 passed, 1 failed, 0 skipped
+        FAIL [   2.064s] (41/69) tur::pipeline_integration test_guided_json_schema_output_is_valid_json
+  stdout ───
+
+    running 1 test
+    test test_guided_json_schema_output_is_valid_json ... FAILED
+
+    failures:
+
+    failures:
+        test_guided_json_schema_output_is_valid_json
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out; finished in 2.02s
+
+  stderr ───
+
+    thread 'test_guided_json_schema_output_is_valid_json' (4774748) panicked at crates/tur/tests/pipeline_integration.rs:685:5:
+    Output must be valid JSON under schema, got: "{\n  \"value\": 1234\n}#"
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+error: test run failed

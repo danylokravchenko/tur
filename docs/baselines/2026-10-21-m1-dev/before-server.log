@@ -1,0 +1,51 @@
+   Compiling tur v0.1.0 (/Users/danylokravchenko/Projects/tur)
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> src/models/attention/cpu_flash/standard.rs:240:34
+    |
+240 |                 let mut m = f32::NEG_INFINITY;
+    |                                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> src/models/attention/cpu_flash/standard.rs:250:35
+    |
+250 |                     if mv == f32::NEG_INFINITY {
+    |                                   ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> src/models/attention/cpu_flash/standard.rs:366:38
+    |
+366 |                     let mut m = f32::NEG_INFINITY;
+    |                                      ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> src/models/attention/cpu_flash/standard.rs:378:39
+    |
+378 |                         if mv == f32::NEG_INFINITY {
+    |                                       ^^^^^^^^^^^^
+
+warning: `tur` (lib) generated 4 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.70s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/server_integration.rs (target/debug/deps/server_integration-5b3fbdebeca0464a)
+
+running 14 tests
+test chat_streaming_returns_sse_content_type ... ok
+test chat_empty_messages_returns_400 ... ok
+test chat_streaming_body_contains_done_sentinel ... ok
+test chat_max_tokens_field_accepted ... ok
+test chat_non_streaming_usage_reflects_token_count ... ok
+test chat_multi_turn_conversation_accepted ... ok
+test chat_non_streaming_returns_assistant_message ... ok
+test chat_streaming_first_chunk_has_role ... ok
+test models_returns_configured_model_id ... ok
+test mixed_streaming_and_non_streaming_concurrent ... ok
+test concurrent_non_streaming_requests_all_complete ... ok
+test tool_call_response_has_correct_structure ... ok
+test concurrent_streaming_requests_all_complete ... ok
+test large_burst_of_requests_does_not_return_503 ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

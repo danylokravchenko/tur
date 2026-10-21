@@ -1,0 +1,68 @@
+[package]
+name = "tur"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "A strong inference engine"
+readme = "../../README.md"
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+tokenizers = { workspace = true }
+llguidance = { workspace = true }
+toktrie_hf_tokenizers = { workspace = true }
+toktrie = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+minijinja = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+indicatif = { workspace = true }
+uuid = { workspace = true }
+metal = { workspace = true, optional = true }
+hf-hub = { workspace = true }
+clap = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+async-stream = { workspace = true }
+either = { workspace = true }
+num-traits = { workspace = true }
+rayon = { workspace = true }
+libc = { workspace = true }
+half = { workspace = true }
+ahash = { workspace = true }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator.workspace = true
+
+[dev-dependencies]
+safetensors.workspace = true
+bytemuck.workspace = true
+criterion.workspace = true
+tower.workspace = true
+http-body-util.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+candle-metal-kernels.workspace = true
+objc2-metal.workspace = true
+objc2-foundation.workspace = true
+
+[features]
+default = ["metal"]
+flash-attn = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "dep:metal"]
+
+[[bench]]
+name = "tur"
+harness = false
+

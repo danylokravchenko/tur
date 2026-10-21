@@ -149,13 +149,6 @@ fn bench_prefill(c: &mut Criterion) {
         let eos_tokens = InferenceEngine::<Qwen35ModelForCausalLM>::get_eos_tokens(&ts)
             .expect("failed to get EOS tokens");
 
-        let cold_start = Instant::now();
-        println!(
-            "Cold start for '{}': {:.2} ms",
-            prompt_name,
-            cold_start.elapsed().as_secs_f64() * 1000.0
-        );
-
         // Warmup
         let warmup_tokens = encode_tokens(&ts, &prompt);
         let warmup_stats = engine
@@ -563,11 +556,9 @@ fn bench_batch_prefill(c: &mut Criterion) {
 ///
 /// The meaningful comparison is **total time to finish the full prefill**.
 /// Chunking adds a small dispatch overhead (O(prompt_len/chunk_size) extra
-/// calls) but caps the per-iteration attention matrix at O(chunk²) instead of
-/// O(prompt²), which reduces peak memory and lets decode requests interleave.
-///
-/// Expect total chunked time to be within ~5–15 % of single-shot; if it is,
-/// chunked prefill is a safe trade-off for the batching workload.
+/// calls) and limits the query dimension. Each chunk still attends to prior
+/// context, so standard attention can use O(chunk length × context length) memory.
+/// Measure total prefill cost and decode latency before selecting a chunk size.
 fn bench_chunked_prefill(c: &mut Criterion) {
     let mut group = c.benchmark_group("chunked_prefill");
     configure_group(&mut group, 10, 40, 3);

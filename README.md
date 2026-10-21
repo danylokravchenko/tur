@@ -2,18 +2,18 @@
 
 > ![tur-mascot](./assets/mascot.png)
 
-A high-performance Rust inference engine for transformer models, built on [Candle](https://github.com/huggingface/candle). Features optimized attention kernels, prefix caching, continuous batching with paged KV memory, and flexible quantization support.
+A high-performance Rust inference engine for transformer models, built on [Candle](https://github.com/huggingface/candle). The Apple Silicon redesign is in progress; see [the implementation plan](docs/apple-silicon-redesign.md) and [baseline instructions](docs/apple-silicon-baseline.md). Performance claims require measurements on the target Mac.
 
 ## Features
 
-- **Fast Inference**: Optimized CPU flash attention and GPU flash attention kernels; BF16 on Metal/CUDA, F32 on CPU
+- **Attention**: Existing CPU attention kernels and Candle GPU operations; dedicated Metal prefill and paged decode kernels are planned
 - **Prefix Caching**: Automatic KV cache reuse for common prompt prefixes, with per-request paged cache support in batch mode
 - **Continuous Batching**: Process multiple concurrent requests together via batched prefill and decode; up to `max_batch_size` requests in flight at once
 - **Chunked Prefill**: Split long prompts into fixed-size chunks processed across scheduler iterations, bounding peak attention-matrix memory and letting decode requests interleave with in-progress prefills
 - **Paged KV Cache**: Block-based memory allocator (`BlockAllocator`) isolates KV state per request, enabling true multi-request concurrency without interference
 - **Scheduling Policies**: FCFS (default), Priority, and Shortest-Job-First to control request ordering and reduce average latency
 - **Quantization**: `Q4_K_M`, `Q5_K_M`, `Q8_0`, and other GGUF quantization formats
-- **Guided Generation**: Grammar-constrained decoding via [llguidance](https://github.com/guidance-ai/llguidance); JSON schema, Lark, and regex grammars with ~50 µs per-token overhead
+- **Guided Generation**: Grammar-constrained decoding via [llguidance](https://github.com/guidance-ai/llguidance); JSON schema, Lark, and regex grammars
 - **Thinking Mode**: Enable chain-of-thought reasoning
 - **Detailed Statistics**: Per-request prefill/decode timing, cache hit rate, and tokens-per-second reporting
 - **Tooling Support**: Define your tools which a model can call
@@ -32,19 +32,19 @@ Auto-detection reads `model_type` from `config.json` (`"qwen3"`, `"granite"`), s
 ### Basic Usage
 
 ```bash
-cargo run -- --model-id 'Qwen3-0.6B' --sample-len 200
+cargo run --bin tur -- --model-id 'Qwen3-0.6B' --sample-len 200
 ```
 
 ### With Thinking Mode
 
 ```bash
-cargo run -- --model-id 'Qwen3-0.6B' --sample-len 200 --thinking
+cargo run --bin tur -- --model-id 'Qwen3-0.6B' --sample-len 200 --thinking
 ```
 
 ### With Quantization
 
 ```bash
-cargo run -- --model-id 'Qwen3-0.6B' --sample-len 200 \
+cargo run --bin tur -- --model-id 'Qwen3-0.6B' --sample-len 200 \
   --quantization Q4_K_M \
   --temperature 0.6 \
   --top-p 0.95 \
@@ -58,29 +58,25 @@ Prefix caching skips redundant computation for requests that share a common prom
 ### Enabling Prefix Cache
 
 ```bash
-cargo run -- --model-id 'Qwen3-0.6B' --prefix-cache \
+cargo run --bin tur -- --model-id 'Qwen3-0.6B' --prefix-cache \
   --cache-max-entries 100 \
   --cache-max-tokens 2048
 ```
 
 ### Performance Impact
 
-For prompts with ~50% prefix overlap:
-
-- **Prefill time**: ~50% reduction
-- **Time to first token**: ~50% faster
-- **Memory overhead**: ~1–2% for cache metadata
+Prefix reuse can save prefill work. Its latency benefit and memory cost have not been measured for the Apple Silicon redesign.
 
 In batch mode the prefix cache integrates with paged KV caches so each request independently restores its cached prefix without interfering with other in-flight requests.
 
 ## Continuous Batching
 
-Continuous batching processes multiple concurrent requests in a single forward pass rather than one at a time, significantly increasing throughput on multi-request workloads.
+Continuous batching admits and advances concurrent requests through a shared scheduler. The existing paged prefill path loops over requests; packed variable-length GPU execution is planned.
 
 ### Enabling Batching
 
 ```bash
-cargo run -- --model-id 'Qwen3-0.6B' --enable-batching \
+cargo run --bin tur -- --model-id 'Qwen3-0.6B' --enable-batching \
   --max-batch-size 16 \
   --max-prefill-batch 8 \
   --max-decode-batch 16 \
@@ -101,9 +97,9 @@ Each request in a batch receives its own isolated KV cache backed by a shared `B
 
 ### Batch Performance
 
-Batch processing amortizes the fixed cost of a forward pass across multiple requests:
+Current batch behavior:
 
-- **Throughput**: Near-linear scaling with batch size up to hardware memory limits
+- **Throughput**: Scaling with concurrency requires end-to-end measurement
 - **Prefill + prefix cache**: Cached prefix tokens are skipped per-request even inside a batch — requests sharing a system prompt pay the prefill cost only for their unique suffix
 - **Decode**: All in-flight requests advance by one token per forward pass
 
@@ -111,7 +107,7 @@ Batch processing amortizes the fixed cost of a forward pass across multiple requ
 
 Without chunked prefill, a request with a long prompt monopolises the GPU for the entire duration of its prefill forward pass. Every decode-phase request in the same batch stalls and waits, increasing their time-to-next-token proportionally to the long prompt's length.
 
-Chunked prefill breaks the prompt into slices of at most `chunk_size` tokens. Each scheduler iteration processes one chunk, then immediately runs the pending decode batch. Decode latency is bounded by `chunk_size` rather than the full prompt length, and peak attention-matrix memory per iteration drops from O(prompt²) to O(chunk²).
+Chunked prefill breaks the prompt into slices of at most `chunk_size` tokens. Each scheduler iteration processes one chunk, then immediately runs the pending decode batch. Decode latency is bounded by `chunk_size` rather than the full prompt length, and the query dimension is limited to the chunk length. Standard attention still attends to the accumulated context, so its attention matrix can grow as O(chunk length × context length).
 
 ### Enabling Chunked Prefill
 
@@ -200,7 +196,7 @@ Tool calling and grammar-constrained generation can be used together. Attach bot
 
 ## OpenAI-Compatible Server
 
-Tur ships a web server (`src/bin/server.rs`) that exposes an OpenAI-compatible REST API.  Any client that speaks the OpenAI Chat Completions protocol — `curl`, the `openai` Python SDK, LangChain, LlamaIndex, etc. — works without modification.
+Tur ships a web server (`crates/tur-server/src/main.rs`) that exposes an OpenAI-compatible REST API.  Any client that speaks the OpenAI Chat Completions protocol — `curl`, the `openai` Python SDK, LangChain, LlamaIndex, etc. — works without modification.
 
 ### Starting the server
 
@@ -334,12 +330,12 @@ curl http://localhost:8080/v1/chat/completions \
 The server uses **continuous batching**: instead of processing requests one at a time, every incoming request is submitted to a shared `ContinuousBatchScheduler`. Each scheduler iteration:
 
 1. **Admits** any newly queued requests (memory-permitting).
-2. **Prefills** a batch of admitted requests in a single GPU forward pass.
+2. **Prefills** admitted requests; the paged path currently processes them individually.
 3. **Decodes** all in-progress requests together, advancing every sequence by one token per iteration.
 4. **Streams** each new token to its originating HTTP response immediately.
 5. **Completes** requests that hit EOS or `max_tokens`, freeing their paged KV cache blocks.
 
-This means `N` concurrent clients each get tokens interleaved in real time rather than waiting for the previous client to finish.  Throughput scales near-linearly with batch size up to the VRAM limit.
+Concurrent clients receive interleaved tokens. Throughput and tail latency under load have not yet been established for the redesign.
 
 **Firing parallel requests with curl:**
 
@@ -404,27 +400,23 @@ The scheduler's memory-based admission control prevents OOM: requests that would
 
 ## Performance
 
-Tur achieves competitive performance through:
-
-1. **Optimized Attention**: Custom CPU flash attention and GPU flash attention (Metal/CUDA)
-2. **Prefix Caching**: KV state reuse for shared prefixes, integrated with paged memory
-3. **Continuous Batching**: Amortized forward-pass cost across concurrent requests
-4. **Paged Memory**: Block allocator eliminates memory fragmentation in multi-request workloads
-5. **Quantization**: 4-bit and 8-bit GGUF models reduce memory footprint and improve cache utilization
+The current implementation includes prefix reuse, a scheduler, a block allocator, and GGUF imports. KV pages still have a duplicate concatenated cache, and the default Qwen GPU path uses standard attention. Competitive performance and bounded resident memory remain release gates.
 
 ### Benchmarks
 
 ```bash
-cargo bench
+cargo bench -p tur --bench tur
 ```
 
-Available benchmark groups:
+These legacy benchmarks use CPU execution and may download checkpoints. They are not a Metal baseline. For synchronized Metal primitive measurements and provenance capture, use [the baseline workflow](docs/apple-silicon-baseline.md).
+
+Available legacy benchmark groups:
 
 | Group | What it measures |
 | ----- | ---------------- |
-| `prefill` | Prompt encoding + first forward pass latency |
+| `prefill` | Prefill latency, excluding prompt encoding |
 | `decode` | Steady-state token generation throughput |
-| `full_pipeline` | Cold-start model load + prefill + decode |
+| `full_pipeline` | Engine build + prefill + decode; checkpoint file cache may be warm |
 | `prefix_cache` | Prefill with vs. without prefix cache on repeated prefixes |
 | `prefix_cache_lengths` | Cache hit speedup across varying prefix lengths |
 | `batch_prefill` | Batched prefill throughput (batch sizes 1/2/4), no-cache vs. with paged prefix cache |

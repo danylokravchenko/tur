@@ -1,0 +1,36 @@
+    Blocking waiting for file lock on build directory
+    Checking candle-core v0.10.2
+    Checking candle-nn v0.10.2
+    Checking candle-transformers v0.10.2
+    Checking tur v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur)
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> crates/tur/src/models/attention/cpu_flash/standard.rs:240:34
+    |
+240 |                 let mut m = f32::NEG_INFINITY;
+    |                                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> crates/tur/src/models/attention/cpu_flash/standard.rs:250:35
+    |
+250 |                     if mv == f32::NEG_INFINITY {
+    |                                   ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> crates/tur/src/models/attention/cpu_flash/standard.rs:366:38
+    |
+366 |                     let mut m = f32::NEG_INFINITY;
+    |                                      ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> crates/tur/src/models/attention/cpu_flash/standard.rs:378:39
+    |
+378 |                         if mv == f32::NEG_INFINITY {
+    |                                       ^^^^^^^^^^^^
+
+warning: `tur` (lib) generated 4 warnings
+    Checking tur-cli v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-cli)
+    Checking tur-server v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-server)
+warning: `tur` (lib test) generated 4 warnings (4 duplicates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.98s
