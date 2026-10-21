@@ -46,6 +46,34 @@ pub struct GuidanceControl {
 }
 
 impl GuidanceControl {
+    /// Check vocabulary bounds and single-token semantics before hybrid request admission.
+    /// Splices/backtracking require model-state transitions that this interface cannot publish.
+    pub fn validate_token_contract(&self, vocab_size: usize) -> Result<()> {
+        if self.factory.tok_env().tok_trie().vocab_size() != vocab_size {
+            return Err(TurError::Guidance(
+                "grammar/model vocabulary mismatch".into(),
+            ));
+        }
+        if let Some(constraint) = &self.constraint {
+            let caps = &constraint.parser.inference_caps;
+            if caps.ff_tokens || caps.conditional_ff_tokens || caps.backtrack || caps.fork {
+                return Err(TurError::Guidance(
+                    "hybrid execution requires single-token grammar commits".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Deep-copy parser state for an independent request checkpoint or speculative branch.
+    pub fn fork(&self) -> Self {
+        Self {
+            factory: Arc::clone(&self.factory),
+            constraint: self.constraint.as_ref().map(Constraint::deep_clone),
+            stopped: self.stopped,
+        }
+    }
+
     pub fn new(factory: Arc<ParserFactory>) -> Self {
         Self {
             factory,

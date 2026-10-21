@@ -1,16 +1,16 @@
 pub mod audio_encoder;
 pub mod batch_manager;
-pub mod chat_template;
+pub use tur_models::backend::chat_template;
 pub mod engine;
-pub mod factory;
+pub use tur_models::backend::factory;
 pub mod guidance;
-pub mod memory_pool;
+pub use tur_metal::memory_pool;
 pub mod pipeline;
 pub mod prefix_cache;
-pub mod progress;
+pub use tur_models::backend::progress;
 pub mod scheduler;
 pub mod tokenizer;
-pub mod tools;
+pub use tur_models::backend::tools;
 
 pub use audio_encoder::AudioEncoder;
 pub use engine::{InferenceEngine, InferenceEngineBuilder};

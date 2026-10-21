@@ -138,7 +138,7 @@ was corrected. No mathematical inference implementation was changed.
 Initial revision was `e58c1c2df467bdd913879ca76449fbbc4d53ad50`; the user's Rust 1.99
 change and unrelated files were preserved. Existing unsafe/panic violations,
 deprecated constants and the upstream `block` compatibility warning remain.
-P2 extraction and hybrid public contracts still require their concrete approval.
+At the baseline checkpoint, P2 extraction and hybrid public contracts still awaited approval. The user subsequently authorized breaking Rust changes; current contracts and validation are recorded in [the P2 report](apple-silicon-p2-contracts.md).
 
 This baseline does not cover 8K/32K contexts, concurrency 8/16, sustained thermal
 behavior, quality budgets, other Macs, cancellation/OOM correctness or production

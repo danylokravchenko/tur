@@ -1,8 +1,8 @@
-pub mod backend;
-pub mod models;
+pub use tur_engine::backend;
+pub use tur_models::models;
 pub mod server;
 pub mod shared;
-pub mod weights;
+pub use tur_models::weights;
 
 pub use backend::{
     audio_encoder::AudioEncoder,
@@ -18,3 +18,8 @@ use tikv_jemallocator::Jemalloc;
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
+
+pub use tur_core as core;
+/// Hybrid request execution contracts.
+pub use tur_engine::hybrid;
+pub use tur_metal as runtime;

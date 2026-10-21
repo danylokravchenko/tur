@@ -1,6 +1,6 @@
 # Tur: Apple Silicon inference redesign
 
-Status: P0's development-Mac evidence/capability gate is complete (2026-10-21), and P1's compatible three-member workspace move is implemented. Safe custom MSL dispatch/readback, pinned model/HTTP baselines and Instruments trace summaries are recorded in [the baseline report](apple-silicon-baseline.md). The pinned checkpoint suite has one retained guided-JSON failure (68/69 pass). Production performance, quality and hybrid-model release gates remain open. Public model/state contracts are unchanged.
+Status: P0's development-Mac evidence/capability gate and P1's workspace move are complete (2026-10-21). P2's four-crate extraction and explicit hybrid state/reference execution contracts are implemented; see [P2 contracts and validation](apple-silicon-p2-contracts.md). Safe dispatch and pinned model/HTTP evidence remain in [the baseline report](apple-silicon-baseline.md). The baseline checkpoint suite retains its guided-JSON failure (68/69 pass); it was not rerun or fixed in P2. Existing ordinary decoders remain regression references. P3 hybrid mathematics, serving integration, production performance and quality gates remain open; Qwen3.8 is not supported.
 
 ## Product and platform
 
@@ -25,11 +25,15 @@ The existing scheduler, API, templates, tokenizer, grammar support, and tests ar
 
 ## Workspace boundaries
 
-First migration step:
+Current workspace after P2:
 
 ```text
 crates/
-  tur/          # Existing library, integration tests, benchmarks
+  tur-core/     # Original shared errors and checked execution descriptors
+  tur-metal/    # Cache/storage ownership and device completion
+  tur-models/   # Models, checkpoint loading and state declarations
+  tur-engine/   # Request lifecycle, execution and sampling
+  tur/          # Facade, HTTP library, integration tests, benchmarks
   tur-cli/      # tur binary
   tur-server/   # server binary
 docs/
@@ -38,20 +42,20 @@ Cargo.toml      # Workspace, shared dependency versions and profiles
 Cargo.lock
 ```
 
-During the first move, the server library module stays in `tur` for API compatibility. Build all members with `cargo check --workspace --all-targets`; run `cargo run --bin tur -- ...` or `cargo run --bin server -- ...` from the repository root.
+The server library module remains in `tur` until adapter migration. Root commands select all seven members by default. Build all members with `cargo check --workspace --all-targets`; run `cargo run --bin tur -- ...` or `cargo run --bin server -- ...` from the repository root.
 
-Proposed subsequent extraction, after agreeing the public contracts:
+P2 extraction (implemented; breaking Rust changes explicitly authorized on 2026-10-21):
 
 | Crate | Responsibility and dependency direction |
 | --- | --- |
 | `tur-core` | Extract the existing shared errors and minimal execution/state descriptors; no runtime, HTTP, or model dependencies |
-| `tur-metal` | Device capabilities, safe resource ownership, packed buffers, kernel compilation/dispatch; no models or scheduler |
+| `tur-metal` | Extracted caches/memory pool, hybrid storage and safe completion ownership; kernel runtime follows in P4; no models or scheduler |
 | `tur-models` | Checkpoint validation, model implementations, layer/state descriptions; depends on Metal runtime |
 | `tur-engine` | Request lifecycle, cache ownership, scheduling, execution and sampling; depends on models/runtime |
 | `tur` | Stable public facade and compatibility exports |
 | `tur-cli`, `tur-server` | Product adapters; depend on public facade |
 
-Extract existing functionality rather than copying it into parallel foundational modules. Keep model-specific configuration with its model; avoid an unrelated universal Config replacement. Move existing shared errors into `tur-core` when the extraction is approved, retaining facade re-exports; do not create a second competing error hierarchy. No new third-party dependencies are selected by this proposal.
+Extract existing functionality rather than copying it into parallel foundational modules. Keep model-specific configuration with its model; avoid an unrelated universal Config replacement. The existing shared errors are now in `tur-core` with facade re-exports; do not create a second competing error hierarchy. No new third-party dependencies are selected by this proposal.
 
 ## Qwen3.8 migration
 
@@ -67,7 +71,7 @@ Replace the assumption that every layer owns K/V with model-declared state kinds
 
 Prefix entries must associate an exact token boundary with both attention pages and a recurrent snapshot. A recurrent state cannot be truncated as if it were a KV array. Share immutable checkpoints; copy writable recurrent state when branching. Namespace entries by model revision, quantization, adapters, positional settings and tenant policy. Verify tokens on hash hits. Release GPU resources only after all referencing commands complete.
 
-Keep wire-level chat/streaming behavior stable where possible. The affected Rust contracts include `ModelImpl`, `KvCacheImpl`, paged-state arguments, prefix snapshots and engine/model construction. AGENTS.md requires confirmation before these public API changes. Approval of this plan should explicitly include these named contract changes and extraction of shared types; otherwise Sol can complete baseline work and the compatible workspace move first.
+Keep wire-level chat/streaming behavior stable where possible. The affected Rust contracts include `ModelImpl`, `KvCacheImpl`, paged-state arguments, prefix snapshots and engine/model construction. The user explicitly authorized breaking Rust changes on 2026-10-21, satisfying the AGENTS.md confirmation gate. Implemented signatures, ownership rules, compatibility exports and migration steps are in [the P2 contract report](apple-silicon-p2-contracts.md).
 
 ## Quantization and kernels
 
@@ -158,7 +162,31 @@ Exit: workspace checks, offline unit tests and existing server tests pass or mat
 
 ### P2 — Extract ownership boundaries and hybrid contracts
 
-Move existing shared functionality into the proposed crates; retain `tur` as a facade. The dependency graph is:
+Implemented on 2026-10-21. `tur-core` owns the original errors and checked packed
+descriptors; `tur-metal` owns extracted caches/memory management plus immutable
+hybrid page/recurrent storage and completion fences; `tur-models` owns existing
+models/loading and the immutable-weight `HybridModel` contract; `tur-engine` owns
+extracted generation code and a single-owner `HybridEngine`. `tur` retains facade
+exports and its HTTP library. No third-party package/version was added.
+
+The new path owns attention pages, convolution/recurrent snapshots, positions,
+independent sampling counters and deep-copied llguidance state per request. It
+validates descriptors before execution and publishes only complete accepted
+boundaries after device completion. Fork/restore/zero acceptance/partial acceptance
+cover every layer and RNG/grammar state together. Cancellation suppresses outputs
+while retaining in-flight bindings. Failed fences retain resources for retry;
+failed drop fences quarantine resources instead of recycling them.
+
+Deterministic offline tests exercise mixed four-layer fixtures, request reordering,
+exact page/recurrent values, partial-page forks, atomic restore, RNG/parser rollback,
+cancellation, stale handles, shape failures, arithmetic overflow and invalid plans.
+The implementation uses F32 state and detached tensor boundaries for isolation;
+its token loop and per-token snapshots are a reference contract implementation,
+not optimized packed GPU execution. CLI/server still use the extracted ordinary
+attention engine. Exact signatures, migration steps, targeted commands and remaining
+limits are in [the P2 contract document](apple-silicon-p2-contracts.md).
+
+The implemented boundaries and original package requirements follow. Move existing shared functionality into these crates; retain `tur` as a facade. The dependency graph is:
 
 ```text
 tur-core

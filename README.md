@@ -4,6 +4,11 @@
 
 A high-performance Rust inference engine for transformer models, built on [Candle](https://github.com/huggingface/candle). The Apple Silicon redesign is in progress; see [the implementation plan](docs/apple-silicon-redesign.md) and [baseline instructions](docs/apple-silicon-baseline.md). Performance claims require measurements on the target Mac.
 
+The workspace now separates shared contracts (`tur-core`), device/state ownership
+(`tur-metal`), models/loading (`tur-models`) and execution (`tur-engine`), with `tur`
+as the facade. [P2 contracts](docs/apple-silicon-p2-contracts.md) include deterministic
+hybrid state fixtures; Qwen3.8 mathematics and serving integration remain pending.
+
 ## Features
 
 - **Attention**: Existing CPU attention kernels and Candle GPU operations; dedicated Metal prefill and paged decode kernels are planned

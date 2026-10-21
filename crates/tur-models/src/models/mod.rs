@@ -1,6 +1,6 @@
 pub mod attention;
 pub mod granite_41;
-pub mod kv_cache;
+pub use tur_metal::kv_cache;
 pub mod layers;
 pub mod qwen3;
 

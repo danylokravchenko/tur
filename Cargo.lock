@@ -3716,43 +3716,31 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 name = "tur"
 version = "0.1.0"
 dependencies = [
- "ahash",
  "async-stream",
  "axum",
- "bytemuck",
  "candle-core",
  "candle-metal-kernels",
- "candle-nn",
  "candle-transformers",
  "clap",
  "criterion",
- "either",
- "half",
- "hf-hub",
  "http-body-util",
- "indicatif 0.18.4",
- "libc",
- "llguidance",
  "metal 0.33.0",
- "minijinja",
- "num-traits",
  "objc2-foundation",
  "objc2-metal",
  "parking_lot",
- "rayon",
- "safetensors 0.7.0",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "tikv-jemallocator",
  "tokenizers 0.21.4",
  "tokio",
- "toktrie",
- "toktrie_hf_tokenizers",
  "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "tur-core",
+ "tur-engine",
+ "tur-metal",
+ "tur-models",
  "uuid",
 ]
 
@@ -3765,6 +3753,76 @@ dependencies = [
  "serde_json",
  "tracing",
  "tur",
+]
+
+[[package]]
+name = "tur-core"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "tur-engine"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "llguidance",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokenizers 0.21.4",
+ "toktrie",
+ "toktrie_hf_tokenizers",
+ "tracing",
+ "tur-core",
+ "tur-metal",
+ "tur-models",
+ "uuid",
+]
+
+[[package]]
+name = "tur-metal"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "candle-core",
+ "candle-nn",
+ "parking_lot",
+ "tur-core",
+]
+
+[[package]]
+name = "tur-models"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "bytemuck",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "either",
+ "half",
+ "hf-hub",
+ "indicatif 0.18.4",
+ "libc",
+ "minijinja",
+ "num-traits",
+ "parking_lot",
+ "rayon",
+ "safetensors 0.7.0",
+ "serde",
+ "serde_json",
+ "tokenizers 0.21.4",
+ "tracing",
+ "tur-core",
+ "tur-metal",
 ]
 
 [[package]]

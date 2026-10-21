@@ -585,15 +585,14 @@ impl ModelConstructor for AnyModel {
 /// # Example
 /// ```no_run
 /// # use candle_core::{DType, Device};
-/// # use tur::backend::factory::{AutoModelFactory, ModelSource};
-/// # use tur::backend::pipeline::TurPipeline;
+/// # use tur_models::backend::factory::{AutoModelFactory, ModelSource};
 /// let factory = AutoModelFactory::new(
 ///     ModelSource::HuggingFace("Qwen/Qwen3-0.6B".to_string()),
 ///     Some("Q4_K_M".to_string()),
 ///     Device::Cpu,
 ///     DType::BF16,
 /// );
-/// let pipeline = TurPipeline::builder(&factory, Device::Cpu).build();
+/// let tokenizer = factory.load_tokenizer_only();
 /// ```
 pub type AutoModelFactory = ModelFactory<AnyModel>;
 

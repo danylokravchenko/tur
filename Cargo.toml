@@ -1,6 +1,13 @@
 [workspace]
-members = ["crates/tur", "crates/tur-cli", "crates/tur-server"]
-default-members = ["crates/tur", "crates/tur-cli", "crates/tur-server"]
+members = [
+    "crates/tur-core",
+    "crates/tur-metal",
+    "crates/tur-models",
+    "crates/tur-engine",
+    "crates/tur",
+    "crates/tur-cli",
+    "crates/tur-server",
+]
 resolver = "3"
 
 [workspace.package]

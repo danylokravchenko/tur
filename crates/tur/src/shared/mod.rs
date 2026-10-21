@@ -1,4 +1,4 @@
-pub mod errors;
+pub use tur_core::errors;
 
 pub use errors::*;
 use tracing_subscriber::{
