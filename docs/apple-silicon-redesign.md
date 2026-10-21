@@ -1,6 +1,6 @@
 # Tur: Apple Silicon inference redesign
 
-Status: P0's development-Mac evidence/capability gate and P1's workspace move are complete (2026-10-21). P2's four-crate extraction and explicit hybrid state/reference execution contracts are implemented; see [P2 contracts and validation](apple-silicon-p2-contracts.md). Safe dispatch and pinned model/HTTP evidence remain in [the baseline report](apple-silicon-baseline.md). The baseline checkpoint suite retains its guided-JSON failure (68/69 pass); it was not rerun or fixed in P2. Existing ordinary decoders remain regression references. P3 hybrid mathematics, serving integration, production performance and quality gates remain open; Qwen3.8 is not supported.
+Status: P0's development-Mac evidence/capability gate and P1's workspace move are complete (2026-10-21). P2's four-crate extraction and explicit hybrid state/reference execution contracts are implemented; see [P2 contracts and validation](apple-silicon-p2-contracts.md). Safe dispatch and pinned model/HTTP evidence remain in [the baseline report](apple-silicon-baseline.md). The baseline checkpoint suite retains its guided-JSON failure (68/69 pass); it was not rerun or fixed in P2. Existing models (ordinary Qwen3, Granite 4.1) are scheduled for removal rather than retained as regression references; see [Breaking changes and legacy removal](#breaking-changes-and-legacy-removal). P3 hybrid mathematics, serving integration, production performance and quality gates remain open; Qwen3.8 is not supported.
 
 ## Product and platform
 
@@ -8,20 +8,46 @@ Build a Rust inference service for Apple Silicon macOS, optimizing prompt throug
 
 Use capability-based Metal dispatch; choose a minimum macOS version after measuring the target machines. Metal 4 exposes newer command and tensor facilities, but their availability does not establish that every chip has identical numerical or throughput capabilities. Benchmark specialized kernels against existing Metal implementations before making them defaults. [Apple Metal 4](https://developer.apple.com/videos/play/wwdc2025/205/)
 
+### ARM64 host optimization
+
+All CPU-side code is optimized for ARM64 (`aarch64-apple-darwin`), not merely compiled for it. GPU kernels carry the model math, but tokenization, scheduling, execution planning, grammar masks, quantization packing/conversion, checkpoint loading, sampling fallbacks and the HTTP path run on the performance and efficiency cores and directly affect TTFT and tail latency.
+
+- **Build targets:** set the release target CPU deliberately (for example an `apple-m1` baseline, which enables NEON, FP16, dot-product and LSE atomics), and measure whether newer per-generation targets are worth separate builds. Do not ship a host-native build as the release artifact. Enable LTO and `codegen-units = 1` for release profiles when measurements confirm a gain.
+- **Vectorization without unsafe:** `std::arch` NEON intrinsics are `unsafe`, so the no-unsafe rule applies. Write hot loops in shapes the compiler auto-vectorizes (fixed-width chunks, `chunks_exact`, no bounds checks inside the inner loop, contiguous structure-of-arrays layouts) and check generated assembly for NEON instructions on hot paths. If a safe abstraction cannot reach the needed throughput, document the gap and propose an approved dependency instead of writing intrinsics in Tur.
+- **Memory layout:** Apple cores use 128-byte cache lines; pad and align contended atomics and per-worker state to 128 bytes, not the 64 bytes common on x86. Keep host-visible buffers contiguous and page-aligned for zero-copy sharing with the GPU through unified memory.
+- **Concurrency:** rely on ARMv8.1 LSE atomics and the weaker ARM memory model. Use the minimal correct `Ordering` instead of defaulting to `SeqCst`, and test lock-free structures under ARM-specific reordering (loom or stress tests on the device), not only on x86 CI.
+- **Core topology:** keep latency-critical host threads (scheduler, plan builder, completion handling) on performance cores using QoS classes, and push background work (prefix eviction, logging, metrics) to lower QoS. Size worker pools from the measured performance-core count, not the total logical CPU count.
+- **Benchmarks:** host-side microbenchmarks (planning, sampling, grammar, tokenization, packing) run on the target Macs and record compiler target flags alongside the existing benchmark manifest.
+
 ## Repository audit
 
 | Existing implementation | Consequence and replacement |
 | --- | --- |
-| `models/qwen3.rs` implements ordinary Qwen3 attention; `Qwen35ModelForCausalLM` is only an alias | Renaming it cannot implement Qwen3.8. Keep the old implementation as a reference during migration. |
+| `models/qwen3.rs` implements ordinary Qwen3 attention; `Qwen35ModelForCausalLM` is only an alias | Renaming it cannot implement Qwen3.8. Delete it together with the alias; validate Qwen3.8 against pinned external references instead. |
 | `ModelImpl` exports only K/V pairs and accepts per-layer `PagedKvCache` | Introduce explicit hybrid request state before supporting DeltaNet batching and prefix reuse. |
 | `PagedKvCache::append` writes blocks and also concatenates full-sequence K/V | Implement attention directly over physical pages; eliminate the duplicate full cache and per-token concatenation. |
 | `InferenceEngine::prefill_batch` loops over requests on its paged path | Pack variable-length prompt chunks into one execution plan with per-sequence offsets. |
 | Default Qwen GPU attention falls through to standard attention | Add tiled Metal prefill and paged decode kernels, without materializing a complete attention matrix. |
 | GGUF linear layers already construct `QMatMul` | Inspect backend dispatch and measure actual resident storage; stale loader logging incorrectly claimed GPU weights were dequantized. |
-| `benches/tur.rs` constructs a CPU factory for Qwen3-0.6B | Add reproducible Metal kernel and serving benchmarks before publishing performance claims. |
+| `benches/tur.rs` constructs a CPU factory for Qwen3-0.6B | Remove it with the old model; add reproducible Metal kernel, ARM64 host-path and serving benchmarks before publishing performance claims. |
 | Existing loading and CPU kernels contain unsafe code; tests contain unwraps | Remove inherited violations as those paths are replaced; do not introduce new unsafe Rust or panic paths. |
 
-The existing scheduler, API, templates, tokenizer, grammar support, and tests are useful migration assets. Their presence does not prove efficient GPU batching or cache residency.
+The existing scheduler, templates, tokenizer, grammar support, and tests may be reused where they fit the new design, but nothing is preserved for its own sake. Their presence does not prove efficient GPU batching or cache residency. The existing Rust and HTTP APIs are not optimal and have no external users; they are not a compatibility constraint.
+
+## Breaking changes and legacy removal
+
+Breaking changes are fully encouraged and allowed (user decision, 2026-10-21). This covers public Rust APIs, crate boundaries, the HTTP wire format, CLI flags, configuration files, on-disk cache formats and binary names. Prefer the design that is best for Apple Silicon throughput and maintainability over one that eases migration. Do not add compatibility shims, deprecated aliases, re-export layers or dual code paths to keep the old API alive; delete replaced code in the same change that replaces it.
+
+Remove the existing models rather than keeping them as regression references:
+
+- `models/qwen3.rs`, the `Qwen35ModelForCausalLM` alias and `Model`/`Config` re-exports
+- `models/granite_41.rs` and `Granite41ModelForCausalLM`
+- their factory detection, chat-template special cases (including the `/think` heuristic), loader branches, benchmarks and checkpoint-dependent tests
+- legacy contracts that exist only to serve them: `ModelImpl`, `KvCacheImpl`, the full-sequence `PagedKvCache` path and the CPU flash-attention kernels under `models/attention/cpu_flash`
+
+Removal unblocks deleting inherited unsafe code and unwraps instead of fixing them. Until the first hybrid model runs end to end, CLI and server may support no models; that is acceptable. Correctness evidence for new models comes from pinned external references (Transformers, MLX-LM), not from the deleted decoders. The 68/69 baseline checkpoint results become historical evidence only.
+
+Still subject to AGENTS.md: new third-party dependencies need approval, and the no-unsafe/no-panic rules are unchanged.
 
 ## Workspace boundaries
 
@@ -52,7 +78,7 @@ P2 extraction (implemented; breaking Rust changes explicitly authorized on 2026-
 | `tur-metal` | Extracted caches/memory pool, hybrid storage and safe completion ownership; kernel runtime follows in P4; no models or scheduler |
 | `tur-models` | Checkpoint validation, model implementations, layer/state descriptions; depends on Metal runtime |
 | `tur-engine` | Request lifecycle, cache ownership, scheduling, execution and sampling; depends on models/runtime |
-| `tur` | Stable public facade and compatibility exports |
+| `tur` | Public facade; no compatibility exports for the old API |
 | `tur-cli`, `tur-server` | Product adapters; depend on public facade |
 
 Extract existing functionality rather than copying it into parallel foundational modules. Keep model-specific configuration with its model; avoid an unrelated universal Config replacement. The existing shared errors are now in `tur-core` with facade re-exports; do not create a second competing error hierarchy. No new third-party dependencies are selected by this proposal.
@@ -71,7 +97,7 @@ Replace the assumption that every layer owns K/V with model-declared state kinds
 
 Prefix entries must associate an exact token boundary with both attention pages and a recurrent snapshot. A recurrent state cannot be truncated as if it were a KV array. Share immutable checkpoints; copy writable recurrent state when branching. Namespace entries by model revision, quantization, adapters, positional settings and tenant policy. Verify tokens on hash hits. Release GPU resources only after all referencing commands complete.
 
-Keep wire-level chat/streaming behavior stable where possible. The affected Rust contracts include `ModelImpl`, `KvCacheImpl`, paged-state arguments, prefix snapshots and engine/model construction. The user explicitly authorized breaking Rust changes on 2026-10-21, satisfying the AGENTS.md confirmation gate. Implemented signatures, ownership rules, compatibility exports and migration steps are in [the P2 contract report](apple-silicon-p2-contracts.md).
+Wire-level chat/streaming behavior may change freely; redesign it where the current shape costs latency or complicates batching. `ModelImpl`, `KvCacheImpl` and the old paged-state arguments are deleted rather than adapted; prefix snapshots and engine/model construction are redesigned around hybrid state. The user explicitly authorized breaking changes on 2026-10-21, satisfying the AGENTS.md confirmation gate. Implemented signatures, ownership rules, compatibility exports and migration steps are in [the P2 contract report](apple-silicon-p2-contracts.md).
 
 ## Quantization and kernels
 
@@ -120,12 +146,12 @@ These are integration candidates, not claims of existing Tur support or a measur
 | Gemma 4 26B-A4B | Independent sparse architecture candidate after MoE kernels exist | 13 GB |
 | Ministral 3 3B/8B/14B | Compact dense alternatives with official GGUF releases | 1.5/4/7 GB nominal language-weight floors; inspect exact checkpoint |
 
-Sources: [Qwen releases](https://github.com/QwenLM/Qwen3.8), [Qwen3.6 MoE](https://huggingface.co/Qwen/Qwen3.6-35B-A3B), [Phi](https://huggingface.co/microsoft/Phi-4-mini-instruct), [Gemma 4](https://huggingface.co/google/gemma-4-26B-A4B), [Ministral 3](https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512-GGUF). Keep Granite as a regression model during migration. Do not choose a default checkpoint until target memory and latency requirements are known.
+Sources: [Qwen releases](https://github.com/QwenLM/Qwen3.8), [Qwen3.6 MoE](https://huggingface.co/Qwen/Qwen3.6-35B-A3B), [Phi](https://huggingface.co/microsoft/Phi-4-mini-instruct), [Gemma 4](https://huggingface.co/google/gemma-4-26B-A4B), [Ministral 3](https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512-GGUF). Granite and ordinary Qwen3 are removed, not kept as regression models. Do not choose a default checkpoint until target memory and latency requirements are known.
 
 ## Implementation order and release gates
 
-1. **Workspace and baseline:** preserve existing behavior, establish Metal benchmarks, record hardware/OS/compiler/revisions. Correct documentation that confuses intended features with measured behavior.
-2. **Hybrid state and Qwen:** implement validated loading and text-only reference execution; compare logits, tokenization, templates, EOS and chunk boundaries to a pinned reference. Reject unsupported architectures before loading large weights.
+1. **Workspace and baseline:** establish Metal and ARM64 host benchmarks, record hardware/OS/compiler/revisions. Correct documentation that confuses intended features with measured behavior.
+2. **Hybrid state and Qwen:** delete the existing models and legacy contracts; implement validated loading and text-only reference execution; compare logits, tokenization, templates, EOS and chunk boundaries to a pinned reference. Reject unsupported architectures before loading large weights.
 3. **Metal execution:** packed weights, fused primitives, DeltaNet prefill/decode, direct paged attention and quantized KV. Differential tests must cover non-aligned shapes, page boundaries and long contexts.
 4. **Serving:** true ragged batches, concurrent cancellation, prefix forks, memory pressure, fairness and overlapping scheduling. Test isolation, resource reclamation and no use of freed in-flight pages.
 5. **Advanced optimizations:** speculative decode, adaptive cache precision and shape tuning only when end-to-end measurements justify them.
@@ -183,7 +209,7 @@ cancellation, stale handles, shape failures, arithmetic overflow and invalid pla
 The implementation uses F32 state and detached tensor boundaries for isolation;
 its token loop and per-token snapshots are a reference contract implementation,
 not optimized packed GPU execution. CLI/server still use the extracted ordinary
-attention engine. Exact signatures, migration steps, targeted commands and remaining
+attention engine; P3 deletes it and its compatibility exports. Exact signatures, migration steps, targeted commands and remaining
 limits are in [the P2 contract document](apple-silicon-p2-contracts.md).
 
 The implemented boundaries and original package requirements follow. Move existing shared functionality into these crates; retain `tur` as a facade. The dependency graph is:
@@ -202,7 +228,7 @@ tur (facade)
 tur-cli / tur-server
 ```
 
-Higher layers may also directly depend on `tur-core`; HTTP implementation belongs in `tur-server` after compatibility is resolved. Keep weight loading in `tur-models` initially instead of introducing another small crate. Put MSL sources, compilation, packing and device tests in `tur-metal`.
+Higher layers may also directly depend on `tur-core`; HTTP implementation moves to `tur-server`; no compatibility layer is required. Keep weight loading in `tur-models` initially instead of introducing another small crate. Put MSL sources, compilation, packing and device tests in `tur-metal`.
 
 Define these semantics before optimizing them:
 
@@ -221,8 +247,9 @@ Exit: small deterministic reference tests for state allocation, independent requ
 
 ### P3 — Implement Qwen3.8 correctness first
 
-Affected functionality: current `models/qwen3.rs`, factory detection, weight loading, chat templates, tokenizer, model-state tests.
+Affected functionality: current `models/qwen3.rs` and `models/granite_41.rs`, factory detection, weight loading, chat templates, tokenizer, model-state tests.
 
+- Delete the existing models, their benchmarks/tests and the legacy `ModelImpl`/`KvCacheImpl` engine path first (see [Breaking changes and legacy removal](#breaking-changes-and-legacy-removal)). Rewire CLI/server onto `HybridEngine`; they may serve no model until the first hybrid path passes.
 - Add architecture-specific parsing for `qwen3_5` and nested text settings. Retain explicit model identity separate from architecture family. Reject unsupported layer layouts or tensor formats with useful errors.
 - Pin Qwen3.8-27B config/tokenizer/template references. Validate dimensions, layer list, gate behavior, normalization conventions, rotary settings and tensor names against weights/reference code.
 - Implement a slow, readable reference for each new mathematical primitive using existing dependencies. Use small tensor fixtures for offline CI; use a real small Qwen hybrid for integration before the larger flagship.
@@ -302,7 +329,7 @@ Exit: exact rollback tests, sampling equivalence tests, actual speedups in enabl
 
 Remove unsupported production CPU/CUDA paths and document the chosen macOS/Apple Silicon capability floor. Preserve reference math only as a development aid. Finish unsafe/panic cleanup, activate workspace lints, and run unit tests with cargo-nextest plus checkpoint-dependent suites on an appropriate Mac.
 
-Add health/readiness reporting, bounded startup loading, failure reporting, request metrics, graceful shutdown, stream cancellation, model revision reporting and diagnostic memory/kernel statistics. Preserve API semantics for usage accounting, stop sequences, tool calls, thinking and structured outputs. Run sustained thermal and leak tests, not only short warmed loops.
+Add health/readiness reporting, bounded startup loading, failure reporting, request metrics, graceful shutdown, stream cancellation, model revision reporting and diagnostic memory/kernel statistics. Support usage accounting, stop sequences, tool calls, thinking and structured outputs; their API shape may differ from the old one. Run sustained thermal and leak tests, not only short warmed loops.
 
 Publish the benchmark matrix, quality evaluations, reproducible commands, known limitations and supported model/quantization combinations. Replace unsupported README speedup claims with measured results. Describe performance separately for single-user latency, prefill throughput and concurrent serving throughput.
 
@@ -324,4 +351,4 @@ These are proposed project gates, not claims that they have been met:
 
 Start with P0 and P1. Keep the public-contract decisions visible before P2. Implement one end-to-end small hybrid model path before expanding the supported-model list. Complete Qwen3.8-27B correctness and packed quantized execution before speculative decoding or unrelated model families. Do not spend the first iteration implementing every research idea.
 
-The user has explicitly authorized a `crates/` layout. Breaking Rust contracts and new third-party dependencies still follow AGENTS.md: obtain approval of the concrete contract/dependency proposal where not already authorized. No exception to the no-unsafe rule is proposed. Hardware-specific performance claims require target-Mac measurements, and pending machine preferences must not be replaced by invented requirements.
+The user has explicitly authorized a `crates/` layout and breaking changes of any kind, including Rust, HTTP and CLI APIs; do not spend effort on backwards compatibility. New third-party dependencies still follow AGENTS.md: obtain approval of the concrete dependency proposal. No exception to the no-unsafe rule is proposed. Hardware-specific performance claims require target-Mac measurements, and pending machine preferences must not be replaced by invented requirements.
