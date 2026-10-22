@@ -69,16 +69,15 @@ struct GatedParams {
 
 #[repr(C)]
 struct ConvParams {
-    tokens: u32,
+    rows: u32,
     channels: u32,
     taps: u32,
     x_stride: u32,
-    every: u32,
 }
 
 #[repr(C)]
 struct ScanParams {
-    tokens: u32,
+    sequences: u32,
     heads: u32,
     groups: u32,
     key_width: u32,
@@ -88,7 +87,6 @@ struct ScanParams {
     proj_stride: u32,
     b_col: u32,
     a_col: u32,
-    every: u32,
 }
 
 #[repr(C)]
@@ -243,34 +241,44 @@ fn query_tiles(first_block: &[u32], visible: &[u32]) -> Option<Vec<u32>> {
     Some(tiles)
 }
 
-/// Recurrent pool slots written by one sequence: one per retained boundary. Uploaded once
-/// per pass and shared by every recurrent layer, whose pools have equal slot counts.
-pub struct Slots {
-    indices: Tensor,
-    values: Vec<u32>,
+/// One sequence's recurrent addressing in a packed pass: its token count, the slot holding
+/// its committed state, and the slots receiving its state after the last token (one) or
+/// after every token (one per token).
+#[derive(Clone, Copy, Debug)]
+pub struct RecurrentSpan<'a> {
+    pub tokens: usize,
+    pub read: u32,
+    pub writes: &'a [u32],
 }
 
-impl Slots {
-    pub fn len(&self) -> usize {
-        self.values.len()
+/// Validated recurrent addressing of a packed pass: consecutive sequences covering every
+/// packed row. Uploaded once per pass and shared by every recurrent layer, whose pools
+/// have equal slot counts, so each layer's convolution and scan is one dispatch.
+pub struct RecurrentSpans {
+    /// `[row, tokens, read, first write, every]` per sequence (`RecurrentSpan` in the MSL).
+    spans: Tensor,
+    /// Sequence of each packed row.
+    rows: Tensor,
+    slots: Tensor,
+    sequences: usize,
+    tokens: usize,
+    /// Highest slot read or written, checked against each pool.
+    max_slot: u32,
+}
+
+impl RecurrentSpans {
+    pub fn sequences(&self) -> usize {
+        self.sequences
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+    pub fn tokens(&self) -> usize {
+        self.tokens
     }
 
-    /// Check against a pool of `capacity` slots and the slot being read.
-    fn check(&self, capacity: usize, read: u32, tokens: usize) -> Result<()> {
-        if (self.len() != 1 && self.len() != tokens)
-            || self
-                .values
-                .iter()
-                .any(|&s| s as usize >= capacity || s == read)
-            || read as usize >= capacity
-        {
+    fn check(&self, capacity: usize, rows: usize) -> Result<()> {
+        if self.max_slot as usize >= capacity || rows != self.tokens {
             return Err(invalid(
-                "recurrent slots must be one or one per token, inside the pool and distinct from \
-                 the committed slot",
+                "recurrent spans exceed the slot pool or do not cover the packed rows",
             ));
         }
         Ok(())
@@ -570,62 +578,98 @@ impl Kernels {
         self.finish(out, (zv.rows, heads * cv.cols))
     }
 
-    /// Upload the recurrent slots one sequence writes.
-    pub fn slots(&self, values: &[u32]) -> Result<Slots> {
-        if values.is_empty() {
-            return Err(invalid("a pass writes at least one recurrent slot"));
+    /// Validate and upload the recurrent addressing of a packed pass. Every sequence has
+    /// at least one token and writes one slot or one per token; no slot is written twice
+    /// or both read and written in the pass. Forks may share a committed slot.
+    pub fn recurrent_spans(&self, spans: &[RecurrentSpan<'_>]) -> Result<RecurrentSpans> {
+        if spans.is_empty() {
+            return Err(invalid("a pass has at least one recurrent sequence"));
         }
-        Ok(Slots {
-            indices: self.runtime.indices(values)?,
-            values: values.to_vec(),
+        let mut table = Vec::with_capacity(spans.len() * 5);
+        let mut rows = Vec::new();
+        let mut slots = Vec::new();
+        for (index, span) in spans.iter().enumerate() {
+            if span.tokens == 0 || (span.writes.len() != 1 && span.writes.len() != span.tokens) {
+                return Err(invalid(
+                    "a recurrent sequence writes one slot or one per token",
+                ));
+            }
+            table.extend([
+                to_u32(rows.len(), "packed row")?,
+                to_u32(span.tokens, "tokens")?,
+                span.read,
+                to_u32(slots.len(), "slot offset")?,
+                u32::from(span.writes.len() > 1),
+            ]);
+            rows.resize(rows.len() + span.tokens, to_u32(index, "sequence")?);
+            slots.extend_from_slice(span.writes);
+        }
+        let mut written = slots.clone();
+        written.sort_unstable();
+        if written.windows(2).any(|pair| pair[0] == pair[1])
+            || spans
+                .iter()
+                .any(|span| written.binary_search(&span.read).is_ok())
+        {
+            return Err(invalid(
+                "recurrent slots must be written once and distinct from every committed slot",
+            ));
+        }
+        let max_slot = spans
+            .iter()
+            .map(|span| span.read)
+            .chain(written.last().copied())
+            .max()
+            .unwrap_or(0);
+        Ok(RecurrentSpans {
+            spans: self.runtime.indices(&table)?,
+            tokens: rows.len(),
+            rows: self.runtime.indices(&rows)?,
+            slots: self.runtime.indices(&slots)?,
+            sequences: spans.len(),
+            max_slot,
         })
     }
 
-    /// Causal depthwise convolution of one sequence: rows `row..row + tokens` of `x`
-    /// (first `channels` columns) after the history in slot `read` of `pool`
-    /// (`[slots, taps - 1, channels]`), with `weight` `[channels, taps]`, then `SiLU` into
-    /// `out` rows `out_row..`. Writes the history after the last token into slot
-    /// `writes[0]`, or after token `t` into `writes[t]` when one slot per token is given.
-    #[allow(clippy::too_many_arguments)]
+    /// Causal depthwise convolution of every sequence of a packed pass: `x` rows (first
+    /// `channels` columns) follow each sequence's history in its committed slot of `pool`
+    /// (`[slots, taps - 1, channels]`), with `weight` `[channels, taps]`, then `SiLU`.
+    /// Returns `[rows, channels]` and writes each sequence's history after its last token,
+    /// or after every token, into its written slots. One dispatch.
     pub fn delta_conv(
         &self,
         x: &Tensor,
-        row: usize,
-        tokens: usize,
+        spans: &RecurrentSpans,
         pool: &Tensor,
-        read: u32,
-        writes: &Slots,
         weight: &Tensor,
-        out: &Output,
-        out_row: usize,
-    ) -> Result<()> {
+    ) -> Result<Tensor> {
         let xv = self.view(x)?;
         let hv = self.view(pool)?;
         let wv = self.view(weight)?;
         let (_, kept, channels) = pool.dims3()?;
         let taps = wv.cols;
-        if taps < 2 || tokens == 0 || kept != taps - 1 {
-            return Err(invalid("convolution needs at least two taps and one token"));
+        if taps < 2 || kept != taps - 1 {
+            return Err(invalid("convolution needs at least two taps"));
         }
         hv.contiguous("convolution history pool")?;
-        writes.check(hv.rows, read, tokens)?;
+        spans.check(hv.rows, xv.rows)?;
         wv.expect(channels, taps, "convolution weight")?;
         wv.contiguous("convolution weight")?;
-        if xv.cols < channels || out.cols() != channels || row + tokens > xv.rows {
-            return Err(invalid(
-                "convolution input or output does not match its channels",
-            ));
+        if xv.cols < channels {
+            return Err(invalid("convolution input is narrower than its channels"));
         }
         let params = ConvParams {
-            tokens: to_u32(tokens, "tokens")?,
+            rows: to_u32(xv.rows, "rows")?,
             channels: to_u32(channels, "channels")?,
             taps: to_u32(taps, "taps")?,
             x_stride: to_u32(xv.row_stride, "row stride")?,
-            every: u32::from(writes.len() > 1),
         };
-        let count = tokens * channels;
+        let count = xv.rows * channels;
         to_u32(count, "elements")?;
-        let slots = self.runtime.view(&writes.indices, DType::U32)?;
+        let table = self.runtime.view(&spans.spans, DType::U32)?;
+        let rows = self.runtime.view(&spans.rows, DType::U32)?;
+        let slots = self.runtime.view(&spans.slots, DType::U32)?;
+        let out = self.output(xv.rows, channels)?;
         let pipeline = self.pipeline("delta_conv_f32")?;
         let threads = pipeline.threads(self.tuning.elementwise_threads);
         self.runtime.dispatch(
@@ -634,39 +678,36 @@ impl Kernels {
             count.div_ceil(threads),
             threads,
             |e| {
-                xv.bind_row(e, 0, row)?;
-                hv.bind_row(e, 1, read as usize)?;
+                xv.bind(e, 0)?;
+                hv.bind_mut(e, 1)?;
                 wv.bind(e, 2)?;
-                out.bind_rows(e, 3, out_row, tokens)?;
-                hv.bind_mut(e, 4)?;
-                e.set_bytes(5, &params);
-                slots.bind(e, 6)?;
+                out.bind(e, 3);
+                e.set_bytes(4, &params);
+                table.bind(e, 5)?;
+                rows.bind(e, 6)?;
+                slots.bind(e, 7)?;
                 Ok(())
             },
-        )
+        )?;
+        self.finish(out, (xv.rows, channels))
     }
 
-    /// Gated delta rule over one sequence: `mixed` rows `row..row + tokens` hold the
-    /// convolved `q | k | v`, `proj` the same rows' `b`/`a` gates. Starts from slot `read`
-    /// of `pool` (`[slots, heads, key_dim, value_dim]`), writes `[tokens, heads, value_dim]`
-    /// outputs into `out` rows `out_row..` and the state after the last token into slot
-    /// `writes[0]`, or after token `t` into `writes[t]`.
+    /// Gated delta rule over every sequence of a packed pass: `mixed` holds the convolved
+    /// `q | k | v` rows, `proj` the same rows' `b`/`a` gates. Each sequence starts from
+    /// its committed slot of `pool` (`[slots, heads, key_dim, value_dim]`) and writes its
+    /// state after the last token, or after every token, into its written slots. Returns
+    /// `[rows * heads, value_dim]`. One dispatch.
     #[allow(clippy::too_many_arguments)]
     pub fn delta_scan(
         &self,
         mixed: &Tensor,
         proj: &Tensor,
-        row: usize,
-        tokens: usize,
+        spans: &RecurrentSpans,
         shape: &DeltaShape,
         dt_bias: &Tensor,
         neg_a: &Tensor,
         pool: &Tensor,
-        read: u32,
-        writes: &Slots,
-        out: &Output,
-        out_row: usize,
-    ) -> Result<()> {
+    ) -> Result<Tensor> {
         let mv = self.view(mixed)?;
         let pv = self.view(proj)?;
         let bv = self.view(dt_bias)?;
@@ -674,7 +715,7 @@ impl Kernels {
         let sv = self.view(pool)?;
         let heads = shape.value_heads;
         let (dk, dv) = (shape.key_dim, shape.value_dim);
-        if shape.key_heads == 0 || !heads.is_multiple_of(shape.key_heads) || tokens == 0 {
+        if shape.key_heads == 0 || !heads.is_multiple_of(shape.key_heads) {
             return Err(invalid("value heads must be a multiple of key heads"));
         }
         let name = match dk {
@@ -689,18 +730,16 @@ impl Kernels {
             return Err(invalid("recurrent pool does not match the delta geometry"));
         }
         sv.contiguous("recurrent pool")?;
-        writes.check(sv.rows, read, tokens)?;
+        spans.check(sv.rows, mv.rows)?;
         if mv.cols < shape.channels()
             || shape.b_col + heads > pv.cols
             || shape.a_col + heads > pv.cols
-            || row + tokens > mv.rows
-            || row + tokens > pv.rows
-            || out.cols() != heads * dv
+            || pv.rows != mv.rows
         {
             return Err(invalid("delta scan inputs do not match the delta geometry"));
         }
         let params = ScanParams {
-            tokens: to_u32(tokens, "tokens")?,
+            sequences: to_u32(spans.sequences, "sequences")?,
             heads: to_u32(heads, "heads")?,
             groups: to_u32(heads / shape.key_heads, "head groups")?,
             key_width: to_u32(shape.key_width(), "key width")?,
@@ -710,9 +749,9 @@ impl Kernels {
             proj_stride: to_u32(pv.row_stride, "projection stride")?,
             b_col: to_u32(shape.b_col, "b column")?,
             a_col: to_u32(shape.a_col, "a column")?,
-            every: u32::from(writes.len() > 1),
         };
-        let slots = self.runtime.view(&writes.indices, DType::U32)?;
+        let table = self.runtime.view(&spans.spans, DType::U32)?;
+        let slots = self.runtime.view(&spans.slots, DType::U32)?;
         let pipeline = self.pipeline(name)?;
         // Halve the threadgroup until its padded state tile fits threadgroup memory.
         let tile_bytes =
@@ -727,25 +766,27 @@ impl Kernels {
             return Err(invalid("delta state tile exceeds threadgroup memory"));
         }
         let per_head = dv.div_ceil(SCAN_COLUMNS).div_ceil(simdgroups);
-        self.runtime.dispatch(
-            pipeline,
-            "tur_delta_scan",
-            heads * per_head,
-            simdgroups * 32,
-            |e| {
-                mv.bind_row(e, 0, row)?;
-                pv.bind_row(e, 1, row)?;
+        let groups = spans
+            .sequences
+            .checked_mul(heads * per_head)
+            .ok_or_else(|| invalid("delta scan grid overflow"))?;
+        to_u32(groups, "delta scan threadgroups")?;
+        let out = self.output(mv.rows * heads, dv)?;
+        self.runtime
+            .dispatch(pipeline, "tur_delta_scan", groups, simdgroups * 32, |e| {
+                mv.bind(e, 0)?;
+                pv.bind(e, 1)?;
                 bv.bind(e, 2)?;
                 av.bind(e, 3)?;
-                sv.bind_row(e, 4, read as usize)?;
-                out.bind_rows(e, 5, out_row, tokens)?;
-                sv.bind_mut(e, 6)?;
-                e.set_bytes(7, &params);
+                sv.bind_mut(e, 4)?;
+                out.bind(e, 5);
+                e.set_bytes(6, &params);
+                table.bind(e, 7)?;
                 slots.bind(e, 8)?;
                 e.set_threadgroup_memory_length(0, tile_bytes(simdgroups));
                 Ok(())
-            },
-        )
+            })?;
+        self.finish(out, (mv.rows * heads, dv))
     }
 
     /// Validate and upload paged addressing for `slots` pool rows of `page` tokens.

@@ -87,7 +87,9 @@ fn test_admission_validates_sampling_context_and_limits_without_leaking_slots() 
     let fixture = Checkpoint::new()?;
     assert!(InferencePipeline::new(&fixture.factory(), PipelineConfig::new(0, 2)).is_err());
     assert!(InferencePipeline::new(&fixture.factory(), PipelineConfig::new(1, 0)).is_err());
-    let mut pipeline = InferencePipeline::new(&fixture.factory(), PipelineConfig::new(1, 2))?;
+    let mut config = PipelineConfig::new(1, 2);
+    config.scheduler.max_waiting = 1;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), config)?;
     for limit in [0, 513, usize::MAX] {
         assert!(
             pipeline
@@ -100,7 +102,9 @@ fn test_admission_validates_sampling_context_and_limits_without_leaking_slots() 
     assert!(pipeline.submit_request(&request).is_err());
     request.sampling.top_k = None;
     let id = pipeline.submit_request(&request)?;
+    // The waiting queue holds one request.
     assert!(pipeline.submit_request(&request).is_err());
+    assert_eq!(pipeline.waiting_request_count(), 1);
     pipeline.cancel(id)?;
     assert_eq!(pipeline.active_request_count(), 0);
     assert!(pipeline.cancel(id).is_err());
@@ -212,22 +216,24 @@ fn test_requests_wait_for_pages_and_complete_in_turn() -> Result<()> {
 }
 
 #[test]
-fn test_exhausted_pool_stops_the_newest_request_and_older_ones_finish() -> Result<()> {
+fn test_exhausted_pool_preempts_the_newest_request_and_both_finish() -> Result<()> {
     let fixture = Checkpoint::new()?;
-    // Two pages; both requests start, and each needs a second page at position 16.
+    // Two pages; both requests start, and each needs a second page at position 16. The
+    // newer one is preempted, recomputes after the older finishes, and completes too.
     let mut pipeline = budgeted(&fixture, 2, 2)?;
     let request = GenerationRequest::new("t10 t11 t12 t13 t14".into(), 20);
     let older = pipeline.submit_request(&request)?;
     let newer = pipeline.submit_request(&request)?;
-    let mut results = drain(&mut pipeline)?;
-    assert!(matches!(
-        results.remove(&newer),
-        Some(Err(TurError::MemoryAllocation(_)))
-    ));
-    assert_eq!(
-        results.remove(&older).transpose()?.as_deref(),
-        Some(["t5"; 20].join(" ").as_str())
-    );
+    let mut preempted = std::collections::HashMap::new();
+    while pipeline.active_request_count() > 0 {
+        for (id, result) in pipeline.step_streaming()?.completed {
+            let stats = result?;
+            assert_eq!(stats.generated_text, ["t5"; 20].join(" "));
+            preempted.insert(id, stats.preemptions);
+        }
+    }
+    assert_eq!(preempted.get(&older), Some(&0));
+    assert!(preempted.get(&newer).is_some_and(|&n| n > 0));
     let usage = pipeline.memory()?;
     assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
     Ok(())

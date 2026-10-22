@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 //! Fused Metal execution of the Qwen3.5 hybrid decoder.
 //!
-//! Stateless work (projections, norms, rotary, activations, attention) runs once over the
-//! packed batch. The stateful `DeltaNet` convolution and scan dispatch once per sequence,
-//! reading the committed slot and writing reserved slots of the layer's recurrent pool.
+//! Every layer runs once over the packed batch: projections, norms, rotary, activations,
+//! attention and the stateful `DeltaNet` convolution and scan, which read each sequence's
+//! committed slot and write its reserved slots of the layer's recurrent pool.
 //! Attention stores new keys and values into the persistent page pool (quantizing to its
 //! format) and reads every key in place through one page table shared by all layers; no
 //! committed key is copied.
@@ -13,7 +13,7 @@ use crate::hybrid::PackedForward;
 use candle_core::{DType, Tensor};
 use tur_core::{Result, execution::invalid};
 use tur_metal::{
-    kernels::{DeltaShape, Heads, Kernels, PagedKv, Slots},
+    kernels::{DeltaShape, Heads, Kernels, PagedKv, RecurrentSpan, RecurrentSpans},
     scratch::ScratchPlan,
 };
 
@@ -111,14 +111,20 @@ impl Qwen35 {
             .layers
             .iter()
             .any(|l| matches!(l.mixer, Mixer::Delta(_)));
-        // One upload per sequence serves every recurrent layer: slot ids span all layers.
-        let slots = if has_delta {
-            pass.spans
+        // One upload serves every recurrent layer: slot ids span all layers.
+        let recurrent = if has_delta {
+            let spans: Vec<_> = pass
+                .spans
                 .iter()
-                .map(|span| k.slots(&span.addresses.writes))
-                .collect::<Result<Vec<_>>>()?
+                .map(|span| RecurrentSpan {
+                    tokens: span.len,
+                    read: span.addresses.read,
+                    writes: &span.addresses.writes,
+                })
+                .collect();
+            Some(k.recurrent_spans(&spans)?)
         } else {
-            Vec::new()
+            None
         };
         let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
         let mut x = self.embed.index_select(&ids, 0)?.to_dtype(DType::F32)?;
@@ -135,7 +141,12 @@ impl Qwen35 {
                         .ok_or_else(|| invalid("attention layer without page addressing"))?;
                     self.fused_attention(fused, a, &h, &positions, pass, paging, index)?
                 }
-                Mixer::Delta(net) => self.fused_delta(fused, net, &h, pass, &slots, index)?,
+                Mixer::Delta(net) => {
+                    let spans = recurrent
+                        .as_ref()
+                        .ok_or_else(|| invalid("recurrent layer without slot addressing"))?;
+                    self.fused_delta(fused, net, &h, pass, spans, index)?
+                }
             };
             let (sum, normed) = k.add_rms_norm(&x, &mixed, &layer.post_norm, d.eps)?;
             let act = k.swiglu(&k.linear(&layer.gate_up, &normed)?)?;
@@ -225,47 +236,23 @@ impl Qwen35 {
         net: &DeltaNet,
         h: &Tensor,
         pass: &Pass<'_, '_>,
-        slots: &[Slots],
+        spans: &RecurrentSpans,
         layer: usize,
     ) -> Result<Tensor> {
         let k = &fused.kernels;
         let d = self.dims;
-        let n = h.dim(0)?;
         let pool = pass.pool.recurrent(layer)?;
         let proj = k.linear(&net.proj, h)?;
-        let mixed = k.output(n, d.channels)?;
-        for (span, writes) in pass.spans.iter().zip(slots) {
-            k.delta_conv(
-                &proj,
-                span.start,
-                span.len,
-                &pool.convolution,
-                span.addresses.read,
-                writes,
-                &net.conv,
-                &mixed,
-                span.start,
-            )?;
-        }
-        let mixed = k.finish(mixed, (n, d.channels))?;
-        let core = k.output(n, d.value_width)?;
-        for (span, writes) in pass.spans.iter().zip(slots) {
-            k.delta_scan(
-                &mixed,
-                &proj,
-                span.start,
-                span.len,
-                &fused.delta,
-                &net.dt_bias,
-                &net.neg_a,
-                &pool.state,
-                span.addresses.read,
-                writes,
-                &core,
-                span.start,
-            )?;
-        }
-        let core = k.finish(core, (n * d.value_heads, d.value_dim))?;
+        let mixed = k.delta_conv(&proj, spans, &pool.convolution, &net.conv)?;
+        let core = k.delta_scan(
+            &mixed,
+            &proj,
+            spans,
+            &fused.delta,
+            &net.dt_bias,
+            &net.neg_a,
+            &pool.state,
+        )?;
         let gated = k.gated_rms(&core, &proj, d.channels, d.value_heads, &net.norm, d.eps)?;
         k.linear(&net.out, &gated)
     }

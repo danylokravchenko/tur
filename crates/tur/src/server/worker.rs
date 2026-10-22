@@ -1,13 +1,16 @@
 #![forbid(unsafe_code)]
 //! A dedicated execution owner between async HTTP handlers and hybrid inference.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::{
     ModelFactory, Result, TurError,
-    backend::pipeline::{GenerationRequest, GenerationStats, InferencePipeline, PipelineConfig},
+    backend::{
+        memory::DeviceBudget,
+        pipeline::{GenerationRequest, GenerationStats, InferencePipeline, PipelineConfig},
+    },
 };
 
 /// A validated text conversation and its independent response channels.
@@ -17,11 +20,15 @@ pub struct WorkerMsg {
     pub result_tx: oneshot::Sender<Result<GenerationStats>>,
 }
 
-/// Checkpoint, admission limits and state budget for one worker. Model operations stay on
+/// Checkpoint, scheduling limits and state budget for one worker. Model operations stay on
 /// its OS thread.
 pub struct WorkerConfig {
     pub factory: ModelFactory,
     pub pipeline: PipelineConfig,
+    /// Device memory shared with every other worker on the same device.
+    pub budget: DeviceBudget,
+    /// Deadline for requests that set none.
+    pub request_timeout: Option<Duration>,
 }
 
 struct PendingRequest {
@@ -36,13 +43,15 @@ pub struct PipelineWorker {
 }
 
 fn admit(
-    msg: WorkerMsg,
+    mut msg: WorkerMsg,
     pipeline: &mut InferencePipeline,
     pending: &mut HashMap<Uuid, PendingRequest>,
+    timeout: Option<Duration>,
 ) {
     if msg.result_tx.is_closed() || msg.token_tx.is_closed() {
         return;
     }
+    msg.request.timeout = msg.request.timeout.or(timeout);
     match pipeline.submit_request(&msg.request) {
         Ok(id) => {
             pending.insert(
@@ -62,7 +71,7 @@ fn admit(
 fn serve(
     mut rx: mpsc::Receiver<WorkerMsg>,
     mut pipeline: InferencePipeline,
-    limit: usize,
+    timeout: Option<Duration>,
 ) -> Result<()> {
     let mut pending: HashMap<Uuid, PendingRequest> = HashMap::new();
     loop {
@@ -70,15 +79,12 @@ fn serve(
             let Some(msg) = rx.blocking_recv() else {
                 return Ok(());
             };
-            admit(msg, &mut pipeline, &mut pending);
+            admit(msg, &mut pipeline, &mut pending, timeout);
         }
-        while pending.len() < limit {
-            match rx.try_recv() {
-                Ok(msg) => admit(msg, &mut pipeline, &mut pending),
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                    break;
-                }
-            }
+        // Drain intake every iteration; the pipeline's waiting queue bounds what it accepts
+        // and rejects the rest, so arrivals join the next pass instead of queueing here.
+        while let Ok(msg) = rx.try_recv() {
+            admit(msg, &mut pipeline, &mut pending, timeout);
         }
         let cancelled: Vec<Uuid> = pending
             .iter()
@@ -121,8 +127,12 @@ impl PipelineWorker {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("hybrid-worker".into())
-            .spawn(
-                move || match InferencePipeline::new(&config.factory, config.pipeline) {
+            .spawn(move || {
+                match InferencePipeline::with_budget(
+                    &config.factory,
+                    config.pipeline,
+                    &config.budget,
+                ) {
                     Ok(pipeline) => {
                         let plan = pipeline.memory_plan();
                         tracing::info!(
@@ -136,15 +146,15 @@ impl PipelineWorker {
                         if ready_tx.send(Ok(())).is_err() {
                             return;
                         }
-                        if let Err(error) = serve(rx, pipeline, config.pipeline.max_batch_size) {
+                        if let Err(error) = serve(rx, pipeline, config.request_timeout) {
                             tracing::warn!("Hybrid worker stopped: {error}");
                         }
                     }
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
                     }
-                },
-            )?;
+                }
+            })?;
         ready_rx
             .recv()
             .map_err(|error| TurError::Other(format!("Worker startup failed: {error}")))??;
@@ -185,6 +195,8 @@ mod tests {
                 kv: DEFAULT_KV_LAYOUT,
             },
             pipeline: PipelineConfig::new(1, 64),
+            budget: DeviceBudget::new(None),
+            request_timeout: None,
         });
         assert!(result.is_err());
     }

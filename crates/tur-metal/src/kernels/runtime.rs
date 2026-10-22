@@ -349,7 +349,6 @@ impl Runtime {
         }
         Ok(View {
             offset: layout.start_offset() * size,
-            size,
             guard,
             rows,
             cols,
@@ -377,7 +376,6 @@ impl Runtime {
 pub(super) struct View<'a> {
     guard: RwLockReadGuard<'a, Storage>,
     offset: usize,
-    size: usize,
     pub(super) rows: usize,
     pub(super) cols: usize,
     pub(super) row_stride: usize,
@@ -396,29 +394,8 @@ impl View<'_> {
         self.offset
     }
 
-    /// Byte offset of `row`, checked against the validated row count.
-    pub(super) fn row_offset(&self, row: usize) -> Result<usize> {
-        if row >= self.rows {
-            return Err(invalid("kernel input row out of range"));
-        }
-        row.checked_mul(self.row_stride)
-            .and_then(|e| e.checked_mul(self.size))
-            .and_then(|b| b.checked_add(self.offset))
-            .ok_or_else(|| invalid("kernel input offset overflows"))
-    }
-
     pub(super) fn bind(&self, encoder: &ComputeCommandEncoder, index: usize) -> Result<()> {
         encoder.set_input_buffer(index, Some(self.buffer()?), self.offset);
-        Ok(())
-    }
-
-    pub(super) fn bind_row(
-        &self,
-        encoder: &ComputeCommandEncoder,
-        index: usize,
-        row: usize,
-    ) -> Result<()> {
-        encoder.set_input_buffer(index, Some(self.buffer()?), self.row_offset(row)?);
         Ok(())
     }
 
@@ -447,8 +424,7 @@ impl View<'_> {
     }
 }
 
-/// A kernel output that several dispatches may fill (for example one row range per
-/// sequence) before it becomes a tensor.
+/// A kernel output that one or more dispatches fill before it becomes a tensor.
 pub struct Output {
     buffer: Arc<Buffer>,
     rows: usize,
@@ -470,24 +446,6 @@ impl Output {
 
     pub(super) fn bind(&self, encoder: &ComputeCommandEncoder, index: usize) {
         encoder.set_output_buffer(index, Some(&self.buffer), 0);
-    }
-
-    /// Bind starting at `row`, checking that `count` rows fit.
-    pub(super) fn bind_rows(
-        &self,
-        encoder: &ComputeCommandEncoder,
-        index: usize,
-        row: usize,
-        count: usize,
-    ) -> Result<()> {
-        let end = row
-            .checked_add(count)
-            .ok_or_else(|| invalid("output row overflow"))?;
-        if end > self.rows {
-            return Err(invalid("output rows out of range"));
-        }
-        encoder.set_output_buffer(index, Some(&self.buffer), row * self.cols * 4);
-        Ok(())
     }
 
     /// Wrap as an F32 tensor of `shape`, which must have exactly `rows × cols` elements.

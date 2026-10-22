@@ -15,7 +15,10 @@ use tokio::sync::{mpsc, oneshot};
 use tower::ServiceExt;
 use tur::{
     Result, TurError,
-    backend::pipeline::{GenerationRequest, PipelineConfig},
+    backend::{
+        memory::DeviceBudget,
+        pipeline::{GenerationRequest, PipelineConfig},
+    },
     server::{
         AppState, build_router,
         worker::{PipelineWorker, WorkerConfig, WorkerMsg},
@@ -26,6 +29,8 @@ fn worker(fixture: &common::Checkpoint, batch: usize) -> Result<PipelineWorker> 
     PipelineWorker::spawn(WorkerConfig {
         factory: fixture.factory(),
         pipeline: PipelineConfig::new(batch, 2),
+        budget: DeviceBudget::new(None),
+        request_timeout: None,
     })
 }
 
@@ -178,6 +183,8 @@ async fn test_http_preserves_sampling_thinking_and_tool_history() -> Result<()> 
                 generated_tokens: 0,
                 prompt_tokens: 0,
                 elapsed: Duration::ZERO,
+                first_token: Duration::ZERO,
+                preemptions: 0,
                 generated_text: String::new(),
                 tool_calls: Vec::new(),
                 finish_reason: "stop",

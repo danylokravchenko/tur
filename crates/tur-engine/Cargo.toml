@@ -34,6 +34,11 @@ harness = false
 required-features = ["metal"]
 
 [[bench]]
+name = "serving"
+harness = false
+required-features = ["metal"]
+
+[[bench]]
 name = "kv_quality"
 harness = false
 required-features = ["metal"]

@@ -521,6 +521,28 @@ impl<M: HybridModel> HybridEngine<M> {
         Ok(request.handle)
     }
 
+    /// Drop every layer's state for recompute preemption: the position returns to zero and
+    /// the pages and slot are released, while RNG draws, sampled history and the grammar
+    /// parser are kept, so recomputing the same tokens continues the same sample stream.
+    /// Invalidates every descriptor with the previous revision.
+    pub fn release_state(&mut self, handle: StateHandle) -> Result<StateHandle> {
+        self.request(handle)?;
+        if self.pending_handles.contains(&handle.request) {
+            return Err(invalid("cannot release in-flight request state"));
+        }
+        let revision = handle
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| invalid("request revision overflow"))?;
+        let request = self
+            .requests
+            .get_mut(&handle.request)
+            .ok_or_else(|| invalid("request disappeared"))?;
+        request.snapshot.model = ModelState::new(&self.pool);
+        request.handle.revision = revision;
+        Ok(request.handle)
+    }
+
     /// Cancel immediately; in-flight resources remain retained until completion.
     pub fn cancel(&mut self, handle: StateHandle) -> Result<()> {
         self.request(handle)?;

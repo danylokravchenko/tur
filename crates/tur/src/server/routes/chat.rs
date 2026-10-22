@@ -190,6 +190,7 @@ pub async fn chat_completions(
                 top_k: req.top_k,
             },
             seed: req.seed.unwrap_or(299_792_458),
+            timeout: None,
             render: RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.thinking,

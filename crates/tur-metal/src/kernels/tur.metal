@@ -223,53 +223,69 @@ kernel void gated_rms_f32(
 // ---------------------------------------------------------------------------------------
 
 struct ConvParams {
-    uint tokens;
+    uint rows;
     uint channels;
     uint taps;
     uint x_stride;
+};
+
+// One sequence of a packed pass: its first packed row, token count, committed recurrent
+// slot, offset of its written slots in the pass's slot list, and whether it writes one
+// slot per token. Sequences are consecutive and cover every packed row.
+struct RecurrentSpan {
+    uint row;
+    uint tokens;
+    uint read;
+    uint writes;
     uint every;
 };
 
 static inline float conv_input(
-    device const float *x, device const float *history, uint r, uint c, constant ConvParams &p) {
-    uint kept = p.taps - 1;
+    device const float *x, device const float *history, uint r, uint c, uint kept,
+    constant ConvParams &p) {
     return r < kept ? history[r * p.channels + c] : x[ulong(r - kept) * p.x_stride + c];
 }
 
-// Depthwise causal convolution of one sequence over [history; x], then SiLU. Writes the
-// final (taps-1)-row history into pool slot `slots[0]`, or the history after token t into
-// `slots[t]` when `every` is set. `history` is the committed slot, never a written one.
+// Depthwise causal convolution of every sequence of a packed pass over [history; x], then
+// SiLU. Each sequence writes its final (taps-1)-row history into its first written slot,
+// or the history after token t into its t-th slot when `every` is set. A sequence reads
+// only its committed slot, which no sequence of the pass writes.
 kernel void delta_conv_f32(
     device const float *x [[buffer(0)]],
-    device const float *history [[buffer(1)]],
+    device float *pool [[buffer(1)]],
     device const float *w [[buffer(2)]],
     device float *out [[buffer(3)]],
-    device float *history_out [[buffer(4)]],
-    constant ConvParams &p [[buffer(5)]],
-    device const uint *slots [[buffer(6)]],
+    constant ConvParams &p [[buffer(4)]],
+    device const RecurrentSpan *spans [[buffer(5)]],
+    device const uint *row_span [[buffer(6)]],
+    device const uint *slots [[buffer(7)]],
     uint gid [[thread_position_in_grid]]) {
-    if (gid >= p.tokens * p.channels) {
+    if (gid >= p.rows * p.channels) {
         return;
     }
-    uint t = gid / p.channels;
+    uint row = gid / p.channels;
     uint c = gid % p.channels;
+    RecurrentSpan s = spans[row_span[row]];
+    uint t = row - s.row;
+    uint kept = p.taps - 1;
+    device const float *xs = x + ulong(s.row) * p.x_stride;
+    device const float *history = pool + ulong(s.read) * kept * p.channels;
     device const float *wc = w + ulong(c) * p.taps;
-    float acc = conv_input(x, history, t, c, p) * wc[0];
+    float acc = conv_input(xs, history, t, c, kept, p) * wc[0];
     for (uint j = 1; j < p.taps; ++j) {
-        acc = acc + conv_input(x, history, t + j, c, p) * wc[j];
+        acc = acc + conv_input(xs, history, t + j, c, kept, p) * wc[j];
     }
     out[gid] = silu(acc);
-    if (p.every != 0 || t + 1 == p.tokens) {
-        uint kept = p.taps - 1;
-        ulong base = ulong(slots[p.every != 0 ? t : 0]) * kept * p.channels;
+    if (s.every != 0 || t + 1 == s.tokens) {
+        ulong base = ulong(slots[s.writes + (s.every != 0 ? t : 0)]) * kept * p.channels;
         for (uint r = 0; r < kept; ++r) {
-            history_out[base + ulong(r) * p.channels + c] = conv_input(x, history, t + 1 + r, c, p);
+            pool[base + ulong(r) * p.channels + c] = conv_input(xs, history, t + 1 + r, c, kept, p);
         }
     }
 }
 
 struct ScanParams {
-    uint tokens;
+    uint sequences;
     uint heads;
     uint groups;
     uint key_width;
@@ -279,27 +295,27 @@ struct ScanParams {
     uint proj_stride;
     uint b_col;
     uint a_col;
-    uint every;
 };
 
-// Gated delta rule over one sequence, token by token, with the state held in registers.
-// Each simdgroup owns COLS value columns of one head; lane l holds key rows l + 32r.
+// Gated delta rule over every sequence of a packed pass, token by token, with the state
+// held in registers. Threadgroups cover (sequence, head, column block); each simdgroup
+// owns COLS value columns of one head and lane l holds key rows l + 32r.
 // Per token: L2-normalise q/k, decay the state, read the prediction, write the
 // beta-scaled correction and read the output with the query.
 //
-// Threadgroups cover consecutive column groups of one head. The [dk, dv] state is read
-// and written through a padded threadgroup tile so device accesses are contiguous rows of
-// the threadgroup's columns; lane-owned rows alone would touch 16 bytes per cache line.
+// The [dk, dv] state is read and written through a padded threadgroup tile so device
+// accesses are contiguous rows of the threadgroup's columns; lane-owned rows alone would
+// touch 16 bytes per cache line.
 template <uint R, uint COLS>
 kernel void delta_scan_f32(
     device const float *mixed [[buffer(0)]],
     device const float *proj [[buffer(1)]],
     device const float *dt_bias [[buffer(2)]],
     device const float *neg_a [[buffer(3)]],
-    device const float *state_in [[buffer(4)]],
+    device float *pool [[buffer(4)]],
     device float *out [[buffer(5)]],
-    device float *state_out [[buffer(6)]],
-    constant ScanParams &p [[buffer(7)]],
+    constant ScanParams &p [[buffer(6)]],
+    device const RecurrentSpan *spans [[buffer(7)]],
     device const uint *slots [[buffer(8)]],
     threadgroup float *tile [[threadgroup(0)]],
     uint tg [[threadgroup_position_in_grid]],
@@ -313,19 +329,27 @@ kernel void delta_scan_f32(
     uint column_groups = (dv + COLS - 1) / COLS;
     uint groups_per_tg = sgs;
     uint tgs_per_head = (column_groups + groups_per_tg - 1) / groups_per_tg;
-    uint h = tg / tgs_per_head;
-    if (h >= p.heads) {
+    uint tgs_per_sequence = p.heads * tgs_per_head;
+    uint sequence = tg / tgs_per_sequence;
+    if (sequence >= p.sequences) {
         return;
     }
+    RecurrentSpan s = spans[sequence];
+    uint local = tg % tgs_per_sequence;
+    uint h = local / tgs_per_head;
+    uint block = local % tgs_per_head;
     uint tile_cols = groups_per_tg * COLS;
     uint pitch = tile_cols + 1;
-    uint tile_col0 = (tg % tgs_per_head) * tile_cols;
-    uint cg = (tg % tgs_per_head) * groups_per_tg + sg;
+    uint tile_col0 = block * tile_cols;
+    uint cg = block * groups_per_tg + sg;
     bool active = cg < column_groups;
     uint col0 = cg * COLS;
     uint kh = h / p.groups;
     ulong head_state = ulong(h) * dk * dv;
     ulong state_size = ulong(p.heads) * dk * dv;
+    device const float *rows = mixed + ulong(s.row) * p.mixed_stride;
+    device const float *gates = proj + ulong(s.row) * p.proj_stride;
+    device const float *state_in = pool + ulong(s.read) * state_size;
 
     for (uint idx = tid; idx < dk * tile_cols; idx += threads) {
         uint i = idx / tile_cols;
@@ -351,18 +375,16 @@ kernel void delta_scan_f32(
 
         // Software pipelining: inputs for token t + 1 load while token t updates the state.
         float q_next[R], k_next[R], v_next[COLS], a_next = 0.0f, b_next = 0.0f;
-        if (p.tokens > 0) {
-            for (uint r = 0; r < R; ++r) {
-                q_next[r] = mixed[q_col + lane + SIMD * r];
-                k_next[r] = mixed[k_col + lane + SIMD * r];
-            }
-            for (uint c = 0; c < COLS; ++c) {
-                v_next[c] = col0 + c < dv ? mixed[v_col + c] : 0.0f;
-            }
-            a_next = proj[p.a_col + h];
-            b_next = proj[p.b_col + h];
+        for (uint r = 0; r < R; ++r) {
+            q_next[r] = rows[q_col + lane + SIMD * r];
+            k_next[r] = rows[k_col + lane + SIMD * r];
         }
-        for (uint t = 0; t < p.tokens; ++t) {
+        for (uint c = 0; c < COLS; ++c) {
+            v_next[c] = col0 + c < dv ? rows[v_col + c] : 0.0f;
+        }
+        a_next = gates[p.a_col + h];
+        b_next = gates[p.b_col + h];
+        for (uint t = 0; t < s.tokens; ++t) {
             float q[R], k[R], v[COLS];
             float qs = 0.0f, ks = 0.0f;
             for (uint r = 0; r < R; ++r) {
@@ -376,8 +398,8 @@ kernel void delta_scan_f32(
             }
             float a = a_next;
             float b = b_next;
-            if (t + 1 < p.tokens) {
-                device const float *row = mixed + ulong(t + 1) * p.mixed_stride;
+            if (t + 1 < s.tokens) {
+                device const float *row = rows + ulong(t + 1) * p.mixed_stride;
                 for (uint r = 0; r < R; ++r) {
                     q_next[r] = row[q_col + lane + SIMD * r];
                     k_next[r] = row[k_col + lane + SIMD * r];
@@ -385,7 +407,7 @@ kernel void delta_scan_f32(
                 for (uint c = 0; c < COLS; ++c) {
                     v_next[c] = col0 + c < dv ? row[v_col + c] : 0.0f;
                 }
-                device const float *pr = proj + ulong(t + 1) * p.proj_stride;
+                device const float *pr = gates + ulong(t + 1) * p.proj_stride;
                 a_next = pr[p.a_col + h];
                 b_next = pr[p.b_col + h];
             }
@@ -416,26 +438,26 @@ kernel void delta_scan_f32(
                 }
                 output[c] = simd_sum(acc);
             }
-            device float *o = out + (ulong(t) * p.heads + h) * dv + col0;
+            device float *o = out + (ulong(s.row + t) * p.heads + h) * dv + col0;
             for (uint c = 0; c < COLS; ++c) {
                 if (lane == c && col0 + c < dv) {
                     o[c] = output[c];
                 }
             }
             // Per-token states serve speculative verification only; they skip staging.
-            if (p.every != 0) {
-                device float *s = state_out + ulong(slots[t]) * state_size + head_state;
+            if (s.every != 0) {
+                device float *st = pool + ulong(slots[s.writes + t]) * state_size + head_state;
                 for (uint r = 0; r < R; ++r) {
                     for (uint c = 0; c < COLS; ++c) {
                         if (col0 + c < dv) {
-                            s[ulong(lane + SIMD * r) * dv + col0 + c] = state[r][c];
+                            st[ulong(lane + SIMD * r) * dv + col0 + c] = state[r][c];
                         }
                     }
                 }
             }
         }
     }
-    if (p.every != 0) {
+    if (s.every != 0) {
         return;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -445,7 +467,7 @@ kernel void delta_scan_f32(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    device float *final_state = state_out + ulong(slots[0]) * state_size + head_state;
+    device float *final_state = pool + ulong(slots[s.writes]) * state_size + head_state;
     for (uint idx = tid; idx < dk * tile_cols; idx += threads) {
         uint i = idx / tile_cols;
         uint c = idx % tile_cols;
@@ -459,7 +481,7 @@ kernel void delta_scan_f32(
 #define SCAN(R) \
     template [[host_name("delta_scan_r" #R "_f32")]] kernel void delta_scan_f32<R, 4>( \
         device const float *, device const float *, device const float *, device const float *, \
-        device const float *, device float *, device float *, constant ScanParams &, \
+        device float *, device float *, constant ScanParams &, device const RecurrentSpan *, \
         device const uint *, threadgroup float *, uint, uint, uint, uint, uint, uint);
 SCAN(2)
 SCAN(4)

@@ -28,29 +28,60 @@ impl Drop for Checkpoint {
     }
 }
 
+/// Deterministic values in `(-scale, scale)`.
+fn values(count: usize, seed: u64, scale: f32) -> Vec<f32> {
+    let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+    (0..count)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32).mul_add(2.0, -1.0) * scale
+        })
+        .collect()
+}
+
 impl Checkpoint {
     /// With zero decoder updates and tied embeddings, token 5 is the unique greedy winner.
     pub fn new() -> Result<Self> {
-        let dir = std::env::temp_dir().join(format!("tur-adapter-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir)?;
-        let fixture = Self(dir);
-        std::fs::write(fixture.0.join("config.json"), TINY)?;
-        let config = Config::from_json(TINY)?;
-        let mut weights = HashMap::new();
-        for (name, shape) in config.weight_shapes()? {
-            let mut values = vec![0f32; shape.iter().product()];
+        Self::write(TINY, |name, count, _| {
+            let mut values = vec![0f32; count];
             if name.ends_with("embed_tokens.weight") {
                 values.fill(1.0);
                 for value in values.iter_mut().skip(5 * 64).take(64) {
                     *value = 2.0;
                 }
             }
-            weights.insert(
+            values
+        })
+    }
+
+    /// Random weights without modality placeholders: every output depends on the whole
+    /// context and on the request's own recurrent and attention state, so leaked or
+    /// misplaced state changes generated text.
+    pub fn random() -> Result<Self> {
+        let config = TINY.replace(r#", "image_token_id": 94"#, "");
+        Self::write(&config, |name, count, seed| {
+            let scale = if name.contains("norm") { 0.1 } else { 0.5 };
+            values(count, seed, scale)
+        })
+    }
+
+    fn write(config: &str, weights: impl Fn(&str, usize, u64) -> Vec<f32>) -> Result<Self> {
+        let dir = std::env::temp_dir().join(format!("tur-adapter-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let fixture = Self(dir);
+        std::fs::write(fixture.0.join("config.json"), config)?;
+        let parsed = Config::from_json(config)?;
+        let mut tensors = HashMap::new();
+        for (seed, (name, shape)) in parsed.weight_shapes()?.into_iter().enumerate() {
+            let values = weights(&name, shape.iter().product(), seed as u64 + 1);
+            tensors.insert(
                 name,
                 Tensor::from_vec(values, shape, &Device::Cpu)?.to_dtype(DType::BF16)?,
             );
         }
-        candle_core::safetensors::save(&weights, fixture.0.join("model.safetensors"))?;
+        candle_core::safetensors::save(&tensors, fixture.0.join("model.safetensors"))?;
         let wordlevel = WordLevel::builder()
             .vocab((0..96u32).map(|id| (format!("t{id}"), id)).collect())
             .unk_token("t0".into())

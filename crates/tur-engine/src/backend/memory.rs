@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 //! Resident memory planning for one model on one device.
 
+use candle_core::Device;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use tur_core::{
     Result, TurError,
     execution::{ModelDescription, invalid},
 };
-use tur_metal::pool::PoolConfig;
+use tur_metal::pool::{PoolConfig, working_set_bytes};
 
 /// Context each concurrent sequence is sized for when no state budget is given.
 pub const DEFAULT_CONTEXT_TOKENS: usize = 8192;
@@ -32,6 +37,8 @@ pub struct MemoryPlan {
     pub overhead: usize,
     /// Device limit the plan fits in, if the device reports one.
     pub limit: Option<usize>,
+    /// Bytes other resident models had leased from the device budget when planning.
+    pub reserved: usize,
 }
 
 /// What the plan must hold besides the state pool.
@@ -47,6 +54,8 @@ pub struct PlanInputs {
     pub state_bytes: Option<usize>,
     /// The device's recommended working set.
     pub limit: Option<usize>,
+    /// Bytes already leased by other models on the device.
+    pub reserved: usize,
 }
 
 impl MemoryPlan {
@@ -59,8 +68,9 @@ impl MemoryPlan {
             .saturating_add(self.overhead)
     }
 
-    /// Size the state pool and check the plan against the device limit. An explicit budget
-    /// that would exceed the limit is rejected rather than left to swap.
+    /// Size the state pool and check the plan, beside memory other models reserved, against
+    /// the device limit. An explicit budget that would exceed the limit is rejected rather
+    /// than left to swap.
     pub fn new(description: &ModelDescription, inputs: PlanInputs) -> Result<(Self, PoolConfig)> {
         let overhead = inputs.limit.map_or(0, |limit| limit / 10);
         let fixed = inputs
@@ -68,6 +78,7 @@ impl MemoryPlan {
             .checked_add(inputs.scratch_peak)
             .and_then(|b| b.checked_add(inputs.in_flight))
             .and_then(|b| b.checked_add(overhead))
+            .and_then(|b| b.checked_add(inputs.reserved))
             .ok_or_else(|| invalid("memory plan overflow"))?;
         let available = inputs.limit.map(|limit| limit.saturating_sub(fixed));
         let bytes = if let Some(bytes) = inputs.state_bytes {
@@ -95,19 +106,99 @@ impl MemoryPlan {
             in_flight: inputs.in_flight,
             overhead,
             limit: inputs.limit,
+            reserved: inputs.reserved,
         };
         if let Some(limit) = inputs.limit
-            && plan.resident() > limit
+            && plan.resident().saturating_add(plan.reserved) > limit
         {
             return Err(TurError::MemoryAllocation(format!(
-                "planned resident memory {} bytes exceeds the device working set of {limit} \
-                 bytes (state pool {}, weights {})",
+                "planned resident memory {} bytes beside {} bytes of other models exceeds the \
+                 device working set of {limit} bytes (state pool {}, weights {})",
                 plan.resident(),
+                plan.reserved,
                 plan.state_pool,
                 plan.weights
             )));
         }
         Ok((plan, config))
+    }
+}
+
+#[derive(Debug)]
+struct Ledger {
+    limit: Option<usize>,
+    leased: AtomicUsize,
+}
+
+/// Device memory shared by every model resident on one device. Each pipeline plans
+/// against what the others left and leases its planned resident bytes, so two models
+/// cannot both promise the same free memory. Cloning shares the budget.
+#[derive(Clone, Debug)]
+pub struct DeviceBudget(Arc<Ledger>);
+
+/// Bytes leased from a [`DeviceBudget`], returned when dropped.
+#[derive(Debug)]
+pub struct BudgetLease {
+    ledger: Arc<Ledger>,
+    bytes: usize,
+}
+
+impl Drop for BudgetLease {
+    fn drop(&mut self) {
+        self.ledger.leased.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+impl BudgetLease {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl DeviceBudget {
+    /// A budget of `limit` bytes; `None` is unbounded (the CPU reference).
+    pub fn new(limit: Option<usize>) -> Self {
+        Self(Arc::new(Ledger {
+            limit,
+            leased: AtomicUsize::new(0),
+        }))
+    }
+
+    /// The device's recommended working set.
+    pub fn for_device(device: &Device) -> Self {
+        Self::new(working_set_bytes(device))
+    }
+
+    pub fn limit(&self) -> Option<usize> {
+        self.0.limit
+    }
+
+    /// Bytes currently leased by resident models.
+    pub fn leased(&self) -> usize {
+        self.0.leased.load(Ordering::Relaxed)
+    }
+
+    /// Lease `bytes`, or fail without leasing if they exceed what remains. The counter
+    /// guards no other data, so relaxed ordering suffices.
+    pub fn lease(&self, bytes: usize) -> Result<BudgetLease> {
+        let limit = self.0.limit;
+        self.0
+            .leased
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |leased| {
+                leased
+                    .checked_add(bytes)
+                    .filter(|total| limit.is_none_or(|limit| *total <= limit))
+            })
+            .map_err(|leased| {
+                TurError::MemoryAllocation(format!(
+                    "{bytes} bytes exceed the {} bytes left of the device budget",
+                    limit.map_or(0, |limit| limit.saturating_sub(leased))
+                ))
+            })?;
+        Ok(BudgetLease {
+            ledger: Arc::clone(&self.0),
+            bytes,
+        })
     }
 }
 
@@ -156,6 +247,7 @@ mod tests {
             sequences: 2,
             state_bytes,
             limit,
+            reserved: 0,
         }
     }
 
@@ -214,5 +306,77 @@ mod tests {
         overflow.sequences = usize::MAX;
         assert!(MemoryPlan::new(&model, overflow).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn test_models_sharing_a_device_budget_cannot_overcommit() -> Result<()> {
+        let model = description();
+        let page = model.page_bytes()?;
+        let slot = model.recurrent_slot_bytes()?;
+        let limit = (1600 + 20 * page + 5 * slot) * 10 / 9;
+        let budget = DeviceBudget::new(Some(limit));
+        // The first model sizes its pool into the whole budget and leases it.
+        let (first, _) = MemoryPlan::new(
+            &model,
+            PlanInputs {
+                reserved: budget.leased(),
+                ..inputs(None, budget.limit())
+            },
+        )?;
+        let lease = budget.lease(first.resident())?;
+        // A second plan sees what is left: too little for its fixed allocations.
+        assert!(matches!(
+            MemoryPlan::new(
+                &model,
+                PlanInputs {
+                    reserved: budget.leased(),
+                    ..inputs(None, budget.limit())
+                },
+            ),
+            Err(TurError::MemoryAllocation(_))
+        ));
+        assert!(budget.lease(limit - lease.bytes() + 1).is_err());
+        assert_eq!(budget.leased(), lease.bytes());
+        // Unloading the first model returns its memory.
+        drop(lease);
+        assert_eq!(budget.leased(), 0);
+        let (second, _) = MemoryPlan::new(
+            &model,
+            PlanInputs {
+                reserved: budget.leased(),
+                ..inputs(None, budget.limit())
+            },
+        )?;
+        assert_eq!(second, first);
+        let unbounded = DeviceBudget::new(None);
+        assert!(unbounded.lease(usize::MAX).is_ok());
+        assert!(unbounded.lease(usize::MAX).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn test_concurrent_leases_never_exceed_the_limit() {
+        let budget = DeviceBudget::new(Some(1000));
+        let leases: Vec<BudgetLease> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let budget = budget.clone();
+                    scope.spawn(move || {
+                        (0..100)
+                            .filter_map(|_| budget.lease(7).ok())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .filter_map(|w| w.join().ok())
+                .flatten()
+                .collect()
+        });
+        assert_eq!(leases.len(), 142);
+        assert_eq!(budget.leased(), 994);
+        drop(leases);
+        assert_eq!(budget.leased(), 0);
     }
 }

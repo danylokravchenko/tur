@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 use clap::Parser;
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration};
 use tur::{
     ModelFactory, ModelSource, Result, TurError,
-    backend::pipeline::PipelineConfig,
+    backend::{memory::DeviceBudget, pipeline::PipelineConfig},
     core::execution::{KvFormat, KvLayout},
     models::qwen3_5::{DEFAULT_KV_LAYOUT, WeightFormat},
     server::{
@@ -43,10 +43,24 @@ struct Args {
     host: String,
     #[arg(long, default_value_t = 8080)]
     port: u16,
+    /// Requests holding model state at once.
     #[arg(long, default_value_t = 8)]
     max_batch_size: usize,
+    /// Largest prefill chunk of one request in one pass.
     #[arg(long, default_value_t = 256)]
     prefill_chunk_size: usize,
+    /// Tokens in one packed pass. Default: one prefill chunk beside every decode.
+    #[arg(long)]
+    max_batch_tokens: Option<usize>,
+    /// Requests queued for admission before new ones are rejected.
+    #[arg(long, default_value_t = 256)]
+    max_waiting: usize,
+    /// Pass duration the adaptive prefill budget aims for, in milliseconds.
+    #[arg(long, default_value_t = 60)]
+    target_pass_ms: u64,
+    /// Fail requests not finished this many seconds after arrival.
+    #[arg(long)]
+    request_timeout_secs: Option<u64>,
     /// K/V storage: f32, f16, q8 (one scale per 32 dimensions, half of F16's memory) or
     /// q8_<group>.
     #[arg(long, default_value_t = DEFAULT_KV_LAYOUT.format)]
@@ -84,19 +98,27 @@ async fn main() -> Result<()> {
             ));
         }
     };
+    let mut pipeline = PipelineConfig {
+        state_bytes: args.state_memory_mb.map(|mb| mb << 20),
+        ..PipelineConfig::new(args.max_batch_size, args.prefill_chunk_size)
+    };
+    let scheduler = &mut pipeline.scheduler;
+    scheduler.max_batch_tokens = args.max_batch_tokens.unwrap_or(scheduler.max_batch_tokens);
+    scheduler.max_waiting = args.max_waiting;
+    scheduler.target_pass = Duration::from_millis(args.target_pass_ms);
+    let device = tur::shared::inference_device(args.cpu_reference)?;
     // Load before binding the listener so readiness means a validated, usable checkpoint.
     let worker = PipelineWorker::spawn(WorkerConfig {
+        budget: DeviceBudget::for_device(&device),
         factory: ModelFactory {
             source,
             revision: args.revision,
             format: args.weight_format,
-            device: tur::shared::inference_device(args.cpu_reference)?,
+            device,
             kv: KvLayout::new(args.kv_page_tokens, args.kv_format),
         },
-        pipeline: PipelineConfig {
-            state_bytes: args.state_memory_mb.map(|mb| mb << 20),
-            ..PipelineConfig::new(args.max_batch_size, args.prefill_chunk_size)
-        },
+        pipeline,
+        request_timeout: args.request_timeout_secs.map(Duration::from_secs),
     })?;
     let default_model = args.served_model_name;
     let workers = HashMap::from([(default_model.clone(), worker)]);

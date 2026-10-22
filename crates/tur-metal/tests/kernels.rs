@@ -19,7 +19,7 @@ use candle_core::{
 use tur_core::{Result, execution::KvFormat};
 use tur_metal::{
     completion::{Completion, Quarantine},
-    kernels::{DeltaShape, Heads, Kernels, Tuning},
+    kernels::{DeltaShape, Heads, Kernels, RecurrentSpan, Tuning},
     packed::PackedLinear,
     pool::{AttentionPool, KvPool, dequantize, quantize},
 };
@@ -247,55 +247,79 @@ fn test_swiglu_and_gated_rms_match_reference() -> Result<()> {
     Ok(())
 }
 
-/// A `[slots, rest..]` pool poisoned with NaN except slot `read`, which holds `initial`.
-fn slot_pool(
+/// Sequences of one packed recurrent test pass: (tokens, committed slot, written slots).
+type Ragged = [(usize, u32, Vec<u32>)];
+
+fn spans(ragged: &Ragged) -> Vec<RecurrentSpan<'_>> {
+    ragged
+        .iter()
+        .map(|(tokens, read, writes)| RecurrentSpan {
+            tokens: *tokens,
+            read: *read,
+            writes,
+        })
+        .collect()
+}
+
+/// A `[slots, rest..]` pool poisoned with NaN except each committed slot, which holds the
+/// state generated from its slot id.
+fn committed_pool(
     device: &Device,
     slots: usize,
     rest: &[usize],
-    read: usize,
-    initial: &[f32],
-) -> Result<Tensor> {
+    ragged: &Ragged,
+    scale: f32,
+) -> Result<(Tensor, Vec<Vec<f32>>)> {
     let size: usize = rest.iter().product();
     let mut data = vec![f32::NAN; slots * size];
-    data[read * size..(read + 1) * size].copy_from_slice(initial);
+    let initial: Vec<Vec<f32>> = (0..slots)
+        .map(|slot| values(size, 40 + slot as u64, scale))
+        .collect();
+    for (_, read, _) in ragged {
+        let read = *read as usize;
+        data[read * size..(read + 1) * size].copy_from_slice(&initial[read]);
+    }
     let mut shape = vec![slots];
     shape.extend_from_slice(rest);
-    upload(device, &data, &shape)
+    Ok((upload(device, &data, &shape)?, initial))
 }
 
 #[test]
-fn test_delta_conv_writes_offset_rows_and_slot_histories() -> Result<()> {
+fn test_delta_conv_runs_ragged_sequences_in_one_dispatch() -> Result<()> {
     let (device, kernels, _gpu) = setup()?;
-    let (rows, cols, channels, taps) = (7, 42, 37, 4);
-    let (row, tokens, out_row, committed) = (2, 4, 3, 2usize);
+    let (cols, channels, taps) = (42, 37, 4);
+    // Mixed decode, prefill and speculative sequences; two forks share committed slot 2.
+    let ragged: Vec<(usize, u32, Vec<u32>)> = vec![
+        (1, 2, vec![5]),
+        (4, 0, vec![9, 6, 8, 1]),
+        (3, 2, vec![7]),
+        (1, 3, vec![4]),
+    ];
+    let rows: usize = ragged.iter().map(|(tokens, _, _)| tokens).sum();
     let x = values(rows * cols, 12, 2.0);
-    let history = values((taps - 1) * channels, 13, 2.0);
     let weight = values(channels * taps, 14, 1.0);
-    let full = |r: usize, c: usize| -> f32 {
-        if r < taps - 1 {
-            history[r * channels + c]
-        } else {
-            x[(row + r - (taps - 1)) * cols + c]
-        }
-    };
-    for writes in [vec![5u32], vec![5, 0, 4, 1]] {
-        let pool = slot_pool(&device, 6, &[taps - 1, channels], committed, &history)?;
-        let out = kernels.output(10, channels)?;
-        kernels.delta_conv(
-            &upload(&device, &x, &[rows, cols])?,
-            row,
-            tokens,
-            &pool,
-            committed as u32,
-            &kernels.slots(&writes)?,
-            &upload(&device, &weight, &[channels, taps])?,
-            &out,
-            out_row,
-        )?;
-        let out = kernels.finish(out, (10, channels))?;
-        let actual = read(&out.narrow(0, out_row, tokens)?)?;
-        let mut expected = Vec::new();
-        for t in 0..tokens {
+    let (pool, initial) = committed_pool(&device, 10, &[taps - 1, channels], &ragged, 2.0)?;
+    let spans = kernels.recurrent_spans(&spans(&ragged))?;
+    assert_eq!((spans.sequences(), spans.tokens()), (4, rows));
+    let out = kernels.delta_conv(
+        &upload(&device, &x, &[rows, cols])?,
+        &spans,
+        &pool,
+        &upload(&device, &weight, &[channels, taps])?,
+    )?;
+    let actual = read(&out)?;
+    let mut expected = Vec::new();
+    let mut row = 0;
+    for (tokens, slot, writes) in &ragged {
+        let history = &initial[*slot as usize];
+        let full = |r: usize, c: usize| -> f32 {
+            if r < taps - 1 {
+                history[r * channels + c]
+            } else {
+                x[(row + r - (taps - 1)) * cols + c]
+            }
+        };
+        for t in 0..*tokens {
             for c in 0..channels {
                 let acc: f64 = (0..taps)
                     .map(|j| f64::from(full(t + j, c)) * f64::from(weight[c * taps + j]))
@@ -303,9 +327,8 @@ fn test_delta_conv_writes_offset_rows_and_slot_histories() -> Result<()> {
                 expected.push(silu(acc));
             }
         }
-        assert!(relative_error(&actual, &expected) < 1e-6);
         let kept: Vec<usize> = if writes.len() > 1 {
-            (0..tokens).collect()
+            (0..*tokens).collect()
         } else {
             vec![tokens - 1]
         };
@@ -319,9 +342,13 @@ fn test_delta_conv_writes_offset_rows_and_slot_histories() -> Result<()> {
                 0.0
             );
         }
-        // The committed slot is untouched and unwritten slots keep their poison.
-        assert_eq!(read(&pool.get(committed)?)?, history);
-        assert!(read(&pool.get(3)?)?.iter().all(|v| v.is_nan()));
+        row += tokens;
+    }
+    assert_eq!(out.dims(), [rows, channels]);
+    assert!(relative_error(&actual, &expected) < 1e-6);
+    // Committed slots are untouched.
+    for slot in [0, 2, 3] {
+        assert_eq!(read(&pool.get(slot)?)?, initial[slot]);
     }
     Ok(())
 }
@@ -387,9 +414,9 @@ fn scan_reference(
 }
 
 #[test]
-fn test_delta_scan_matches_scalar_recurrence() -> Result<()> {
+fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<()> {
     let (device, kernels, _gpu) = setup()?;
-    for (dk, tokens) in [(64usize, 1usize), (128, 5), (128, 70), (256, 3)] {
+    for dk in [64usize, 128, 256] {
         let shape = DeltaShape {
             key_heads: 2,
             value_heads: 4,
@@ -403,50 +430,44 @@ fn test_delta_scan_matches_scalar_recurrence() -> Result<()> {
             mixed_cols: shape.channels() + 3,
             proj_cols: 12,
         };
-        let (row, rows) = (1, tokens + 2);
+        // A long prefill, decodes forked from one slot and a speculative sequence.
+        let ragged: Vec<(usize, u32, Vec<u32>)> = vec![
+            (70, 1, vec![0]),
+            (1, 3, vec![2]),
+            (5, 4, (5..10).rev().collect()),
+            (1, 3, vec![10]),
+        ];
+        let rows: usize = ragged.iter().map(|(tokens, _, _)| tokens).sum();
         let mixed = values(rows * case.mixed_cols, 15, 1.0);
         let proj = values(rows * case.proj_cols, 16, 3.0);
         let dt_bias = values(4, 17, 1.0);
         let neg_a: Vec<f32> = values(4, 18, 1.0).iter().map(|v| -v.abs() - 0.1).collect();
-        let initial = values(4 * dk * 22, 19, 0.1);
-        let (expected_out, expected_states) = scan_reference(
-            &case,
-            &mixed,
-            &proj,
-            row..row + tokens,
-            &dt_bias,
-            &neg_a,
-            &initial,
-        );
-        let read_slot = tokens + 1;
-        for every in [false, true] {
-            let slots = tokens + 2;
-            let pool = slot_pool(&device, slots, &[4, dk, 22], read_slot, &initial)?;
-            // Writes in reverse slot order, skipping the committed slot.
-            let writes: Vec<u32> = if every {
-                (0..tokens as u32).rev().collect()
-            } else {
-                vec![0]
-            };
-            let out = kernels.output(tokens + 1, 4 * 22)?;
-            kernels.delta_scan(
-                &upload(&device, &mixed, &[rows, case.mixed_cols])?,
-                &upload(&device, &proj, &[rows, case.proj_cols])?,
-                row,
-                tokens,
-                &shape,
-                &upload(&device, &dt_bias, &[4])?,
-                &upload(&device, &neg_a, &[4])?,
-                &pool,
-                read_slot as u32,
-                &kernels.slots(&writes)?,
-                &out,
-                1,
-            )?;
-            let out = kernels.finish(out, (tokens + 1, 4 * 22))?;
-            let error = relative_error(&read(&out.narrow(0, 1, tokens)?)?, &expected_out);
+        let (pool, initial) = committed_pool(&device, 12, &[4, dk, 22], &ragged, 0.1)?;
+        let out = kernels.delta_scan(
+            &upload(&device, &mixed, &[rows, case.mixed_cols])?,
+            &upload(&device, &proj, &[rows, case.proj_cols])?,
+            &kernels.recurrent_spans(&spans(&ragged))?,
+            &shape,
+            &upload(&device, &dt_bias, &[4])?,
+            &upload(&device, &neg_a, &[4])?,
+            &pool,
+        )?;
+        assert_eq!(out.dims(), [rows * 4, 22]);
+        let mut row = 0;
+        for (tokens, slot, writes) in &ragged {
+            let (expected_out, expected_states) = scan_reference(
+                &case,
+                &mixed,
+                &proj,
+                row..row + tokens,
+                &dt_bias,
+                &neg_a,
+                &initial[*slot as usize],
+            );
+            let actual = read(&out.narrow(0, row * 4, tokens * 4)?)?;
+            let error = relative_error(&actual, &expected_out);
             assert!(error < 1e-5, "dk {dk} tokens {tokens}: output {error}");
-            let boundaries: Vec<&Vec<f64>> = if every {
+            let boundaries: Vec<&Vec<f64>> = if writes.len() > 1 {
                 expected_states.iter().collect()
             } else {
                 expected_states.last().into_iter().collect()
@@ -455,9 +476,10 @@ fn test_delta_scan_matches_scalar_recurrence() -> Result<()> {
                 let error = relative_error(&read(&pool.get(slot as usize)?)?, expected);
                 assert!(error < 1e-5, "dk {dk} tokens {tokens}: state {error}");
             }
-            assert_eq!(read(&pool.get(read_slot)?)?, initial);
-            assert!(read(&pool.get(tokens)?)?.iter().all(|v| v.is_nan()));
+            assert_eq!(read(&pool.get(*slot as usize)?)?, initial[*slot as usize]);
+            row += tokens;
         }
+        assert!(read(&pool.get(11)?)?.iter().all(|v| v.is_nan()));
     }
     Ok(())
 }
@@ -998,55 +1020,72 @@ fn test_invalid_inputs_are_rejected_before_encoding() -> Result<()> {
         b_col: 0,
         a_col: 1,
     };
-    let mixed = Tensor::ones((1, 200), DType::F32, &device)?;
+    let mixed = Tensor::ones((2, 200), DType::F32, &device)?;
     let ones = Tensor::ones(1, DType::F32, &device)?;
-    let state = Tensor::zeros((3, 1, 96, 4), DType::F32, &device)?;
-    let out = kernels.output(1, 4)?;
-    let scan = |shape: &DeltaShape, read: u32, writes: &[u32]| {
-        kernels.delta_scan(
-            &mixed,
-            &mixed,
-            0,
-            1,
-            shape,
-            &ones,
-            &ones,
-            &state,
-            read,
-            &kernels.slots(writes)?,
-            &out,
-            0,
-        )
+    let span = |tokens: usize, read: u32, writes: &'static [u32]| RecurrentSpan {
+        tokens,
+        read,
+        writes,
     };
-    // Unsupported key dim, then slot misuse at a supported one.
-    assert!(scan(&shape, 0, &[1]).is_err());
+    let state = Tensor::zeros((3, 1, 96, 4), DType::F32, &device)?;
+    let decodes = kernels.recurrent_spans(&[span(1, 0, &[1]), span(1, 0, &[2])])?;
+    // Unsupported key dim, then addressing misuse at a supported one.
+    assert!(
+        kernels
+            .delta_scan(&mixed, &mixed, &decodes, &shape, &ones, &ones, &state)
+            .is_err()
+    );
     let supported = DeltaShape {
         key_dim: 64,
         ..shape
     };
     let state = Tensor::zeros((3, 1, 64, 4), DType::F32, &device)?;
-    let scan = |read: u32, writes: &[u32]| {
+    let scan = |spans: &[RecurrentSpan<'_>]| {
         kernels.delta_scan(
             &mixed,
             &mixed,
-            0,
-            1,
+            &kernels.recurrent_spans(spans)?,
             &supported,
             &ones,
             &ones,
             &state,
-            read,
-            &kernels.slots(writes)?,
-            &out,
-            0,
         )
     };
-    assert!(scan(0, &[1]).is_ok());
-    assert!(scan(1, &[1]).is_err(), "writing the committed slot");
-    assert!(scan(0, &[3]).is_err(), "slot outside the pool");
-    assert!(scan(3, &[1]).is_err(), "read outside the pool");
-    assert!(scan(0, &[1, 2]).is_err(), "two boundaries for one token");
-    assert!(kernels.slots(&[]).is_err());
+    assert!(scan(&[span(1, 0, &[1]), span(1, 0, &[2])]).is_ok());
+    assert!(scan(&[span(2, 0, &[1])]).is_ok());
+    assert!(
+        scan(&[span(1, 1, &[1]), span(1, 0, &[2])]).is_err(),
+        "writing its committed slot"
+    );
+    assert!(
+        scan(&[span(1, 2, &[1]), span(1, 0, &[2])]).is_err(),
+        "writing another's committed slot"
+    );
+    assert!(
+        scan(&[span(1, 0, &[1]), span(1, 0, &[1])]).is_err(),
+        "one slot written twice"
+    );
+    assert!(
+        scan(&[span(1, 0, &[1]), span(1, 0, &[3])]).is_err(),
+        "slot outside the pool"
+    );
+    assert!(
+        scan(&[span(1, 3, &[1]), span(1, 0, &[2])]).is_err(),
+        "read outside the pool"
+    );
+    assert!(
+        scan(&[span(1, 0, &[1, 2]), span(1, 0, &[])]).is_err(),
+        "wrong boundary counts"
+    );
+    assert!(
+        scan(&[span(1, 0, &[1])]).is_err(),
+        "spans cover one of two rows"
+    );
+    assert!(
+        scan(&[span(0, 0, &[1]), span(2, 0, &[2])]).is_err(),
+        "empty sequence"
+    );
+    assert!(kernels.recurrent_spans(&[]).is_err());
     Ok(())
 }
 

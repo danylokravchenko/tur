@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::time::Instant;
 use tur_core::{Result, execution::KvFormat};
 use tur_metal::{
-    kernels::{DeltaShape, Heads, Kernels, PagedKv, Tuning},
+    kernels::{DeltaShape, Heads, Kernels, PagedKv, RecurrentSpan, Tuning},
     packed::PackedLinear,
     pool::{AttentionPool, KvPool},
 };
@@ -465,18 +465,16 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
             let dt_bias = random(device, &[value_heads], 11, 1.0)?;
             let neg_a = (random(device, &[value_heads], 12, 1.0)?.abs()? * -1.0)?;
             let state = random(device, &[2, value_heads, 128, 128], 13, 0.1)?;
-            let writes = kernels.slots(&[1])?;
+            let writes = kernels.recurrent_spans(&[RecurrentSpan {
+                tokens,
+                read: 0,
+                writes: &[1],
+            }])?;
             let conv = time(device, || {
-                let out = kernels.output(tokens, channels)?;
-                kernels.delta_conv(&mixed, 0, tokens, &history, 0, &writes, &conv_w, &out, 0)?;
-                kernels.finish(out, (tokens, channels))
+                kernels.delta_conv(&mixed, &writes, &history, &conv_w)
             })?;
             let scan = time(device, || {
-                let out = kernels.output(tokens, value_heads * 128)?;
-                kernels.delta_scan(
-                    &mixed, &proj, 0, tokens, &shape, &dt_bias, &neg_a, &state, 0, &writes, &out, 0,
-                )?;
-                kernels.finish(out, (tokens, value_heads * 128))
+                kernels.delta_scan(&mixed, &proj, &writes, &shape, &dt_bias, &neg_a, &state)
             })?;
             let per_token = scan["median_seconds"].as_f64().unwrap_or(0.0) / tokens as f64;
             // Threadgroup shape sweep: the staged state tile trades coalescing for occupancy.
@@ -487,12 +485,7 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
                     ..kernels.tuning()
                 })?;
                 let timing = time(device, || {
-                    let out = tuned.output(tokens, value_heads * 128)?;
-                    tuned.delta_scan(
-                        &mixed, &proj, 0, tokens, &shape, &dt_bias, &neg_a, &state, 0, &writes,
-                        &out, 0,
-                    )?;
-                    tuned.finish(out, (tokens, value_heads * 128))
+                    tuned.delta_scan(&mixed, &proj, &writes, &shape, &dt_bias, &neg_a, &state)
                 })?;
                 sweep.push(json!({"scan_simdgroups": scan_simdgroups, "scan": timing}));
             }
@@ -503,6 +496,62 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
                 "scan_simdgroup_sweep": sweep,
             }));
         }
+        cases.extend(delta_decode_cases(device, kernels, label, shape)?);
+    }
+    Ok(cases)
+}
+
+/// Batched decode: one ragged dispatch per operation against one dispatch per sequence.
+fn delta_decode_cases(
+    device: &Device,
+    kernels: &Kernels,
+    label: &str,
+    shape: DeltaShape,
+) -> Result<Vec<Value>> {
+    let (channels, heads) = (shape.channels(), shape.value_heads);
+    let mut cases = Vec::new();
+    for batch in [1usize, 2, 4, 8, 16] {
+        let mixed = random(device, &[batch, channels], 7, 1.0)?;
+        let proj = random(device, &[batch, 2 * heads], 8, 1.0)?;
+        let history = random(device, &[2 * batch, 3, channels], 9, 1.0)?;
+        let conv_w = random(device, &[channels, 4], 10, 0.5)?;
+        let dt_bias = random(device, &[heads], 11, 1.0)?;
+        let neg_a = (random(device, &[heads], 12, 1.0)?.abs()? * -1.0)?;
+        let state = random(device, &[2 * batch, heads, 128, 128], 13, 0.1)?;
+        let writes: Vec<[u32; 1]> = (0..batch).map(|i| [(batch + i) as u32]).collect();
+        let spans: Vec<_> = writes
+            .iter()
+            .enumerate()
+            .map(|(i, w)| RecurrentSpan {
+                tokens: 1,
+                read: i as u32,
+                writes: w,
+            })
+            .collect();
+        let ragged = kernels.recurrent_spans(&spans)?;
+        let single = spans
+            .iter()
+            .map(|span| kernels.recurrent_spans(std::slice::from_ref(span)))
+            .collect::<Result<Vec<_>>>()?;
+        let packed = time(device, || {
+            let mixed = kernels.delta_conv(&mixed, &ragged, &history, &conv_w)?;
+            kernels.delta_scan(&mixed, &proj, &ragged, &shape, &dt_bias, &neg_a, &state)
+        })?;
+        let looped = time(device, || {
+            let mut last = None;
+            for (i, spans) in single.iter().enumerate() {
+                let (row, gates) = (mixed.narrow(0, i, 1)?, proj.narrow(0, i, 1)?);
+                let row = kernels.delta_conv(&row, spans, &history, &conv_w)?;
+                last = Some(
+                    kernels.delta_scan(&row, &gates, spans, &shape, &dt_bias, &neg_a, &state)?,
+                );
+            }
+            last.ok_or_else(|| tur_core::execution::invalid("empty batch"))
+        })?;
+        cases.push(json!({
+            "operation": "delta_net_decode", "shape": label, "sequences": batch,
+            "ragged": packed, "per_sequence": looped, "speedup": speedup(&packed, &looped),
+        }));
     }
     Ok(cases)
 }
