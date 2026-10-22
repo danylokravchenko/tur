@@ -321,7 +321,7 @@ checksum = "5ecb245093b0f791b89d3420c3df9c6d49c60ab63ba54db896bf8a3baf486706"
 dependencies = [
  "byteorder",
  "candle-kernels",
- "candle-metal-kernels 0.11.0",
+ "candle-metal-kernels",
  "candle-ug",
  "cudarc 0.19.10",
  "float8",
@@ -356,21 +356,6 @@ dependencies = [
 
 [[package]]
 name = "candle-metal-kernels"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b6b5a4cae6b4e1ab0efcee4dc05272d11b374a3d1ba121b3a961e36be54ab60"
-dependencies = [
- "half",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "once_cell",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "candle-metal-kernels"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "242e83c6acf639bb273c929d73c67a882bb4dd08a140f121096e19ba2f213d3e"
@@ -392,7 +377,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eaa10b6ccc365b33210ce404fbf45e60d3e0bdac1004463cf1052e6ee1c1739a"
 dependencies = [
  "candle-core",
- "candle-metal-kernels 0.11.0",
+ "candle-metal-kernels",
  "half",
  "libc",
  "num-traits",
@@ -2182,6 +2167,7 @@ version = "2.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "805bfd7352166bae857ee569628b52bcd85a1cecf7810861ebceb1686b72b75d"
 dependencies = [
+ "indexmap",
  "memo-map",
  "serde",
  "serde_json",
@@ -2984,17 +2970,6 @@ dependencies = [
 
 [[package]]
 name = "safetensors"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "675656c1eabb620b921efea4f9199f97fc86e36dd6ffd1fbbe48d0f59a4987f5"
-dependencies = [
- "hashbrown 0.16.1",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "safetensors"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79b079b829cb27a1c3c374341345ed2e8b2c0c839034522cee576c140bd7f846"
@@ -3750,7 +3725,7 @@ dependencies = [
  "async-stream",
  "axum",
  "candle-core",
- "candle-metal-kernels 0.10.2",
+ "candle-metal-kernels",
  "candle-transformers",
  "clap",
  "criterion",
@@ -3847,7 +3822,7 @@ dependencies = [
  "num-traits",
  "parking_lot",
  "rayon",
- "safetensors 0.7.0",
+ "safetensors 0.8.0",
  "serde",
  "serde_json",
  "tokenizers 0.21.4",

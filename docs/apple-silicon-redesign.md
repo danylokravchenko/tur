@@ -1,6 +1,6 @@
 # Tur: Apple Silicon inference redesign
 
-Status: P0's development-Mac evidence/capability gate and P1's workspace move are complete (2026-10-21). P2's four-crate extraction and explicit hybrid state and packed execution contracts are implemented (revised after review); see [P2 contracts and validation](apple-silicon-p2-contracts.md). Safe dispatch and pinned model/HTTP evidence remain in [the baseline report](apple-silicon-baseline.md). The baseline checkpoint suite retains its guided-JSON failure (68/69 pass); it was not rerun or fixed in P2. Existing models (ordinary Qwen3, Granite 4.1) are scheduled for removal rather than retained as regression references; see [Breaking changes and legacy removal](#breaking-changes-and-legacy-removal). P3 hybrid mathematics, serving integration, production performance and quality gates remain open; Qwen3.8 is not supported.
+Status: P0's development-Mac evidence/capability gate and P1's workspace move are complete (2026-10-21). P2's four-crate extraction and explicit hybrid state and packed execution contracts are implemented (revised after review); see [P2 contracts and validation](apple-silicon-p2-contracts.md). Safe dispatch and pinned model/HTTP evidence remain in [the baseline report](apple-silicon-baseline.md). The baseline checkpoint suite retains its guided-JSON failure (68/69 pass); it was not rerun or fixed in P2. Existing models (ordinary Qwen3, Granite 4.1) are scheduled for removal rather than retained as regression references; see [Breaking changes and legacy removal](#breaking-changes-and-legacy-removal). P3's model work is complete (2026-10-22): the Qwen3.5 dense hybrid text model matches Transformers on the real Qwen3.5-0.8B checkpoint on CPU and Metal, with Q8_0/Q4K packed execution; Qwen3.8-27B shares that path and is validated against its pinned config, tensor headers and template but has not been executed on this hardware; see [P3 report](apple-silicon-p3-qwen.md). P3's legacy deletion and CLI/server rewiring are deferred to a follow-up by user decision. Serving integration, production performance and quality gates remain open.
 
 ## Product and platform
 
@@ -252,6 +252,14 @@ Use checked arithmetic and validate shape/offset/page indices before submission.
 Exit: small deterministic reference tests for state allocation, independent requests, checkpoint/fork/restore, rollback and cancellation. No cyclic crate dependencies or duplicate Config/error systems.
 
 ### P3 — Implement Qwen3.8 correctness first
+
+Model work implemented on 2026-10-22; measurements, pins, tolerances and limits are in
+[the P3 report](apple-silicon-p3-qwen.md). Every bullet below is done except the first
+(legacy deletion and CLI/server rewiring), which the user deferred to a follow-up.
+Exit evidence: per-layer and logit agreement with Transformers (relative error
+≤ 3.5e-6, against a 1e-4 gate), whole/chunked/incremental agreement, batch
+enter/leave isolation, and coherent Q8_0/Q4K generation. Q4K has no quality budget
+yet.
 
 Affected functionality: current `models/qwen3.rs` and `models/granite_41.rs`, factory detection, weight loading, chat templates, tokenizer, model-state tests.
 

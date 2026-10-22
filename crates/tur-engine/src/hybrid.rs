@@ -3,7 +3,7 @@
 
 use crate::backend::guidance::GuidanceControl;
 use candle_core::{DType, Device, Tensor};
-use candle_transformers::generation::LogitsProcessor;
+use candle_transformers::generation::{LogitsProcessor, Sampling};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -28,7 +28,23 @@ use uuid::Uuid;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SamplingOptions {
     pub temperature: Option<f64>,
+    pub top_k: Option<usize>,
     pub top_p: Option<f64>,
+}
+
+impl SamplingOptions {
+    /// Greedy below the sampler's temperature floor; otherwise top-k, then top-p.
+    fn sampling(&self) -> Sampling {
+        let Some(temperature) = self.temperature.filter(|t| *t >= 1e-7) else {
+            return Sampling::ArgMax;
+        };
+        match (self.top_k, self.top_p) {
+            (None, None) => Sampling::All { temperature },
+            (Some(k), None) => Sampling::TopK { k, temperature },
+            (None, Some(p)) => Sampling::TopP { p, temperature },
+            (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature },
+        }
+    }
 }
 
 struct SamplingState {
@@ -115,7 +131,7 @@ impl SamplingState {
         }
         let vocab = values.len();
         let masked = Tensor::from_vec(values, vocab, &Device::Cpu)?;
-        let mut sampler = LogitsProcessor::new(seed, self.options.temperature, self.options.top_p);
+        let mut sampler = LogitsProcessor::from_sampling(seed, self.options.sampling());
         let token = sampler.sample(&masked)?;
         if let Some(guidance) = &mut self.guidance
             && guidance.commit(token)?
@@ -378,6 +394,7 @@ impl<M: HybridModel> HybridEngine<M> {
         if options
             .temperature
             .is_some_and(|t| !t.is_finite() || t < 0.0)
+            || options.top_k == Some(0)
             || options
                 .top_p
                 .is_some_and(|p| !p.is_finite() || p <= 0.0 || p > 1.0)
@@ -738,18 +755,22 @@ mod tests {
             SamplingOptions {
                 temperature: Some(f64::NAN),
                 top_p: None,
+                ..Default::default()
             },
             SamplingOptions {
                 temperature: Some(-1.0),
                 top_p: None,
+                ..Default::default()
             },
             SamplingOptions {
                 temperature: None,
                 top_p: Some(0.0),
+                ..Default::default()
             },
             SamplingOptions {
                 temperature: None,
                 top_p: Some(1.1),
+                ..Default::default()
             },
         ] {
             assert!(engine.allocate(1, options, None).is_err());

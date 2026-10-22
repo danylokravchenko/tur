@@ -7,7 +7,9 @@ A high-performance Rust inference engine for transformer models, built on [Candl
 The workspace now separates shared contracts (`tur-core`), device/state ownership
 (`tur-metal`), models/loading (`tur-models`) and execution (`tur-engine`), with `tur`
 as the facade. [P2 contracts](docs/apple-silicon-p2-contracts.md) include deterministic
-hybrid state fixtures; Qwen3.8 mathematics and serving integration remain pending.
+hybrid state fixtures. [P3](docs/apple-silicon-p3-qwen.md) adds the Qwen3.5/3.8 dense
+hybrid text model, validated against Transformers on Qwen3.5-0.8B; serving integration
+remains pending.
 
 ## Features
 

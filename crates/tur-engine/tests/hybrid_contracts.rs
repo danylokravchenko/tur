@@ -203,6 +203,7 @@ fn allocate(engine: &mut HybridEngine<Fixture>, seed: u64) -> Result<StateHandle
         SamplingOptions {
             temperature: Some(0.8),
             top_p: Some(0.9),
+            ..Default::default()
         },
         None,
     )

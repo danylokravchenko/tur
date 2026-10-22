@@ -28,6 +28,7 @@ rayon.workspace = true
 libc.workspace = true
 half.workspace = true
 ahash.workspace = true
+safetensors.workspace = true
 
 [features]
 default = ["metal"]
@@ -36,5 +37,4 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "tur-core/cuda", "tur-metal/cuda"]
 flash-attn = []
 
 [dev-dependencies]
-safetensors.workspace = true
 bytemuck.workspace = true

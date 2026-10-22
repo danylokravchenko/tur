@@ -107,10 +107,12 @@ fn custom_dispatch_probe(device: &Device) -> Result<Value> {
             return Err(io::Error::other("probe allocation is too small").into());
         }
         {
-            let encoder = native.command_encoder()?;
-            encoder.set_label("tur_p0_write_indices");
-            encoder.set_compute_pipeline_state(&pipeline);
-            encoder.set_buffer(0, Some(&buffer), std::mem::size_of::<u32>());
+            let guard = native.command_encoder()?;
+            guard.set_label("tur_p0_write_indices");
+            guard.set_compute_pipeline_state(&pipeline);
+            // The guard keeps the encoder locked while binding; outputs are tracked for barriers.
+            let encoder: &candle_metal_kernels::metal::ComputeCommandEncoder = guard.as_ref();
+            encoder.set_output_buffer(0, Some(&buffer), std::mem::size_of::<u32>());
             encoder.set_bytes(1, &count);
             encoder.dispatch_thread_groups(
                 MTLSize {
