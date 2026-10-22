@@ -1,3 +1,11 @@
+#![allow(
+    clippy::print_stderr,
+    reason = "checkpoint comparisons report numerical evidence to the test runner"
+)]
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 #![forbid(unsafe_code)]
 //! Qwen3.5/3.8 template fidelity and real-checkpoint reference agreement.
 //!
@@ -239,7 +247,7 @@ fn test_f32_layers_and_logits_match_transformers() -> Result<()> {
         .to_device(&Device::Cpu)?)?;
     let expected = ids(get("argmax")?)?;
     let agree = argmax.iter().zip(&expected).filter(|(a, b)| a == b).count();
-    println!(
+    eprintln!(
         "worst layer relative error {worst:.2e}; logits {logit_error:.2e}; argmax {agree}/{}",
         expected.len()
     );

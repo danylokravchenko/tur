@@ -66,6 +66,7 @@ impl GuidanceControl {
     }
 
     /// Deep-copy parser state for an independent request checkpoint or speculative branch.
+    #[must_use]
     pub fn fork(&self) -> Self {
         Self {
             factory: Arc::clone(&self.factory),

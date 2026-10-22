@@ -1,3 +1,11 @@
+#![allow(
+    clippy::print_stderr,
+    reason = "checkpoint comparisons report numerical evidence to the test runner"
+)]
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 #![cfg(feature = "metal")]
 #![forbid(unsafe_code)]
 //! Fused Metal execution against the F32 reference on identical weights: per-layer and
@@ -268,30 +276,31 @@ fn test_fused_packed_formats_track_reference() -> Result<()> {
         );
         let reference = load(&checkpoint.0, format, &device, Execution::Reference)?;
         let pool = pool(&reference)?;
-        let (_, a) = prefill(&reference, ModelState::new(&pool), &prompt(30, 9), 30)?;
-        let (_, b) = prefill(&reference, ModelState::new(&pool), &prompt(7, 10), 7)?;
+        let (_, long_state) = prefill(&reference, ModelState::new(&pool), &prompt(30, 9), 30)?;
+        let (_, short_state) = prefill(&reference, ModelState::new(&pool), &prompt(7, 10), 7)?;
         // Three single-token sequences: the fused path takes the small-batch GEMV. The
         // reference run per sequence uses Candle's one-row GEMV (F32 dequantization); run
         // as a batch it uses Candle's tiled GEMM, which stages weight tiles as F16.
         let new = [prompt(1, 11), prompt(1, 12), prompt(1, 13)];
-        let batch: Vec<(&ModelState, &[u32], Boundaries)> = [&a, &b, &a]
-            .into_iter()
-            .zip(&new)
-            .map(|(state, tokens)| (state, tokens.as_slice(), Boundaries::Final))
-            .collect();
+        let batch: Vec<(&ModelState, &[u32], Boundaries)> =
+            [&long_state, &short_state, &long_state]
+                .into_iter()
+                .zip(&new)
+                .map(|(state, tokens)| (state, tokens.as_slice(), Boundaries::Final))
+                .collect();
         let (tiled, _held) = forward(&reference, &batch)?;
         let (fused_steps, _held) = forward(&fused, &batch)?;
         for ((fused, tiled), single) in fused_steps.into_iter().zip(tiled).zip(&batch) {
             let (mut alone, _held) = forward(&reference, std::slice::from_ref(single))?;
             let alone = alone.pop().ok_or_else(|| invalid("missing step"))??;
-            let (x, y, z) = (
+            let (fused_logits, single_logits, tiled_logits) = (
                 rows(&fused?.logits)?,
                 rows(&alone.logits)?,
                 rows(&tiled?.logits)?,
             );
-            let error = max_relative(&x, &y);
+            let error = max_relative(&fused_logits, &single_logits);
             assert!(error < 1e-4, "{format:?} decode vs one-row GEMV {error}");
-            let error = max_relative(&z, &y);
+            let error = max_relative(&tiled_logits, &single_logits);
             assert!(
                 error < 2e-2,
                 "{format:?} F16-tiled GEMM vs one-row GEMV {error}"
@@ -347,7 +356,7 @@ fn test_kv_formats_and_page_sizes_on_the_fused_path() -> Result<()> {
         let error = max_relative(&fused, &reference);
         assert!(error < 1e-3, "{format} fused vs reference: {error}");
         let error = max_relative(&fused, &exact);
-        println!("{format}: logits vs F32 K/V {error:.2e}");
+        eprintln!("{format}: logits vs F32 K/V {error:.2e}");
         assert!(error < bound, "{format} vs F32 K/V: {error}");
     }
     Ok(())
@@ -389,7 +398,7 @@ fn test_decode_reads_pages_in_place_without_rebuilding_the_cache() -> Result<()>
     // partials with context.
     let rebuilt = 2 * 1500 * 2 * 2 * 64 * 4;
     let extra = long_pass.saturating_sub(short_pass);
-    println!("decode pass: {short_pass} bytes at 40 tokens, {long_pass} at 1500");
+    eprintln!("decode pass: {short_pass} bytes at 40 tokens, {long_pass} at 1500");
     assert!(
         extra * 16 < rebuilt,
         "decode at 1500 tokens allocated {extra} more bytes"
@@ -568,7 +577,7 @@ fn test_full_and_partial_prefix_forks_and_restores_continue_exactly() -> Result<
         pages: 64,
         recurrent_slots: 16,
     };
-    let mut engine = HybridEngine::new(Arc::clone(&model), device.clone(), config)?;
+    let mut engine = HybridEngine::new(Arc::clone(&model), device, config)?;
     // Prefixes ending mid-page (37) and on a page boundary (48).
     for length in [37usize, 48] {
         let tokens = prompt(length + 3, 24);
@@ -659,7 +668,7 @@ fn test_memory_pressure_fails_new_work_without_corrupting_live_requests() -> Res
     // prefill (4 pages) never fits beside it.
     let mut engine = HybridEngine::new(
         Arc::clone(&model),
-        device.clone(),
+        device,
         PoolConfig {
             pages: 7,
             recurrent_slots: 4,
@@ -767,7 +776,7 @@ fn test_real_checkpoint_fused_matches_reference() -> Result<()> {
         .zip(argmax(&b))
         .filter(|(x, y)| **x == *y)
         .count();
-    println!(
+    eprintln!(
         "F32 {} tokens: worst layer {worst:.2e}, logits {logit_error:.2e}, argmax {agree}/{}",
         tokens.len(),
         tokens.len()
@@ -787,7 +796,7 @@ fn test_real_checkpoint_fused_matches_reference() -> Result<()> {
             .zip(argmax(&y))
             .filter(|(p, q)| **p == *q)
             .count();
-        println!(
+        eprintln!(
             "{format:?}: logits {error:.2e}, argmax {agree}/{}",
             tokens.len()
         );
@@ -919,7 +928,7 @@ fn test_real_checkpoint_kv_formats_keep_attention_quality() -> Result<()> {
             .zip(&greedy_exact[0])
             .take_while(|(a, b)| a == b)
             .count();
-        println!("{format}: logits {error:.2e}, top-1 {agree:.3}, greedy prefix {same}/64");
+        eprintln!("{format}: logits {error:.2e}, top-1 {agree:.3}, greedy prefix {same}/64");
         assert!(agree >= agreement, "{format}: agreement {agree}");
         assert!(same >= prefix, "{format}: greedy prefix {same}");
     }

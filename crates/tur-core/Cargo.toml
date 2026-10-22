@@ -17,4 +17,6 @@ uuid.workspace = true
 [features]
 default = []
 metal = ["candle-core/metal"]
-cuda = ["candle-core/cuda"]
+
+[lints]
+workspace = true

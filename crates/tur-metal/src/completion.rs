@@ -129,6 +129,10 @@ impl<T: Send + 'static> Drop for Completion<T> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

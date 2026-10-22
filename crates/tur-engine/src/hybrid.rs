@@ -116,9 +116,9 @@ impl SamplingState {
         // The request counter itself is checked and never wraps or depends on batch order.
         let mut seed = self
             .seed
-            .wrapping_add(self.draws.wrapping_mul(0x9e3779b97f4a7c15));
-        seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d049bb133111eb);
+            .wrapping_add(self.draws.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         seed ^= seed >> 31;
         let mut values = logits.to_vec();
         if let Some(guidance) = &mut self.guidance
@@ -712,6 +712,10 @@ impl<M: HybridModel> HybridEngine<M> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 mod tests {
     use super::*;
     use tur_core::execution::{
@@ -758,7 +762,7 @@ mod tests {
         };
         assert!(state.sample(&[1.0, 2.0]).is_err());
         assert_eq!(state.draws, u64::MAX);
-        assert!(state.tokens.is_empty());
+        assert_eq!(state.tokens, [] as [u32; 0]);
     }
 
     #[test]
@@ -836,6 +840,6 @@ mod tests {
         assert!(state.sample(&[f32::NAN, 1.0]).is_err());
         state.rollback(mark);
         assert_eq!(state.draws, 0);
-        assert!(state.tokens.is_empty());
+        assert_eq!(state.tokens, [] as [u32; 0]);
     }
 }

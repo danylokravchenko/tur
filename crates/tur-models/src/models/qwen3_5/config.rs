@@ -98,6 +98,10 @@ pub struct Config {
 
 impl Config {
     /// Parse explicit architecture identifiers and nested text settings, never a model name.
+    #[allow(
+        clippy::float_cmp,
+        reason = "duplicate configuration fields must agree exactly"
+    )]
     pub fn from_json(json: &str) -> Result<Self> {
         let raw: serde_json::Value = serde_json::from_str(json)?;
         let architectures = raw["architectures"].as_array();
@@ -158,7 +162,7 @@ impl Config {
         }
         if raw
             .get("tie_word_embeddings")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .is_some_and(|t| t != text.tie_word_embeddings)
         {
             return Err(invalid("conflicting embedding tying settings"));
@@ -234,7 +238,7 @@ impl Config {
             "vision_end_token_id",
             "audio_token_id",
         ] {
-            if let Some(id) = raw.get(field).and_then(|v| v.as_u64()) {
+            if let Some(id) = raw.get(field).and_then(serde_json::Value::as_u64) {
                 forbidden_tokens
                     .push(u32::try_from(id).map_err(|_| invalid("modality token overflow"))?);
             }
@@ -413,7 +417,7 @@ impl Config {
         })
     }
 
-    /// Exact SafeTensors weight names and dimensions required by the text tower.
+    /// Exact `SafeTensors` weight names and dimensions required by the text tower.
     pub fn weight_shapes(&self) -> Result<BTreeMap<String, Vec<usize>>> {
         let t = &self.text;
         let mut shapes = BTreeMap::new();
@@ -505,10 +509,9 @@ impl Config {
 }
 
 fn parse_tokens(raw: &serde_json::Value, vocab: usize) -> Result<Vec<u32>> {
-    let values = match raw.as_array() {
-        Some(values) => values.clone(),
-        None => vec![raw.clone()],
-    };
+    let values = raw
+        .as_array()
+        .map_or_else(|| vec![raw.clone()], Clone::clone);
     if values.is_empty() {
         return Err(invalid("empty EOS list"));
     }
@@ -528,6 +531,10 @@ fn parse_tokens(raw: &serde_json::Value, vocab: usize) -> Result<Vec<u32>> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 mod tests {
     use super::*;
 
@@ -556,7 +563,10 @@ mod tests {
             assert_eq!(full, attention);
             assert_eq!(config.rotary_dim(), 64);
             assert_eq!(config.conv_history(), 3);
-            assert_eq!(config.forbidden_tokens(), &[248056, 248057, 248053, 248054]);
+            assert_eq!(
+                config.forbidden_tokens(),
+                &[248_056, 248_057, 248_053, 248_054]
+            );
         }
         Ok(())
     }
@@ -592,7 +602,7 @@ mod tests {
         config.forbid_tokenizer_modalities(FLAGSHIP_TOKENIZER_CONFIG, tokenizer)?;
         assert_eq!(
             config.forbidden_tokens(),
-            &[248056, 248057, 248053, 248054, 248070, 248076]
+            &[248_056, 248_057, 248_053, 248_054, 248_070, 248_076]
         );
         Ok(())
     }
@@ -601,7 +611,7 @@ mod tests {
     fn test_generation_defaults_merge_eos_and_sampling() -> Result<()> {
         let config = Config::from_json(FLAGSHIP)?;
         let defaults = config.generation_defaults(Some(FLAGSHIP_GENERATION))?;
-        assert_eq!(defaults.eos_tokens, vec![248044, 248046]);
+        assert_eq!(defaults.eos_tokens, vec![248_044, 248_046]);
         assert_eq!(defaults.top_k, Some(20));
         assert_eq!(defaults.top_p, Some(0.95));
         assert_eq!(defaults.temperature, Some(1.0));

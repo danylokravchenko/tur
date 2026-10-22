@@ -26,9 +26,11 @@ metal = [
     "dep:candle-metal-kernels",
     "dep:objc2-metal",
 ]
-cuda = ["candle-core/cuda", "tur-core/cuda"]
 
 [[bench]]
 name = "kernels"
 harness = false
 required-features = ["metal"]
+
+[lints]
+workspace = true

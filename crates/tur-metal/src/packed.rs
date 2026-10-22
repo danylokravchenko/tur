@@ -16,7 +16,7 @@ enum Weights {
     Packed {
         matmul: QMatMul,
         format: GgmlDType,
-        /// Handle to the same MTLBuffer the `QMatMul` owns, for the packed GEMV kernels.
+        /// Handle to the same `MTLBuffer` the `QMatMul` owns, for the packed GEMV kernels.
         /// `matmul` keeps Candle's pooled `Arc` alive, so the pool cannot recycle it while
         /// this handle exists.
         #[cfg(feature = "metal")]

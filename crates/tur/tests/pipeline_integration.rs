@@ -1,3 +1,7 @@
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 #![forbid(unsafe_code)]
 mod common;
 use common::Checkpoint;
@@ -36,12 +40,12 @@ fn test_generation_config_eos_stops_and_is_not_streamed() -> Result<()> {
     let mut pipeline = InferencePipeline::new(&fixture.factory(), PipelineConfig::new(1, 2))?;
     let mut text = String::new();
     let stats = pipeline.run(&GenerationRequest::new("t10 t11 t12".into(), 20), |t| {
-        text.push_str(t)
+        text.push_str(t);
     })?;
     assert_eq!(stats.generated_tokens, 1);
     assert_eq!(stats.finish_reason, "stop");
-    assert!(stats.generated_text.is_empty());
-    assert!(text.is_empty());
+    assert_eq!(stats.generated_text, "");
+    assert_eq!(text, "");
     assert_eq!(pipeline.active_request_count(), 0);
     Ok(())
 }
@@ -143,13 +147,17 @@ fn budgeted(fixture: &Checkpoint, batch: usize, pages: usize) -> Result<Inferenc
     // Unit sizes come from an unconstrained pipeline over the same checkpoint.
     let usage =
         InferencePipeline::new(&fixture.factory(), PipelineConfig::new(batch, 2))?.memory()?;
-    InferencePipeline::new(
+    let budget = (2 * batch + 1) * usage.slot_bytes + pages * usage.page_bytes;
+    let mut pipeline = InferencePipeline::new(
         &fixture.factory(),
         PipelineConfig {
-            state_bytes: Some(2 * batch * usage.slot_bytes + pages * usage.page_bytes),
+            state_bytes: Some(budget),
             ..PipelineConfig::new(batch, 2)
         },
-    )
+    )?;
+    assert_eq!(pipeline.memory()?.pages.capacity, pages);
+    assert!(pipeline.memory_plan().state_pool <= budget);
+    Ok(pipeline)
 }
 
 fn drain(

@@ -26,7 +26,7 @@ use crate::{
             ApiErrorResponse, AssistantFunction, AssistantToolCall, ChatChoice,
             ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
             ChatResponseMessage, ChunkChoice, DeltaFunction, DeltaMessage, DeltaToolCall,
-            ResponseFunction, ResponseToolCall, Usage,
+            MessageContent, ResponseFunction, ResponseToolCall, Usage,
         },
         worker::WorkerMsg,
     },
@@ -77,7 +77,11 @@ fn to_internal_messages(
                 .collect::<crate::Result<Vec<_>>>()?;
             Ok(ChatMessage {
                 role,
-                content: m.content.as_ref().map(|c| c.as_text()).unwrap_or_default(),
+                content: m
+                    .content
+                    .as_ref()
+                    .map(MessageContent::as_text)
+                    .unwrap_or_default(),
                 reasoning_content: m.reasoning_content.clone(),
                 tool_calls,
             })
@@ -254,7 +258,7 @@ async fn blocking_response(
             .tool_calls
             .iter()
             .map(|tc| AssistantToolCall {
-                id: format!("call_{}", &Uuid::new_v4().simple().to_string()[..8]),
+                id: format!("call_{:08x}", Uuid::new_v4().as_fields().0),
                 call_type: "function".to_string(),
                 function: AssistantFunction {
                     name: tc.name.clone(),
@@ -374,7 +378,7 @@ fn stream_response(
                         content: None,
                         tool_calls: vec![DeltaToolCall {
                             index: idx as u32,
-                            id: Some(format!("call_{}", &Uuid::new_v4().simple().to_string()[..8])),
+                            id: Some(format!("call_{:08x}", Uuid::new_v4().as_fields().0)),
                             call_type: Some("function"),
                             function: Some(DeltaFunction {
                                 name: Some(tc.name.clone()),

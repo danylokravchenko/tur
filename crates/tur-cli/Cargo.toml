@@ -15,7 +15,6 @@ path = "src/main.rs"
 
 [dependencies]
 tur = { path = "../tur", default-features = false }
-candle-core.workspace = true
 clap.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
@@ -23,4 +22,6 @@ serde_json.workspace = true
 [features]
 default = ["metal"]
 metal = ["tur/metal"]
-cuda = ["tur/cuda"]
+
+[lints]
+workspace = true

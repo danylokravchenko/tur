@@ -42,6 +42,7 @@ objc2-foundation.workspace = true
 
 [features]
 default = ["metal"]
-cuda = ["tur-engine/cuda", "tur-metal/cuda", "tur-models/cuda", "tur-core/cuda", "candle-core/cuda"]
 metal = ["tur-engine/metal", "tur-metal/metal", "tur-models/metal", "tur-core/metal", "candle-core/metal", "dep:metal"]
 
+[lints]
+workspace = true

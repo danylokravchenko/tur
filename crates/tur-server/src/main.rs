@@ -27,13 +27,13 @@ struct Args {
         required_unless_present = "weight_path"
     )]
     model_id: Option<String>,
-    /// Local SafeTensors checkpoint directory.
+    /// Local `SafeTensors` checkpoint directory.
     #[arg(long, env = "MODEL_WEIGHT_PATH", conflicts_with = "model_id")]
     weight_path: Option<PathBuf>,
     /// Remote commit or explicit immutable identity for local weights.
     #[arg(long)]
     revision: String,
-    /// Explicit SafeTensors conversion to f32, q8_0 or q4k resident projections.
+    /// Explicit `SafeTensors` conversion to f32, `q8_0` or q4k resident projections.
     #[arg(long, default_value = "q8_0")]
     weight_format: WeightFormat,
     /// Model ID accepted by /v1/chat/completions and listed by /v1/models.

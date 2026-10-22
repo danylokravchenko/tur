@@ -160,7 +160,7 @@ pub struct Heads {
     pub col_offset: usize,
 }
 
-/// Gated DeltaNet geometry. The projection row holds `[q | k | v | z | b | a]`, with the
+/// Gated `DeltaNet` geometry. The projection row holds `[q | k | v | z | b | a]`, with the
 /// `b` and `a` gate columns at `b_col` and `a_col`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeltaShape {
@@ -432,7 +432,7 @@ impl Kernels {
         Ok(Tensor::from_vec(values, rotary_dim / 2, self.device())?)
     }
 
-    /// Per-head RMSNorm then split-half rotary over the first `2 * inv_freq.len()`
+    /// Per-head `RMSNorm` then split-half rotary over the first `2 * inv_freq.len()`
     /// dimensions at angle `position * inv_freq[i]`. `x` is `[tokens, width]`; returns
     /// contiguous `[tokens, heads, dim]`.
     pub fn qk_norm_rope(
@@ -583,7 +583,7 @@ impl Kernels {
 
     /// Causal depthwise convolution of one sequence: rows `row..row + tokens` of `x`
     /// (first `channels` columns) after the history in slot `read` of `pool`
-    /// (`[slots, taps - 1, channels]`), with `weight` `[channels, taps]`, then SiLU into
+    /// (`[slots, taps - 1, channels]`), with `weight` `[channels, taps]`, then `SiLU` into
     /// `out` rows `out_row..`. Writes the history after the last token into slot
     /// `writes[0]`, or after token `t` into `writes[t]` when one slot per token is given.
     #[allow(clippy::too_many_arguments)]
@@ -1132,7 +1132,7 @@ impl Kernels {
         self.finish(out, (kv.tokens, heads * dim))
     }
 
-    /// Project `x` (`[rows, in]`) through `layer`. Packed Q8_0/Q4K weights with a row count
+    /// Project `x` (`[rows, in]`) through `layer`. Packed `Q8_0/Q4K` weights with a row count
     /// in the tuned GEMV range use the small-batch GEMV, which reads each weight once for
     /// all rows; everything else uses Candle's dense, one-row GEMV or tiled packed kernels.
     pub fn linear(&self, layer: &PackedLinear, x: &Tensor) -> Result<Tensor> {

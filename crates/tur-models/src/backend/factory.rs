@@ -14,7 +14,7 @@ use crate::{
     models::qwen3_5::{Config, Execution, GenerationDefaults, LoadOptions, Qwen35, WeightFormat},
 };
 
-/// A local SafeTensors directory or a fully qualified Hugging Face repository.
+/// A local `SafeTensors` directory or a fully qualified Hugging Face repository.
 #[derive(Debug, Clone)]
 pub enum ModelSource {
     LocalPath(PathBuf),
@@ -102,7 +102,7 @@ impl ModelFactory {
     }
 
     /// Load the text model and serving metadata. Missing or invalid templates are errors.
-    /// Q8_0/Q4K explicitly convert SafeTensors matrices into packed resident weights;
+    /// `Q8_0/Q4K` explicitly convert `SafeTensors` matrices into packed resident weights;
     /// legacy ordinary-attention GGUF checkpoints are unsupported.
     pub fn create_model(&self) -> Result<(Qwen35, Tokenizer, ChatTemplate, GenerationDefaults)> {
         let dir = self.resolve()?;

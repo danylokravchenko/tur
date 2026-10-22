@@ -1,3 +1,8 @@
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "benchmarks emit JSON artifacts and timing summaries"
+)]
 #![forbid(unsafe_code)]
 //! Kernel benchmarks: each custom kernel against the existing Candle path at Qwen3.5
 //! shapes. Prints one JSON document. Timing covers completed GPU work: every sample
@@ -21,13 +26,13 @@ const WARMUP: usize = 3;
 const SAMPLES: usize = 15;
 
 fn values(count: usize, seed: u64, scale: f32) -> Vec<f32> {
-    let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+    let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
     (0..count)
         .map(|_| {
             state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * scale
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32).mul_add(2.0, -1.0) * scale
         })
         .collect()
 }

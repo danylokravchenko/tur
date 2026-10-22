@@ -1,15 +1,20 @@
-/// Integration tests for the OpenAI-compatible HTTP server.
-///
-/// All tests use a mock `PipelineWorker` (via `PipelineWorker::from_sender`)
-/// so no model weights are needed.  The mock task simulates the contract that
-/// the real continuous-batching worker upholds:
-///   1. Drain `WorkerMsg`s from the channel concurrently.
-///   2. Stream tokens via `token_tx` for each request independently.
-///   3. Close `token_tx` and send `GenerationStats` via `result_tx` when done.
-///
-/// The axum router is exercised via `tower::ServiceExt::oneshot` (no TCP
-/// socket needed) for single-request tests, and via a shared `axum::Router`
-/// clone for concurrent-request tests.
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
+#![forbid(unsafe_code)]
+//! Integration tests for the OpenAI-compatible HTTP server.
+//!
+//! All tests use a mock `PipelineWorker` (via `PipelineWorker::from_sender`)
+//! so no model weights are needed.  The mock task simulates the contract that
+//! the real continuous-batching worker upholds:
+//!   1. Drain `WorkerMsg`s from the channel concurrently.
+//!   2. Stream tokens via `token_tx` for each request independently.
+//!   3. Close `token_tx` and send `GenerationStats` via `result_tx` when done.
+//!
+//! The axum router is exercised via `tower::ServiceExt::oneshot` (no TCP
+//! socket needed) for single-request tests, and via a shared `axum::Router`
+//! clone for concurrent-request tests.
 use std::{sync::Arc, time::Duration};
 
 use axum::{
@@ -20,6 +25,9 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tower::ServiceExt;
+
+type TestError = Box<dyn std::error::Error + Send + Sync>;
+type TestResult<T = ()> = std::result::Result<T, TestError>;
 
 use tur::{
     backend::{pipeline::GenerationStats, tools::ToolCall},
@@ -59,14 +67,18 @@ fn mock_worker(response_text: &'static str) -> PipelineWorker {
 }
 
 /// Spawn a mock that returns a single tool call instead of text.
-fn mock_tool_call_worker(tool_name: &'static str, args_json: &'static str) -> PipelineWorker {
+fn mock_tool_call_worker(
+    tool_name: &'static str,
+    args_json: &'static str,
+) -> TestResult<PipelineWorker> {
+    let arguments: Value = serde_json::from_str(args_json)?;
     let (tx, mut rx) = mpsc::channel::<WorkerMsg>(256);
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             drop(msg.token_tx);
             let tc = ToolCall {
                 name: tool_name.to_string(),
-                arguments: serde_json::from_str(args_json).unwrap_or_default(),
+                arguments: arguments.clone(),
             };
             let _ = msg.result_tx.send(Ok(GenerationStats {
                 finish_reason: "stop",
@@ -78,7 +90,7 @@ fn mock_tool_call_worker(tool_name: &'static str, args_json: &'static str) -> Pi
             }));
         }
     });
-    PipelineWorker::from_sender(tx)
+    Ok(PipelineWorker::from_sender(tx))
 }
 
 fn test_state(response_text: &'static str) -> AppState {
@@ -90,24 +102,23 @@ fn test_state(response_text: &'static str) -> AppState {
     }
 }
 
-fn json_request(uri: &str, method: &str, body: Value) -> Request<Body> {
-    Request::builder()
+fn json_request(uri: &str, method: &str, body: &Value) -> TestResult<Request<Body>> {
+    Ok(Request::builder()
         .method(method)
         .uri(uri)
         .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .expect("request builder")
+        .body(Body::from(body.to_string()))?)
 }
 
-async fn body_json(body: axum::body::Body) -> Value {
-    let bytes = body.collect().await.expect("collect body").to_bytes();
-    serde_json::from_slice(&bytes).expect("parse JSON body")
+async fn body_json(body: axum::body::Body) -> TestResult<Value> {
+    let bytes = body.collect().await?.to_bytes();
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 // ── /v1/models ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn models_returns_configured_model_id() {
+async fn test_models_returns_configured_model_id() -> TestResult {
     let app = build_router(test_state("irrelevant"));
 
     let response = app
@@ -115,41 +126,39 @@ async fn models_returns_configured_model_id() {
             Request::builder()
                 .method("GET")
                 .uri("/v1/models")
-                .body(Body::empty())
-                .expect("request"),
+                .body(Body::empty())?,
         )
-        .await
-        .expect("response");
+        .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
 
-    let json = body_json(response.into_body()).await;
+    let json = body_json(response.into_body()).await?;
     assert_eq!(json["object"], "list");
     assert_eq!(json["data"][0]["id"], "test-model");
     assert_eq!(json["data"][0]["object"], "model");
+    Ok(())
 }
 
 // ── /v1/chat/completions — non-streaming ─────────────────────────────────────
 
 #[tokio::test]
-async fn chat_non_streaming_returns_assistant_message() {
+async fn test_chat_non_streaming_returns_assistant_message() -> TestResult {
     let app = build_router(test_state("Hello from the assistant"));
 
     let response = app
         .oneshot(json_request(
             "/v1/chat/completions",
             "POST",
-            json!({
+            &json!({
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "Hi"}]
             }),
-        ))
-        .await
-        .expect("response");
+        )?)
+        .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
 
-    let json = body_json(response.into_body()).await;
+    let json = body_json(response.into_body()).await?;
     assert_eq!(json["object"], "chat.completion");
     assert_eq!(json["model"], "test-model");
     assert_eq!(json["choices"][0]["message"]["role"], "assistant");
@@ -157,62 +166,63 @@ async fn chat_non_streaming_returns_assistant_message() {
 
     let content = json["choices"][0]["message"]["content"]
         .as_str()
-        .expect("content");
+        .ok_or("content")?;
     assert!(
         content.contains("Hello"),
         "content should contain mock tokens, got: {content}"
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn chat_non_streaming_usage_reflects_token_count() {
+async fn test_chat_non_streaming_usage_reflects_token_count() -> TestResult {
     let app = build_router(test_state("one two three"));
 
     let response = app
         .oneshot(json_request(
             "/v1/chat/completions",
             "POST",
-            json!({
+            &json!({
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "count"}]
             }),
-        ))
-        .await
-        .expect("response");
+        )?)
+        .await?;
 
-    let json = body_json(response.into_body()).await;
+    let json = body_json(response.into_body()).await?;
     // The mock reports generated_tokens = number of whitespace-separated words.
     assert_eq!(json["usage"]["completion_tokens"], 3);
+    Ok(())
 }
 
 #[tokio::test]
-async fn chat_empty_messages_returns_400() {
+async fn test_chat_empty_messages_returns_400() -> TestResult {
     let app = build_router(test_state("irrelevant"));
 
     let response = app
         .oneshot(json_request(
             "/v1/chat/completions",
             "POST",
-            json!({ "model": "test-model", "messages": [] }),
-        ))
-        .await
-        .expect("response");
+            &json!({ "model": "test-model", "messages": [] }),
+        )?)
+        .await?;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    let json = body_json(response.into_body()).await;
+    let json = body_json(response.into_body()).await?;
     assert!(json["error"]["message"].as_str().is_some());
+    Ok(())
 }
 
 #[tokio::test]
-async fn chat_multi_turn_conversation_accepted() {
+async fn test_chat_multi_turn_conversation_accepted() -> TestResult {
     let app = build_router(test_state("I remember our chat"));
 
     let response = app
         .oneshot(json_request(
             "/v1/chat/completions",
             "POST",
-            json!({
+            &json!({
                 "model": "test-model",
                 "messages": [
                     {"role": "system", "content": "You are helpful."},
@@ -221,43 +231,43 @@ async fn chat_multi_turn_conversation_accepted() {
                     {"role": "user", "content": "How are you?"}
                 ]
             }),
-        ))
-        .await
-        .expect("response");
+        )?)
+        .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
-    let json = body_json(response.into_body()).await;
+    let json = body_json(response.into_body()).await?;
     assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+    Ok(())
 }
 
 #[tokio::test]
-async fn chat_max_tokens_field_accepted() {
+async fn test_chat_max_tokens_field_accepted() -> TestResult {
     let app = build_router(test_state("short reply"));
 
     let response = app
         .oneshot(json_request(
             "/v1/chat/completions",
             "POST",
-            json!({
+            &json!({
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "Hi"}],
                 "max_tokens": 64
             }),
-        ))
-        .await
-        .expect("response");
+        )?)
+        .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
 }
 
 // ── Tool calls ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn tool_call_response_has_correct_structure() {
+async fn test_tool_call_response_has_correct_structure() -> TestResult {
     let mut workers = std::collections::HashMap::new();
     workers.insert(
         "test-model".to_string(),
-        mock_tool_call_worker("get_weather", r#"{"location": "Paris", "unit": "celsius"}"#),
+        mock_tool_call_worker("get_weather", r#"{"location": "Paris", "unit": "celsius"}"#)?,
     );
     let app = build_router(AppState {
         workers,
@@ -268,7 +278,7 @@ async fn tool_call_response_has_correct_structure() {
         .oneshot(json_request(
             "/v1/chat/completions",
             "POST",
-            json!({
+            &json!({
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "What is the weather?"}],
                 "tools": [{
@@ -287,13 +297,12 @@ async fn tool_call_response_has_correct_structure() {
                     }
                 }]
             }),
-        ))
-        .await
-        .expect("response");
+        )?)
+        .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
 
-    let json = body_json(response.into_body()).await;
+    let json = body_json(response.into_body()).await?;
     assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
 
     let tool_calls = &json["choices"][0]["message"]["tool_calls"];
@@ -303,30 +312,29 @@ async fn tool_call_response_has_correct_structure() {
     let args: Value = serde_json::from_str(
         tool_calls[0]["function"]["arguments"]
             .as_str()
-            .expect("arguments string"),
-    )
-    .expect("args JSON");
+            .ok_or("arguments string")?,
+    )?;
     assert_eq!(args["location"], "Paris");
+    Ok(())
 }
 
 // ── /v1/chat/completions — streaming ─────────────────────────────────────────
 
 #[tokio::test]
-async fn chat_streaming_returns_sse_content_type() {
+async fn test_chat_streaming_returns_sse_content_type() -> TestResult {
     let app = build_router(test_state("streamed response"));
 
     let response = app
         .oneshot(json_request(
             "/v1/chat/completions",
             "POST",
-            json!({
+            &json!({
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": true
             }),
-        ))
-        .await
-        .expect("response");
+        )?)
+        .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
 
@@ -339,78 +347,68 @@ async fn chat_streaming_returns_sse_content_type() {
         ct.contains("text/event-stream"),
         "expected SSE content-type, got: {ct}"
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn chat_streaming_body_contains_done_sentinel() {
+async fn test_chat_streaming_body_contains_done_sentinel() -> TestResult {
     let app = build_router(test_state("hello world"));
 
     let response = app
         .oneshot(json_request(
             "/v1/chat/completions",
             "POST",
-            json!({
+            &json!({
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": true
             }),
-        ))
-        .await
-        .expect("response");
+        )?)
+        .await?;
 
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("collect")
-        .to_bytes();
-    let body = std::str::from_utf8(&bytes).expect("utf8");
+    let bytes = response.into_body().collect().await?.to_bytes();
+    let body = std::str::from_utf8(&bytes)?;
 
     assert!(body.contains("[DONE]"), "SSE stream must end with [DONE]");
     assert!(
         body.contains("chat.completion.chunk"),
         "SSE stream must contain chunk objects"
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn chat_streaming_first_chunk_has_role() {
+async fn test_chat_streaming_first_chunk_has_role() -> TestResult {
     let app = build_router(test_state("response text"));
 
     let response = app
         .oneshot(json_request(
             "/v1/chat/completions",
             "POST",
-            json!({
+            &json!({
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": true
             }),
-        ))
-        .await
-        .expect("response");
+        )?)
+        .await?;
 
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("collect")
-        .to_bytes();
-    let body = std::str::from_utf8(&bytes).expect("utf8");
+    let bytes = response.into_body().collect().await?.to_bytes();
+    let body = std::str::from_utf8(&bytes)?;
 
     // Extract the first `data:` line and parse it.
     let first_data = body
         .lines()
         .find(|l| l.starts_with("data:") && !l.contains("[DONE]"))
-        .expect("at least one data line");
+        .ok_or("at least one data line")?;
 
-    let chunk: Value =
-        serde_json::from_str(first_data.trim_start_matches("data:").trim()).expect("chunk JSON");
+    let chunk: Value = serde_json::from_str(first_data.trim_start_matches("data:").trim())?;
 
     assert_eq!(
         chunk["choices"][0]["delta"]["role"], "assistant",
         "first chunk must establish role"
     );
+    Ok(())
 }
 
 // ── Concurrent / batching behaviour ──────────────────────────────────────────
@@ -420,7 +418,7 @@ async fn chat_streaming_first_chunk_has_role() {
 /// and mock worker correctly handle multiple in-flight requests — the same
 /// contract the continuous-batch worker upholds for real model requests.
 #[tokio::test]
-async fn concurrent_non_streaming_requests_all_complete() {
+async fn test_concurrent_non_streaming_requests_all_complete() -> TestResult {
     const N: usize = 8;
 
     // axum::Router is cheaply clone-able — each `oneshot` call consumes a clone.
@@ -435,40 +433,40 @@ async fn concurrent_non_streaming_requests_all_complete() {
                     .oneshot(json_request(
                         "/v1/chat/completions",
                         "POST",
-                        json!({
+                        &json!({
                             "model": "test-model",
                             "messages": [{"role": "user", "content": format!("msg {i}")}]
                         }),
-                    ))
-                    .await
-                    .expect("response");
+                    )?)
+                    .await?;
 
                 let status = resp.status();
-                let json = body_json(resp.into_body()).await;
-                (status, json)
+                let json = body_json(resp.into_body()).await?;
+                Ok::<_, TestError>((status, json))
             })
         })
         .collect();
 
     for handle in handles {
-        let (status, json) = handle.await.expect("task");
+        let (status, json) = handle.await??;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["choices"][0]["message"]["role"], "assistant");
         let content = json["choices"][0]["message"]["content"]
             .as_str()
-            .expect("content string");
+            .ok_or("content string")?;
         assert!(
             content.contains("parallel"),
             "unexpected content: {content}"
         );
     }
+    Ok(())
 }
 
 /// Same as above but with streaming.  Every SSE stream must terminate with
 /// `[DONE]` and carry at least one `chat.completion.chunk` event, even when
 /// multiple streams are open at the same time.
 #[tokio::test]
-async fn concurrent_streaming_requests_all_complete() {
+async fn test_concurrent_streaming_requests_all_complete() -> TestResult {
     const N: usize = 8;
 
     let router = Arc::new(build_router(test_state("streamed token")));
@@ -482,44 +480,39 @@ async fn concurrent_streaming_requests_all_complete() {
                     .oneshot(json_request(
                         "/v1/chat/completions",
                         "POST",
-                        json!({
+                        &json!({
                             "model": "test-model",
                             "messages": [{"role": "user", "content": format!("stream {i}")}],
                             "stream": true
                         }),
-                    ))
-                    .await
-                    .expect("response");
+                    )?)
+                    .await?;
 
                 assert_eq!(resp.status(), StatusCode::OK);
 
-                let bytes = resp
-                    .into_body()
-                    .collect()
-                    .await
-                    .expect("collect")
-                    .to_bytes();
+                let bytes = resp.into_body().collect().await?.to_bytes();
 
-                std::str::from_utf8(&bytes).expect("utf8").to_string()
+                Ok::<_, TestError>(std::str::from_utf8(&bytes)?.to_owned())
             })
         })
         .collect();
 
     for handle in handles {
-        let body = handle.await.expect("task");
+        let body = handle.await??;
         assert!(body.contains("[DONE]"), "stream must end with [DONE]");
         assert!(
             body.contains("chat.completion.chunk"),
             "stream must contain chunk objects"
         );
     }
+    Ok(())
 }
 
 /// Verify that a mix of streaming and non-streaming requests in-flight at the
 /// same time all receive correct responses — this mirrors real usage where
 /// different clients use different modes simultaneously.
 #[tokio::test]
-async fn mixed_streaming_and_non_streaming_concurrent() {
+async fn test_mixed_streaming_and_non_streaming_concurrent() -> TestResult {
     let router = Arc::new(build_router(test_state("mixed result")));
 
     let non_stream_handle = {
@@ -530,13 +523,13 @@ async fn mixed_streaming_and_non_streaming_concurrent() {
                 .oneshot(json_request(
                     "/v1/chat/completions",
                     "POST",
-                    json!({
+                    &json!({
                         "model": "test-model",
                         "messages": [{"role": "user", "content": "blocking"}]
                     }),
-                ))
+                )?)
                 .await
-                .expect("response")
+                .map_err(TestError::from)
         })
     };
 
@@ -548,35 +541,36 @@ async fn mixed_streaming_and_non_streaming_concurrent() {
                 .oneshot(json_request(
                     "/v1/chat/completions",
                     "POST",
-                    json!({
+                    &json!({
                         "model": "test-model",
                         "messages": [{"role": "user", "content": "streaming"}],
                         "stream": true
                     }),
-                ))
+                )?)
                 .await
-                .expect("response")
+                .map_err(TestError::from)
         })
     };
 
     let (non_stream_resp, stream_resp) = tokio::join!(non_stream_handle, stream_handle);
 
-    let ns = non_stream_resp.expect("non-stream task");
+    let ns = non_stream_resp??;
     assert_eq!(ns.status(), StatusCode::OK);
-    let json = body_json(ns.into_body()).await;
+    let json = body_json(ns.into_body()).await?;
     assert_eq!(json["choices"][0]["message"]["role"], "assistant");
 
-    let ss = stream_resp.expect("stream task");
+    let ss = stream_resp??;
     assert_eq!(ss.status(), StatusCode::OK);
-    let bytes = ss.into_body().collect().await.expect("collect").to_bytes();
-    let body = std::str::from_utf8(&bytes).expect("utf8");
+    let bytes = ss.into_body().collect().await?.to_bytes();
+    let body = std::str::from_utf8(&bytes)?;
     assert!(body.contains("[DONE]"));
+    Ok(())
 }
 
 /// The worker channel has capacity 256.  Enqueuing more requests than the old
 /// capacity (4) must never return 503 — all requests must eventually complete.
 #[tokio::test]
-async fn large_burst_of_requests_does_not_return_503() {
+async fn test_large_burst_of_requests_does_not_return_503() -> TestResult {
     const N: usize = 32;
 
     let router = Arc::new(build_router(test_state("burst ok")));
@@ -585,25 +579,25 @@ async fn large_burst_of_requests_does_not_return_503() {
         .map(|_| {
             let router = Arc::clone(&router);
             tokio::spawn(async move {
-                (*router)
+                let status = (*router)
                     .clone()
                     .oneshot(json_request(
                         "/v1/chat/completions",
                         "POST",
-                        json!({
+                        &json!({
                             "model": "test-model",
                             "messages": [{"role": "user", "content": "burst"}]
                         }),
-                    ))
-                    .await
-                    .expect("response")
-                    .status()
+                    )?)
+                    .await?
+                    .status();
+                Ok::<_, TestError>(status)
             })
         })
         .collect();
 
     for handle in handles {
-        let status = handle.await.expect("task");
+        let status = handle.await??;
         assert_ne!(
             status,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -611,4 +605,5 @@ async fn large_burst_of_requests_does_not_return_503() {
         );
         assert_eq!(status, StatusCode::OK);
     }
+    Ok(())
 }

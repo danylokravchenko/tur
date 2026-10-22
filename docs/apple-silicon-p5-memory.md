@@ -25,6 +25,46 @@ halves its state again for capacity-bound deployments: 295 MB against 483 MB for
 four contexts. It is 8–12% slower in long prefill.
 
 The P0 M1 is the only measured device; Qwen3.8-27B has still not been executed.
+The performance tables below record P5 before [tiled attention
+prefill](apple-silicon-tiled-attention.md); that report contains the later kernel
+measurements and dispatch policy.
+
+## P3–P5 review cleanup (2026-10-22)
+
+Pool sizing now charges the permanent zero recurrent slot before assigning pages.
+Previously `for_budget` charged only usable slots, while `bytes` counted the zero
+slot too. A pool could exceed its explicit budget, and a default plan capped by the
+working set could fail despite room for a smaller pool. Whole-page rounding now
+stays inside the budget. Slot-count arithmetic is checked for overflow.
+
+Regression coverage includes exact and one-byte-short budgets, page boundaries,
+attention-only and recurrent-only layouts, overflow, a working-set-capped default
+plan, and pipeline admission/pressure with exact page capacities.
+
+All seven workspace members inherit the root Rust/Clippy lints. Unsafe Rust is
+forbidden; unwrap/expect, explicit panics and locks across await remain denied.
+HTTP fixtures propagate request/body/task errors and reject invalid mock arguments
+instead of silently substituting defaults. Assertions in fallible tests have a
+test-scoped allowance for `panic_in_result_fn`; benchmark output, exact config/code
+comparisons, mathematical variable names and consuming scratch regions have narrow,
+documented allowances where their semantics require them.
+
+Removed the ten unused workspace dependency declarations, unused adapter
+dependencies, CUDA feature wiring and the unused `BatchManager`, `InvalidPhase` and
+`BlockNotFound` errors. The engine's test-only lock dependency is a dev-dependency.
+Cargo removed 18 unreachable lockfile packages without adding or upgrading any.
+Pinned references and historical benchmark artifacts remain.
+
+Validation in the development profile:
+
+- `cargo nextest run --offline --workspace --no-default-features`: 111 passed;
+  four real-checkpoint tests explicitly skipped.
+- `cargo nextest run --offline --workspace --test-threads 1`, with host GPU access:
+  140 passed; seven real-checkpoint tests explicitly skipped.
+- Workspace/all-targets Clippy with `-D warnings` passes both with Metal and with
+  `--no-default-features`; formatting and whitespace checks pass.
+
+Checkpoint-dependent comparisons and benchmarks were not rerun for this cleanup.
 
 ## Design overview
 
@@ -76,7 +116,7 @@ The P0 M1 is the only measured device; Qwen3.8-27B has still not been executed.
 
 | Item | Contract |
 | --- | --- |
-| `PoolConfig { pages, recurrent_slots }` | Capacities; `for_budget` reserves two slots per concurrent sequence (its committed state and one in-flight state) and fills the rest of a byte budget with pages |
+| `PoolConfig { pages, recurrent_slots }` | Capacities; `for_budget` budgets the permanent zero slot plus two usable slots per concurrent sequence (its committed state and one in-flight state), then fills the rest with pages |
 | `StatePool` | Validated layout, zeroed device tensors, page and slot allocators, occupancy (`usage`), `reclaim` |
 | `Id { index, generation }` | A page or slot address; resolves only while its lease is live and its generation current |
 | `AttentionPool::gather/scatter`, `RecurrentPool::read/write` | Reference reads and writes for the CPU oracle and tests; kernels address pages directly |
@@ -389,8 +429,10 @@ Admission and pressure:
   context-dependent Q8 error to correct. Revisit for 4-bit K/V, or if the release
   quality suite finds a regression.
 - **4-bit K/V.** Not implemented. The plan evaluates it separately after 8-bit.
-- **Q8 prefill attention** costs 1.45× F32's: each query re-dequantizes every key. A tiled
-  (matrix-unit) prefill kernel, already open from P4, would dequantize each tile once.
+- **Q8 tiled prefill: implemented after P5.** The [tiled attention
+  kernel](apple-silicon-tiled-attention.md) dequantizes each staged tile once per
+  threadgroup. The original per-query measurements above remain historical evidence;
+  the tiled report records the current dispatch policy and kernel timings.
 - **Per-sequence DeltaNet dispatch.** It remains: the slot pools make one batched
   dispatch possible, but that change belongs to P6's packed execution work.
 - **Recurrent memory.** Every in-flight request holds two recurrent slots: its committed

@@ -203,16 +203,17 @@ environment variables.
 
 ## Limits
 
-- This is a reference implementation, not optimized execution:
+- The retained `Execution::Reference` implementation is the CPU path and numerical
+  oracle. Its costs include:
   - attention concatenates every committed page on each step;
   - the chunk solver and recurrence loop over candle ops;
-  - activations are F32;
-  - the loader keeps every raw text tensor in memory during load.
+  - activations are F32.
 
-  Page-native kernels, fused DeltaNet and quantized GEMM are P4/P5 work, so there are
-  no performance claims. P4 update: this reference remains the CPU path and the
-  numerical oracle (`Execution::Reference`); Metal now defaults to the fused kernels in
-  [the P4 report](apple-silicon-p4-metal.md).
+  Metal defaults to the fused kernels from [P4](apple-silicon-p4-metal.md), persistent
+  page pools from [P5](apple-silicon-p5-memory.md), and [tiled attention
+  prefill](apple-silicon-tiled-attention.md). The reference remains for differential
+  tests.
+- The loader keeps every raw text tensor in memory during load on both paths.
 - Speculative per-token recurrent snapshots grow with draft length (P8).
 - Image, video and audio inputs are rejected, not supported. MTP heads are not used.
 - The CLI and server use the hybrid path. Production scheduling/admission (P6),

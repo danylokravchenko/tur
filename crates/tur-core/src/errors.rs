@@ -18,16 +18,10 @@ pub enum TurError {
     Unhandled(#[from] Box<dyn std::error::Error + Send + Sync>),
     #[error("Unknown error: {0}")]
     Other(String),
-    #[error("Batch Manager Error: {0}")]
-    BatchManager(String),
     #[error("Request not found: {0}")]
     RequestNotFound(String),
-    #[error("Invalid request phase: {0}")]
-    InvalidPhase(String),
     #[error("Invalid execution or state transition: {0}")]
     InvalidExecution(String),
     #[error("Memory allocation error: {0}")]
     MemoryAllocation(String),
-    #[error("Block not found: {0}")]
-    BlockNotFound(usize),
 }

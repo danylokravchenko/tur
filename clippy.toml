@@ -1,5 +1,5 @@
-# This configuration enforces strict coding standards for a high-performance,
-# async Rust project dealing with database operations and networking.
+# Clippy thresholds for Tur inference, kernels and serving.
+# Lint levels live in Cargo.toml and are inherited by every workspace member.
 
 # ------------------------------------------------------------------------------
 # COGNITIVE COMPLEXITY
@@ -52,7 +52,7 @@ future-size-threshold = 16384
 # SAFETY
 # ------------------------------------------------------------------------------
 # Maximum strictness on unsafe code (should never be used per guidelines)
-# This is enforced through lint groups below
+# Unsafe Rust is forbidden by the workspace Rust lints in Cargo.toml.
 
 # ------------------------------------------------------------------------------
 # VECTOR OPERATIONS

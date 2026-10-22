@@ -20,6 +20,8 @@ Rust 1.99 or later is required. Metal is enabled by default on macOS.
 
 ```sh
 cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 cargo nextest run --workspace
 cargo build --bin tur --bin server
 ```
@@ -28,6 +30,11 @@ The offline suite uses small tensor and tokenizer fixtures. Real checkpoint test
 are explicitly ignored and require the environment variables documented in the
 [P3 report](docs/apple-silicon-p3-qwen.md). `--cpu-reference` on either binary selects
 the CPU numerical reference for development checks.
+
+Every workspace member inherits the shared Rust and Clippy lints, including forbidden
+unsafe Rust and denied unwrap/expect, explicit panic and lock-across-await paths.
+Fallible tests allow assertions while propagating setup and task errors with `?`.
+`--no-default-features` builds the CPU reference; obsolete CUDA features are removed.
 
 ## CLI
 
@@ -69,7 +76,9 @@ and `--kv-page-tokens` (default 16) the page size. `q8` halves K/V memory relati
 `f16` with a small, measured quality cost. `--state-memory-mb` sets the memory for K/V
 pages and recurrent state; by default each concurrent request gets room for an 8K-token
 context within the device's working set, and a budget beyond the working set is
-rejected.
+rejected. The budget includes the permanent zero recurrent slot, two usable recurrent
+slots per concurrent request, and whole K/V pages; page rounding stays within the
+requested bytes.
 
 ## HTTP server
 

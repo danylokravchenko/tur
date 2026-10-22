@@ -202,10 +202,7 @@ fn python_method(
     };
     let arg = |i: usize| args.get(i).and_then(|a| a.as_str());
     let strip = |chars: Option<&str>, start: bool, end: bool| -> String {
-        let keep = |c: char| match chars {
-            Some(set) => set.contains(c),
-            None => c.is_whitespace(),
-        };
+        let keep = |c: char| chars.map_or_else(|| c.is_whitespace(), |set| set.contains(c));
         let mut s = text;
         if start {
             s = s.trim_start_matches(keep);
@@ -294,6 +291,10 @@ fn python_tojson(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 mod tests {
     use super::*;
 

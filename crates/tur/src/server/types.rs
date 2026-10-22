@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Represents either a plain string or a typed content-part array,
-/// matching the OpenAI spec's two allowed forms for message content.
+/// matching the `OpenAI` spec's two allowed forms for message content.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
@@ -12,8 +12,8 @@ pub enum MessageContent {
 impl MessageContent {
     pub fn as_text(&self) -> String {
         match self {
-            MessageContent::Text(s) => s.clone(),
-            MessageContent::Parts(parts) => parts
+            Self::Text(s) => s.clone(),
+            Self::Parts(parts) => parts
                 .iter()
                 .map(|p| match p {
                     ContentPart::Text { text } => text.as_str(),
@@ -57,7 +57,7 @@ pub struct ChatCompletionRequest {
 pub struct ChatMessage {
     pub role: String,
     /// Content is a string or typed part array for user/system/assistant text
-    /// turns, null for assistant messages that only emit tool_calls.
+    /// turns, null for assistant messages that only emit `tool_calls`.
     pub content: Option<MessageContent>,
     pub tool_call_id: Option<String>,
     pub reasoning_content: Option<String>,
@@ -136,7 +136,7 @@ pub struct ResponseToolCall {
 #[derive(Debug, Serialize)]
 pub struct ResponseFunction {
     pub name: String,
-    /// JSON-encoded arguments string (as OpenAI specifies).
+    /// JSON-encoded arguments string (as `OpenAI` specifies).
     pub arguments: String,
 }
 

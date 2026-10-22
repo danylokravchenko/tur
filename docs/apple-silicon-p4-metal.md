@@ -322,9 +322,9 @@ exact rollback exist.
 - **Attention prefill on the matrix units: completed after P5.** The
   [tiled attention path](apple-silicon-tiled-attention.md) replaces per-query SIMD
   dot products for sufficiently populated query tiles, retaining split-K for decode.
-- **Per-pass K/V pool.** Attention still concatenates committed pages each pass, as P3
-  did. The kernel already addresses a block table, so P5 can switch to persistent
-  page-native pools without changing the kernel.
+- **Per-pass K/V pool: replaced in P5.** Attention now reads persistent page pools
+  directly; committed pages are no longer concatenated or staged per pass. The
+  per-pass storage descriptions above document the original P4 implementation.
 - **DeltaNet decode state traffic.** About 80 µs per layer for 0.8B, or roughly 25 GB/s
   effective on 2 MB of state read and write. It is insensitive to threadgroup shape.
 - **Scope of support.** F16/BF16 activations, other head or key sizes and more devices

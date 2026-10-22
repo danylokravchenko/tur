@@ -23,4 +23,6 @@ safetensors.workspace = true
 [features]
 default = ["metal"]
 metal = ["candle-core/metal", "candle-nn/metal", "tur-core/metal", "tur-metal/metal"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "tur-core/cuda", "tur-metal/cuda"]
+
+[lints]
+workspace = true

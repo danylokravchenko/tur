@@ -1,3 +1,8 @@
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "benchmarks emit JSON artifacts and timing summaries"
+)]
 #![forbid(unsafe_code)]
 //! K/V storage quality on a real checkpoint: teacher-forced next-token prediction over a
 //! long held-out text, every K/V format against F32 K/V on identical weights. Reports,

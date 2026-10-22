@@ -531,6 +531,10 @@ impl PackedExecution {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 mod tests {
     use super::*;
 

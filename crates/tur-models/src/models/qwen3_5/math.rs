@@ -1,3 +1,7 @@
+#![allow(
+    clippy::many_single_char_names,
+    reason = "tensor names follow the reference equations"
+)]
 //! F32 reference operations over one sequence. State tensors are values; no input is mutated.
 
 use candle_core::{D, DType, Device, Tensor};
@@ -15,7 +19,7 @@ pub(super) fn rms(x: &Tensor, scale: &Tensor, eps: f64) -> Result<Tensor> {
     Ok(x.broadcast_mul(&inv)?.broadcast_mul(scale)?)
 }
 
-/// Gated RMSNorm: normalise, scale by the (not zero-centred) weight, then gate with SiLU(z).
+/// Gated `RMSNorm`: normalise, scale by the (not zero-centred) weight, then gate with SiLU(z).
 pub(super) fn gated_rms(x: &Tensor, z: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     Ok((rms(x, weight, eps)? * candle_nn::ops::silu(z)?)?)
 }
@@ -213,7 +217,7 @@ pub(super) fn delta_chunked(inputs: &DeltaInputs<'_>, state: &Tensor) -> Result<
     let k_beta = k.broadcast_mul(&beta.unsqueeze(3)?)?;
     let cum = g.cumsum(2)?;
     let mask = strict_lower_mask(c, q.device())?;
-    let lower_or_diag = (mask.clone() + Tensor::eye(c, DType::F32, q.device())?)?;
+    let lower_or_diag = (mask + Tensor::eye(c, DType::F32, q.device())?)?;
     // exp(cum_i - cum_j) for j <= i; masked entries are zeroed after a safe exp.
     let pairwise = cum
         .unsqueeze(3)?
@@ -346,19 +350,23 @@ pub(super) fn attention(q: &Tensor, keys: &Tensor, values: &Tensor, past: usize)
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 mod tests {
     use super::*;
 
     fn random(shape: &[usize], seed: u64) -> Result<Tensor> {
         // Deterministic LCG values in (-1, 1); independent of RNG crates.
         let count: usize = shape.iter().product();
-        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
         let values: Vec<f32> = (0..count)
             .map(|_| {
                 state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 40) as f32 / (1u64 << 24) as f32).mul_add(2.0, -1.0)
             })
             .collect();
         Ok(Tensor::from_vec(values, shape, &Device::Cpu)?)
@@ -512,8 +520,8 @@ mod tests {
         for i in 0..2 {
             let angle = 3.0f32 / 10000f32.powf((2 * i) as f32 / 4.0);
             let (l, r) = (row[i], row[i + 2]);
-            assert!((out[i] - (l * angle.cos() - r * angle.sin())).abs() < 1e-6);
-            assert!((out[i + 2] - (r * angle.cos() + l * angle.sin())).abs() < 1e-6);
+            assert!((out[i] - f32::mul_add(r, -angle.sin(), l * angle.cos())).abs() < 1e-6);
+            assert!((out[i + 2] - f32::mul_add(l, angle.sin(), r * angle.cos())).abs() < 1e-6);
         }
         assert_eq!(&out[4..], &row[4..]);
         Ok(())
@@ -530,7 +538,7 @@ mod tests {
         let gated = gated_rms(&x, &z, &scale, 0.0)?.to_vec2::<f32>()?;
         assert!(gated[0][0].abs() < 1e-7);
         let silu = 1.0 / (1.0 + (-1.0f32).exp());
-        assert!((gated[0][1] - 8.0 / r * silu).abs() < 1e-6);
+        assert!((8.0 / r).mul_add(-silu, gated[0][1]).abs() < 1e-6);
         Ok(())
     }
 }

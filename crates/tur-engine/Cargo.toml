@@ -19,13 +19,14 @@ tokenizers.workspace = true
 llguidance.workspace = true
 toktrie_hf_tokenizers.workspace = true
 serde_json.workspace = true
-parking_lot.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+parking_lot.workspace = true
 
 [features]
 default = ["metal"]
 metal = ["candle-core/metal", "tur-core/metal", "tur-metal/metal", "tur-models/metal"]
-cuda = ["candle-core/cuda", "tur-core/cuda", "tur-metal/cuda", "tur-models/cuda"]
 
 [[bench]]
 name = "qwen3_5"
@@ -36,3 +37,6 @@ required-features = ["metal"]
 name = "kv_quality"
 harness = false
 required-features = ["metal"]
+
+[lints]
+workspace = true

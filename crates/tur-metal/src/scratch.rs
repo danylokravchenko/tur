@@ -50,6 +50,10 @@ impl ScratchPlan {
         Ok(())
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "consuming a region prevents releasing it twice"
+    )]
     pub fn release(&mut self, region: Region) {
         self.live = self.live.saturating_sub(region.0);
     }
@@ -66,6 +70,10 @@ impl ScratchPlan {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 mod tests {
     use super::*;
 

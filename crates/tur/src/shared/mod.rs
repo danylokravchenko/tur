@@ -52,6 +52,10 @@ pub fn inference_device(cpu_reference: bool) -> Result<candle_core::Device> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 mod tests {
     use super::*;
 

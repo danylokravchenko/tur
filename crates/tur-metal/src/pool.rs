@@ -31,8 +31,8 @@ pub struct PoolConfig {
 
 impl PoolConfig {
     /// Fit `bytes`: two recurrent slots per concurrent sequence (its committed state and one
-    /// in-flight state), then as many K/V pages as remain. Fails if either kind of state the
-    /// model needs gets no capacity.
+    /// in-flight state) plus the permanent zero slot, then as many K/V pages as remain.
+    /// Fails if either kind of state the model needs gets no capacity.
     pub fn for_budget(
         description: &ModelDescription,
         bytes: usize,
@@ -45,7 +45,10 @@ impl PoolConfig {
         } else {
             0
         };
-        let slot_bytes = recurrent_slots
+        let allocated_slots = recurrent_slots
+            .checked_add(usize::from(description.has_recurrent()))
+            .ok_or_else(|| invalid("recurrent slot count overflow"))?;
+        let slot_bytes = allocated_slots
             .checked_mul(description.recurrent_slot_bytes()?)
             .ok_or_else(|| invalid("recurrent pool size overflow"))?;
         let remaining = bytes.checked_sub(slot_bytes).ok_or_else(|| {
@@ -70,7 +73,9 @@ impl PoolConfig {
     /// Device bytes of pools with this capacity, including the zero slot.
     pub fn bytes(&self, description: &ModelDescription) -> Result<usize> {
         let slots = if description.has_recurrent() {
-            self.recurrent_slots + 1
+            self.recurrent_slots
+                .checked_add(1)
+                .ok_or_else(|| invalid("recurrent slot count overflow"))?
         } else {
             0
         };
@@ -97,7 +102,11 @@ impl PoolConfig {
             .checked_mul(description.kv.page_tokens)
             .ok_or_else(|| invalid("K/V slot count overflow"))?;
         u32::try_from(slots).map_err(|_| invalid("K/V pool exceeds u32 slot indices"))?;
-        u32::try_from(self.recurrent_slots + 1)
+        let recurrent_slots = self
+            .recurrent_slots
+            .checked_add(1)
+            .ok_or_else(|| invalid("recurrent slot count overflow"))?;
+        u32::try_from(recurrent_slots)
             .map_err(|_| invalid("recurrent pool exceeds u32 slot indices"))?;
         Ok(())
     }
@@ -689,11 +698,15 @@ impl RecurrentPool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 mod tests {
     use super::*;
     use tur_core::execution::{KvLayout, Modality, ModelIdentity};
 
-    pub(crate) fn description(page_tokens: usize, format: KvFormat) -> Arc<ModelDescription> {
+    pub fn description(page_tokens: usize, format: KvFormat) -> Arc<ModelDescription> {
         Arc::new(ModelDescription {
             identity: ModelIdentity {
                 revision: "pool-fixture".into(),
@@ -722,7 +735,7 @@ mod tests {
 
     fn rows(n: usize, seed: u64) -> Result<Tensor> {
         let values: Vec<f32> = (0..n * 128)
-            .map(|i| (((i as u64 * 2654435761 + seed * 97) % 2001) as f32 / 1000.0 - 1.0) * 3.0)
+            .map(|i| (((i as u64 * 2_654_435_761 + seed * 97) % 2001) as f32 / 1000.0 - 1.0) * 3.0)
             .collect();
         Ok(Tensor::from_vec(values, (n, 2, 64), &Device::Cpu)?)
     }
@@ -732,7 +745,8 @@ mod tests {
         let model = description(4, KvFormat::F32);
         let page = model.page_bytes()?;
         let slot = model.recurrent_slot_bytes()?;
-        let config = PoolConfig::for_budget(&model, 3 * page + 4 * slot + 7, 2)?;
+        let budget = 3 * page + 5 * slot + 7;
+        let config = PoolConfig::for_budget(&model, budget, 2)?;
         assert_eq!(
             config,
             PoolConfig {
@@ -741,11 +755,51 @@ mod tests {
             }
         );
         assert_eq!(config.bytes(&model)?, 3 * page + 5 * slot);
+        assert!(config.bytes(&model)? <= budget);
         assert!(PoolConfig::for_budget(&model, 4 * slot, 2).is_err());
         assert!(matches!(
             PoolConfig::for_budget(&model, slot, 2),
             Err(TurError::MemoryAllocation(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_budget_includes_zero_slot_at_page_and_recurrent_boundaries() -> Result<()> {
+        let model = description(4, KvFormat::F32);
+        let page = model.page_bytes()?;
+        let slot = model.recurrent_slot_bytes()?;
+        let minimum = page + 3 * slot;
+        assert!(PoolConfig::for_budget(&model, minimum - 1, 1).is_err());
+        for budget in [minimum, minimum + page - 1, minimum + page] {
+            let config = PoolConfig::for_budget(&model, budget, 1)?;
+            assert_eq!(config.pages, (budget - 3 * slot) / page);
+            assert!(config.bytes(&model)? <= budget);
+        }
+        let mut recurrent = (*model).clone();
+        recurrent
+            .layers
+            .retain(|kind| matches!(kind, LayerStateKind::Recurrent { .. }));
+        assert!(PoolConfig::for_budget(&recurrent, 3 * slot - 1, 1).is_err());
+        let config = PoolConfig::for_budget(&recurrent, 3 * slot, 1)?;
+        assert_eq!(config.bytes(&recurrent)?, 3 * slot);
+
+        let mut attention = (*model).clone();
+        attention
+            .layers
+            .retain(|kind| matches!(kind, LayerStateKind::Attention { .. }));
+        let config = PoolConfig::for_budget(&attention, page, 1)?;
+        assert_eq!(config.bytes(&attention)?, page);
+        assert_eq!(config.recurrent_slots, 0);
+        assert!(PoolConfig::for_budget(&model, usize::MAX, usize::MAX).is_err());
+        assert!(
+            PoolConfig {
+                pages: 1,
+                recurrent_slots: usize::MAX
+            }
+            .bytes(&model)
+            .is_err()
+        );
         Ok(())
     }
 

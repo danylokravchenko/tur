@@ -1,4 +1,4 @@
-//! SafeTensors checkpoint discovery, header validation and payload loading without mmap.
+//! `SafeTensors` checkpoint discovery, header validation and payload loading without mmap.
 
 use super::config::Config;
 use candle_core::{DType, Device, Tensor, safetensors::Load};
@@ -17,7 +17,7 @@ struct Entry {
     shape: Vec<usize>,
 }
 
-/// A validated set of text-tower tensors spread over one or more SafeTensors files.
+/// A validated set of text-tower tensors spread over one or more `SafeTensors` files.
 pub(super) struct Checkpoint {
     files: Vec<PathBuf>,
     entries: BTreeMap<String, Entry>,

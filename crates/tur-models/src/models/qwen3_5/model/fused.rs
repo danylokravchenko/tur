@@ -2,7 +2,7 @@
 //! Fused Metal execution of the Qwen3.5 hybrid decoder.
 //!
 //! Stateless work (projections, norms, rotary, activations, attention) runs once over the
-//! packed batch. The stateful DeltaNet convolution and scan dispatch once per sequence,
+//! packed batch. The stateful `DeltaNet` convolution and scan dispatch once per sequence,
 //! reading the committed slot and writing reserved slots of the layer's recurrent pool.
 //! Attention stores new keys and values into the persistent page pool (quantizing to its
 //! format) and reads every key in place through one page table shared by all layers; no

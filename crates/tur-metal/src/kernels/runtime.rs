@@ -159,7 +159,7 @@ pub struct Tuning {
     /// the per-query kernel when tiles average at least 16 query rows; below it, splitting
     /// keys fills the GPU better. 0 always tiles eligible passes; `usize::MAX` never tiles.
     pub attention_tiled_groups: usize,
-    /// Inclusive row counts served by the packed Q8_0 and Q4K GEMVs; other counts use
+    /// Inclusive row counts served by the packed `Q8_0` and Q4K GEMVs; other counts use
     /// Candle's one-row GEMV or tiled GEMM.
     pub gemv_q8_0_rows: (usize, usize),
     pub gemv_q4k_rows: (usize, usize),

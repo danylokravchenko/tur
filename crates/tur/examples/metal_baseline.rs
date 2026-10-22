@@ -1,3 +1,7 @@
+#![allow(
+    clippy::print_stdout,
+    reason = "this recorder emits its JSON artifact on stdout"
+)]
 #![forbid(unsafe_code)]
 
 use candle_core::{DType, Device, Tensor};
@@ -18,7 +22,10 @@ fn validate(actual: &Tensor, reference: &Tensor) -> Result<f32> {
     let mut max_error = 0.0_f32;
     for (actual, reference) in actual.iter().zip(reference.iter()) {
         let error = (actual - reference).abs();
-        if !actual.is_finite() || !reference.is_finite() || error > 1e-4 + 1e-4 * reference.abs() {
+        if !actual.is_finite()
+            || !reference.is_finite()
+            || error > 1e-4f32.mul_add(reference.abs(), 1e-4)
+        {
             return Err(io::Error::other(format!(
                 "Metal readback {actual} differs from CPU reference {reference}"
             ))
@@ -212,6 +219,10 @@ fn main() -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 mod tests {
     use super::*;
 

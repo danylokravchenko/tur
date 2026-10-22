@@ -1,3 +1,11 @@
+#![allow(
+    clippy::float_cmp,
+    reason = "quantization tests count exact stored-code differences"
+)]
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 #![cfg(feature = "metal")]
 #![forbid(unsafe_code)]
 //! Device-versus-reference differential tests for the fused Metal kernels. References are
@@ -29,13 +37,13 @@ fn setup() -> Result<(Device, Kernels, parking_lot::MutexGuard<'static, ()>)> {
 
 /// Deterministic values in (-scale, scale).
 fn values(count: usize, seed: u64, scale: f32) -> Vec<f32> {
-    let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+    let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
     (0..count)
         .map(|_| {
             state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * scale
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32).mul_add(2.0, -1.0) * scale
         })
         .collect()
 }
@@ -181,9 +189,9 @@ fn test_qk_norm_rope_reads_interleaved_heads_and_rotates_partially() -> Result<(
                         let angle = f64::from(p as f32 * freqs[f]);
                         let (sin, cos) = angle.sin_cos();
                         if i < half {
-                            y[i] * cos - y[i + half] * sin
+                            y[i + half].mul_add(-sin, y[i] * cos)
                         } else {
-                            y[i] * cos + y[i - half] * sin
+                            y[i - half].mul_add(sin, y[i] * cos)
                         }
                     } else {
                         y[i]
@@ -306,7 +314,10 @@ fn test_delta_conv_writes_offset_rows_and_slot_histories() -> Result<()> {
                 .flat_map(|r| (0..channels).map(move |c| (t + 1 + r, c)))
                 .map(|(r, c)| f64::from(full(r, c)))
                 .collect();
-            assert!(relative_error(&read(&pool.get(slot as usize)?)?, &expected) == 0.0);
+            assert_eq!(
+                relative_error(&read(&pool.get(slot as usize)?)?, &expected),
+                0.0
+            );
         }
         // The committed slot is untouched and unwritten slots keep their poison.
         assert_eq!(read(&pool.get(committed)?)?, history);
@@ -359,11 +370,14 @@ fn scan_reference(
             .exp();
             let beta = sigmoid(f64::from(pr[s.b_col + h]));
             let st = &mut state[h * dk * dv..(h + 1) * dk * dv];
-            st.iter_mut().for_each(|x| *x *= decay);
+            for x in st.iter_mut() {
+                *x *= decay;
+            }
             for j in 0..dv {
                 let prediction: f64 = (0..dk).map(|i| k[i] * st[i * dv + j]).sum();
                 let correction = (f64::from(v[j]) - prediction) * beta;
-                (0..dk).for_each(|i| st[i * dv + j] += k[i] * correction);
+                (0..dk)
+                    .for_each(|i| st[i * dv + j] = f64::mul_add(k[i], correction, st[i * dv + j]));
             }
             outputs.extend((0..dv).map(|j| (0..dk).map(|i| q[i] * st[i * dv + j]).sum::<f64>()));
         }
@@ -1049,9 +1063,9 @@ fn test_repeated_passes_reach_a_stable_allocation_bound() -> Result<()> {
         page: 16,
         sequences: vec![(100, 1), (3, 1)],
     };
-    let (k, v, slots, table, first, visible) = paged_pool(&case, 40);
-    let (key, _) = stored(&device, &k, slots, 2, 128, KvFormat::Q8)?;
-    let (value, _) = stored(&device, &v, slots, 2, 128, KvFormat::Q8)?;
+    let (keys, vals, slots, table, first, visible) = paged_pool(&case, 40);
+    let (key, _) = stored(&device, &keys, slots, 2, 128, KvFormat::Q8)?;
+    let (value, _) = stored(&device, &vals, slots, 2, 128, KvFormat::Q8)?;
     let pool = AttentionPool {
         key,
         value,
@@ -1060,10 +1074,10 @@ fn test_repeated_passes_reach_a_stable_allocation_bound() -> Result<()> {
         kv_heads: 2,
         head_dim: 128,
     };
-    let q = upload(&device, &values(2 * 8 * 128, 41, 1.0), &[2, 8, 128])?;
+    let queries = upload(&device, &values(2 * 8 * 128, 41, 1.0), &[2, 8, 128])?;
     let gate = upload(&device, &values(2 * 8 * 256, 42, 1.0), &[2, 8 * 256])?;
-    let w = upload(&device, &values(1024, 43, 1.0), &[1024])?;
-    let x = upload(&device, &values(2 * 1024, 44, 1.0), &[2, 1024])?;
+    let weight = upload(&device, &values(1024, 43, 1.0), &[1024])?;
+    let input = upload(&device, &values(2 * 1024, 44, 1.0), &[2, 1024])?;
     let step = || -> Result<()> {
         let paged = kernels.paged_kv(16, slots, &table, &first, &visible)?;
         let heads = Heads {
@@ -1072,9 +1086,9 @@ fn test_repeated_passes_reach_a_stable_allocation_bound() -> Result<()> {
             head_stride: 256,
             col_offset: 128,
         };
-        let attended = kernels.attention(&q, &pool, &paged, &gate, heads)?;
-        let (sum, _) = kernels.add_rms_norm(&x, &attended, &w, 1e-6)?;
-        let _normed = kernels.rms_norm(&sum, &w, 1e-6)?;
+        let attended = kernels.attention(&queries, &pool, &paged, &gate, heads)?;
+        let (sum, _) = kernels.add_rms_norm(&input, &attended, &weight, 1e-6)?;
+        let _normed = kernels.rms_norm(&sum, &weight, 1e-6)?;
         Ok(device.synchronize()?)
     };
     for _ in 0..3 {
@@ -1094,7 +1108,7 @@ fn test_completion_retains_kernel_outputs_until_the_fence() -> Result<()> {
     let x = upload(&device, &values(64, 45, 1.0), &[1, 64])?;
     let w = upload(&device, &[1.0; 64], &[64])?;
     let out = kernels.rms_norm(&x, &w, 1e-6)?;
-    let mut completion = Completion::new(device.clone(), &Quarantine::new(), out);
+    let mut completion = Completion::new(device, &Quarantine::new(), out);
     assert!(completion.take().is_none());
     completion.wait()?;
     let out = completion

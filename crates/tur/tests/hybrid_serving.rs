@@ -1,3 +1,7 @@
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 #![forbid(unsafe_code)]
 mod common;
 use axum::{
@@ -25,7 +29,7 @@ fn worker(fixture: &common::Checkpoint, batch: usize) -> Result<PipelineWorker> 
     })
 }
 
-fn request(body: Value) -> Result<Request<Body>> {
+fn request(body: &Value) -> Result<Request<Body>> {
     Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -54,10 +58,10 @@ async fn test_real_worker_serves_concurrent_requests_with_queued_admission() -> 
     };
     let router = build_router(state);
     let a = router.clone().oneshot(request(
-        json!({"messages":[{"role":"user","content":"t10 t11 t12 t13 t14"}],"max_tokens":3}),
+        &json!({"messages":[{"role":"user","content":"t10 t11 t12 t13 t14"}],"max_tokens":3}),
     )?);
     let b = router.oneshot(request(
-        json!({"model":"tiny","messages":[{"role":"user","content":"t20"}],"max_tokens":2}),
+        &json!({"model":"tiny","messages":[{"role":"user","content":"t20"}],"max_tokens":2}),
     )?);
     let (a, b) = tokio::join!(a, b);
     let a = json_body(a.map_err(|error| TurError::Other(error.to_string()))?).await?;
@@ -83,7 +87,7 @@ async fn test_real_stream_stops_at_tokenizer_eos_and_reports_usage() -> Result<(
         workers: HashMap::from([("tiny".into(), worker(&fixture, 2)?)]),
         default_model: "tiny".into(),
     };
-    let response = build_router(state).oneshot(request(json!({"messages":[{"role":"user","content":"t10 t11 t12"}],"stream":true,"max_tokens":20}))?).await
+    let response = build_router(state).oneshot(request(&json!({"messages":[{"role":"user","content":"t10 t11 t12"}],"stream":true,"max_tokens":20}))?).await
         .map_err(|error| TurError::Other(error.to_string()))?;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response
@@ -180,7 +184,7 @@ async fn test_http_preserves_sampling_thinking_and_tool_history() -> Result<()> 
             }));
         Ok::<(), TurError>(())
     });
-    let response = build_router(state).oneshot(request(json!({
+    let response = build_router(state).oneshot(request(&json!({
         "messages":[{"role":"user","content":"query"}, {"role":"assistant","reasoning_content":"reason","tool_calls":[{
             "id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"id\":\"123\"}"}
         }]}, {"role":"tool","tool_call_id":"call_1","content":"value"}, {"role":"user","content":"continue"}],
@@ -208,12 +212,12 @@ async fn test_http_rejects_unsupported_media_and_invalid_controls() -> Result<()
     ] {
         let response = router
             .clone()
-            .oneshot(request(body)?)
+            .oneshot(request(&body)?)
             .await
             .map_err(|error| TurError::Other(error.to_string()))?;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
-    let response = router.oneshot(request(json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}))?).await
+    let response = router.oneshot(request(&json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}))?).await
         .map_err(|error| TurError::Other(error.to_string()))?;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     Ok(())

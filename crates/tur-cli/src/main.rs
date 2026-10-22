@@ -19,20 +19,20 @@ struct Args {
         required_unless_present = "weight_path"
     )]
     model_id: Option<String>,
-    /// Local directory with SafeTensors, config, tokenizer and chat template.
+    /// Local directory with `SafeTensors`, config, tokenizer and chat template.
     #[arg(long, env = "MODEL_WEIGHT_PATH", conflicts_with = "model_id")]
     weight_path: Option<PathBuf>,
     /// Checkpoint commit (remote) or explicit immutable identity (local).
     #[arg(long)]
     revision: String,
-    /// Convert SafeTensors projections into this resident format: f32, q8_0, q4k.
+    /// Convert `SafeTensors` projections into this resident format: f32, `q8_0`, q4k.
     #[arg(long, default_value = "q8_0")]
     weight_format: WeightFormat,
     #[arg(long, default_value = "Who are you?")]
     prompt: String,
     #[arg(short = 'n', long, default_value_t = 128)]
     max_tokens: usize,
-    /// Unset sampling controls inherit generation_config.json.
+    /// Unset sampling controls inherit `generation_config.json`.
     #[arg(long)]
     temperature: Option<f64>,
     #[arg(long)]

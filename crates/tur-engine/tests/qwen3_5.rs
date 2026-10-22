@@ -1,3 +1,11 @@
+#![allow(
+    clippy::print_stderr,
+    reason = "checkpoint comparisons report numerical evidence to the test runner"
+)]
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 #![forbid(unsafe_code)]
 //! Qwen3.5 through `HybridEngine`: prefill/chunk/decode agreement, batch isolation,
 //! speculation and quantization on a tiny random checkpoint, plus real-checkpoint
@@ -158,7 +166,7 @@ fn test_batch_members_entering_and_leaving_do_not_leak_state() -> Result<()> {
     let a = runner
         .engine
         .allocate(0, SamplingOptions::default(), None)?;
-    let mut a_out = runner.step(&[(a, a_prompt.clone())])?;
+    let mut a_out = runner.step(&[(a, a_prompt)])?;
     let mut b = None;
     let mut b_out = Vec::new();
     while a_out.len() < 10 {
@@ -319,7 +327,7 @@ fn test_q8_projection_storage_tracks_f32() -> Result<()> {
         .filter(|(a, b)| argmax(a) == argmax(b))
         .count();
     let error = max_relative(&q, &f);
-    println!(
+    eprintln!(
         "Q8_0 tiny: relative logit error {error:.3e}; top-1 {agree}/{}",
         f.len()
     );
@@ -382,7 +390,7 @@ fn real(format: WeightFormat) -> Result<Real> {
         .generation_defaults(generation.as_deref())?
         .eos_tokens;
     // The tokenizer's EOS (<|im_end|>) ends a chat turn.
-    stops.push(248046);
+    stops.push(248_046);
     Ok(Real {
         model,
         prompt: i64_ids(get("input_ids")?)?,
@@ -493,7 +501,7 @@ fn test_quantized_generation_is_coherent() -> Result<()> {
         let text = tokenizer
             .decode(&output, true)
             .map_err(|e| TurError::Tokenizer(e.to_string()))?;
-        println!(
+        eprintln!(
             "{format:?}: top-1 agreement {agree:.3}; greedy prefix {prefix}/{}; {text:?}",
             expected.len()
         );

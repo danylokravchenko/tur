@@ -1,3 +1,7 @@
+#![allow(
+    clippy::many_single_char_names,
+    reason = "tensor names follow the reference equations"
+)]
 //! Packed Qwen3.5/3.8 text execution over explicit hybrid state.
 
 use super::{
@@ -176,7 +180,7 @@ fn f32_on(tensor: &Tensor, device: &Device) -> Result<Tensor> {
     Ok(tensor.to_dtype(DType::F32)?.to_device(device)?)
 }
 
-/// Zero-centred RMSNorm stores `w`; fold the `1 + w` scale once at load.
+/// Zero-centred `RMSNorm` stores `w`; fold the `1 + w` scale once at load.
 fn centred(tensor: &Tensor, device: &Device) -> Result<Tensor> {
     Ok((tensor.to_dtype(DType::F32)? + 1.0)?.to_device(device)?)
 }
@@ -734,8 +738,8 @@ impl HybridModel for Qwen35 {
         self.description.clone()
     }
 
-    /// Peak fused-kernel scratch of this plan (projections, convolved channels, the
-    /// per-pass K/V pool and split partials). The reference path is a development oracle
+    /// Peak fused-kernel scratch of this plan (projections, convolved channels, page
+    /// addressing and split partials). The reference path is a development oracle
     /// and declares none.
     fn workspace_bytes(&self, batch: &PackedForward<'_>) -> Result<usize> {
         #[cfg(feature = "metal")]

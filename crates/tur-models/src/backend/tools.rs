@@ -48,21 +48,17 @@ impl ToolCall {
         let mut calls = Vec::new();
         let mut remaining = text;
 
-        while let Some(start) = remaining.find(OPEN) {
-            let after_open = &remaining[start + OPEN.len()..];
-            match after_open.find(CLOSE) {
-                Some(end) => {
-                    let json_str = after_open[..end].trim();
-                    if let Some(call) = serde_json::from_str::<ToolCall>(json_str)
-                        .ok()
-                        .or_else(|| parse_xml_call(json_str, tools))
-                    {
-                        calls.push(call);
-                    }
-                    remaining = &after_open[end + CLOSE.len()..];
-                }
-                None => break,
+        while let Some((_, after_open)) = remaining.split_once(OPEN) {
+            let Some((body, rest)) = after_open.split_once(CLOSE) else {
+                break;
+            };
+            if let Some(call) = serde_json::from_str::<Self>(body.trim())
+                .ok()
+                .or_else(|| parse_xml_call(body.trim(), tools))
+            {
+                calls.push(call);
             }
+            remaining = rest;
         }
 
         calls

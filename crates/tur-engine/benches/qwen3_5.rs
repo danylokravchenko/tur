@@ -1,3 +1,8 @@
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "benchmarks emit JSON artifacts and timing summaries"
+)]
 #![forbid(unsafe_code)]
 //! Qwen3.5 model-level benchmark on a real checkpoint: fused Metal passes over persistent
 //! state pools for prefill and batched decode at several contexts, per weight and K/V
@@ -203,7 +208,7 @@ fn engine_case(model: Arc<Qwen35>, generated: usize) -> Result<Value> {
     let handle = engine.allocate(0, SamplingOptions::default(), None)?;
     let mut next = tokens(SHORT_CONTEXT, 99);
     let mut samples = Vec::new();
-    for step in 0..generated + 1 {
+    for step in 0..=generated {
         let meta = engine.metadata(handle.request)?;
         let n = next.len();
         let start = Instant::now();

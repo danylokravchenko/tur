@@ -70,20 +70,22 @@ impl MemoryPlan {
             .and_then(|b| b.checked_add(overhead))
             .ok_or_else(|| invalid("memory plan overflow"))?;
         let available = inputs.limit.map(|limit| limit.saturating_sub(fixed));
-        let bytes = match inputs.state_bytes {
-            Some(bytes) => bytes,
-            None => {
-                let context = DEFAULT_CONTEXT_TOKENS.min(description.max_position);
-                let wanted = PoolConfig {
-                    pages: description
-                        .pages_for(context)
-                        .checked_mul(inputs.sequences)
-                        .ok_or_else(|| invalid("page count overflow"))?,
-                    recurrent_slots: 2 * inputs.sequences,
-                }
-                .bytes(description)?;
-                available.map_or(wanted, |available| wanted.min(available))
+        let bytes = if let Some(bytes) = inputs.state_bytes {
+            bytes
+        } else {
+            let context = DEFAULT_CONTEXT_TOKENS.min(description.max_position);
+            let wanted = PoolConfig {
+                pages: description
+                    .pages_for(context)
+                    .checked_mul(inputs.sequences)
+                    .ok_or_else(|| invalid("page count overflow"))?,
+                recurrent_slots: inputs
+                    .sequences
+                    .checked_mul(2)
+                    .ok_or_else(|| invalid("recurrent slot count overflow"))?,
             }
+            .bytes(description)?;
+            available.map_or(wanted, |available| wanted.min(available))
         };
         let config = PoolConfig::for_budget(description, bytes, inputs.sequences)?;
         let plan = Self {
@@ -110,6 +112,10 @@ impl MemoryPlan {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 mod tests {
     use super::*;
     use candle_core::DType;
@@ -184,6 +190,29 @@ mod tests {
             Err(TurError::MemoryAllocation(_))
         ));
         assert!(MemoryPlan::new(&model, inputs(Some(0), None)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_budget_boundaries_fit_without_overallocating_the_zero_slot() -> Result<()> {
+        let model = description();
+        let page = model.page_bytes()?;
+        let slot = model.recurrent_slot_bytes()?;
+        let minimum = page + 5 * slot;
+        assert!(MemoryPlan::new(&model, inputs(Some(minimum - 1), None)).is_err());
+        for budget in [minimum, minimum + page - 1, minimum + page] {
+            let (plan, _) = MemoryPlan::new(&model, inputs(Some(budget), None))?;
+            assert!(plan.state_pool <= budget);
+        }
+        // Leave exactly ten pages plus usable slots after fixed allocations and overhead.
+        // The zero slot must reduce page capacity instead of exceeding the working set.
+        let limit = (1600 + 10 * page + 4 * slot) * 10 / 9;
+        let (plan, config) = MemoryPlan::new(&model, inputs(None, Some(limit)))?;
+        assert_eq!(config.pages, 9);
+        assert!(plan.resident() <= limit);
+        let mut overflow = inputs(None, None);
+        overflow.sequences = usize::MAX;
+        assert!(MemoryPlan::new(&model, overflow).is_err());
         Ok(())
     }
 }

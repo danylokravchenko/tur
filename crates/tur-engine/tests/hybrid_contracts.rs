@@ -1,3 +1,7 @@
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
 #![forbid(unsafe_code)]
 
 use candle_core::{DType, Device, Tensor};
@@ -125,7 +129,7 @@ impl Fixture {
                     let mut history = Vec::new();
                     let mut matrices = Vec::new();
                     for &token in tokens {
-                        value = 2.0 * value + token as f32 + last;
+                        value = 2.0f32.mul_add(value, token as f32) + last;
                         history.extend([last, token as f32]);
                         matrices.push(value);
                         last = token as f32;
@@ -764,7 +768,7 @@ fn test_invalid_descriptors_are_rejected_before_model_execution() -> Result<()> 
     let mut value = input.clone();
     value.sequences[0].tokens = 0..0;
     cases.push(value);
-    let mut value = input.clone();
+    let mut value = input;
     value.tokens.clear();
     cases.push(value);
     for invalid in cases {
@@ -896,7 +900,7 @@ fn test_no_output_positions_advance_only_model_state() -> Result<()> {
     let saved = checkpoint(&engine, a)?;
     assert_eq!(saved.position(), 2);
     assert_eq!(saved.rng_draws(), 0);
-    assert!(saved.sampled_tokens().is_empty());
+    assert_eq!(saved.sampled_tokens(), &[] as &[u32]);
     let a = handle(&engine, a)?;
     assert_eq!(tokens(&run(&mut engine, &[(a, &[3])])?), vec![1]);
     Ok(())
