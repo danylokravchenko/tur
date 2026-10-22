@@ -26,8 +26,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--profile", choices=("dev", "pre-release"), default="pre-release")
-    parser.add_argument("--example", choices=("metal_baseline", "model_baseline"), default="metal_baseline")
-    parser.add_argument("--hf-home", type=Path)
+    parser.add_argument("--example", choices=("metal_baseline",), default="metal_baseline")
     parser.add_argument("example_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
@@ -79,13 +78,6 @@ def main():
         for path in sources
     }
     environment = dict(os.environ)
-    if args.hf_home:
-        environment.update(HF_HOME=str(args.hf_home.resolve()), HF_ENDPOINT="http://127.0.0.1:9")
-        metadata["checkpoints"] = json.loads((args.hf_home / "checkpoints.json").read_text())
-        metadata["checkpoint"] = metadata["checkpoints"]["repositories"]
-        metadata["tokenizer"] = "pinned Qwen repository tokenizer.json and tokenizer_config.json"
-        metadata["template"] = metadata["checkpoints"]["qwen_chat_template_sha256"]
-        metadata["quantizer"] = metadata["checkpoints"]["quantization"]
     build = capture(["cargo", "build", "--locked", "--offline", "-p", "tur", "--example", args.example, "--profile", args.profile])
     (args.output / "build.stdout").write_text(build.pop("stdout"))
     (args.output / "build.stderr").write_text(build.pop("stderr"))

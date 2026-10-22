@@ -1,255 +1,183 @@
-use std::{collections::HashMap, sync::Arc};
+#![forbid(unsafe_code)]
+//! A dedicated execution owner between async HTTP handlers and hybrid inference.
 
+use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
-    AutoModelFactory, Result, TurError,
-    backend::{
-        chat_template::Message,
-        pipeline::{GenerationRequest, GenerationStats, InferencePipeline},
-        tools::{ToolCall, ToolDefinition},
-    },
+    ModelFactory, Result, TurError,
+    backend::pipeline::{GenerationRequest, GenerationStats, InferencePipeline},
 };
 
-/// A single generation job sent from the async HTTP layer to the worker thread.
+/// A validated text conversation and its independent response channels.
 pub struct WorkerMsg {
-    pub messages: Vec<Message>,
-    pub tools: Vec<ToolDefinition>,
-    pub max_tokens: usize,
-    pub thinking: bool,
-    /// Token stream — each generated token is sent here.  The channel is
-    /// closed when generation completes so the consumer detects end-of-stream.
+    pub request: GenerationRequest,
     pub token_tx: mpsc::UnboundedSender<String>,
     pub result_tx: oneshot::Sender<Result<GenerationStats>>,
 }
 
-/// Configuration used to build the pipeline inside the worker thread.
+/// Checkpoint and admission limits for one worker. Model operations stay on its OS thread.
 pub struct WorkerConfig {
-    pub factory: Arc<AutoModelFactory>,
-    pub seed: u64,
-    pub temperature: Option<f64>,
-    pub top_p: Option<f64>,
-    pub repeat_penalty: f32,
-    pub repeat_last_n: usize,
-    /// Maximum number of requests to process simultaneously in the decode step.
+    pub factory: ModelFactory,
     pub max_batch_size: usize,
-    /// Enable prefix KV-cache to reuse prompt tokens across turns.
-    pub prefix_cache: bool,
-    /// Maximum number of cached prefixes.
-    pub prefix_cache_max_entries: usize,
-    /// Maximum token length eligible for prefix caching.
-    pub prefix_cache_max_tokens: usize,
+    pub prefill_chunk_size: usize,
 }
 
-/// Per-request state kept in the worker while a request is in-flight.
 struct PendingRequest {
     token_tx: mpsc::UnboundedSender<String>,
     result_tx: oneshot::Sender<Result<GenerationStats>>,
-    /// Whether the original request included tool definitions.
-    /// When true the worker parses tool calls from the generated text at
-    /// completion time.
-    has_tools: bool,
 }
 
-/// Handle to the dedicated pipeline worker thread.  Cheap to clone.
+/// Handle to a single-owner packed hybrid worker with a bounded intake queue.
 #[derive(Clone)]
 pub struct PipelineWorker {
     tx: mpsc::Sender<WorkerMsg>,
 }
 
+fn admit(
+    msg: WorkerMsg,
+    pipeline: &mut InferencePipeline,
+    pending: &mut HashMap<Uuid, PendingRequest>,
+) {
+    if msg.result_tx.is_closed() || msg.token_tx.is_closed() {
+        return;
+    }
+    match pipeline.submit_request(&msg.request) {
+        Ok(id) => {
+            pending.insert(
+                id,
+                PendingRequest {
+                    token_tx: msg.token_tx,
+                    result_tx: msg.result_tx,
+                },
+            );
+        }
+        Err(error) => {
+            let _ = msg.result_tx.send(Err(error));
+        }
+    }
+}
+
+fn serve(
+    mut rx: mpsc::Receiver<WorkerMsg>,
+    mut pipeline: InferencePipeline,
+    limit: usize,
+) -> Result<()> {
+    let mut pending: HashMap<Uuid, PendingRequest> = HashMap::new();
+    loop {
+        if pending.is_empty() {
+            let Some(msg) = rx.blocking_recv() else {
+                return Ok(());
+            };
+            admit(msg, &mut pipeline, &mut pending);
+        }
+        while pending.len() < limit {
+            match rx.try_recv() {
+                Ok(msg) => admit(msg, &mut pipeline, &mut pending),
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+        let cancelled: Vec<Uuid> = pending
+            .iter()
+            .filter(|(_, request)| request.result_tx.is_closed() || request.token_tx.is_closed())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in cancelled {
+            pipeline.cancel(id)?;
+            pending.remove(&id);
+        }
+        let step = match pipeline.step_streaming() {
+            Ok(step) => step,
+            Err(error) => {
+                for (_, request) in pending.drain() {
+                    let _ = request
+                        .result_tx
+                        .send(Err(TurError::Other(error.to_string())));
+                }
+                return Err(error);
+            }
+        };
+        for (id, text) in step.new_tokens {
+            if let Some(request) = pending.get(&id) {
+                let _ = request.token_tx.send(text);
+            }
+        }
+        for (id, result) in step.completed {
+            if let Some(request) = pending.remove(&id) {
+                drop(request.token_tx);
+                let _ = request.result_tx.send(result);
+            }
+        }
+    }
+}
+
 impl PipelineWorker {
-    /// Spawn the worker thread and build the pipeline inside it.
-    ///
-    /// The pipeline is built with continuous batching enabled so multiple
-    /// in-flight requests share every GPU forward pass.  Metal/CUDA device
-    /// state never crosses thread boundaries — all model operations happen on
-    /// the single dedicated OS thread.
+    /// Load and validate the checkpoint before reporting readiness. Startup errors propagate.
     pub fn spawn(config: WorkerConfig) -> Result<Self> {
-        // Larger channel so many concurrent HTTP handlers can enqueue without
-        // back-pressure.  The scheduler's own memory-based admission control is
-        // the real throttle.
-        let (tx, rx) = mpsc::channel::<WorkerMsg>(256);
-
+        let (tx, rx) = mpsc::channel(256);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
-            .name("pipeline-worker".to_string())
+            .name("hybrid-worker".into())
             .spawn(move || {
-                let WorkerConfig {
-                    factory,
-                    seed,
-                    temperature,
-                    top_p,
-                    repeat_penalty,
-                    repeat_last_n,
-                    max_batch_size,
-                    prefix_cache,
-                    prefix_cache_max_entries,
-                    prefix_cache_max_tokens,
-                } = config;
-
-                let device = factory.device().clone();
-
-                let mut builder = InferencePipeline::builder(&*factory, device)
-                    .seed(seed)
-                    .repeat_penalty(repeat_penalty)
-                    .repeat_last_n(repeat_last_n)
-                    .enable_batching(true)
-                    .max_batch_size(max_batch_size)
-                    .max_prefill_batch(max_batch_size)
-                    .max_decode_batch(max_batch_size);
-
-                if let Some(temp) = temperature {
-                    builder = builder.temperature(temp);
-                }
-                if let Some(tp) = top_p {
-                    builder = builder.top_p(tp);
-                }
-                if prefix_cache {
-                    builder = builder.with_prefix_cache(prefix_cache_max_entries, prefix_cache_max_tokens);
-                }
-
-                let mut pipeline = builder.build();
-                debug!("Pipeline worker ready (continuous batching enabled, max_batch={max_batch_size})");
-
-                // Per-request routing table: uuid → (token_tx, result_tx, has_tools)
-                let mut pending: HashMap<Uuid, PendingRequest> = HashMap::new();
-
-                // We need a blocking handle to the tokio receiver.  The channel
-                // is created outside (in async context) but we receive on it here
-                // from a plain OS thread using `blocking_recv`.
-                let mut rx = rx;
-
-                loop {
-                    // ── 1. Intake new requests ──────────────────────────────
-                    if pending.is_empty() {
-                        // Nothing in flight: block until the next message
-                        // arrives so we don't busy-spin.
-                        let msg = match rx.blocking_recv() {
-                            Some(m) => m,
-                            None => {
-                                debug!("Pipeline worker channel closed, shutting down");
-                                return;
-                            }
-                        };
-                        Self::admit_msg(msg, &mut pipeline, &mut pending);
-                    }
-
-                    // Drain any additional messages that arrived without blocking.
-                    loop {
-                        match rx.try_recv() {
-                            Ok(msg) => Self::admit_msg(msg, &mut pipeline, &mut pending),
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                debug!("Pipeline worker channel disconnected");
-                                // Drain remaining pending requests with an error.
-                                for (_, pr) in pending.drain() {
-                                    let _ = pr.result_tx.send(Err(TurError::Other(
-                                        "Worker shutting down".to_string(),
-                                    )));
-                                }
-                                return;
-                            }
-                        }
-                    }
-
-                    // ── 2. Run one scheduling iteration ────────────────────
-                    match pipeline.step_streaming() {
-                        Ok(output) => {
-                            // Route streaming tokens to their HTTP handlers.
-                            for (id, text) in output.new_tokens {
-                                if let Some(pr) = pending.get(&id) {
-                                    let _ = pr.token_tx.send(text);
-                                }
-                            }
-
-                            // Complete finished requests.
-                            for (id, mut result) in output.completed {
-                                if let Some(pr) = pending.remove(&id) {
-                                    // Parse tool calls from the full generated
-                                    // text when the request included tools.
-                                    if pr.has_tools {
-                                        result.stats.tool_calls =
-                                            ToolCall::parse_from_output(&result.generated_text);
-                                    }
-                                    // Dropping token_tx closes the stream so the
-                                    // HTTP handler detects end-of-tokens.
-                                    drop(pr.token_tx);
-                                    let _ = pr.result_tx.send(Ok(result.stats));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Scheduler step failed: {e}");
-                            // Propagate the error to every waiting request and
-                            // reset — the pipeline may be in an undefined state.
-                            for (_, pr) in pending.drain() {
-                                drop(pr.token_tx);
-                                let _ = pr.result_tx.send(Err(TurError::Other(e.to_string())));
-                            }
+                match InferencePipeline::new(
+                    &config.factory,
+                    config.max_batch_size,
+                    config.prefill_chunk_size,
+                ) {
+                    Ok(pipeline) => {
+                        if ready_tx.send(Ok(())).is_err() {
                             return;
                         }
+                        if let Err(error) = serve(rx, pipeline, config.max_batch_size) {
+                            tracing::warn!("Hybrid worker stopped: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
                     }
                 }
-            })
-            .map_err(|e| TurError::Other(format!("Failed to spawn pipeline worker: {e}")))?;
-
+            })?;
+        ready_rx
+            .recv()
+            .map_err(|error| TurError::Other(format!("Worker startup failed: {error}")))??;
         Ok(Self { tx })
     }
 
-    /// Format the incoming message and enqueue it with the scheduler.
-    fn admit_msg(
-        msg: WorkerMsg,
-        pipeline: &mut InferencePipeline<crate::backend::AnyModel>,
-        pending: &mut HashMap<Uuid, PendingRequest>,
-    ) {
-        let tools_opt = if msg.tools.is_empty() {
-            None
-        } else {
-            Some(msg.tools.as_slice())
-        };
-        let prompt = pipeline.format_messages(&msg.messages, tools_opt, msg.thinking);
-
-        let mut req = GenerationRequest::new(prompt, msg.max_tokens).with_raw(true);
-        if !msg.tools.is_empty() {
-            req = req.with_tools(msg.tools.clone());
-        }
-        if msg.thinking {
-            req = req.with_thinking(true);
-        }
-
-        let has_tools = !msg.tools.is_empty();
-        match pipeline.submit_request(&req) {
-            Ok(handle) => {
-                pending.insert(
-                    handle.id,
-                    PendingRequest {
-                        token_tx: msg.token_tx,
-                        result_tx: msg.result_tx,
-                        has_tools,
-                    },
-                );
-            }
-            Err(e) => {
-                drop(msg.token_tx);
-                let _ = msg.result_tx.send(Err(e));
-            }
-        }
-    }
-
-    /// Build a `PipelineWorker` from an already-created channel sender.
-    ///
-    /// Useful in tests: the caller spawns a Tokio task that receives
-    /// `WorkerMsg` values and responds with predetermined output, then wraps
-    /// its `Sender` here to obtain a usable `PipelineWorker`.
+    /// Wrap a caller-provided sender, allowing HTTP tests to provide deterministic workers.
     pub fn from_sender(tx: mpsc::Sender<WorkerMsg>) -> Self {
         Self { tx }
     }
 
+    /// Enqueue a conversation with backpressure when the intake queue is full.
     pub async fn send(&self, msg: WorkerMsg) -> Result<()> {
         self.tx
             .send(msg)
             .await
-            .map_err(|_| TurError::Other("Pipeline worker unavailable".to_string()))
+            .map_err(|_| TurError::Other("Hybrid worker unavailable".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ModelSource, models::qwen3_5::WeightFormat};
+    use candle_core::Device;
+
+    #[test]
+    fn test_startup_failure_is_returned_before_worker_is_ready() {
+        let result = PipelineWorker::spawn(WorkerConfig {
+            factory: ModelFactory {
+                source: ModelSource::LocalPath("/missing/tur-checkpoint".into()),
+                revision: "fixture".into(),
+                format: WeightFormat::F32,
+                device: Device::Cpu,
+            },
+            max_batch_size: 1,
+            prefill_chunk_size: 64,
+        });
+        assert!(result.is_err());
     }
 }

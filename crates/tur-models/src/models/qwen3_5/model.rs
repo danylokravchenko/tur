@@ -34,6 +34,19 @@ pub enum WeightFormat {
     Q4K,
 }
 
+impl std::str::FromStr for WeightFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "f32" => Ok(Self::F32),
+            "q8_0" => Ok(Self::Q8_0),
+            "q4k" => Ok(Self::Q4K),
+            _ => Err("weight format must be f32, q8_0 or q4k (SafeTensors conversion)".into()),
+        }
+    }
+}
+
 impl WeightFormat {
     fn tag(self) -> &'static str {
         match self {

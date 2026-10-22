@@ -34,6 +34,7 @@ pub enum ContentPart {
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
+    #[serde(default)]
     pub model: String,
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
@@ -41,11 +42,15 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<usize>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub top_k: Option<usize>,
+    pub seed: Option<u64>,
     #[serde(default)]
     pub tools: Vec<OpenAITool>,
     pub tool_choice: Option<serde_json::Value>,
     #[serde(default, alias = "enable_thinking")]
-    pub thinking: bool,
+    pub thinking: Option<bool>,
+    pub reasoning_effort: Option<String>,
+    pub preserve_thinking: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +60,7 @@ pub struct ChatMessage {
     /// turns, null for assistant messages that only emit tool_calls.
     pub content: Option<MessageContent>,
     pub tool_call_id: Option<String>,
+    pub reasoning_content: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<AssistantToolCall>,
 }

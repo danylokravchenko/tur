@@ -31,11 +31,7 @@ async-stream = { workspace = true }
 tikv-jemallocator.workspace = true
 
 [dev-dependencies]
-candle-transformers.workspace = true
 tokenizers.workspace = true
-parking_lot.workspace = true
-clap.workspace = true
-criterion.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
 
@@ -46,11 +42,6 @@ objc2-foundation.workspace = true
 
 [features]
 default = ["metal"]
-flash-attn = ["tur-engine/flash-attn"]
 cuda = ["tur-engine/cuda", "tur-metal/cuda", "tur-models/cuda", "tur-core/cuda", "candle-core/cuda"]
 metal = ["tur-engine/metal", "tur-metal/metal", "tur-models/metal", "tur-core/metal", "candle-core/metal", "dep:metal"]
-
-[[bench]]
-name = "tur"
-harness = false
 

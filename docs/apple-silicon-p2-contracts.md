@@ -1,5 +1,10 @@
 # P2 ownership and hybrid state contracts
 
+P3 update: the temporary legacy model/engine/cache exports described in this P2
+report have been removed. CLI and HTTP now use the hybrid pipeline; see the
+[P3 migration report](apple-silicon-p3-qwen.md). Hybrid state contracts below remain
+in use.
+
 Status: implemented on 2026-10-21 and revised the same day after review. The revision
 replaces the per-token `step` contract with packed execution, isolates per-request
 failures, removes per-token snapshot retention, moves sampling behind the completion

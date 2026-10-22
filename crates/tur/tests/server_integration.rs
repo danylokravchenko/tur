@@ -46,6 +46,7 @@ fn mock_worker(response_text: &'static str) -> PipelineWorker {
             drop(msg.token_tx);
             // generated_text is used by the non-streaming path in blocking_response.
             let _ = msg.result_tx.send(Ok(GenerationStats {
+                finish_reason: "stop",
                 generated_tokens: response_text.split_whitespace().count(),
                 prompt_tokens: 0,
                 elapsed: Duration::from_millis(1),
@@ -68,6 +69,7 @@ fn mock_tool_call_worker(tool_name: &'static str, args_json: &'static str) -> Pi
                 arguments: serde_json::from_str(args_json).unwrap_or_default(),
             };
             let _ = msg.result_tx.send(Ok(GenerationStats {
+                finish_reason: "stop",
                 generated_tokens: 1,
                 prompt_tokens: 0,
                 elapsed: Duration::from_millis(1),

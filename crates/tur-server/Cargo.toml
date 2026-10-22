@@ -24,4 +24,3 @@ tokio.workspace = true
 default = ["metal"]
 metal = ["tur/metal"]
 cuda = ["tur/cuda"]
-flash-attn = ["tur/flash-attn"]

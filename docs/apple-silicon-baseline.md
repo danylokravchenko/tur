@@ -1,5 +1,10 @@
 # P0: Apple Silicon baseline and safe dispatch
 
+Historical P0 evidence: P3 has retired the ordinary Qwen3/Granite code, model
+runner, checkpoint-materialization and serving scripts referenced below. Commands
+for those runners describe the original measurement checkout; the recorded results
+remain. Current hybrid commands are in the [README](../README.md).
+
 P0's evidence and capability gate is complete on the available development Mac.
 P1's compatible workspace move is also implemented. This establishes a measured
 starting point for the rewrite, not production readiness or hybrid-model support.

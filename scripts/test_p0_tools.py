@@ -1,38 +1,12 @@
-import hashlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
 
-import p0_checkpoints
-from p0_serving_baseline import percentile
 from p0_trace_summary import summarize
 
 
 class BaselineToolsTests(unittest.TestCase):
-    def test_percentiles_interpolate_and_handle_empty_samples(self):
-        self.assertIsNone(percentile([], .95))
-        self.assertEqual(percentile([9, 1, 5], .5), 5)
-        self.assertAlmostEqual(percentile([1, 5], .95), 4.8)
-        self.assertEqual(percentile([7], .99), 7)
-
-    def test_checkpoint_materialization_hashes_files_and_refuses_overwrite(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            repo = root / "cache/models--Qwen--Qwen3-0.6B/snapshots/pinned"
-            repo.mkdir(parents=True)
-            source = repo / "tokenizer_config.json"
-            source.write_text(json.dumps({"chat_template": "fixture"}))
-            output = root / "isolated"
-            with patch.object(p0_checkpoints, "CHECKPOINTS", [("Qwen/Qwen3-0.6B", "pinned", [source.name])]):
-                manifest = p0_checkpoints.materialize(root / "cache", output)
-                self.assertEqual(manifest["repositories"][0]["revision"], "pinned")
-                self.assertEqual(manifest["repositories"][0]["files"][0]["sha256"], hashlib.sha256(source.read_bytes()).hexdigest())
-                self.assertEqual((output / "hub/models--Qwen--Qwen3-0.6B/refs/main").read_text(), "pinned")
-                with self.assertRaises(FileExistsError):
-                    p0_checkpoints.materialize(root / "cache", output)
-
     def test_trace_summary_counts_referenced_labels_and_sizes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

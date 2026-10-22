@@ -1,30 +1,4 @@
 use crate::{Result, TurError};
-use candle_core::Tensor;
-
-/// Trait for processing logits and sampling tokens
-/// This abstraction allows for different sampling strategies including:
-/// - Standard temperature/top-p sampling (LogitsProcessor)
-/// - Guided generation with constraints (future)
-/// - Custom sampling strategies
-pub trait LogitsSampler: Send {
-    /// Sample a token from the logits tensor
-    fn sample(&mut self, logits: &Tensor) -> Result<u32>;
-
-    /// Optional: Apply guidance or constraints to logits before sampling
-    /// Returns a new tensor only if modifications are needed, otherwise returns None
-    /// to avoid unnecessary cloning
-    fn apply_constraints(&mut self, _logits: &Tensor, _context: &[u32]) -> Result<Option<Tensor>> {
-        // Default implementation: no constraints, no modifications
-        Ok(None)
-    }
-}
-
-/// Standard implementation using candle's LogitsProcessor
-impl LogitsSampler for candle_transformers::generation::LogitsProcessor {
-    fn sample(&mut self, logits: &Tensor) -> Result<u32> {
-        self.sample(logits).map_err(TurError::CandleError)
-    }
-}
 
 /// This is a wrapper around a tokenizer to ensure that tokens can be returned to the user in a
 /// streaming way rather than having to wait for the full decoding.
@@ -68,11 +42,13 @@ impl TokenOutputStream {
         };
         self.tokens.push(token);
         let text = self.decode(&self.tokens[self.prev_index..])?;
-        if text.len() > prev_text.len() && text.chars().last().unwrap().is_alphanumeric() {
-            let text = text.split_at(prev_text.len());
+        if text.len() > prev_text.len() && text.chars().last().is_some_and(char::is_alphanumeric) {
+            let text = text
+                .get(prev_text.len()..)
+                .ok_or_else(|| TurError::Tokenizer("unstable UTF-8 decode boundary".into()))?;
             self.prev_index = self.current_index;
             self.current_index = self.tokens.len();
-            Ok(Some(text.1.to_string()))
+            Ok(Some(text.to_string()))
         } else {
             Ok(None)
         }
@@ -87,8 +63,10 @@ impl TokenOutputStream {
         };
         let text = self.decode(&self.tokens[self.prev_index..])?;
         if text.len() > prev_text.len() {
-            let text = text.split_at(prev_text.len());
-            Ok(Some(text.1.to_string()))
+            let text = text
+                .get(prev_text.len()..)
+                .ok_or_else(|| TurError::Tokenizer("unstable UTF-8 decode boundary".into()))?;
+            Ok(Some(text.to_string()))
         } else {
             Ok(None)
         }

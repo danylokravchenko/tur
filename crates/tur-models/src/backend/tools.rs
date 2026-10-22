@@ -2,9 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Definition of a callable tool (function) that the model can invoke.
 ///
-/// Pass a slice of these to [`GenerationRequest::with_tools`]; the pipeline
-/// injects them into the prompt via the model's `format_prompt_with_tools`
-/// implementation and then parses any [`ToolCall`]s from the generated text.
+/// Passed to the checkpoint chat template when rendering a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     /// Unique name the model uses when calling this tool.
@@ -12,7 +10,7 @@ pub struct ToolDefinition {
     /// Human-readable description that guides the model on when/how to call it.
     pub description: String,
     /// JSON-Schema `object` describing the tool's parameters.
-    /// Build it with [`serde_json::json!`] or [`ToolParameters`].
+    /// Build it with [`serde_json::json!`].
     pub parameters: serde_json::Value,
 }
 
@@ -40,9 +38,10 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
-    /// Scan `text` for `<tool_call>…</tool_call>` blocks (Qwen3 format) and
-    /// return all successfully parsed calls in order.
-    pub fn parse_from_output(text: &str) -> Vec<Self> {
+    /// Parse complete Qwen hybrid XML calls, using the tool schema to preserve string
+    /// parameters and decode structured values. JSON call envelopes are also accepted.
+    /// Malformed or incomplete blocks are ignored.
+    pub fn parse_from_output(text: &str, tools: &[ToolDefinition]) -> Vec<Self> {
         const OPEN: &str = "<tool_call>";
         const CLOSE: &str = "</tool_call>";
 
@@ -54,7 +53,10 @@ impl ToolCall {
             match after_open.find(CLOSE) {
                 Some(end) => {
                     let json_str = after_open[..end].trim();
-                    if let Ok(call) = serde_json::from_str::<ToolCall>(json_str) {
+                    if let Some(call) = serde_json::from_str::<ToolCall>(json_str)
+                        .ok()
+                        .or_else(|| parse_xml_call(json_str, tools))
+                    {
                         calls.push(call);
                     }
                     remaining = &after_open[end + CLOSE.len()..];
@@ -67,25 +69,54 @@ impl ToolCall {
     }
 }
 
+fn parse_xml_call(text: &str, tools: &[ToolDefinition]) -> Option<ToolCall> {
+    let (name, body) = text.strip_prefix("<function=")?.split_once('>')?;
+    let tool = tools.iter().find(|tool| tool.name == name)?;
+    let mut body = body.trim().strip_suffix("</function>")?.trim();
+    let mut arguments = serde_json::Map::new();
+    while !body.is_empty() {
+        let (parameter, rest) = body.strip_prefix("<parameter=")?.split_once('>')?;
+        if parameter.is_empty() {
+            return None;
+        }
+        let (value, rest) = rest.split_once("</parameter>")?;
+        let schema = &tool.parameters["properties"][parameter];
+        let value = match schema["type"].as_str() {
+            Some("number" | "integer" | "boolean" | "object" | "array" | "null") => {
+                serde_json::from_str(value.trim()).ok()?
+            }
+            _ => serde_json::Value::String(value.trim().to_string()),
+        };
+        if arguments.insert(parameter.to_string(), value).is_some() {
+            return None;
+        }
+        body = rest.trim();
+    }
+    Some(ToolCall {
+        name: name.to_string(),
+        arguments: arguments.into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_single_tool_call() {
+    fn test_parse_single_tool_call() {
         let text = r#"Sure, let me check the weather.
 <tool_call>
 {"name": "get_weather", "arguments": {"location": "Paris", "unit": "celsius"}}
 </tool_call>"#;
 
-        let calls = ToolCall::parse_from_output(text);
+        let calls = ToolCall::parse_from_output(text, &[]);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "get_weather");
         assert_eq!(calls[0].arguments["location"], "Paris");
     }
 
     #[test]
-    fn parse_multiple_tool_calls() {
+    fn test_parse_multiple_tool_calls() {
         let text = r#"<tool_call>
 {"name": "search", "arguments": {"query": "rust"}}
 </tool_call>
@@ -93,25 +124,48 @@ mod tests {
 {"name": "fetch", "arguments": {"url": "https://example.com"}}
 </tool_call>"#;
 
-        let calls = ToolCall::parse_from_output(text);
+        let calls = ToolCall::parse_from_output(text, &[]);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "search");
         assert_eq!(calls[1].name, "fetch");
     }
 
     #[test]
-    fn parse_no_tool_calls() {
-        let calls = ToolCall::parse_from_output("Just a normal response with no tool calls.");
+    fn test_parse_no_tool_calls() {
+        let calls = ToolCall::parse_from_output("Just a normal response with no tool calls.", &[]);
         assert!(calls.is_empty());
     }
 
     #[test]
-    fn parse_malformed_json_skipped() {
+    fn test_parse_malformed_json_skipped() {
         let text = r#"<tool_call>not json</tool_call>
 <tool_call>{"name": "ok", "arguments": {}}</tool_call>"#;
 
-        let calls = ToolCall::parse_from_output(text);
+        let calls = ToolCall::parse_from_output(text, &[]);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "ok");
+    }
+    #[test]
+    fn test_xml_calls_preserve_schema_types_and_reject_incomplete_calls() {
+        let tools = [ToolDefinition::new(
+            "lookup",
+            "",
+            serde_json::json!({"properties": {
+                "id": {"type":"string"}, "count": {"type":"integer"}, "data": {"type":"object"}
+            }}),
+        )];
+        let text = "<tool_call><function=lookup>\n<parameter=id>\n123\n</parameter>\n<parameter=count>2</parameter><parameter=data>{\"ok\":true}</parameter></function></tool_call>";
+        let calls = ToolCall::parse_from_output(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["id"], "123");
+        assert_eq!(calls[0].arguments["count"], 2);
+        assert_eq!(calls[0].arguments["data"]["ok"], true);
+        assert!(
+            ToolCall::parse_from_output(
+                "<tool_call><function=lookup><parameter=id>unfinished",
+                &tools
+            )
+            .is_empty()
+        );
     }
 }

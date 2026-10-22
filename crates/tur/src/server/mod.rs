@@ -16,7 +16,7 @@ use worker::PipelineWorker;
 /// Shared state injected into every request handler.
 #[derive(Clone)]
 pub struct AppState {
-    /// Workers keyed by model ID (e.g. "qwen3-0.6b", "granite4.1-3b").
+    /// Workers keyed by the configured hybrid model ID.
     pub workers: HashMap<String, PipelineWorker>,
     /// The model used when the client omits the `model` field.
     pub default_model: String,

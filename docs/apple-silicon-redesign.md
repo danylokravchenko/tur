@@ -1,6 +1,6 @@
 # Tur: Apple Silicon inference redesign
 
-Status: P0's development-Mac evidence/capability gate and P1's workspace move are complete (2026-10-21). P2's four-crate extraction and explicit hybrid state and packed execution contracts are implemented (revised after review); see [P2 contracts and validation](apple-silicon-p2-contracts.md). Safe dispatch and pinned model/HTTP evidence remain in [the baseline report](apple-silicon-baseline.md). The baseline checkpoint suite retains its guided-JSON failure (68/69 pass); it was not rerun or fixed in P2. Existing models (ordinary Qwen3, Granite 4.1) are scheduled for removal rather than retained as regression references; see [Breaking changes and legacy removal](#breaking-changes-and-legacy-removal). P3's model work is complete (2026-10-22): the Qwen3.5 dense hybrid text model matches Transformers on the real Qwen3.5-0.8B checkpoint on CPU and Metal, with Q8_0/Q4K packed execution; Qwen3.8-27B shares that path and is validated against its pinned config, tensor headers and template but has not been executed on this hardware; see [P3 report](apple-silicon-p3-qwen.md). P3's legacy deletion and CLI/server rewiring are deferred to a follow-up by user decision. Serving integration, production performance and quality gates remain open.
+Status: P0's development-Mac evidence/capability gate and P1's workspace move are complete (2026-10-21). P2's four-crate extraction and explicit hybrid state and packed execution contracts are implemented (revised after review); see [P2 contracts and validation](apple-silicon-p2-contracts.md). Safe dispatch and pinned model/HTTP evidence remain in [the baseline report](apple-silicon-baseline.md). The baseline checkpoint suite retains its guided-JSON failure (68/69 pass); it was not rerun or fixed in P2. The legacy models (ordinary Qwen3, Granite 4.1), their execution/cache path and model runners have been removed; see [Breaking changes and legacy removal](#breaking-changes-and-legacy-removal). P3's model work is complete (2026-10-22): the Qwen3.5 dense hybrid text model matches Transformers on the real Qwen3.5-0.8B checkpoint on CPU and Metal, with Q8_0/Q4K packed execution; Qwen3.8-27B shares that path and is validated against its pinned config, tensor headers and template but has not been executed on this hardware; see [P3 report](apple-silicon-p3-qwen.md). P3's deferred legacy deletion and CLI/server migration are now complete: both adapters use the packed hybrid text pipeline, with checkpoint templates/defaults, independent outcomes, EOS and cancellation. Production serving hardening, performance and quality gates remain open.
 
 ## Product and platform
 
@@ -214,7 +214,7 @@ Deterministic offline tests cover packed-versus-incremental agreement, request
 reordering, exact page/recurrent values, partial-page forks, atomic restore,
 speculative acceptance/rejection, per-request failure isolation, whole-batch failure,
 cancellation, stale handles, shape/dtype failures, overflow and invalid plans.
-CLI/server still use the extracted ordinary attention engine; P3 deletes it. Exact
+CLI/server used the extracted ordinary attention engine at the P2 exit; P3 has now replaced it with the hybrid pipeline. Exact
 signatures, ownership rules, commands and remaining limits are in
 [the P2 contract document](apple-silicon-p2-contracts.md).
 
@@ -253,9 +253,10 @@ Exit: small deterministic reference tests for state allocation, independent requ
 
 ### P3 — Implement Qwen3.8 correctness first
 
-Model work implemented on 2026-10-22; measurements, pins, tolerances and limits are in
-[the P3 report](apple-silicon-p3-qwen.md). Every bullet below is done except the first
-(legacy deletion and CLI/server rewiring), which the user deferred to a follow-up.
+Completed on 2026-10-22, including the deferred legacy deletion and CLI/server
+migration; measurements, pins, adapter behavior and limits are in
+[the P3 report](apple-silicon-p3-qwen.md). Both adapters now execute the validated
+hybrid model through `HybridEngine`; no ordinary-attention compatibility path remains.
 Exit evidence: per-layer and logit agreement with Transformers (relative error
 ≤ 3.5e-6, against a 1e-4 gate), whole/chunked/incremental agreement, batch
 enter/leave isolation, and coherent Q8_0/Q4K generation. Q4K has no quality budget

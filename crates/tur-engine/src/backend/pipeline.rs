@@ -1,1070 +1,384 @@
-use candle_core::{DType, Device};
-use parking_lot::RwLock;
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use tokenizers::Tokenizer;
-use tracing::{debug, info, trace, warn};
-use uuid::Uuid;
+#![forbid(unsafe_code)]
+//! Chat admission and packed prefill/decode over the single-owner hybrid engine.
 
-use crate::{
-    ProgressReporter, Result, TurError,
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokenizers::Tokenizer;
+use tur_core::execution::{PackedExecution, SequenceDescriptor, StateHandle, invalid};
+use tur_models::{
     backend::{
-        audio_encoder::AudioEncoder,
-        chat_template::{ChatTemplate, Message},
-        engine::InferenceEngine,
-        factory::{ModelConstructor, ModelFactory},
-        guidance::{ParserFactory, TopLevelGrammar},
-        scheduler::{ContinuousBatchScheduler, SchedulingPolicy},
-        tokenizer::TokenOutputStream,
+        chat_template::{ChatMessage, ChatTemplate, RenderOptions, Role},
+        factory::ModelFactory,
         tools::{ToolCall, ToolDefinition},
     },
-    models::kv_cache::BlockAllocator,
+    models::qwen3_5::{GenerationDefaults, Qwen35},
+};
+use uuid::Uuid;
+
+use super::tokenizer::TokenOutputStream;
+use crate::{
+    Result, TurError,
+    hybrid::{HybridEngine, SamplingOptions, SequenceCommit},
 };
 
-/// A single modality input to a generation request.
-#[derive(Debug, Clone)]
-pub enum ModalInput {
-    /// Plain text — the normal prompt string.
-    Text(String),
-    /// Raw PCM audio samples (mono f32) at the given sample rate.
-    Audio { pcm: Vec<f32>, sample_rate: u32 },
-}
-
-/// Request struct for generation, supporting text and audio inputs.
-#[derive(Debug, Clone)]
+/// One text conversation. Unset sampling and thinking controls use checkpoint defaults.
 pub struct GenerationRequest {
-    pub id: Uuid,
-    /// Ordered list of inputs.  Use [`GenerationRequest::new`] for text-only
-    /// requests or [`with_audio`] to append audio inputs.
-    pub inputs: Vec<ModalInput>,
-    pub sample_len: usize,
-    /// Optional grammar for guided (constrained) generation.
-    /// When set, only tokens valid under the grammar are sampled.
-    pub grammar: Option<TopLevelGrammar>,
-    /// Tools available to the model.  When non-empty the pipeline injects them
-    /// into the prompt via the model's `format_prompt_with_tools` and parses
-    /// any [`ToolCall`]s from the generated text, returning them in
-    /// [`GenerationStats::tool_calls`].
+    pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolDefinition>,
-    /// Enable extended thinking (`/think` tag in Qwen3).  Only effective when
-    /// tools are also set; for tool-free requests the caller is responsible for
-    /// pre-formatting the prompt with the appropriate tag.
-    pub thinking: bool,
-    /// When `true`, skip chat-template formatting and pass the text prompt
-    /// directly to the tokeniser.  Used by the OpenAI-compatible server after
-    /// it has already formatted the full conversation via `format_messages`.
-    pub raw: bool,
+    pub max_tokens: usize,
+    pub render: RenderOptions,
+    pub sampling: SamplingOptions,
+    pub seed: u64,
 }
 
 impl GenerationRequest {
-    /// Create a text-only request with auto-generated UUID.
-    pub fn new(prompt: String, sample_len: usize) -> Self {
+    /// Generate a reply to one user turn, using the checkpoint's generation opener.
+    pub fn new(prompt: String, max_tokens: usize) -> Self {
         Self {
-            id: Uuid::new_v4(),
-            inputs: vec![ModalInput::Text(prompt)],
-            sample_len,
-            grammar: None,
+            messages: vec![ChatMessage::new(Role::User, prompt)],
             tools: Vec::new(),
-            thinking: false,
-            raw: false,
+            max_tokens,
+            render: RenderOptions {
+                add_generation_prompt: true,
+                ..Default::default()
+            },
+            sampling: SamplingOptions::default(),
+            seed: 299_792_458,
         }
-    }
-
-    /// Return the first text input, or an empty string when there is none.
-    /// Used internally to extract the prompt for template formatting and tokenisation.
-    pub fn text_prompt(&self) -> &str {
-        self.inputs
-            .iter()
-            .find_map(|i| match i {
-                ModalInput::Text(s) => Some(s.as_str()),
-                _ => None,
-            })
-            .unwrap_or("")
-    }
-
-    /// Append a PCM audio input (mono f32 at `sample_rate` Hz).
-    pub fn with_audio(mut self, pcm: Vec<f32>, sample_rate: u32) -> Self {
-        self.inputs.push(ModalInput::Audio { pcm, sample_rate });
-        self
-    }
-
-    /// Attach a grammar for guided generation.
-    pub fn with_grammar(mut self, grammar: TopLevelGrammar) -> Self {
-        self.grammar = Some(grammar);
-        self
-    }
-
-    /// Attach tool definitions.  The text prompt is treated as a raw user message
-    /// and the pipeline formats it with the model's tool-calling template.
-    pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
-        self.tools = tools;
-        self
-    }
-
-    /// Enable extended thinking mode (Qwen3 `/think` tag).
-    pub fn with_thinking(mut self, thinking: bool) -> Self {
-        self.thinking = thinking;
-        self
-    }
-
-    /// Skip chat-template formatting and pass the text prompt directly to the
-    /// tokeniser.  Use this when the caller has already formatted the full
-    /// conversation (e.g. the OpenAI-compatible server pre-formats multi-turn
-    /// chats via [`InferencePipeline::format_messages`]).
-    pub fn with_raw(mut self, raw: bool) -> Self {
-        self.raw = raw;
-        self
     }
 }
 
-/// Statistics for generation runs
-#[derive(Debug, Clone)]
+/// Completed generation, including EOS in the generated token count when sampled.
+#[derive(Debug)]
 pub struct GenerationStats {
     pub generated_tokens: usize,
     pub prompt_tokens: usize,
-    pub elapsed: std::time::Duration,
-    /// Tool calls parsed from the generated text.  Non-empty only when the
-    /// request included tool definitions and the model emitted `<tool_call>`
-    /// blocks in its output.
+    pub elapsed: Duration,
     pub tool_calls: Vec<ToolCall>,
-    /// Full decoded generated text.  Populated by the batching worker path
-    /// (`step_streaming`) so the non-streaming HTTP handler can use it directly
-    /// instead of assembling text from per-step streaming tokens.
     pub generated_text: String,
+    /// `stop` for EOS, `length` for the request limit.
+    pub finish_reason: &'static str,
 }
 
-/// Result handle for async request tracking
-#[derive(Debug, Clone)]
-pub struct RequestHandle {
-    pub id: Uuid,
-}
-
-/// Completed generation result
-#[derive(Debug, Clone)]
-pub struct GenerationResult {
-    pub request_id: Uuid,
-    pub prompt: String,
-    pub generated_text: String,
-    pub generated_tokens: Vec<u32>,
-    pub stats: GenerationStats,
-}
-
-/// Output of [`InferencePipeline::step_streaming`].
+/// Incremental text and independent request outcomes from one packed model invocation.
+#[derive(Default)]
 pub struct BatchStepOutput {
-    /// Requests that completed this iteration.  Each entry carries the
-    /// `GenerationResult` (with `generated_text` populated) ready to be
-    /// returned to the caller.
-    pub completed: Vec<(Uuid, GenerationResult)>,
-    /// One `(request_id, decoded_text)` pair per token emitted during the
-    /// decode step.  EOS tokens are excluded.  The decoded string may be
-    /// empty for byte-fallback tokens; callers should skip empty strings.
     pub new_tokens: Vec<(Uuid, String)>,
+    pub completed: Vec<(Uuid, Result<GenerationStats>)>,
 }
 
-/// Components that are only present when batching is enabled.
-struct BatchingComponents {
-    scheduler: ContinuousBatchScheduler,
-    tokenizer: Arc<Tokenizer>,
+struct Pending {
+    handle: StateHandle,
+    prompt: Vec<u32>,
+    consumed: usize,
+    next: Option<u32>,
+    stream: TokenOutputStream,
+    generated: usize,
+    max_tokens: usize,
+    started: Instant,
+    tools: Vec<ToolDefinition>,
 }
 
-pub type OnTokenFn = Box<dyn FnMut(&str)>;
-
-/// High-level generation pipeline with output handling, continuous batching, and multimodal support.
-pub struct InferencePipeline<T: ModelConstructor> {
-    engine: InferenceEngine<T>,
-    tokenizer: TokenOutputStream,
-    progress: Option<ProgressReporter>,
-    on_token: Option<OnTokenFn>,
-    batching: Option<BatchingComponents>,
-    results: Arc<RwLock<HashMap<Uuid, GenerationResult>>>,
-    /// Insertion-order tracking for bounded eviction of `results`.
-    result_order: VecDeque<Uuid>,
-    max_results: usize,
-    /// Per-request incremental tokenizer state for streaming decode.
-    /// Created in `submit_request`, consumed (removed) in `step_streaming`.
-    streaming_decoders: HashMap<Uuid, TokenOutputStream>,
-    /// Jinja2 chat template loaded from the model's `tokenizer_config.json`.
-    /// When present, `format_prompt` and `format_prompt_with_tools` use it
-    /// instead of the hardcoded static fallback on `ModelImpl`.
-    chat_template: Option<ChatTemplate>,
-    /// Optional audio encoder for multimodal requests.
-    /// When present, [`ModalInput::Audio`] inputs are encoded before prefill.
-    audio_encoder: Option<Box<dyn AudioEncoder>>,
-}
-
-/// Builder for [`InferencePipeline`].
-pub struct InferencePipelineBuilder<'a, T: ModelConstructor> {
-    factory: &'a ModelFactory<T>,
-    device: Device,
-    seed: u64,
-    temp: Option<f64>,
-    top_p: Option<f64>,
-    repeat_penalty: f32,
-    repeat_last_n: usize,
-    progress: Option<ProgressReporter>,
-    on_token: Option<OnTokenFn>,
-    prefix_cache: Option<super::prefix_cache::SharedPrefixCache>,
-    guidance_factory: Option<Arc<ParserFactory>>,
-    audio_encoder: Option<Box<dyn AudioEncoder>>,
-    // Batching configuration
-    enable_batching: bool,
+/// Thin serving adapter. Every iteration packs all admitted sequences into one model pass.
+/// Prefix reuse, memory-based admission and production scheduling are later stages.
+pub struct InferencePipeline {
+    engine: HybridEngine<Qwen35>,
+    tokenizer: Tokenizer,
+    template: ChatTemplate,
+    defaults: GenerationDefaults,
+    max_position: usize,
     max_batch_size: usize,
-    max_prefill_batch: usize,
-    max_decode_batch: usize,
-    scheduling_policy: SchedulingPolicy,
-    max_results: usize,
-    prefill_chunk_size: Option<usize>,
+    prefill_chunk_size: usize,
+    pending: HashMap<Uuid, Pending>,
+    order: Vec<Uuid>,
 }
 
-impl<'a, T: ModelConstructor> InferencePipelineBuilder<'a, T> {
-    pub fn new(factory: &'a ModelFactory<T>, device: Device) -> Self {
-        Self {
-            factory,
-            device,
-            seed: 299_792_458,
-            temp: None,
-            top_p: None,
-            repeat_penalty: 1.0,
-            repeat_last_n: 64,
-            progress: None,
-            on_token: None,
-            prefix_cache: None,
-            guidance_factory: None,
-            audio_encoder: None,
-            enable_batching: false,
-            max_batch_size: 16,
-            max_prefill_batch: 8,
-            max_decode_batch: 16,
-            scheduling_policy: SchedulingPolicy::FCFS,
-            max_results: 10_000,
-            prefill_chunk_size: None,
+fn sampling(overrides: SamplingOptions, defaults: &GenerationDefaults) -> SamplingOptions {
+    SamplingOptions {
+        temperature: overrides.temperature.or(defaults.temperature),
+        top_k: overrides.top_k.or(defaults.top_k),
+        top_p: overrides.top_p.or(defaults.top_p),
+    }
+}
+
+impl InferencePipeline {
+    /// Load the validated model. Zero batch or chunk limits fail before loading weights.
+    pub fn new(
+        factory: &ModelFactory,
+        max_batch_size: usize,
+        prefill_chunk_size: usize,
+    ) -> Result<Self> {
+        if max_batch_size == 0 || prefill_chunk_size == 0 {
+            return Err(invalid("batch and prefill chunk sizes must be positive"));
         }
-    }
-
-    pub fn seed(mut self, seed: u64) -> Self {
-        self.seed = seed;
-        self
-    }
-
-    pub fn temperature(mut self, temp: f64) -> Self {
-        self.temp = Some(temp);
-        self
-    }
-
-    pub fn top_p(mut self, top_p: f64) -> Self {
-        self.top_p = Some(top_p);
-        self
-    }
-
-    pub fn repeat_penalty(mut self, penalty: f32) -> Self {
-        self.repeat_penalty = penalty;
-        self
-    }
-
-    pub fn repeat_last_n(mut self, n: usize) -> Self {
-        self.repeat_last_n = n;
-        self
-    }
-
-    pub fn progress(mut self, progress: ProgressReporter) -> Self {
-        self.progress = Some(progress);
-        self
-    }
-
-    pub fn on_token<F: FnMut(&str) + 'static>(mut self, callback: F) -> Self {
-        self.on_token = Some(Box::new(callback));
-        self
-    }
-
-    pub fn with_prefix_cache(mut self, max_entries: usize, max_token_length: usize) -> Self {
-        self.prefix_cache = Some(Arc::new(RwLock::new(
-            super::prefix_cache::PrefixCache::new(max_entries, max_token_length),
-        )));
-        self
-    }
-
-    /// Use a shared prefix cache instance
-    pub fn with_shared_prefix_cache(
-        mut self,
-        cache: super::prefix_cache::SharedPrefixCache,
-    ) -> Self {
-        self.prefix_cache = Some(cache);
-        self
-    }
-
-    pub fn enable_batching(mut self, enable: bool) -> Self {
-        self.enable_batching = enable;
-        self
-    }
-
-    pub fn max_batch_size(mut self, size: usize) -> Self {
-        self.max_batch_size = size;
-        self
-    }
-
-    pub fn max_prefill_batch(mut self, size: usize) -> Self {
-        self.max_prefill_batch = size;
-        self
-    }
-
-    pub fn max_decode_batch(mut self, size: usize) -> Self {
-        self.max_decode_batch = size;
-        self
-    }
-
-    pub fn scheduling_policy(mut self, policy: SchedulingPolicy) -> Self {
-        self.scheduling_policy = policy;
-        self
-    }
-
-    /// Maximum number of completed results to retain before evicting oldest entries.
-    pub fn max_results(mut self, max: usize) -> Self {
-        self.max_results = max;
-        self
-    }
-
-    /// Split each prompt into chunks of `chunk_size` tokens during prefill.
-    ///
-    /// Each scheduler iteration processes at most `chunk_size` new prompt tokens
-    /// per request.  This bounds per-iteration memory (attention is O(chunk²) not
-    /// O(prompt²)) and lets decode-phase requests interleave with in-progress
-    /// prefills instead of waiting for a full long-prompt prefill to complete.
-    ///
-    /// Only effective when batching is enabled (paged KV caches are required to
-    /// hold intermediate KV state between chunks).  Setting `chunk_size` larger
-    /// than any prompt degrades gracefully to the single-shot behaviour.
-    pub fn prefill_chunk_size(mut self, chunk_size: usize) -> Self {
-        self.prefill_chunk_size = Some(chunk_size);
-        self
-    }
-
-    /// Enable guided (constrained) generation using the given parser factory.
-    /// Build the factory with `guidance::build_llg_factory`.
-    pub fn with_guidance_factory(mut self, factory: Arc<ParserFactory>) -> Self {
-        self.guidance_factory = Some(factory);
-        self
-    }
-
-    /// Attach an audio encoder for multimodal requests.
-    /// When set, [`ModalInput::Audio`] inputs in each request are encoded to
-    /// embeddings before prefill via [`InferenceEngine::prefill_with_audio`].
-    pub fn with_audio_encoder(mut self, encoder: Box<dyn AudioEncoder>) -> Self {
-        self.audio_encoder = Some(encoder);
-        self
-    }
-
-    pub fn build(self) -> InferencePipeline<T> {
-        debug!(
-            seed = self.seed,
-            temp = ?self.temp,
-            top_p = ?self.top_p,
-            repeat_penalty = self.repeat_penalty,
-            repeat_last_n = self.repeat_last_n,
-            has_on_token = self.on_token.is_some(),
-            has_prefix_cache = self.prefix_cache.is_some(),
-            enable_batching = self.enable_batching,
-            max_batch_size = self.max_batch_size,
-            max_prefill_batch = self.max_prefill_batch,
-            max_decode_batch = self.max_decode_batch,
-            scheduling_policy = ?self.scheduling_policy,
-            prefill_chunk_size = ?self.prefill_chunk_size,
-            "Building text generation pipeline with configuration"
-        );
-
-        let mut engine_builder = InferenceEngine::builder(self.factory, self.device.clone())
-            .seed(self.seed)
-            .repeat_penalty(self.repeat_penalty)
-            .repeat_last_n(self.repeat_last_n);
-
-        if let Some(temp) = self.temp {
-            engine_builder = engine_builder.temperature(temp);
-        }
-        if let Some(top_p) = self.top_p {
-            engine_builder = engine_builder.top_p(top_p);
-        }
-        if let Some(progress) = &self.progress {
-            engine_builder = engine_builder.with_progress(progress.clone());
-        }
-        if let Some(prefix_cache) = &self.prefix_cache {
-            engine_builder = engine_builder.with_shared_prefix_cache(prefix_cache.clone());
-        }
-        if let Some(guidance_factory) = self.guidance_factory {
-            engine_builder = engine_builder.with_guidance_factory(guidance_factory);
-        }
-
-        let (batching, engine, tokenizer, chat_template) = if self.enable_batching {
-            let block_size = 64;
-            let dtype = DType::BF16;
-            let max_decode_tokens = 4096;
-            let max_prefill_tokens = 2048;
-            let memory_pool_size_bytes = 8 * 1024 * 1024 * 1024;
-            let total_blocks = 1024;
-
-            let block_allocator =
-                Arc::new(RwLock::new(BlockAllocator::new(total_blocks, block_size)));
-
-            let (engine, tokenizer, chat_template) =
-                engine_builder.build().expect("Failed to build engine");
-            let tokenizer_arc = Arc::new(tokenizer.clone());
-
-            // Derive all structural parameters from the actual model so this
-            // works correctly for any architecture (e.g. Granite head_dim=64
-            // vs Qwen3 head_dim=128) without hardcoded constants.
-            let num_layers = engine.model().num_layers();
-            let num_heads = engine.model().num_kv_heads();
-            let head_dim = engine.model().head_dim();
-            let model_eos_ids = engine.model().eos_token_ids();
-            let (eos_token, im_end_token) = match model_eos_ids.as_slice() {
-                [] => (
-                    tokenizer_arc
-                        .token_to_id("<|endoftext|>")
-                        .or_else(|| tokenizer_arc.token_to_id("<|end_of_text|>"))
-                        .expect("cannot find EOS token"),
-                    tokenizer_arc
-                        .token_to_id("<|im_end|>")
-                        .or_else(|| tokenizer_arc.token_to_id("<|end_of_role|>"))
-                        .or_else(|| tokenizer_arc.token_to_id("<|endoftext|>"))
-                        .or_else(|| tokenizer_arc.token_to_id("<|end_of_text|>"))
-                        .expect("cannot find secondary EOS token"),
-                ),
-                [a] => (*a, *a),
-                [a, b, ..] => (*a, *b),
-            };
-
-            debug!(
-                total_blocks,
-                block_size,
-                num_heads,
-                head_dim,
-                dtype = ?dtype,
-                memory_pool_size_bytes,
-                max_prefill_tokens,
-                max_decode_tokens,
-                num_layers,
-                eos_token,
-                im_end_token,
-                "Initializing continuous batching components"
-            );
-
-            let memory_pool = Arc::new(RwLock::new(crate::backend::memory_pool::MemoryPool::new(
-                memory_pool_size_bytes,
-                block_size,
-                num_layers,
-                num_heads,
-                head_dim,
-                2,
-            )));
-
-            let batch_config = crate::backend::scheduler::BatchConfig {
-                max_prefill_batch: self.max_prefill_batch,
-                max_decode_batch: self.max_decode_batch,
-                max_prefill_tokens,
-                max_decode_tokens,
-                prefill_chunk_size: self.prefill_chunk_size,
-            };
-
-            let scheduler = ContinuousBatchScheduler::new(
-                self.scheduling_policy,
-                batch_config,
-                memory_pool,
-                block_allocator,
-                num_layers,
-                (eos_token, im_end_token),
-            );
-
-            let batching = Some(BatchingComponents {
-                scheduler,
-                tokenizer: tokenizer_arc,
-            });
-            (batching, engine, tokenizer, chat_template)
-        } else {
-            debug!("Batching disabled, using single-request mode");
-            let (engine, tokenizer, chat_template) =
-                engine_builder.build().expect("Failed to build engine");
-            (None, engine, tokenizer, chat_template)
-        };
-
-        debug!("Text generation pipeline built successfully");
-
-        InferencePipeline {
+        let (model, tokenizer, template, defaults) = factory.create_model()?;
+        let max_position = model.config().max_position();
+        let engine = HybridEngine::new(Arc::new(model), factory.device.clone())?;
+        Ok(Self {
             engine,
-            tokenizer: TokenOutputStream::new(tokenizer),
-            progress: self.progress,
-            on_token: self.on_token,
-            batching,
-            results: Arc::new(RwLock::new(HashMap::new())),
-            result_order: VecDeque::new(),
-            max_results: self.max_results,
-            chat_template,
-            audio_encoder: self.audio_encoder,
-            streaming_decoders: HashMap::new(),
-        }
-    }
-}
-
-impl<T: ModelConstructor> InferencePipeline<T> {
-    /// Create a builder for [`InferencePipeline`] from factory.
-    pub fn builder(
-        factory: &'_ ModelFactory<T>,
-        device: Device,
-    ) -> InferencePipelineBuilder<'_, T> {
-        InferencePipelineBuilder::new(factory, device)
-    }
-
-    /// Access the underlying inference engine
-    pub fn engine(&self) -> &InferenceEngine<T> {
-        &self.engine
-    }
-
-    /// Access the underlying inference engine mutably
-    pub fn engine_mut(&mut self) -> &mut InferenceEngine<T> {
-        &mut self.engine
-    }
-
-    pub fn run(&mut self, request: &GenerationRequest) -> Result<GenerationStats> {
-        if let Some(grammar) = request.grammar.clone() {
-            self.engine.activate_grammar(grammar)?;
-        }
-        let result = self.run_inner(request);
-        self.engine.deactivate_grammar();
-        result
-    }
-
-    fn run_inner(&mut self, request: &GenerationRequest) -> Result<GenerationStats> {
-        let sample_len = request.sample_len;
-        let has_tools = !request.tools.is_empty();
-        self.tokenizer.clear();
-
-        let text = request.text_prompt();
-        let prompt_str = if request.raw {
-            text.to_string()
-        } else if has_tools {
-            self.format_prompt_with_tools(text, &request.tools, request.thinking)
-        } else {
-            self.format_prompt(text, request.thinking)
-        };
-
-        trace!(
-            request_id = %request.id,
-            prompt_chars = prompt_str.chars().count(),
-            has_tools,
-            sample_len,
-            "Starting generation request",
-        );
-        let mut tokens = self
-            .tokenizer
-            .tokenizer()
-            .encode(prompt_str.as_str(), true)
-            .map_err(|e| TurError::Tokenizer(e.to_string()))?
-            .get_ids()
-            .to_vec();
-        trace!(
-            request_id = %request.id,
-            prompt_tokens = tokens.len(),
-            "Prompt encoded into tokens",
-        );
-
-        if let Some(ref progress) = self.progress {
-            progress.init_generation(sample_len);
-        }
-
-        let mut generated_tokens = 0usize;
-        // Accumulate text for tool-call parsing when tools are active.
-        let mut generated_text: Option<String> = if has_tools { Some(String::new()) } else { None };
-        let model_eos_ids = self.engine.model().eos_token_ids();
-        let (eos_token, im_end_token) =
-            InferenceEngine::<T>::resolve_eos_tokens(&model_eos_ids, &self.tokenizer)?;
-
-        let start_gen = std::time::Instant::now();
-
-        // Encode audio inputs when an encoder is available, then dispatch to the
-        // appropriate prefill path.
-        let audio_embeds = self.encode_audio_inputs(&request.inputs)?;
-        let (first_token, _, cache_hit, cached_tokens) = if audio_embeds.is_empty() {
-            self.engine.prefill(&tokens)?
-        } else {
-            self.engine.prefill_with_audio(&tokens, audio_embeds)?
-        };
-        trace!(
-            request_id = %request.id,
-            first_token,
-            cache_hit,
-            cached_tokens,
-            "Engine prefetched prompt and produced first token",
-        );
-        tokens.push(first_token);
-        generated_tokens += 1;
-
-        if let Some(ref progress) = self.progress {
-            progress.inc_generation();
-        }
-
-        if first_token != eos_token
-            && first_token != im_end_token
-            && let Some(t) = self.tokenizer.next_token(first_token)?
-        {
-            trace!(
-                request_id = %request.id,
-                text_chars = t.chars().count(),
-                "Decoded first token into text chunk",
-            );
-            if let Some(ref mut buf) = generated_text {
-                buf.push_str(&t);
-            }
-            if let Some(ref mut on_token) = self.on_token {
-                on_token(&t);
-            }
-        }
-
-        // Decode phase
-        for _ in 1..sample_len {
-            if tokens[tokens.len() - 1] == eos_token || tokens[tokens.len() - 1] == im_end_token {
-                break;
-            }
-
-            let start_pos = tokens.len() - 1;
-            let next_token = self.engine.decode_step(&tokens, start_pos)?;
-            tokens.push(next_token);
-            generated_tokens += 1;
-
-            if let Some(ref progress) = self.progress {
-                progress.inc_generation();
-            }
-
-            if next_token == eos_token || next_token == im_end_token {
-                trace!(
-                    request_id = %request.id,
-                    next_token,
-                    generated_tokens,
-                    "Decode loop reached EOS token",
-                );
-                break;
-            }
-            if let Some(t) = self.tokenizer.next_token(next_token)? {
-                trace!(
-                    request_id = %request.id,
-                    next_token,
-                    text_chars = t.chars().count(),
-                    "Decoded token into text chunk",
-                );
-                if let Some(ref mut buf) = generated_text {
-                    buf.push_str(&t);
-                }
-                if let Some(ref mut on_token) = self.on_token {
-                    on_token(&t);
-                }
-            }
-        }
-        let dt = start_gen.elapsed();
-        if let Some(rest) = self
-            .tokenizer
-            .decode_rest()
-            .map_err(|e| TurError::Tokenizer(e.to_string()))?
-        {
-            trace!(
-                request_id = %request.id,
-                text_chars = rest.chars().count(),
-                "Flushed remaining decoded text",
-            );
-            if let Some(ref mut buf) = generated_text {
-                buf.push_str(&rest);
-            }
-            if let Some(ref mut on_token) = self.on_token {
-                on_token(&rest);
-            }
-        }
-
-        if let Some(ref progress) = self.progress {
-            progress.flush_text();
-        }
-
-        trace!(
-            request_id = %request.id,
-            generated_tokens,
-            elapsed_ms = dt.as_secs_f64() * 1000.0,
-            "Generation request completed",
-        );
-
-        if let Some(ref progress) = self.progress {
-            progress.finish_generation(generated_tokens, dt.as_secs_f64());
-        } else {
-            info!(
-                "\n{generated_tokens} tokens generated ({:.2} token/s)",
-                generated_tokens as f64 / dt.as_secs_f64(),
-            );
-        }
-
-        let tool_calls = generated_text
-            .as_deref()
-            .map(ToolCall::parse_from_output)
-            .unwrap_or_default();
-
-        Ok(GenerationStats {
-            generated_tokens,
-            prompt_tokens: tokens.len(),
-            elapsed: dt,
-            tool_calls,
-            generated_text: String::new(),
+            tokenizer,
+            template,
+            defaults,
+            max_position,
+            max_batch_size,
+            prefill_chunk_size,
+            pending: HashMap::new(),
+            order: Vec::new(),
         })
     }
 
-    /// Encode all [`ModalInput::Audio`] entries in `inputs` using the pipeline's
-    /// audio encoder.  Returns an empty `Vec` when no encoder is configured or
-    /// when there are no audio inputs, leaving the normal text-only path intact.
-    fn encode_audio_inputs(&self, inputs: &[ModalInput]) -> Result<Vec<candle_core::Tensor>> {
-        let Some(enc) = &self.audio_encoder else {
-            return Ok(Vec::new());
-        };
-        inputs
-            .iter()
-            .filter_map(|i| match i {
-                ModalInput::Audio { pcm, sample_rate } => Some(enc.encode(pcm, *sample_rate)),
-                _ => None,
-            })
-            .collect()
+    /// Number of requests with allocated model state.
+    pub fn active_request_count(&self) -> usize {
+        self.pending.len()
     }
 
-    /// Format a raw user message using the loaded Jinja2 chat template when
-    /// available, or the model's static `format_prompt` implementation otherwise.
-    pub fn format_prompt(&self, prompt: &str, thinking: bool) -> String {
-        self.chat_template
-            .as_ref()
-            .and_then(|ct| {
-                ct.format(&[Message::user(prompt)], None, true, thinking)
-                    .map_err(|e| {
-                        tracing::warn!(
-                            "Chat template render error in format_prompt: {e}; \
-                             falling back to static format"
-                        );
-                        e
-                    })
-                    .ok()
-            })
-            .unwrap_or_else(|| self.engine.model().format_prompt(prompt, thinking))
-    }
-
-    /// Format a full multi-turn conversation using the loaded Jinja2 chat
-    /// template.  Falls back to formatting only the last user message through
-    /// the model's static `format_prompt` when no template is available.
-    ///
-    /// Pair with [`GenerationRequest::with_raw`] so `run` does not re-wrap the
-    /// already-formatted prompt in another user turn.
-    pub fn format_messages(
-        &self,
-        messages: &[crate::backend::chat_template::Message],
-        tools: Option<&[crate::backend::tools::ToolDefinition]>,
-        thinking: bool,
-    ) -> String {
-        let non_empty_tools = tools.filter(|t| !t.is_empty());
-        if let Some(ct) = &self.chat_template {
-            match ct.format(messages, non_empty_tools, true, thinking) {
-                Ok(s) => return s,
-                Err(e) => {
-                    tracing::warn!(
-                        "Chat template render error in format_messages: {e}; falling back"
-                    );
-                }
-            }
+    /// Render, tokenize and allocate independent hybrid state for one text conversation.
+    pub fn submit_request(&mut self, request: &GenerationRequest) -> Result<Uuid> {
+        if self.pending.len() >= self.max_batch_size {
+            return Err(invalid("pipeline admission limit reached"));
         }
-        // Full ChatML fallback: format every message so context is preserved.
-        let mut prompt = String::new();
-        for msg in messages {
-            prompt.push_str("<|im_start|>");
-            prompt.push_str(&msg.role);
-            prompt.push('\n');
-            prompt.push_str(&msg.content);
-            prompt.push_str("<|im_end|>\n");
+        if request.messages.is_empty() || request.max_tokens == 0 {
+            return Err(invalid("messages and max_tokens must be nonempty/positive"));
         }
-        prompt.push_str("<|im_start|>assistant\n");
-        prompt
-    }
-
-    /// Format a raw user message with tool definitions using the loaded Jinja2
-    /// chat template when available, or the static `format_prompt_with_tools`
-    /// otherwise.  Useful for inspecting the prompt before submitting a request.
-    pub fn format_prompt_with_tools(
-        &self,
-        prompt: &str,
-        tools: &[ToolDefinition],
-        thinking: bool,
-    ) -> String {
-        self.chat_template
-            .as_ref()
-            .and_then(|ct| {
-                ct.format(&[Message::user(prompt)], Some(tools), true, thinking)
-                    .map_err(|e| {
-                        tracing::warn!(
-                            "Chat template render error in format_prompt_with_tools: {e}; \
-                             falling back to static format"
-                        );
-                        e
-                    })
-                    .ok()
-            })
-            .unwrap_or_else(|| {
-                self.engine
-                    .model()
-                    .format_prompt_with_tools(prompt, tools, thinking)
-            })
-    }
-
-    /// Submit a new generation request (batching mode only).
-    /// Audio inputs are not supported in batching mode — only the text prompt is used.
-    pub fn submit_request(&mut self, request: &GenerationRequest) -> Result<RequestHandle> {
-        let batching = self.batching.as_mut().ok_or_else(|| {
-            TurError::Other("Batching not enabled. Use builder.enable_batching(true)".to_string())
-        })?;
-
-        let prompt = request.text_prompt();
-        let tokens = batching
+        let prompt = self
+            .template
+            .render(&request.messages, &request.tools, &request.render)?;
+        let tokens = self
             .tokenizer
-            .encode(prompt, true)
-            .map_err(|e| TurError::Tokenizer(e.to_string()))?
+            .encode(prompt, false)
+            .map_err(|error| TurError::Tokenizer(error.to_string()))?
             .get_ids()
             .to_vec();
-
-        trace!(
-            request_id = %request.id,
-            prompt_tokens = tokens.len(),
-            sample_len = request.sample_len,
-            "Submitting request to scheduler"
+        if tokens.is_empty() {
+            return Err(invalid("chat template produced an empty prompt"));
+        }
+        // The final sampled token need not be consumed into model state.
+        let positions = tokens
+            .len()
+            .checked_add(request.max_tokens - 1)
+            .ok_or_else(|| invalid("request context length overflow"))?;
+        if positions > self.max_position {
+            return Err(invalid(
+                "prompt and generation limit exceed the model context",
+            ));
+        }
+        let handle = self.engine.allocate(
+            request.seed,
+            sampling(request.sampling, &self.defaults),
+            None,
+        )?;
+        self.pending.insert(
+            handle.request,
+            Pending {
+                handle,
+                prompt: tokens,
+                consumed: 0,
+                next: None,
+                stream: TokenOutputStream::new(self.tokenizer.clone()),
+                generated: 0,
+                max_tokens: request.max_tokens,
+                started: Instant::now(),
+                tools: request.tools.clone(),
+            },
         );
-
-        let request_state = crate::backend::batch_manager::RequestState::new(
-            request.id,
-            prompt.to_string(),
-            tokens,
-            request.sample_len,
-            0,
-        );
-
-        batching.scheduler.enqueue_request(request_state);
-
-        // Create a per-request incremental decoder for streaming.
-        let decoder = TokenOutputStream::new((*batching.tokenizer).clone());
-        self.streaming_decoders.insert(request.id, decoder);
-
-        Ok(RequestHandle { id: request.id })
+        self.order.push(handle.request);
+        Ok(handle.request)
     }
 
-    /// Run one iteration of continuous batching (batching mode only).
-    /// Returns the number of active requests.
-    pub fn step(&mut self) -> Result<usize> {
-        let batching = self
-            .batching
-            .as_mut()
-            .ok_or_else(|| TurError::Other("Batching not enabled".to_string()))?;
-
-        let output = batching.scheduler.schedule_iteration(&mut self.engine)?;
-
-        let mut results = self.results.write();
-        for (request_id, tokens, prompt, arrival_time, prompt_len) in output.completed {
-            let generated_text = batching
-                .tokenizer
-                .decode(&tokens, true)
-                .map_err(|e| TurError::Tokenizer(e.to_string()))?;
-
-            let result = GenerationResult {
-                request_id,
-                prompt,
-                generated_text,
-                generated_tokens: tokens.clone(),
-                stats: GenerationStats {
-                    generated_tokens: tokens.len(),
-                    prompt_tokens: prompt_len,
-                    elapsed: arrival_time.elapsed(),
-                    tool_calls: Vec::new(),
-                    generated_text: String::new(),
-                },
-            };
-
-            // Evict oldest result when at capacity.
-            if self.result_order.len() >= self.max_results
-                && let Some(oldest) = self.result_order.pop_front()
-            {
-                results.remove(&oldest);
-                warn!(
-                    evicted_request_id = %oldest,
-                    max_results = self.max_results,
-                    "Results map at capacity; evicted oldest completed result. \
-                     Call clear_results() periodically to avoid this.",
-                );
-            }
-
-            results.insert(request_id, result);
-            self.result_order.push_back(request_id);
-
-            trace!(
-                request_id = %request_id,
-                generated_tokens = tokens.len(),
-                "Request completed and result stored"
-            );
-        }
-
-        let active = self
-            .batching
-            .as_ref()
-            .map(|b| b.scheduler.active_request_count())
-            .unwrap_or(0);
-        Ok(active)
-    }
-
-    /// Like [`step`] but also returns per-request streaming tokens and the
-    /// completed [`GenerationResult`]s directly (instead of only storing them
-    /// in the internal results map).
-    ///
-    /// Intended for use by the server worker that needs to fan-out tokens to
-    /// per-request SSE streams and send final stats when a request finishes.
-    pub fn step_streaming(&mut self) -> Result<BatchStepOutput> {
-        let batching = self
-            .batching
-            .as_mut()
-            .ok_or_else(|| TurError::Other("Batching not enabled".to_string()))?;
-
-        let output = batching.scheduler.schedule_iteration(&mut self.engine)?;
-
-        // Use per-request TokenOutputStream for correct incremental BPE decoding.
-        // This handles multi-byte/multi-token sequences that decode to empty strings
-        // when processed individually.
-        let new_tokens: Vec<(Uuid, String)> = output
-            .new_tokens
-            .iter()
-            .filter_map(|(id, token)| {
-                let decoder = self.streaming_decoders.get_mut(id)?;
-                let text = decoder.next_token(*token).ok()??;
-                Some((*id, text))
-            })
-            .collect();
-
-        // Build GenerationResults for completed requests and store them.
-        let mut completed = Vec::with_capacity(output.completed.len());
-        {
-            let mut results = self.results.write();
-            for (request_id, tokens, prompt, arrival_time, prompt_len) in output.completed {
-                let generated_text = batching
-                    .tokenizer
-                    .decode(&tokens, true)
-                    .map_err(|e| TurError::Tokenizer(e.to_string()))?;
-
-                let result = GenerationResult {
-                    request_id,
-                    prompt,
-                    generated_text: generated_text.clone(),
-                    generated_tokens: tokens.clone(),
-                    stats: GenerationStats {
-                        generated_tokens: tokens.len(),
-                        prompt_tokens: prompt_len,
-                        elapsed: arrival_time.elapsed(),
-                        // Tool calls are parsed by the caller (the worker knows
-                        // which requests had tool definitions).
-                        tool_calls: Vec::new(),
-                        generated_text,
-                    },
-                };
-
-                // Remove the per-request streaming decoder now that it's done.
-                self.streaming_decoders.remove(&request_id);
-
-                if self.result_order.len() >= self.max_results
-                    && let Some(oldest) = self.result_order.pop_front()
-                {
-                    results.remove(&oldest);
-                }
-                results.insert(request_id, result.clone());
-                self.result_order.push_back(request_id);
-                completed.push((request_id, result));
-            }
-        }
-
-        Ok(BatchStepOutput {
-            completed,
-            new_tokens,
-        })
-    }
-
-    /// Run continuous batching until all requests are completed (batching mode only)
-    pub fn run_until_complete(&mut self) -> Result<()> {
-        if self.batching.is_none() {
-            return Err(TurError::Other("Batching not enabled".to_string()));
-        }
-
-        while self
-            .batching
-            .as_ref()
-            .map(|b| b.scheduler.has_pending_work())
-            .unwrap_or(false)
-        {
-            self.step()?;
-        }
+    /// Release all model state for a disconnected or cancelled request.
+    pub fn cancel(&mut self, id: Uuid) -> Result<()> {
+        let pending = self
+            .pending
+            .get(&id)
+            .ok_or_else(|| TurError::RequestNotFound(id.to_string()))?;
+        self.engine.cancel(pending.handle)?;
+        self.pending.remove(&id);
+        self.order.retain(|request| *request != id);
         Ok(())
     }
 
-    /// Try to get a completed result (non-blocking, batching mode only)
-    pub fn try_get_result(&self, handle: &RequestHandle) -> Option<GenerationResult> {
-        self.results.read().get(&handle.id).cloned()
+    fn publish(
+        &mut self,
+        id: Uuid,
+        commit: SequenceCommit,
+        output: &mut BatchStepOutput,
+    ) -> Result<()> {
+        let pending = self
+            .pending
+            .get_mut(&id)
+            .ok_or_else(|| invalid("unknown pipeline request"))?;
+        pending.handle = commit.handle;
+        if pending.consumed < pending.prompt.len() {
+            pending.consumed = pending
+                .consumed
+                .checked_add(commit.accepted_tokens)
+                .ok_or_else(|| invalid("prefill position overflow"))?;
+        }
+        let mut finished = commit.finished;
+        let mut reason = "stop";
+        for token in commit.outputs {
+            pending.generated += 1;
+            pending.next = Some(token.token);
+            let eos = self.defaults.eos_tokens.contains(&token.token);
+            if !eos && let Some(text) = pending.stream.next_token(token.token)? {
+                output.new_tokens.push((id, text));
+            }
+            if eos || pending.generated >= pending.max_tokens {
+                finished = true;
+                reason = if eos { "stop" } else { "length" };
+            }
+        }
+        if !finished {
+            return Ok(());
+        }
+        if let Some(text) = pending.stream.decode_rest()? {
+            output.new_tokens.push((id, text));
+        }
+        let generated_text = pending.stream.decode_all()?;
+        let tool_calls = if pending.tools.is_empty() {
+            Vec::new()
+        } else {
+            ToolCall::parse_from_output(&generated_text, &pending.tools)
+        };
+        let stats = GenerationStats {
+            generated_tokens: pending.generated,
+            prompt_tokens: pending.prompt.len(),
+            elapsed: pending.started.elapsed(),
+            generated_text,
+            tool_calls,
+            finish_reason: reason,
+        };
+        self.engine.cancel(pending.handle)?;
+        self.pending.remove(&id);
+        output.completed.push((id, Ok(stats)));
+        Ok(())
     }
 
-    /// Wait for a result to complete (blocking, batching mode only)
-    pub fn get_result(&mut self, handle: &RequestHandle) -> Result<GenerationResult> {
-        if let Some(result) = self.try_get_result(handle) {
-            return Ok(result);
+    /// Pack one chunk per prefill request and one token per decode request, fence, then publish.
+    /// A request's model or decode error is returned only to that request.
+    pub fn step_streaming(&mut self) -> Result<BatchStepOutput> {
+        let mut output = BatchStepOutput::default();
+        if self.pending.is_empty() {
+            return Ok(output);
         }
-
-        if self.batching.is_none() {
-            return Err(TurError::Other("Batching not enabled".to_string()));
+        let mut plan = PackedExecution {
+            tokens: Vec::new(),
+            positions: Vec::new(),
+            sequences: Vec::new(),
+        };
+        for id in &self.order {
+            let pending = self
+                .pending
+                .get(id)
+                .ok_or_else(|| invalid("missing pipeline request"))?;
+            let meta = self.engine.metadata(*id)?;
+            let start = plan.tokens.len();
+            let outputs = if pending.consumed < pending.prompt.len() {
+                let end = pending
+                    .consumed
+                    .saturating_add(self.prefill_chunk_size)
+                    .min(pending.prompt.len());
+                plan.tokens
+                    .extend_from_slice(&pending.prompt[pending.consumed..end]);
+                if end == pending.prompt.len() {
+                    vec![plan.tokens.len() - 1]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                plan.tokens.push(
+                    pending
+                        .next
+                        .ok_or_else(|| invalid("decode without a sampled token"))?,
+                );
+                vec![plan.tokens.len() - 1]
+            };
+            let end_position = meta
+                .position
+                .checked_add(plan.tokens.len() - start)
+                .ok_or_else(|| invalid("position overflow"))?;
+            plan.positions.extend(meta.position..end_position);
+            plan.sequences.push(SequenceDescriptor {
+                state: pending.handle,
+                tokens: start..plan.tokens.len(),
+                outputs,
+                speculative: false,
+            });
         }
+        self.engine.submit(plan)?;
+        for result in self.engine.finish()? {
+            let id = result.request;
+            let outcome = result
+                .outcome
+                .and_then(|commit| self.publish(id, commit, &mut output));
+            if let Err(error) = outcome {
+                self.cancel(id)?;
+                output.completed.push((id, Err(error)));
+            }
+        }
+        self.order.retain(|id| self.pending.contains_key(id));
+        Ok(output)
+    }
 
+    /// Run one request to completion and stream decoded text to a caller-owned callback.
+    pub fn run(
+        &mut self,
+        request: &GenerationRequest,
+        mut on_token: impl FnMut(&str),
+    ) -> Result<GenerationStats> {
+        if !self.pending.is_empty() {
+            return Err(invalid("run requires an idle pipeline"));
+        }
+        let id = self.submit_request(request)?;
         loop {
-            if let Some(result) = self.try_get_result(handle) {
-                return Ok(result);
+            let step = match self.step_streaming() {
+                Ok(step) => step,
+                Err(error) => {
+                    self.cancel(id)?;
+                    return Err(error);
+                }
+            };
+            for (_, text) in step.new_tokens {
+                on_token(&text);
             }
-
-            let has_work = self
-                .batching
-                .as_ref()
-                .map(|b| b.scheduler.has_pending_work())
-                .unwrap_or(false);
-
-            if !has_work {
-                return Err(TurError::Other(format!(
-                    "Request {} not found and no active requests",
-                    handle.id
-                )));
+            for (finished, result) in step.completed {
+                if finished == id {
+                    return result;
+                }
             }
-
-            self.step()?;
         }
     }
+}
 
-    /// Get all completed results (batching mode only)
-    pub fn get_all_results(&self) -> HashMap<Uuid, GenerationResult> {
-        self.results.read().clone()
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// Clear completed results (batching mode only)
-    pub fn clear_results(&mut self) {
-        self.results.write().clear();
-        self.result_order.clear();
-    }
-
-    /// Get number of active requests (batching mode only)
-    pub fn active_request_count(&self) -> usize {
-        self.batching
-            .as_ref()
-            .map(|b| b.scheduler.active_request_count())
-            .unwrap_or(0)
-    }
-
-    /// Get number of queued requests (batching mode only)
-    pub fn queued_request_count(&self) -> usize {
-        self.batching
-            .as_ref()
-            .map(|b| b.scheduler.queued_request_count())
-            .unwrap_or(0)
-    }
-
-    /// Check if batching is enabled
-    pub fn is_batching_enabled(&self) -> bool {
-        self.batching.is_some()
+    #[test]
+    fn test_sampling_uses_checkpoint_defaults_and_explicit_greedy() {
+        let defaults = GenerationDefaults {
+            temperature: Some(0.7),
+            top_k: Some(20),
+            top_p: Some(0.8),
+            eos_tokens: vec![1],
+        };
+        let inherited = sampling(SamplingOptions::default(), &defaults);
+        assert_eq!(inherited.temperature, Some(0.7));
+        assert_eq!(inherited.top_k, Some(20));
+        assert_eq!(inherited.top_p, Some(0.8));
+        let explicit = sampling(
+            SamplingOptions {
+                temperature: Some(0.0),
+                top_k: Some(1),
+                top_p: Some(1.0),
+            },
+            &defaults,
+        );
+        assert_eq!(explicit.temperature, Some(0.0));
+        assert_eq!(explicit.top_k, Some(1));
+        assert_eq!(explicit.top_p, Some(1.0));
     }
 }

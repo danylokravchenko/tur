@@ -14,7 +14,12 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    backend::{chat_template::Message, pipeline::GenerationStats, tools::ToolDefinition},
+    backend::{
+        chat_template::{ChatMessage, RenderOptions, Role, ToolCall},
+        pipeline::{GenerationRequest, GenerationStats},
+        tools::ToolDefinition,
+    },
+    hybrid::SamplingOptions,
     server::{
         AppState,
         types::{
@@ -38,11 +43,44 @@ fn new_completion_id() -> String {
     format!("chatcmpl-{}", Uuid::new_v4().simple())
 }
 
-fn to_internal_messages(msgs: &[crate::server::types::ChatMessage]) -> Vec<Message> {
+fn to_internal_messages(
+    msgs: &[crate::server::types::ChatMessage],
+) -> crate::Result<Vec<ChatMessage>> {
     msgs.iter()
-        .map(|m| Message {
-            role: m.role.clone(),
-            content: m.content.as_ref().map(|c| c.as_text()).unwrap_or_default(),
+        .map(|m| {
+            let role = match m.role.as_str() {
+                "system" => Role::System,
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                "tool" => Role::Tool,
+                _ => {
+                    return Err(crate::TurError::Other(format!(
+                        "unsupported message role '{}'",
+                        m.role
+                    )));
+                }
+            };
+            let tool_calls = m
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    if call.call_type != "function" {
+                        return Err(crate::TurError::Other(
+                            "only function tools are supported".into(),
+                        ));
+                    }
+                    Ok(ToolCall {
+                        name: call.function.name.clone(),
+                        arguments: serde_json::from_str(&call.function.arguments)?,
+                    })
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            Ok(ChatMessage {
+                role,
+                content: m.content.as_ref().map(|c| c.as_text()).unwrap_or_default(),
+                reasoning_content: m.reasoning_content.clone(),
+                tool_calls,
+            })
         })
         .collect()
 }
@@ -91,7 +129,46 @@ pub async fn chat_completions(
         }
     };
 
-    let messages = to_internal_messages(&req.messages);
+    let messages = match to_internal_messages(&req.messages) {
+        Ok(messages) => messages,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiErrorResponse::bad_request(error.to_string())),
+            )
+                .into_response();
+        }
+    };
+    if req
+        .tool_choice
+        .as_ref()
+        .is_some_and(|choice| choice != "auto")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse::bad_request(
+                "only tool_choice=auto is supported",
+            )),
+        )
+            .into_response();
+    }
+    if req.max_tokens == Some(0)
+        || req.temperature.is_some_and(|v| !v.is_finite() || v < 0.0)
+        || req
+            .top_p
+            .is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 1.0)
+        || req.top_k == Some(0)
+        || req
+            .reasoning_effort
+            .as_ref()
+            .is_some_and(|v| !matches!(v.as_str(), "low" | "medium" | "xhigh"))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse::bad_request("invalid generation controls")),
+        )
+            .into_response();
+    }
     let tools = to_internal_tools(&req.tools);
     let max_tokens = req.max_tokens.unwrap_or(1024);
 
@@ -99,10 +176,23 @@ pub async fn chat_completions(
     let (result_tx, result_rx) = oneshot::channel();
 
     let worker_msg = WorkerMsg {
-        messages,
-        tools,
-        max_tokens,
-        thinking: req.thinking,
+        request: GenerationRequest {
+            messages,
+            tools,
+            max_tokens,
+            sampling: SamplingOptions {
+                temperature: req.temperature,
+                top_p: req.top_p,
+                top_k: req.top_k,
+            },
+            seed: req.seed.unwrap_or(299_792_458),
+            render: RenderOptions {
+                add_generation_prompt: true,
+                enable_thinking: req.thinking,
+                reasoning_effort: req.reasoning_effort,
+                preserve_thinking: req.preserve_thinking,
+            },
+        },
         token_tx,
         result_tx,
     };
@@ -176,7 +266,7 @@ async fn blocking_response(
     };
 
     let finish_reason = if response_tool_calls.is_empty() {
-        "stop"
+        stats.finish_reason
     } else {
         "tool_calls"
     };
@@ -306,7 +396,7 @@ fn stream_response(
 
         let prompt_tokens = stats.prompt_tokens as u32;
         let completion_tokens = stats.generated_tokens as u32;
-        let finish_reason = if stats.tool_calls.is_empty() { "stop" } else { "tool_calls" };
+        let finish_reason = if stats.tool_calls.is_empty() { stats.finish_reason } else { "tool_calls" };
         let final_chunk = ChatCompletionChunk {
             id: id.clone(),
             object: "chat.completion.chunk",

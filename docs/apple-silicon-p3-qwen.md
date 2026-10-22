@@ -6,8 +6,9 @@ on the CPU and Metal. Qwen3.8-27B uses the same architecture code path. Its conf
 all 851 text-tensor names and shapes, its tokenizer differences and its chat template
 are validated against the pinned checkpoint, but it has not been executed: its 4-bit
 weights alone (~13.5 GB) exceed this Mac's 12.7 GB recommended GPU working set.
-Deleting the legacy models and rewiring CLI/server onto `HybridEngine` was deferred
-by the user to a follow-up; the legacy path is unchanged.
+The deferred legacy cleanup and CLI/server migration are now complete. Both adapters
+use `HybridEngine` through the packed hybrid text pipeline; ordinary Qwen3 and
+Granite 4.1 and their execution/cache path have been deleted.
 
 ## Pinned references
 
@@ -75,10 +76,46 @@ template exactly as `apply_chat_template` does:
 `enable_thinking`, `reasoning_effort` and `preserve_thinking` stay undefined when
 unset. That matters for Qwen3.8, which thinks by default and adds instructions for
 the reasoning-effort levels xhigh, medium and low. No `/think` heuristic is added.
-The legacy `format` path is unchanged.
+The legacy `format` path and its template preprocessing have been removed; all
+serving prompts use `render`.
 
 `tur_engine::hybrid::SamplingOptions` gained `top_k` (top-k, then top-p, as in candle),
 which the Qwen3.8 generation defaults need.
+
+## CLI/server migration and legacy removal
+
+The CLI and HTTP worker load the concrete `Qwen35` model with `ModelFactory`, then
+run it through `InferencePipeline` and the existing `HybridEngine`. Every iteration
+packs one bounded prompt chunk or one decode token per admitted sequence into a
+single `PackedExecution`. Intermediate prompt chunks request no logits. Live
+requests own independent hybrid state and sampling; completed, failed and cancelled
+requests release it. Startup loading is fallible and completes before HTTP binding.
+
+Loading requires an explicit checkpoint identity; remote sources require a fully
+qualified repository and immutable commit, with architecture validation before
+weight downloads. Local SafeTensors directories work offline. Q8_0 (default) and
+Q4K are explicit SafeTensors-to-packed conversions, not legacy GGUF imports. EOS
+IDs merge architecture config, generation config and the tokenizer's declared chat
+EOS. Sampling parameters inherit checkpoint defaults and HTTP overrides are honored.
+Thinking controls remain optional, preserving undefined versus false.
+
+HTTP conversations retain assistant reasoning and tool calls for exact checkpoint
+rendering. Complete hybrid XML tool calls use the supplied schema to distinguish
+string from JSON-valued arguments. Images, video and audio content parts are
+rejected; modality placeholder tokens fail only their request. The worker uses a
+bounded intake queue and live-request count and observes disconnected consumers.
+The response stream remains unbounded until P7. There is one resident model; no
+memory-budget or production concurrency claims are made.
+
+Removed: ordinary Qwen3 and Granite implementations and aliases; `ModelImpl`,
+`ModelInput`, `KvCacheImpl`, old K/V storage and memory-pool helpers; the ordinary
+engine, scheduler, batch manager and prefix cache; old factory/weight builders and
+model-name detection; legacy models' tests, benchmark, baseline runner and download/
+serving scripts. Historical P0 reports and measured results remain. The reusable
+projection enum, tokenizer streaming, tool definitions, faithful chat rendering and
+hybrid grammar contracts remain in use. No third-party dependency/version was added.
+
+Command examples and the intentionally changed flags are in the [README](../README.md).
 
 ## Tolerances and measurements
 
@@ -119,7 +156,10 @@ Offline fixtures also cover:
 ## Validation
 
 ```sh
-# Offline
+# Workspace and adapter fixtures
+cargo nextest run --offline --workspace
+cargo test --offline -p tur --test pipeline_integration --test hybrid_serving
+# Model/reference fixtures
 cargo test --offline -p tur-models --lib qwen3_5
 cargo test --offline -p tur-models --test qwen3_5
 cargo test --offline --release -p tur-engine --test qwen3_5
@@ -129,9 +169,34 @@ cargo test --offline --release -p tur-models --test qwen3_5 -- --ignored
 cargo test --offline --release -p tur-engine --test qwen3_5 -- --ignored
 ```
 
-Workspace checks pass with and without default features. Formatting, clippy (on the
-new code) and diff checks are clean. Run under nextest, the legacy checkpoint suite
-still has only its known `test_guided_json_schema_output_is_valid_json` failure (16/17).
+Migration validation on 2026-10-22:
+
+- `cargo nextest run --offline --workspace`: **102 passed**, four explicitly ignored
+  real-checkpoint tests. The existing mathematical reference results above remain
+  the P3 model oracle; the migration does not change that math.
+- `cargo check --offline --workspace --all-targets` and the same command with
+  `--no-default-features`: pass.
+- `cargo clippy --offline --workspace --all-targets -- -D warnings`, formatting and
+  diff checks: pass. The retained P0 trace-summary Python test passes.
+- Adapter fixtures cover streamed/full text equality, whole/chunked prefill, both
+  generation-config and tokenizer EOS, bounded admission, context and sampling
+  validation, request join/cancellation/failure isolation, startup errors, HTTP
+  sampling/thinking overrides and reasoning/tool history, and media rejection.
+- The pinned real **Qwen3.5-0.8B / Q8_0 on Metal** completed through both binaries.
+  CLI, concurrent non-streamed HTTP and streamed HTTP produced identical greedy
+  text and stopped at EOS. The HTTP modes reported identical usage: 20 prompt and
+  21 completion tokens. This used eight-token prefill chunks and two live HTTP
+  requests, in a development build; it is a correctness smoke test, not a benchmark.
+  [Run manifest](baselines/2026-10-22-m1-p3-serving/manifest.json),
+  [HTTP response](baselines/2026-10-22-m1-p3-serving/response.json),
+  [SSE output](baselines/2026-10-22-m1-p3-serving/stream.sse) and CLI/server logs
+  preserve the evidence. Metal checks ran with GPU access outside the filesystem
+  sandbox; the adapters now return a clear error if no Metal device is accessible.
+
+The legacy checkpoint suite, including its historical guided-JSON failure, was
+retired with the ordinary models. This is removal of an unsupported execution
+path, not a claim that guided JSON serving has been fixed; hybrid grammar state
+contracts retain their deterministic tests.
 
 The checkpoint tests are `#[ignore]` and fail, rather than skip, without their
 environment variables.
@@ -148,4 +213,6 @@ environment variables.
   no performance claims.
 - Speculative per-token recurrent snapshots grow with draft length (P8).
 - Image, video and audio inputs are rejected, not supported. MTP heads are not used.
-- The legacy models, engine, CLI and server remain until the deferred follow-up.
+- The CLI and server use the hybrid path. Production scheduling/admission (P6),
+  prefix reuse and bounded streaming delivery (P7), and production serving
+  hardening (P9) are not part of this migration.
