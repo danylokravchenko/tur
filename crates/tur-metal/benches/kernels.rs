@@ -4,7 +4,8 @@
 //! enqueues `reps` operations and then synchronizes.
 //!
 //! `cargo bench --offline -p tur-metal --bench kernels > out.json`
-//! `TUR_BENCH_ONLY=delta|linear|paged` restricts the run to one group.
+//! `TUR_BENCH_ONLY=delta|linear|paged|tiled` restricts the run to one group.
+//! `TUR_BENCH_SHAPE=<substring>` selects tiled attention shapes for focused tuning.
 
 use candle_core::{D, DType, Device, Tensor, quantized::GgmlDType};
 use serde_json::{Value, json};
@@ -368,6 +369,75 @@ fn paged_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     Ok(cases)
 }
 
+/// Tiled matrix-unit kernel against the per-query kernel (with its split-K choice), to
+/// place the dispatch crossover: (label, past keys, new tokens per sequence, sequences).
+fn tiled_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+    let tiled = kernels.clone().with_tuning(Tuning {
+        attention_tiled_groups: 0,
+        ..kernels.tuning()
+    })?;
+    let simd = kernels.clone().with_tuning(Tuning {
+        attention_tiled_groups: usize::MAX,
+        ..kernels.tuning()
+    })?;
+    let shapes = [
+        ("prefill 16", 0usize, 16usize, 1usize),
+        ("prefill 32", 0, 32, 1),
+        ("prefill 64", 0, 64, 1),
+        ("prefill 128", 0, 128, 1),
+        ("prefill 512", 0, 512, 1),
+        ("prefill 2048", 0, 2048, 1),
+        ("prefill 8192", 0, 8192, 1),
+        ("chunk 16 after 2048", 2048, 16, 1),
+        ("chunk 64 after 2048", 2048, 64, 1),
+        ("chunk 256 after 8192", 8192, 256, 1),
+        ("chunk 32 x4 after 1024", 1024, 32, 4),
+        ("decode ctx 2048 x8", 2047, 1, 8),
+    ];
+    let mut cases = Vec::new();
+    let shape_filter = std::env::var("TUR_BENCH_SHAPE").ok();
+    for (label, past, new, sequences) in shapes {
+        if shape_filter
+            .as_ref()
+            .is_some_and(|filter| !label.contains(filter))
+        {
+            continue;
+        }
+        let tokens = new * sequences;
+        let q = random(device, &[tokens, HEADS, HEAD_DIM], 5, 1.0)?;
+        let gate = random(device, &[tokens, HEADS * 2 * HEAD_DIM], 6, 1.0)?;
+        for format in [KvFormat::F32, KvFormat::F16, KvFormat::Q8] {
+            let paged = paged(
+                device, kernels, format, 16, KV_HEADS, HEAD_DIM, past, new, sequences,
+            )?;
+            let run = |k: &Kernels| {
+                time(device, || {
+                    k.attention(&q, &paged.pool, &paged.kv, &gate, gate_heads())
+                })
+            };
+            let (t, s) = (run(&tiled)?, run(&simd)?);
+            eprintln!(
+                "{label:23} {format:5}: tiled {:8.3} ms  per-query {:8.3} ms  x{:.2}",
+                t["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
+                s["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
+                speedup(&t, &s),
+            );
+            cases.push(json!({
+                "operation": "attention_tiled", "shape": label, "kv_format": format.to_string(),
+                "heads": HEADS, "kv_heads": KV_HEADS, "head_dim": HEAD_DIM,
+                "context": past + new, "sequences": sequences, "tiles": paged.kv.tiles(),
+                "default_kernel": if kernels.attention_tiled(&paged.kv, HEADS, HEAD_DIM) {
+                    "tiled"
+                } else {
+                    "per_query"
+                },
+                "tiled": t, "per_query": s, "speedup": speedup(&t, &s),
+            }));
+        }
+    }
+    Ok(cases)
+}
+
 fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     // Qwen3.5-0.8B: 16 key/value heads of 128; Qwen3.8-27B: 16 key and 48 value heads.
     let mut cases = Vec::new();
@@ -459,7 +529,7 @@ fn norm_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     Ok(cases)
 }
 
-/// `TUR_BENCH_ONLY=delta|linear|paged` restricts the run to one group (normalization runs
+/// `TUR_BENCH_ONLY=delta|linear|paged|tiled` restricts the run to one group (normalization runs
 /// with delta, the F32 attention baseline with paged).
 fn skip(group: &str) -> bool {
     std::env::var("TUR_BENCH_ONLY").is_ok_and(|v| v != group)
@@ -469,7 +539,7 @@ fn main() -> Result<()> {
     let device = Device::new_metal(0)?;
     let kernels = Kernels::new(&device)?;
     let document = json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "workload": "synthetic kernel shapes from Qwen3.5-0.8B and Qwen3.8-27B; not model or serving throughput",
         "dtype": DType::F32.as_str(),
         "capabilities": format!("{:?}", kernels.capabilities()),
@@ -482,6 +552,7 @@ fn main() -> Result<()> {
             "delta_net": if skip("delta") { json!([]) } else { json!(delta_cases(&device, &kernels)?) },
             "attention": if skip("paged") { json!([]) } else { json!(attention_cases(&device, &kernels)?) },
             "paged_attention": if skip("paged") { json!([]) } else { json!(paged_cases(&device, &kernels)?) },
+            "tiled_attention": if skip("tiled") { json!([]) } else { json!(tiled_cases(&device, &kernels)?) },
             "packed_linear": if skip("linear") { json!([]) } else { json!(gemv_cases(&device, &kernels)?) },
         },
     });

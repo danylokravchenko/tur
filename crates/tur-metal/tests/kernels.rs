@@ -638,7 +638,12 @@ fn check_attention(kernels: &Kernels, device: &Device, case: &AttentionCase) -> 
         KvFormat::F16,
         KvFormat::Q8,
         KvFormat::Q8 { group: 64 },
+        KvFormat::Q8 { group: 128 },
+        KvFormat::Q8 { group: 256 },
     ] {
+        if format.group().is_some_and(|group| group > case.dim) {
+            continue;
+        }
         let (actual, expected) = run_attention(kernels, device, case, format)?;
         let error = relative_error(&actual, &expected);
         assert!(error < 1e-5, "{format} dim {}: {error}", case.dim);
@@ -649,6 +654,10 @@ fn check_attention(kernels: &Kernels, device: &Device, case: &AttentionCase) -> 
 #[test]
 fn test_attention_paged_gqa_matches_reference_for_every_format_and_split() -> Result<()> {
     let (device, kernels, _gpu) = setup()?;
+    let kernels = kernels.clone().with_tuning(Tuning {
+        attention_tiled_groups: usize::MAX,
+        ..kernels.tuning()
+    })?;
     let split = kernels.clone().with_tuning(Tuning {
         min_split_keys: 8,
         ..kernels.tuning()
@@ -676,6 +685,98 @@ fn test_attention_paged_gqa_matches_reference_for_every_format_and_split() -> Re
     };
     assert!(kernels.attention_split(1, 4, 1000).splits > 1);
     check_attention(&kernels, &device, &case)
+}
+
+#[test]
+fn test_tiled_attention_matches_reference_for_every_format_and_tile_shape() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    let tiled = kernels.clone().with_tuning(Tuning {
+        attention_tiled_groups: 0,
+        ..kernels.tuning()
+    })?;
+    for dim in [64usize, 128, 256] {
+        // Partial and whole query tiles, key counts off the 32-key blocks, a single-token
+        // sequence and a long prefill continuing 37 committed keys.
+        let case = AttentionCase {
+            heads: 8,
+            kv_heads: 2,
+            dim,
+            page: 16,
+            sequences: vec![
+                (37, 3),
+                (0, 20),
+                (15, 1),
+                (37, 70),
+                (0, 32),
+                (65, 7),
+                (31, 8),
+                (0, 9),
+            ],
+        };
+        let (_, _, slots, table, first, visible) = paged_pool(&case, 30);
+        let paged = tiled.paged_kv(case.page, slots, &table, &first, &visible)?;
+        assert_eq!(paged.tiles(), Some(10));
+        assert!(tiled.attention_tiled(&paged, case.heads, dim));
+        check_attention(&tiled, &device, &case)?;
+    }
+    for (heads, kv_heads, page) in [(1, 1, 1), (3, 3, 7), (6, 2, 64)] {
+        let case = AttentionCase {
+            heads,
+            kv_heads,
+            dim: 64,
+            page,
+            sequences: vec![(0, 1), (63, 33)],
+        };
+        check_attention(&tiled, &device, &case)?;
+    }
+    check_attention(
+        &tiled,
+        &device,
+        &AttentionCase {
+            heads: 1,
+            kv_heads: 1,
+            dim: 64,
+            page: 32,
+            sequences: vec![(2047, 33)],
+        },
+    )?;
+    // Non-consecutive positions inside one sequence cannot tile.
+    let paged = tiled.paged_kv(16, 64, &[0, 1], &[0, 0], &[3, 5])?;
+    assert_eq!(paged.tiles(), None);
+    assert!(!tiled.attention_tiled(&paged, 8, 64));
+    Ok(())
+}
+
+#[test]
+fn test_tiled_attention_dispatch_preserves_decode_parallelism() -> Result<()> {
+    let (_, kernels, _gpu) = setup()?;
+    let decode = kernels.paged_kv(16, 32, &[0, 1], &[0, 1, 0, 1], &[16; 4])?;
+    assert!(!kernels.attention_tiled(&decode, 32, 128));
+
+    let visible: Vec<u32> = (1..=256).collect();
+    let table: Vec<u32> = (0..16).collect();
+    let short = kernels.paged_kv(16, 256, &table, &[0; 32], &visible[..32])?;
+    let crossover = kernels.paged_kv(16, 256, &table, &[0; 64], &visible[..64])?;
+    assert!(!kernels.attention_tiled(&short, 8, 256));
+    assert!(kernels.attention_tiled(&crossover, 8, 256));
+    let prefill = kernels.paged_kv(16, 256, &table, &[0; 256], &visible)?;
+    for dim in [64, 128, 256] {
+        assert!(kernels.attention_tiled(&prefill, 32, dim));
+    }
+    for dim in [0, 32, 192, 512] {
+        assert!(!kernels.attention_tiled(&prefill, 32, dim));
+    }
+    let per_query = kernels.clone().with_tuning(Tuning {
+        attention_tiled_groups: usize::MAX,
+        ..kernels.tuning()
+    })?;
+    assert!(!per_query.attention_tiled(&prefill, 32, 128));
+    let forced = kernels.clone().with_tuning(Tuning {
+        attention_tiled_groups: 0,
+        ..kernels.tuning()
+    })?;
+    assert!(forced.attention_tiled(&decode, 32, 128));
+    Ok(())
 }
 
 #[test]

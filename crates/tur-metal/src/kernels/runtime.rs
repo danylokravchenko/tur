@@ -17,7 +17,8 @@ use tur_core::{Result, TurError, execution::invalid};
 
 /// Version of the buffer layouts the kernels assume. Bump when any binding layout changes.
 /// 2: paged K/V pools in F32/F16/Q8 and slot-addressed recurrent state (P5).
-pub const LAYOUT_VERSION: u32 = 2;
+/// 3: tiled prefill attention over query tiles.
+pub const LAYOUT_VERSION: u32 = 3;
 
 const SOURCE: &str = include_str!("tur.metal");
 const SIMD_WIDTH: usize = 32;
@@ -52,6 +53,15 @@ const FUNCTIONS: &[&str] = &[
     "attention_r8_f32",
     "attention_r8_f16",
     "attention_r8_q8",
+    "attention_tiled_r2_f32",
+    "attention_tiled_r2_f16",
+    "attention_tiled_r2_q8",
+    "attention_tiled_r4_f32",
+    "attention_tiled_r4_f16",
+    "attention_tiled_r4_q8",
+    "attention_tiled_r8_f32",
+    "attention_tiled_r8_f16",
+    "attention_tiled_r8_q8",
     "attention_reduce_r2_f32",
     "attention_reduce_r4_f32",
     "attention_reduce_r8_f32",
@@ -145,6 +155,10 @@ pub struct Tuning {
     pub attention_parallelism: usize,
     /// Smallest key range of one attention split.
     pub min_split_keys: usize,
+    /// Threadgroups (query tiles × heads) from which the tiled matrix-unit kernel replaces
+    /// the per-query kernel when tiles average at least 16 query rows; below it, splitting
+    /// keys fills the GPU better. 0 always tiles eligible passes; `usize::MAX` never tiles.
+    pub attention_tiled_groups: usize,
     /// Inclusive row counts served by the packed Q8_0 and Q4K GEMVs; other counts use
     /// Candle's one-row GEMV or tiled GEMM.
     pub gemv_q8_0_rows: (usize, usize),
@@ -163,6 +177,8 @@ impl Tuning {
             elementwise_threads: limit.min(256),
             attention_parallelism: 1024,
             min_split_keys: 64,
+            // The M1 attention sweep crosses over at 64 queries × 8 heads (16 tiles).
+            attention_tiled_groups: 16,
             // Measured crossovers on M1 (P4 kernel artifact): Candle's one-row GEMV wins at
             // one row; the tiled GEMM wins from 7 (Q8_0) or 5 (Q4K) rows.
             gemv_q8_0_rows: (2, 6),

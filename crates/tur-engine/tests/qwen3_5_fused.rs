@@ -132,8 +132,9 @@ fn test_fused_layers_and_logits_match_reference_across_page_and_chunk_boundaries
     let device = metal()?;
     let fused = load(&checkpoint.0, WeightFormat::F32, &device, Execution::Fused)?;
     assert_eq!(fused.execution(), Execution::Fused);
-    // 150 tokens cross 16-token pages and the reference's 64-token delta chunks.
-    let tokens = prompt(150, 0);
+    // 513 tokens reach the default tiled-attention dispatch and leave a partial query
+    // tile, while crossing 16-token pages and the reference's 64-token delta chunks.
+    let tokens = prompt(513, 0);
     let all: Vec<usize> = (0..tokens.len()).collect();
     let (fused_layers, fused_logits) = fused.trace(&tokens, &all)?;
     let reference = fused.with_execution(Execution::Reference)?;

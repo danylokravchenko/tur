@@ -108,6 +108,25 @@ struct AttentionParams {
 }
 
 #[repr(C)]
+struct TiledParams {
+    tiles: u32,
+    heads: u32,
+    kv_heads: u32,
+    page: u32,
+    group: u32,
+    gate_stride: u32,
+    gate_col: u32,
+    gate_head_stride: u32,
+    scale: f32,
+}
+
+/// Query tokens per tile (8 rows per simdgroup), key block and staged dimensions of the
+/// tiled kernel (`TQ`, `TK`, `TD` in the MSL).
+const TILE_QUERIES: usize = 32;
+const TILE_KEYS: usize = 32;
+const TILE_DIMS: usize = 64;
+
+#[repr(C)]
 struct KvWriteParams {
     tokens: u32,
     kv_heads: u32,
@@ -176,6 +195,9 @@ pub struct PagedKv {
     table: Tensor,
     first_block: Tensor,
     visible: Tensor,
+    /// `(first token, count)` query tiles for the tiled kernel, or `None` when some
+    /// sequence's tokens are not consecutive positions sharing one page table.
+    tiles: Option<(Tensor, usize)>,
     page: usize,
     slots: usize,
     tokens: usize,
@@ -190,6 +212,35 @@ impl PagedKv {
     pub fn max_visible(&self) -> usize {
         self.max_visible
     }
+
+    /// Query tiles of the tiled kernel, if the layout allows it.
+    pub fn tiles(&self) -> Option<usize> {
+        self.tiles.as_ref().map(|(_, count)| *count)
+    }
+}
+
+/// Split runs of tokens sharing a page table, at consecutive positions, into tiles of at
+/// most `TILE_QUERIES`; `None` if any run breaks that shape.
+fn query_tiles(first_block: &[u32], visible: &[u32]) -> Option<Vec<u32>> {
+    let mut tiles = Vec::new();
+    let mut start = 0;
+    while start < visible.len() {
+        let mut end = start + 1;
+        while end < visible.len() && first_block[end] == first_block[start] {
+            if visible[end - 1].checked_add(1) != Some(visible[end]) {
+                return None;
+            }
+            end += 1;
+        }
+        for tile in (start..end).step_by(TILE_QUERIES) {
+            tiles.extend([
+                u32::try_from(tile).ok()?,
+                u32::try_from((end - tile).min(TILE_QUERIES)).ok()?,
+            ]);
+        }
+        start = end;
+    }
+    Some(tiles)
 }
 
 /// Recurrent pool slots written by one sequence: one per retained boundary. Uploaded once
@@ -723,10 +774,16 @@ impl Kernels {
             }
             max_visible = max_visible.max(keys as usize);
         }
+        let tiles = query_tiles(first_block, visible)
+            .map(|tiles| -> Result<(Tensor, usize)> {
+                Ok((self.runtime.indices(&tiles)?, tiles.len() / 2))
+            })
+            .transpose()?;
         Ok(PagedKv {
             table: self.runtime.indices(table)?,
             first_block: self.runtime.indices(first_block)?,
             visible: self.runtime.indices(visible)?,
+            tiles,
             page,
             slots,
             tokens: visible.len(),
@@ -750,6 +807,24 @@ impl Kernels {
             splits: max_visible.div_ceil(split_keys).max(1),
             split_keys,
         }
+    }
+
+    /// Threadgroup memory of the tiled kernel's staging buffer and physical slots.
+    fn tiled_memory_bytes() -> usize {
+        (TILE_KEYS * TILE_DIMS + TILE_KEYS) * 4
+    }
+
+    /// Whether a pass with `kv` addressing and `heads` query heads runs the tiled kernel.
+    pub fn attention_tiled(&self, kv: &PagedKv, heads: usize, dim: usize) -> bool {
+        kv.tiles().is_some_and(|tiles| {
+            tiles.saturating_mul(heads) >= self.tuning.attention_tiled_groups
+                // Sparse query tiles waste matrix work and lose split-K parallelism.
+                && (self.tuning.attention_tiled_groups == 0
+                    || kv.tokens >= tiles.saturating_mul(TILE_QUERIES / 2))
+                && matches!(dim, 64 | 128 | 256)
+                && self.capabilities().max_threads_per_threadgroup >= 128
+                && Self::tiled_memory_bytes() <= self.capabilities().threadgroup_memory_bytes
+        })
     }
 
     /// Scratch bytes of one attention dispatch (split partials and statistics).
@@ -918,12 +993,23 @@ impl Kernels {
         let qv = self.view(q)?;
         let gv = self.view(gate_source)?;
         qv.contiguous("queries")?;
-        let table = self.runtime.view(&kv.table, DType::U32)?;
-        let first = self.runtime.view(&kv.first_block, DType::U32)?;
-        let visible = self.runtime.view(&kv.visible, DType::U32)?;
         if gv.rows != tokens || gate.col_offset + (heads - 1) * gate.head_stride + dim > gv.cols {
             return Err(invalid("attention gate exceeds its projection"));
         }
+        if self.attention_tiled(kv, heads, dim) {
+            return self.attention_tiles(
+                &qv,
+                pool,
+                kv,
+                &gv,
+                gate,
+                (k_data, k_scales),
+                (v_data, v_scales),
+            );
+        }
+        let table = self.runtime.view(&kv.table, DType::U32)?;
+        let first = self.runtime.view(&kv.first_block, DType::U32)?;
+        let visible = self.runtime.view(&kv.visible, DType::U32)?;
         let split = self.attention_split(tokens, heads, kv.max_visible);
         let params = AttentionParams {
             tokens: to_u32(tokens, "tokens")?,
@@ -984,6 +1070,66 @@ impl Kernels {
                 })?;
         }
         self.finish(out, (tokens, heads * dim))
+    }
+
+    /// The tiled matrix-unit kernel over `kv`'s query tiles; same contract as `attention`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_tiles(
+        &self,
+        qv: &View<'_>,
+        pool: &AttentionPool,
+        kv: &PagedKv,
+        gv: &View<'_>,
+        gate: Heads,
+        (k_data, k_scales): (View<'_>, Option<View<'_>>),
+        (v_data, v_scales): (View<'_>, Option<View<'_>>),
+    ) -> Result<Tensor> {
+        let (tiles, count) = kv
+            .tiles
+            .as_ref()
+            .ok_or_else(|| invalid("page addressing has no query tiles"))?;
+        let (heads, dim) = (gate.count, pool.head_dim);
+        let params = TiledParams {
+            tiles: to_u32(*count, "tiles")?,
+            heads: to_u32(heads, "heads")?,
+            kv_heads: to_u32(pool.kv_heads, "kv heads")?,
+            page: to_u32(kv.page, "page")?,
+            group: to_u32(pool.format.group().unwrap_or(32), "group")?,
+            gate_stride: to_u32(gv.row_stride, "gate stride")?,
+            gate_col: to_u32(gate.col_offset, "gate column")?,
+            gate_head_stride: to_u32(gate.head_stride, "gate head stride")?,
+            scale: (dim as f64).sqrt().recip() as f32,
+        };
+        let pipeline = self.pipeline(&Self::kv_kernel("attention_tiled", dim, pool.format)?)?;
+        if pipeline.threads(128) != 128 {
+            return Err(invalid("tiled attention needs 128-thread threadgroups"));
+        }
+        let tiles = self.runtime.view(tiles, DType::U32)?;
+        let table = self.runtime.view(&kv.table, DType::U32)?;
+        let first = self.runtime.view(&kv.first_block, DType::U32)?;
+        let visible = self.runtime.view(&kv.visible, DType::U32)?;
+        let out = self.output(kv.tokens * heads, dim)?;
+        let groups = count
+            .checked_mul(heads)
+            .ok_or_else(|| invalid("tile count overflow"))?;
+        self.runtime
+            .dispatch(pipeline, "tur_attention_tiled", groups, 128, |e| {
+                qv.bind(e, 0)?;
+                k_data.bind(e, 1)?;
+                v_data.bind(e, 2)?;
+                table.bind(e, 3)?;
+                first.bind(e, 4)?;
+                visible.bind(e, 5)?;
+                gv.bind(e, 6)?;
+                out.bind(e, 7);
+                tiles.bind(e, 8)?;
+                e.set_bytes(9, &params);
+                k_scales.as_ref().unwrap_or(&k_data).bind(e, 10)?;
+                v_scales.as_ref().unwrap_or(&v_data).bind(e, 11)?;
+                e.set_threadgroup_memory_length(0, Self::tiled_memory_bytes());
+                Ok(())
+            })?;
+        self.finish(out, (kv.tokens, heads * dim))
     }
 
     /// Project `x` (`[rows, in]`) through `layer`. Packed Q8_0/Q4K weights with a row count
@@ -1054,5 +1200,28 @@ impl Kernels {
                 Ok(())
             })?;
         self.finish(out, (xv.rows, n))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::query_tiles;
+
+    #[test]
+    fn test_query_tiles_preserve_sequence_boundaries_and_tails() {
+        let first = [vec![0; 33], vec![4; 7]].concat();
+        let visible = [(1..=33).collect::<Vec<_>>(), (10..17).collect()].concat();
+        assert_eq!(
+            query_tiles(&first, &visible),
+            Some(vec![0, 32, 32, 1, 33, 7])
+        );
+    }
+
+    #[test]
+    fn test_query_tiles_reject_gaps_at_tile_boundaries_and_overflow() {
+        let mut visible: Vec<u32> = (1..=33).collect();
+        visible[32] = 34;
+        assert_eq!(query_tiles(&[0; 33], &visible), None);
+        assert_eq!(query_tiles(&[0; 2], &[u32::MAX, 0]), None);
     }
 }

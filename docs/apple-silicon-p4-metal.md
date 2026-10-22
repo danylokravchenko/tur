@@ -17,9 +17,9 @@ It is faster than the P3 reference in every measured regime:
 - **Decode, one sequence:** 1.6–3.0×.
 - **Decode, eight sequences:** 3.1–4.7×.
 
-Two kernel-order items remain open, with measurements: chunked parallel DeltaNet
-prefill, and attention prefill on the matrix units. The P0 M1 is the only measured
-device.
+Attention prefill on the matrix units is now implemented; see the
+[tiled attention report](apple-silicon-tiled-attention.md). Chunked parallel DeltaNet
+prefill remains open. The P0 M1 is the only measured device.
 
 ## Design overview
 
@@ -319,10 +319,9 @@ exact rollback exist.
   10 µs per token per layer on 0.8B and about 30 µs on 27B shapes, around a sixth of
   0.8B prefill at 2K tokens. A chunked kernel (UT transform on the matrix units) is the
   next DeltaNet step and must match the scan's boundary states.
-- **Attention prefill on the matrix units.** The attention kernel uses SIMD dot
-  products. It beats the reference by 4–10× in prefill, but at 2K tokens it runs about
-  0.24 TFLOPS, and its cost grows quadratically with prompt length. A
-  `simdgroup_matrix` tile path should replace it for long prompts.
+- **Attention prefill on the matrix units: completed after P5.** The
+  [tiled attention path](apple-silicon-tiled-attention.md) replaces per-query SIMD
+  dot products for sufficiently populated query tiles, retaining split-K for decode.
 - **Per-pass K/V pool.** Attention still concatenates committed pages each pass, as P3
   did. The kernel already addresses a block table, so P5 can switch to persistent
   page-native pools without changing the kernel.
