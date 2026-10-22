@@ -5,23 +5,19 @@ use super::{
     math::{self, DeltaInputs},
     weights::Checkpoint,
 };
-use crate::{
-    hybrid::{
-        Boundaries, HybridModel, LayerRead, LayerUpdate, PackedForward, SequenceForward,
-        SequenceStep,
-    },
-    models::layers::linear::LinearX,
+use crate::hybrid::{
+    Boundaries, HybridModel, LayerRead, LayerUpdate, PackedForward, SequenceForward, SequenceStep,
 };
-use candle_core::{
-    DType, Device, Module, Tensor,
-    quantized::{GgmlDType, QMatMul, QTensor},
-};
+use candle_core::{DType, Device, Tensor, quantized::GgmlDType};
 use std::{collections::HashMap, path::Path, sync::Arc};
 use tur_core::{
     Result,
     execution::{ModelDescription, invalid},
 };
-use tur_metal::state::ModelState;
+use tur_metal::{packed::PackedLinear, state::ModelState};
+
+#[cfg(feature = "metal")]
+mod fused;
 
 /// Storage for projection matrices. Norms, gates, convolution and state stay F32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +53,18 @@ impl WeightFormat {
     }
 }
 
+/// Which implementation executes the model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Execution {
+    /// Fused Metal kernels on a Metal device; the reference on the CPU, which has no
+    /// kernels. A Metal model never falls back to the CPU.
+    #[default]
+    Fused,
+    /// F32 reference operations over Candle tensors: the numerical oracle the fused
+    /// kernels are tested against, on any device.
+    Reference,
+}
+
 /// How to place a checkpoint.
 #[derive(Clone, Debug)]
 pub struct LoadOptions {
@@ -64,24 +72,25 @@ pub struct LoadOptions {
     pub revision: String,
     pub format: WeightFormat,
     pub device: Device,
+    pub execution: Execution,
 }
 
 struct Attention {
-    q: LinearX,
-    kv: LinearX,
-    o: LinearX,
+    q: PackedLinear,
+    kv: PackedLinear,
+    o: PackedLinear,
     q_norm: Tensor,
     k_norm: Tensor,
 }
 
 struct DeltaNet {
     /// Fused `in_proj_qkv | in_proj_z | in_proj_b | in_proj_a`.
-    proj: LinearX,
+    proj: PackedLinear,
     conv: Tensor,
     neg_a: Tensor,
     dt_bias: Tensor,
     norm: Tensor,
-    out: LinearX,
+    out: PackedLinear,
 }
 
 enum Mixer {
@@ -94,8 +103,8 @@ struct Layer {
     post_norm: Tensor,
     mixer: Mixer,
     /// Fused `gate_proj | up_proj`.
-    gate_up: LinearX,
-    down: LinearX,
+    gate_up: PackedLinear,
+    down: PackedLinear,
 }
 
 #[derive(Clone, Copy)]
@@ -123,9 +132,11 @@ pub struct Qwen35 {
     device: Device,
     dims: Dims,
     embed: Tensor,
-    lm_head: LinearX,
+    lm_head: PackedLinear,
     norm: Tensor,
     layers: Vec<Layer>,
+    #[cfg(feature = "metal")]
+    fused: Option<fused::Fused>,
 }
 
 /// One live sequence's rows within the packed hidden states.
@@ -135,25 +146,12 @@ struct Span<'a> {
     sequence: &'a SequenceForward<'a>,
 }
 
-fn linear(weight: &Tensor, format: WeightFormat, device: &Device) -> Result<LinearX> {
-    let weight = weight.to_dtype(DType::F32)?;
-    Ok(match format {
-        WeightFormat::F32 => {
-            LinearX::Standard(candle_nn::Linear::new(weight.to_device(device)?, None))
-        }
-        WeightFormat::Q8_0 | WeightFormat::Q4K => {
-            let dtype = if format == WeightFormat::Q8_0 {
-                GgmlDType::Q8_0
-            } else {
-                GgmlDType::Q4K
-            };
-            let quantized = QTensor::quantize_onto(&weight, dtype, device)?;
-            LinearX::Quantized {
-                qmatmul: QMatMul::from_qtensor(quantized)?,
-                bias: None,
-            }
-        }
-    })
+fn linear(weight: &Tensor, format: WeightFormat, device: &Device) -> Result<PackedLinear> {
+    match format {
+        WeightFormat::F32 => PackedLinear::dense(weight, device),
+        WeightFormat::Q8_0 => PackedLinear::quantized(weight, GgmlDType::Q8_0, device),
+        WeightFormat::Q4K => PackedLinear::quantized(weight, GgmlDType::Q4K, device),
+    }
 }
 
 fn f32_on(tensor: &Tensor, device: &Device) -> Result<Tensor> {
@@ -284,15 +282,13 @@ impl Qwen35 {
             _ => embed_source.to_dtype(DType::BF16)?.to_device(device)?,
         };
         let lm_head = match (config.tied_embeddings(), format) {
-            (true, WeightFormat::F32) => {
-                LinearX::Standard(candle_nn::Linear::new(embed.clone(), None))
-            }
+            (true, WeightFormat::F32) => PackedLinear::dense(&embed, device)?,
             (true, _) => linear(&embed_source, format, device)?,
             (false, _) => linear(&tensors.take("lm_head.weight")?, format, device)?,
         };
         let norm = centred(&tensors.take(&format!("{prefix}.norm.weight"))?, device)?;
         let revision = format!("{}#{}", options.revision, format.tag());
-        Ok(Self {
+        Self {
             description: config.description(revision)?,
             config,
             device: device.clone(),
@@ -301,7 +297,53 @@ impl Qwen35 {
             lm_head,
             norm,
             layers,
-        })
+            #[cfg(feature = "metal")]
+            fused: None,
+        }
+        .with_execution(options.execution)
+    }
+
+    /// Switch implementation without reloading weights, e.g. to compare the fused kernels
+    /// against the reference on identical weights.
+    pub fn with_execution(self, execution: Execution) -> Result<Self> {
+        #[cfg(feature = "metal")]
+        {
+            let fused = match (execution, &self.device) {
+                (Execution::Fused, Device::Metal(_)) => Some(fused::Fused::new(&self)?),
+                _ => None,
+            };
+            Ok(Self { fused, ..self })
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = execution;
+            Ok(self)
+        }
+    }
+
+    /// The implementation that executes forward passes.
+    pub fn execution(&self) -> Execution {
+        #[cfg(feature = "metal")]
+        if self.fused.is_some() {
+            return Execution::Fused;
+        }
+        Execution::Reference
+    }
+
+    /// Device bytes held by projection weights, all in their packed storage format.
+    pub fn projection_bytes(&self) -> usize {
+        let mut total = self.lm_head.resident_bytes();
+        for layer in &self.layers {
+            let mixer = match &layer.mixer {
+                Mixer::Attention(a) => [&a.q, &a.kv, &a.o]
+                    .iter()
+                    .map(|l| l.resident_bytes())
+                    .sum::<usize>(),
+                Mixer::Delta(net) => net.proj.resident_bytes() + net.out.resident_bytes(),
+            };
+            total += mixer + layer.gate_up.resident_bytes() + layer.down.resident_bytes();
+        }
+        total
     }
 
     /// Run `tokens` from an empty state and return the residual stream after every decoder
@@ -466,7 +508,7 @@ impl Qwen35 {
             });
         }
         let attended = Tensor::cat(&outputs, 0)?.reshape((n, d.heads * d.head_dim))?;
-        Ok(a.o.forward(&(attended * candle_nn::ops::sigmoid(&gate)?)?)?)
+        a.o.forward(&(attended * candle_nn::ops::sigmoid(&gate)?)?)
     }
 
     fn delta(
@@ -541,23 +583,22 @@ impl Qwen35 {
         let rows = n * d.value_heads;
         let core = Tensor::cat(&outputs, 0)?.reshape((rows, d.value_dim))?;
         let gated = math::gated_rms(&core, &z.reshape((rows, d.value_dim))?, &net.norm, d.eps)?;
-        Ok(net.out.forward(&gated.reshape((n, d.value_width))?)?)
+        net.out.forward(&gated.reshape((n, d.value_width))?)
     }
 
     fn mlp(&self, layer: &Layer, h: &Tensor) -> Result<Tensor> {
         let i = self.dims.intermediate;
         let gate_up = layer.gate_up.forward(h)?;
         let act = (candle_nn::ops::silu(&gate_up.narrow(1, 0, i)?)? * gate_up.narrow(1, i, i)?)?;
-        Ok(layer.down.forward(&act)?)
+        layer.down.forward(&act)
     }
 
     fn run(
         &self,
         batch: &PackedForward<'_>,
         spans: &[Span<'_>],
-        mut trace: Option<&mut Vec<Tensor>>,
+        trace: Option<&mut Vec<Tensor>>,
     ) -> Result<Vec<SequenceStep>> {
-        let d = self.dims;
         let mut ids = Vec::new();
         let mut positions = Vec::new();
         for span in spans {
@@ -569,29 +610,6 @@ impl Qwen35 {
             };
             ids.extend_from_slice(tokens);
             positions.extend_from_slice(at);
-        }
-        let count = ids.len();
-        let ids = Tensor::from_vec(ids, count, &self.device)?;
-        let mut x = self.embed.index_select(&ids, 0)?.to_dtype(DType::F32)?;
-        let rotary = math::rotary_tables(&positions, d.rotary_dim, d.theta, &self.device)?;
-        let mut updates: Vec<Vec<LayerUpdate>> = spans
-            .iter()
-            .map(|_| Vec::with_capacity(self.layers.len()))
-            .collect();
-        for (index, layer) in self.layers.iter().enumerate() {
-            let h = math::rms(&x, &layer.input_norm, d.eps)?;
-            let mixed = match &layer.mixer {
-                Mixer::Attention(a) => {
-                    self.attention(a, &h, &rotary, index, spans, &mut updates)?
-                }
-                Mixer::Delta(net) => self.delta(net, &h, index, spans, &mut updates)?,
-            };
-            x = (x + mixed)?;
-            let h = math::rms(&x, &layer.post_norm, d.eps)?;
-            x = (&x + self.mlp(layer, &h)?)?;
-            if let Some(trace) = trace.as_mut() {
-                trace.push(x.clone());
-            }
         }
         let mut rows = Vec::new();
         for span in spans {
@@ -607,14 +625,23 @@ impl Qwen35 {
             .into_iter()
             .collect::<std::result::Result<Vec<u32>, _>>()
             .map_err(|_| invalid("logit row overflow"))?;
-        let logits = if rows.is_empty() {
-            Tensor::zeros((0, self.description.vocab_size), DType::F32, &self.device)?
-        } else {
-            let selected = rows.len();
-            let index = Tensor::from_vec(rows, selected, &self.device)?;
-            let h = math::rms(&x.index_select(&index, 0)?, &self.norm, d.eps)?;
-            self.lm_head.forward(&h)?
+        let mut updates: Vec<Vec<LayerUpdate>> = spans
+            .iter()
+            .map(|_| Vec::with_capacity(self.layers.len()))
+            .collect();
+        let pass = Pass {
+            ids,
+            positions,
+            rows,
+            spans,
         };
+        #[cfg(feature = "metal")]
+        let logits = match &self.fused {
+            Some(fused) => self.run_fused(fused, &pass, &mut updates, trace)?,
+            None => self.run_reference(&pass, &mut updates, trace)?,
+        };
+        #[cfg(not(feature = "metal"))]
+        let logits = self.run_reference(&pass, &mut updates, trace)?;
         let mut offset = 0;
         let mut steps = Vec::with_capacity(spans.len());
         for (span, layers) in spans.iter().zip(updates) {
@@ -627,11 +654,69 @@ impl Qwen35 {
         }
         Ok(steps)
     }
+
+    /// F32 reference body: returns logits for `pass.rows` and pushes per-layer updates.
+    fn run_reference(
+        &self,
+        pass: &Pass<'_, '_>,
+        updates: &mut [Vec<LayerUpdate>],
+        mut trace: Option<&mut Vec<Tensor>>,
+    ) -> Result<Tensor> {
+        let d = self.dims;
+        let spans = pass.spans;
+        let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
+        let mut x = self.embed.index_select(&ids, 0)?.to_dtype(DType::F32)?;
+        let rotary = math::rotary_tables(&pass.positions, d.rotary_dim, d.theta, &self.device)?;
+        for (index, layer) in self.layers.iter().enumerate() {
+            let h = math::rms(&x, &layer.input_norm, d.eps)?;
+            let mixed = match &layer.mixer {
+                Mixer::Attention(a) => self.attention(a, &h, &rotary, index, spans, updates)?,
+                Mixer::Delta(net) => self.delta(net, &h, index, spans, updates)?,
+            };
+            x = (x + mixed)?;
+            let h = math::rms(&x, &layer.post_norm, d.eps)?;
+            x = (&x + self.mlp(layer, &h)?)?;
+            if let Some(trace) = trace.as_mut() {
+                trace.push(x.clone());
+            }
+        }
+        if pass.rows.is_empty() {
+            return Ok(Tensor::zeros(
+                (0, self.description.vocab_size),
+                DType::F32,
+                &self.device,
+            )?);
+        }
+        let index = Tensor::new(pass.rows.as_slice(), &self.device)?;
+        let h = math::rms(&x.index_select(&index, 0)?, &self.norm, d.eps)?;
+        self.lm_head.forward(&h)
+    }
+}
+
+/// Packed inputs of one pass, gathered from the live sequences.
+struct Pass<'s, 'a> {
+    ids: Vec<u32>,
+    positions: Vec<usize>,
+    /// Packed rows whose logits are returned, in sequence order.
+    rows: Vec<u32>,
+    spans: &'s [Span<'a>],
 }
 
 impl HybridModel for Qwen35 {
     fn description(&self) -> ModelDescription {
         self.description.clone()
+    }
+
+    /// Peak fused-kernel scratch of this plan (projections, convolved channels, the
+    /// per-pass K/V pool and split partials). The reference path is a development oracle
+    /// and declares none.
+    fn workspace_bytes(&self, batch: &PackedForward<'_>) -> Result<usize> {
+        #[cfg(feature = "metal")]
+        if let Some(fused) = &self.fused {
+            return self.fused_workspace(fused, batch);
+        }
+        let _ = batch;
+        Ok(0)
     }
 
     fn forward(&self, batch: &PackedForward<'_>) -> Result<Vec<Result<SequenceStep>>> {

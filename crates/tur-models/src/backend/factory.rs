@@ -10,7 +10,7 @@ use tokenizers::Tokenizer;
 use crate::{
     Result, TurError,
     backend::chat_template::ChatTemplate,
-    models::qwen3_5::{Config, GenerationDefaults, LoadOptions, Qwen35, WeightFormat},
+    models::qwen3_5::{Config, Execution, GenerationDefaults, LoadOptions, Qwen35, WeightFormat},
 };
 
 /// A local SafeTensors directory or a fully qualified Hugging Face repository.
@@ -150,6 +150,7 @@ impl ModelFactory {
                 },
                 format: self.format,
                 device: self.device.clone(),
+                execution: Execution::Fused,
             },
         )?;
         Ok((model, tokenizer, template, defaults))

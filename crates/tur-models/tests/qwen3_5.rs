@@ -13,7 +13,7 @@ use tur_models::{
         chat_template::{ChatMessage, ChatTemplate, RenderOptions, Role, ToolCall},
         tools::ToolDefinition,
     },
-    models::qwen3_5::{LoadOptions, Qwen35, WeightFormat},
+    models::qwen3_5::{Execution, LoadOptions, Qwen35, WeightFormat},
 };
 
 const FIXTURES: &str = include_str!("fixtures/qwen3_5_templates.json");
@@ -201,6 +201,7 @@ fn test_f32_layers_and_logits_match_transformers() -> Result<()> {
             revision: "Qwen/Qwen3.5-0.8B@2fc06364".into(),
             format: WeightFormat::F32,
             device: device()?,
+            execution: Execution::Fused,
         },
     )?;
     let tokens = ids(get("input_ids")?)?;

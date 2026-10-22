@@ -210,7 +210,9 @@ environment variables.
   - the loader keeps every raw text tensor in memory during load.
 
   Page-native kernels, fused DeltaNet and quantized GEMM are P4/P5 work, so there are
-  no performance claims.
+  no performance claims. P4 update: this reference remains the CPU path and the
+  numerical oracle (`Execution::Reference`); Metal now defaults to the fused kernels in
+  [the P4 report](apple-silicon-p4-metal.md).
 - Speculative per-token recurrent snapshots grow with draft length (P8).
 - Image, video and audio inputs are rejected, not supported. MTP heads are not used.
 - The CLI and server use the hybrid path. Production scheduling/admission (P6),

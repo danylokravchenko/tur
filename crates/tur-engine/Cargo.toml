@@ -26,3 +26,8 @@ uuid.workspace = true
 default = ["metal"]
 metal = ["candle-core/metal", "tur-core/metal", "tur-metal/metal", "tur-models/metal"]
 cuda = ["candle-core/cuda", "tur-core/cuda", "tur-metal/cuda", "tur-models/cuda"]
+
+[[bench]]
+name = "qwen3_5"
+harness = false
+required-features = ["metal"]

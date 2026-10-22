@@ -1,3 +1,2 @@
-//! Hybrid text models and reusable projection layers.
-pub mod layers;
+//! Hybrid text models.
 pub mod qwen3_5;

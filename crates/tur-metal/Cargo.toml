@@ -12,8 +12,23 @@ publish.workspace = true
 tur-core = { path = "../tur-core", default-features = false }
 candle-core.workspace = true
 parking_lot.workspace = true
+candle-metal-kernels = { workspace = true, optional = true }
+objc2-metal = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [features]
 default = ["metal"]
-metal = ["candle-core/metal", "tur-core/metal"]
+metal = [
+    "candle-core/metal",
+    "tur-core/metal",
+    "dep:candle-metal-kernels",
+    "dep:objc2-metal",
+]
 cuda = ["candle-core/cuda", "tur-core/cuda"]
+
+[[bench]]
+name = "kernels"
+harness = false
+required-features = ["metal"]

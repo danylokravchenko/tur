@@ -6,4 +6,4 @@ mod model;
 mod weights;
 
 pub use config::{Config, GenerationDefaults};
-pub use model::{LoadOptions, Qwen35, WeightFormat};
+pub use model::{Execution, LoadOptions, Qwen35, WeightFormat};

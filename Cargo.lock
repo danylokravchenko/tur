@@ -3641,7 +3641,10 @@ name = "tur-metal"
 version = "0.1.0"
 dependencies = [
  "candle-core",
+ "candle-metal-kernels",
+ "objc2-metal",
  "parking_lot",
+ "serde_json",
  "tur-core",
 ]
 

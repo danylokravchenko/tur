@@ -3,9 +3,11 @@
 //! speculation and quantization on a tiny random checkpoint, plus real-checkpoint
 //! generation (`#[ignore]`; needs `TUR_QWEN35_0_8B` and `TUR_QWEN35_GOLDEN`).
 
-use candle_core::{DType, Device, Tensor};
+mod common;
+
+use candle_core::{Device, Tensor};
+use common::{Checkpoint, max_relative};
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -17,7 +19,7 @@ use tur_engine::hybrid::{
     Boundaries, HybridEngine, HybridModel, PackedForward, SamplingOptions, SequenceForward,
 };
 use tur_metal::state::ModelState;
-use tur_models::models::qwen3_5::{Config, LoadOptions, Qwen35, WeightFormat};
+use tur_models::models::qwen3_5::{Execution, LoadOptions, Qwen35, WeightFormat};
 
 const TINY: &str = r#"{
   "architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5_text",
@@ -31,44 +33,8 @@ const TINY: &str = r#"{
   "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.25}
 }"#;
 
-/// Deterministic values in `(-scale, scale)`.
-fn values(count: usize, seed: u64, scale: f32) -> Vec<f32> {
-    let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    (0..count)
-        .map(|_| {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * scale
-        })
-        .collect()
-}
-
-struct TinyCheckpoint(PathBuf);
-
-impl Drop for TinyCheckpoint {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn tiny_checkpoint() -> Result<TinyCheckpoint> {
-    let dir = std::env::temp_dir().join(format!("tur-qwen35-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("config.json"), TINY)?;
-    let config = Config::from_json(TINY)?;
-    let mut tensors = HashMap::new();
-    for (seed, (name, shape)) in config.weight_shapes()?.into_iter().enumerate() {
-        let count = shape.iter().product();
-        let scale = if name.contains("norm") { 0.1 } else { 0.3 };
-        let data = values(count, seed as u64 + 1, scale);
-        tensors.insert(
-            name,
-            Tensor::from_vec(data, shape, &Device::Cpu)?.to_dtype(DType::BF16)?,
-        );
-    }
-    candle_core::safetensors::save(&tensors, dir.join("model.safetensors"))?;
-    Ok(TinyCheckpoint(dir))
+fn tiny_checkpoint() -> Result<Checkpoint> {
+    common::checkpoint(TINY, 0.3, 0.1)
 }
 
 fn load(dir: &Path, format: WeightFormat, device: Device) -> Result<Arc<Qwen35>> {
@@ -78,6 +44,7 @@ fn load(dir: &Path, format: WeightFormat, device: Device) -> Result<Arc<Qwen35>>
             revision: "tiny-fixture".into(),
             format,
             device,
+            execution: Execution::Fused,
         },
     )?))
 }
@@ -116,19 +83,6 @@ fn logits_by_chunks(model: &Qwen35, tokens: &[u32], chunk: usize) -> Result<Vec<
         state = state.apply(&staged, piece.len())?;
     }
     Ok(out)
-}
-
-fn max_relative(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
-    let scale = b
-        .iter()
-        .flatten()
-        .fold(0f32, |m, v| m.max(v.abs()))
-        .max(1e-6);
-    a.iter()
-        .flatten()
-        .zip(b.iter().flatten())
-        .fold(0f32, |m, (x, y)| m.max((x - y).abs()))
-        / scale
 }
 
 #[test]
@@ -432,6 +386,7 @@ fn real(format: WeightFormat) -> Result<Real> {
             revision: "Qwen/Qwen3.5-0.8B@2fc06364".into(),
             format,
             device: device()?,
+            execution: Execution::Fused,
         },
     )?);
     let generation = std::fs::read_to_string(dir.join("generation_config.json")).ok();
