@@ -738,6 +738,11 @@ impl HybridModel for Qwen35 {
         self.description.clone()
     }
 
+    #[cfg(feature = "metal")]
+    fn kernels(&self) -> Option<tur_metal::kernels::Kernels> {
+        self.fused.as_ref().map(|fused| fused.kernels().clone())
+    }
+
     /// Peak fused-kernel scratch of this plan (projections, convolved channels, page
     /// addressing and split partials). The reference path is a development oracle
     /// and declares none.

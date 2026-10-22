@@ -65,7 +65,53 @@ struct SamplingMark {
     guidance: Option<GuidanceControl>,
 }
 
+/// One output position's logits as `finish` delivers them.
+#[derive(Clone, Copy)]
+enum Row<'a> {
+    Logits(&'a [f32]),
+    /// Reduced on the device for greedy decoding: first maximum and whether the row is
+    /// finite.
+    Best {
+        index: u32,
+        finite: bool,
+    },
+}
+
+/// First maximum of finite `logits`, as Candle's argmax keeps. Chunked so the finiteness
+/// check and maximum vectorize; only a chunk with a new maximum is searched for its index.
+fn first_max(logits: &[f32]) -> Result<u32> {
+    const CHUNK: usize = 64;
+    let mut best: Option<(usize, f32)> = None;
+    for (chunk_index, chunk) in logits.chunks(CHUNK).enumerate() {
+        let (finite, max) = chunk
+            .iter()
+            .fold((true, f32::NEG_INFINITY), |(finite, max), &v| {
+                (finite & v.is_finite(), max.max(v))
+            });
+        if !finite {
+            return Err(invalid("nonfinite model logits"));
+        }
+        if best.is_none_or(|(_, value)| max > value) {
+            // Exact: `max` is one of the chunk's values.
+            #[allow(
+                clippy::float_cmp,
+                reason = "locating the element equal to the maximum"
+            )]
+            let offset = chunk.iter().position(|&v| v == max).unwrap_or(0);
+            best = Some((chunk_index * CHUNK + offset, max));
+        }
+    }
+    let (index, _) = best.ok_or_else(|| invalid("empty logits"))?;
+    u32::try_from(index).map_err(|_| invalid("token id exceeds u32"))
+}
+
 impl SamplingState {
+    /// Greedy without a grammar: only the first maximum matters, so the device may reduce
+    /// each row before it reaches the host.
+    fn reduces_to_argmax(&self) -> bool {
+        self.guidance.is_none() && matches!(self.options.sampling(), Sampling::ArgMax)
+    }
+
     fn fork(&self) -> Self {
         Self {
             seed: self.seed,
@@ -101,17 +147,34 @@ impl SamplingState {
     }
 
     /// Sample one output, or `None` once the grammar has reached a terminal state.
-    fn sample(&mut self, logits: &[f32]) -> Result<Option<u32>> {
+    fn sample(&mut self, row: Row<'_>) -> Result<Option<u32>> {
         if self.finished {
             return Ok(None);
-        }
-        if logits.iter().any(|value| !value.is_finite()) {
-            return Err(invalid("nonfinite model logits"));
         }
         let next_draw = self
             .draws
             .checked_add(1)
             .ok_or_else(|| invalid("RNG counter overflow"))?;
+        let logits = match row {
+            Row::Best { index, finite } => {
+                if !self.reduces_to_argmax() {
+                    return Err(invalid("reduced logits for a non-greedy request"));
+                }
+                if !finite {
+                    return Err(invalid("nonfinite model logits"));
+                }
+                self.draws = next_draw;
+                self.tokens.push(index);
+                return Ok(Some(index));
+            }
+            Row::Logits(logits) if self.reduces_to_argmax() => {
+                let token = first_max(logits)?;
+                self.draws = next_draw;
+                self.tokens.push(token);
+                return Ok(Some(token));
+            }
+            Row::Logits(logits) => logits,
+        };
         // SplitMix64's specified modular arithmetic derives a stable per-draw stream.
         // The request counter itself is checked and never wraps or depends on batch order.
         let mut seed = self
@@ -120,6 +183,9 @@ impl SamplingState {
         seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         seed ^= seed >> 31;
+        if logits.iter().any(|value| !value.is_finite()) {
+            return Err(invalid("nonfinite model logits"));
+        }
         let mut values = logits.to_vec();
         if let Some(guidance) = &mut self.guidance
             && guidance.apply_mask(&mut values)?
@@ -232,6 +298,13 @@ struct Batch<M> {
     plan: PackedExecution,
     reservations: Vec<Reservation>,
     logits: Vec<Result<Tensor>>,
+    /// Where each sequence's rows went: full logit rows for the host sampler, or (for
+    /// greedy requests on a device with kernels) argmax pairs reduced on the device.
+    reduced: Vec<bool>,
+    /// Full rows and argmax pairs of every sequence, each concatenated on the device before
+    /// the fence, so `finish` copies them to the host once rather than once per sequence.
+    packed: Option<Tensor>,
+    best: Option<Tensor>,
     error: Option<TurError>,
 }
 
@@ -248,6 +321,9 @@ pub struct HybridEngine<M: HybridModel> {
     requests: HashMap<Uuid, Request>,
     pending: Option<Completion<Batch<M>>>,
     pending_handles: HashSet<Uuid>,
+    /// The model's kernels, for reducing greedy rows on the device.
+    #[cfg(feature = "metal")]
+    kernels: Option<tur_metal::kernels::Kernels>,
 }
 
 fn validate_logits(logits: &Tensor, rows: usize, vocab: usize, device: &Device) -> Result<()> {
@@ -260,16 +336,45 @@ fn validate_logits(logits: &Tensor, rows: usize, vocab: usize, device: &Device) 
     Ok(())
 }
 
-/// Sample in order and decide how many inputs are accepted.
+/// This sequence's rows as `finish` copied them: full logits (`[outputs, vocab]`, flat)
+/// or argmax pairs (`[outputs, 2]`, flat).
+#[derive(Clone, Copy)]
+enum Rows<'a> {
+    Logits(&'a [f32], usize),
+    Best(&'a [f32]),
+}
+
+impl<'a> Rows<'a> {
+    fn iter(self) -> impl Iterator<Item = Row<'a>> {
+        let (logits, best) = match self {
+            Self::Logits(rows, vocab) => (Some(rows.chunks_exact(vocab.max(1))), None),
+            Self::Best(pairs) => (None, Some(pairs.as_chunks::<2>().0)),
+        };
+        logits
+            .into_iter()
+            .flatten()
+            .map(Row::Logits)
+            .chain(
+                best.into_iter()
+                    .flatten()
+                    .map(|&[index, finite]| Row::Best {
+                        index: index as u32,
+                        finite: finite != 0.0,
+                    }),
+            )
+    }
+}
+
+/// Sample in order from `rows` and decide how many inputs are accepted.
 fn sample_sequence(
     sampling: &mut SamplingState,
     sequence: &SequenceDescriptor,
     tokens: &[u32],
-    rows: &[Vec<f32>],
+    rows: Rows<'_>,
 ) -> Result<(usize, Vec<TokenOutput>)> {
     let length = sequence.tokens.len();
     let mut outputs = Vec::with_capacity(sequence.outputs.len());
-    for (index, (&position, row)) in sequence.outputs.iter().zip(rows).enumerate() {
+    for (index, (&position, row)) in sequence.outputs.iter().zip(rows.iter()).enumerate() {
         let Some(token) = sampling.sample(row)? else {
             return Ok((
                 if sequence.speculative {
@@ -320,19 +425,15 @@ fn forwards<'a>(
         .collect()
 }
 
-/// Sample, select the accepted boundary and publish one request; on error nothing changes.
+/// Sample from `rows`, select the accepted boundary and publish one request; on error
+/// nothing changes.
 fn publish(
     request: &mut Request,
     sequence: &SequenceDescriptor,
     tokens: &[u32],
     reservation: &Reservation,
-    logits: &Tensor,
+    rows: Rows<'_>,
 ) -> Result<SequenceCommit> {
-    let rows: Vec<Vec<f32>> = if sequence.outputs.is_empty() {
-        Vec::new()
-    } else {
-        logits.to_vec2()?
-    };
     let revision = request
         .handle
         .revision
@@ -340,7 +441,7 @@ fn publish(
         .ok_or_else(|| invalid("request revision overflow"))?;
     let sampling = &mut request.snapshot.sampling;
     let mark = sampling.mark();
-    let published = sample_sequence(sampling, sequence, tokens, &rows)
+    let published = sample_sequence(sampling, sequence, tokens, rows)
         .and_then(|(accepted, outputs)| Ok((reservation.commit(accepted)?, accepted, outputs)));
     let (model, accepted, outputs) = match published {
         Ok(published) => published,
@@ -366,7 +467,6 @@ impl<M: HybridModel> HybridEngine<M> {
         let description = Arc::new(model.description());
         let pool = StatePool::new(Arc::clone(&description), &device, config)?;
         Ok(Self {
-            model,
             description,
             device,
             pool,
@@ -374,6 +474,9 @@ impl<M: HybridModel> HybridEngine<M> {
             requests: HashMap::new(),
             pending: None,
             pending_handles: HashSet::new(),
+            #[cfg(feature = "metal")]
+            kernels: model.kernels(),
+            model,
         })
     }
 
@@ -636,6 +739,9 @@ impl<M: HybridModel> HybridEngine<M> {
                 plan,
                 reservations,
                 logits: Vec::new(),
+                reduced: Vec::new(),
+                packed: None,
+                best: None,
                 error: None,
             },
         );
@@ -672,6 +778,11 @@ impl<M: HybridModel> HybridEngine<M> {
             Ok(_) => batch.error = Some(invalid("model returned wrong number of sequences")),
             Err(error) => batch.error = Some(error),
         }
+        if batch.error.is_none()
+            && let Err(error) = self.gather(batch)
+        {
+            batch.error = Some(error);
+        }
         self.pending_handles = batch
             .plan
             .sequences
@@ -680,6 +791,57 @@ impl<M: HybridModel> HybridEngine<M> {
             .collect();
         self.pending = Some(completion);
         Ok(requirements)
+    }
+
+    /// Enqueue, before the fence, one concatenation of every full logit row and one of every
+    /// device-reduced argmax pair, so `finish` makes at most two host copies.
+    fn gather(&self, batch: &mut Batch<M>) -> Result<()> {
+        let mut full = Vec::new();
+        let mut best = Vec::new();
+        batch.reduced = Vec::with_capacity(batch.logits.len());
+        for (sequence, logits) in batch.plan.sequences.iter().zip(&batch.logits) {
+            let Ok(logits) = logits else {
+                batch.reduced.push(false);
+                continue;
+            };
+            let greedy = self
+                .requests
+                .get(&sequence.state.request)
+                .is_some_and(|r| r.snapshot.sampling.reduces_to_argmax());
+            let pairs = self.reduce(logits, greedy && !sequence.outputs.is_empty())?;
+            let reduced = pairs.is_some();
+            if let Some(pairs) = pairs {
+                best.push(pairs);
+            } else if !sequence.outputs.is_empty() {
+                full.push(logits.clone());
+            }
+            batch.reduced.push(reduced);
+        }
+        if !full.is_empty() {
+            batch.packed = Some(Tensor::cat(&full, 0)?);
+        }
+        if !best.is_empty() {
+            batch.best = Some(Tensor::cat(&best, 0)?);
+        }
+        Ok(())
+    }
+
+    /// Argmax pairs of `logits` on the device, when wanted and kernels are available.
+    #[cfg_attr(
+        not(feature = "metal"),
+        allow(
+            clippy::unused_self,
+            clippy::unnecessary_wraps,
+            reason = "without Metal every row stays on the host"
+        )
+    )]
+    fn reduce(&self, logits: &Tensor, wanted: bool) -> Result<Option<Tensor>> {
+        #[cfg(feature = "metal")]
+        if wanted && let Some(kernels) = &self.kernels {
+            return Ok(Some(kernels.argmax(logits)?));
+        }
+        let _ = (logits, wanted);
+        Ok(None)
     }
 
     /// Fence the pending batch, then sample and publish each request independently.
@@ -700,6 +862,9 @@ impl<M: HybridModel> HybridEngine<M> {
             plan,
             reservations,
             logits,
+            reduced,
+            packed,
+            best,
             error,
             ..
         } = batch;
@@ -709,16 +874,45 @@ impl<M: HybridModel> HybridEngine<M> {
             self.pool.reclaim();
             return Err(error);
         }
+        let vocab = self.description.vocab_size;
+        // One host copy each of the full rows and the argmax pairs, sliced in order.
+        let host = |tensor: Option<Tensor>| -> Result<Vec<f32>> {
+            tensor.map_or(Ok(Vec::new()), |t| Ok(t.flatten_all()?.to_vec1::<f32>()?))
+        };
+        let (full, pairs) = (host(packed)?, host(best)?);
+        let (mut full_at, mut pairs_at) = (0, 0);
         let mut results = Vec::with_capacity(plan.sequences.len());
-        for ((sequence, reservation), logits) in
-            plan.sequences.iter().zip(&reservations).zip(logits)
+        for (((sequence, reservation), logits), reduced) in plan
+            .sequences
+            .iter()
+            .zip(&reservations)
+            .zip(logits)
+            .zip(reduced)
         {
+            let rows = logits.and_then(|_| {
+                let outputs = sequence.outputs.len();
+                let (source, at, width) = if reduced {
+                    (&pairs, &mut pairs_at, 2)
+                } else {
+                    (&full, &mut full_at, vocab)
+                };
+                let start = *at;
+                *at += outputs * width;
+                let rows = source
+                    .get(start..*at)
+                    .ok_or_else(|| invalid("logit rows outside the copied batch"))?;
+                Ok(if reduced {
+                    Rows::Best(rows)
+                } else {
+                    Rows::Logits(rows, vocab)
+                })
+            });
             let id = sequence.state.request;
             let Some(request) = self.requests.get_mut(&id).filter(|r| !r.cancelled) else {
                 continue;
             };
-            let outcome = logits
-                .and_then(|logits| publish(request, sequence, &plan.tokens, reservation, &logits));
+            let outcome =
+                rows.and_then(|rows| publish(request, sequence, &plan.tokens, reservation, rows));
             results.push(SequenceResult {
                 request: id,
                 outcome,
@@ -782,7 +976,7 @@ mod tests {
             tokens: vec![],
             finished: false,
         };
-        assert!(state.sample(&[1.0, 2.0]).is_err());
+        assert!(state.sample(Row::Logits(&[1.0, 2.0])).is_err());
         assert_eq!(state.draws, u64::MAX);
         assert_eq!(state.tokens, [] as [u32; 0]);
     }
@@ -848,6 +1042,28 @@ mod tests {
     }
 
     #[test]
+    fn test_greedy_fast_path_keeps_the_first_maximum_and_rejects_nonfinite_rows() {
+        let mut state = SamplingState {
+            seed: 3,
+            draws: 0,
+            options: SamplingOptions::default(),
+            guidance: None,
+            tokens: vec![],
+            finished: false,
+        };
+        assert!(matches!(
+            state.sample(Row::Logits(&[1.0, 3.0, 3.0, -2.0])),
+            Ok(Some(1))
+        ));
+        assert!(matches!(
+            state.sample(Row::Logits(&[-5.0, -5.0])),
+            Ok(Some(0))
+        ));
+        assert!(state.sample(Row::Logits(&[1.0, f32::INFINITY])).is_err());
+        assert_eq!((state.draws, state.tokens.as_slice()), (2, &[1, 0][..]));
+    }
+
+    #[test]
     fn test_rollback_restores_history_and_draws() {
         let mut state = SamplingState {
             seed: 3,
@@ -858,8 +1074,11 @@ mod tests {
             finished: false,
         };
         let mark = state.mark();
-        assert!(matches!(state.sample(&[0.0, 1.0]), Ok(Some(1))));
-        assert!(state.sample(&[f32::NAN, 1.0]).is_err());
+        assert!(matches!(
+            state.sample(Row::Logits(&[0.0, 1.0])),
+            Ok(Some(1))
+        ));
+        assert!(state.sample(Row::Logits(&[f32::NAN, 1.0])).is_err());
         state.rollback(mark);
         assert_eq!(state.draws, 0);
         assert_eq!(state.tokens, [] as [u32; 0]);

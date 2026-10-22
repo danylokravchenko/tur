@@ -275,36 +275,61 @@ fn test_fused_packed_formats_track_reference() -> Result<()> {
             "{format:?} expanded"
         );
         let reference = load(&checkpoint.0, format, &device, Execution::Reference)?;
-        let pool = pool(&reference)?;
+        // Two batches of up to twelve sequences and their one-sequence references each write
+        // a slot per sequence before the batch is reclaimed.
+        let pool = common::pool(&reference, 256, 64)?;
         let (_, long_state) = prefill(&reference, ModelState::new(&pool), &prompt(30, 9), 30)?;
         let (_, short_state) = prefill(&reference, ModelState::new(&pool), &prompt(7, 10), 7)?;
-        // Three single-token sequences: the fused path takes the small-batch GEMV. The
-        // reference run per sequence uses Candle's one-row GEMV (F32 dequantization); run
-        // as a batch it uses Candle's tiled GEMM, which stages weight tiles as F16.
-        let new = [prompt(1, 11), prompt(1, 12), prompt(1, 13)];
-        let batch: Vec<(&ModelState, &[u32], Boundaries)> =
-            [&long_state, &short_state, &long_state]
-                .into_iter()
-                .zip(&new)
-                .map(|(state, tokens)| (state, tokens.as_slice(), Boundaries::Final))
+        // Batches of single-token sequences: three take the small-batch GEMV, six and twelve
+        // the Q8_0 matrix-unit kernel (one and two row tiles), and every recurrent layer
+        // the decode step kernel. The reference run per sequence uses Candle's one-row GEMV
+        // (F32 dequantization); run as a batch it uses Candle's tiled GEMM, which stages
+        // weight tiles as F16.
+        for count in [3usize, 6, 12] {
+            let new: Vec<Vec<u32>> = (0..count).map(|i| prompt(1, 11 + i)).collect();
+            let batch: Vec<(&ModelState, &[u32], Boundaries)> = new
+                .iter()
+                .enumerate()
+                .map(|(i, tokens)| {
+                    let state = if i % 2 == 0 {
+                        &long_state
+                    } else {
+                        &short_state
+                    };
+                    (state, tokens.as_slice(), Boundaries::Final)
+                })
                 .collect();
-        let (tiled, _held) = forward(&reference, &batch)?;
-        let (fused_steps, _held) = forward(&fused, &batch)?;
-        for ((fused, tiled), single) in fused_steps.into_iter().zip(tiled).zip(&batch) {
-            let (mut alone, _held) = forward(&reference, std::slice::from_ref(single))?;
-            let alone = alone.pop().ok_or_else(|| invalid("missing step"))??;
-            let (fused_logits, single_logits, tiled_logits) = (
-                rows(&fused?.logits)?,
-                rows(&alone.logits)?,
-                rows(&tiled?.logits)?,
-            );
-            let error = max_relative(&fused_logits, &single_logits);
-            assert!(error < 1e-4, "{format:?} decode vs one-row GEMV {error}");
-            let error = max_relative(&tiled_logits, &single_logits);
-            assert!(
-                error < 2e-2,
-                "{format:?} F16-tiled GEMM vs one-row GEMV {error}"
-            );
+            let (tiled, tiled_held) = forward(&reference, &batch)?;
+            let (fused_steps, fused_steps_held) = forward(&fused, &batch)?;
+            for ((fused, tiled), single) in fused_steps.into_iter().zip(tiled).zip(&batch) {
+                let (mut alone, _held) = forward(&reference, std::slice::from_ref(single))?;
+                let alone = alone.pop().ok_or_else(|| invalid("missing step"))??;
+                let (fused_logits, single_logits, tiled_logits) = (
+                    rows(&fused?.logits)?,
+                    rows(&alone.logits)?,
+                    rows(&tiled?.logits)?,
+                );
+                // Q4K has no matrix-unit kernel: above its GEMV range it uses F16 tiles.
+                let bound = if format == WeightFormat::Q4K && count > 4 {
+                    2e-2
+                } else {
+                    1e-4
+                };
+                let error = max_relative(&fused_logits, &single_logits);
+                assert!(
+                    error < bound,
+                    "{format:?} decode of {count} vs one-row GEMV {error}"
+                );
+                let error = max_relative(&tiled_logits, &single_logits);
+                assert!(
+                    error < 2e-2,
+                    "{format:?} F16-tiled GEMM vs one-row GEMV {error}"
+                );
+            }
+            // Retire this batch's slots before the next one leases its own.
+            drop((fused_steps_held, tiled_held));
+            device.synchronize()?;
+            pool.reclaim();
         }
         let tokens = prompt(100, 14);
         let error = max_relative(

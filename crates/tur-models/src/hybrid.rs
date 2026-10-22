@@ -49,6 +49,13 @@ pub trait HybridModel: Send + Sync + 'static {
         Ok(0)
     }
 
+    /// Compiled Metal kernels the engine may reuse for logit reductions, when the model
+    /// runs on them; `None` keeps the engine's host path.
+    #[cfg(feature = "metal")]
+    fn kernels(&self) -> Option<tur_metal::kernels::Kernels> {
+        None
+    }
+
     /// Encode one packed pass. The outer error fails the whole batch (a shared dispatch);
     /// each inner result is one sequence, in order, so one request's failure is isolated.
     /// Implementations should only enqueue device work; the engine fences before reading.

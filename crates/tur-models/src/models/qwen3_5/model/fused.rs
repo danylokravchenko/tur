@@ -26,6 +26,10 @@ pub(super) struct Fused {
 }
 
 impl Fused {
+    pub(super) fn kernels(&self) -> &Kernels {
+        &self.kernels
+    }
+
     pub(super) fn new(model: &Qwen35) -> Result<Self> {
         let kernels = Kernels::new(&model.device)?;
         let d = model.dims;

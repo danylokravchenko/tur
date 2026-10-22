@@ -64,6 +64,72 @@ kernel void rms_norm_f32(
     }
 }
 
+struct ArgmaxParams {
+    uint rows;
+    uint cols;
+    uint stride;
+};
+
+// Keep the larger value, or the lower index between equal values.
+static inline void better(thread float &v, thread uint &i, float ov, uint oi) {
+    if (oi != UINT_MAX && (i == UINT_MAX || ov > v || (ov == v && oi < i))) {
+        v = ov;
+        i = oi;
+    }
+}
+
+// Greedy decoding without host logits: per row, the first maximum and whether every value
+// is finite, as out[row] = (index, 1) or (index, 0). One threadgroup per row; indices are
+// exact in F32 because the host bounds the vocabulary below 2^24.
+kernel void argmax_f32(
+    device const float *x [[buffer(0)]],
+    device float2 *out [[buffer(1)]],
+    constant ArgmaxParams &p [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgs [[simdgroups_per_threadgroup]]) {
+    threadgroup float values[SIMD];
+    threadgroup uint indices[SIMD];
+    threadgroup uint flags[SIMD];
+    if (row >= p.rows) {
+        return;
+    }
+    device const float *xr = x + ulong(row) * p.stride;
+    float v = 0.0f;
+    uint i = UINT_MAX;
+    uint nonfinite = 0;
+    for (uint c = tid; c < p.cols; c += threads) {
+        float s = xr[c];
+        nonfinite |= isfinite(s) ? 0u : 1u;
+        better(v, i, s, c);
+    }
+    for (uint offset = SIMD / 2; offset > 0; offset /= 2) {
+        better(v, i, simd_shuffle_xor(v, offset), simd_shuffle_xor(i, offset));
+    }
+    nonfinite = simd_max(nonfinite);
+    if (lane == 0) {
+        values[sg] = v;
+        indices[sg] = i;
+        flags[sg] = nonfinite;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        v = lane < sgs ? values[lane] : 0.0f;
+        i = lane < sgs ? indices[lane] : UINT_MAX;
+        nonfinite = lane < sgs ? flags[lane] : 0u;
+        for (uint offset = SIMD / 2; offset > 0; offset /= 2) {
+            better(v, i, simd_shuffle_xor(v, offset), simd_shuffle_xor(i, offset));
+        }
+        nonfinite = simd_max(nonfinite);
+        if (lane == 0) {
+            out[row] = float2(float(i), nonfinite == 0 ? 1.0f : 0.0f);
+        }
+    }
+}
+
 // s = x + r (written out), y = rms(s) * w: residual addition fused with the next norm.
 kernel void add_rms_norm_f32(
     device const float *x [[buffer(0)]],
@@ -297,9 +363,9 @@ struct ScanParams {
     uint a_col;
 };
 
-// Gated delta rule over every sequence of a packed pass, token by token, with the state
-// held in registers. Threadgroups cover (sequence, head, column block); each simdgroup
-// owns COLS value columns of one head and lane l holds key rows l + 32r.
+// Gated delta rule over the sequences `order` lists, token by token, with the state held
+// in registers. Threadgroups cover (sequence, head, column block); each simdgroup owns
+// COLS value columns of one head and lane l holds key rows l + 32r.
 // Per token: L2-normalise q/k, decay the state, read the prediction, write the
 // beta-scaled correction and read the output with the query.
 //
@@ -317,6 +383,7 @@ kernel void delta_scan_f32(
     constant ScanParams &p [[buffer(6)]],
     device const RecurrentSpan *spans [[buffer(7)]],
     device const uint *slots [[buffer(8)]],
+    device const uint *order [[buffer(9)]],
     threadgroup float *tile [[threadgroup(0)]],
     uint tg [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
@@ -330,11 +397,11 @@ kernel void delta_scan_f32(
     uint groups_per_tg = sgs;
     uint tgs_per_head = (column_groups + groups_per_tg - 1) / groups_per_tg;
     uint tgs_per_sequence = p.heads * tgs_per_head;
-    uint sequence = tg / tgs_per_sequence;
-    if (sequence >= p.sequences) {
+    uint index = tg / tgs_per_sequence;
+    if (index >= p.sequences) {
         return;
     }
-    RecurrentSpan s = spans[sequence];
+    RecurrentSpan s = spans[order[index]];
     uint local = tg % tgs_per_sequence;
     uint h = local / tgs_per_head;
     uint block = local % tgs_per_head;
@@ -482,10 +549,110 @@ kernel void delta_scan_f32(
     template [[host_name("delta_scan_r" #R "_f32")]] kernel void delta_scan_f32<R, 4>( \
         device const float *, device const float *, device const float *, device const float *, \
         device float *, device float *, constant ScanParams &, device const RecurrentSpan *, \
-        device const uint *, threadgroup float *, uint, uint, uint, uint, uint, uint);
+        device const uint *, device const uint *, threadgroup float *, uint, uint, uint, uint, \
+        uint, uint);
 SCAN(2)
 SCAN(4)
 SCAN(8)
+
+// One gated delta step for each single-token sequence `order` lists. A threadgroup covers
+// (sequence, head, 64 value columns) with DK / 32 simdgroups: lane l owns value columns
+// col0 + 2l and col0 + 2l + 1 and simdgroup g owns key rows 32g..32g+31, so every state
+// load and store is a coalesced 256-byte row segment. The two column reductions
+// (prediction and output) sum the simdgroups' partials through threadgroup memory.
+template <uint DK>
+kernel void delta_step_f32(
+    device const float *mixed [[buffer(0)]],
+    device const float *proj [[buffer(1)]],
+    device const float *dt_bias [[buffer(2)]],
+    device const float *neg_a [[buffer(3)]],
+    device float *pool [[buffer(4)]],
+    device float *out [[buffer(5)]],
+    constant ScanParams &p [[buffer(6)]],
+    device const RecurrentSpan *spans [[buffer(7)]],
+    device const uint *slots [[buffer(8)]],
+    device const uint *order [[buffer(9)]],
+    threadgroup float2 *partial [[threadgroup(0)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint GROUPS = DK / SIMD;
+    uint dv = p.value_dim;
+    uint blocks = (dv + 2 * SIMD - 1) / (2 * SIMD);
+    uint per_sequence = p.heads * blocks;
+    uint index = tg / per_sequence;
+    if (index >= p.sequences) {
+        return;
+    }
+    RecurrentSpan s = spans[order[index]];
+    uint h = (tg % per_sequence) / blocks;
+    uint j = (tg % blocks) * 2 * SIMD + 2 * lane;
+    // Value dims are even (checked by the host), so a lane's pair is wholly in or out.
+    bool active = j < dv;
+    uint kh = h / p.groups;
+    device const float *row = mixed + ulong(s.row) * p.mixed_stride;
+    device const float *gates = proj + ulong(s.row) * p.proj_stride;
+    device const float *q = row + kh * DK;
+    device const float *k = row + p.key_width + kh * DK;
+    float qs = 0.0f, ks = 0.0f;
+    for (uint i = lane; i < DK; i += SIMD) {
+        qs += q[i] * q[i];
+        ks += k[i] * k[i];
+    }
+    float q_scale = 1.0f / (sqrt(simd_sum(qs) + 1e-6f) * sqrt(float(DK)));
+    float k_scale = 1.0f / sqrt(simd_sum(ks) + 1e-6f);
+    float decay = exp(softplus(gates[p.a_col + h] + dt_bias[h]) * neg_a[h]);
+    float beta = sigmoid(gates[p.b_col + h]);
+    device const float *vr = row + 2 * p.key_width + h * dv + j;
+    float2 v = active ? float2(vr[0], vr[1]) : float2(0.0f);
+
+    ulong state_size = ulong(p.heads) * DK * dv;
+    ulong head = ulong(h) * DK * dv + j;
+    device const float *state_in = pool + ulong(s.read) * state_size + head;
+    uint i0 = sg * SIMD;
+    float2 st[SIMD];
+    float2 prediction = 0.0f;
+    for (uint r = 0; r < SIMD; ++r) {
+        st[r] = active ? *((device const float2 *)(state_in + ulong(i0 + r) * dv)) * decay
+                       : float2(0.0f);
+        prediction += k[i0 + r] * k_scale * st[r];
+    }
+    partial[sg * SIMD + lane] = prediction;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    prediction = 0.0f;
+    for (uint g = 0; g < GROUPS; ++g) {
+        prediction += partial[g * SIMD + lane];
+    }
+    float2 correction = (v - prediction) * beta;
+    float2 output = 0.0f;
+    device float *state_out = pool + ulong(slots[s.writes]) * state_size + head;
+    for (uint r = 0; r < SIMD; ++r) {
+        st[r] += k[i0 + r] * k_scale * correction;
+        output += q[i0 + r] * q_scale * st[r];
+        if (active) {
+            *((device float2 *)(state_out + ulong(i0 + r) * dv)) = st[r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    partial[sg * SIMD + lane] = output;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0 && active) {
+        output = 0.0f;
+        for (uint g = 0; g < GROUPS; ++g) {
+            output += partial[g * SIMD + lane];
+        }
+        *((device float2 *)(out + (ulong(s.row) * p.heads + h) * dv + j)) = output;
+    }
+}
+
+#define STEP(DK) \
+    template [[host_name("delta_step_d" #DK "_f32")]] kernel void delta_step_f32<DK>( \
+        device const float *, device const float *, device const float *, device const float *, \
+        device float *, device float *, constant ScanParams &, device const RecurrentSpan *, \
+        device const uint *, device const uint *, threadgroup float2 *, uint, uint, uint);
+STEP(64)
+STEP(128)
+STEP(256)
 
 // ---------------------------------------------------------------------------------------
 // Paged K/V: quantize-on-write of new rows and attention reading pages in place.
@@ -991,6 +1158,8 @@ struct block_q4_k {
 };
 
 // Four lanes share one Q8_0 block (8 quants each); a simdgroup covers 8 blocks per step.
+// Quants and activations load as vectors; each activation vector is reused by all NR
+// rows, so activation traffic per weight byte falls as NR grows.
 template <uint B, uint NR>
 kernel void qmv_q8_0_f32(
     device const block_q8_0 *w [[buffer(0)]],
@@ -1015,28 +1184,23 @@ kernel void qmv_q8_0_f32(
         }
     }
     for (uint ib = ix; ib < blocks; ib += 8) {
-        float quant[NR][8];
+        float4 q_lo[NR], q_hi[NR];
         float scale[NR];
         for (uint r = 0; r < NR; ++r) {
             uint row = min(row0 + r, p.n - 1);
             device const block_q8_0 &blk = w[ulong(row) * blocks + ib];
+            device const packed_char4 *qs = (device const packed_char4 *)(blk.qs + il * 8);
             scale[r] = float(blk.d);
-            for (uint i = 0; i < 8; ++i) {
-                quant[r][i] = float(blk.qs[il * 8 + i]);
-            }
+            q_lo[r] = float4(char4(qs[0]));
+            q_hi[r] = float4(char4(qs[1]));
         }
         for (uint b = 0; b < B; ++b) {
-            device const float *xb = x + ulong(b) * p.x_stride + ib * 32 + il * 8;
-            float xv[8];
-            for (uint i = 0; i < 8; ++i) {
-                xv[i] = xb[i];
-            }
+            device const float4 *xb =
+                (device const float4 *)(x + ulong(b) * p.x_stride + ib * 32 + il * 8);
+            float4 x_lo = xb[0];
+            float4 x_hi = xb[1];
             for (uint r = 0; r < NR; ++r) {
-                float dot = 0.0f;
-                for (uint i = 0; i < 8; ++i) {
-                    dot += quant[r][i] * xv[i];
-                }
-                acc[r][b] += dot * scale[r];
+                acc[r][b] += (dot(q_lo[r], x_lo) + dot(q_hi[r], x_hi)) * scale[r];
             }
         }
     }
@@ -1135,6 +1299,131 @@ kernel void qmv_q4k_f32(
     }
 }
 
+// Small-batch Q8_0 matrix multiplication on the matrix units, computed transposed:
+// y^T[n, b] = w[n, :] · x^T[:, b] for up to 8 * BT activation rows. A threadgroup owns
+// 8 * NT output columns; its simdgroups split the Q8_0 blocks along k and reduce once at
+// the end, so even narrow projections fill the GPU.
+//
+// Fragments load straight from device memory with no staging or barriers. Lane l of an
+// 8x8 fragment holds (r, c) and (r, c + 1), r = (l/4 & 4) + (l/2) % 4, c = (l/4 & 2) * 2 +
+// (l % 2) * 2. Within a block, step s of four maps fragment column c to input
+// k = (c / 2) * 8 + 2s + c % 2, so each lane's weights for the whole block are one 8-byte
+// load, and its activations follow the same permutation. Accumulation is F32 throughout.
+struct QmmParams {
+    uint n;
+    uint k;
+    uint x_stride;
+    uint y_stride;
+    uint rows;
+};
+
+template <uint BT, uint NT>
+kernel void qmm_q8_0_f32(
+    device const block_q8_0 *w [[buffer(0)]],
+    device const float *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant QmmParams &p [[buffer(3)]],
+    threadgroup float *partial [[threadgroup(0)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgs [[simdgroups_per_threadgroup]]) {
+    uint qid = lane / 4;
+    uint fr = (qid & 4) + (lane / 2) % 4;
+    uint fc = (qid & 2) * 2 + (lane % 2) * 2;
+    uint col0 = tg * 8 * NT;
+    uint blocks = p.k / 32;
+    simdgroup_float8x8 acc[NT][BT];
+    for (uint t = 0; t < NT; ++t) {
+        for (uint b = 0; b < BT; ++b) {
+            acc[t][b] = simdgroup_float8x8(0.0f);
+        }
+    }
+    // This lane's weight rows and activation rows.
+    device const block_q8_0 *wr[NT];
+    for (uint t = 0; t < NT; ++t) {
+        wr[t] = w + ulong(min(col0 + t * 8 + fr, p.n - 1)) * blocks;
+    }
+    // Activations k = 8 * (fr / 2) + 2s + fr % 2: two vector loads, then this lane's parity.
+    uint xk = (fr / 2) * 8;
+    bool odd = fr % 2 != 0;
+    for (uint ib = sg; ib < blocks; ib += sgs) {
+        float2 xv[BT][4];
+        for (uint b = 0; b < BT; ++b) {
+            for (uint e = 0; e < 2; ++e) {
+                uint row = b * 8 + fc + e;
+                float4 lo = float4(0.0f), hi = float4(0.0f);
+                if (row < p.rows) {
+                    device const float4 *xr =
+                        (device const float4 *)(x + ulong(row) * p.x_stride + ib * 32 + xk);
+                    lo = xr[0];
+                    hi = xr[1];
+                }
+                xv[b][0][e] = odd ? lo.y : lo.x;
+                xv[b][1][e] = odd ? lo.w : lo.z;
+                xv[b][2][e] = odd ? hi.y : hi.x;
+                xv[b][3][e] = odd ? hi.w : hi.z;
+            }
+        }
+        float4 q_lo[NT], q_hi[NT];
+        for (uint t = 0; t < NT; ++t) {
+            device const block_q8_0 &blk = wr[t][ib];
+            device const packed_char4 *qs = (device const packed_char4 *)(blk.qs + (fc / 2) * 8);
+            float d = float(blk.d);
+            q_lo[t] = float4(char4(qs[0])) * d;
+            q_hi[t] = float4(char4(qs[1])) * d;
+        }
+        for (uint s = 0; s < 4; ++s) {
+            simdgroup_float8x8 xm[BT];
+            for (uint b = 0; b < BT; ++b) {
+                xm[b].thread_elements()[0] = xv[b][s][0];
+                xm[b].thread_elements()[1] = xv[b][s][1];
+            }
+            for (uint t = 0; t < NT; ++t) {
+                float4 q = s < 2 ? q_lo[t] : q_hi[t];
+                simdgroup_float8x8 wm;
+                wm.thread_elements()[0] = q[(s % 2) * 2];
+                wm.thread_elements()[1] = q[(s % 2) * 2 + 1];
+                for (uint b = 0; b < BT; ++b) {
+                    simdgroup_multiply_accumulate(acc[t][b], wm, xm[b], acc[t][b]);
+                }
+            }
+        }
+    }
+    // Reduce the k splits: partial[sg][t][b][r][c].
+    for (uint t = 0; t < NT; ++t) {
+        for (uint b = 0; b < BT; ++b) {
+            threadgroup float *out = partial + ((sg * NT + t) * BT + b) * 64 + fr * 8 + fc;
+            out[0] = acc[t][b].thread_elements()[0];
+            out[1] = acc[t][b].thread_elements()[1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < NT * BT * 64; i += threads) {
+        float total = 0.0f;
+        for (uint g = 0; g < sgs; ++g) {
+            total += partial[g * NT * BT * 64 + i];
+        }
+        uint t = i / (BT * 64);
+        uint b = (i / 64) % BT;
+        uint col = col0 + t * 8 + (i % 64) / 8;
+        uint row = b * 8 + i % 8;
+        if (row < p.rows && col < p.n) {
+            y[ulong(row) * p.y_stride + col] = total;
+        }
+    }
+}
+
+#define QMM(BT, NT) \
+    template [[host_name("qmm_q8_0_t" #BT "_f32")]] kernel void qmm_q8_0_f32<BT, NT>( \
+        device const block_q8_0 *, device const float *, device float *, constant QmmParams &, \
+        threadgroup float *, uint, uint, uint, uint, uint, uint);
+// Two column tiles per threadgroup: four measured no faster on M1 (P6 kernel artifact).
+QMM(1, 2)
+QMM(2, 2)
+
 // Rows per simdgroup shrink with the batch to bound accumulator registers.
 #define QMV(B, NR8, NR4) \
     template [[host_name("qmv_q8_0_b" #B "_f32")]] kernel void qmv_q8_0_f32<B, NR8>( \
@@ -1147,7 +1436,7 @@ QMV(1, 4, 2)
 QMV(2, 4, 2)
 QMV(3, 4, 2)
 QMV(4, 4, 2)
-QMV(5, 2, 2)
-QMV(6, 2, 2)
-QMV(7, 2, 2)
-QMV(8, 2, 2)
+QMV(5, 4, 2)
+QMV(6, 4, 2)
+QMV(7, 4, 2)
+QMV(8, 4, 2)

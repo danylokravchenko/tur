@@ -249,7 +249,7 @@ fn run(model: &Qwen35, prefill: &[usize], contexts: &[usize]) -> Result<Value> {
         .iter()
         .map(|&length| prefill_case(model, length))
         .collect::<Result<Vec<_>>>()?;
-    let mut decode = [1, 2, 4, 8]
+    let mut decode = [1, 2, 4, 8, 16]
         .into_iter()
         .map(|batch| decode_case(model, batch, SHORT_CONTEXT))
         .collect::<Result<Vec<_>>>()?;

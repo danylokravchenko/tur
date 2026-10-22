@@ -137,6 +137,11 @@ fn gemv_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     let gemv = kernels.clone().with_tuning(Tuning {
         gemv_q8_0_rows: (1, 8),
         gemv_q4k_rows: (1, 8),
+        qmm_q8_0_rows: (16, 16),
+        ..kernels.tuning()
+    })?;
+    let qmm = kernels.clone().with_tuning(Tuning {
+        qmm_q8_0_rows: (1, 16),
         ..kernels.tuning()
     })?;
     let mut cases = Vec::new();
@@ -154,6 +159,13 @@ fn gemv_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
                     "candle": existing,
                     "candle_kernel": if rows == 1 { "mul_mv" } else { "mul_mm (F16 tiles)" },
                 });
+                if format == GgmlDType::Q8_0 && rows <= 16 {
+                    let custom = time(device, || qmm.linear(&layer, &x))?;
+                    let seconds = custom["median_seconds"].as_f64().unwrap_or(f64::INFINITY);
+                    case["tur_qmm"] = custom;
+                    case["tur_qmm_weight_gb_per_s"] =
+                        json!(layer.resident_bytes() as f64 / seconds / 1e9);
+                }
                 if rows <= 8 {
                     // Force the GEMV for every measured row count, whatever the dispatch range.
                     let custom = time(device, || gemv.linear(&layer, &x))?;
@@ -501,7 +513,8 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     Ok(cases)
 }
 
-/// Batched decode: one ragged dispatch per operation against one dispatch per sequence.
+/// Batched decode: the ragged convolution and coalesced step kernel, against the ragged
+/// scan and one scan dispatch per sequence.
 fn delta_decode_cases(
     device: &Device,
     kernels: &Kernels,
@@ -533,24 +546,37 @@ fn delta_decode_cases(
             .iter()
             .map(|span| kernels.recurrent_spans(std::slice::from_ref(span)))
             .collect::<Result<Vec<_>>>()?;
+        let scan_only = kernels.clone().with_tuning(Tuning {
+            delta_step: false,
+            ..kernels.tuning()
+        })?;
         let packed = time(device, || {
             let mixed = kernels.delta_conv(&mixed, &ragged, &history, &conv_w)?;
             kernels.delta_scan(&mixed, &proj, &ragged, &shape, &dt_bias, &neg_a, &state)
+        })?;
+        let scanned = time(device, || {
+            let mixed = scan_only.delta_conv(&mixed, &ragged, &history, &conv_w)?;
+            scan_only.delta_scan(&mixed, &proj, &ragged, &shape, &dt_bias, &neg_a, &state)
+        })?;
+        let conv = time(device, || {
+            kernels.delta_conv(&mixed, &ragged, &history, &conv_w)
         })?;
         let looped = time(device, || {
             let mut last = None;
             for (i, spans) in single.iter().enumerate() {
                 let (row, gates) = (mixed.narrow(0, i, 1)?, proj.narrow(0, i, 1)?);
-                let row = kernels.delta_conv(&row, spans, &history, &conv_w)?;
+                let row = scan_only.delta_conv(&row, spans, &history, &conv_w)?;
                 last = Some(
-                    kernels.delta_scan(&row, &gates, spans, &shape, &dt_bias, &neg_a, &state)?,
+                    scan_only.delta_scan(&row, &gates, spans, &shape, &dt_bias, &neg_a, &state)?,
                 );
             }
             last.ok_or_else(|| tur_core::execution::invalid("empty batch"))
         })?;
         cases.push(json!({
             "operation": "delta_net_decode", "shape": label, "sequences": batch,
-            "ragged": packed, "per_sequence": looped, "speedup": speedup(&packed, &looped),
+            "state_bytes_moved": 2 * batch * heads * 128 * 128 * 4,
+            "step": packed, "ragged_scan": scanned, "per_sequence": looped, "conv": conv,
+            "speedup_vs_scan": speedup(&packed, &scanned), "speedup": speedup(&packed, &looped),
         }));
     }
     Ok(cases)

@@ -73,6 +73,12 @@ const FUNCTIONS: &[&str] = &[
     "qmv_q8_0_b6_f32",
     "qmv_q8_0_b7_f32",
     "qmv_q8_0_b8_f32",
+    "qmm_q8_0_t1_f32",
+    "qmm_q8_0_t2_f32",
+    "delta_step_d64_f32",
+    "delta_step_d128_f32",
+    "delta_step_d256_f32",
+    "argmax_f32",
     "qmv_q4k_b1_f32",
     "qmv_q4k_b2_f32",
     "qmv_q4k_b3_f32",
@@ -163,6 +169,11 @@ pub struct Tuning {
     /// Candle's one-row GEMV or tiled GEMM.
     pub gemv_q8_0_rows: (usize, usize),
     pub gemv_q4k_rows: (usize, usize),
+    /// Inclusive row counts served by the small-batch `Q8_0` matrix-unit kernel, which
+    /// takes precedence over the GEMV range; at most 16.
+    pub qmm_q8_0_rows: (usize, usize),
+    /// Single-token recurrent sequences use the coalesced step kernel instead of the scan.
+    pub delta_step: bool,
 }
 
 impl Tuning {
@@ -179,10 +190,14 @@ impl Tuning {
             min_split_keys: 64,
             // The M1 attention sweep crosses over at 64 queries × 8 heads (16 tiles).
             attention_tiled_groups: 16,
-            // Measured crossovers on M1 (P4 kernel artifact): Candle's one-row GEMV wins at
-            // one row; the tiled GEMM wins from 7 (Q8_0) or 5 (Q4K) rows.
-            gemv_q8_0_rows: (2, 6),
+            // Measured crossovers on M1 (P4 and P6 kernel artifacts): Candle's one-row GEMV
+            // wins at one row. For Q8_0 the custom GEMV wins at 2–3 rows and the
+            // matrix-unit kernel from 4 (1.3–2.6× at 5–8 rows, F32 parity with Candle's
+            // F16-tile GEMM at 16). Q4K uses Candle's tiled GEMM from 5 rows.
+            gemv_q8_0_rows: (2, 3),
             gemv_q4k_rows: (2, 4),
+            qmm_q8_0_rows: (4, 16),
+            delta_step: true,
         }
     }
 }

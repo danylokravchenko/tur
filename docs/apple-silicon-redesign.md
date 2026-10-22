@@ -343,8 +343,15 @@ pressure; recomputation reproduces its output exactly. Stress tests cover mixed
 lengths, reshuffled arrivals, cancellation and pool exhaustion, all matching solo runs,
 plus bounded decode gaps and prefill progress. On the mixed 128/2K workload, decode ITL
 p95 falls 3.7×; throughput drops 7% and TTFT p95 rises 14%. Decode-only serving is
-unchanged. Pass cost still grows about 3.4 ms per added decode sequence: recurrent-state
-bandwidth and projections beyond the GEMV row range.
+unchanged. A follow-up removed most of the per-sequence decode cost:
+
+- Q8_0 projections for 4–16 rows on the matrix units.
+- A coalesced recurrent decode step.
+- One logits copy per pass and greedy argmax on the device.
+
+The batch-8 model pass falls from 43.4 to 28.6 ms, and greedy serving output at 8 and 16
+concurrent requests rises 1.72× and 1.66×. F32 recurrent-state bandwidth is now the
+main per-sequence cost.
 
 Refactor the existing scheduler and batch manager around validated execution plans. Combine projections across variable-length requests, track actual token boundaries, gather only required logits and eliminate padding from the main path. Separate decode and prefill kernels may share one scheduling iteration; a single monolithic kernel is not required.
 

@@ -416,7 +416,15 @@ fn scan_reference(
 #[test]
 fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<()> {
     let (device, kernels, _gpu) = setup()?;
-    for dk in [64usize, 128, 256] {
+    // Single-token sequences take the step kernel, or the scan when tuning disables it.
+    for (dk, delta_step) in [64usize, 128, 256]
+        .into_iter()
+        .flat_map(|dk| [(dk, true), (dk, false)])
+    {
+        let kernels = kernels.clone().with_tuning(Tuning {
+            delta_step,
+            ..kernels.tuning()
+        })?;
         let shape = DeltaShape {
             key_heads: 2,
             value_heads: 4,
@@ -430,19 +438,21 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
             mixed_cols: shape.channels() + 3,
             proj_cols: 12,
         };
-        // A long prefill, decodes forked from one slot and a speculative sequence.
+        // A long prefill, decodes forked from one slot, a speculative sequence and a
+        // single-token speculative boundary.
         let ragged: Vec<(usize, u32, Vec<u32>)> = vec![
             (70, 1, vec![0]),
             (1, 3, vec![2]),
             (5, 4, (5..10).rev().collect()),
             (1, 3, vec![10]),
+            (1, 11, vec![12]),
         ];
         let rows: usize = ragged.iter().map(|(tokens, _, _)| tokens).sum();
         let mixed = values(rows * case.mixed_cols, 15, 1.0);
         let proj = values(rows * case.proj_cols, 16, 3.0);
         let dt_bias = values(4, 17, 1.0);
         let neg_a: Vec<f32> = values(4, 18, 1.0).iter().map(|v| -v.abs() - 0.1).collect();
-        let (pool, initial) = committed_pool(&device, 12, &[4, dk, 22], &ragged, 0.1)?;
+        let (pool, initial) = committed_pool(&device, 14, &[4, dk, 22], &ragged, 0.1)?;
         let out = kernels.delta_scan(
             &upload(&device, &mixed, &[rows, case.mixed_cols])?,
             &upload(&device, &proj, &[rows, case.proj_cols])?,
@@ -466,7 +476,10 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
             );
             let actual = read(&out.narrow(0, row * 4, tokens * 4)?)?;
             let error = relative_error(&actual, &expected_out);
-            assert!(error < 1e-5, "dk {dk} tokens {tokens}: output {error}");
+            assert!(
+                error < 1e-5,
+                "dk {dk} step {delta_step} tokens {tokens}: output {error}"
+            );
             let boundaries: Vec<&Vec<f64>> = if writes.len() > 1 {
                 expected_states.iter().collect()
             } else {
@@ -474,12 +487,15 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
             };
             for (&slot, expected) in writes.iter().zip(boundaries) {
                 let error = relative_error(&read(&pool.get(slot as usize)?)?, expected);
-                assert!(error < 1e-5, "dk {dk} tokens {tokens}: state {error}");
+                assert!(
+                    error < 1e-5,
+                    "dk {dk} step {delta_step} tokens {tokens}: state {error}"
+                );
             }
             assert_eq!(read(&pool.get(*slot as usize)?)?, initial[*slot as usize]);
             row += tokens;
         }
-        assert!(read(&pool.get(11)?)?.iter().all(|v| v.is_nan()));
+        assert!(read(&pool.get(13)?)?.iter().all(|v| v.is_nan()));
     }
     Ok(())
 }
@@ -956,12 +972,19 @@ fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<
 #[test]
 fn test_gemv_matches_dequantized_reference_for_every_batch_size() -> Result<()> {
     let (device, kernels, _gpu) = setup()?;
-    // Exercise the GEMV at every row count it supports.
-    let kernels = kernels.clone().with_tuning(Tuning {
+    // Exercise the GEMV at every row count it supports, and separately the small-batch
+    // matrix kernel at every row count it supports (Q8_0 only).
+    let gemv = kernels.clone().with_tuning(Tuning {
         gemv_q8_0_rows: (1, 8),
         gemv_q4k_rows: (1, 8),
+        qmm_q8_0_rows: (16, 16),
         ..kernels.tuning()
     })?;
+    let qmm = kernels.clone().with_tuning(Tuning {
+        qmm_q8_0_rows: (1, 16),
+        ..kernels.tuning()
+    })?;
+    // 37 outputs leave partial column tiles; 512 inputs give 16 blocks to split.
     let (n, k) = (37, 512);
     let weight = upload(&Device::Cpu, &values(n * k, 22, 1.0), &[n, k])?;
     for format in [GgmlDType::Q8_0, GgmlDType::Q4K] {
@@ -971,7 +994,7 @@ fn test_gemv_matches_dequantized_reference_for_every_batch_size() -> Result<()> 
             n * k / format.block_size() * format.type_size()
         );
         let dequantized = read(&QTensor::quantize(&weight, format)?.dequantize(&Device::Cpu)?)?;
-        for rows in 1..=9 {
+        for rows in 1..=16 {
             let x = values(rows * k, 23 + rows as u64, 1.0);
             let expected: Vec<f64> = (0..rows)
                 .flat_map(|r| {
@@ -985,13 +1008,61 @@ fn test_gemv_matches_dequantized_reference_for_every_batch_size() -> Result<()> 
                     })
                 })
                 .collect();
-            let out = kernels.linear(&layer, &upload(&device, &x, &[rows, k])?)?;
-            let error = relative_error(&read(&out)?, &expected);
-            // Above the GEMV range Candle's tiled GEMM stages weight tiles as F16.
-            let bound = if rows <= 8 { 1e-5 } else { 2e-3 };
-            assert!(error < bound, "{format:?} rows {rows}: {error}");
+            let input = upload(&device, &x, &[rows, k])?;
+            if rows <= 9 {
+                let error = relative_error(&read(&gemv.linear(&layer, &input)?)?, &expected);
+                // Above the GEMV range Candle's tiled GEMM stages weight tiles as F16.
+                let bound = if rows <= 8 { 1e-5 } else { 2e-3 };
+                assert!(error < bound, "{format:?} rows {rows}: {error}");
+            }
+            if format == GgmlDType::Q8_0 {
+                let error = relative_error(&read(&qmm.linear(&layer, &input)?)?, &expected);
+                assert!(error < 1e-5, "matrix kernel rows {rows}: {error}");
+                // Strided rows read in place: every other row of a wider tensor.
+                let doubled: Vec<f32> = x
+                    .chunks(k)
+                    .flat_map(|r| r.iter().chain(r))
+                    .copied()
+                    .collect();
+                let wide = upload(&device, &doubled, &[rows, 2 * k])?;
+                let strided = wide.narrow(1, k, k)?;
+                let error = relative_error(&read(&qmm.linear(&layer, &strided)?)?, &expected);
+                assert!(error < 1e-5, "strided matrix kernel rows {rows}: {error}");
+            }
         }
     }
+    Ok(())
+}
+
+#[test]
+fn test_argmax_keeps_the_first_maximum_and_flags_nonfinite_rows() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    let cols = 248_320;
+    let mut rows = [
+        values(cols, 31, 4.0),
+        values(cols, 32, 4.0),
+        values(cols, 33, 4.0),
+    ];
+    // Row 0: a maximum repeated later; row 1: a maximum in the last column; row 2: NaN.
+    rows[0][1000] = 9.0;
+    rows[0][200_000] = 9.0;
+    rows[1][cols - 1] = 9.0;
+    rows[2][5] = f32::NAN;
+    let flat: Vec<f32> = rows.concat();
+    let out = read(&kernels.argmax(&upload(&device, &flat, &[3, cols])?)?)?;
+    assert_eq!(out[..4], [1000.0, 1.0, (cols - 1) as f32, 1.0]);
+    assert_eq!(out[5], 0.0);
+    // Strided rows: the right half of a wider tensor.
+    let wide: Vec<f32> = rows[..2]
+        .iter()
+        .flat_map(|r| r.iter().chain(r))
+        .copied()
+        .collect();
+    let strided = upload(&device, &wide, &[2, 2 * cols])?.narrow(1, cols, cols)?;
+    assert_eq!(
+        read(&kernels.argmax(&strided)?)?,
+        [1000.0, 1.0, (cols - 1) as f32, 1.0]
+    );
     Ok(())
 }
 
