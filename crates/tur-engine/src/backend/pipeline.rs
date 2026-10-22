@@ -18,10 +18,13 @@ use tur_models::{
 };
 use uuid::Uuid;
 
-use super::tokenizer::TokenOutputStream;
+use super::{
+    memory::{MemoryPlan, PlanInputs},
+    tokenizer::TokenOutputStream,
+};
 use crate::{
     Result, TurError,
-    hybrid::{HybridEngine, SamplingOptions, SequenceCommit},
+    hybrid::{Demand, HybridEngine, PoolUsage, SamplingOptions, SequenceCommit},
 };
 
 /// One text conversation. Unset sampling and thinking controls use checkpoint defaults.
@@ -82,8 +85,32 @@ struct Pending {
     tools: Vec<ToolDefinition>,
 }
 
-/// Thin serving adapter. Every iteration packs all admitted sequences into one model pass.
-/// Prefix reuse, memory-based admission and production scheduling are later stages.
+/// Admission limits and the state memory budget of one pipeline.
+#[derive(Clone, Copy, Debug)]
+pub struct PipelineConfig {
+    pub max_batch_size: usize,
+    pub prefill_chunk_size: usize,
+    /// Bytes for K/V pages and recurrent state. `None` sizes the pool for
+    /// `max_batch_size` contexts of [`super::memory::DEFAULT_CONTEXT_TOKENS`] tokens, within
+    /// the device's working set.
+    pub state_bytes: Option<usize>,
+}
+
+impl PipelineConfig {
+    /// Limits with a derived state budget.
+    pub fn new(max_batch_size: usize, prefill_chunk_size: usize) -> Self {
+        Self {
+            max_batch_size,
+            prefill_chunk_size,
+            state_bytes: None,
+        }
+    }
+}
+
+/// Thin serving adapter. Every iteration packs the admitted sequences whose next chunk
+/// fits the state pool into one model pass; the rest wait. If nothing fits, the newest
+/// request is failed with [`TurError::MemoryAllocation`] so older ones can progress.
+/// Prefix reuse and production scheduling with preemption are later stages.
 pub struct InferencePipeline {
     engine: HybridEngine<Qwen35>,
     tokenizer: Tokenizer,
@@ -92,6 +119,7 @@ pub struct InferencePipeline {
     max_position: usize,
     max_batch_size: usize,
     prefill_chunk_size: usize,
+    plan: MemoryPlan,
     pending: HashMap<Uuid, Pending>,
     order: Vec<Uuid>,
 }
@@ -105,18 +133,42 @@ fn sampling(overrides: SamplingOptions, defaults: &GenerationDefaults) -> Sampli
 }
 
 impl InferencePipeline {
-    /// Load the validated model. Zero batch or chunk limits fail before loading weights.
-    pub fn new(
-        factory: &ModelFactory,
-        max_batch_size: usize,
-        prefill_chunk_size: usize,
-    ) -> Result<Self> {
+    /// Load the validated model and size its state pool. Zero batch or chunk limits fail
+    /// before loading weights; a plan beyond the device working set fails after.
+    pub fn new(factory: &ModelFactory, config: PipelineConfig) -> Result<Self> {
+        let PipelineConfig {
+            max_batch_size,
+            prefill_chunk_size,
+            state_bytes,
+        } = config;
         if max_batch_size == 0 || prefill_chunk_size == 0 {
             return Err(invalid("batch and prefill chunk sizes must be positive"));
         }
         let (model, tokenizer, template, defaults) = factory.create_model()?;
         let max_position = model.config().max_position();
-        let engine = HybridEngine::new(Arc::new(model), factory.device.clone())?;
+        let description = tur_models::hybrid::HybridModel::description(&model);
+        // The largest pass: every sequence prefills a whole chunk at the sizing context.
+        let context = super::memory::DEFAULT_CONTEXT_TOKENS.min(max_position);
+        let tokens = max_batch_size
+            .checked_mul(prefill_chunk_size)
+            .ok_or_else(|| invalid("pass size overflow"))?;
+        let in_flight = max_batch_size
+            .checked_mul(description.vocab_size * 4)
+            .and_then(|logits| logits.checked_add(tokens * 12))
+            .ok_or_else(|| invalid("in-flight size overflow"))?;
+        let (plan, pool) = MemoryPlan::new(
+            &description,
+            PlanInputs {
+                weights: model.weight_bytes(),
+                scratch_peak: model
+                    .planned_workspace_bytes(tokens, &vec![context; max_batch_size])?,
+                in_flight,
+                sequences: max_batch_size,
+                state_bytes,
+                limit: tur_metal::pool::working_set_bytes(&factory.device),
+            },
+        )?;
+        let engine = HybridEngine::new(Arc::new(model), factory.device.clone(), pool)?;
         Ok(Self {
             engine,
             tokenizer,
@@ -125,6 +177,7 @@ impl InferencePipeline {
             max_position,
             max_batch_size,
             prefill_chunk_size,
+            plan,
             pending: HashMap::new(),
             order: Vec::new(),
         })
@@ -133,6 +186,16 @@ impl InferencePipeline {
     /// Number of requests with allocated model state.
     pub fn active_request_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Planned resident memory and the state pool it sized.
+    pub fn memory_plan(&self) -> &MemoryPlan {
+        &self.plan
+    }
+
+    /// Current state pool occupancy, after reclaiming released pages and slots.
+    pub fn memory(&mut self) -> Result<PoolUsage> {
+        self.engine.memory()
     }
 
     /// Render, tokenize and allocate independent hybrid state for one text conversation.
@@ -164,6 +227,16 @@ impl InferencePipeline {
             return Err(invalid(
                 "prompt and generation limit exceed the model context",
             ));
+        }
+        // A request that cannot fit the whole pool alone would never complete.
+        let usage = self.engine.memory()?;
+        let pages = self.engine.pool().description().pages_for(positions);
+        if pages > usage.pages.capacity {
+            return Err(TurError::MemoryAllocation(format!(
+                "request needs {pages} K/V pages for {positions} positions; the state pool \
+                 holds {}",
+                usage.pages.capacity
+            )));
         }
         let handle = self.engine.allocate(
             request.seed,
@@ -257,57 +330,94 @@ impl InferencePipeline {
         Ok(())
     }
 
-    /// Pack one chunk per prefill request and one token per decode request, fence, then publish.
-    /// A request's model or decode error is returned only to that request.
-    pub fn step_streaming(&mut self) -> Result<BatchStepOutput> {
-        let mut output = BatchStepOutput::default();
-        if self.pending.is_empty() {
-            return Ok(output);
-        }
+    /// Pack the requests whose next chunk fits the state pool, in admission order.
+    fn plan(&self, usage: &PoolUsage) -> Result<PackedExecution> {
         let mut plan = PackedExecution {
             tokens: Vec::new(),
             positions: Vec::new(),
             sequences: Vec::new(),
         };
+        let mut demand = Demand::default();
         for id in &self.order {
             let pending = self
                 .pending
                 .get(id)
                 .ok_or_else(|| invalid("missing pipeline request"))?;
             let meta = self.engine.metadata(*id)?;
-            let start = plan.tokens.len();
-            let outputs = if pending.consumed < pending.prompt.len() {
+            let (input, last) = if pending.consumed < pending.prompt.len() {
                 let end = pending
                     .consumed
                     .saturating_add(self.prefill_chunk_size)
                     .min(pending.prompt.len());
-                plan.tokens
-                    .extend_from_slice(&pending.prompt[pending.consumed..end]);
-                if end == pending.prompt.len() {
-                    vec![plan.tokens.len() - 1]
-                } else {
-                    Vec::new()
-                }
+                (
+                    &pending.prompt[pending.consumed..end],
+                    end == pending.prompt.len(),
+                )
             } else {
-                plan.tokens.push(
-                    pending
-                        .next
-                        .ok_or_else(|| invalid("decode without a sampled token"))?,
-                );
-                vec![plan.tokens.len() - 1]
+                let next = pending
+                    .next
+                    .as_ref()
+                    .ok_or_else(|| invalid("decode without a sampled token"))?;
+                (std::slice::from_ref(next), true)
             };
+            let needed = demand + self.engine.demand(pending.handle, input.len(), false)?;
+            if !needed.fits(usage) {
+                continue;
+            }
+            demand = needed;
+            let start = plan.tokens.len();
+            plan.tokens.extend_from_slice(input);
             let end_position = meta
                 .position
-                .checked_add(plan.tokens.len() - start)
+                .checked_add(input.len())
                 .ok_or_else(|| invalid("position overflow"))?;
             plan.positions.extend(meta.position..end_position);
             plan.sequences.push(SequenceDescriptor {
                 state: pending.handle,
                 tokens: start..plan.tokens.len(),
-                outputs,
+                outputs: if last {
+                    vec![plan.tokens.len() - 1]
+                } else {
+                    Vec::new()
+                },
                 speculative: false,
             });
         }
+        Ok(plan)
+    }
+
+    /// Pack one chunk per prefill request and one token per decode request, fence, then
+    /// publish. Requests whose chunk does not fit the state pool wait; when nothing fits,
+    /// the newest request fails with a memory error. A request's model or decode error is
+    /// returned only to that request.
+    pub fn step_streaming(&mut self) -> Result<BatchStepOutput> {
+        let mut output = BatchStepOutput::default();
+        let plan = loop {
+            if self.pending.is_empty() {
+                return Ok(output);
+            }
+            let usage = self.engine.memory()?;
+            let plan = self.plan(&usage)?;
+            if !plan.sequences.is_empty() {
+                break plan;
+            }
+            let newest = *self
+                .order
+                .last()
+                .ok_or_else(|| invalid("pending request missing from order"))?;
+            self.cancel(newest)?;
+            output.completed.push((
+                newest,
+                Err(TurError::MemoryAllocation(format!(
+                    "state pool exhausted ({} of {} K/V pages and {} of {} recurrent slots \
+                     held); the newest request was stopped",
+                    usage.pages.leased,
+                    usage.pages.capacity,
+                    usage.slots.leased,
+                    usage.slots.capacity
+                ))),
+            ));
+        };
         self.engine.submit(plan)?;
         for result in self.engine.finish()? {
             let id = result.request;

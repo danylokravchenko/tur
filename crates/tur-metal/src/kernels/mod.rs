@@ -7,12 +7,18 @@
 
 mod runtime;
 
-use crate::packed::PackedLinear;
+use crate::{
+    packed::PackedLinear,
+    pool::{AttentionPool, KvPool},
+};
 use candle_core::{DType, Device, Tensor, quantized::GgmlDType};
 pub use runtime::{Capabilities, LAYOUT_VERSION, Output, Tuning};
 use runtime::{Pipeline, Runtime, View, to_u32};
 use std::sync::Arc;
-use tur_core::{Result, execution::invalid};
+use tur_core::{
+    Result,
+    execution::{KvFormat, invalid},
+};
 
 /// Columns of value state owned by one delta-scan simdgroup (`COLS` in the MSL).
 const SCAN_COLUMNS: usize = 4;
@@ -97,7 +103,24 @@ struct AttentionParams {
     gate_stride: u32,
     gate_col: u32,
     gate_head_stride: u32,
+    group: u32,
     scale: f32,
+}
+
+#[repr(C)]
+struct KvWriteParams {
+    tokens: u32,
+    kv_heads: u32,
+    dim: u32,
+    page: u32,
+    group: u32,
+    k_stride: u32,
+    k_col: u32,
+    k_head_stride: u32,
+    v_stride: u32,
+    v_col: u32,
+    v_head_stride: u32,
+    inv_127: f32,
 }
 
 #[repr(C)]
@@ -147,7 +170,8 @@ impl DeltaShape {
 
 /// Validated paged K/V addressing for a packed batch. Key `j` of query token `t` lives in
 /// pool slot `table[first_block[t] + j / page] * page + j % page`; token `t` attends to
-/// keys `0..visible[t]`.
+/// keys `0..visible[t]` and, when written, is stored at key `visible[t] - 1`. One
+/// addressing serves every attention layer of a pass: page ids span all layers.
 pub struct PagedKv {
     table: Tensor,
     first_block: Tensor,
@@ -165,6 +189,40 @@ impl PagedKv {
 
     pub fn max_visible(&self) -> usize {
         self.max_visible
+    }
+}
+
+/// Recurrent pool slots written by one sequence: one per retained boundary. Uploaded once
+/// per pass and shared by every recurrent layer, whose pools have equal slot counts.
+pub struct Slots {
+    indices: Tensor,
+    values: Vec<u32>,
+}
+
+impl Slots {
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Check against a pool of `capacity` slots and the slot being read.
+    fn check(&self, capacity: usize, read: u32, tokens: usize) -> Result<()> {
+        if (self.len() != 1 && self.len() != tokens)
+            || self
+                .values
+                .iter()
+                .any(|&s| s as usize >= capacity || s == read)
+            || read as usize >= capacity
+        {
+            return Err(invalid(
+                "recurrent slots must be one or one per token, inside the pool and distinct from \
+                 the committed slot",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -461,32 +519,45 @@ impl Kernels {
         self.finish(out, (zv.rows, heads * cv.cols))
     }
 
+    /// Upload the recurrent slots one sequence writes.
+    pub fn slots(&self, values: &[u32]) -> Result<Slots> {
+        if values.is_empty() {
+            return Err(invalid("a pass writes at least one recurrent slot"));
+        }
+        Ok(Slots {
+            indices: self.runtime.indices(values)?,
+            values: values.to_vec(),
+        })
+    }
+
     /// Causal depthwise convolution of one sequence: rows `row..row + tokens` of `x`
-    /// (first `history.cols` columns) after `history` (`[taps - 1, channels]`), with
-    /// `weight` `[channels, taps]`, then SiLU into `out` rows `out_row..`. Returns the
-    /// history after the last token, or after every token: `[1 | tokens, taps - 1, channels]`.
+    /// (first `channels` columns) after the history in slot `read` of `pool`
+    /// (`[slots, taps - 1, channels]`), with `weight` `[channels, taps]`, then SiLU into
+    /// `out` rows `out_row..`. Writes the history after the last token into slot
+    /// `writes[0]`, or after token `t` into `writes[t]` when one slot per token is given.
     #[allow(clippy::too_many_arguments)]
     pub fn delta_conv(
         &self,
         x: &Tensor,
         row: usize,
         tokens: usize,
-        history: &Tensor,
+        pool: &Tensor,
+        read: u32,
+        writes: &Slots,
         weight: &Tensor,
-        every: bool,
         out: &Output,
         out_row: usize,
-    ) -> Result<Tensor> {
+    ) -> Result<()> {
         let xv = self.view(x)?;
-        let hv = self.view(history)?;
+        let hv = self.view(pool)?;
         let wv = self.view(weight)?;
-        let channels = hv.cols;
+        let (_, kept, channels) = pool.dims3()?;
         let taps = wv.cols;
-        if taps < 2 || tokens == 0 {
+        if taps < 2 || tokens == 0 || kept != taps - 1 {
             return Err(invalid("convolution needs at least two taps and one token"));
         }
-        hv.expect(taps - 1, channels, "convolution history")?;
-        hv.contiguous("convolution history")?;
+        hv.contiguous("convolution history pool")?;
+        writes.check(hv.rows, read, tokens)?;
         wv.expect(channels, taps, "convolution weight")?;
         wv.contiguous("convolution weight")?;
         if xv.cols < channels || out.cols() != channels || row + tokens > xv.rows {
@@ -499,13 +570,12 @@ impl Kernels {
             channels: to_u32(channels, "channels")?,
             taps: to_u32(taps, "taps")?,
             x_stride: to_u32(xv.row_stride, "row stride")?,
-            every: u32::from(every),
+            every: u32::from(writes.len() > 1),
         };
-        let boundaries = if every { tokens } else { 1 };
         let count = tokens * channels;
         to_u32(count, "elements")?;
+        let slots = self.runtime.view(&writes.indices, DType::U32)?;
         let pipeline = self.pipeline("delta_conv_f32")?;
-        let histories = self.output(boundaries * (taps - 1), channels)?;
         let threads = pipeline.threads(self.tuning.elementwise_threads);
         self.runtime.dispatch(
             pipeline,
@@ -514,22 +584,22 @@ impl Kernels {
             threads,
             |e| {
                 xv.bind_row(e, 0, row)?;
-                hv.bind(e, 1)?;
+                hv.bind_row(e, 1, read as usize)?;
                 wv.bind(e, 2)?;
                 out.bind_rows(e, 3, out_row, tokens)?;
-                histories.bind(e, 4);
+                hv.bind_mut(e, 4)?;
                 e.set_bytes(5, &params);
+                slots.bind(e, 6)?;
                 Ok(())
             },
-        )?;
-        self.finish(histories, (boundaries, taps - 1, channels))
+        )
     }
 
     /// Gated delta rule over one sequence: `mixed` rows `row..row + tokens` hold the
-    /// convolved `q | k | v`, `proj` the same rows' `b`/`a` gates. Writes `[tokens, heads,
-    /// value_dim]` outputs into `out` rows `out_row..` (one row per token) and returns the
-    /// recurrent state after the last token or every token: `[1 | tokens, heads, key_dim,
-    /// value_dim]`.
+    /// convolved `q | k | v`, `proj` the same rows' `b`/`a` gates. Starts from slot `read`
+    /// of `pool` (`[slots, heads, key_dim, value_dim]`), writes `[tokens, heads, value_dim]`
+    /// outputs into `out` rows `out_row..` and the state after the last token into slot
+    /// `writes[0]`, or after token `t` into `writes[t]`.
     #[allow(clippy::too_many_arguments)]
     pub fn delta_scan(
         &self,
@@ -540,16 +610,17 @@ impl Kernels {
         shape: &DeltaShape,
         dt_bias: &Tensor,
         neg_a: &Tensor,
-        state: &Tensor,
-        every: bool,
+        pool: &Tensor,
+        read: u32,
+        writes: &Slots,
         out: &Output,
         out_row: usize,
-    ) -> Result<Tensor> {
+    ) -> Result<()> {
         let mv = self.view(mixed)?;
         let pv = self.view(proj)?;
         let bv = self.view(dt_bias)?;
         let av = self.view(neg_a)?;
-        let sv = self.view(state)?;
+        let sv = self.view(pool)?;
         let heads = shape.value_heads;
         let (dk, dv) = (shape.key_dim, shape.value_dim);
         if shape.key_heads == 0 || !heads.is_multiple_of(shape.key_heads) || tokens == 0 {
@@ -563,8 +634,11 @@ impl Kernels {
         };
         bv.expect(1, heads, "dt bias")?;
         av.expect(1, heads, "decay rate")?;
-        sv.expect(heads, dk * dv, "recurrent state")?;
-        sv.contiguous("recurrent state")?;
+        if pool.dims().get(1..) != Some(&[heads, dk, dv][..]) {
+            return Err(invalid("recurrent pool does not match the delta geometry"));
+        }
+        sv.contiguous("recurrent pool")?;
+        writes.check(sv.rows, read, tokens)?;
         if mv.cols < shape.channels()
             || shape.b_col + heads > pv.cols
             || shape.a_col + heads > pv.cols
@@ -585,11 +659,10 @@ impl Kernels {
             proj_stride: to_u32(pv.row_stride, "projection stride")?,
             b_col: to_u32(shape.b_col, "b column")?,
             a_col: to_u32(shape.a_col, "a column")?,
-            every: u32::from(every),
+            every: u32::from(writes.len() > 1),
         };
-        let boundaries = if every { tokens } else { 1 };
+        let slots = self.runtime.view(&writes.indices, DType::U32)?;
         let pipeline = self.pipeline(name)?;
-        let states = self.output(boundaries * heads, dk * dv)?;
         // Halve the threadgroup until its padded state tile fits threadgroup memory.
         let tile_bytes =
             |simdgroups: usize| (dk * (simdgroups * SCAN_COLUMNS + 1) * 4).next_multiple_of(16);
@@ -613,15 +686,15 @@ impl Kernels {
                 pv.bind_row(e, 1, row)?;
                 bv.bind(e, 2)?;
                 av.bind(e, 3)?;
-                sv.bind(e, 4)?;
+                sv.bind_row(e, 4, read as usize)?;
                 out.bind_rows(e, 5, out_row, tokens)?;
-                states.bind(e, 6);
+                sv.bind_mut(e, 6)?;
                 e.set_bytes(7, &params);
+                slots.bind(e, 8)?;
                 e.set_threadgroup_memory_length(0, tile_bytes(simdgroups));
                 Ok(())
             },
-        )?;
-        self.finish(states, (boundaries, heads, dk, dv))
+        )
     }
 
     /// Validate and upload paged addressing for `slots` pool rows of `page` tokens.
@@ -698,45 +771,153 @@ impl Kernels {
             .saturating_mul(4)
     }
 
-    /// Causal grouped-query attention with online softmax over a paged pool, gated by
-    /// `sigmoid(gate)`. `q` is `[tokens, heads, dim]`; `k`/`v` pools are `[slots, kv_heads,
-    /// dim]`. Gate head `h` of token `t` is at column `gate.col_offset + h *
-    /// gate.head_stride` of `gate_source` row `t`. Returns `[tokens, heads * dim]`.
+    /// Validate a K/V pool in `format` against `slots` rows of `kv_heads × dim`.
+    fn kv_views<'a>(
+        &self,
+        pool: &'a KvPool,
+        format: KvFormat,
+        slots: usize,
+        kv_heads: usize,
+        dim: usize,
+    ) -> Result<(View<'a>, Option<View<'a>>)> {
+        if pool.data.dims() != [slots, kv_heads, dim] {
+            return Err(invalid("K/V pool does not match its page addressing"));
+        }
+        let data = self.runtime.view(&pool.data, format.data_dtype())?;
+        data.contiguous("K/V pool")?;
+        let scales = match (format.group(), &pool.scales) {
+            (None, None) => None,
+            (Some(group), Some(scales)) => {
+                if scales.dims() != [slots, kv_heads, dim / group] {
+                    return Err(invalid("K/V scales do not match the pool"));
+                }
+                let view = self.runtime.view(scales, DType::F16)?;
+                view.contiguous("K/V scales")?;
+                Some(view)
+            }
+            _ => return Err(invalid("K/V scales do not match the format")),
+        };
+        Ok((data, scales))
+    }
+
+    fn kv_kernel(prefix: &str, dim: usize, format: KvFormat) -> Result<String> {
+        let registers = match dim {
+            64 => 2,
+            128 => 4,
+            256 => 8,
+            _ => return Err(invalid(format!("no {prefix} kernel for head dim {dim}"))),
+        };
+        let suffix = match format {
+            KvFormat::F32 => "f32",
+            KvFormat::F16 => "f16",
+            KvFormat::Q8 { .. } => "q8",
+        };
+        Ok(format!("{prefix}_r{registers}_{suffix}"))
+    }
+
+    /// Store new keys and values into `pool`, quantizing to its format. Token `t` of the
+    /// pass writes logical position `visible[t] - 1` of its page table in `kv`. Key head
+    /// `h` of token `t` is read at column `key_heads.col_offset + h * head_stride` of `key`
+    /// row `t`; values likewise from `value`.
+    pub fn kv_write(
+        &self,
+        key: &Tensor,
+        key_heads: Heads,
+        value: &Tensor,
+        value_heads: Heads,
+        pool: &AttentionPool,
+        kv: &PagedKv,
+    ) -> Result<()> {
+        let (kv_heads, dim) = (pool.kv_heads, pool.head_dim);
+        if kv_heads == 0 {
+            return Err(invalid("attention pool has no K/V heads"));
+        }
+        let kv_view = self.view(key)?;
+        let vv = self.view(value)?;
+        for (view, heads) in [(&kv_view, key_heads), (&vv, value_heads)] {
+            let last = heads.col_offset + (kv_heads - 1) * heads.head_stride + dim;
+            if heads.count != kv_heads
+                || heads.dim != dim
+                || view.rows != kv.tokens
+                || last > view.cols
+            {
+                return Err(invalid("new K/V rows do not match the pool"));
+            }
+        }
+        if kv.page != pool.page_tokens {
+            return Err(invalid("page addressing does not match the pool"));
+        }
+        let (k_data, k_scales) = self.kv_views(&pool.key, pool.format, kv.slots, kv_heads, dim)?;
+        let (v_data, v_scales) =
+            self.kv_views(&pool.value, pool.format, kv.slots, kv_heads, dim)?;
+        let table = self.runtime.view(&kv.table, DType::U32)?;
+        let first = self.runtime.view(&kv.first_block, DType::U32)?;
+        let visible = self.runtime.view(&kv.visible, DType::U32)?;
+        let params = KvWriteParams {
+            tokens: to_u32(kv.tokens, "tokens")?,
+            kv_heads: to_u32(kv_heads, "kv heads")?,
+            dim: to_u32(dim, "head dim")?,
+            page: to_u32(kv.page, "page")?,
+            group: to_u32(pool.format.group().unwrap_or(32), "group")?,
+            k_stride: to_u32(kv_view.row_stride, "key stride")?,
+            k_col: to_u32(key_heads.col_offset, "key column")?,
+            k_head_stride: to_u32(key_heads.head_stride, "key head stride")?,
+            v_stride: to_u32(vv.row_stride, "value stride")?,
+            v_col: to_u32(value_heads.col_offset, "value column")?,
+            v_head_stride: to_u32(value_heads.head_stride, "value head stride")?,
+            inv_127: (1.0f64 / 127.0) as f32,
+        };
+        let pipeline = self.pipeline(&Self::kv_kernel("kv_write", dim, pool.format)?)?;
+        let (groups, threads) = self.simdgroup_launch(pipeline, 2 * kv.tokens * kv_heads);
+        self.runtime
+            .dispatch(pipeline, "tur_kv_write", groups, threads, |e| {
+                kv_view.bind(e, 0)?;
+                vv.bind(e, 1)?;
+                table.bind(e, 2)?;
+                first.bind(e, 3)?;
+                visible.bind(e, 4)?;
+                k_data.bind_mut(e, 5)?;
+                // Unscaled formats bind the data again; every declared buffer must be bound.
+                k_scales.as_ref().unwrap_or(&k_data).bind_mut(e, 6)?;
+                v_data.bind_mut(e, 7)?;
+                v_scales.as_ref().unwrap_or(&v_data).bind_mut(e, 8)?;
+                e.set_bytes(9, &params);
+                Ok(())
+            })
+    }
+
+    /// Causal grouped-query attention with online softmax over a paged pool in any K/V
+    /// format, gated by `sigmoid(gate)`. `q` is `[tokens, heads, dim]`. Gate head `h` of
+    /// token `t` is at column `gate.col_offset + h * gate.head_stride` of `gate_source`
+    /// row `t`. Returns `[tokens, heads * dim]`.
     pub fn attention(
         &self,
         q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
+        pool: &AttentionPool,
         kv: &PagedKv,
         gate_source: &Tensor,
         gate: Heads,
     ) -> Result<Tensor> {
         let (tokens, heads, dim) = q.dims3()?;
-        let (slots, kv_heads, kdim) = k.dims3()?;
+        let kv_heads = pool.kv_heads;
         if kv_heads == 0
             || !heads.is_multiple_of(kv_heads)
-            || kdim != dim
-            || v.dims() != k.dims()
-            || slots != kv.slots
+            || pool.head_dim != dim
+            || kv.page != pool.page_tokens
             || tokens != kv.tokens
             || gate.count != heads
             || gate.dim != dim
         {
             return Err(invalid("attention shapes do not match"));
         }
-        let name = match dim {
-            64 => ("attention_r2_f32", "attention_reduce_r2_f32"),
-            128 => ("attention_r4_f32", "attention_reduce_r4_f32"),
-            256 => ("attention_r8_f32", "attention_reduce_r8_f32"),
-            _ => return Err(invalid(format!("no attention kernel for head dim {dim}"))),
-        };
+        let name = Self::kv_kernel("attention", dim, pool.format)?;
+        let reduce = Self::kv_kernel("attention_reduce", dim, KvFormat::F32)?;
+        let (k_data, k_scales) = self.kv_views(&pool.key, pool.format, kv.slots, kv_heads, dim)?;
+        let (v_data, v_scales) =
+            self.kv_views(&pool.value, pool.format, kv.slots, kv_heads, dim)?;
         let qv = self.view(q)?;
-        let kv_view = self.view(k)?;
-        let vv = self.view(v)?;
         let gv = self.view(gate_source)?;
         qv.contiguous("queries")?;
-        kv_view.contiguous("key pool")?;
-        vv.contiguous("value pool")?;
         let table = self.runtime.view(&kv.table, DType::U32)?;
         let first = self.runtime.view(&kv.first_block, DType::U32)?;
         let visible = self.runtime.view(&kv.visible, DType::U32)?;
@@ -755,6 +936,7 @@ impl Kernels {
             gate_stride: to_u32(gv.row_stride, "gate stride")?,
             gate_col: to_u32(gate.col_offset, "gate column")?,
             gate_head_stride: to_u32(gate.head_stride, "gate head stride")?,
+            group: to_u32(pool.format.group().unwrap_or(32), "group")?,
             scale: (dim as f64).sqrt().recip() as f32,
         };
         let items = tokens * heads;
@@ -767,13 +949,13 @@ impl Kernels {
         } else {
             None
         };
-        let pipeline = self.pipeline(name.0)?;
+        let pipeline = self.pipeline(&name)?;
         let (groups, threads) = self.simdgroup_launch(pipeline, items * split.splits);
         self.runtime
             .dispatch(pipeline, "tur_attention", groups, threads, |e| {
                 qv.bind(e, 0)?;
-                kv_view.bind(e, 1)?;
-                vv.bind(e, 2)?;
+                k_data.bind(e, 1)?;
+                v_data.bind(e, 2)?;
                 table.bind(e, 3)?;
                 first.bind(e, 4)?;
                 visible.bind(e, 5)?;
@@ -784,10 +966,12 @@ impl Kernels {
                 partial.bind(e, 8);
                 stats.bind(e, 9);
                 e.set_bytes(10, &params);
+                k_scales.as_ref().unwrap_or(&k_data).bind(e, 11)?;
+                v_scales.as_ref().unwrap_or(&v_data).bind(e, 12)?;
                 Ok(())
             })?;
         if let Some((partial, stats)) = &scratch {
-            let pipeline = self.pipeline(name.1)?;
+            let pipeline = self.pipeline(&reduce)?;
             let (groups, threads) = self.simdgroup_launch(pipeline, items);
             self.runtime
                 .dispatch(pipeline, "tur_attention_reduce", groups, threads, |e| {

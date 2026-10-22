@@ -1,0 +1,189 @@
+#![forbid(unsafe_code)]
+//! Resident memory planning for one model on one device.
+
+use tur_core::{
+    Result, TurError,
+    execution::{ModelDescription, invalid},
+};
+use tur_metal::pool::PoolConfig;
+
+/// Context each concurrent sequence is sized for when no state budget is given.
+pub const DEFAULT_CONTEXT_TOKENS: usize = 8192;
+
+/// Device memory of one resident model:
+///
+/// ```text
+/// resident = packed weights + attention KV + recurrent state
+///          + retained checkpoints + activation/scratch peak
+///          + speculative state + in-flight buffers + runtime overhead
+/// ```
+///
+/// Attention K/V, recurrent state, retained checkpoints and speculative boundaries all
+/// live in one state pool (pages and slots), so `state_pool` bounds their sum.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryPlan {
+    pub weights: usize,
+    pub state_pool: usize,
+    /// Kernel scratch of the largest planned pass.
+    pub scratch_peak: usize,
+    /// Packed inputs and logits of the largest planned pass.
+    pub in_flight: usize,
+    /// Reserve for the runtime, allocator rounding and the OS.
+    pub overhead: usize,
+    /// Device limit the plan fits in, if the device reports one.
+    pub limit: Option<usize>,
+}
+
+/// What the plan must hold besides the state pool.
+#[derive(Clone, Copy, Debug)]
+pub struct PlanInputs {
+    pub weights: usize,
+    pub scratch_peak: usize,
+    pub in_flight: usize,
+    /// Concurrent sequences, each needing a committed and an in-flight recurrent slot.
+    pub sequences: usize,
+    /// Explicit state pool budget in bytes; otherwise sized for [`DEFAULT_CONTEXT_TOKENS`]
+    /// per sequence within the device limit.
+    pub state_bytes: Option<usize>,
+    /// The device's recommended working set.
+    pub limit: Option<usize>,
+}
+
+impl MemoryPlan {
+    /// Total planned resident bytes.
+    pub fn resident(&self) -> usize {
+        self.weights
+            .saturating_add(self.state_pool)
+            .saturating_add(self.scratch_peak)
+            .saturating_add(self.in_flight)
+            .saturating_add(self.overhead)
+    }
+
+    /// Size the state pool and check the plan against the device limit. An explicit budget
+    /// that would exceed the limit is rejected rather than left to swap.
+    pub fn new(description: &ModelDescription, inputs: PlanInputs) -> Result<(Self, PoolConfig)> {
+        let overhead = inputs.limit.map_or(0, |limit| limit / 10);
+        let fixed = inputs
+            .weights
+            .checked_add(inputs.scratch_peak)
+            .and_then(|b| b.checked_add(inputs.in_flight))
+            .and_then(|b| b.checked_add(overhead))
+            .ok_or_else(|| invalid("memory plan overflow"))?;
+        let available = inputs.limit.map(|limit| limit.saturating_sub(fixed));
+        let bytes = match inputs.state_bytes {
+            Some(bytes) => bytes,
+            None => {
+                let context = DEFAULT_CONTEXT_TOKENS.min(description.max_position);
+                let wanted = PoolConfig {
+                    pages: description
+                        .pages_for(context)
+                        .checked_mul(inputs.sequences)
+                        .ok_or_else(|| invalid("page count overflow"))?,
+                    recurrent_slots: 2 * inputs.sequences,
+                }
+                .bytes(description)?;
+                available.map_or(wanted, |available| wanted.min(available))
+            }
+        };
+        let config = PoolConfig::for_budget(description, bytes, inputs.sequences)?;
+        let plan = Self {
+            weights: inputs.weights,
+            state_pool: config.bytes(description)?,
+            scratch_peak: inputs.scratch_peak,
+            in_flight: inputs.in_flight,
+            overhead,
+            limit: inputs.limit,
+        };
+        if let Some(limit) = inputs.limit
+            && plan.resident() > limit
+        {
+            return Err(TurError::MemoryAllocation(format!(
+                "planned resident memory {} bytes exceeds the device working set of {limit} \
+                 bytes (state pool {}, weights {})",
+                plan.resident(),
+                plan.state_pool,
+                plan.weights
+            )));
+        }
+        Ok((plan, config))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::DType;
+    use tur_core::execution::{KvFormat, KvLayout, LayerStateKind, Modality, ModelIdentity};
+
+    fn description() -> ModelDescription {
+        ModelDescription {
+            identity: ModelIdentity {
+                revision: "plan-fixture".into(),
+                state_format: 1,
+            },
+            layers: vec![
+                LayerStateKind::Attention {
+                    kv_heads: 1,
+                    head_dim: 32,
+                },
+                LayerStateKind::Recurrent {
+                    conv_channels: 4,
+                    conv_width: 2,
+                    heads: 1,
+                    key_dim: 4,
+                    value_dim: 4,
+                    dtype: DType::F32,
+                },
+            ],
+            kv: KvLayout::new(16, KvFormat::F32),
+            modalities: vec![Modality::Text],
+            vocab_size: 8,
+            max_position: 1 << 20,
+        }
+    }
+
+    fn inputs(state_bytes: Option<usize>, limit: Option<usize>) -> PlanInputs {
+        PlanInputs {
+            weights: 1000,
+            scratch_peak: 500,
+            in_flight: 100,
+            sequences: 2,
+            state_bytes,
+            limit,
+        }
+    }
+
+    #[test]
+    fn test_default_budget_sizes_contexts_and_fits_the_device_limit() -> Result<()> {
+        let model = description();
+        let page = model.page_bytes()?;
+        let slot = model.recurrent_slot_bytes()?;
+        // Unlimited (CPU): two default contexts of pages plus four recurrent slots.
+        let (plan, config) = MemoryPlan::new(&model, inputs(None, None))?;
+        assert_eq!(config.pages, 2 * DEFAULT_CONTEXT_TOKENS / 16);
+        assert_eq!(config.recurrent_slots, 4);
+        assert_eq!(plan.state_pool, config.pages * page + 5 * slot);
+        assert_eq!(plan.resident(), 1600 + plan.state_pool);
+        // A device limit shrinks the pool to what remains after weights, scratch,
+        // in-flight buffers and a tenth for overhead.
+        let limit = 1600 + 10 * page + 5 * slot;
+        let limit = limit + limit / 9;
+        let (plan, config) = MemoryPlan::new(&model, inputs(None, Some(limit)))?;
+        assert!(config.pages >= 9 && config.pages <= 10, "{config:?}");
+        assert!(plan.resident() <= limit);
+        Ok(())
+    }
+
+    #[test]
+    fn test_explicit_budget_beyond_the_device_limit_is_rejected() -> Result<()> {
+        let model = description();
+        let (plan, _) = MemoryPlan::new(&model, inputs(Some(1 << 20), None))?;
+        assert!(plan.state_pool <= 1 << 20);
+        assert!(matches!(
+            MemoryPlan::new(&model, inputs(Some(1 << 20), Some(1 << 20))),
+            Err(TurError::MemoryAllocation(_))
+        ));
+        assert!(MemoryPlan::new(&model, inputs(Some(0), None)).is_err());
+        Ok(())
+    }
+}

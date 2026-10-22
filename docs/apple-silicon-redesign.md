@@ -1,6 +1,6 @@
 # Tur: Apple Silicon inference redesign
 
-Status: P0's development-Mac evidence/capability gate and P1's workspace move are complete (2026-10-21). P2's four-crate extraction and explicit hybrid state and packed execution contracts are implemented (revised after review); see [P2 contracts and validation](apple-silicon-p2-contracts.md). Safe dispatch and pinned model/HTTP evidence remain in [the baseline report](apple-silicon-baseline.md). The baseline checkpoint suite retains its guided-JSON failure (68/69 pass); it was not rerun or fixed in P2. The legacy models (ordinary Qwen3, Granite 4.1), their execution/cache path and model runners have been removed; see [Breaking changes and legacy removal](#breaking-changes-and-legacy-removal). P3's model work is complete (2026-10-22): the Qwen3.5 dense hybrid text model matches Transformers on the real Qwen3.5-0.8B checkpoint on CPU and Metal, with Q8_0/Q4K packed execution; Qwen3.8-27B shares that path and is validated against its pinned config, tensor headers and template but has not been executed on this hardware; see [P3 report](apple-silicon-p3-qwen.md). P3's deferred legacy deletion and CLI/server migration are now complete: both adapters use the packed hybrid text pipeline, with checkpoint templates/defaults, independent outcomes, EOS and cancellation. P4's Metal runtime and first fused kernels are implemented (2026-10-22): the fused Qwen3.5 path matches the F32 reference on the real 0.8B checkpoint (≤ 3.8e-6) and is the default on Metal for the engine, CLI and server; chunked DeltaNet prefill and matrix-unit attention prefill remain open; see [P4 report](apple-silicon-p4-metal.md). Production serving hardening, performance and quality gates remain open.
+Status: P0's development-Mac evidence/capability gate and P1's workspace move are complete (2026-10-21). P2's four-crate extraction and explicit hybrid state and packed execution contracts are implemented (revised after review); see [P2 contracts and validation](apple-silicon-p2-contracts.md). Safe dispatch and pinned model/HTTP evidence remain in [the baseline report](apple-silicon-baseline.md). The baseline checkpoint suite retains its guided-JSON failure (68/69 pass); it was not rerun or fixed in P2. The legacy models (ordinary Qwen3, Granite 4.1), their execution/cache path and model runners have been removed; see [Breaking changes and legacy removal](#breaking-changes-and-legacy-removal). P3's model work is complete (2026-10-22): the Qwen3.5 dense hybrid text model matches Transformers on the real Qwen3.5-0.8B checkpoint on CPU and Metal, with Q8_0/Q4K packed execution; Qwen3.8-27B shares that path and is validated against its pinned config, tensor headers and template but has not been executed on this hardware; see [P3 report](apple-silicon-p3-qwen.md). P3's deferred legacy deletion and CLI/server migration are now complete: both adapters use the packed hybrid text pipeline, with checkpoint templates/defaults, independent outcomes, EOS and cancellation. P4's Metal runtime and first fused kernels are implemented (2026-10-22): the fused Qwen3.5 path matches the F32 reference on the real 0.8B checkpoint (≤ 3.8e-6) and is the default on Metal for the engine, CLI and server; chunked DeltaNet prefill and matrix-unit attention prefill remain open; see [P4 report](apple-silicon-p4-metal.md). P5's paged and quantized memory is implemented (2026-10-22): K/V and recurrent state live in persistent device pools read in place through page tables, with generation-tagged leases, copy-on-write tails, completion-gated reclamation, F32/F16/Q8 K/V quantized on write, and a budgeted memory plan with explicit out-of-memory errors; see [P5 report](apple-silicon-p5-memory.md). Production serving hardening, performance and quality gates remain open.
 
 ## Product and platform
 
@@ -75,7 +75,7 @@ P2 extraction (implemented; breaking Rust changes explicitly authorized on 2026-
 | Crate | Responsibility and dependency direction |
 | --- | --- |
 | `tur-core` | Extract the existing shared errors and minimal execution/state descriptors; no runtime, HTTP, or model dependencies |
-| `tur-metal` | Hybrid storage, safe completion ownership, the Metal kernel runtime (P4), MSL kernels, packed weights and scratch planning; no models or scheduler |
+| `tur-metal` | Persistent paged K/V and recurrent state pools (P5), safe completion ownership, the Metal kernel runtime (P4), MSL kernels, packed weights and scratch planning; no models or scheduler |
 | `tur-models` | Checkpoint validation, model implementations, layer/state descriptions; depends on Metal runtime |
 | `tur-engine` | Request lifecycle, cache ownership, scheduling, execution and sampling; depends on models/runtime |
 | `tur` | Public facade; no compatibility exports for the old API |
@@ -301,6 +301,14 @@ FP16/BF16 selection is capability- and quality-dependent. Keep FP32 softmax/redu
 Exit: device/reference differential tests, allocation bounds, no unexpected CPU fallback or hidden full-weight expansion, and kernel benchmark artifacts. Do not hard-code one threadgroup configuration for all devices.
 
 ### P5 — Make memory genuinely paged and quantized
+
+Implemented on 2026-10-22; design, tests, measurements and open items are in
+[the P5 report](apple-silicon-p5-memory.md). Attention reads persistent page pools in
+place (no per-pass concatenation), recurrent layers read and write their own slot pools,
+and the model writes state directly into reserved pages and slots. Q8 K/V (group 32)
+stays within 1e-4 nats of F32 K/V over 8K held-out tokens with 99.2% top-1 agreement;
+quality did not justify a recent high-precision region. Page sizes 16–128 measured
+within 3%.
 
 Replace `k_full`/`v_full` concatenation with page-native kernels. Model metadata determines which layers need KV; recurrent layers consume their own state pools. Implement generation-tagged handles or equivalent stale-handle protection, copy-on-write tails, page reclamation after completion and consistent accounting across all pools.
 

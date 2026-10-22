@@ -8,11 +8,12 @@ use candle_core::{
     DType, Device, Tensor,
     quantized::{GgmlDType, QTensor},
 };
-use tur_core::Result;
+use tur_core::{Result, execution::KvFormat};
 use tur_metal::{
     completion::{Completion, Quarantine},
     kernels::{DeltaShape, Heads, Kernels, Tuning},
     packed::PackedLinear,
+    pool::{AttentionPool, KvPool, dequantize, quantize},
 };
 
 /// Device-wide allocation counters are shared by every test in the process, so tests in
@@ -238,11 +239,27 @@ fn test_swiglu_and_gated_rms_match_reference() -> Result<()> {
     Ok(())
 }
 
+/// A `[slots, rest..]` pool poisoned with NaN except slot `read`, which holds `initial`.
+fn slot_pool(
+    device: &Device,
+    slots: usize,
+    rest: &[usize],
+    read: usize,
+    initial: &[f32],
+) -> Result<Tensor> {
+    let size: usize = rest.iter().product();
+    let mut data = vec![f32::NAN; slots * size];
+    data[read * size..(read + 1) * size].copy_from_slice(initial);
+    let mut shape = vec![slots];
+    shape.extend_from_slice(rest);
+    upload(device, &data, &shape)
+}
+
 #[test]
-fn test_delta_conv_writes_offset_rows_and_histories() -> Result<()> {
+fn test_delta_conv_writes_offset_rows_and_slot_histories() -> Result<()> {
     let (device, kernels, _gpu) = setup()?;
     let (rows, cols, channels, taps) = (7, 42, 37, 4);
-    let (row, tokens, out_row) = (2, 4, 3);
+    let (row, tokens, out_row, committed) = (2, 4, 3, 2usize);
     let x = values(rows * cols, 12, 2.0);
     let history = values((taps - 1) * channels, 13, 2.0);
     let weight = values(channels * taps, 14, 1.0);
@@ -253,15 +270,17 @@ fn test_delta_conv_writes_offset_rows_and_histories() -> Result<()> {
             x[(row + r - (taps - 1)) * cols + c]
         }
     };
-    for every in [false, true] {
+    for writes in [vec![5u32], vec![5, 0, 4, 1]] {
+        let pool = slot_pool(&device, 6, &[taps - 1, channels], committed, &history)?;
         let out = kernels.output(10, channels)?;
-        let histories = kernels.delta_conv(
+        kernels.delta_conv(
             &upload(&device, &x, &[rows, cols])?,
             row,
             tokens,
-            &upload(&device, &history, &[taps - 1, channels])?,
+            &pool,
+            committed as u32,
+            &kernels.slots(&writes)?,
             &upload(&device, &weight, &[channels, taps])?,
-            every,
             &out,
             out_row,
         )?;
@@ -277,20 +296,21 @@ fn test_delta_conv_writes_offset_rows_and_histories() -> Result<()> {
             }
         }
         assert!(relative_error(&actual, &expected) < 1e-6);
-        let kept: Vec<usize> = if every {
+        let kept: Vec<usize> = if writes.len() > 1 {
             (0..tokens).collect()
         } else {
             vec![tokens - 1]
         };
-        let expected: Vec<f64> = kept
-            .iter()
-            .flat_map(|&t| {
-                (0..taps - 1).flat_map(move |r| (0..channels).map(move |c| (t + 1 + r, c)))
-            })
-            .map(|(r, c)| f64::from(full(r, c)))
-            .collect();
-        assert_eq!(histories.dims(), [kept.len(), taps - 1, channels]);
-        assert!(relative_error(&read(&histories)?, &expected) == 0.0);
+        for (&slot, &t) in writes.iter().zip(&kept) {
+            let expected: Vec<f64> = (0..taps - 1)
+                .flat_map(|r| (0..channels).map(move |c| (t + 1 + r, c)))
+                .map(|(r, c)| f64::from(full(r, c)))
+                .collect();
+            assert!(relative_error(&read(&pool.get(slot as usize)?)?, &expected) == 0.0);
+        }
+        // The committed slot is untouched and unwritten slots keep their poison.
+        assert_eq!(read(&pool.get(committed)?)?, history);
+        assert!(read(&pool.get(3)?)?.iter().all(|v| v.is_nan()));
     }
     Ok(())
 }
@@ -384,9 +404,18 @@ fn test_delta_scan_matches_scalar_recurrence() -> Result<()> {
             &neg_a,
             &initial,
         );
+        let read_slot = tokens + 1;
         for every in [false, true] {
+            let slots = tokens + 2;
+            let pool = slot_pool(&device, slots, &[4, dk, 22], read_slot, &initial)?;
+            // Writes in reverse slot order, skipping the committed slot.
+            let writes: Vec<u32> = if every {
+                (0..tokens as u32).rev().collect()
+            } else {
+                vec![0]
+            };
             let out = kernels.output(tokens + 1, 4 * 22)?;
-            let states = kernels.delta_scan(
+            kernels.delta_scan(
                 &upload(&device, &mixed, &[rows, case.mixed_cols])?,
                 &upload(&device, &proj, &[rows, case.proj_cols])?,
                 row,
@@ -394,21 +423,26 @@ fn test_delta_scan_matches_scalar_recurrence() -> Result<()> {
                 &shape,
                 &upload(&device, &dt_bias, &[4])?,
                 &upload(&device, &neg_a, &[4])?,
-                &upload(&device, &initial, &[4, dk, 22])?,
-                every,
+                &pool,
+                read_slot as u32,
+                &kernels.slots(&writes)?,
                 &out,
                 1,
             )?;
             let out = kernels.finish(out, (tokens + 1, 4 * 22))?;
             let error = relative_error(&read(&out.narrow(0, 1, tokens)?)?, &expected_out);
             assert!(error < 1e-5, "dk {dk} tokens {tokens}: output {error}");
-            let expected: Vec<f64> = if every {
-                expected_states.concat()
+            let boundaries: Vec<&Vec<f64>> = if every {
+                expected_states.iter().collect()
             } else {
-                expected_states.last().cloned().unwrap_or_default()
+                expected_states.last().into_iter().collect()
             };
-            let error = relative_error(&read(&states)?, &expected);
-            assert!(error < 1e-5, "dk {dk} tokens {tokens}: state {error}");
+            for (&slot, expected) in writes.iter().zip(boundaries) {
+                let error = relative_error(&read(&pool.get(slot as usize)?)?, expected);
+                assert!(error < 1e-5, "dk {dk} tokens {tokens}: state {error}");
+            }
+            assert_eq!(read(&pool.get(read_slot)?)?, initial);
+            assert!(read(&pool.get(tokens)?)?.iter().all(|v| v.is_nan()));
         }
     }
     Ok(())
@@ -460,6 +494,45 @@ fn paged_pool(case: &AttentionCase, seed: u64) -> Pool {
         }
     }
     (k, v, slots, table, first, visible)
+}
+
+/// Store F32 pool rows in `format`. Quantized pools keep NaN poison in the scales of
+/// unused slots (codes cannot hold NaN); returns the device pool and its exact dequantized
+/// host values, which are what a correct kernel reads.
+fn stored(
+    device: &Device,
+    rows: &[f32],
+    slots: usize,
+    kv_heads: usize,
+    dim: usize,
+    format: KvFormat,
+) -> Result<(KvPool, Vec<f32>)> {
+    let host = Tensor::from_slice(rows, (slots, kv_heads, dim), &Device::Cpu)?;
+    let (data, scales) = quantize(format, &host)?;
+    let scales = match scales {
+        Some(scales) => {
+            let mut values = scales
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let per = values.len() / slots;
+            for slot in 0..slots {
+                if rows[slot * kv_heads * dim].is_nan() {
+                    values[slot * per..(slot + 1) * per].fill(f32::NAN);
+                }
+            }
+            Some(Tensor::from_vec(values, scales.dims(), &Device::Cpu)?.to_dtype(DType::F16)?)
+        }
+        None => None,
+    };
+    let exact = read(&dequantize(format, &data, scales.as_ref())?)?;
+    Ok((
+        KvPool {
+            data: data.to_device(device)?,
+            scales: scales.map(|s| s.to_device(device)).transpose()?,
+        },
+        exact,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -514,38 +587,67 @@ fn attention_reference(
     out
 }
 
-fn check_attention(kernels: &Kernels, device: &Device, case: &AttentionCase) -> Result<()> {
+fn gate_heads(case: &AttentionCase) -> Heads {
+    Heads {
+        count: case.heads,
+        dim: case.dim,
+        head_stride: 2 * case.dim,
+        col_offset: case.dim,
+    }
+}
+
+/// Run attention over a pool stored in `format`; returns the F32 output and the reference
+/// over the values that format actually stores.
+fn run_attention(
+    kernels: &Kernels,
+    device: &Device,
+    case: &AttentionCase,
+    format: KvFormat,
+) -> Result<(Vec<f32>, Vec<f64>)> {
     let (k, v, slots, table, first, visible) = paged_pool(case, 30);
     let tokens = visible.len();
     let q = values(tokens * case.heads * case.dim, 20, 1.0);
     let gate = values(tokens * case.heads * 2 * case.dim, 21, 2.0);
-    let expected = attention_reference(case, &q, &k, &v, &gate, &table, &first, &visible);
+    let (key, k_exact) = stored(device, &k, slots, case.kv_heads, case.dim, format)?;
+    let (value, v_exact) = stored(device, &v, slots, case.kv_heads, case.dim, format)?;
+    let pool = AttentionPool {
+        key,
+        value,
+        format,
+        page_tokens: case.page,
+        kv_heads: case.kv_heads,
+        head_dim: case.dim,
+    };
+    let expected = attention_reference(
+        case, &q, &k_exact, &v_exact, &gate, &table, &first, &visible,
+    );
     let paged = kernels.paged_kv(case.page, slots, &table, &first, &visible)?;
     let out = kernels.attention(
         &upload(device, &q, &[tokens, case.heads, case.dim])?,
-        &upload(device, &k, &[slots, case.kv_heads, case.dim])?,
-        &upload(device, &v, &[slots, case.kv_heads, case.dim])?,
+        &pool,
         &paged,
         &upload(device, &gate, &[tokens, case.heads * 2 * case.dim])?,
-        Heads {
-            count: case.heads,
-            dim: case.dim,
-            head_stride: 2 * case.dim,
-            col_offset: case.dim,
-        },
+        gate_heads(case),
     )?;
-    let error = relative_error(&read(&out)?, &expected);
-    assert!(
-        error < 1e-5,
-        "dim {} split {:?}: {error}",
-        case.dim,
-        kernels.attention_split(tokens, case.heads, paged.max_visible())
-    );
+    Ok((read(&out)?, expected))
+}
+
+fn check_attention(kernels: &Kernels, device: &Device, case: &AttentionCase) -> Result<()> {
+    for format in [
+        KvFormat::F32,
+        KvFormat::F16,
+        KvFormat::Q8,
+        KvFormat::Q8 { group: 64 },
+    ] {
+        let (actual, expected) = run_attention(kernels, device, case, format)?;
+        let error = relative_error(&actual, &expected);
+        assert!(error < 1e-5, "{format} dim {}: {error}", case.dim);
+    }
     Ok(())
 }
 
 #[test]
-fn test_attention_paged_gqa_matches_reference_with_and_without_splits() -> Result<()> {
+fn test_attention_paged_gqa_matches_reference_for_every_format_and_split() -> Result<()> {
     let (device, kernels, _gpu) = setup()?;
     let split = kernels.clone().with_tuning(Tuning {
         min_split_keys: 8,
@@ -574,6 +676,144 @@ fn test_attention_paged_gqa_matches_reference_with_and_without_splits() -> Resul
     };
     assert!(kernels.attention_split(1, 4, 1000).splits > 1);
     check_attention(&kernels, &device, &case)
+}
+
+#[test]
+fn test_quantized_kv_attention_stays_close_to_f32_attention() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    // Decode and prefill over 1000 keys: the error the K/V format adds to the output.
+    let case = AttentionCase {
+        heads: 8,
+        kv_heads: 2,
+        dim: 256,
+        page: 64,
+        sequences: vec![(999, 1), (200, 30)],
+    };
+    let (exact, _) = run_attention(&kernels, &device, &case, KvFormat::F32)?;
+    let exact: Vec<f64> = exact.iter().map(|v| f64::from(*v)).collect();
+    for (format, bound) in [
+        (KvFormat::F16, 2e-3),
+        (KvFormat::Q8, 2e-2),
+        (KvFormat::Q8 { group: 256 }, 3e-2),
+    ] {
+        let (actual, _) = run_attention(&kernels, &device, &case, format)?;
+        let error = relative_error(&actual, &exact);
+        assert!(error < bound, "{format}: {error}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    let case = AttentionCase {
+        heads: 4,
+        kv_heads: 2,
+        dim: 128,
+        page: 16,
+        sequences: vec![(37, 3), (0, 20), (15, 1)],
+    };
+    let (_, _, slots, table, first, visible) = paged_pool(&case, 31);
+    let tokens = visible.len();
+    let width = case.kv_heads * case.dim;
+    // Keys contiguous; values read in place from a wider interleaved projection.
+    let key = values(tokens * width, 32, 4.0);
+    let projection = values(tokens * (2 * width + 5), 33, 4.0);
+    let value: Vec<f32> = (0..tokens)
+        .flat_map(|t| projection[t * (2 * width + 5) + width..][..width].to_vec())
+        .collect();
+    let paged = kernels.paged_kv(case.page, slots, &table, &first, &visible)?;
+    for format in [
+        KvFormat::F32,
+        KvFormat::F16,
+        KvFormat::Q8,
+        KvFormat::Q8 { group: 128 },
+    ] {
+        let poison = vec![f32::NAN; slots * width];
+        let (key_pool, _) = stored(&device, &poison, slots, case.kv_heads, case.dim, format)?;
+        let (value_pool, _) = stored(&device, &poison, slots, case.kv_heads, case.dim, format)?;
+        let pool = AttentionPool {
+            key: key_pool,
+            value: value_pool,
+            format,
+            page_tokens: case.page,
+            kv_heads: case.kv_heads,
+            head_dim: case.dim,
+        };
+        kernels.kv_write(
+            &upload(&device, &key, &[tokens, case.kv_heads, case.dim])?,
+            Heads {
+                count: case.kv_heads,
+                dim: case.dim,
+                head_stride: case.dim,
+                col_offset: 0,
+            },
+            &upload(&device, &projection, &[tokens, 2 * width + 5])?,
+            Heads {
+                count: case.kv_heads,
+                dim: case.dim,
+                head_stride: case.dim,
+                col_offset: width,
+            },
+            &pool,
+            &paged,
+        )?;
+        for (rows, kv) in [(&key, &pool.key), (&value, &pool.value)] {
+            let host = Tensor::from_slice(
+                rows.as_slice(),
+                (tokens, case.kv_heads, case.dim),
+                &Device::Cpu,
+            )?;
+            let (codes, scales) = quantize(format, &host)?;
+            let expected = read(&dequantize(format, &codes, scales.as_ref())?)?;
+            let step = scales.map(|s| read(&s.to_dtype(DType::F32)?)).transpose()?;
+            let stored_rows = read(&dequantize(
+                format,
+                &kv.data.to_device(&Device::Cpu)?,
+                kv.scales
+                    .as_ref()
+                    .map(|s| s.to_device(&Device::Cpu))
+                    .transpose()?
+                    .as_ref(),
+            )?)?;
+            let mut written = vec![false; slots];
+            let mut flips = 0;
+            for t in 0..tokens {
+                let j = visible[t] as usize - 1;
+                let slot =
+                    table[first[t] as usize + j / case.page] as usize * case.page + j % case.page;
+                written[slot] = true;
+                for i in 0..width {
+                    let (a, b) = (stored_rows[slot * width + i], expected[t * width + i]);
+                    if a != b {
+                        // Division rounding may move a Q8 code across a .5 tie by one step.
+                        let group = format.group().unwrap_or(case.dim);
+                        let s = step.as_ref().map_or(0.0, |s| s[(t * width + i) / group]);
+                        assert!(
+                            (a - b).abs() <= s * 1.0001,
+                            "{format} token {t} element {i}"
+                        );
+                        flips += 1;
+                    }
+                }
+            }
+            assert!(
+                flips * 1000 <= tokens * width,
+                "{format}: {flips} code flips"
+            );
+            // Unwritten slots keep their poison: nothing outside the target slots changed.
+            for (slot, done) in written.iter().enumerate() {
+                if !done {
+                    assert!(
+                        stored_rows[slot * width..(slot + 1) * width]
+                            .iter()
+                            .all(|v| v.is_nan())
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -645,15 +885,53 @@ fn test_invalid_inputs_are_rejected_before_encoding() -> Result<()> {
     };
     let mixed = Tensor::ones((1, 200), DType::F32, &device)?;
     let ones = Tensor::ones(1, DType::F32, &device)?;
-    let state = Tensor::zeros((1, 96, 4), DType::F32, &device)?;
+    let state = Tensor::zeros((3, 1, 96, 4), DType::F32, &device)?;
     let out = kernels.output(1, 4)?;
-    assert!(
-        kernels
-            .delta_scan(
-                &mixed, &mixed, 0, 1, &shape, &ones, &ones, &state, false, &out, 0
-            )
-            .is_err()
-    );
+    let scan = |shape: &DeltaShape, read: u32, writes: &[u32]| {
+        kernels.delta_scan(
+            &mixed,
+            &mixed,
+            0,
+            1,
+            shape,
+            &ones,
+            &ones,
+            &state,
+            read,
+            &kernels.slots(writes)?,
+            &out,
+            0,
+        )
+    };
+    // Unsupported key dim, then slot misuse at a supported one.
+    assert!(scan(&shape, 0, &[1]).is_err());
+    let supported = DeltaShape {
+        key_dim: 64,
+        ..shape
+    };
+    let state = Tensor::zeros((3, 1, 64, 4), DType::F32, &device)?;
+    let scan = |read: u32, writes: &[u32]| {
+        kernels.delta_scan(
+            &mixed,
+            &mixed,
+            0,
+            1,
+            &supported,
+            &ones,
+            &ones,
+            &state,
+            read,
+            &kernels.slots(writes)?,
+            &out,
+            0,
+        )
+    };
+    assert!(scan(0, &[1]).is_ok());
+    assert!(scan(1, &[1]).is_err(), "writing the committed slot");
+    assert!(scan(0, &[3]).is_err(), "slot outside the pool");
+    assert!(scan(3, &[1]).is_err(), "read outside the pool");
+    assert!(scan(0, &[1, 2]).is_err(), "two boundaries for one token");
+    assert!(kernels.slots(&[]).is_err());
     Ok(())
 }
 
@@ -671,8 +949,16 @@ fn test_repeated_passes_reach_a_stable_allocation_bound() -> Result<()> {
         sequences: vec![(100, 1), (3, 1)],
     };
     let (k, v, slots, table, first, visible) = paged_pool(&case, 40);
-    let k = upload(&device, &k, &[slots, 2, 128])?;
-    let v = upload(&device, &v, &[slots, 2, 128])?;
+    let (key, _) = stored(&device, &k, slots, 2, 128, KvFormat::Q8)?;
+    let (value, _) = stored(&device, &v, slots, 2, 128, KvFormat::Q8)?;
+    let pool = AttentionPool {
+        key,
+        value,
+        format: KvFormat::Q8,
+        page_tokens: 16,
+        kv_heads: 2,
+        head_dim: 128,
+    };
     let q = upload(&device, &values(2 * 8 * 128, 41, 1.0), &[2, 8, 128])?;
     let gate = upload(&device, &values(2 * 8 * 256, 42, 1.0), &[2, 8 * 256])?;
     let w = upload(&device, &values(1024, 43, 1.0), &[1024])?;
@@ -685,7 +971,7 @@ fn test_repeated_passes_reach_a_stable_allocation_bound() -> Result<()> {
             head_stride: 256,
             col_offset: 128,
         };
-        let attended = kernels.attention(&q, &k, &v, &paged, &gate, heads)?;
+        let attended = kernels.attention(&q, &pool, &paged, &gate, heads)?;
         let (sum, _) = kernels.add_rms_norm(&x, &attended, &w, 1e-6)?;
         let _normed = kernels.rms_norm(&sum, &w, 1e-6)?;
         Ok(device.synchronize()?)

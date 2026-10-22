@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use candle_core::Device;
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use tokenizers::Tokenizer;
+use tur_core::execution::KvLayout;
 
 use crate::{
     Result, TurError,
@@ -27,6 +28,8 @@ pub struct ModelFactory {
     pub revision: String,
     pub format: WeightFormat,
     pub device: Device,
+    /// Paged K/V page size and storage format.
+    pub kv: KvLayout,
 }
 
 fn hub_error(error: impl std::fmt::Display) -> TurError {
@@ -151,6 +154,7 @@ impl ModelFactory {
                 format: self.format,
                 device: self.device.clone(),
                 execution: Execution::Fused,
+                kv: self.kv,
             },
         )?;
         Ok((model, tokenizer, template, defaults))
@@ -181,6 +185,7 @@ mod tests {
             revision: "main".into(),
             format: WeightFormat::F32,
             device: Device::Cpu,
+            kv: crate::models::qwen3_5::DEFAULT_KV_LAYOUT,
         };
         assert!(factory.resolve().is_err());
     }

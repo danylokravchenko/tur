@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use tower::ServiceExt;
 use tur::{
     Result, TurError,
-    backend::pipeline::GenerationRequest,
+    backend::pipeline::{GenerationRequest, PipelineConfig},
     server::{
         AppState, build_router,
         worker::{PipelineWorker, WorkerConfig, WorkerMsg},
@@ -21,8 +21,7 @@ use tur::{
 fn worker(fixture: &common::Checkpoint, batch: usize) -> Result<PipelineWorker> {
     PipelineWorker::spawn(WorkerConfig {
         factory: fixture.factory(),
-        max_batch_size: batch,
-        prefill_chunk_size: 2,
+        pipeline: PipelineConfig::new(batch, 2),
     })
 }
 

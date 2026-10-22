@@ -4,14 +4,16 @@
 //! enqueues `reps` operations and then synchronizes.
 //!
 //! `cargo bench --offline -p tur-metal --bench kernels > out.json`
+//! `TUR_BENCH_ONLY=delta|linear|paged` restricts the run to one group.
 
 use candle_core::{D, DType, Device, Tensor, quantized::GgmlDType};
 use serde_json::{Value, json};
 use std::time::Instant;
-use tur_core::Result;
+use tur_core::{Result, execution::KvFormat};
 use tur_metal::{
-    kernels::{DeltaShape, Heads, Kernels, Tuning},
+    kernels::{DeltaShape, Heads, Kernels, PagedKv, Tuning},
     packed::PackedLinear,
+    pool::{AttentionPool, KvPool},
 };
 
 const WARMUP: usize = 3;
@@ -162,8 +164,96 @@ fn gemv_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     Ok(cases)
 }
 
+/// Contiguous page tables for `sequences` sequences of `past` committed and `new` tokens,
+/// and a pool of `format` holding random keys and values written by the kernel itself.
+struct Paged {
+    pool: AttentionPool,
+    kv: PagedKv,
+    /// Addressing that writes one key per committed and new position, to fill the pool.
+    fill: PagedKv,
+    slots: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paged(
+    device: &Device,
+    kernels: &Kernels,
+    format: KvFormat,
+    page: usize,
+    kv_heads: usize,
+    dim: usize,
+    past: usize,
+    new: usize,
+    sequences: usize,
+) -> Result<Paged> {
+    let length = past + new;
+    let pages = length.div_ceil(page);
+    let slots = pages * page * sequences;
+    let store = || -> Result<KvPool> {
+        Ok(KvPool {
+            data: Tensor::zeros((slots, kv_heads, dim), format.data_dtype(), device)?,
+            scales: format
+                .group()
+                .map(|g| Tensor::zeros((slots, kv_heads, dim / g), DType::F16, device))
+                .transpose()?,
+        })
+    };
+    let pool = AttentionPool {
+        key: store()?,
+        value: store()?,
+        format,
+        page_tokens: page,
+        kv_heads,
+        head_dim: dim,
+    };
+    let table: Vec<u32> = (0..(pages * sequences) as u32).collect();
+    let (mut first, mut visible) = (Vec::new(), Vec::new());
+    let (mut fill_first, mut fill_visible) = (Vec::new(), Vec::new());
+    for s in 0..sequences {
+        let base = (s * pages) as u32;
+        for t in 0..new {
+            first.push(base);
+            visible.push((past + t + 1) as u32);
+        }
+        for t in 0..length {
+            fill_first.push(base);
+            fill_visible.push((t + 1) as u32);
+        }
+    }
+    let kv = kernels.paged_kv(page, slots, &table, &first, &visible)?;
+    let fill = kernels.paged_kv(page, slots, &table, &fill_first, &fill_visible)?;
+    let rows = random(device, &[length * sequences, kv_heads, dim], 3, 1.0)?;
+    let heads = Heads {
+        count: kv_heads,
+        dim,
+        head_stride: dim,
+        col_offset: 0,
+    };
+    kernels.kv_write(&rows, heads, &rows, heads, &pool, &fill)?;
+    device.synchronize()?;
+    Ok(Paged {
+        pool,
+        kv,
+        fill,
+        slots,
+    })
+}
+
+const HEADS: usize = 8;
+const KV_HEADS: usize = 2;
+const HEAD_DIM: usize = 256;
+
+fn gate_heads() -> Heads {
+    Heads {
+        count: HEADS,
+        dim: HEAD_DIM,
+        head_stride: 2 * HEAD_DIM,
+        col_offset: HEAD_DIM,
+    }
+}
+
 fn attention_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
-    let (heads, kv_heads, dim, page) = (8usize, 2usize, 256usize, 16usize);
+    let (heads, kv_heads, dim, page) = (HEADS, KV_HEADS, HEAD_DIM, 16usize);
     let mut cases = Vec::new();
     // (label, past, new tokens per sequence, sequences)
     let shapes = [
@@ -175,35 +265,26 @@ fn attention_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     ];
     for (label, past, new, sequences) in shapes {
         let length = past + new;
-        let pages = length.div_ceil(page);
-        let slots = pages * page * sequences;
-        let k_pool = random(device, &[slots, kv_heads, dim], 3, 1.0)?;
-        let v_pool = random(device, &[slots, kv_heads, dim], 4, 1.0)?;
+        let paged = paged(
+            device,
+            kernels,
+            KvFormat::F32,
+            page,
+            kv_heads,
+            dim,
+            past,
+            new,
+            sequences,
+        )?;
         let tokens = new * sequences;
         let q = random(device, &[tokens, heads, dim], 5, 1.0)?;
         let gate = random(device, &[tokens, heads * 2 * dim], 6, 1.0)?;
-        let table: Vec<u32> = (0..(pages * sequences) as u32).collect();
-        let mut first = Vec::new();
-        let mut visible = Vec::new();
-        for s in 0..sequences {
-            for t in 0..new {
-                first.push((s * pages) as u32);
-                visible.push((past + t + 1) as u32);
-            }
-        }
-        let gate_heads = Heads {
-            count: heads,
-            dim,
-            head_stride: 2 * dim,
-            col_offset: dim,
-        };
         let custom = time(device, || {
-            let paged = kernels.paged_kv(page, slots, &table, &first, &visible)?;
-            kernels.attention(&q, &k_pool, &v_pool, &paged, &gate, gate_heads)
+            kernels.attention(&q, &paged.pool, &paged.kv, &gate, gate_heads())
         })?;
         // The existing path also needs per-sequence K/V, gating and concatenation.
-        let k_seq = k_pool.narrow(0, 0, length)?;
-        let v_seq = v_pool.narrow(0, 0, length)?;
+        let k_seq = paged.pool.key.data.narrow(0, 0, length)?;
+        let v_seq = paged.pool.value.data.narrow(0, 0, length)?;
         let existing = time(device, || {
             let mut outputs = Vec::with_capacity(sequences);
             for s in 0..sequences {
@@ -222,10 +303,67 @@ fn attention_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
         cases.push(json!({
             "operation": "attention", "shape": label, "heads": heads, "kv_heads": kv_heads,
             "head_dim": dim, "context": length, "sequences": sequences, "page": page,
+            "kv_format": "f32",
             "split": format!("{:?}", kernels.attention_split(tokens, heads, length)),
             "tur": custom, "candle_reference": existing,
             "speedup": speedup(&custom, &existing),
         }));
+    }
+    Ok(cases)
+}
+
+/// K/V format × page size sweep at Qwen3.5-0.8B attention shapes: attention over pages
+/// in place, and the quantize-on-write cost of the pass's new rows.
+fn paged_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+    let formats = [
+        KvFormat::F32,
+        KvFormat::F16,
+        KvFormat::Q8,
+        KvFormat::Q8 { group: 64 },
+        KvFormat::Q8 { group: 256 },
+    ];
+    // (label, past, new tokens per sequence, sequences)
+    let shapes = [
+        ("decode ctx 2048", 2047usize, 1usize, 1usize),
+        ("decode ctx 8192", 8191, 1, 1),
+        ("decode ctx 32768", 32767, 1, 1),
+        ("decode ctx 2048 x8", 2047, 1, 8),
+        ("prefill 2048", 0, 2048, 1),
+    ];
+    let mut cases = Vec::new();
+    for (label, past, new, sequences) in shapes {
+        let tokens = new * sequences;
+        let q = random(device, &[tokens, HEADS, HEAD_DIM], 5, 1.0)?;
+        let gate = random(device, &[tokens, HEADS * 2 * HEAD_DIM], 6, 1.0)?;
+        let rows = random(device, &[tokens, KV_HEADS, HEAD_DIM], 7, 1.0)?;
+        let heads = Heads {
+            count: KV_HEADS,
+            dim: HEAD_DIM,
+            head_stride: HEAD_DIM,
+            col_offset: 0,
+        };
+        for format in formats {
+            for page in [16usize, 32, 64, 128] {
+                let paged = paged(
+                    device, kernels, format, page, KV_HEADS, HEAD_DIM, past, new, sequences,
+                )?;
+                let attention = time(device, || {
+                    kernels.attention(&q, &paged.pool, &paged.kv, &gate, gate_heads())
+                })?;
+                let write = time(device, || {
+                    kernels.kv_write(&rows, heads, &rows, heads, &paged.pool, &paged.kv)?;
+                    Ok(rows.clone())
+                })?;
+                let bytes = format.token_bytes(KV_HEADS, HEAD_DIM)? * 2 * paged.slots;
+                cases.push(json!({
+                    "operation": "paged_attention", "shape": label, "kv_format": format.to_string(),
+                    "page": page, "context": past + new, "sequences": sequences,
+                    "pool_bytes": bytes, "fill_tokens": paged.fill.tokens(),
+                    "split": format!("{:?}", kernels.attention_split(tokens, HEADS, past + new)),
+                    "attention": attention, "kv_write": write,
+                }));
+            }
+        }
     }
     Ok(cases)
 }
@@ -246,20 +384,22 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
         for tokens in [1usize, 128, 2048] {
             let mixed = random(device, &[tokens, channels], 7, 1.0)?;
             let proj = random(device, &[tokens, 2 * value_heads], 8, 1.0)?;
-            let history = random(device, &[3, channels], 9, 1.0)?;
+            // Pools of two slots: the committed state in slot 0, the new one in slot 1.
+            let history = random(device, &[2, 3, channels], 9, 1.0)?;
             let conv_w = random(device, &[channels, 4], 10, 0.5)?;
             let dt_bias = random(device, &[value_heads], 11, 1.0)?;
             let neg_a = (random(device, &[value_heads], 12, 1.0)?.abs()? * -1.0)?;
-            let state = random(device, &[value_heads, 128, 128], 13, 0.1)?;
+            let state = random(device, &[2, value_heads, 128, 128], 13, 0.1)?;
+            let writes = kernels.slots(&[1])?;
             let conv = time(device, || {
                 let out = kernels.output(tokens, channels)?;
-                kernels.delta_conv(&mixed, 0, tokens, &history, &conv_w, false, &out, 0)?;
+                kernels.delta_conv(&mixed, 0, tokens, &history, 0, &writes, &conv_w, &out, 0)?;
                 kernels.finish(out, (tokens, channels))
             })?;
             let scan = time(device, || {
                 let out = kernels.output(tokens, value_heads * 128)?;
                 kernels.delta_scan(
-                    &mixed, &proj, 0, tokens, &shape, &dt_bias, &neg_a, &state, false, &out, 0,
+                    &mixed, &proj, 0, tokens, &shape, &dt_bias, &neg_a, &state, 0, &writes, &out, 0,
                 )?;
                 kernels.finish(out, (tokens, value_heads * 128))
             })?;
@@ -274,7 +414,8 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
                 let timing = time(device, || {
                     let out = tuned.output(tokens, value_heads * 128)?;
                     tuned.delta_scan(
-                        &mixed, &proj, 0, tokens, &shape, &dt_bias, &neg_a, &state, false, &out, 0,
+                        &mixed, &proj, 0, tokens, &shape, &dt_bias, &neg_a, &state, 0, &writes,
+                        &out, 0,
                     )?;
                     tuned.finish(out, (tokens, value_heads * 128))
                 })?;
@@ -318,12 +459,8 @@ fn norm_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     Ok(cases)
 }
 
-/// `TUR_BENCH_ONLY=delta|linear` restricts the run to one group (normalization runs with
-/// delta).
-fn only(group: &str) -> bool {
-    std::env::var("TUR_BENCH_ONLY").is_ok_and(|v| v == group)
-}
-
+/// `TUR_BENCH_ONLY=delta|linear|paged` restricts the run to one group (normalization runs
+/// with delta, the F32 attention baseline with paged).
 fn skip(group: &str) -> bool {
     std::env::var("TUR_BENCH_ONLY").is_ok_and(|v| v != group)
 }
@@ -332,7 +469,7 @@ fn main() -> Result<()> {
     let device = Device::new_metal(0)?;
     let kernels = Kernels::new(&device)?;
     let document = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "workload": "synthetic kernel shapes from Qwen3.5-0.8B and Qwen3.8-27B; not model or serving throughput",
         "dtype": DType::F32.as_str(),
         "capabilities": format!("{:?}", kernels.capabilities()),
@@ -343,7 +480,8 @@ fn main() -> Result<()> {
         "cases": {
             "norm": if skip("delta") { json!([]) } else { json!(norm_cases(&device, &kernels)?) },
             "delta_net": if skip("delta") { json!([]) } else { json!(delta_cases(&device, &kernels)?) },
-            "attention": if only("delta") || only("linear") { json!([]) } else { json!(attention_cases(&device, &kernels)?) },
+            "attention": if skip("paged") { json!([]) } else { json!(attention_cases(&device, &kernels)?) },
+            "paged_attention": if skip("paged") { json!([]) } else { json!(paged_cases(&device, &kernels)?) },
             "packed_linear": if skip("linear") { json!([]) } else { json!(gemv_cases(&device, &kernels)?) },
         },
     });

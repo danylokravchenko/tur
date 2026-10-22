@@ -5,6 +5,7 @@ use std::{collections::HashMap, path::PathBuf};
 use tokenizers::{Tokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};
 use tur::{
     ModelFactory, ModelSource, Result, TurError,
+    core::execution::{KvFormat, KvLayout},
     models::qwen3_5::{Config, WeightFormat},
 };
 
@@ -80,6 +81,8 @@ impl Checkpoint {
             revision: "tiny-adapter-fixture-v1".into(),
             format: WeightFormat::F32,
             device: Device::Cpu,
+            // 16-dimension heads take unscaled formats only.
+            kv: KvLayout::new(16, KvFormat::F32),
         }
     }
 }

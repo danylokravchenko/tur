@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 //! Projection weights kept in their packed storage format.
 
+#[cfg(feature = "metal")]
+use candle_core::quantized::QStorage;
 use candle_core::{
     DType, Device, Module, Tensor,
-    quantized::{GgmlDType, QMatMul, QStorage, QTensor},
+    quantized::{GgmlDType, QMatMul, QTensor},
 };
 use tur_core::{Result, execution::invalid};
 

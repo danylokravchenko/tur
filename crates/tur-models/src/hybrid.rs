@@ -1,21 +1,23 @@
 #![forbid(unsafe_code)]
-//! Explicit-state packed execution contract. Legacy decoders remain in `models`.
+//! Explicit-state packed execution contract over persistent state pools.
 
 use candle_core::Tensor;
 use std::ops::Range;
 use tur_core::{Result, execution::ModelDescription};
-pub use tur_metal::state::{Boundaries, LayerRead, LayerUpdate};
+pub use tur_metal::{
+    pool::StatePool,
+    state::{Addresses, Boundaries, SequenceState},
+};
 
 /// One request's slice of a packed forward pass.
 pub struct SequenceForward<'a> {
     /// Range into [`PackedForward::tokens`] and [`PackedForward::positions`].
     pub tokens: Range<usize>,
-    /// Committed state before the first token; shared storage, read-only.
-    pub state: &'a [LayerRead],
+    /// Pool addressing: committed pages and recurrent slot, plus the pages and slots
+    /// reserved for this pass's new tokens and boundaries.
+    pub state: &'a SequenceState,
     /// Strictly increasing packed positions whose logits are required.
     pub logits: &'a [usize],
-    /// Recurrent states to return; attention always returns K/V for every token.
-    pub boundaries: Boundaries,
 }
 
 /// Variable-length requests packed without padding.
@@ -23,21 +25,26 @@ pub struct PackedForward<'a> {
     pub tokens: &'a [u32],
     pub positions: &'a [usize],
     pub sequences: &'a [SequenceForward<'a>],
+    /// Persistent state of every sequence; built from the model's own description.
+    pub pool: &'a StatePool,
 }
 
-/// One request's output: complete per-layer updates and F32 `[logits.len(), vocab]` logits.
+/// One request's output: F32 `[logits.len(), vocab]` logits. State is written in place.
 pub struct SequenceStep {
-    pub layers: Vec<LayerUpdate>,
     pub logits: Tensor,
 }
 
-/// Shared immutable model weights. All mutable sequence state is passed explicitly.
-/// Implementations must not retain or mutate inputs after returning, or hide request state.
+/// Shared immutable model weights. All mutable sequence state lives in the pool.
+///
+/// A pass writes keys and values for every new token at their reserved page positions,
+/// and the recurrent state after the last token (or after every token, as the sequence's
+/// [`Boundaries`] request) into its reserved slots. It must not write anywhere else:
+/// committed pages and slots are shared with checkpoints and other sequences.
 pub trait HybridModel: Send + Sync + 'static {
     /// Declare the exact model identity, state layout, modalities, vocabulary and limits.
     fn description(&self) -> ModelDescription;
 
-    /// Kernel scratch this plan needs beyond its inputs and outputs, for admission.
+    /// Kernel scratch this plan needs beyond its inputs, outputs and pools, for admission.
     fn workspace_bytes(&self, _batch: &PackedForward<'_>) -> Result<usize> {
         Ok(0)
     }

@@ -1,13 +1,16 @@
 #![forbid(unsafe_code)]
 mod common;
 use common::Checkpoint;
-use tur::{InferencePipeline, Result, backend::pipeline::GenerationRequest};
+use tur::{
+    InferencePipeline, Result, TurError,
+    backend::pipeline::{GenerationRequest, PipelineConfig},
+};
 
 #[test]
 fn test_streamed_text_matches_full_decode_and_chunked_prefill() -> Result<()> {
     let fixture = Checkpoint::new()?;
     let request = GenerationRequest::new("t10 t11 t12 t13 t14".into(), 4);
-    let mut full = InferencePipeline::new(&fixture.factory(), 1, 256)?;
+    let mut full = InferencePipeline::new(&fixture.factory(), PipelineConfig::new(1, 256))?;
     let mut text = String::new();
     let stats = full.run(&request, |token| text.push_str(token))?;
     assert_eq!(stats.generated_text, "t5 t5 t5 t5");
@@ -16,7 +19,7 @@ fn test_streamed_text_matches_full_decode_and_chunked_prefill() -> Result<()> {
     assert_eq!(stats.generated_tokens, 4);
     assert_eq!(stats.finish_reason, "length");
     assert_eq!(full.active_request_count(), 0);
-    let mut chunked = InferencePipeline::new(&fixture.factory(), 1, 2)?;
+    let mut chunked = InferencePipeline::new(&fixture.factory(), PipelineConfig::new(1, 2))?;
     let chunked_stats = chunked.run(&request, |_| {})?;
     assert_eq!(chunked_stats.generated_text, stats.generated_text);
     assert_eq!(chunked_stats.generated_tokens, stats.generated_tokens);
@@ -30,7 +33,7 @@ fn test_generation_config_eos_stops_and_is_not_streamed() -> Result<()> {
         fixture.0.join("generation_config.json"),
         r#"{"do_sample":false,"eos_token_id":5}"#,
     )?;
-    let mut pipeline = InferencePipeline::new(&fixture.factory(), 1, 2)?;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), PipelineConfig::new(1, 2))?;
     let mut text = String::new();
     let stats = pipeline.run(&GenerationRequest::new("t10 t11 t12".into(), 20), |t| {
         text.push_str(t)
@@ -46,7 +49,7 @@ fn test_generation_config_eos_stops_and_is_not_streamed() -> Result<()> {
 #[test]
 fn test_packed_requests_can_join_cancel_and_fail_independently() -> Result<()> {
     let fixture = Checkpoint::new()?;
-    let mut pipeline = InferencePipeline::new(&fixture.factory(), 3, 2)?;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), PipelineConfig::new(3, 2))?;
     let first =
         pipeline.submit_request(&GenerationRequest::new("t10 t11 t12 t13 t14".into(), 3))?;
     assert!(pipeline.step_streaming()?.completed.is_empty());
@@ -69,7 +72,7 @@ fn test_packed_requests_can_join_cancel_and_fail_independently() -> Result<()> {
     for (id, expected) in [(first, "t5 t5 t5"), (second, "t5 t5")] {
         let stats = results
             .remove(&id)
-            .ok_or_else(|| tur::TurError::Other("missing completion".into()))??;
+            .ok_or_else(|| TurError::Other("missing completion".into()))??;
         assert_eq!(stats.generated_text, expected);
     }
     Ok(())
@@ -78,9 +81,9 @@ fn test_packed_requests_can_join_cancel_and_fail_independently() -> Result<()> {
 #[test]
 fn test_admission_validates_sampling_context_and_limits_without_leaking_slots() -> Result<()> {
     let fixture = Checkpoint::new()?;
-    assert!(InferencePipeline::new(&fixture.factory(), 0, 2).is_err());
-    assert!(InferencePipeline::new(&fixture.factory(), 1, 0).is_err());
-    let mut pipeline = InferencePipeline::new(&fixture.factory(), 1, 2)?;
+    assert!(InferencePipeline::new(&fixture.factory(), PipelineConfig::new(0, 2)).is_err());
+    assert!(InferencePipeline::new(&fixture.factory(), PipelineConfig::new(1, 0)).is_err());
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), PipelineConfig::new(1, 2))?;
     for limit in [0, 513, usize::MAX] {
         assert!(
             pipeline
@@ -108,7 +111,7 @@ fn test_checkpoint_template_controls_thinking_without_prompt_heuristics() -> Res
         fixture.0.join("chat_template.jinja"),
         "{{ messages[0].content }}{% if enable_thinking is not defined %} t70 t71{% elif enable_thinking %} t72{% endif %}",
     )?;
-    let mut pipeline = InferencePipeline::new(&fixture.factory(), 1, 2)?;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), PipelineConfig::new(1, 2))?;
     let mut request = GenerationRequest::new("t10".into(), 1);
     assert_eq!(pipeline.run(&request, |_| {})?.prompt_tokens, 3);
     request.render.enable_thinking = Some(true);
@@ -132,5 +135,92 @@ fn test_factory_rejects_legacy_architectures_and_invalid_templates() -> Result<(
     std::fs::write(fixture.0.join("config.json"), original)?;
     std::fs::write(fixture.0.join("chat_template.jinja"), "{% invalid %}")?;
     assert!(fixture.factory().create_model().is_err());
+    Ok(())
+}
+
+/// A pipeline whose state pool holds `pages` K/V pages beside its recurrent slots.
+fn budgeted(fixture: &Checkpoint, batch: usize, pages: usize) -> Result<InferencePipeline> {
+    // Unit sizes come from an unconstrained pipeline over the same checkpoint.
+    let usage =
+        InferencePipeline::new(&fixture.factory(), PipelineConfig::new(batch, 2))?.memory()?;
+    InferencePipeline::new(
+        &fixture.factory(),
+        PipelineConfig {
+            state_bytes: Some(2 * batch * usage.slot_bytes + pages * usage.page_bytes),
+            ..PipelineConfig::new(batch, 2)
+        },
+    )
+}
+
+fn drain(
+    pipeline: &mut InferencePipeline,
+) -> Result<std::collections::HashMap<uuid::Uuid, Result<String>>> {
+    let mut results = std::collections::HashMap::new();
+    while pipeline.active_request_count() > 0 {
+        for (id, result) in pipeline.step_streaming()?.completed {
+            results.insert(id, result.map(|stats| stats.generated_text));
+        }
+    }
+    Ok(results)
+}
+
+#[test]
+fn test_requests_beyond_the_state_pool_are_rejected_at_admission() -> Result<()> {
+    let fixture = Checkpoint::new()?;
+    // One 16-token page: 5 prompt tokens plus 12 generated fit, plus 13 do not.
+    let mut pipeline = budgeted(&fixture, 2, 1)?;
+    let planned = pipeline.memory_plan().state_pool;
+    assert_eq!(planned, pipeline.memory()?.resident_bytes());
+    assert!(matches!(
+        pipeline.submit_request(&GenerationRequest::new("t10 t11 t12 t13 t14".into(), 13)),
+        Err(TurError::MemoryAllocation(_))
+    ));
+    let id = pipeline.submit_request(&GenerationRequest::new("t10 t11 t12 t13 t14".into(), 12))?;
+    let mut results = drain(&mut pipeline)?;
+    assert_eq!(
+        results.remove(&id).transpose()?.as_deref(),
+        Some(["t5"; 12].join(" ").as_str())
+    );
+    Ok(())
+}
+
+#[test]
+fn test_requests_wait_for_pages_and_complete_in_turn() -> Result<()> {
+    let fixture = Checkpoint::new()?;
+    // Each request fits the single page alone; the second waits for the first.
+    let mut pipeline = budgeted(&fixture, 2, 1)?;
+    let request = GenerationRequest::new("t10 t11 t12 t13 t14".into(), 8);
+    let first = pipeline.submit_request(&request)?;
+    let second = pipeline.submit_request(&request)?;
+    let mut results = drain(&mut pipeline)?;
+    for id in [first, second] {
+        assert_eq!(
+            results.remove(&id).transpose()?.as_deref(),
+            Some(["t5"; 8].join(" ").as_str())
+        );
+    }
+    assert_eq!(pipeline.memory()?.pages.leased, 0);
+    Ok(())
+}
+
+#[test]
+fn test_exhausted_pool_stops_the_newest_request_and_older_ones_finish() -> Result<()> {
+    let fixture = Checkpoint::new()?;
+    // Two pages; both requests start, and each needs a second page at position 16.
+    let mut pipeline = budgeted(&fixture, 2, 2)?;
+    let request = GenerationRequest::new("t10 t11 t12 t13 t14".into(), 20);
+    let older = pipeline.submit_request(&request)?;
+    let newer = pipeline.submit_request(&request)?;
+    let mut results = drain(&mut pipeline)?;
+    assert!(matches!(
+        results.remove(&newer),
+        Some(Err(TurError::MemoryAllocation(_)))
+    ));
+    assert_eq!(
+        results.remove(&older).transpose()?.as_deref(),
+        Some(["t5"; 20].join(" ").as_str())
+    );
+    let usage = pipeline.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
     Ok(())
 }

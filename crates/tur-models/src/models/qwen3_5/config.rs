@@ -6,12 +6,10 @@ use std::collections::BTreeMap;
 use tur_core::{
     Result,
     execution::{
-        LayerStateKind, Modality, ModelDescription, ModelIdentity, checked_elements, invalid,
+        KvFormat, KvLayout, LayerStateKind, Modality, ModelDescription, ModelIdentity,
+        checked_elements, invalid,
     },
 };
-
-/// Attention page capacity. Independent of the model; tuned in P5.
-const PAGE_TOKENS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -247,7 +245,9 @@ impl Config {
             forbidden_tokens,
             eos,
         };
-        config.description("validation".into())?.validate()?;
+        config
+            .description("validation".into(), KvLayout::new(1, KvFormat::F32))?
+            .validate()?;
         // Validate every weight product before any file payload is read.
         config.weight_shapes()?;
         Ok(config)
@@ -376,8 +376,9 @@ impl Config {
         (self.text.head_dim as f64 * self.text.rope_parameters.partial_rotary_factor) as usize
     }
 
-    /// State layout. F32 state matches the reference's `mamba_ssm_dtype` and FP32 accumulation.
-    pub(super) fn description(&self, revision: String) -> Result<ModelDescription> {
+    /// State layout with K/V stored as `kv`. F32 recurrent state matches the reference's
+    /// `mamba_ssm_dtype` and FP32 accumulation.
+    pub(super) fn description(&self, revision: String, kv: KvLayout) -> Result<ModelDescription> {
         let t = &self.text;
         let layers = t
             .layer_types
@@ -387,8 +388,6 @@ impl Config {
                     LayerKind::FullAttention => LayerStateKind::Attention {
                         kv_heads: t.num_key_value_heads,
                         head_dim: t.head_dim,
-                        page_tokens: PAGE_TOKENS,
-                        dtype: DType::F32,
                     },
                     LayerKind::LinearAttention => LayerStateKind::Recurrent {
                         conv_channels: self.conv_channels()?,
@@ -407,6 +406,7 @@ impl Config {
                 state_format: 1,
             },
             layers,
+            kv,
             modalities: vec![Modality::Text],
             vocab_size: t.vocab_size,
             max_position: t.max_position_embeddings,
@@ -544,7 +544,9 @@ mod tests {
     fn test_pinned_configs_parse_with_hybrid_layout() -> Result<()> {
         for (json, layers, attention) in [(SMALL, 24, 6), (FLAGSHIP, 64, 16)] {
             let config = Config::from_json(json)?;
-            let description = config.description("fixture".into())?;
+            let description =
+                config.description("fixture".into(), KvLayout::new(16, KvFormat::Q8))?;
+            description.validate()?;
             assert_eq!(description.layers.len(), layers);
             let full = description
                 .layers

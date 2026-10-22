@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     ModelFactory, Result, TurError,
-    backend::pipeline::{GenerationRequest, GenerationStats, InferencePipeline},
+    backend::pipeline::{GenerationRequest, GenerationStats, InferencePipeline, PipelineConfig},
 };
 
 /// A validated text conversation and its independent response channels.
@@ -17,11 +17,11 @@ pub struct WorkerMsg {
     pub result_tx: oneshot::Sender<Result<GenerationStats>>,
 }
 
-/// Checkpoint and admission limits for one worker. Model operations stay on its OS thread.
+/// Checkpoint, admission limits and state budget for one worker. Model operations stay on
+/// its OS thread.
 pub struct WorkerConfig {
     pub factory: ModelFactory,
-    pub max_batch_size: usize,
-    pub prefill_chunk_size: usize,
+    pub pipeline: PipelineConfig,
 }
 
 struct PendingRequest {
@@ -121,25 +121,30 @@ impl PipelineWorker {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("hybrid-worker".into())
-            .spawn(move || {
-                match InferencePipeline::new(
-                    &config.factory,
-                    config.max_batch_size,
-                    config.prefill_chunk_size,
-                ) {
+            .spawn(
+                move || match InferencePipeline::new(&config.factory, config.pipeline) {
                     Ok(pipeline) => {
+                        let plan = pipeline.memory_plan();
+                        tracing::info!(
+                            resident_bytes = plan.resident(),
+                            weights = plan.weights,
+                            state_pool = plan.state_pool,
+                            scratch_peak = plan.scratch_peak,
+                            limit = ?plan.limit,
+                            "Memory plan"
+                        );
                         if ready_tx.send(Ok(())).is_err() {
                             return;
                         }
-                        if let Err(error) = serve(rx, pipeline, config.max_batch_size) {
+                        if let Err(error) = serve(rx, pipeline, config.pipeline.max_batch_size) {
                             tracing::warn!("Hybrid worker stopped: {error}");
                         }
                     }
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
                     }
-                }
-            })?;
+                },
+            )?;
         ready_rx
             .recv()
             .map_err(|error| TurError::Other(format!("Worker startup failed: {error}")))??;
@@ -163,7 +168,10 @@ impl PipelineWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ModelSource, models::qwen3_5::WeightFormat};
+    use crate::{
+        ModelSource,
+        models::qwen3_5::{DEFAULT_KV_LAYOUT, WeightFormat},
+    };
     use candle_core::Device;
 
     #[test]
@@ -174,9 +182,9 @@ mod tests {
                 revision: "fixture".into(),
                 format: WeightFormat::F32,
                 device: Device::Cpu,
+                kv: DEFAULT_KV_LAYOUT,
             },
-            max_batch_size: 1,
-            prefill_chunk_size: 64,
+            pipeline: PipelineConfig::new(1, 64),
         });
         assert!(result.is_err());
     }

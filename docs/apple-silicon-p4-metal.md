@@ -1,5 +1,10 @@
 # P4 Metal runtime and first fused kernels
 
+P5 update: the per-pass K/V pool described below is replaced by persistent page pools
+that attention reads in place, K/V formats beyond F32, and slot-addressed DeltaNet
+state; the attention kernel now reads vectors per lane. See the
+[P5 report](apple-silicon-p5-memory.md).
+
 Status (2026-10-22): `tur-metal` has a Metal kernel runtime and fused MSL kernels for
 the Qwen3.5 hybrid decoder. On a Metal device the fused path is the default for the
 engine, CLI and server. On the real Qwen3.5-0.8B checkpoint it matches the F32

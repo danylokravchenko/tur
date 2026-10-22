@@ -15,12 +15,13 @@ use tur_core::{
         StateMetadata, invalid,
     },
 };
-use tur_metal::{
-    completion::{Completion, Quarantine},
-    state::{ModelState, StagedUpdate},
+use tur_metal::completion::{Completion, Quarantine};
+pub use tur_metal::{
+    pool::{PoolConfig, PoolUsage, StatePool},
+    state::{Demand, ModelState, Reservation},
 };
 pub use tur_models::hybrid::{
-    Boundaries, HybridModel, LayerRead, PackedForward, SequenceForward, SequenceStep,
+    Boundaries, HybridModel, PackedForward, SequenceForward, SequenceState, SequenceStep,
 };
 use uuid::Uuid;
 
@@ -159,7 +160,8 @@ impl Snapshot {
 }
 
 /// Opaque atomic snapshot of all layers, sequence position, RNG and grammar parser.
-/// Cloning uses independent parser state and shares private immutable model buffers.
+/// Cloning uses independent parser state and shares the snapshot's pool pages and slot;
+/// holding a checkpoint keeps them leased.
 pub struct Checkpoint(Snapshot);
 impl Clone for Checkpoint {
     fn clone(&self) -> Self {
@@ -224,33 +226,28 @@ pub struct SequenceResult {
 }
 
 struct Batch<M> {
-    // Weights, committed inputs and model outputs stay alive across the completion fence.
+    // Weights, every page and slot the pass reads or writes, and logits stay alive across
+    // the completion fence.
     model: Arc<M>,
     plan: PackedExecution,
-    bases: Vec<ModelState>,
-    inputs: Vec<Vec<LayerRead>>,
-    staged: Vec<Result<(StagedUpdate, Tensor)>>,
+    reservations: Vec<Reservation>,
+    logits: Vec<Result<Tensor>>,
     error: Option<TurError>,
 }
 
-/// Device work enqueued while publishing accepted boundaries reads these buffers.
-type Trailing = (
-    Vec<ModelState>,
-    Vec<Vec<LayerRead>>,
-    Vec<(StagedUpdate, Tensor)>,
-);
-
 /// One execution owner with at most one in-flight batch. No locks are held during execution.
-/// `submit` validates and enqueues one packed pass; `finish` fences, samples and publishes.
+/// `submit` validates, reserves pool memory and enqueues one packed pass; `finish` fences,
+/// samples and publishes. Released pages and slots are reclaimed only while no batch is in
+/// flight, so no unfenced work can reference a reused id.
 pub struct HybridEngine<M: HybridModel> {
     model: Arc<M>,
     description: Arc<ModelDescription>,
     device: Device,
+    pool: StatePool,
     quarantine: Quarantine,
     requests: HashMap<Uuid, Request>,
     pending: Option<Completion<Batch<M>>>,
     pending_handles: HashSet<Uuid>,
-    trailing: Option<Completion<Trailing>>,
 }
 
 fn validate_logits(logits: &Tensor, rows: usize, vocab: usize, device: &Device) -> Result<()> {
@@ -300,8 +297,8 @@ fn sample_sequence(
     Ok((length, outputs))
 }
 
-fn boundaries(sequence: &SequenceDescriptor) -> Boundaries {
-    if sequence.speculative {
+fn boundaries(speculative: bool) -> Boundaries {
+    if speculative {
         Boundaries::EveryToken
     } else {
         Boundaries::Final
@@ -310,16 +307,15 @@ fn boundaries(sequence: &SequenceDescriptor) -> Boundaries {
 
 fn forwards<'a>(
     plan: &'a PackedExecution,
-    inputs: &'a [Vec<LayerRead>],
+    states: &'a [SequenceState],
 ) -> Vec<SequenceForward<'a>> {
     plan.sequences
         .iter()
-        .zip(inputs)
+        .zip(states)
         .map(|(sequence, state)| SequenceForward {
             tokens: sequence.tokens.clone(),
             state,
             logits: &sequence.outputs,
-            boundaries: boundaries(sequence),
         })
         .collect()
 }
@@ -329,8 +325,8 @@ fn publish(
     request: &mut Request,
     sequence: &SequenceDescriptor,
     tokens: &[u32],
-    base: &ModelState,
-    (update, logits): &(StagedUpdate, Tensor),
+    reservation: &Reservation,
+    logits: &Tensor,
 ) -> Result<SequenceCommit> {
     let rows: Vec<Vec<f32>> = if sequence.outputs.is_empty() {
         Vec::new()
@@ -345,7 +341,7 @@ fn publish(
     let sampling = &mut request.snapshot.sampling;
     let mark = sampling.mark();
     let published = sample_sequence(sampling, sequence, tokens, &rows)
-        .and_then(|(accepted, outputs)| Ok((base.apply(update, accepted)?, accepted, outputs)));
+        .and_then(|(accepted, outputs)| Ok((reservation.commit(accepted)?, accepted, outputs)));
     let (model, accepted, outputs) = match published {
         Ok(published) => published,
         Err(error) => {
@@ -364,21 +360,42 @@ fn publish(
 }
 
 impl<M: HybridModel> HybridEngine<M> {
-    /// Validate the model description before allocating any request resources.
+    /// Validate the model description and allocate its state pools with `config` capacity.
     /// Completion fences wait on `device`; give each engine its own device for isolation.
-    pub fn new(model: Arc<M>, device: Device) -> Result<Self> {
-        let description = model.description();
-        description.validate()?;
+    pub fn new(model: Arc<M>, device: Device, config: PoolConfig) -> Result<Self> {
+        let description = Arc::new(model.description());
+        let pool = StatePool::new(Arc::clone(&description), &device, config)?;
         Ok(Self {
             model,
-            description: Arc::new(description),
+            description,
             device,
+            pool,
             quarantine: Quarantine::new(),
             requests: HashMap::new(),
             pending: None,
             pending_handles: HashSet::new(),
-            trailing: None,
         })
+    }
+
+    /// Persistent state storage shared by every request of this engine.
+    pub fn pool(&self) -> &StatePool {
+        &self.pool
+    }
+
+    /// Reclaim released pages and slots if no batch is in flight, then report occupancy.
+    pub fn memory(&mut self) -> Result<PoolUsage> {
+        if self.pending.is_none() && self.quarantine.retry() == 0 {
+            self.pool.reclaim();
+        }
+        self.pool.usage()
+    }
+
+    /// Pool pages and slots that a pass of `tokens` new tokens for `handle` would lease.
+    pub fn demand(&self, handle: StateHandle, tokens: usize, speculative: bool) -> Result<Demand> {
+        self.request(handle)?
+            .snapshot
+            .model
+            .demand(tokens, boundaries(speculative))
     }
 
     /// Allocate request-owned layer state, independent RNG and an optional grammar parser.
@@ -402,7 +419,7 @@ impl<M: HybridModel> HybridEngine<M> {
             return Err(invalid("invalid sampling options"));
         }
         let snapshot = Snapshot {
-            model: ModelState::allocate(Arc::clone(&self.description), &self.device)?,
+            model: ModelState::new(&self.pool),
             sampling: SamplingState {
                 seed,
                 draws: 0,
@@ -468,11 +485,10 @@ impl<M: HybridModel> HybridEngine<M> {
     }
 
     fn validate_checkpoint(&self, checkpoint: &Checkpoint) -> Result<()> {
-        if checkpoint.0.model.description() != self.description.as_ref()
-            || !checkpoint.0.model.device().same_device(&self.device)
-        {
+        // Pages live in one engine's pool; the pool pins model identity, layout and device.
+        if !checkpoint.0.model.pool().same_pool(&self.pool) {
             return Err(invalid(
-                "checkpoint model identity, layout or device mismatch",
+                "checkpoint belongs to another model, state layout or engine",
             ));
         }
         Ok(())
@@ -523,22 +539,20 @@ impl<M: HybridModel> HybridEngine<M> {
         self.quarantine.retry()
     }
 
-    /// Validate the complete packed descriptor, then enqueue one packed model pass.
-    /// Returns the checked payload this submission retains, including model workspace.
-    /// Per-request execution errors are reported by `finish`.
+    /// Validate the complete packed descriptor, reserve pool memory for every sequence,
+    /// then enqueue one packed model pass. Returns the checked payload this submission
+    /// retains, including model workspace. A pool that cannot hold the pass fails with
+    /// [`TurError::MemoryAllocation`] before any work is enqueued, leaving every request
+    /// unchanged. Per-request execution errors are reported by `finish`.
     pub fn submit(&mut self, plan: PackedExecution) -> Result<ExecutionRequirements> {
         if self.pending.is_some() {
             return Err(invalid("one batch is already in flight"));
         }
-        if let Some(mut trailing) = self.trailing.take()
-            && let Err(error) = trailing.wait()
-        {
-            self.trailing = Some(trailing);
-            return Err(error);
-        }
         if self.quarantine.retry() != 0 {
             return Err(invalid("retired submissions still await device completion"));
         }
+        // Nothing is in flight: every released id is safe to reuse.
+        self.pool.reclaim();
         let states: Vec<_> = self
             .requests
             .values()
@@ -550,20 +564,46 @@ impl<M: HybridModel> HybridEngine<M> {
             })
             .collect();
         let (plan, mut requirements) = plan.validate(&self.description, &states)?.into_parts();
-        let mut bases = Vec::with_capacity(plan.sequences.len());
+        let mut demand = Demand::default();
         for sequence in &plan.sequences {
             sequence
                 .state
                 .revision
                 .checked_add(1)
                 .ok_or_else(|| invalid("request revision overflow"))?;
-            bases.push(self.request(sequence.state)?.snapshot.model.clone());
+            demand = demand
+                + self.demand(sequence.state, sequence.tokens.len(), sequence.speculative)?;
         }
-        let inputs: Vec<_> = bases.iter().map(ModelState::bind_layers).collect();
+        let usage = self.pool.usage()?;
+        if !demand.fits(&usage) {
+            return Err(TurError::MemoryAllocation(format!(
+                "pass needs {} K/V pages and {} recurrent slots; {} and {} are free",
+                demand.pages,
+                demand.slots,
+                usage.pages.free(),
+                usage.slots.free()
+            )));
+        }
+        let mut reservations = Vec::with_capacity(plan.sequences.len());
+        for sequence in &plan.sequences {
+            reservations.push(
+                self.request(sequence.state)?
+                    .snapshot
+                    .model
+                    .reserve(sequence.tokens.len(), boundaries(sequence.speculative))?,
+            );
+        }
+        requirements.state_update_bytes = reservations.iter().try_fold(0usize, |total, r| {
+            total
+                .checked_add(r.bytes()?)
+                .ok_or_else(|| invalid("batch state update overflow"))
+        })?;
+        let bindings: Vec<_> = reservations.iter().map(Reservation::binding).collect();
         requirements.workspace_bytes = self.model.workspace_bytes(&PackedForward {
             tokens: &plan.tokens,
             positions: &plan.positions,
-            sequences: &forwards(&plan, &inputs),
+            sequences: &forwards(&plan, &bindings),
+            pool: &self.pool,
         })?;
         requirements.total_bytes()?;
         let mut completion = Completion::new(
@@ -572,35 +612,38 @@ impl<M: HybridModel> HybridEngine<M> {
             Batch {
                 model: Arc::clone(&self.model),
                 plan,
-                bases,
-                inputs,
-                staged: Vec::new(),
+                reservations,
+                logits: Vec::new(),
                 error: None,
             },
         );
         let batch = completion
             .resources_mut()
             .ok_or_else(|| invalid("missing submission resources"))?;
-        let result = batch.model.forward(&PackedForward {
-            tokens: &batch.plan.tokens,
-            positions: &batch.plan.positions,
-            sequences: &forwards(&batch.plan, &batch.inputs),
+        // Copy-on-write tails are the first work of the pass, after every lease succeeded.
+        let prepared = batch
+            .reservations
+            .iter_mut()
+            .try_for_each(Reservation::prepare);
+        let result = prepared.and_then(|()| {
+            batch.model.forward(&PackedForward {
+                tokens: &batch.plan.tokens,
+                positions: &batch.plan.positions,
+                sequences: &forwards(&batch.plan, &bindings),
+                pool: &self.pool,
+            })
         });
         match result {
             Ok(steps) if steps.len() == batch.plan.sequences.len() => {
-                for ((sequence, base), step) in
-                    batch.plan.sequences.iter().zip(&batch.bases).zip(steps)
-                {
-                    batch.staged.push(step.and_then(|step| {
+                for (sequence, step) in batch.plan.sequences.iter().zip(steps) {
+                    batch.logits.push(step.and_then(|step| {
                         validate_logits(
                             &step.logits,
                             sequence.outputs.len(),
                             self.description.vocab_size,
                             &self.device,
                         )?;
-                        let staged =
-                            base.stage(step.layers, sequence.tokens.len(), boundaries(sequence))?;
-                        Ok((staged, step.logits))
+                        Ok(step.logits)
                     }));
                 }
             }
@@ -633,44 +676,37 @@ impl<M: HybridModel> HybridEngine<M> {
         self.pending_handles.clear();
         let Batch {
             plan,
-            bases,
-            inputs,
-            staged,
+            reservations,
+            logits,
             error,
             ..
         } = batch;
         if let Some(error) = error {
             self.requests.retain(|_, request| !request.cancelled);
+            drop(reservations);
+            self.pool.reclaim();
             return Err(error);
         }
         let mut results = Vec::with_capacity(plan.sequences.len());
-        let mut retained = Vec::with_capacity(staged.len());
-        for ((sequence, base), staged) in plan.sequences.iter().zip(&bases).zip(staged) {
+        for ((sequence, reservation), logits) in
+            plan.sequences.iter().zip(&reservations).zip(logits)
+        {
             let id = sequence.state.request;
-            let live = self.requests.get_mut(&id).filter(|r| !r.cancelled);
-            let outcome = match (live, staged) {
-                (None, staged) => {
-                    retained.extend(staged.ok());
-                    continue;
-                }
-                (Some(_), Err(error)) => Err(error),
-                (Some(request), Ok(staged)) => {
-                    let outcome = publish(request, sequence, &plan.tokens, base, &staged);
-                    retained.push(staged);
-                    outcome
-                }
+            let Some(request) = self.requests.get_mut(&id).filter(|r| !r.cancelled) else {
+                continue;
             };
+            let outcome = logits
+                .and_then(|logits| publish(request, sequence, &plan.tokens, reservation, &logits));
             results.push(SequenceResult {
                 request: id,
                 outcome,
             });
         }
         self.requests.retain(|_, request| !request.cancelled);
-        self.trailing = Some(Completion::new(
-            self.device.clone(),
-            &self.quarantine,
-            (bases, inputs, retained),
-        ));
+        // Unaccepted pages, superseded slots and cancelled states retire here; their work
+        // has completed, and publishing enqueued none.
+        drop(reservations);
+        self.pool.reclaim();
         Ok(results)
     }
 }
@@ -678,7 +714,14 @@ impl<M: HybridModel> HybridEngine<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tur_core::execution::{LayerStateKind, Modality, ModelIdentity, SequenceDescriptor};
+    use tur_core::execution::{
+        KvFormat, KvLayout, LayerStateKind, Modality, ModelIdentity, SequenceDescriptor,
+    };
+
+    const POOL: PoolConfig = PoolConfig {
+        pages: 2,
+        recurrent_slots: 1,
+    };
 
     struct UnusedModel;
     impl HybridModel for UnusedModel {
@@ -691,9 +734,8 @@ mod tests {
                 layers: vec![LayerStateKind::Attention {
                     kv_heads: 1,
                     head_dim: 1,
-                    page_tokens: 2,
-                    dtype: DType::F32,
                 }],
+                kv: KvLayout::new(2, KvFormat::F32),
                 modalities: vec![Modality::Text],
                 vocab_size: 2,
                 max_position: 4,
@@ -721,7 +763,7 @@ mod tests {
 
     #[test]
     fn test_revision_overflow_rejects_submission_and_restore_without_changes() -> Result<()> {
-        let mut engine = HybridEngine::new(Arc::new(UnusedModel), Device::Cpu)?;
+        let mut engine = HybridEngine::new(Arc::new(UnusedModel), Device::Cpu, POOL)?;
         let mut handle = engine.allocate(1, SamplingOptions::default(), None)?;
         let checkpoint = engine.checkpoint(handle)?;
         handle.revision = u64::MAX;
@@ -750,7 +792,7 @@ mod tests {
 
     #[test]
     fn test_invalid_sampling_options_do_not_allocate_requests() -> Result<()> {
-        let mut engine = HybridEngine::new(Arc::new(UnusedModel), Device::Cpu)?;
+        let mut engine = HybridEngine::new(Arc::new(UnusedModel), Device::Cpu, POOL)?;
         for options in [
             SamplingOptions {
                 temperature: Some(f64::NAN),

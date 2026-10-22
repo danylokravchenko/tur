@@ -1,5 +1,12 @@
 # P2 ownership and hybrid state contracts
 
+P5 update: per-request page tensors, `LayerRead`, `LayerUpdate`, `StagedUpdate` and
+`ModelState::stage/apply` are replaced by persistent state pools. Models now receive a
+`StatePool` and per-sequence `SequenceState` addressing, write K/V and recurrent state
+into reserved pages and slots, and return only logits; `Reservation::commit` publishes
+the accepted boundary. Engine semantics below (validation, isolation, speculation,
+completion) are unchanged. See the [P5 report](apple-silicon-p5-memory.md).
+
 P3 update: the temporary legacy model/engine/cache exports described in this P2
 report have been removed. CLI and HTTP now use the hybrid pipeline; see the
 [P3 migration report](apple-silicon-p3-qwen.md). Hybrid state contracts below remain

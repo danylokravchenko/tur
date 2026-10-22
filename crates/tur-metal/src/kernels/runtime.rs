@@ -16,13 +16,14 @@ use std::{collections::HashMap, sync::Arc, sync::RwLockReadGuard};
 use tur_core::{Result, TurError, execution::invalid};
 
 /// Version of the buffer layouts the kernels assume. Bump when any binding layout changes.
-pub const LAYOUT_VERSION: u32 = 1;
+/// 2: paged K/V pools in F32/F16/Q8 and slot-addressed recurrent state (P5).
+pub const LAYOUT_VERSION: u32 = 2;
 
 const SOURCE: &str = include_str!("tur.metal");
 const SIMD_WIDTH: usize = 32;
 
 /// Every function in [`SOURCE`]. Template instantiations encode their shape family
-/// (`r4` = 4 registers per lane, `b3` = 3 batch rows) and dtype in the name.
+/// (`r4` = 4 registers per lane, `b3` = 3 batch rows) and dtype or K/V format in the name.
 const FUNCTIONS: &[&str] = &[
     "rms_norm_f32",
     "add_rms_norm_f32",
@@ -33,9 +34,24 @@ const FUNCTIONS: &[&str] = &[
     "delta_scan_r2_f32",
     "delta_scan_r4_f32",
     "delta_scan_r8_f32",
+    "kv_write_r2_f32",
+    "kv_write_r2_f16",
+    "kv_write_r2_q8",
+    "kv_write_r4_f32",
+    "kv_write_r4_f16",
+    "kv_write_r4_q8",
+    "kv_write_r8_f32",
+    "kv_write_r8_f16",
+    "kv_write_r8_q8",
     "attention_r2_f32",
+    "attention_r2_f16",
+    "attention_r2_q8",
     "attention_r4_f32",
+    "attention_r4_f16",
+    "attention_r4_q8",
     "attention_r8_f32",
+    "attention_r8_f16",
+    "attention_r8_q8",
     "attention_reduce_r2_f32",
     "attention_reduce_r4_f32",
     "attention_reduce_r8_f32",
@@ -359,12 +375,12 @@ impl View<'_> {
         }
     }
 
-    /// Byte offset of `row`, checked against the validated row count.
     /// Byte offset of the first element in its buffer.
     pub(super) fn offset(&self) -> usize {
         self.offset
     }
 
+    /// Byte offset of `row`, checked against the validated row count.
     pub(super) fn row_offset(&self, row: usize) -> Result<usize> {
         if row >= self.rows {
             return Err(invalid("kernel input row out of range"));
@@ -387,6 +403,13 @@ impl View<'_> {
         row: usize,
     ) -> Result<()> {
         encoder.set_input_buffer(index, Some(self.buffer()?), self.row_offset(row)?);
+        Ok(())
+    }
+
+    /// Bind as a kernel output, so later readers of this buffer wait for the writes.
+    /// Used for persistent pools that kernels update in place.
+    pub(super) fn bind_mut(&self, encoder: &ComputeCommandEncoder, index: usize) -> Result<()> {
+        encoder.set_output_buffer(index, Some(self.buffer()?), self.offset);
         Ok(())
     }
 

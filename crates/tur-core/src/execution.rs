@@ -25,14 +25,13 @@ pub enum Modality {
     Audio,
 }
 
-/// State required by one model layer, including its storage dtype.
+/// State required by one model layer. Attention storage follows the model's [`KvLayout`];
+/// recurrent state declares its own dtype.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayerStateKind {
     Attention {
         kv_heads: usize,
         head_dim: usize,
-        page_tokens: usize,
-        dtype: DType,
     },
     Recurrent {
         conv_channels: usize,
@@ -44,11 +43,125 @@ pub enum LayerStateKind {
     },
 }
 
+/// Version of the paged K/V memory layout. Bump when page, scale or code layouts change, so
+/// checkpoints and persisted prefixes from another layout are rejected rather than misread.
+pub const KV_LAYOUT_VERSION: u32 = 1;
+
+/// Storage format of attention keys and values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KvFormat {
+    F32,
+    F16,
+    /// Symmetric 8-bit codes with one F16 scale per `group` consecutive head dimensions.
+    /// Codes are two's-complement bytes in U8 storage; the scale is `max |x| / 127` of
+    /// the group.
+    Q8 {
+        group: usize,
+    },
+}
+
+impl KvFormat {
+    /// Default Q8 group: one scale per 32 dimensions.
+    pub const Q8: Self = Self::Q8 { group: 32 };
+
+    /// Dtype of the stored codes or values.
+    pub fn data_dtype(self) -> DType {
+        match self {
+            Self::F32 => DType::F32,
+            Self::F16 => DType::F16,
+            Self::Q8 { .. } => DType::U8,
+        }
+    }
+
+    /// Head dimensions sharing one scale, or `None` for unscaled formats.
+    pub fn group(self) -> Option<usize> {
+        match self {
+            Self::Q8 { group } => Some(group),
+            Self::F32 | Self::F16 => None,
+        }
+    }
+
+    /// Reject groups that do not tile `head_dim` in whole 32-lane SIMD rows.
+    pub fn validate(self, head_dim: usize) -> Result<()> {
+        if let Some(group) = self.group()
+            && (group == 0 || !group.is_multiple_of(32) || !head_dim.is_multiple_of(group))
+        {
+            return Err(invalid(format!(
+                "K/V group {group} must be a multiple of 32 dividing head dim {head_dim}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Bytes of one token's keys (or values): codes plus F16 scales.
+    pub fn token_bytes(self, kv_heads: usize, head_dim: usize) -> Result<usize> {
+        let data = checked_elements(&[kv_heads, head_dim, self.data_dtype().size_in_bytes()])?;
+        let scales = match self.group() {
+            Some(group) if group > 0 => checked_elements(&[kv_heads, head_dim / group, 2])?,
+            Some(_) => return Err(invalid("zero K/V group")),
+            None => 0,
+        };
+        data.checked_add(scales)
+            .ok_or_else(|| invalid("K/V token size overflow"))
+    }
+}
+
+impl std::fmt::Display for KvFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::F32 => f.write_str("f32"),
+            Self::F16 => f.write_str("f16"),
+            Self::Q8 { group } => write!(f, "q8_{group}"),
+        }
+    }
+}
+
+impl std::str::FromStr for KvFormat {
+    type Err = String;
+
+    /// `f32`, `f16`, `q8` (group 32) or `q8_<group>`.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let value = value.to_ascii_lowercase();
+        match value.as_str() {
+            "f32" => Ok(Self::F32),
+            "f16" => Ok(Self::F16),
+            "q8" => Ok(Self::Q8),
+            _ => value
+                .strip_prefix("q8_")
+                .and_then(|group| group.parse().ok())
+                .map(|group| Self::Q8 { group })
+                .ok_or_else(|| "K/V format must be f32, f16, q8 or q8_<group>".into()),
+        }
+    }
+}
+
+/// Paged K/V layout shared by every attention layer: page capacity, storage format and
+/// layout version. Page size and quantization group are validated independently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KvLayout {
+    pub page_tokens: usize,
+    pub format: KvFormat,
+    pub version: u32,
+}
+
+impl KvLayout {
+    /// A layout at the current [`KV_LAYOUT_VERSION`].
+    pub fn new(page_tokens: usize, format: KvFormat) -> Self {
+        Self {
+            page_tokens,
+            format,
+            version: KV_LAYOUT_VERSION,
+        }
+    }
+}
+
 /// Model-declared layout; this describes state, not model-specific configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelDescription {
     pub identity: ModelIdentity,
     pub layers: Vec<LayerStateKind>,
+    /// Paged storage of every attention layer.
+    pub kv: KvLayout,
     pub modalities: Vec<Modality>,
     pub vocab_size: usize,
     pub max_position: usize,
@@ -78,15 +191,13 @@ fn state_dtype_bytes(dtype: DType) -> Result<usize> {
 }
 
 impl LayerStateKind {
-    /// K plus V bytes for one token; zero for recurrent layers.
-    pub fn attention_token_bytes(&self) -> Result<usize> {
+    /// K plus V bytes for one token in `format`, including scales; zero for recurrent layers.
+    pub fn attention_token_bytes(&self, format: KvFormat) -> Result<usize> {
         match *self {
-            Self::Attention {
-                kv_heads,
-                head_dim,
-                dtype,
-                ..
-            } => checked_elements(&[kv_heads, head_dim, 2, state_dtype_bytes(dtype)?]),
+            Self::Attention { kv_heads, head_dim } => format
+                .token_bytes(kv_heads, head_dim)?
+                .checked_mul(2)
+                .ok_or_else(|| invalid("K/V token size overflow")),
             Self::Recurrent { .. } => Ok(0),
         }
     }
@@ -113,44 +224,89 @@ impl LayerStateKind {
 }
 
 impl ModelDescription {
-    /// State tensor payload at a token boundary, excluding allocator/grammar overhead.
+    /// K/V payload of one token summed over attention layers:
+    /// `2 × kv_heads × head_dim × element bytes` plus scales. Recurrent layers add nothing.
+    pub fn kv_token_bytes(&self) -> Result<usize> {
+        self.layers.iter().try_fold(0usize, |total, kind| {
+            total
+                .checked_add(kind.attention_token_bytes(self.kv.format)?)
+                .ok_or_else(|| invalid("K/V token size overflow"))
+        })
+    }
+
+    /// Bytes of one page across every attention layer.
+    pub fn page_bytes(&self) -> Result<usize> {
+        self.kv_token_bytes()?
+            .checked_mul(self.kv.page_tokens)
+            .ok_or_else(|| invalid("page size overflow"))
+    }
+
+    /// Convolution histories plus recurrent matrices of every recurrent layer at one boundary.
+    pub fn recurrent_slot_bytes(&self) -> Result<usize> {
+        self.layers.iter().try_fold(0usize, |total, kind| {
+            total
+                .checked_add(kind.recurrent_boundary_bytes()?)
+                .ok_or_else(|| invalid("recurrent slot size overflow"))
+        })
+    }
+
+    /// Whether any layer keeps paged attention state.
+    pub fn has_attention(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|kind| matches!(kind, LayerStateKind::Attention { .. }))
+    }
+
+    /// Whether any layer keeps recurrent state.
+    pub fn has_recurrent(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|kind| matches!(kind, LayerStateKind::Recurrent { .. }))
+    }
+
+    /// Pages holding `positions` tokens; zero without attention layers.
+    pub fn pages_for(&self, positions: usize) -> usize {
+        if self.has_attention() {
+            positions.div_ceil(self.kv.page_tokens.max(1))
+        } else {
+            0
+        }
+    }
+
+    /// Resident state of one sequence at a token boundary: whole pages plus one recurrent
+    /// slot, excluding allocator and grammar overhead.
     pub fn state_payload_bytes(&self, position: usize) -> Result<usize> {
         if position > self.max_position {
             return Err(invalid("state position exceeds model limit"));
         }
-        self.layers.iter().try_fold(0usize, |total, kind| {
-            let recurrent = kind.recurrent_boundary_bytes()?;
-            let bytes = kind
-                .attention_token_bytes()?
-                .checked_mul(position)
-                .and_then(|b| b.checked_add(recurrent))
-                .ok_or_else(|| invalid("layer payload overflow"))?;
-            total
-                .checked_add(bytes)
-                .ok_or_else(|| invalid("model payload overflow"))
-        })
+        self.pages_for(position)
+            .checked_mul(self.page_bytes()?)
+            .and_then(|b| b.checked_add(self.recurrent_slot_bytes().ok()?))
+            .ok_or_else(|| invalid("model payload overflow"))
     }
 
-    /// Model outputs retained until completion for `tokens` new tokens and `boundaries`
-    /// recurrent snapshots (1 for ordinary execution, `tokens` for speculation).
-    pub fn state_update_bytes(&self, tokens: usize, boundaries: usize) -> Result<usize> {
-        self.layers.iter().try_fold(0usize, |total, kind| {
-            let attention = kind
-                .attention_token_bytes()?
-                .checked_mul(tokens)
-                .ok_or_else(|| invalid("attention update overflow"))?;
-            let recurrent = kind
-                .recurrent_boundary_bytes()?
-                .checked_mul(boundaries)
-                .ok_or_else(|| invalid("recurrent update overflow"))?;
-            total
-                .checked_add(attention)
-                .and_then(|t| t.checked_add(recurrent))
-                .ok_or_else(|| invalid("model update overflow"))
-        })
+    /// Pool memory one pass reserves for `tokens` new tokens after `start`: the pages it
+    /// opens plus `boundaries` recurrent slots (1 ordinarily, `tokens` for speculation).
+    /// A copy-on-write tail page, when needed, adds one page.
+    pub fn state_update_bytes(
+        &self,
+        start: usize,
+        tokens: usize,
+        boundaries: usize,
+    ) -> Result<usize> {
+        let end = start
+            .checked_add(tokens)
+            .ok_or_else(|| invalid("position overflow"))?;
+        let pages = self.pages_for(end) - self.pages_for(start);
+        let slots = if self.has_recurrent() { boundaries } else { 0 };
+        pages
+            .checked_mul(self.page_bytes()?)
+            .zip(slots.checked_mul(self.recurrent_slot_bytes()?))
+            .and_then(|(p, s)| p.checked_add(s))
+            .ok_or_else(|| invalid("model update overflow"))
     }
 
-    /// Validate every dimension, including byte sizes, before allocating state.
+    /// Validate every dimension, the K/V layout and byte sizes before allocating state.
     pub fn validate(&self) -> Result<()> {
         if self.identity.revision.is_empty()
             || self.identity.state_format == 0
@@ -163,14 +319,23 @@ impl ModelDescription {
         if !self.modalities.contains(&Modality::Text) {
             return Err(invalid("packed execution requires text input support"));
         }
+        if self.kv.version != KV_LAYOUT_VERSION {
+            return Err(invalid(format!(
+                "K/V layout version {} is not the supported {KV_LAYOUT_VERSION}",
+                self.kv.version
+            )));
+        }
+        checked_elements(&[self.kv.page_tokens])?;
+        u32::try_from(self.kv.page_tokens).map_err(|_| invalid("page size exceeds u32"))?;
         self.vocab_size
             .checked_mul(4)
             .ok_or_else(|| invalid("logits byte size overflow"))?;
         for kind in &self.layers {
-            if let LayerStateKind::Attention { page_tokens, .. } = *kind {
-                checked_elements(&[page_tokens])?;
+            if let LayerStateKind::Attention { kv_heads, head_dim } = *kind {
+                checked_elements(&[kv_heads, head_dim])?;
+                self.kv.format.validate(head_dim)?;
             }
-            kind.attention_token_bytes()?;
+            kind.attention_token_bytes(self.kv.format)?;
             kind.recurrent_boundary_bytes()?;
         }
         self.state_payload_bytes(self.max_position)?;
@@ -229,7 +394,8 @@ pub struct ExecutionRequirements {
     pub packed_input_bytes: usize,
     /// F32 logits for requested output positions only.
     pub logits_bytes: usize,
-    /// New K/V for every token plus recurrent state at each retained boundary.
+    /// Pool pages opened and recurrent slots written by this pass, including any
+    /// copy-on-write tail page.
     pub state_update_bytes: usize,
     /// Model-declared kernel scratch for this plan.
     pub workspace_bytes: usize,
@@ -343,7 +509,7 @@ impl PackedExecution {
             let boundaries = if sequence.speculative { length } else { 1 };
             requirements.state_update_bytes = requirements
                 .state_update_bytes
-                .checked_add(model.state_update_bytes(length, boundaries)?)
+                .checked_add(model.state_update_bytes(state.position, length, boundaries)?)
                 .ok_or_else(|| invalid("batch state update overflow"))?;
             outputs = outputs
                 .checked_add(sequence.outputs.len())
@@ -368,22 +534,29 @@ impl PackedExecution {
 mod tests {
     use super::*;
 
-    fn attention(kv_heads: usize, dtype: DType) -> LayerStateKind {
-        LayerStateKind::Attention {
-            kv_heads,
-            head_dim: 1,
-            page_tokens: 2,
-            dtype,
+    fn attention(kv_heads: usize, head_dim: usize) -> LayerStateKind {
+        LayerStateKind::Attention { kv_heads, head_dim }
+    }
+
+    fn recurrent() -> LayerStateKind {
+        LayerStateKind::Recurrent {
+            conv_channels: 1,
+            conv_width: 2,
+            heads: 1,
+            key_dim: 1,
+            value_dim: 1,
+            dtype: DType::F32,
         }
     }
 
-    fn description(layers: Vec<LayerStateKind>) -> ModelDescription {
+    fn description(layers: Vec<LayerStateKind>, format: KvFormat) -> ModelDescription {
         ModelDescription {
             identity: ModelIdentity {
                 revision: "fixture".into(),
                 state_format: 1,
             },
             layers,
+            kv: KvLayout::new(2, format),
             modalities: vec![Modality::Text],
             vocab_size: 4,
             max_position: 8,
@@ -399,17 +572,17 @@ mod tests {
 
     #[test]
     fn test_execution_payload_requirements_and_aggregate_overflow() -> Result<()> {
-        let mut model = description(vec![attention(1, DType::F32)]);
+        let mut model = description(vec![attention(1, 1)], KvFormat::F32);
         let state = StateHandle {
             request: Uuid::new_v4(),
             revision: 0,
         };
         let plan = PackedExecution {
-            tokens: vec![1, 2],
-            positions: vec![0, 1],
+            tokens: vec![1, 2, 3],
+            positions: vec![1, 2, 3],
             sequences: vec![SequenceDescriptor {
                 state,
-                tokens: 0..2,
+                tokens: 0..3,
                 outputs: vec![1],
                 speculative: false,
             }],
@@ -418,54 +591,101 @@ mod tests {
             &model,
             &[StateMetadata {
                 handle: state,
-                position: 0,
+                position: 1,
                 finished: false,
             }],
         )?;
         let requirements = validated.requirements();
         assert_eq!(
             requirements.packed_input_bytes,
-            2 * (4 + std::mem::size_of::<usize>())
+            3 * (4 + std::mem::size_of::<usize>())
         );
         assert_eq!(requirements.logits_bytes, 16);
+        // Positions 1..4 already own page 0 and open page 1: one 2-token page of K and V.
         assert_eq!(requirements.state_update_bytes, 16);
         assert_eq!(model.state_payload_bytes(0)?, 0);
+        assert_eq!(model.state_payload_bytes(3)?, 32);
         model.max_position = 1;
-        model.layers = vec![attention(usize::MAX / 16, DType::F32); 3];
+        model.layers = vec![attention(usize::MAX / 16, 1); 3];
         assert!(model.validate().is_err());
         Ok(())
     }
 
     #[test]
-    fn test_state_dtype_and_modalities_are_validated() {
-        assert_eq!(
-            description(vec![attention(1, DType::BF16)])
-                .state_payload_bytes(2)
-                .ok(),
-            Some(8)
-        );
-        assert!(
-            description(vec![attention(1, DType::U8)])
-                .validate()
-                .is_err()
-        );
-        let mut model = description(vec![attention(1, DType::F32)]);
-        model.modalities = vec![Modality::Image];
-        assert!(model.validate().is_err());
+    fn test_kv_formats_count_codes_and_scales_per_attention_layer() -> Result<()> {
+        // Qwen3.5-0.8B: six attention layers with 2 K/V heads of 256 dims among 24.
+        let mut layers = vec![recurrent(); 18];
+        layers.extend(vec![attention(2, 256); 6]);
+        let bytes = |format| description(layers.clone(), format).kv_token_bytes();
+        assert_eq!(bytes(KvFormat::F32)?, 6 * 2 * 2 * 256 * 4);
+        assert_eq!(bytes(KvFormat::F16)?, 6 * 2 * 2 * 256 * 2);
+        // 512 one-byte codes plus 2 heads × 8 groups of F16 scales, for K and V.
+        assert_eq!(bytes(KvFormat::Q8)?, 6 * 2 * (512 + 32));
+        assert_eq!(bytes(KvFormat::Q8 { group: 128 })?, 6 * 2 * (512 + 8));
+        let model = description(layers, KvFormat::Q8);
+        assert_eq!(model.page_bytes()?, 2 * 6 * 2 * 544);
+        assert_eq!(model.recurrent_slot_bytes()?, 18 * 12);
+        assert_eq!(model.pages_for(5), 3);
+        Ok(())
     }
 
     #[test]
-    fn test_speculative_recurrent_boundaries_are_charged_per_token() -> Result<()> {
-        let model = description(vec![LayerStateKind::Recurrent {
+    fn test_kv_layout_groups_pages_versions_and_modalities_are_validated() {
+        assert!(
+            description(vec![attention(1, 64)], KvFormat::Q8)
+                .validate()
+                .is_ok()
+        );
+        for group in [0, 16, 48, 128] {
+            assert!(
+                description(vec![attention(1, 64)], KvFormat::Q8 { group })
+                    .validate()
+                    .is_err(),
+                "group {group}"
+            );
+        }
+        let mut model = description(vec![attention(1, 64)], KvFormat::F16);
+        model.kv.page_tokens = 0;
+        assert!(model.validate().is_err());
+        let mut model = description(vec![attention(1, 64)], KvFormat::F16);
+        model.kv.version = KV_LAYOUT_VERSION + 1;
+        assert!(model.validate().is_err());
+        let mut model = description(vec![attention(1, 1)], KvFormat::F32);
+        model.modalities = vec![Modality::Image];
+        assert!(model.validate().is_err());
+        let mut model = description(vec![recurrent()], KvFormat::F32);
+        model.layers = vec![LayerStateKind::Recurrent {
             conv_channels: 1,
             conv_width: 2,
             heads: 1,
             key_dim: 1,
             value_dim: 1,
-            dtype: DType::F32,
-        }]);
-        assert_eq!(model.state_update_bytes(4, 1)?, 12);
-        assert_eq!(model.state_update_bytes(4, 4)?, 48);
+            dtype: DType::U8,
+        }];
+        assert!(model.validate().is_err());
+    }
+
+    #[test]
+    fn test_kv_format_names_round_trip() {
+        for format in [
+            KvFormat::F32,
+            KvFormat::F16,
+            KvFormat::Q8,
+            KvFormat::Q8 { group: 64 },
+        ] {
+            assert_eq!(format.to_string().parse::<KvFormat>(), Ok(format));
+        }
+        assert_eq!("q8".parse::<KvFormat>(), Ok(KvFormat::Q8 { group: 32 }));
+        assert!("q4".parse::<KvFormat>().is_err());
+        assert!("q8_x".parse::<KvFormat>().is_err());
+    }
+
+    #[test]
+    fn test_speculative_recurrent_boundaries_are_charged_per_token() -> Result<()> {
+        let model = description(vec![recurrent()], KvFormat::F32);
+        assert_eq!(model.state_update_bytes(0, 4, 1)?, 12);
+        assert_eq!(model.state_update_bytes(0, 4, 4)?, 48);
+        assert_eq!(model.pages_for(4), 0);
         Ok(())
     }
 }

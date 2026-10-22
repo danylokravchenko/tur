@@ -1,16 +1,18 @@
 # Tur
 
-Tur is a Rust inference engine being redesigned for Apple Silicon. P3 is complete:
-Qwen3.5/3.8 dense hybrid text execution, checkpoint loading, the CLI and the HTTP
-worker use the packed `HybridEngine` path. Ordinary Qwen3, Granite 4.1 and their
-legacy engine, cache, tests and benchmark have been removed.
+Tur is a Rust inference engine being redesigned for Apple Silicon. It runs the
+Qwen3.5/3.8 dense hybrid text model through the packed `HybridEngine`: fused Metal
+kernels (P4) over persistent, paged and optionally quantized K/V and recurrent state
+pools (P5). The CLI and HTTP worker use this path. Ordinary Qwen3, Granite 4.1 and
+their legacy engine, cache, tests and benchmark have been removed.
 
 The real Qwen3.5-0.8B checkpoint was validated against Transformers on CPU and Metal.
 Qwen3.8-27B shares the implementation and has pinned config, tensor-header and
-template validation; it has **not been executed** on the development Mac.
-This remains reference execution. Production performance, quality budgets and
-serving hardening are later stages. See the [redesign plan](docs/apple-silicon-redesign.md)
-and [P3 evidence and limitations](docs/apple-silicon-p3-qwen.md).
+template validation; it has **not been executed** on the development Mac. Measurements
+come from one M1; production serving hardening, quality budgets and release gates are
+later stages. See the [redesign plan](docs/apple-silicon-redesign.md), the
+[P3](docs/apple-silicon-p3-qwen.md), [P4](docs/apple-silicon-p4-metal.md) and
+[P5](docs/apple-silicon-p5-memory.md) reports.
 
 ## Build and test
 
@@ -62,6 +64,13 @@ Omitting them preserves the template's defaults. No `/think` suffix is injected.
 `--tools /path/to/tools.json` accepts an array of `{name, description, parameters}`
 function definitions. `--prefill-chunk-size` defaults to 256.
 
+K/V state is paged: `--kv-format f32|f16|q8|q8_<group>` (default `f16`) selects storage
+and `--kv-page-tokens` (default 16) the page size. `q8` halves K/V memory relative to
+`f16` with a small, measured quality cost. `--state-memory-mb` sets the memory for K/V
+pages and recurrent state; by default each concurrent request gets room for an 8K-token
+context within the device's working set, and a budget beyond the working set is
+rejected.
+
 ## HTTP server
 
 The binary loads one resident hybrid model before opening the listener. Model load
@@ -100,14 +109,17 @@ are `stop`, `length`, or `tool_calls`.
 
 The worker bounds intake and live request counts, packs one prefill chunk or decode
 token per sequence, isolates per-request failures, and releases state on completion
-or client cancellation. Memory-based admission, prefix reuse, production scheduling,
-bounded streaming output and comprehensive serving controls remain P6/P7/P9 work.
+or client cancellation. The server takes the same K/V and state-memory flags as the
+CLI. Requests that can never fit the state pool are rejected; requests whose next chunk
+does not fit wait; if nothing fits, the newest request fails with a memory error.
+Preemption with recompute, prefix reuse, production scheduling, bounded streaming
+output and comprehensive serving controls remain P6/P7/P9 work.
 There are no performance or production-readiness claims.
 
 ## Workspace
 
-`tur-core` owns checked descriptors and shared errors; `tur-metal` owns hybrid state
-and completion; `tur-models` owns the hybrid decoder and checkpoint metadata;
+`tur-core` owns checked descriptors and shared errors; `tur-metal` owns state pools,
+completion and Metal kernels; `tur-models` owns the hybrid decoder and checkpoint metadata;
 `tur-engine` owns execution and the text pipeline. `tur` provides facade exports and
 the HTTP library; `tur-cli` and `tur-server` provide the binaries. Breaking Rust and
 CLI changes are deliberate; legacy compatibility aliases and flags are removed.

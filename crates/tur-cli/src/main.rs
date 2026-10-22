@@ -3,8 +3,9 @@ use clap::Parser;
 use std::{io::Write, path::PathBuf};
 use tur::{
     ModelFactory, ModelSource, Result,
-    backend::pipeline::{GenerationRequest, InferencePipeline},
-    models::qwen3_5::WeightFormat,
+    backend::pipeline::{GenerationRequest, InferencePipeline, PipelineConfig},
+    core::execution::{KvFormat, KvLayout},
+    models::qwen3_5::{DEFAULT_KV_LAYOUT, WeightFormat},
 };
 
 #[derive(Debug, Parser)]
@@ -52,6 +53,17 @@ struct Args {
     tools: Option<PathBuf>,
     #[arg(long, default_value_t = 256)]
     prefill_chunk_size: usize,
+    /// K/V storage: f32, f16, q8 (one scale per 32 dimensions, half of F16's memory) or
+    /// q8_<group>.
+    #[arg(long, default_value_t = DEFAULT_KV_LAYOUT.format)]
+    kv_format: KvFormat,
+    /// Tokens per K/V page.
+    #[arg(long, default_value_t = DEFAULT_KV_LAYOUT.page_tokens)]
+    kv_page_tokens: usize,
+    /// Memory for K/V pages and recurrent state, in MiB. Default: room for each concurrent
+    /// request's 8K-token context within the device's working set.
+    #[arg(long)]
+    state_memory_mb: Option<usize>,
     /// Use the CPU numerical reference for development checks.
     #[arg(long)]
     cpu_reference: bool,
@@ -75,8 +87,23 @@ fn main() -> Result<()> {
         revision: args.revision,
         format: args.weight_format,
         device,
+        kv: KvLayout::new(args.kv_page_tokens, args.kv_format),
     };
-    let mut pipeline = InferencePipeline::new(&factory, 1, args.prefill_chunk_size)?;
+    let mut pipeline = InferencePipeline::new(
+        &factory,
+        PipelineConfig {
+            state_bytes: args.state_memory_mb.map(|mb| mb << 20),
+            ..PipelineConfig::new(1, args.prefill_chunk_size)
+        },
+    )?;
+    let plan = pipeline.memory_plan();
+    tracing::info!(
+        resident_bytes = plan.resident(),
+        weights = plan.weights,
+        state_pool = plan.state_pool,
+        scratch_peak = plan.scratch_peak,
+        "Memory plan"
+    );
     let mut request = GenerationRequest::new(args.prompt, args.max_tokens);
     request.seed = args.seed;
     request.sampling = tur::hybrid::SamplingOptions {

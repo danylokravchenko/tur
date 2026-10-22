@@ -9,18 +9,19 @@ use std::sync::{
 use tur_core::{
     Result, TurError,
     execution::{
-        LayerStateKind, Modality, ModelDescription, ModelIdentity, PackedExecution,
-        SequenceDescriptor, StateHandle, StateMetadata, invalid,
+        KvFormat, KvLayout, LayerStateKind, Modality, ModelDescription, ModelIdentity,
+        PackedExecution, SequenceDescriptor, StateHandle, StateMetadata, invalid,
     },
 };
 use tur_engine::{
     backend::guidance::{GuidanceControl, TopLevelGrammar, build_llg_factory},
     hybrid::{
-        Boundaries, Checkpoint, HybridEngine, HybridModel, LayerRead, PackedForward,
-        SamplingOptions, SequenceCommit, SequenceResult, SequenceStep, TokenOutput,
+        Boundaries, Checkpoint, HybridEngine, HybridModel, PackedForward, PoolConfig,
+        SamplingOptions, SequenceCommit, SequenceForward, SequenceResult, SequenceStep, StatePool,
+        TokenOutput,
     },
 };
-use tur_metal::state::LayerUpdate;
+use tur_metal::state::LayerSnapshot;
 
 const LOGITS: [f32; 8] = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4];
 
@@ -33,8 +34,8 @@ struct Fixture {
     fault: Option<u32>,
     /// Fails the whole forward pass when any sequence contains this token.
     batch_fault: Option<u32>,
-    /// Turns `fault` into a malformed recurrent update instead of an error.
-    invalid_update: bool,
+    /// Turns `fault` into malformed logits, after the sequence wrote its state.
+    invalid_logits: bool,
 }
 
 fn fixture() -> Fixture {
@@ -44,14 +45,18 @@ fn fixture() -> Fixture {
     }
 }
 
-fn attention(page_tokens: usize) -> LayerStateKind {
+fn attention() -> LayerStateKind {
     LayerStateKind::Attention {
         kv_heads: 1,
         head_dim: 1,
-        page_tokens,
-        dtype: DType::F32,
     }
 }
+
+/// Ample capacity: 8 pages of 2 tokens hold the 16-position limit; 8 recurrent slots.
+const POOL: PoolConfig = PoolConfig {
+    pages: 8,
+    recurrent_slots: 8,
+};
 
 fn recurrent() -> LayerStateKind {
     LayerStateKind::Recurrent {
@@ -70,27 +75,28 @@ fn scalars(tensor: &Tensor) -> Result<Vec<f32>> {
 
 impl Fixture {
     /// Sequential reference math: each attention key adds the token, its position and all
-    /// prior keys; recurrent state doubles and adds the token and previous token.
+    /// prior keys; recurrent state doubles and adds the token and previous token. State is
+    /// written into the reserved pages and slots before any injected logits fault.
     fn sequence(
         &self,
+        pool: &StatePool,
         tokens: &[u32],
         positions: &[usize],
-        state: &[LayerRead],
-        logits: usize,
-        boundaries: Boundaries,
+        sequence: &SequenceForward<'_>,
     ) -> Result<SequenceStep> {
-        if self.fault.is_some_and(|f| tokens.contains(&f)) && !self.invalid_update {
+        let faulty = self.fault.is_some_and(|f| tokens.contains(&f));
+        if faulty && !self.invalid_logits {
             return Err(invalid("injected sequence failure"));
         }
+        let state = sequence.state;
+        let addresses = state.resolve(pool)?;
         let n = tokens.len();
-        let mut layers = Vec::new();
-        for (index, layer) in state.iter().enumerate() {
-            layers.push(match layer {
-                LayerRead::Attention { pages } => {
-                    let mut sum = 0.0;
-                    for (key, _) in pages {
-                        sum += scalars(key)?.iter().sum::<f32>();
-                    }
+        for (index, kind) in self.description().layers.iter().enumerate() {
+            match kind {
+                LayerStateKind::Attention { .. } => {
+                    let store = pool.attention(index)?;
+                    let (past, _) = store.gather(&addresses.pages, state.past())?;
+                    let mut sum: f32 = scalars(&past)?.iter().sum();
                     let mut keys = Vec::with_capacity(n);
                     for (&token, &position) in tokens.iter().zip(positions) {
                         let key = token as f32 + position as f32 + sum;
@@ -98,20 +104,21 @@ impl Fixture {
                         keys.push(key);
                     }
                     let values: Vec<f32> = keys.iter().map(|k| k + index as f32).collect();
-                    LayerUpdate::Attention {
-                        key: Tensor::from_vec(keys, (n, 1, 1), &Device::Cpu)?,
-                        value: Tensor::from_vec(values, (n, 1, 1), &Device::Cpu)?,
-                    }
+                    store.scatter(
+                        &addresses.pages,
+                        state.past(),
+                        &Tensor::from_vec(keys, (n, 1, 1), &Device::Cpu)?,
+                        &Tensor::from_vec(values, (n, 1, 1), &Device::Cpu)?,
+                    )?;
                 }
-                LayerRead::Recurrent {
-                    convolution,
-                    recurrent,
-                } => {
-                    let mut last = scalars(convolution)?
+                LayerStateKind::Recurrent { .. } => {
+                    let store = pool.recurrent(index)?;
+                    let (convolution, recurrent) = store.read(addresses.read)?;
+                    let mut last = scalars(&convolution)?
                         .last()
                         .copied()
                         .ok_or_else(|| invalid("missing convolution history"))?;
-                    let mut value = scalars(recurrent)?
+                    let mut value = scalars(&recurrent)?
                         .first()
                         .copied()
                         .ok_or_else(|| invalid("missing recurrent state"))?;
@@ -123,30 +130,33 @@ impl Fixture {
                         matrices.push(value);
                         last = token as f32;
                     }
-                    let keep = match boundaries {
+                    let keep = match state.boundaries() {
                         Boundaries::Final => 1,
                         Boundaries::EveryToken => n,
                     };
-                    let history = history.split_off(2 * (n - keep));
-                    let matrices = matrices.split_off(n - keep);
-                    let recurrent =
-                        if self.invalid_update && self.fault.is_some_and(|f| tokens.contains(&f)) {
-                            Tensor::new(&[1.0f32], &Device::Cpu)?
-                        } else {
-                            Tensor::from_vec(matrices, (keep, 1, 1, 1), &Device::Cpu)?
-                        };
-                    LayerUpdate::Recurrent {
-                        convolution: Tensor::from_vec(history, (keep, 2, 1), &Device::Cpu)?,
-                        recurrent,
+                    let history = Tensor::from_vec(
+                        history.split_off(2 * (n - keep)),
+                        (keep, 2, 1),
+                        &Device::Cpu,
+                    )?;
+                    let matrices = Tensor::from_vec(
+                        matrices.split_off(n - keep),
+                        (keep, 1, 1, 1),
+                        &Device::Cpu,
+                    )?;
+                    for (b, &slot) in addresses.writes.iter().enumerate() {
+                        store.write(slot, &history, &matrices, b)?;
                     }
                 }
-            });
+            }
         }
-        let rows = LOGITS.repeat(logits);
-        Ok(SequenceStep {
-            layers,
-            logits: Tensor::from_vec(rows, (logits, LOGITS.len()), &Device::Cpu)?,
-        })
+        let rows = sequence.logits.len();
+        let logits = if faulty {
+            Tensor::new(&[1.0f32], &Device::Cpu)?
+        } else {
+            Tensor::from_vec(LOGITS.repeat(rows), (rows, LOGITS.len()), &Device::Cpu)?
+        };
+        Ok(SequenceStep { logits })
     }
 }
 
@@ -157,7 +167,8 @@ impl HybridModel for Fixture {
                 revision: self.revision.into(),
                 state_format: 1,
             },
-            layers: vec![attention(2), recurrent(), attention(3), recurrent()],
+            layers: vec![attention(), recurrent(), attention(), recurrent()],
+            kv: KvLayout::new(2, KvFormat::F32),
             modalities: vec![Modality::Text],
             vocab_size: 8,
             max_position: 16,
@@ -178,14 +189,13 @@ impl HybridModel for Fixture {
             .sequences
             .iter()
             .map(|sequence| {
-                recorded.push(sequence.boundaries);
+                recorded.push(sequence.state.boundaries());
                 let range = sequence.tokens.clone();
                 self.sequence(
+                    batch.pool,
                     batch.tokens.get(range.clone()).unwrap_or_default(),
                     batch.positions.get(range).unwrap_or_default(),
-                    sequence.state,
-                    sequence.logits.len(),
-                    sequence.boundaries,
+                    sequence,
                 )
             })
             .collect())
@@ -193,8 +203,15 @@ impl HybridModel for Fixture {
 }
 
 fn engine(model: Fixture) -> Result<(HybridEngine<Fixture>, Arc<Fixture>)> {
+    sized(model, POOL)
+}
+
+fn sized(model: Fixture, pool: PoolConfig) -> Result<(HybridEngine<Fixture>, Arc<Fixture>)> {
     let model = Arc::new(model);
-    Ok((HybridEngine::new(Arc::clone(&model), Device::Cpu)?, model))
+    Ok((
+        HybridEngine::new(Arc::clone(&model), Device::Cpu, pool)?,
+        model,
+    ))
 }
 
 fn allocate(engine: &mut HybridEngine<Fixture>, seed: u64) -> Result<StateHandle> {
@@ -294,21 +311,15 @@ fn handle(engine: &HybridEngine<Fixture>, original: StateHandle) -> Result<State
 fn values(checkpoint: &Checkpoint) -> Result<Vec<Vec<f32>>> {
     let mut values = Vec::new();
     for layer in checkpoint.model_state().read_layers()? {
-        match layer {
-            LayerRead::Attention { pages } => {
-                for (key, value) in pages {
-                    values.push(scalars(&key)?);
-                    values.push(scalars(&value)?);
-                }
-            }
-            LayerRead::Recurrent {
+        let (a, b) = match &layer {
+            LayerSnapshot::Attention { key, value } => (key, value),
+            LayerSnapshot::Recurrent {
                 convolution,
                 recurrent,
-            } => {
-                values.push(scalars(&convolution)?);
-                values.push(scalars(&recurrent)?);
-            }
-        }
+            } => (convolution, recurrent),
+        };
+        values.push(scalars(a)?);
+        values.push(scalars(b)?);
     }
     Ok(values)
 }
@@ -374,10 +385,8 @@ fn test_checkpoint_fork_restore_crosses_partial_attention_pages_and_all_recurren
     assert_eq!(
         original,
         vec![
-            vec![1.0, 4.0],
-            vec![1.0, 4.0],
-            vec![10.0],
-            vec![10.0],
+            vec![1.0, 4.0, 10.0],
+            vec![1.0, 4.0, 10.0],
             vec![2.0, 3.0],
             vec![15.0],
             vec![1.0, 4.0, 10.0],
@@ -422,15 +431,17 @@ fn test_ordinary_execution_retains_only_final_recurrent_boundary() -> Result<()>
         *model.boundaries.lock(),
         vec![Boundaries::Final, Boundaries::EveryToken]
     );
-    // Two attention layers × 3 tokens × 8 bytes, plus two recurrent layers × 12 bytes
-    // per retained boundary.
-    assert_eq!(ordinary.state_update_bytes, 48 + 24);
-    assert_eq!(speculative.state_update_bytes, 48 + 72);
+    // Pages hold 2 tokens of 8 K/V bytes in each of two attention layers (32 bytes); a
+    // recurrent slot holds 12 bytes in each of two layers. Three new tokens open two pages
+    // and write one slot; three speculative tokens after position 3 fill the exclusive
+    // tail in place, open one page and write a slot per token.
+    assert_eq!(ordinary.state_update_bytes, 2 * 32 + 24);
+    assert_eq!(speculative.state_update_bytes, 32 + 3 * 24);
     assert_eq!(ordinary.logits_bytes, 3 * 8 * 4);
     assert_eq!(ordinary.workspace_bytes, 48);
     assert_eq!(
         ordinary.total_bytes()?,
-        ordinary.packed_input_bytes + 72 + 96 + 48
+        ordinary.packed_input_bytes + 88 + 96 + 48
     );
     Ok(())
 }
@@ -557,20 +568,108 @@ fn test_whole_batch_model_error_leaves_every_request_unchanged() -> Result<()> {
 }
 
 #[test]
-fn test_invalid_layer_update_is_isolated_and_never_published() -> Result<()> {
+fn test_invalid_output_is_isolated_and_its_state_writes_are_never_published() -> Result<()> {
     let (mut engine, _) = engine(Fixture {
         fault: Some(6),
-        invalid_update: true,
+        invalid_logits: true,
         ..fixture()
     })?;
     let a = allocate(&mut engine, 11)?;
     let b = allocate(&mut engine, 12)?;
+    run(&mut engine, &[(a, &[1])])?;
+    let a = handle(&engine, a)?;
     let before = checkpoint(&engine, a)?;
+    // `a` wrote keys into its exclusive tail page and a fresh slot, then failed.
     let input = plan(&engine, &[(a, &[1, 6]), (b, &[2])])?;
     let results = submit_all(&mut engine, input)?;
     assert!(outcome(&results, a)?.is_err());
     assert!(outcome(&results, b)?.is_ok());
-    equivalent(&checkpoint(&engine, a)?, &before)
+    equivalent(&checkpoint(&engine, a)?, &before)?;
+    let a = handle(&engine, a)?;
+    run(&mut engine, &[(a, &[3])])?;
+    let (mut control, _) = engine_control()?;
+    let c = allocate(&mut control, 11)?;
+    run(&mut control, &[(c, &[1])])?;
+    let c = handle(&control, c)?;
+    run(&mut control, &[(c, &[3])])?;
+    equivalent(&checkpoint(&engine, a)?, &checkpoint(&control, c)?)
+}
+
+fn engine_control() -> Result<(HybridEngine<Fixture>, Arc<Fixture>)> {
+    engine(fixture())
+}
+
+#[test]
+fn test_pool_exhaustion_fails_the_pass_before_execution_and_leaves_state_unchanged() -> Result<()> {
+    // Three pages of two tokens and four recurrent slots.
+    let (mut engine, model) = sized(
+        fixture(),
+        PoolConfig {
+            pages: 3,
+            recurrent_slots: 4,
+        },
+    )?;
+    let a = allocate(&mut engine, 1)?;
+    let b = allocate(&mut engine, 2)?;
+    run(&mut engine, &[(a, &[1, 2, 3, 4])])?;
+    let a = handle(&engine, a)?;
+    let before = checkpoint(&engine, a)?;
+    let calls = model.calls.load(Ordering::SeqCst);
+    // a needs one more page and b two: four pages exceed three.
+    let input = plan(&engine, &[(a, &[5]), (b, &[1, 2, 3])])?;
+    assert!(matches!(
+        engine.submit(input),
+        Err(TurError::MemoryAllocation(_))
+    ));
+    assert_eq!(model.calls.load(Ordering::SeqCst), calls);
+    equivalent(&checkpoint(&engine, a)?, &before)?;
+    assert_eq!(engine.metadata(b.request)?.position, 0);
+    let usage = engine.memory()?;
+    assert_eq!((usage.pages.leased, usage.pages.free()), (2, 1));
+    // A retained checkpoint keeps a's pages leased after a is cancelled; releasing it
+    // frees them for b once nothing is in flight.
+    engine.cancel(a)?;
+    assert_eq!(engine.memory()?.pages.leased, 2);
+    drop(before);
+    run(&mut engine, &[(b, &[1, 2, 3])])?;
+    assert_eq!(engine.metadata(b.request)?.position, 3);
+    Ok(())
+}
+
+#[test]
+fn test_released_pages_and_slots_are_reclaimed_after_completion() -> Result<()> {
+    let (mut engine, _) = sized(
+        fixture(),
+        PoolConfig {
+            pages: 4,
+            recurrent_slots: 3,
+        },
+    )?;
+    // Far more passes than capacity: every cycle's pages and slots come back.
+    for round in 0..20u32 {
+        let a = allocate(&mut engine, u64::from(round))?;
+        run(&mut engine, &[(a, &[1, 2, 3])])?;
+        let saved = checkpoint(&engine, a)?;
+        let b = engine.fork(&saved)?;
+        let a = handle(&engine, a)?;
+        run(&mut engine, &[(a, &[4])])?;
+        // An in-flight cancel keeps its reservation until the fence, then releases it.
+        engine.submit(plan(&engine, &[(b, &[5])])?)?;
+        engine.cancel(b)?;
+        assert!(engine.finish()?.is_empty());
+        engine.cancel(handle(&engine, a)?)?;
+        drop(saved);
+        let usage = engine.memory()?;
+        assert_eq!(
+            (usage.pages.leased, usage.slots.leased),
+            (0, 0),
+            "round {round}"
+        );
+        assert_eq!(usage.pages.retired + usage.slots.retired, 0);
+    }
+    let usage = engine.memory()?;
+    assert!(usage.pages.peak <= 4 && usage.slots.peak <= 3);
+    Ok(())
 }
 
 #[test]
@@ -581,21 +680,15 @@ fn test_checkpoint_tensor_inspection_cannot_mutate_shared_state() -> Result<()> 
     let saved = checkpoint(&engine, a)?;
     let before = values(&saved)?;
     for layer in saved.model_state().read_layers()? {
-        match layer {
-            LayerRead::Attention { pages } => {
-                for (key, value) in pages {
-                    key.zero_set()?;
-                    value.zero_set()?;
-                }
-            }
-            LayerRead::Recurrent {
+        let (a, b) = match &layer {
+            LayerSnapshot::Attention { key, value } => (key, value),
+            LayerSnapshot::Recurrent {
                 convolution,
                 recurrent,
-            } => {
-                convolution.zero_set()?;
-                recurrent.zero_set()?;
-            }
-        }
+            } => (convolution, recurrent),
+        };
+        a.zero_set()?;
+        b.zero_set()?;
     }
     assert_eq!(values(&saved)?, before);
     equivalent(&checkpoint(&engine, a)?, &saved)

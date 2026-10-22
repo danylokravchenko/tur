@@ -13,13 +13,23 @@ use std::{
 };
 use tur_core::{
     Result, TurError,
-    execution::{PackedExecution, SequenceDescriptor, StateHandle, invalid},
+    execution::{KvFormat, KvLayout, PackedExecution, SequenceDescriptor, StateHandle, invalid},
 };
-use tur_engine::hybrid::{
-    Boundaries, HybridEngine, HybridModel, PackedForward, SamplingOptions, SequenceForward,
-};
-use tur_metal::state::ModelState;
+use tur_engine::hybrid::{HybridEngine, HybridModel, ModelState, PoolConfig, SamplingOptions};
 use tur_models::models::qwen3_5::{Execution, LoadOptions, Qwen35, WeightFormat};
+
+/// Exact K/V storage: these tests compare chunking, batching and Transformers outputs.
+const EXACT_KV: KvLayout = KvLayout {
+    page_tokens: 16,
+    format: KvFormat::F32,
+    version: tur_core::execution::KV_LAYOUT_VERSION,
+};
+
+/// Room for a few full contexts of the tiny model.
+const POOL: PoolConfig = PoolConfig {
+    pages: 128,
+    recurrent_slots: 8,
+};
 
 const TINY: &str = r#"{
   "architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5_text",
@@ -45,6 +55,7 @@ fn load(dir: &Path, format: WeightFormat, device: Device) -> Result<Arc<Qwen35>>
             format,
             device,
             execution: Execution::Fused,
+            kv: EXACT_KV,
         },
     )?))
 }
@@ -56,33 +67,8 @@ fn prompt(len: usize) -> Vec<u32> {
 
 /// Logits at every position, feeding `tokens` in pieces of `chunk` through `forward`.
 fn logits_by_chunks(model: &Qwen35, tokens: &[u32], chunk: usize) -> Result<Vec<Vec<f32>>> {
-    let device = Device::Cpu;
-    let mut state = ModelState::allocate(Arc::new(model.description()), &device)?;
-    let mut out = Vec::new();
-    for piece in tokens.chunks(chunk) {
-        let start = state.position();
-        let positions: Vec<usize> = (start..start + piece.len()).collect();
-        let reads = state.bind_layers();
-        let rows: Vec<usize> = (0..piece.len()).collect();
-        let sequences = [SequenceForward {
-            tokens: 0..piece.len(),
-            state: &reads,
-            logits: &rows,
-            boundaries: Boundaries::Final,
-        }];
-        let step = model
-            .forward(&PackedForward {
-                tokens: piece,
-                positions: &positions,
-                sequences: &sequences,
-            })?
-            .pop()
-            .ok_or_else(|| invalid("missing step"))??;
-        out.extend(step.logits.to_vec2::<f32>()?);
-        let staged = state.stage(step.layers, piece.len(), Boundaries::Final)?;
-        state = state.apply(&staged, piece.len())?;
-    }
-    Ok(out)
+    let pool = common::pool(model, 16, 2)?;
+    Ok(common::prefill(model, ModelState::new(&pool), tokens, chunk)?.0)
 }
 
 #[test]
@@ -106,7 +92,7 @@ struct Runner {
 impl Runner {
     fn new(model: Arc<Qwen35>) -> Result<Self> {
         Ok(Self {
-            engine: HybridEngine::new(model, Device::Cpu)?,
+            engine: HybridEngine::new(model, Device::Cpu, POOL)?,
         })
     }
 
@@ -387,6 +373,7 @@ fn real(format: WeightFormat) -> Result<Real> {
             format,
             device: device()?,
             execution: Execution::Fused,
+            kv: EXACT_KV,
         },
     )?);
     let generation = std::fs::read_to_string(dir.join("generation_config.json")).ok();
@@ -420,7 +407,7 @@ fn engine_generate(
     limit: usize,
 ) -> Result<Vec<u32>> {
     let device = model.device().clone();
-    let mut engine = HybridEngine::new(model, device)?;
+    let mut engine = HybridEngine::new(model, device, POOL)?;
     let h = engine.allocate(0, SamplingOptions::default(), None)?;
     let mut out = Vec::new();
     let mut next = prompt.to_vec();

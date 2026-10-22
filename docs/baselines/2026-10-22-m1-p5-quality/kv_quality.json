@@ -1,0 +1,276 @@
+{
+  "schema_version": 1,
+  "checkpoint": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
+  "weights": "q8_0",
+  "reference_kv": "f32",
+  "page_tokens": 16,
+  "text": "docs/{apple-silicon-redesign,apple-silicon-baseline,apple-silicon-p2-contracts,apple-silicon-p3-qwen,apple-silicon-p4-metal}.md at commit 7ca1ecb, concatenated in that order",
+  "text_bytes": 96386,
+  "evaluated_positions": 8192,
+  "chunk": 256,
+  "metric": "teacher-forced next-token distributions; KL(F32-K/V || format) in nats",
+  "results": [
+    {
+      "kv_format": "f16",
+      "all": {
+        "positions": [
+          0,
+          8192
+        ],
+        "count": 8192,
+        "mean_kl": 7.535960185935944e-08,
+        "max_kl": 1.9481958588585258e-06,
+        "top1_agreement": 1.0,
+        "mean_nll": 3.6997059978031244,
+        "reference_mean_nll": 3.6996932561747022
+      },
+      "buckets": [
+        {
+          "positions": [
+            0,
+            1024
+          ],
+          "count": 1024,
+          "mean_kl": 5.2552020353858336e-08,
+          "max_kl": 7.157796062529087e-07,
+          "top1_agreement": 1.0,
+          "mean_nll": 3.9328143277764482,
+          "reference_mean_nll": 3.9327924052996153
+        },
+        {
+          "positions": [
+            1024,
+            2048
+          ],
+          "count": 1024,
+          "mean_kl": 7.034615899167984e-08,
+          "max_kl": 1.1189840734004974e-06,
+          "top1_agreement": 1.0,
+          "mean_nll": 3.580272566079568,
+          "reference_mean_nll": 3.580284566136637
+        },
+        {
+          "positions": [
+            2048,
+            4096
+          ],
+          "count": 2048,
+          "mean_kl": 6.173985873150203e-08,
+          "max_kl": 1.9481958588585258e-06,
+          "top1_agreement": 1.0,
+          "mean_nll": 3.6768881229795984,
+          "reference_mean_nll": 3.67686160251224
+        },
+        {
+          "positions": [
+            4096,
+            8192
+          ],
+          "count": 4096,
+          "mean_kl": 8.912472951658331e-08,
+          "max_kl": 1.936059561558068e-06,
+          "top1_agreement": 1.0,
+          "mean_nll": 3.682696210652446,
+          "reference_mean_nll": 3.6826864682342215
+        }
+      ]
+    },
+    {
+      "kv_format": "q8_32",
+      "all": {
+        "positions": [
+          0,
+          8192
+        ],
+        "count": 8192,
+        "mean_kl": 9.74189866556188e-05,
+        "max_kl": 0.0019422061741352081,
+        "top1_agreement": 0.9923095703125,
+        "mean_nll": 3.699686494105502,
+        "reference_mean_nll": 3.6996932561747022
+      },
+      "buckets": [
+        {
+          "positions": [
+            0,
+            1024
+          ],
+          "count": 1024,
+          "mean_kl": 9.23066663256894e-05,
+          "max_kl": 0.0007542143575847149,
+          "top1_agreement": 0.994140625,
+          "mean_nll": 3.9326204000334,
+          "reference_mean_nll": 3.9327924052996153
+        },
+        {
+          "positions": [
+            1024,
+            2048
+          ],
+          "count": 1024,
+          "mean_kl": 9.247382902794268e-05,
+          "max_kl": 0.0006612222641706467,
+          "top1_agreement": 0.9921875,
+          "mean_nll": 3.5800513793208815,
+          "reference_mean_nll": 3.580284566136637
+        },
+        {
+          "positions": [
+            2048,
+            4096
+          ],
+          "count": 2048,
+          "mean_kl": 8.795200321888227e-05,
+          "max_kl": 0.0009604673832654953,
+          "top1_agreement": 0.99462890625,
+          "mean_nll": 3.6766294427027377,
+          "reference_mean_nll": 3.67686160251224
+        },
+        {
+          "positions": [
+            4096,
+            8192
+          ],
+          "count": 4096,
+          "mean_kl": 0.00010466684786338844,
+          "max_kl": 0.0019422061741352081,
+          "top1_agreement": 0.99072265625,
+          "mean_nll": 3.6828903220210654,
+          "reference_mean_nll": 3.6826864682342215
+        }
+      ]
+    },
+    {
+      "kv_format": "q8_64",
+      "all": {
+        "positions": [
+          0,
+          8192
+        ],
+        "count": 8192,
+        "mean_kl": 0.00012988875272094264,
+        "max_kl": 0.00256291963160038,
+        "top1_agreement": 0.9927978515625,
+        "mean_nll": 3.6998616418100063,
+        "reference_mean_nll": 3.6996932561747022
+      },
+      "buckets": [
+        {
+          "positions": [
+            0,
+            1024
+          ],
+          "count": 1024,
+          "mean_kl": 0.00012963477015813518,
+          "max_kl": 0.00256291963160038,
+          "top1_agreement": 0.9921875,
+          "mean_nll": 3.93380024740436,
+          "reference_mean_nll": 3.9327924052996153
+        },
+        {
+          "positions": [
+            1024,
+            2048
+          ],
+          "count": 1024,
+          "mean_kl": 0.00012990731034932465,
+          "max_kl": 0.0011018002405762672,
+          "top1_agreement": 0.9912109375,
+          "mean_nll": 3.5812883780173834,
+          "reference_mean_nll": 3.580284566136637
+        },
+        {
+          "positions": [
+            2048,
+            4096
+          ],
+          "count": 2048,
+          "mean_kl": 0.00011628819378716945,
+          "max_kl": 0.0010066221002489328,
+          "top1_agreement": 0.99560546875,
+          "mean_nll": 3.6770275629799403,
+          "reference_mean_nll": 3.67686160251224
+        },
+        {
+          "positions": [
+            4096,
+            8192
+          ],
+          "count": 4096,
+          "mean_kl": 0.0001367478884214356,
+          "max_kl": 0.0022607743740081787,
+          "top1_agreement": 0.991943359375,
+          "mean_nll": 3.682437345774606,
+          "reference_mean_nll": 3.6826864682342215
+        }
+      ]
+    },
+    {
+      "kv_format": "q8_256",
+      "all": {
+        "positions": [
+          0,
+          8192
+        ],
+        "count": 8192,
+        "mean_kl": 0.000270900709788479,
+        "max_kl": 0.007081450894474983,
+        "top1_agreement": 0.98876953125,
+        "mean_nll": 3.700486257630487,
+        "reference_mean_nll": 3.6996932561747022
+      },
+      "buckets": [
+        {
+          "positions": [
+            0,
+            1024
+          ],
+          "count": 1024,
+          "mean_kl": 0.00028360735391338987,
+          "max_kl": 0.003014842513948679,
+          "top1_agreement": 0.984375,
+          "mean_nll": 3.9347013532096824,
+          "reference_mean_nll": 3.9327924052996153
+        },
+        {
+          "positions": [
+            1024,
+            2048
+          ],
+          "count": 1024,
+          "mean_kl": 0.00028893451263917874,
+          "max_kl": 0.004074345342814922,
+          "top1_agreement": 0.990234375,
+          "mean_nll": 3.582018037395585,
+          "reference_mean_nll": 3.580284566136637
+        },
+        {
+          "positions": [
+            2048,
+            4096
+          ],
+          "count": 2048,
+          "mean_kl": 0.00024290091139025916,
+          "max_kl": 0.003769315779209137,
+          "top1_agreement": 0.99169921875,
+          "mean_nll": 3.6775492899577413,
+          "reference_mean_nll": 3.67686160251224
+        },
+        {
+          "positions": [
+            4096,
+            8192
+          ],
+          "count": 4096,
+          "mean_kl": 0.00027721549724368626,
+          "max_kl": 0.007081450894474983,
+          "top1_agreement": 0.988037109375,
+          "mean_nll": 3.6830180226307863,
+          "reference_mean_nll": 3.6826864682342215
+        }
+      ]
+    }
+  ],
+  "text_sha256": "d4b954c2b213bef24aa5d9267e4175621ddc5e196893629f0643c3826c658a4e",
+  "runs": "two invocations (TUR_EVAL_KV=f16,q8 and q8_64,q8_256), each against its own F32-K/V reference on identical weights"
+}

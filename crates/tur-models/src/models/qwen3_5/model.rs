@@ -6,15 +6,15 @@ use super::{
     weights::Checkpoint,
 };
 use crate::hybrid::{
-    Boundaries, HybridModel, LayerRead, LayerUpdate, PackedForward, SequenceForward, SequenceStep,
+    Addresses, Boundaries, HybridModel, PackedForward, SequenceForward, SequenceStep, StatePool,
 };
 use candle_core::{DType, Device, Tensor, quantized::GgmlDType};
 use std::{collections::HashMap, path::Path, sync::Arc};
 use tur_core::{
     Result,
-    execution::{ModelDescription, invalid},
+    execution::{KvFormat, KvLayout, ModelDescription, invalid},
 };
-use tur_metal::{packed::PackedLinear, state::ModelState};
+use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
 
 #[cfg(feature = "metal")]
 mod fused;
@@ -65,6 +65,16 @@ pub enum Execution {
     Reference,
 }
 
+/// K/V storage chosen from the P5 measurements on the M1 (see the P5 report): F16 was the
+/// fastest format end to end and indistinguishable from F32 in quality; page sizes of
+/// 16–128 tokens performed alike, and 16 wastes the least tail memory. Q8 halves K/V
+/// memory again for capacity-bound deployments.
+pub const DEFAULT_KV_LAYOUT: KvLayout = KvLayout {
+    page_tokens: 16,
+    format: KvFormat::F16,
+    version: tur_core::execution::KV_LAYOUT_VERSION,
+};
+
 /// How to place a checkpoint.
 #[derive(Clone, Debug)]
 pub struct LoadOptions {
@@ -73,6 +83,8 @@ pub struct LoadOptions {
     pub format: WeightFormat,
     pub device: Device,
     pub execution: Execution,
+    /// Paged K/V page size and storage format; part of the state identity.
+    pub kv: KvLayout,
 }
 
 struct Attention {
@@ -133,16 +145,22 @@ pub struct Qwen35 {
     dims: Dims,
     embed: Tensor,
     lm_head: PackedLinear,
+    /// The head is the embedding itself (tied F32 weights), not a second copy.
+    shares_embedding: bool,
     norm: Tensor,
     layers: Vec<Layer>,
     #[cfg(feature = "metal")]
     fused: Option<fused::Fused>,
 }
 
-/// One live sequence's rows within the packed hidden states.
+/// One live sequence's rows within the packed hidden states and its resolved state.
 struct Span<'a> {
     start: usize,
     len: usize,
+    /// Committed tokens before this pass.
+    past: usize,
+    every: bool,
+    addresses: Addresses,
     sequence: &'a SequenceForward<'a>,
 }
 
@@ -281,6 +299,7 @@ impl Qwen35 {
             WeightFormat::F32 => f32_on(&embed_source, device)?,
             _ => embed_source.to_dtype(DType::BF16)?.to_device(device)?,
         };
+        let shares_embedding = config.tied_embeddings() && format == WeightFormat::F32;
         let lm_head = match (config.tied_embeddings(), format) {
             (true, WeightFormat::F32) => PackedLinear::dense(&embed, device)?,
             (true, _) => linear(&embed_source, format, device)?,
@@ -289,12 +308,13 @@ impl Qwen35 {
         let norm = centred(&tensors.take(&format!("{prefix}.norm.weight"))?, device)?;
         let revision = format!("{}#{}", options.revision, format.tag());
         Self {
-            description: config.description(revision)?,
+            description: config.description(revision, options.kv)?,
             config,
             device: device.clone(),
             dims,
             embed,
             lm_head,
+            shares_embedding,
             norm,
             layers,
             #[cfg(feature = "metal")]
@@ -330,6 +350,38 @@ impl Qwen35 {
         Execution::Reference
     }
 
+    /// Device bytes of every weight: packed projections plus embeddings, norms,
+    /// convolution and gate parameters. A tied F32 head shares the embedding's storage.
+    pub fn weight_bytes(&self) -> usize {
+        let bytes = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
+        let mut total = self.projection_bytes() + bytes(&self.norm);
+        if !self.shares_embedding {
+            total += bytes(&self.embed);
+        }
+        for layer in &self.layers {
+            total += bytes(&layer.input_norm) + bytes(&layer.post_norm);
+            total += match &layer.mixer {
+                Mixer::Attention(a) => bytes(&a.q_norm) + bytes(&a.k_norm),
+                Mixer::Delta(net) => {
+                    bytes(&net.conv) + bytes(&net.neg_a) + bytes(&net.dt_bias) + bytes(&net.norm)
+                }
+            };
+        }
+        total
+    }
+
+    /// Kernel scratch of a pass of `tokens` packed tokens whose sequences end at
+    /// `contexts` tokens, for memory planning before any request exists. The reference
+    /// path declares none.
+    pub fn planned_workspace_bytes(&self, tokens: usize, contexts: &[usize]) -> Result<usize> {
+        #[cfg(feature = "metal")]
+        if let Some(fused) = &self.fused {
+            return self.planned_workspace(fused, tokens, contexts);
+        }
+        let _ = (tokens, contexts);
+        Ok(0)
+    }
+
     /// Device bytes held by projection weights, all in their packed storage format.
     pub fn projection_bytes(&self) -> usize {
         let mut total = self.lm_head.resident_bytes();
@@ -350,26 +402,30 @@ impl Qwen35 {
     /// layer (`[tokens, hidden]` each, before the final norm) plus logits for `rows`.
     /// For validation against reference implementations.
     pub fn trace(&self, tokens: &[u32], rows: &[usize]) -> Result<(Vec<Tensor>, Tensor)> {
-        let description = Arc::new(self.description.clone());
-        let state = ModelState::allocate(description, &self.device)?.bind_layers();
+        let pool = StatePool::new(
+            Arc::new(self.description.clone()),
+            &self.device,
+            PoolConfig {
+                pages: self.description.pages_for(tokens.len()).max(1),
+                recurrent_slots: 1,
+            },
+        )?;
+        let mut reservation = ModelState::new(&pool).reserve(tokens.len(), Boundaries::Final)?;
+        reservation.prepare()?;
+        let state = reservation.binding();
         let positions: Vec<usize> = (0..tokens.len()).collect();
         let sequences = [SequenceForward {
             tokens: 0..tokens.len(),
             state: &state,
             logits: rows,
-            boundaries: Boundaries::Final,
         }];
         let batch = PackedForward {
             tokens,
             positions: &positions,
             sequences: &sequences,
+            pool: &pool,
         };
-        self.check(&batch, &sequences[0])?;
-        let span = Span {
-            start: 0,
-            len: tokens.len(),
-            sequence: &sequences[0],
-        };
+        let span = self.check(&batch, &sequences[0], 0)?;
         let mut layers = Vec::with_capacity(self.layers.len());
         let mut steps = self.run(&batch, &[span], Some(&mut layers))?;
         let logits = steps
@@ -389,14 +445,20 @@ impl Qwen35 {
         &self.config
     }
 
-    /// Reject a sequence before any work: bounds, modality placeholders and state layout.
-    fn check(&self, batch: &PackedForward<'_>, sequence: &SequenceForward<'_>) -> Result<()> {
+    /// Reject a sequence before any work (bounds, modality placeholders, positions and
+    /// stale state ids); returns its span at packed row `start`.
+    fn check<'a>(
+        &self,
+        batch: &PackedForward<'_>,
+        sequence: &'a SequenceForward<'a>,
+        start: usize,
+    ) -> Result<Span<'a>> {
         let tokens = batch
             .tokens
             .get(sequence.tokens.clone())
             .filter(|t| !t.is_empty())
             .ok_or_else(|| invalid("sequence range outside packed tokens"))?;
-        let start = *batch
+        let past = *batch
             .positions
             .get(sequence.tokens.start)
             .ok_or_else(|| invalid("sequence range outside packed positions"))?;
@@ -411,44 +473,26 @@ impl Qwen35 {
         if sequence.logits.iter().any(|p| !sequence.tokens.contains(p)) {
             return Err(invalid("logit position outside sequence"));
         }
-        if sequence.state.len() != self.layers.len() {
-            return Err(invalid("state layer count mismatch"));
+        let state = sequence.state;
+        if state.past() != past || state.tokens() != tokens.len() {
+            return Err(invalid("sequence state does not match its positions"));
         }
-        let d = self.dims;
-        for (layer, read) in self.layers.iter().zip(sequence.state) {
-            match (&layer.mixer, read) {
-                (Mixer::Attention(_), LayerRead::Attention { pages }) => {
-                    let mut past = 0usize;
-                    for (k, v) in pages {
-                        let (tokens, heads, dim) = k.dims3()?;
-                        if heads != d.kv_heads || dim != d.head_dim || v.dims() != k.dims() {
-                            return Err(invalid("attention page has wrong layout"));
-                        }
-                        past = past
-                            .checked_add(tokens)
-                            .ok_or_else(|| invalid("attention length overflow"))?;
-                    }
-                    if past != start {
-                        return Err(invalid("attention pages do not match the start position"));
-                    }
-                }
-                (
-                    Mixer::Delta(_),
-                    LayerRead::Recurrent {
-                        convolution,
-                        recurrent,
-                    },
-                ) => {
-                    if convolution.dims() != [self.config.conv_history(), d.channels]
-                        || recurrent.dims() != [d.value_heads, d.key_dim, d.value_dim]
-                    {
-                        return Err(invalid("recurrent state has wrong layout"));
-                    }
-                }
-                _ => return Err(invalid("state kind does not match layer")),
-            }
+        let addresses = state.resolve(batch.pool)?;
+        let every = state.boundaries() == Boundaries::EveryToken;
+        let boundaries = if every { tokens.len() } else { 1 };
+        if addresses.pages.len() != self.description.pages_for(past + tokens.len())
+            || addresses.writes.len() != boundaries
+        {
+            return Err(invalid("sequence state does not cover its new tokens"));
         }
-        Ok(())
+        Ok(Span {
+            start,
+            len: tokens.len(),
+            past,
+            every,
+            addresses,
+            sequence,
+        })
     }
 
     fn attention(
@@ -456,9 +500,9 @@ impl Qwen35 {
         a: &Attention,
         h: &Tensor,
         rotary: &(Tensor, Tensor),
+        pool: &StatePool,
         layer: usize,
         spans: &[Span<'_>],
-        updates: &mut [Vec<LayerUpdate>],
     ) -> Result<Tensor> {
         let d = self.dims;
         let n = h.dim(0)?;
@@ -480,32 +524,25 @@ impl Qwen35 {
             .reshape((n, d.kv_heads, d.head_dim))?;
         let q = math::rotary(&math::rms(&q, &a.q_norm, d.eps)?, &rotary.0, &rotary.1)?;
         let k = math::rotary(&math::rms(&k, &a.k_norm, d.eps)?, &rotary.0, &rotary.1)?;
+        let store = pool.attention(layer)?;
         let mut outputs = Vec::with_capacity(spans.len());
-        for (span, updates) in spans.iter().zip(updates.iter_mut()) {
-            let LayerRead::Attention { pages } = &span.sequence.state[layer] else {
-                return Err(invalid("state kind does not match layer"));
-            };
-            let k_new = k.narrow(0, span.start, span.len)?.contiguous()?;
-            let v_new = v.narrow(0, span.start, span.len)?.contiguous()?;
-            let past: usize = pages
-                .iter()
-                .map(|(k, _)| k.dim(0))
-                .sum::<candle_core::Result<_>>()?;
-            let mut keys: Vec<&Tensor> = pages.iter().map(|(k, _)| k).collect();
-            let mut values: Vec<&Tensor> = pages.iter().map(|(_, v)| v).collect();
-            keys.push(&k_new);
-            values.push(&v_new);
-            let output = math::attention(
-                &q.narrow(0, span.start, span.len)?,
-                &Tensor::cat(&keys, 0)?,
-                &Tensor::cat(&values, 0)?,
-                past,
+        for span in spans {
+            let pages = &span.addresses.pages;
+            store.scatter(
+                pages,
+                span.past,
+                &k.narrow(0, span.start, span.len)?,
+                &v.narrow(0, span.start, span.len)?,
             )?;
-            outputs.push(output);
-            updates.push(LayerUpdate::Attention {
-                key: k_new,
-                value: v_new,
-            });
+            // Read new keys back from the pool, so the reference attends to stored values
+            // exactly as the kernels do.
+            let (keys, values) = store.gather(pages, span.past + span.len)?;
+            outputs.push(math::attention(
+                &q.narrow(0, span.start, span.len)?,
+                &keys,
+                &values,
+                span.past,
+            )?);
         }
         let attended = Tensor::cat(&outputs, 0)?.reshape((n, d.heads * d.head_dim))?;
         a.o.forward(&(attended * candle_nn::ops::sigmoid(&gate)?)?)
@@ -515,9 +552,9 @@ impl Qwen35 {
         &self,
         net: &DeltaNet,
         h: &Tensor,
+        pool: &StatePool,
         layer: usize,
         spans: &[Span<'_>],
-        updates: &mut [Vec<LayerUpdate>],
     ) -> Result<Tensor> {
         let d = self.dims;
         let n = h.dim(0)?;
@@ -529,20 +566,15 @@ impl Qwen35 {
         let beta = candle_nn::ops::sigmoid(&b.contiguous()?)?;
         let g = math::decay(&a.contiguous()?, &net.dt_bias, &net.neg_a)?;
         let groups = d.value_heads / d.key_heads;
+        let store = pool.recurrent(layer)?;
         let mut outputs = Vec::with_capacity(spans.len());
-        for (span, updates) in spans.iter().zip(updates.iter_mut()) {
-            let LayerRead::Recurrent {
-                convolution,
-                recurrent,
-            } = &span.sequence.state[layer]
-            else {
-                return Err(invalid("state kind does not match layer"));
-            };
-            let every = span.sequence.boundaries == Boundaries::EveryToken;
+        for span in spans {
+            let (convolution, recurrent) = store.read(span.addresses.read)?;
+            let every = span.every;
             let len = span.len;
             let conv = math::convolution(
                 &qkv.narrow(0, span.start, len)?.contiguous()?,
-                convolution,
+                &convolution,
                 &net.conv,
                 every,
             )?;
@@ -570,15 +602,14 @@ impl Qwen35 {
             };
             // The reference uses the recurrence for single-token decode and chunks otherwise.
             let core = if every || len == 1 {
-                math::delta_recurrent(&inputs, recurrent, every)?
+                math::delta_recurrent(&inputs, &recurrent, every)?
             } else {
-                math::delta_chunked(&inputs, recurrent)?
+                math::delta_chunked(&inputs, &recurrent)?
             };
             outputs.push(core.output);
-            updates.push(LayerUpdate::Recurrent {
-                convolution: conv.histories,
-                recurrent: core.states,
-            });
+            for (b, &slot) in span.addresses.writes.iter().enumerate() {
+                store.write(slot, &conv.histories, &core.states, b)?;
+            }
         }
         let rows = n * d.value_heads;
         let core = Tensor::cat(&outputs, 0)?.reshape((rows, d.value_dim))?;
@@ -625,29 +656,25 @@ impl Qwen35 {
             .into_iter()
             .collect::<std::result::Result<Vec<u32>, _>>()
             .map_err(|_| invalid("logit row overflow"))?;
-        let mut updates: Vec<Vec<LayerUpdate>> = spans
-            .iter()
-            .map(|_| Vec::with_capacity(self.layers.len()))
-            .collect();
         let pass = Pass {
             ids,
             positions,
             rows,
             spans,
+            pool: batch.pool,
         };
         #[cfg(feature = "metal")]
         let logits = match &self.fused {
-            Some(fused) => self.run_fused(fused, &pass, &mut updates, trace)?,
-            None => self.run_reference(&pass, &mut updates, trace)?,
+            Some(fused) => self.run_fused(fused, &pass, trace)?,
+            None => self.run_reference(&pass, trace)?,
         };
         #[cfg(not(feature = "metal"))]
-        let logits = self.run_reference(&pass, &mut updates, trace)?;
+        let logits = self.run_reference(&pass, trace)?;
         let mut offset = 0;
         let mut steps = Vec::with_capacity(spans.len());
-        for (span, layers) in spans.iter().zip(updates) {
+        for span in spans {
             let rows = span.sequence.logits.len();
             steps.push(SequenceStep {
-                layers,
                 logits: logits.narrow(0, offset, rows)?.contiguous()?,
             });
             offset += rows;
@@ -655,11 +682,10 @@ impl Qwen35 {
         Ok(steps)
     }
 
-    /// F32 reference body: returns logits for `pass.rows` and pushes per-layer updates.
+    /// F32 reference body: returns logits for `pass.rows` and writes state into the pool.
     fn run_reference(
         &self,
         pass: &Pass<'_, '_>,
-        updates: &mut [Vec<LayerUpdate>],
         mut trace: Option<&mut Vec<Tensor>>,
     ) -> Result<Tensor> {
         let d = self.dims;
@@ -670,8 +696,8 @@ impl Qwen35 {
         for (index, layer) in self.layers.iter().enumerate() {
             let h = math::rms(&x, &layer.input_norm, d.eps)?;
             let mixed = match &layer.mixer {
-                Mixer::Attention(a) => self.attention(a, &h, &rotary, index, spans, updates)?,
-                Mixer::Delta(net) => self.delta(net, &h, index, spans, updates)?,
+                Mixer::Attention(a) => self.attention(a, &h, &rotary, pass.pool, index, spans)?,
+                Mixer::Delta(net) => self.delta(net, &h, pass.pool, index, spans)?,
             };
             x = (x + mixed)?;
             let h = math::rms(&x, &layer.post_norm, d.eps)?;
@@ -700,6 +726,7 @@ struct Pass<'s, 'a> {
     /// Packed rows whose logits are returned, in sequence order.
     rows: Vec<u32>,
     spans: &'s [Span<'a>],
+    pool: &'s StatePool,
 }
 
 impl HybridModel for Qwen35 {
@@ -720,21 +747,24 @@ impl HybridModel for Qwen35 {
     }
 
     fn forward(&self, batch: &PackedForward<'_>) -> Result<Vec<Result<SequenceStep>>> {
+        if batch.pool.description() != &self.description
+            || !batch.pool.device().same_device(&self.device)
+        {
+            return Err(invalid(
+                "state pool was built for another model layout or device",
+            ));
+        }
         let mut results: Vec<Option<Result<SequenceStep>>> =
             batch.sequences.iter().map(|_| None).collect();
         let mut spans = Vec::with_capacity(batch.sequences.len());
         let mut live = Vec::with_capacity(batch.sequences.len());
         let mut start = 0;
         for (index, sequence) in batch.sequences.iter().enumerate() {
-            match self.check(batch, sequence) {
-                Ok(()) => {
-                    spans.push(Span {
-                        start,
-                        len: sequence.tokens.len(),
-                        sequence,
-                    });
+            match self.check(batch, sequence, start) {
+                Ok(span) => {
+                    start += span.len;
+                    spans.push(span);
                     live.push(index);
-                    start += sequence.tokens.len();
                 }
                 Err(error) => results[index] = Some(Err(error)),
             }

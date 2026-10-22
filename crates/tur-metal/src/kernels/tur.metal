@@ -237,7 +237,8 @@ static inline float conv_input(
 }
 
 // Depthwise causal convolution of one sequence over [history; x], then SiLU. Writes the
-// final (taps-1)-row history, or one history per token when `every` is set.
+// final (taps-1)-row history into pool slot `slots[0]`, or the history after token t into
+// `slots[t]` when `every` is set. `history` is the committed slot, never a written one.
 kernel void delta_conv_f32(
     device const float *x [[buffer(0)]],
     device const float *history [[buffer(1)]],
@@ -245,6 +246,7 @@ kernel void delta_conv_f32(
     device float *out [[buffer(3)]],
     device float *history_out [[buffer(4)]],
     constant ConvParams &p [[buffer(5)]],
+    device const uint *slots [[buffer(6)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= p.tokens * p.channels) {
         return;
@@ -259,7 +261,7 @@ kernel void delta_conv_f32(
     out[gid] = silu(acc);
     if (p.every != 0 || t + 1 == p.tokens) {
         uint kept = p.taps - 1;
-        ulong base = ulong(p.every != 0 ? t : 0) * kept * p.channels;
+        ulong base = ulong(slots[p.every != 0 ? t : 0]) * kept * p.channels;
         for (uint r = 0; r < kept; ++r) {
             history_out[base + ulong(r) * p.channels + c] = conv_input(x, history, t + 1 + r, c, p);
         }
@@ -298,6 +300,7 @@ kernel void delta_scan_f32(
     device float *out [[buffer(5)]],
     device float *state_out [[buffer(6)]],
     constant ScanParams &p [[buffer(7)]],
+    device const uint *slots [[buffer(8)]],
     threadgroup float *tile [[threadgroup(0)]],
     uint tg [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
@@ -421,7 +424,7 @@ kernel void delta_scan_f32(
             }
             // Per-token states serve speculative verification only; they skip staging.
             if (p.every != 0) {
-                device float *s = state_out + ulong(t) * state_size + head_state;
+                device float *s = state_out + ulong(slots[t]) * state_size + head_state;
                 for (uint r = 0; r < R; ++r) {
                     for (uint c = 0; c < COLS; ++c) {
                         if (col0 + c < dv) {
@@ -442,12 +445,13 @@ kernel void delta_scan_f32(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    device float *final_state = state_out + ulong(slots[0]) * state_size + head_state;
     for (uint idx = tid; idx < dk * tile_cols; idx += threads) {
         uint i = idx / tile_cols;
         uint c = idx % tile_cols;
         uint j = tile_col0 + c;
         if (j < dv) {
-            state_out[head_state + ulong(i) * dv + j] = tile[i * pitch + c];
+            final_state[ulong(i) * dv + j] = tile[i * pitch + c];
         }
     }
 }
@@ -456,14 +460,93 @@ kernel void delta_scan_f32(
     template [[host_name("delta_scan_r" #R "_f32")]] kernel void delta_scan_f32<R, 4>( \
         device const float *, device const float *, device const float *, device const float *, \
         device const float *, device float *, device float *, constant ScanParams &, \
-        threadgroup float *, uint, uint, uint, uint, uint, uint);
+        device const uint *, threadgroup float *, uint, uint, uint, uint, uint, uint);
 SCAN(2)
 SCAN(4)
 SCAN(8)
 
 // ---------------------------------------------------------------------------------------
-// Attention: ragged queries over a paged K/V pool, direct grouped-query addressing.
+// Paged K/V: quantize-on-write of new rows and attention reading pages in place.
+// Storage formats: F32 and F16 values, or Q8 two's-complement codes with one F16 scale
+// per `group` head dimensions. Q8 groups are multiples of 32, so a group never splits a
+// 32-dimension run of one register (writes) or a lane's 4-dimension vector (reads).
 // ---------------------------------------------------------------------------------------
+
+struct KvWriteParams {
+    uint tokens;
+    uint kv_heads;
+    uint dim;
+    uint page;
+    uint group;
+    uint k_stride;
+    uint k_col;
+    uint k_head_stride;
+    uint v_stride;
+    uint v_col;
+    uint v_head_stride;
+    float inv_127;
+};
+
+// Store new keys and values. One simdgroup per (K or V, token, head). Token t's row goes
+// to logical position visible[t] - 1 of its page table. Q8 codes match the host
+// reference: scale = half(max|x| * (1/127)), code = clamp(round(x / scale), +-127).
+template <uint R, typename T, uint QUANT>
+kernel void kv_write(
+    device const float *k_src [[buffer(0)]],
+    device const float *v_src [[buffer(1)]],
+    device const uint *table [[buffer(2)]],
+    device const uint *first_block [[buffer(3)]],
+    device const uint *visible [[buffer(4)]],
+    device T *k_data [[buffer(5)]],
+    device half *k_scales [[buffer(6)]],
+    device T *v_data [[buffer(7)]],
+    device half *v_scales [[buffer(8)]],
+    constant KvWriteParams &p [[buffer(9)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgs [[simdgroups_per_threadgroup]]) {
+    uint item = tg * sgs + sg;
+    if (item >= 2 * p.tokens * p.kv_heads) {
+        return;
+    }
+    uint h = item % p.kv_heads;
+    uint rest = item / p.kv_heads;
+    uint t = rest % p.tokens;
+    bool value = rest >= p.tokens;
+    uint j = visible[t] - 1;
+    ulong slot = ulong(table[first_block[t] + j / p.page]) * p.page + j % p.page;
+    device const float *src = value
+        ? v_src + ulong(t) * p.v_stride + p.v_col + ulong(h) * p.v_head_stride
+        : k_src + ulong(t) * p.k_stride + p.k_col + ulong(h) * p.k_head_stride;
+    float x[R];
+    for (uint r = 0; r < R; ++r) {
+        x[r] = src[lane + SIMD * r];
+    }
+    device T *dst = (value ? v_data : k_data) + (slot * p.kv_heads + h) * p.dim;
+    if (QUANT == 0) {
+        for (uint r = 0; r < R; ++r) {
+            dst[lane + SIMD * r] = T(x[r]);
+        }
+        return;
+    }
+    uint per = p.group / SIMD;
+    device half *scales = (value ? v_scales : k_scales) + (slot * p.kv_heads + h) * (p.dim / p.group);
+    for (uint g = 0; g * per < R; ++g) {
+        float amax = 0.0f;
+        for (uint r = g * per; r < (g + 1) * per; ++r) {
+            amax = max(amax, simd_max(fabs(x[r])));
+        }
+        half scale = half(amax * p.inv_127);
+        float divisor = max(float(scale), FLT_MIN);
+        for (uint r = g * per; r < (g + 1) * per; ++r) {
+            dst[lane + SIMD * r] = T(int(clamp(round(x[r] / divisor), -127.0f, 127.0f)));
+        }
+        if (lane == 0) {
+            scales[g] = scale;
+        }
+    }
+}
 
 struct AttentionParams {
     uint tokens;
@@ -476,17 +559,20 @@ struct AttentionParams {
     uint gate_stride;
     uint gate_col;
     uint gate_head_stride;
+    uint group;
     float scale;
 };
 
-// One simdgroup per (head, split, token); lane l owns dimensions l + 32r. Online softmax
-// keeps the running max/sum in F32. With one split the gated output is written directly;
-// otherwise unnormalised partial sums and (max, sum) statistics go to scratch.
-template <uint R>
-kernel void attention_f32(
+// One simdgroup per (head, split, token). Lane l owns the W-wide vectors at dimensions
+// W*l + 32*W*c, so each key and value row is read with vector loads; a Q8 lane needs one
+// scale per vector. Online softmax keeps the running max/sum in F32. With one split the
+// gated output is written directly; otherwise unnormalised partial sums and (max, sum)
+// statistics go to scratch.
+template <uint C, uint W, typename T, uint QUANT>
+kernel void attention_kv(
     device const float *q [[buffer(0)]],
-    device const float *k [[buffer(1)]],
-    device const float *v [[buffer(2)]],
+    device const T *k [[buffer(1)]],
+    device const T *v [[buffer(2)]],
     device const uint *table [[buffer(3)]],
     device const uint *first_block [[buffer(4)]],
     device const uint *visible [[buffer(5)]],
@@ -495,10 +581,14 @@ kernel void attention_f32(
     device float *partial [[buffer(8)]],
     device float *stats [[buffer(9)]],
     constant AttentionParams &p [[buffer(10)]],
+    device const half *k_scales [[buffer(11)]],
+    device const half *v_scales [[buffer(12)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sgs [[simdgroups_per_threadgroup]]) {
+    typedef vec<float, W> fv;
+    typedef vec<T, W> tv;
     uint item = tg * sgs + sg;
     if (item >= p.tokens * p.heads * p.splits) {
         return;
@@ -512,31 +602,37 @@ kernel void attention_f32(
     uint begin = split * p.split_keys;
     uint end = min(keys, begin + p.split_keys);
     uint base = first_block[t];
+    uint groups = QUANT == 0 ? 0 : p.dim / p.group;
 
-    float qv[R], acc[R];
+    fv qv[C], acc[C];
+    uint dims[C], sidx[C];
     device const float *qr = q + (ulong(t) * p.heads + h) * p.dim;
-    for (uint r = 0; r < R; ++r) {
-        qv[r] = qr[lane + SIMD * r];
-        acc[r] = 0.0f;
+    for (uint c = 0; c < C; ++c) {
+        dims[c] = W * lane + SIMD * W * c;
+        qv[c] = *(device const fv *)(qr + dims[c]);
+        acc[c] = fv(0.0f);
+        sidx[c] = QUANT == 0 ? 0 : dims[c] / p.group;
     }
     float m = -FLT_MAX;
     float l = 0.0f;
     for (uint j = begin; j < end; ++j) {
-        uint slot = table[base + j / p.page] * p.page + j % p.page;
-        ulong row = (ulong(slot) * p.kv_heads + g) * p.dim;
-        device const float *kr = k + row;
-        float dot = 0.0f;
-        for (uint r = 0; r < R; ++r) {
-            dot += qv[r] * kr[lane + SIMD * r];
+        ulong slot = ulong(table[base + j / p.page]) * p.page + j % p.page;
+        ulong head = slot * p.kv_heads + g;
+        device const T *kr = k + head * p.dim;
+        device const T *vr = v + head * p.dim;
+        float partial_dot = 0.0f;
+        for (uint c = 0; c < C; ++c) {
+            float d = dot(qv[c], fv(*(device const tv *)(kr + dims[c])));
+            partial_dot += QUANT == 0 ? d : d * float(k_scales[head * groups + sidx[c]]);
         }
-        float score = simd_sum(dot) * p.scale;
+        float score = simd_sum(partial_dot) * p.scale;
         float m_new = max(m, score);
         float correction = exp(m - m_new);
         float weight = exp(score - m_new);
         l = l * correction + weight;
-        device const float *vr = v + row;
-        for (uint r = 0; r < R; ++r) {
-            acc[r] = acc[r] * correction + weight * vr[lane + SIMD * r];
+        for (uint c = 0; c < C; ++c) {
+            float w = QUANT == 0 ? weight : weight * float(v_scales[head * groups + sidx[c]]);
+            acc[c] = acc[c] * correction + w * fv(*(device const tv *)(vr + dims[c]));
         }
         m = m_new;
     }
@@ -544,16 +640,17 @@ kernel void attention_f32(
         device const float *gr = gate + ulong(t) * p.gate_stride + p.gate_col + ulong(h) * p.gate_head_stride;
         device float *o = out + (ulong(t) * p.heads + h) * p.dim;
         float inv = l > 0.0f ? 1.0f / l : 0.0f;
-        for (uint r = 0; r < R; ++r) {
-            uint i = lane + SIMD * r;
-            o[i] = acc[r] * inv * sigmoid(gr[i]);
+        for (uint c = 0; c < C; ++c) {
+            for (uint i = 0; i < W; ++i) {
+                o[dims[c] + i] = acc[c][i] * inv * sigmoid(gr[dims[c] + i]);
+            }
         }
         return;
     }
     ulong slot = (ulong(t) * p.heads + h) * p.splits + split;
     device float *pp = partial + slot * p.dim;
-    for (uint r = 0; r < R; ++r) {
-        pp[lane + SIMD * r] = acc[r];
+    for (uint c = 0; c < C; ++c) {
+        *(device fv *)(pp + dims[c]) = acc[c];
     }
     if (lane == 0) {
         stats[2 * slot] = m;
@@ -611,17 +708,27 @@ kernel void attention_reduce_f32(
     }
 }
 
-#define ATTENTION(R) \
-    template [[host_name("attention_r" #R "_f32")]] kernel void attention_f32<R>( \
-        device const float *, device const float *, device const float *, device const uint *, \
+#define KV_FORMAT(R, C, W, NAME, T, QUANT) \
+    template [[host_name("kv_write_r" #R "_" #NAME)]] kernel void kv_write<R, T, QUANT>( \
+        device const float *, device const float *, device const uint *, device const uint *, \
+        device const uint *, device T *, device half *, device T *, device half *, \
+        constant KvWriteParams &, uint, uint, uint, uint); \
+    template [[host_name("attention_r" #R "_" #NAME)]] kernel void attention_kv<C, W, T, QUANT>( \
+        device const float *, device const T *, device const T *, device const uint *, \
         device const uint *, device const uint *, device const float *, device float *, \
-        device float *, device float *, constant AttentionParams &, uint, uint, uint, uint); \
+        device float *, device float *, constant AttentionParams &, device const half *, \
+        device const half *, uint, uint, uint, uint);
+// R registers per lane = C vectors of W lanes' dimensions: 64 = 1 x 2, 128 = 1 x 4, 256 = 2 x 4.
+#define ATTENTION(R, C, W) \
+    KV_FORMAT(R, C, W, f32, float, 0) \
+    KV_FORMAT(R, C, W, f16, half, 0) \
+    KV_FORMAT(R, C, W, q8, char, 1) \
     template [[host_name("attention_reduce_r" #R "_f32")]] kernel void attention_reduce_f32<R>( \
         device const float *, device const float *, device const float *, device float *, \
         constant AttentionParams &, uint, uint, uint, uint);
-ATTENTION(2)
-ATTENTION(4)
-ATTENTION(8)
+ATTENTION(2, 1, 2)
+ATTENTION(4, 1, 4)
+ATTENTION(8, 2, 4)
 
 // ---------------------------------------------------------------------------------------
 // Packed small-batch matrix-vector products: y[b, n] = sum_k x[b, k] * W[n, k], b < B.
