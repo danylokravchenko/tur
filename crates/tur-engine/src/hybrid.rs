@@ -24,7 +24,8 @@ pub use tur_metal::{
     state::{Demand, ModelState, Reservation},
 };
 pub use tur_models::hybrid::{
-    Boundaries, HybridModel, PackedForward, SequenceForward, SequenceState, SequenceStep,
+    Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward, SequenceForward,
+    SequenceState, SequenceStep,
 };
 use uuid::Uuid;
 
@@ -45,7 +46,7 @@ pub struct SamplingOptions {
 
 impl SamplingOptions {
     /// Greedy below a temperature of 1e-7, ignoring top-k and top-p.
-    fn greedy(&self) -> bool {
+    pub fn greedy(&self) -> bool {
         self.temperature.is_none_or(|t| t < 1e-7)
     }
 
@@ -495,6 +496,23 @@ pub struct SequenceResult {
     /// Model logits of the sequence's last output, before penalties and masks; a view of
     /// the pass's output, so copy it to keep it beyond the result.
     pub logits: Option<Tensor>,
+    /// Final hidden states of every input token of the pass, when the draft head is
+    /// enabled ([`HybridEngine::enable_draft_head`]); the first `accepted_tokens` rows are
+    /// the committed ones.
+    pub hidden: Option<Tensor>,
+}
+
+/// One request's draft-head pass over its newest committed positions.
+pub struct DraftRequest {
+    pub handle: StateHandle,
+    /// First position; the positions run to the request's committed position.
+    pub start: usize,
+    /// The token at each position + 1: committed inputs, then the newest sampled output.
+    pub tokens: Vec<u32>,
+    /// F32 `[tokens, hidden]` final hidden states of the positions.
+    pub hidden: Tensor,
+    /// Return the head's greedy draft for the token after the newest one.
+    pub draft: bool,
 }
 
 /// Output rows sampled since the engine was created, by where they were decided.
@@ -532,6 +550,8 @@ struct Batch<M> {
     plan: PackedExecution,
     reservations: Vec<Reservation>,
     logits: Vec<Result<Tensor>>,
+    /// Final hidden states of every sequence's tokens, when the draft head is enabled.
+    hidden: Vec<Option<Tensor>>,
     placement: Vec<Placement>,
     /// Full rows for the host sampler and token/status pairs decided on the device, each
     /// concatenated before the fence, so `finish` copies them to the host once.
@@ -578,6 +598,8 @@ pub struct HybridEngine<M: HybridModel> {
     stats: SamplingStats,
     /// Decide unconstrained rows on the device when kernels exist.
     device_sampling: bool,
+    /// Return every sequence's final hidden states for the model's draft head.
+    draft_head: bool,
     /// The model's kernels, for penalizing and sampling rows on the device.
     #[cfg(feature = "metal")]
     kernels: Option<tur_metal::kernels::Kernels>,
@@ -664,6 +686,7 @@ fn boundaries(speculative: bool) -> Boundaries {
 fn forwards<'a>(
     plan: &'a PackedExecution,
     states: &'a [SequenceState],
+    hidden: bool,
 ) -> Vec<SequenceForward<'a>> {
     plan.sequences
         .iter()
@@ -672,6 +695,7 @@ fn forwards<'a>(
             tokens: sequence.tokens.clone(),
             state,
             logits: &sequence.outputs,
+            hidden,
         })
         .collect()
 }
@@ -729,6 +753,7 @@ impl<M: HybridModel> HybridEngine<M> {
             completed_at: None,
             stats: SamplingStats::default(),
             device_sampling: true,
+            draft_head: false,
             #[cfg(feature = "metal")]
             kernels: model.kernels(),
             model,
@@ -1030,7 +1055,7 @@ impl<M: HybridModel> HybridEngine<M> {
         requirements.workspace_bytes = self.model.workspace_bytes(&PackedForward {
             tokens: &plan.tokens,
             positions: &plan.positions,
-            sequences: &forwards(&plan, &bindings),
+            sequences: &forwards(&plan, &bindings, self.draft_head),
             pool: &self.pool,
         })?;
         requirements.total_bytes()?;
@@ -1042,6 +1067,7 @@ impl<M: HybridModel> HybridEngine<M> {
                 plan,
                 reservations,
                 logits: Vec::new(),
+                hidden: Vec::new(),
                 placement: Vec::new(),
                 host: None,
                 pairs: None,
@@ -1061,13 +1087,16 @@ impl<M: HybridModel> HybridEngine<M> {
             batch.model.forward(&PackedForward {
                 tokens: &batch.plan.tokens,
                 positions: &batch.plan.positions,
-                sequences: &forwards(&batch.plan, &bindings),
+                sequences: &forwards(&batch.plan, &bindings, self.draft_head),
                 pool: &self.pool,
             })
         });
         match result {
             Ok(steps) if steps.len() == batch.plan.sequences.len() => {
                 for (sequence, step) in batch.plan.sequences.iter().zip(steps) {
+                    batch
+                        .hidden
+                        .push(step.as_ref().ok().and_then(|step| step.hidden.clone()));
                     batch.logits.push(step.and_then(|step| {
                         validate_logits(
                             &step.logits,
@@ -1111,6 +1140,121 @@ impl<M: HybridModel> HybridEngine<M> {
     /// from the same distribution with the same per-request stream.
     pub fn set_device_sampling(&mut self, enabled: bool) {
         self.device_sampling = enabled;
+    }
+
+    /// Return every pass's final hidden states with its results, for the model's draft
+    /// head ([`Self::draft`]).
+    pub fn enable_draft_head(&mut self) {
+        self.draft_head = true;
+    }
+
+    /// Run the model's draft head between passes over each request's newest committed
+    /// positions, writing the head's own state layer, and return its greedy draft where
+    /// requested. Requests fail independently; the pages a request's positions occupy
+    /// must not be shared with a snapshot. Waits for the device only to read drafts.
+    pub fn draft(&mut self, requests: &[DraftRequest]) -> Result<Vec<Result<Option<u32>>>> {
+        if self.pending.is_some() {
+            return Err(invalid("the draft head runs between passes"));
+        }
+        let mut results: Vec<Option<Result<Option<u32>>>> = requests.iter().map(|_| None).collect();
+        let (mut tokens, mut positions, mut live, mut states) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (index, request) in requests.iter().enumerate() {
+            let state = self.request(request.handle).and_then(|r| {
+                let position = r.snapshot.model.position();
+                if request.start.checked_add(request.tokens.len()) != Some(position) {
+                    return Err(invalid(
+                        "draft positions must end at the committed position",
+                    ));
+                }
+                r.snapshot.model.side(request.start, request.tokens.len())
+            });
+            match state {
+                Ok(state) => {
+                    let first = tokens.len();
+                    tokens.extend_from_slice(&request.tokens);
+                    positions.extend(request.start..request.start + request.tokens.len());
+                    live.push((index, first..tokens.len()));
+                    states.push(state);
+                }
+                Err(error) => results[index] = Some(Err(error)),
+            }
+        }
+        if !live.is_empty() {
+            let sequences: Vec<_> = live
+                .iter()
+                .zip(&states)
+                .map(|((index, range), state)| DraftSequence {
+                    tokens: range.clone(),
+                    state,
+                    hidden: &requests[*index].hidden,
+                    logits: requests[*index].draft,
+                })
+                .collect();
+            let outputs = self.model.draft(&DraftForward {
+                tokens: &tokens,
+                positions: &positions,
+                sequences: &sequences,
+                pool: &self.pool,
+            })?;
+            if outputs.len() != live.len() {
+                return Err(invalid("draft head returned wrong number of sequences"));
+            }
+            let mut rows = Vec::new();
+            let mut wanted = Vec::with_capacity(live.len());
+            for ((index, _), output) in live.iter().zip(outputs) {
+                match output {
+                    Ok(Some(logits)) => {
+                        wanted.push((*index, Some(rows.len())));
+                        rows.push(logits);
+                    }
+                    Ok(None) => wanted.push((*index, None)),
+                    Err(error) => results[*index] = Some(Err(error)),
+                }
+            }
+            let drafts = if rows.is_empty() {
+                // Nothing waits: later passes, and the reuse of any page released meanwhile,
+                // are encoded after these writes on the same queue.
+                Vec::new()
+            } else {
+                self.argmax(&Tensor::cat(&rows, 0)?)?
+            };
+            for (index, row) in wanted {
+                results[index] = Some(
+                    row.map(|row| {
+                        drafts
+                            .get(row)
+                            .copied()
+                            .ok_or_else(|| invalid("missing draft row"))
+                    })
+                    .transpose(),
+                );
+            }
+        }
+        Ok(results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(invalid("draft request was not executed"))))
+            .collect())
+    }
+
+    /// First maximum of each F32 row, on the device when kernels exist. Reading the result
+    /// waits for all work enqueued before it.
+    fn argmax(&self, rows: &Tensor) -> Result<Vec<u32>> {
+        #[cfg(feature = "metal")]
+        if let Some(kernels) = &self.kernels {
+            let pairs = kernels.argmax(rows)?.to_vec2::<f32>()?;
+            return pairs
+                .iter()
+                .map(|pair| match pair.as_slice() {
+                    [token, valid] if *valid > 0.5 => Ok(*token as u32),
+                    _ => Err(invalid("draft logits are not finite")),
+                })
+                .collect();
+        }
+        rows.argmax_keepdim(1)?
+            .flatten_all()?
+            .to_vec1::<u32>()
+            .map_err(Into::into)
     }
 
     /// Whether rows can be penalized and sampled on the device.
@@ -1352,6 +1496,7 @@ impl<M: HybridModel> HybridEngine<M> {
             plan,
             reservations,
             logits,
+            hidden,
             placement,
             host,
             pairs,
@@ -1385,6 +1530,7 @@ impl<M: HybridModel> HybridEngine<M> {
         let outside = || invalid("logit rows outside the copied batch");
         let mut fallbacks = 0;
         let mut results = Vec::with_capacity(plan.sequences.len());
+        let mut hidden = hidden.into_iter();
         for (((sequence, reservation), logits), placement) in plan
             .sequences
             .iter()
@@ -1392,6 +1538,7 @@ impl<M: HybridModel> HybridEngine<M> {
             .zip(logits)
             .zip(placement)
         {
+            let hidden = hidden.next().flatten();
             let n = sequence.outputs.len();
             let last = logits
                 .as_ref()
@@ -1441,6 +1588,7 @@ impl<M: HybridModel> HybridEngine<M> {
                 request: id,
                 outcome,
                 logits: last,
+                hidden,
             });
         }
         self.stats.fallback_rows += fallbacks;

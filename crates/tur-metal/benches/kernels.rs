@@ -140,10 +140,12 @@ fn gemv_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
         gemv_q8_0_rows: (1, 8),
         gemv_q4k_rows: (1, 8),
         qmm_q8_0_rows: (16, 16),
+        qmm_q4k_rows: (16, 16),
         ..kernels.tuning()
     })?;
     let qmm = kernels.clone().with_tuning(Tuning {
         qmm_q8_0_rows: (1, 16),
+        qmm_q4k_rows: (1, 16),
         ..kernels.tuning()
     })?;
     let mut cases = Vec::new();
@@ -161,7 +163,7 @@ fn gemv_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
                     "candle": existing,
                     "candle_kernel": if rows == 1 { "mul_mv" } else { "mul_mm (F16 tiles)" },
                 });
-                if format == GgmlDType::Q8_0 && rows <= 16 {
+                if rows <= 16 {
                     let custom = time(device, || qmm.linear(&layer, &x))?;
                     let seconds = custom["median_seconds"].as_f64().unwrap_or(f64::INFINITY);
                     case["tur_qmm"] = custom;

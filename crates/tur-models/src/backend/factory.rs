@@ -22,6 +22,7 @@ pub enum ModelSource {
 }
 
 /// Loads a validated hybrid checkpoint, its tokenizer and its own chat template.
+#[derive(Clone)]
 pub struct ModelFactory {
     pub source: ModelSource,
     /// Immutable commit for remote sources; a caller-provided identity for local weights.
@@ -32,6 +33,9 @@ pub struct ModelFactory {
     pub kv: KvLayout,
     /// Recurrent matrix storage: F32, F16 or BF16.
     pub recurrent: candle_core::DType,
+    /// Load the checkpoint's native multi-token prediction head. The inference pipeline
+    /// sets it from its speculation config.
+    pub mtp: bool,
 }
 
 fn hub_error(error: impl std::fmt::Display) -> TurError {
@@ -167,7 +171,9 @@ impl ModelFactory {
             execution: Execution::Fused,
             kv: self.kv,
             recurrent: self.recurrent,
+            mtp: self.mtp,
         };
+        let config = if self.mtp { config.with_mtp()? } else { config };
         let reservation = reserve(&config, &options)?;
         let model = Qwen35::load(&dir, &options)?;
         Ok((model, tokenizer, template, defaults, reservation))
@@ -200,6 +206,7 @@ mod tests {
             device: Device::Cpu,
             kv: crate::models::qwen3_5::DEFAULT_KV_LAYOUT,
             recurrent: crate::models::qwen3_5::DEFAULT_RECURRENT_STATE,
+            mtp: false,
         };
         assert!(factory.resolve().is_err());
     }

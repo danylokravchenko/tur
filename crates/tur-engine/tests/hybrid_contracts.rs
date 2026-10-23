@@ -160,7 +160,10 @@ impl Fixture {
         } else {
             Tensor::from_vec(LOGITS.repeat(rows), (rows, LOGITS.len()), &Device::Cpu)?
         };
-        Ok(SequenceStep { logits })
+        Ok(SequenceStep {
+            logits,
+            hidden: None,
+        })
     }
 }
 

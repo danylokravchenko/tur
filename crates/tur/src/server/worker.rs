@@ -414,6 +414,7 @@ mod tests {
                 device: Device::Cpu,
                 kv: DEFAULT_KV_LAYOUT,
                 recurrent: DEFAULT_RECURRENT_STATE,
+                mtp: false,
             },
             pipeline: PipelineConfig::new(1, 64),
             budget: DeviceBudget::new(None),

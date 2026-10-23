@@ -91,6 +91,7 @@ fn load_state(
             execution,
             kv,
             recurrent,
+            mtp: false,
         },
     )
 }
@@ -471,6 +472,7 @@ fn test_execution_selection_and_declared_workspace() -> Result<()> {
                 tokens: 0..n,
                 state: &binding,
                 logits: &logits,
+                hidden: false,
             }],
             pool: &pool,
         })
@@ -487,6 +489,7 @@ fn test_execution_selection_and_declared_workspace() -> Result<()> {
             execution: Execution::Fused,
             kv: F32_KV,
             recurrent: DType::F32,
+            mtp: false,
         },
         512,
         &[512],
@@ -531,6 +534,7 @@ fn test_preload_weight_plans_match_every_format_and_tied_embedding_layout() -> R
                 execution: Execution::Fused,
                 kv: F32_KV,
                 recurrent: DType::F16,
+                mtp: false,
             };
             let (description, weights, scratch) =
                 Qwen35::memory_requirements(&parsed, &options, 512, &[512])?;
@@ -860,6 +864,7 @@ fn real(format: WeightFormat, execution: Execution, kv: KvLayout) -> Result<Qwen
             execution,
             kv,
             recurrent: DType::F32,
+            mtp: false,
         },
     )
 }

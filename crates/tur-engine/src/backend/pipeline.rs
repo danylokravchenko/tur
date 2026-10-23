@@ -25,13 +25,17 @@ use super::{
     prefix::{PrefixCache, PrefixConfig, PrefixKeys, PrefixStats},
     scheduler::{Candidate, Chunk, Decision, Scheduler, SchedulerConfig},
     speculation::{
-        self, Acceptance, DraftCosts, NgramIndex, Proposal, SpeculationConfig, SpeculationStats,
+        self, Acceptance, DraftCosts, DraftSource, HeadCosts, NgramIndex, Proposal,
+        SpeculationConfig, SpeculationStats,
     },
     tokenizer::TokenOutputStream,
 };
 use crate::{
     Result, TurError,
-    hybrid::{Demand, HybridEngine, PoolUsage, SamplingOptions, SamplingStats, SequenceCommit},
+    hybrid::{
+        Demand, DraftRequest, HybridEngine, PoolUsage, SamplingOptions, SamplingStats,
+        SequenceCommit,
+    },
 };
 
 /// One text conversation. Unset sampling and thinking controls use checkpoint defaults.
@@ -116,6 +120,8 @@ pub struct PassTiming {
     pub sequences: usize,
     /// Speculative draft tokens among `tokens`.
     pub drafts: usize,
+    /// Draft-head pass after publication, from submission to its drafts on the host.
+    pub draft_head: Duration,
     /// Expiry, prefix restore, scheduling and packing.
     pub schedule: Duration,
     /// Validation, reservation and encoding.
@@ -136,8 +142,9 @@ pub struct PassTiming {
 /// A submitted pass awaiting `finish_step`.
 struct InFlight {
     chunks: Vec<Chunk>,
-    /// Speculative drafts appended to each chunk's single decode token.
+    /// Speculative drafts appended to each chunk's single decode token, and their source.
     drafts: Vec<Vec<u32>>,
+    sources: Vec<DraftSource>,
     /// Decoding sequences of the pass; when they are all its chunks, the pass's cost
     /// feeds the draft cost fit.
     decodes: usize,
@@ -174,8 +181,15 @@ struct Pending {
     tools: Vec<ToolDefinition>,
     /// Grammar-constrained: never drafted, so masks stay on the device.
     constrained: bool,
+    /// Greedy decoding, the regime where draft-head drafts were measured to pay.
+    greedy: bool,
     ngrams: NgramIndex,
     acceptance: Acceptance,
+    /// Positions whose draft-head keys and values are written, and the head's draft for
+    /// the token after the pending one, valid while `mtp_done == consumed`.
+    mtp_done: usize,
+    mtp_draft: Option<u32>,
+    mtp_acceptance: Acceptance,
     drafted: usize,
     accepted_drafts: usize,
 }
@@ -291,8 +305,14 @@ pub struct InferencePipeline {
     guidance: Option<Arc<ParserFactory>>,
     speculation: SpeculationConfig,
     draft_costs: DraftCosts,
-    /// Pipeline-wide acceptance, the starting estimate of new requests.
+    head_costs: HeadCosts,
+    /// Consecutive draft-head passes whose drafts were skipped as unprofitable, and the
+    /// count after which one explores anyway.
+    head_skips: usize,
+    head_explore: usize,
+    /// Pipeline-wide acceptance, the starting estimate of new requests, per source.
     acceptance: Acceptance,
+    mtp_acceptance: Acceptance,
     speculation_stats: SpeculationStats,
 }
 
@@ -337,6 +357,17 @@ impl InferencePipeline {
                 SpeculationConfig::DISABLED
             },
             ..config
+        };
+        if config.speculation.mtp_enabled() && config.prefix.enabled() {
+            // A snapshot at boundary B cannot hold the head's entry for B - 1: it depends on
+            // the token sampled after B, which differs between requests sharing the snapshot.
+            return Err(invalid(
+                "native MTP drafts need prefix reuse disabled (PrefixConfig::DISABLED)",
+            ));
+        }
+        let factory = &ModelFactory {
+            mtp: config.speculation.mtp_enabled(),
+            ..factory.clone()
         };
         let limits = config.scheduler;
         let draft_rows = config
@@ -411,6 +442,9 @@ impl InferencePipeline {
         }
         let mut engine = HybridEngine::new(Arc::new(model), factory.device.clone(), pool)?;
         engine.set_device_sampling(config.device_sampling);
+        if config.speculation.mtp_enabled() {
+            engine.enable_draft_head();
+        }
         config
             .prefix
             .validate(engine.pool().description().kv.page_tokens)?;
@@ -433,7 +467,11 @@ impl InferencePipeline {
             guidance: None,
             speculation: config.speculation,
             draft_costs: DraftCosts::default(),
+            head_costs: HeadCosts::default(),
+            head_skips: 0,
+            head_explore: speculation::HEAD_EXPLORE_PASSES,
             acceptance: Acceptance::default(),
+            mtp_acceptance: Acceptance::default(),
             speculation_stats: SpeculationStats::default(),
         })
     }
@@ -551,6 +589,7 @@ impl InferencePipeline {
             return Err(TurError::DeadlineExceeded);
         }
         let constrained = request.grammar.is_some();
+        let options = sampling(request.sampling, &self.defaults);
         let guidance = request
             .grammar
             .clone()
@@ -568,11 +607,7 @@ impl InferencePipeline {
                 Ok(control)
             })
             .transpose()?;
-        let handle = self.engine.allocate(
-            request.seed,
-            sampling(request.sampling, &self.defaults),
-            guidance,
-        )?;
+        let handle = self.engine.allocate(request.seed, options, guidance)?;
         self.engine.add_context(handle, &tokens)?;
         let keys = self.prefix.keys(request.cache_salt.as_deref(), &tokens);
         self.pending.insert(
@@ -597,8 +632,12 @@ impl InferencePipeline {
                 preemptions: 0,
                 tools: request.tools.clone(),
                 constrained,
+                greedy: options.greedy(),
                 ngrams: NgramIndex::default(),
                 acceptance: self.acceptance,
+                mtp_done: 0,
+                mtp_draft: None,
+                mtp_acceptance: self.mtp_acceptance,
                 drafted: 0,
                 accepted_drafts: 0,
             },
@@ -637,6 +676,7 @@ impl InferencePipeline {
         pending.consumed = 0;
         pending.running = false;
         pending.ngrams = NgramIndex::default();
+        (pending.mtp_done, pending.mtp_draft) = (0, None);
         pending.preemptions += 1;
         tracing::debug!(request = %id, tokens = pending.tokens.len(), "preempted for recompute");
         Ok(())
@@ -923,7 +963,7 @@ impl InferencePipeline {
         }
     }
 
-    /// Drafts for each chunk of a pass, and how many chunks are decodes. Every
+    /// Drafts for each chunk of a pass, their sources, and how many chunks are decodes. Every
     /// decoding sequence may draft, also beside prefill chunks once draft costs are
     /// identified: the prefill's estimated cost then joins the pass base, so drafts are
     /// weighed against the whole pass they lengthen. Proposals come from each request's
@@ -934,8 +974,9 @@ impl InferencePipeline {
     /// pass's ordinary demand. No growth headroom is held back: rejected drafts return
     /// their leases when the pass completes, and accepted ones are progress a decode
     /// would have leased anyway.
-    fn draft(&mut self, chunks: &[Chunk]) -> Result<(Vec<Vec<u32>>, usize)> {
+    fn draft(&mut self, chunks: &[Chunk]) -> Result<(Vec<Vec<u32>>, Vec<DraftSource>, usize)> {
         let mut drafts = vec![Vec::new(); chunks.len()];
+        let mut sources = vec![DraftSource::Lookup; chunks.len()];
         let decoding: Vec<bool> = chunks
             .iter()
             .map(|chunk| {
@@ -951,7 +992,7 @@ impl InferencePipeline {
         let decodes = decoding.iter().filter(|&&d| d).count();
         let decode_only = decodes > 0 && decodes == chunks.len();
         if decodes == 0 || !self.speculation.enabled() {
-            return Ok((drafts, decodes));
+            return Ok((drafts, sources, decodes));
         }
         let chunk_tokens = chunks.iter().map(|chunk| chunk.tokens).sum::<usize>();
         let room = self
@@ -978,7 +1019,7 @@ impl InferencePipeline {
                 .estimate(chunk_tokens - decodes, context)
             {
                 Some(seconds) => Some(seconds),
-                None => return Ok((drafts, decodes)),
+                None => return Ok((drafts, sources, decodes)),
             }
         };
         let mut proposed = Vec::with_capacity(decodes);
@@ -1009,22 +1050,35 @@ impl InferencePipeline {
                 cap = cap.min(boundary.saturating_sub(pending.consumed + 1));
             }
             let eos = &self.defaults.eos_tokens;
-            let proposal: Vec<u32> = pending
+            let mut proposal: Vec<u32> = pending
                 .ngrams
                 .propose(&pending.tokens, &self.speculation, cap)
                 .into_iter()
                 .take_while(|token| !eos.contains(token))
                 .collect();
+            let mut source = DraftSource::Lookup;
+            // The head's draft replaces a lookup proposal whose acceptance is lower.
+            if (proposal.is_empty() || pending.mtp_acceptance.rate() > pending.acceptance.rate())
+                && cap > 0
+                && pending.mtp_done == pending.consumed
+                && let Some(token) = pending.mtp_draft.filter(|token| !eos.contains(token))
+            {
+                (proposal, source) = (vec![token], DraftSource::Mtp);
+            }
             if !proposal.is_empty() {
-                proposed.push((index, proposal, pending.acceptance));
+                let acceptance = match source {
+                    DraftSource::Lookup => pending.acceptance,
+                    DraftSource::Mtp => pending.mtp_acceptance,
+                };
+                proposed.push((index, proposal, acceptance, source));
             }
         }
         if proposed.is_empty() {
-            return Ok((drafts, decodes));
+            return Ok((drafts, sources, decodes));
         }
         let proposals: Vec<Proposal> = proposed
             .iter()
-            .map(|(_, tokens, acceptance)| Proposal {
+            .map(|(_, tokens, acceptance, _)| Proposal {
                 tokens: tokens.len(),
                 acceptance: *acceptance,
             })
@@ -1044,7 +1098,7 @@ impl InferencePipeline {
             demand = demand + one;
             plain.push(one);
         }
-        for ((index, proposal, _), &count) in proposed.into_iter().zip(&counts) {
+        for ((index, proposal, _, source), &count) in proposed.into_iter().zip(&counts) {
             let pending = self
                 .pending
                 .get_mut(&chunks[index].id)
@@ -1063,11 +1117,15 @@ impl InferencePipeline {
                 count -= 1;
             }
             if count == 0 {
-                pending.acceptance.recover(self.acceptance);
+                match source {
+                    DraftSource::Lookup => pending.acceptance.recover(self.acceptance),
+                    DraftSource::Mtp => pending.mtp_acceptance.recover(Acceptance::default()),
+                }
             }
             drafts[index] = proposal.get(..count).unwrap_or_default().to_vec();
+            sources[index] = source;
         }
-        Ok((drafts, decodes))
+        Ok((drafts, sources, decodes))
     }
 
     /// Pack the selected chunks: each sequence's next unconsumed tokens, with logits at its
@@ -1143,7 +1201,7 @@ impl InferencePipeline {
         if chunks.is_empty() {
             return Ok(false);
         }
-        let (drafts, decodes) = self.draft(&chunks)?;
+        let (drafts, sources, decodes) = self.draft(&chunks)?;
         let chunk_tokens = chunks.iter().map(|chunk| chunk.tokens).sum::<usize>();
         let (plan, context) = self.pack(&chunks, &drafts)?;
         let (tokens, sequences) = (plan.tokens.len(), plan.sequences.len());
@@ -1153,6 +1211,7 @@ impl InferencePipeline {
         self.in_flight = Some(InFlight {
             chunks,
             drafts,
+            sources,
             decodes,
             context,
             started,
@@ -1219,12 +1278,13 @@ impl InferencePipeline {
         if timing.drafts > 0 {
             self.speculation_stats.passes += 1;
         }
-        let drafted: HashMap<Uuid, usize> = flight
+        let drafted: HashMap<Uuid, (usize, DraftSource)> = flight
             .chunks
             .iter()
             .zip(&flight.drafts)
-            .filter(|(_, draft)| !draft.is_empty())
-            .map(|(chunk, draft)| (chunk.id, draft.len()))
+            .zip(&flight.sources)
+            .filter(|((_, draft), _)| !draft.is_empty())
+            .map(|((chunk, draft), &source)| (chunk.id, (draft.len(), source)))
             .collect();
         for chunk in &flight.chunks {
             if let Some(pending) = self.pending.get_mut(&chunk.id) {
@@ -1232,24 +1292,48 @@ impl InferencePipeline {
                 pending.last_run = chunk.ticket;
             }
         }
+        // Committed positions each request's draft head still needs: (id, first, hidden).
+        let mut heads = Vec::new();
         for result in results {
             let id = result.request;
-            if !self.pending.contains_key(&id) {
+            let Some(before) = self.pending.get(&id).map(|p| p.consumed) else {
                 continue;
-            }
-            if let (Some(&drafted), Ok(commit)) = (drafted.get(&id), &result.outcome) {
+            };
+            if let (Some(&(drafted, source)), Ok(commit)) = (drafted.get(&id), &result.outcome) {
                 // Every accepted input after the decode token is an accepted draft.
                 let accepted = commit.accepted_tokens.saturating_sub(1).min(drafted);
                 if let Some(pending) = self.pending.get_mut(&id) {
-                    pending.acceptance.observe(drafted, accepted);
+                    match source {
+                        DraftSource::Lookup => pending.acceptance.observe(drafted, accepted),
+                        DraftSource::Mtp => pending.mtp_acceptance.observe(drafted, accepted),
+                    }
                     pending.drafted += drafted;
                     pending.accepted_drafts += accepted;
                 }
-                self.acceptance.observe(drafted, accepted);
                 let stats = &mut self.speculation_stats;
+                match source {
+                    DraftSource::Lookup => self.acceptance.observe(drafted, accepted),
+                    DraftSource::Mtp => {
+                        self.mtp_acceptance.observe(drafted, accepted);
+                        stats.mtp_drafted += drafted as u64;
+                        stats.mtp_accepted += accepted as u64;
+                    }
+                }
                 stats.sequences += 1;
                 stats.drafted += drafted as u64;
                 stats.accepted += accepted as u64;
+            }
+            // Only greedy, unconstrained requests ever take the head's drafts; it runs for
+            // no other.
+            let drafts_from_head = self
+                .pending
+                .get(&id)
+                .is_some_and(|p| p.greedy && !p.constrained);
+            if let (Some(hidden), Ok(commit)) = (&result.hidden, &result.outcome)
+                && commit.accepted_tokens > 0
+                && drafts_from_head
+            {
+                heads.push((id, before, hidden.narrow(0, 0, commit.accepted_tokens)?));
             }
             let logits = result.logits;
             let outcome = result
@@ -1259,10 +1343,121 @@ impl InferencePipeline {
                 self.fail(id, error, &mut output)?;
             }
         }
+        if !heads.is_empty() {
+            timing.draft_head = self.draft_head(heads)?;
+            self.speculation_stats.mtp_passes += 1;
+            self.speculation_stats.mtp_seconds += timing.draft_head.as_secs_f64();
+        }
         self.expire(Instant::now(), &mut output)?;
         timing.publish = published.elapsed();
         output.timing = Some(timing);
         Ok(output)
+    }
+
+    /// Run the draft head over each published request's newly committed positions, pairing
+    /// each with the token that followed it, and keep the head's draft for a request whose
+    /// next pass decodes, unless prompt lookup proposes with higher acceptance. A request whose head falls behind (it failed, or a position was
+    /// published without hidden states) stops drafting from the head until it recomputes.
+    fn draft_head(&mut self, heads: Vec<(Uuid, usize, Tensor)>) -> Result<Duration> {
+        let mut requests = Vec::with_capacity(heads.len());
+        let mut ids = Vec::with_capacity(heads.len());
+        let mut rates = Vec::new();
+        for (id, before, hidden) in heads {
+            let Some(pending) = self.pending.get_mut(&id) else {
+                continue;
+            };
+            pending.mtp_draft = None;
+            let Some(tokens) = pending.tokens.get(before + 1..=pending.consumed) else {
+                continue;
+            };
+            if pending.mtp_done != before || tokens.len() != hidden.dim(0)? {
+                continue;
+            }
+            // Its LM-head projection costs about a third of a small model's decode: compute
+            // a draft only when the next pass decodes, prompt lookup has no proposal or a less
+            // accepted one, and the head's acceptance can repay it.
+            let mut draft = pending.tokens.len() == pending.consumed + 1;
+            if draft && pending.mtp_acceptance.rate() < speculation::MTP_MIN_RATE {
+                // Towards the neutral prior, not the pipeline's rate, which may itself sit
+                // below the threshold: a skipped head is retried after a few passes.
+                pending.mtp_acceptance.recover(Acceptance::default());
+                draft = false;
+            }
+            draft = draft
+                && (pending.mtp_acceptance.rate() > pending.acceptance.rate()
+                    || pending
+                        .ngrams
+                        .propose(&pending.tokens, &self.speculation, 1)
+                        .is_empty());
+            if draft {
+                rates.push(pending.mtp_acceptance.rate());
+            }
+            requests.push(DraftRequest {
+                handle: pending.handle,
+                start: before,
+                tokens: tokens.to_vec(),
+                hidden,
+                draft,
+            });
+            ids.push(id);
+        }
+        if requests.is_empty() {
+            return Ok(Duration::ZERO);
+        }
+        // The head's drafts must repay its projection for the whole next pass. Beyond the
+        // measured beneficial range its drafts are not computed; its keys and values still
+        // are, so drafting resumes when fewer sequences decode.
+        let decodes = self
+            .pending
+            .values()
+            .filter(|p| p.running && p.tokens.len() == p.consumed + 1)
+            .count();
+        if decodes > speculation::MTP_MAX_DECODES {
+            rates.clear();
+            for request in &mut requests {
+                request.draft = false;
+            }
+        }
+        if !rates.is_empty() {
+            if self
+                .head_costs
+                .worthwhile(&rates, decodes, &self.draft_costs)
+            {
+                (self.head_skips, self.head_explore) = (0, speculation::HEAD_EXPLORE_PASSES);
+            } else if self.head_skips >= self.head_explore {
+                self.head_skips = 0;
+                self.head_explore =
+                    (self.head_explore * 2).min(speculation::HEAD_EXPLORE_MAX_PASSES);
+            } else {
+                self.head_skips += 1;
+                for request in &mut requests {
+                    request.draft = false;
+                }
+            }
+        }
+        let drafts = requests.iter().filter(|r| r.draft).count();
+        // Decode-sized: at most the drafted tokens plus one per sequence.
+        let rows: usize = requests.iter().map(|r| r.tokens.len()).sum();
+        let decode_sized = rows <= requests.len() * (self.speculation.max_draft + 1);
+        let started = Instant::now();
+        let outcomes = self.engine.draft(&requests)?;
+        let elapsed = started.elapsed();
+        if decode_sized {
+            self.head_costs.record(drafts, elapsed.as_secs_f64());
+        }
+        for (id, outcome) in ids.into_iter().zip(outcomes) {
+            let Some(pending) = self.pending.get_mut(&id) else {
+                continue;
+            };
+            match outcome {
+                Ok(draft) => {
+                    pending.mtp_done = pending.consumed;
+                    pending.mtp_draft = draft;
+                }
+                Err(error) => tracing::debug!(request = %id, "draft head failed: {error}"),
+            }
+        }
+        Ok(elapsed)
     }
 
     /// Run one scheduled packed pass to completion: [`Self::begin_step`] then

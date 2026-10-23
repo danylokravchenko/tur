@@ -5,8 +5,11 @@ use tur_core::{Result, execution::invalid};
 
 /// Assignments per histogram block and threads of the block-wide routing kernels.
 const BLOCK: usize = 256;
-/// Rows of one expert tile.
+/// Rows of one expert tile; groups above it use wider tiles (32 rows, fewer tiles).
 const TILE: usize = 16;
+/// Staged F16 weights `[64, 32]` and F32 activations `[32, 32]`, reused for the
+/// `[32, 64]` F32 result.
+const WIDE_STAGE_BYTES: usize = 64 * 32 * 2 + 32 * 32 * 4;
 /// Simdgroups of one matrix-unit threadgroup, each owning 32 outputs of a tile.
 const GEMM_SIMDGROUPS: usize = 2;
 
@@ -61,7 +64,13 @@ impl ExpertRoutes {
     fn rows(&self) -> usize {
         self.tokens * self.top_k
     }
-    fn params(&self, width: usize, stride: usize, out: usize, routed: bool) -> Result<ExpertParams> {
+    fn params(
+        &self,
+        width: usize,
+        stride: usize,
+        out: usize,
+        routed: bool,
+    ) -> Result<ExpertParams> {
         Ok(ExpertParams {
             rows: to_u32(self.rows(), "assignments")?,
             experts: to_u32(self.experts, "experts")?,
@@ -134,8 +143,9 @@ impl Kernels {
             },
         )?;
         let groups = self.output(experts, 1)?;
+        // Wide tiles hold more rows, so the small-tile bound covers both kinds.
         let tile_count = assignments.min(assignments.div_ceil(TILE) + experts - 1);
-        let tiles = self.output(tile_count, 3)?;
+        let tiles = self.output(tile_count, 4)?;
         self.runtime.dispatch(
             self.pipeline("moe_offsets_f32")?,
             "tur_moe_offsets",
@@ -169,7 +179,7 @@ impl Kernels {
         drop((hv, gv, sv));
         Ok(ExpertRoutes {
             selected,
-            tiles: self.finish(tiles, (tile_count, 3))?,
+            tiles: self.finish(tiles, (tile_count, 4))?,
             order: self.finish(order, (assignments, 3))?,
             tokens,
             experts,
@@ -242,11 +252,7 @@ impl Kernels {
         let xv = self.view(x)?;
         let width = layer.in_features();
         let out_width = layer.out_features() / routes.experts;
-        let rows = if routed {
-            routes.tokens
-        } else {
-            routes.rows()
-        };
+        let rows = if routed { routes.tokens } else { routes.rows() };
         if xv.rows != rows
             || xv.cols != width
             || !width.is_multiple_of(32)
@@ -277,16 +283,27 @@ impl Kernels {
         let tiles = self.view(&routes.tiles)?;
         let order = self.view(&routes.order)?;
         let out = self.output(routes.rows(), out_width)?;
-        // Every tile goes to exactly one kernel: GEMV for at most three rows, matrix
-        // units otherwise. Each launches over all tiles and skips the other kind.
+        if WIDE_STAGE_BYTES > self.capabilities().threadgroup_memory_bytes {
+            return Err(invalid("wide expert tiles exceed threadgroup memory"));
+        }
+        // Every tile goes to exactly one kernel: within groups of at most sixteen rows, GEMV
+        // for at most three rows and F32 matrix units otherwise; larger groups' wide tiles
+        // use F16-staged weights. Each launches over all tiles and skips the others.
         let gemv = self.pipeline(&format!("moe_gemv_{suffix}"))?;
         let gemv_simdgroups = gemv.simdgroups(self.tuning.simdgroups).max(1);
-        for (pipeline, simdgroups, outputs) in [
-            (gemv, gemv_simdgroups, gemv_rows * gemv_simdgroups),
+        for (pipeline, simdgroups, outputs, stage) in [
+            (gemv, gemv_simdgroups, gemv_rows * gemv_simdgroups, 0),
             (
                 self.pipeline(&format!("moe_gemm_{suffix}"))?,
                 GEMM_SIMDGROUPS,
                 32 * GEMM_SIMDGROUPS,
+                0,
+            ),
+            (
+                self.pipeline(&format!("moe_gemm_wide_{suffix}"))?,
+                4,
+                64,
+                WIDE_STAGE_BYTES,
             ),
         ] {
             let launch = tiles
@@ -309,6 +326,9 @@ impl Kernels {
                     out.bind(e, 3);
                     e.set_bytes(4, &p);
                     order.bind(e, 5)?;
+                    if stage > 0 {
+                        e.set_threadgroup_memory_length(0, stage);
+                    }
                     Ok(())
                 })?;
         }
@@ -361,7 +381,10 @@ impl Kernels {
                 views.as_ref().map_or(0, |(o, _)| o.row_stride),
                 "shared stride",
             )?,
-            gate_stride: to_u32(views.as_ref().map_or(0, |(_, g)| g.row_stride), "gate stride")?,
+            gate_stride: to_u32(
+                views.as_ref().map_or(0, |(_, g)| g.row_stride),
+                "gate stride",
+            )?,
         };
         routes
             .tokens

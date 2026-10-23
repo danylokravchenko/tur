@@ -183,7 +183,8 @@ impl PackedLinear {
                 let bytes = data
                     .get(start * row..(start + rows) * row)
                     .ok_or_else(|| invalid("packed rows outside weights"))?;
-                let (slice, _) = upload_bytes(bytes, *format, (rows, self.in_features), &Device::Cpu)?;
+                let (slice, _) =
+                    upload_bytes(bytes, *format, (rows, self.in_features), &Device::Cpu)?;
                 QMatMul::from_qtensor(slice)?.forward(x)?
             }
             Weights::Packed { matmul, .. } => matmul.forward(x)?.narrow(1, start, rows)?,
@@ -225,7 +226,11 @@ fn host_f32(weight: &Tensor) -> Result<Tensor> {
             && matches!(&*storage, candle_core::Storage::Cpu(candle_core::CpuStorage::F32(v))
                 if v.len() == host.elem_count())
     };
-    Ok(if owned { host } else { host.force_contiguous()? })
+    Ok(if owned {
+        host
+    } else {
+        host.force_contiguous()?
+    })
 }
 
 #[cfg(feature = "metal")]
@@ -237,7 +242,12 @@ type Handle = ();
 fn upload(packed: QTensor, device: &Device) -> Result<(QTensor, Handle)> {
     match device {
         Device::Cpu => Ok((packed, Handle::default())),
-        _ => upload_bytes(&packed.data()?, packed.dtype(), packed.shape().clone(), device),
+        _ => upload_bytes(
+            &packed.data()?,
+            packed.dtype(),
+            packed.shape().clone(),
+            device,
+        ),
     }
 }
 
@@ -299,17 +309,15 @@ mod tests {
             let full = single.forward(&x)?.narrow(1, 8, 8)?.to_vec2::<f32>()?;
             let rows = single.forward_rows(&x, 8, 8)?.to_vec2::<f32>()?;
             for (a, b) in full.iter().flatten().zip(rows.iter().flatten()) {
-                assert!((a - b).abs() <= 1e-5 * a.abs().max(1.0), "{format:?}: {a} {b}");
+                assert!(
+                    (a - b).abs() <= 1e-5 * a.abs().max(1.0),
+                    "{format:?}: {a} {b}"
+                );
             }
             assert!(single.forward_rows(&x, 20, 8).is_err());
         }
         assert!(
-            PackedLinear::stacked(
-                [weights(2, 64), weights(2, 32)],
-                None,
-                &Device::Cpu
-            )
-            .is_err()
+            PackedLinear::stacked([weights(2, 64), weights(2, 32)], None, &Device::Cpu).is_err()
         );
         Ok(())
     }

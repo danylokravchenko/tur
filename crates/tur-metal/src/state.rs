@@ -205,6 +205,38 @@ impl ModelState {
         })
     }
 
+    /// Addressing of committed positions `start..start + tokens` for a side pass, such as a
+    /// draft head, that writes only layers no ordinary pass writes. It leases nothing and
+    /// writes no recurrent slot. The pages must be exclusively owned: a page shared with a
+    /// snapshot would see the side layer change under it.
+    pub fn side(&self, start: usize, tokens: usize) -> Result<SequenceState> {
+        let end = start
+            .checked_add(tokens)
+            .ok_or_else(|| invalid("position overflow"))?;
+        if tokens == 0 || end > self.position {
+            return Err(invalid("side pass outside committed positions"));
+        }
+        let description = self.description();
+        let first = start / description.kv.page_tokens;
+        if self
+            .pages
+            .get(first..description.pages_for(end))
+            .is_none_or(|pages| pages.iter().any(|page| Arc::strong_count(page) > 1))
+        {
+            return Err(invalid("side pass needs exclusively owned pages"));
+        }
+        Ok(SequenceState {
+            pool: self.pool.id(),
+            past: start,
+            tokens,
+            page_tokens: description.kv.page_tokens,
+            pages: ids(&self.pages),
+            read: self.slot.id(),
+            writes: Vec::new(),
+            boundaries: Boundaries::Final,
+        })
+    }
+
     /// Detached F32 copies of every layer for inspection. Waits for the copies to finish,
     /// so no unfenced work references these pages if the snapshot is released afterwards.
     pub fn read_layers(&self) -> Result<Vec<LayerSnapshot>> {

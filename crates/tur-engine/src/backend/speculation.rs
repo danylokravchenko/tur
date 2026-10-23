@@ -35,6 +35,11 @@ pub struct SpeculationConfig {
     pub min_ngram: usize,
     /// Longest suffix n-gram matched against the history; longer matches are tried first.
     pub max_ngram: usize,
+    /// Also draft one token from the checkpoint's native multi-token prediction head when
+    /// prompt lookup has no proposal or a less accepted one. Drafts are computed for greedy
+    /// requests in passes of at most [`MTP_MAX_DECODES`] decodes. Needs prefix reuse
+    /// disabled.
+    pub mtp: bool,
 }
 
 impl SpeculationConfig {
@@ -44,6 +49,7 @@ impl SpeculationConfig {
         max_pass_drafts: 0,
         min_ngram: 1,
         max_ngram: 1,
+        mtp: false,
     };
 
     /// Up to `max_draft` drafts per sequence and four sequences' worth per pass, from
@@ -54,7 +60,21 @@ impl SpeculationConfig {
             max_pass_drafts: max_draft.saturating_mul(4),
             min_ngram: 1,
             max_ngram: 4,
+            mtp: false,
         }
+    }
+
+    /// [`Self::new`] plus one-token drafts from the native multi-token prediction head.
+    pub const fn with_mtp(max_draft: usize) -> Self {
+        Self {
+            mtp: true,
+            ..Self::new(max_draft)
+        }
+    }
+
+    /// Whether the multi-token prediction head drafts.
+    pub fn mtp_enabled(&self) -> bool {
+        self.enabled() && self.mtp
     }
 
     /// Whether proposals and their memory reservation are enabled.
@@ -227,7 +247,17 @@ impl Acceptance {
 /// Weight kept by older samples of a cost fit per new sample (a window of about twenty).
 const COST_DECAY: f64 = 0.95;
 /// Variance of drafted tokens below which a fit cannot separate base and draft costs.
-const MIN_DRAFT_VARIANCE: f64 = 0.25;
+/// Passes alternating zero and one draft (single-token proposals) reach 0.25.
+const MIN_DRAFT_VARIANCE: f64 = 0.1;
+/// Conditional acceptance below which a multi-token prediction draft cannot repay the
+/// head's LM-head projection: its logits are then skipped (its keys and values are still
+/// written) and the estimate recovers towards the pipeline-wide rate.
+pub const MTP_MIN_RATE: f64 = 0.3;
+/// Most decoding sequences of a pass for which draft-head drafts are computed. On the M1
+/// with Qwen3.5-0.8B they paid at one to four greedy sequences and lost at eight, where a
+/// one-draft verification doubles every projection's rows past the small-batch kernels
+/// (P8 report); the linear draft cost fit cannot see that step.
+pub const MTP_MAX_DECODES: usize = 4;
 /// Decode counts above this share one fit.
 const COST_BUCKETS: usize = 64;
 
@@ -391,8 +421,67 @@ pub fn plan(
     counts
 }
 
+/// Weight of one observation in a draft-head cost estimate.
+const HEAD_SMOOTHING: f64 = 0.2;
+/// Draft-head passes skipped as unprofitable before one computes drafts anyway, so the
+/// acceptance and cost estimates that decided it stay current. The interval doubles while
+/// exploring keeps finding no gain, up to the maximum.
+pub const HEAD_EXPLORE_PASSES: usize = 16;
+pub const HEAD_EXPLORE_MAX_PASSES: usize = 256;
+/// Predicted throughput gain head drafts must exceed. Within it, the draft cost fit (often
+/// learned from multi-token lookup drafts) cannot tell a gain from a loss.
+const HEAD_MARGIN: f64 = 1.05;
+
+/// Measured device seconds of draft-head passes that computed `n` drafts, by `n`. The
+/// head's LM-head projection is paid before any draft is verified, so its cost decides
+/// whether head drafts can raise throughput at all.
+#[derive(Clone, Debug, Default)]
+pub struct HeadCosts {
+    seconds: Vec<Option<f64>>,
+}
+
+impl HeadCosts {
+    /// Record a decode-sized head pass (one or a few positions per sequence) that computed
+    /// `drafts` drafts in `seconds`. Passes that also cover prefill positions cost more
+    /// and are not recorded.
+    pub fn record(&mut self, drafts: usize, seconds: f64) {
+        if drafts == 0 || !seconds.is_finite() || seconds < 0.0 {
+            return;
+        }
+        let bucket = drafts.min(COST_BUCKETS);
+        if self.seconds.len() <= bucket {
+            self.seconds.resize(bucket + 1, None);
+        }
+        let cell = &mut self.seconds[bucket];
+        *cell = Some(cell.map_or(seconds, |mean| HEAD_SMOOTHING.mul_add(seconds - mean, mean)));
+    }
+
+    /// Whether computing drafts for sequences with acceptance `rates` raises the expected
+    /// tokens per second of a pass of `decodes` decoding sequences by more than the margin,
+    /// given its drafted cost line. Unmeasured costs are worth measuring.
+    pub fn worthwhile(&self, rates: &[f64], decodes: usize, costs: &DraftCosts) -> bool {
+        let n = rates.len();
+        let head = self.seconds.get(n.min(COST_BUCKETS)).copied().flatten();
+        let (Some(head), Some((base, per_draft))) = (head, costs.line(decodes)) else {
+            return n > 0;
+        };
+        let gain: f64 = rates.iter().map(|r| r.clamp(0.0, 1.0)).sum();
+        let decodes = decodes as f64;
+        (decodes + gain) / per_draft.mul_add(n as f64, base + head) > HEAD_MARGIN * decodes / base
+    }
+}
+
+/// Where a sequence's drafts came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftSource {
+    /// The request's own history (prompt lookup).
+    Lookup,
+    /// The checkpoint's native multi-token prediction head.
+    Mtp,
+}
+
 /// Cumulative speculation counters.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SpeculationStats {
     /// Passes that verified at least one draft.
     pub passes: u64,
@@ -400,6 +489,12 @@ pub struct SpeculationStats {
     pub sequences: u64,
     pub drafted: u64,
     pub accepted: u64,
+    /// Of `drafted`/`accepted`, those from the multi-token prediction head.
+    pub mtp_drafted: u64,
+    pub mtp_accepted: u64,
+    /// Draft-head passes run between ordinary passes, and their device seconds.
+    pub mtp_passes: u64,
+    pub mtp_seconds: f64,
 }
 
 #[cfg(test)]
@@ -544,6 +639,21 @@ mod tests {
         costs.record(1, 0, 0.018);
         costs.record(1, 0, 0.018);
         assert!(costs.line(1).is_some());
+    }
+
+    #[test]
+    fn test_head_drafts_only_when_their_cost_repays_them() {
+        let costs = costs(4, 0.020, 0.0005);
+        let mut head = HeadCosts::default();
+        // Unmeasured: measure it.
+        assert!(head.worthwhile(&[0.7; 4], 4, &costs));
+        // A 6 ms head beside a 20 ms pass: 70% acceptance across four sequences pays.
+        head.record(4, 0.006);
+        assert!(head.worthwhile(&[0.7; 4], 4, &costs));
+        // The same head for a single unlikely draft does not.
+        head.record(1, 0.006);
+        assert!(!head.worthwhile(&[0.2], 4, &costs));
+        assert!(!head.worthwhile(&[], 4, &costs));
     }
 
     #[test]

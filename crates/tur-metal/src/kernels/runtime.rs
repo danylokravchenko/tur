@@ -54,6 +54,9 @@ const FUNCTIONS: &[&str] = &[
     "moe_gemm_f32",
     "moe_gemm_q8_0",
     "moe_gemm_q4k",
+    "moe_gemm_wide_f32",
+    "moe_gemm_wide_q8_0",
+    "moe_gemm_wide_q4k",
     "rms_norm_f32",
     "add_rms_norm_f32",
     "qk_norm_rope_f32",
@@ -100,6 +103,8 @@ const FUNCTIONS: &[&str] = &[
     "qmv_q8_0_b8_f32",
     "qmm_q8_0_t1_f32",
     "qmm_q8_0_t2_f32",
+    "qmm_q4k_t1_f32",
+    "qmm_q4k_t2_f32",
     "delta_scan_r2_f32",
     "delta_scan_r2_f16",
     "delta_scan_r2_bf16",
@@ -212,9 +217,10 @@ pub struct Tuning {
     /// Candle's one-row GEMV or tiled GEMM.
     pub gemv_q8_0_rows: (usize, usize),
     pub gemv_q4k_rows: (usize, usize),
-    /// Inclusive row counts served by the small-batch `Q8_0` matrix-unit kernel, which
-    /// takes precedence over the GEMV range; at most 16.
+    /// Inclusive row counts served by the small-batch matrix-unit kernels, which take
+    /// precedence over the GEMV ranges; at most 16.
     pub qmm_q8_0_rows: (usize, usize),
+    pub qmm_q4k_rows: (usize, usize),
     /// Single-token recurrent sequences use the coalesced step kernel instead of the scan.
     pub delta_step: bool,
 }
@@ -236,10 +242,14 @@ impl Tuning {
             // Measured crossovers on M1 (P4 and P6 kernel artifacts): Candle's one-row GEMV
             // wins at one row. For Q8_0 the custom GEMV wins at 2–3 rows and the
             // matrix-unit kernel from 4 (1.3–2.6× at 5–8 rows, F32 parity with Candle's
-            // F16-tile GEMM at 16). Q4K uses Candle's tiled GEMM from 5 rows.
+            // F16-tile GEMM at 16). Q4K uses its GEMV at 2–3 rows and its matrix-unit
+            // kernel at 4–16: 1.6–2.0× faster than Candle's F16-staged tiles at 4–8 rows and
+            // 10–25% slower at 16, kept for F32 precision so that small batches and
+            // verification windows compute what single-token decoding does (P8 artifact).
             gemv_q8_0_rows: (2, 3),
             gemv_q4k_rows: (2, 4),
             qmm_q8_0_rows: (4, 16),
+            qmm_q4k_rows: (4, 16),
             delta_step: true,
         }
     }

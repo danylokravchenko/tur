@@ -30,6 +30,10 @@ pub(super) struct Rope {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "mirrors the checkpoint's JSON settings field for field"
+)]
 pub(super) struct TextConfig {
     pub model_type: String,
     pub hidden_size: usize,
@@ -55,6 +59,11 @@ pub(super) struct TextConfig {
     #[serde(default)]
     pub output_gate_type: Option<String>,
     pub tie_word_embeddings: bool,
+    /// Native multi-token prediction layers shipped beside the text tower.
+    #[serde(default)]
+    pub mtp_num_hidden_layers: usize,
+    #[serde(default)]
+    pub mtp_use_dedicated_embeddings: bool,
     pub layer_types: Vec<LayerKind>,
     pub rope_parameters: Rope,
     #[serde(default)]
@@ -96,6 +105,8 @@ struct RawGeneration {
 pub struct Config {
     pub(super) text: TextConfig,
     pub(super) moe: Option<MoeConfig>,
+    /// Load and run the native multi-token prediction head ([`Config::with_mtp`]).
+    pub(super) mtp: bool,
     pub(super) prefix: String,
     forbidden_tokens: Vec<u32>,
     eos: Vec<u32>,
@@ -315,6 +326,7 @@ impl Config {
         let config = Self {
             text,
             moe,
+            mtp: false,
             prefix: prefix.into(),
             forbidden_tokens,
             eos,
@@ -427,6 +439,29 @@ impl Config {
         &self.text.layer_types
     }
 
+    /// Whether the checkpoint declares a native multi-token prediction head this
+    /// implementation can run: one dense full-attention layer sharing the embedding.
+    pub fn supports_mtp(&self) -> bool {
+        self.text.mtp_num_hidden_layers == 1
+            && !self.text.mtp_use_dedicated_embeddings
+            && self.moe.is_none()
+    }
+
+    /// Also load the `mtp.*` head, whose attention keys and values add one state layer.
+    pub fn with_mtp(self) -> Result<Self> {
+        if !self.supports_mtp() {
+            return Err(invalid(
+                "checkpoint has no supported MTP head (one dense layer, shared embedding)",
+            ));
+        }
+        Ok(Self { mtp: true, ..self })
+    }
+
+    /// Whether the multi-token prediction head is loaded.
+    pub fn mtp(&self) -> bool {
+        self.mtp
+    }
+
     pub(super) fn key_width(&self) -> Result<usize> {
         checked_elements(&[
             self.text.linear_num_key_heads,
@@ -487,10 +522,22 @@ impl Config {
                     },
                 })
             })
-            .collect::<Result<_>>()?;
+            .collect::<Result<Vec<_>>>()?;
+        let mut layers = layers;
+        if self.mtp {
+            // The head's own attention keys and values, after every text layer.
+            layers.push(LayerStateKind::Attention {
+                kv_heads: t.num_key_value_heads,
+                head_dim: t.head_dim,
+            });
+        }
         Ok(ModelDescription {
             identity: ModelIdentity {
-                revision,
+                revision: if self.mtp {
+                    format!("{revision}+mtp")
+                } else {
+                    revision
+                },
                 state_format: 1,
             },
             layers,
@@ -605,6 +652,44 @@ impl Config {
             };
             for (n, shape) in entries {
                 shapes.insert(format!("{p}.{module}.{n}"), shape);
+            }
+        }
+        if self.mtp {
+            let h = t.hidden_size;
+            let p = "mtp.layers.0";
+            for (name, shape) in [
+                (
+                    "mtp.fc.weight".to_owned(),
+                    vec![h, checked_elements(&[2, h])?],
+                ),
+                ("mtp.pre_fc_norm_embedding.weight".into(), vec![h]),
+                ("mtp.pre_fc_norm_hidden.weight".into(), vec![h]),
+                ("mtp.norm.weight".into(), vec![h]),
+                (format!("{p}.input_layernorm.weight"), vec![h]),
+                (format!("{p}.post_attention_layernorm.weight"), vec![h]),
+                (
+                    format!("{p}.self_attn.q_proj.weight"),
+                    vec![checked_elements(&[2, q])?, h],
+                ),
+                (format!("{p}.self_attn.k_proj.weight"), vec![kv, h]),
+                (format!("{p}.self_attn.v_proj.weight"), vec![kv, h]),
+                (format!("{p}.self_attn.o_proj.weight"), vec![h, q]),
+                (format!("{p}.self_attn.q_norm.weight"), vec![t.head_dim]),
+                (format!("{p}.self_attn.k_norm.weight"), vec![t.head_dim]),
+                (
+                    format!("{p}.mlp.gate_proj.weight"),
+                    vec![t.intermediate_size, h],
+                ),
+                (
+                    format!("{p}.mlp.up_proj.weight"),
+                    vec![t.intermediate_size, h],
+                ),
+                (
+                    format!("{p}.mlp.down_proj.weight"),
+                    vec![h, t.intermediate_size],
+                ),
+            ] {
+                shapes.insert(name, shape);
             }
         }
         for shape in shapes.values() {
@@ -757,6 +842,38 @@ mod tests {
         let mut raw: serde_json::Value = serde_json::from_str(SMALL)?;
         raw["text_config"]["rope_parameters"]["mrope_section"] = serde_json::json!([10, 11, 10]);
         assert!(Config::from_json(&raw.to_string()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_mtp_head_adds_its_tensors_and_one_attention_state_layer() -> Result<()> {
+        let config = Config::from_json(SMALL)?;
+        assert!(config.supports_mtp() && !config.mtp());
+        let plain = config.description("r".into(), KvLayout::new(16, KvFormat::F16), DType::F32)?;
+        let with = config.clone().with_mtp()?;
+        let description =
+            with.description("r".into(), KvLayout::new(16, KvFormat::F16), DType::F32)?;
+        assert_eq!(description.layers.len(), plain.layers.len() + 1);
+        assert!(matches!(
+            description.layers.last(),
+            Some(LayerStateKind::Attention { .. })
+        ));
+        assert_ne!(description.identity, plain.identity);
+        let shapes = with.weight_shapes()?;
+        assert_eq!(shapes.keys().filter(|n| n.starts_with("mtp.")).count(), 15);
+        assert!(
+            !config
+                .weight_shapes()?
+                .keys()
+                .any(|n| n.starts_with("mtp."))
+        );
+        // No head declared, or dedicated embeddings: no MTP.
+        let mut raw: serde_json::Value = serde_json::from_str(SMALL)?;
+        raw["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(0);
+        assert!(Config::from_json(&raw.to_string())?.with_mtp().is_err());
+        raw["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
+        raw["text_config"]["mtp_use_dedicated_embeddings"] = serde_json::json!(true);
+        assert!(Config::from_json(&raw.to_string())?.with_mtp().is_err());
         Ok(())
     }
 }

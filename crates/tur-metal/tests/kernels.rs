@@ -223,9 +223,27 @@ fn test_grouped_expert_gemm_preserves_routing_skew_ties_and_packed_weights() -> 
                         );
                     }
                 }
+                // Groups above sixteen rows stage weights as F16, like dense projections.
+                let mut sizes = vec![0; experts];
+                for t in 0..tokens {
+                    let mut chosen: Vec<_> = (0..experts).collect();
+                    chosen.sort_unstable_by(|&a, &b| {
+                        scores[t * experts + b]
+                            .total_cmp(&scores[t * experts + a])
+                            .then(a.cmp(&b))
+                    });
+                    for &e in &chosen[..top_k] {
+                        sizes[e] += 1;
+                    }
+                }
+                let bound = if sizes.iter().any(|&n| n > 16) {
+                    2e-3
+                } else {
+                    2e-5
+                };
                 let error = relative_error(&read(&output)?, &expected);
                 assert!(
-                    error < 2e-5,
+                    error < bound,
                     "{format:?}, {tokens} tokens, skew {skewed}: {error}"
                 );
                 let with_shared: Vec<f64> = expected
@@ -237,7 +255,7 @@ fn test_grouped_expert_gemm_preserves_routing_skew_ties_and_packed_weights() -> 
                     })
                     .collect();
                 let error = relative_error(&combined, &with_shared);
-                assert!(error < 2e-5, "shared {format:?}, {tokens} tokens: {error}");
+                assert!(error < bound, "shared {format:?}, {tokens} tokens: {error}");
             }
         }
     }
@@ -1128,15 +1146,17 @@ fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<
 fn test_gemv_matches_dequantized_reference_for_every_batch_size() -> Result<()> {
     let (device, kernels, _gpu) = setup()?;
     // Exercise the GEMV at every row count it supports, and separately the small-batch
-    // matrix kernel at every row count it supports (Q8_0 only).
+    // matrix kernel at every row count it supports.
     let gemv = kernels.clone().with_tuning(Tuning {
         gemv_q8_0_rows: (1, 8),
         gemv_q4k_rows: (1, 8),
         qmm_q8_0_rows: (16, 16),
+        qmm_q4k_rows: (16, 16),
         ..kernels.tuning()
     })?;
     let qmm = kernels.clone().with_tuning(Tuning {
         qmm_q8_0_rows: (1, 16),
+        qmm_q4k_rows: (1, 16),
         ..kernels.tuning()
     })?;
     // 37 outputs leave partial column tiles; 512 inputs give 16 blocks to split.
@@ -1164,26 +1184,28 @@ fn test_gemv_matches_dequantized_reference_for_every_batch_size() -> Result<()> 
                 })
                 .collect();
             let input = upload(&device, &x, &[rows, k])?;
-            if rows <= 9 {
+            if rows <= 8 {
                 let error = relative_error(&read(&gemv.linear(&layer, &input)?)?, &expected);
-                // Above the GEMV range Candle's tiled GEMM stages weight tiles as F16.
-                let bound = if rows <= 8 { 1e-5 } else { 2e-3 };
-                assert!(error < bound, "{format:?} rows {rows}: {error}");
+                assert!(error < 1e-5, "{format:?} rows {rows}: {error}");
             }
-            if format == GgmlDType::Q8_0 {
-                let error = relative_error(&read(&qmm.linear(&layer, &input)?)?, &expected);
-                assert!(error < 1e-5, "matrix kernel rows {rows}: {error}");
-                // Strided rows read in place: every other row of a wider tensor.
-                let doubled: Vec<f32> = x
-                    .chunks(k)
-                    .flat_map(|r| r.iter().chain(r))
-                    .copied()
-                    .collect();
-                let wide = upload(&device, &doubled, &[rows, 2 * k])?;
-                let strided = wide.narrow(1, k, k)?;
-                let error = relative_error(&read(&qmm.linear(&layer, &strided)?)?, &expected);
-                assert!(error < 1e-5, "strided matrix kernel rows {rows}: {error}");
-            }
+            let error = relative_error(&read(&qmm.linear(&layer, &input)?)?, &expected);
+            assert!(
+                error < 1e-5,
+                "{format:?} matrix kernel rows {rows}: {error}"
+            );
+            // Strided rows read in place: every other row of a wider tensor.
+            let doubled: Vec<f32> = x
+                .chunks(k)
+                .flat_map(|r| r.iter().chain(r))
+                .copied()
+                .collect();
+            let wide = upload(&device, &doubled, &[rows, 2 * k])?;
+            let strided = wide.narrow(1, k, k)?;
+            let error = relative_error(&read(&qmm.linear(&layer, &strided)?)?, &expected);
+            assert!(
+                error < 1e-5,
+                "{format:?} strided matrix kernel rows {rows}: {error}"
+            );
         }
     }
     Ok(())

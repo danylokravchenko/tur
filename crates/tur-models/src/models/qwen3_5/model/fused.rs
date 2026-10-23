@@ -8,7 +8,7 @@
 //! format) and reads every key in place through one page table shared by all layers; no
 //! committed key is copied.
 
-use super::{Attention, Config, DeltaNet, Dims, LayerKind, Mixer, Mlp, Pass, Qwen35};
+use super::{Attention, Config, DeltaNet, Dims, LayerKind, Mixer, Mlp, MtpHead, Pass, Qwen35};
 use crate::hybrid::PackedForward;
 use candle_core::{DType, Tensor};
 use tur_core::{
@@ -89,13 +89,14 @@ impl Qwen35 {
 }
 
 impl Qwen35 {
-    /// Fused body of [`Qwen35::run`]: returns logits for `pass.rows` and writes state.
+    /// Fused body of [`Qwen35::run`]: returns logits for `pass.rows`, and every row's final
+    /// hidden state when `pass.hidden`, and writes state.
     pub(super) fn run_fused(
         &self,
         fused: &Fused,
         pass: &Pass<'_, '_>,
         mut trace: Option<&mut Vec<Tensor>>,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let k = &fused.kernels;
         let d = self.dims;
         let positions = pass
@@ -173,6 +174,55 @@ impl Qwen35 {
                 trace.push(x.clone());
             }
         }
+        let hidden = pass.hidden.then(|| h.clone());
+        if pass.rows.is_empty() {
+            let empty = Tensor::zeros((0, self.description.vocab_size), DType::F32, &self.device)?;
+            return Ok((empty, hidden));
+        }
+        let rows = Tensor::new(pass.rows.as_slice(), &self.device)?;
+        Ok((k.linear(&self.lm_head, &h.index_select(&rows, 0)?)?, hidden))
+    }
+
+    /// Fused draft-head pass: logits for `pass.rows`; writes the head's keys and values.
+    pub(super) fn draft_fused(
+        &self,
+        fused: &Fused,
+        mtp: &MtpHead,
+        pass: &Pass<'_, '_>,
+        hidden: &Tensor,
+    ) -> Result<Tensor> {
+        let k = &fused.kernels;
+        let d = self.dims;
+        let Mixer::Attention(a) = &mtp.layer.mixer else {
+            return Err(invalid("draft head layer is not attention"));
+        };
+        let positions = pass
+            .positions
+            .iter()
+            .map(|&p| u32::try_from(p))
+            .collect::<std::result::Result<Vec<u32>, _>>()
+            .map_err(|_| invalid("position exceeds u32"))?;
+        let positions = Tensor::new(positions.as_slice(), &self.device)?;
+        let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
+        let embedded = self.embed.index_select(&ids, 0)?.to_dtype(DType::F32)?;
+        let joined = Tensor::cat(
+            &[
+                k.rms_norm(&embedded, &mtp.embedding_norm, d.eps)?,
+                k.rms_norm(hidden, &mtp.hidden_norm, d.eps)?,
+            ],
+            1,
+        )?;
+        let x = k.linear(&mtp.fc, &joined)?;
+        let h = k.rms_norm(&x, &mtp.layer.input_norm, d.eps)?;
+        let paging = fused.paging(self, pass)?;
+        let mixed =
+            self.fused_attention(fused, a, &h, &positions, pass, &paging, self.layers.len())?;
+        let (sum, normed) = k.add_rms_norm(&x, &mixed, &mtp.layer.post_norm, d.eps)?;
+        let Mlp::Dense(mlp) = &mtp.layer.mlp else {
+            return Err(invalid("draft head MLP is not dense"));
+        };
+        let out = k.linear(&mlp.down, &k.swiglu(&k.linear(&mlp.gate_up, &normed)?)?)?;
+        let (_, h) = k.add_rms_norm(&sum, &out, &mtp.norm, d.eps)?;
         if pass.rows.is_empty() {
             return Ok(Tensor::zeros(
                 (0, self.description.vocab_size),

@@ -33,6 +33,7 @@ fn load(path: &Path, device: &Device, format: WeightFormat) -> Result<Qwen35> {
             execution: Execution::Fused,
             kv: KvLayout::new(16, KvFormat::F32),
             recurrent: DType::F32,
+            mtp: false,
         },
     )
 }
@@ -168,6 +169,7 @@ fn test_moe_fused_packed_prefill_decode_and_rollback_match_reference() -> Result
                 execution: Execution::Reference,
                 kv: KvLayout::new(16, KvFormat::F32),
                 recurrent: DType::F32,
+                mtp: false,
             },
             32,
             &[32],
@@ -178,8 +180,7 @@ fn test_moe_fused_packed_prefill_decode_and_rollback_match_reference() -> Result
 }
 
 /// Verification logits of a `window`-token draft against decoding the same tokens one at
-/// a time. Windows beyond the custom GEMV range run Candle's F16-staged tiles for Q4K, a
-/// different numerical path than single-token decoding; this bounds the resulting drift.
+/// a time, inside and beyond the Q4K GEMV range.
 #[cfg(feature = "metal")]
 #[test]
 fn test_verification_windows_bound_drift_from_sequential_decoding() -> Result<()> {
@@ -199,24 +200,15 @@ fn test_verification_windows_bound_drift_from_sequential_decoding() -> Result<()
             let (_, base) = common::prefill(&model, ModelState::new(&pool), &ids[..start], 7)?;
             let (mut steps, reservations) =
                 common::forward(&model, &[(&base, draft, Boundaries::EveryToken)])?;
-            let verified = common::rows(
-                &steps
-                    .pop()
-                    .ok_or_else(|| invalid("missing step"))??
-                    .logits,
-            )?;
+            let verified =
+                common::rows(&steps.pop().ok_or_else(|| invalid("missing step"))??.logits)?;
             drop(reservations);
             let (sequential, _) = common::prefill(&model, base, draft, 1)?;
             let error = max_relative(&verified, &sequential);
-            // Same F32 kernels as decoding inside the Q4K GEMV range (2–4 rows) and for
-            // F32/Q8_0. Beyond it Q4K projections use Candle's F16-staged tiles, as batched
-            // Q4K decoding of as many rows does, and close routing decisions can flip: about
-            // 1.1e-2 measured on this fixture (Apple M1).
-            let bound = if window > 4 && format == WeightFormat::Q4K {
-                2e-2
-            } else {
-                2e-4
-            };
+            // Every row count up to 16 stays on F32 GEMV or matrix-unit kernels, so a
+            // verification window computes what one-at-a-time decoding does. (Before Q4K had
+            // a matrix-unit kernel, 5–16 rows used Candle's F16-staged tiles: 1.1e-2 here.)
+            let bound = 2e-4;
             assert!(error < bound, "{format:?} window {window}: {error}");
         }
     }

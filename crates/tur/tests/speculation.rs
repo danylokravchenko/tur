@@ -317,3 +317,115 @@ fn test_decodes_draft_beside_a_prefill_and_match_plain_decoding() -> Result<()> 
     assert!(mixed_drafts, "no pass drafted beside a prefill");
     Ok(())
 }
+
+/// Lookup needs eight-token matches, which the random fixtures' text rarely repeats, so the
+/// head drafts.
+fn mtp_config(drafts: usize, batch: usize) -> PipelineConfig {
+    PipelineConfig {
+        prefix: PrefixConfig::DISABLED,
+        speculation: SpeculationConfig {
+            min_ngram: 8,
+            max_ngram: 8,
+            ..SpeculationConfig::with_mtp(drafts)
+        },
+        ..PipelineConfig::new(batch, 16)
+    }
+}
+
+/// Multi-token prediction drafts verified by the target: whatever the (random) head
+/// predicts, outputs equal ordinary decoding, and every page and slot is returned.
+fn assert_mtp_preserves_outputs(factory: &tur::ModelFactory) -> Result<()> {
+    let mut plain = InferencePipeline::new(factory, config(0, 1))?;
+    let mut drafted = InferencePipeline::new(factory, mtp_config(4, 1))?;
+    // Novel token sequences give prompt lookup nothing, so the head drafts.
+    let prompt = (2..40)
+        .map(|t| format!("t{t}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for sampling in [
+        SamplingOptions::default(),
+        SamplingOptions {
+            temperature: Some(0.8),
+            top_k: Some(8),
+            top_p: Some(0.95),
+            repetition_penalty: Some(1.2),
+            ..SamplingOptions::default()
+        },
+    ] {
+        for (seed, limit) in [(0, 1), (1, 7), (2, 33)] {
+            let mut request = GenerationRequest::new(prompt.clone(), limit);
+            request.sampling = sampling;
+            request.seed = seed;
+            assert_eq!(
+                drafted.run(&request, |_| {})?.generated_text,
+                plain.run(&request, |_| {})?.generated_text,
+                "seed {seed}, limit {limit}"
+            );
+        }
+    }
+    let stats = drafted.speculation_stats();
+    assert!(stats.mtp_passes > 0 && stats.mtp_drafted > 0, "{stats:?}");
+    let usage = drafted.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn test_mtp_drafts_preserve_target_sampling_and_release_state() -> Result<()> {
+    let fixture = Checkpoint::random_mtp()?;
+    assert_mtp_preserves_outputs(&fixture.factory())
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn test_fused_mtp_drafts_preserve_target_sampling() -> Result<()> {
+    let fixture = Checkpoint::fused_mtp()?;
+    let mut factory = fixture.factory();
+    factory.device = candle_core::Device::new_metal(0)?;
+    factory.format = tur::models::qwen3_5::WeightFormat::Q8_0;
+    assert_mtp_preserves_outputs(&factory)
+}
+
+#[test]
+fn test_mtp_needs_a_head_and_no_prefix_reuse() -> Result<()> {
+    let with_head = Checkpoint::random_mtp()?;
+    let mut prefix = mtp_config(4, 1);
+    prefix.prefix = PipelineConfig::new(1, 16).prefix;
+    assert!(InferencePipeline::new(&with_head.factory(), prefix).is_err());
+    let without_head = Checkpoint::random()?;
+    assert!(InferencePipeline::new(&without_head.factory(), mtp_config(4, 1)).is_err());
+    // The head's keys and values are one more state layer of the plan.
+    let plain = InferencePipeline::new(&with_head.factory(), config(4, 1))?;
+    let drafted = InferencePipeline::new(&with_head.factory(), mtp_config(4, 1))?;
+    assert!(drafted.memory_plan().weights > plain.memory_plan().weights);
+    Ok(())
+}
+
+#[test]
+fn test_preempted_mtp_requests_recompute_the_head_and_match_plain_decoding() -> Result<()> {
+    let fixture = Checkpoint::random_mtp()?;
+    let request = GenerationRequest::new("t10 t11 t12 t13 t14".into(), 20);
+    let expected = InferencePipeline::new(&fixture.factory(), config(0, 1))?
+        .run(&request, |_| {})?
+        .generated_text;
+    let mut cfg = mtp_config(4, 2);
+    let usage = InferencePipeline::new(&fixture.factory(), cfg)?.memory()?;
+    cfg.state_bytes = Some((usage.slots.capacity + 1) * usage.slot_bytes + 2 * usage.page_bytes);
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), cfg)?;
+    for _ in 0..2 {
+        pipeline.submit_request(&request)?;
+    }
+    let mut preemptions = 0;
+    while pipeline.active_request_count() > 0 {
+        for (_, result) in pipeline.step_streaming()?.completed {
+            let stats = result?;
+            assert_eq!(stats.generated_text, expected);
+            preemptions += stats.preemptions;
+        }
+    }
+    assert!(preemptions > 0, "the pool never forced a preemption");
+    assert!(pipeline.speculation_stats().mtp_passes > 0);
+    let usage = pipeline.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+    Ok(())
+}

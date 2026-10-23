@@ -65,6 +65,7 @@ fn load(dir: &Path, format: WeightFormat, device: Device) -> Result<Arc<Qwen35>>
             execution: Execution::Fused,
             kv: EXACT_KV,
             recurrent: candle_core::DType::F32,
+            mtp: false,
         },
     )?))
 }
@@ -384,6 +385,7 @@ fn real(format: WeightFormat) -> Result<Real> {
             execution: Execution::Fused,
             kv: EXACT_KV,
             recurrent: candle_core::DType::F32,
+            mtp: false,
         },
     )?);
     let generation = std::fs::read_to_string(dir.join("generation_config.json")).ok();
@@ -518,6 +520,112 @@ fn test_quantized_generation_is_coherent() -> Result<()> {
             2 * prefix >= expected.len(),
             "{format:?} diverged after {prefix} tokens"
         );
+    }
+    Ok(())
+}
+
+/// The native MTP head against `scripts/qwen3_5_mtp_reference.py`: the backbone's final
+/// hidden states of a greedy continuation, then the head over consecutive segments ending at
+/// each golden row, so its own keys and values accumulate exactly as they do while serving.
+#[test]
+#[ignore = "needs TUR_QWEN35_0_8B and TUR_QWEN35_MTP_GOLDEN"]
+fn test_mtp_head_matches_transformers_reference() -> Result<()> {
+    use tur_models::hybrid::{
+        Boundaries, DraftForward, DraftSequence, PackedForward, SequenceForward, StatePool,
+    };
+    let dir = env_path("TUR_QWEN35_0_8B")?;
+    let golden = candle_core::safetensors::load(env_path("TUR_QWEN35_MTP_GOLDEN")?, &Device::Cpu)?;
+    let get = |n: &str| golden.get(n).ok_or_else(|| invalid(format!("golden {n}")));
+    let tokens = i64_ids(get("tokens")?)?;
+    let rows: Vec<usize> = i64_ids(get("logit_rows")?)?
+        .into_iter()
+        .map(|r| r as usize)
+        .collect();
+    let expected = get("logits")?.to_vec2::<f32>()?;
+    let argmax = i64_ids(get("argmax")?)?;
+    let count = tokens.len() - 1;
+    for execution in [Execution::Fused, Execution::Reference] {
+        let model = Qwen35::load(
+            &dir,
+            &LoadOptions {
+                revision: "Qwen/Qwen3.5-0.8B@2fc06364".into(),
+                format: WeightFormat::F32,
+                device: device()?,
+                execution,
+                kv: EXACT_KV,
+                recurrent: candle_core::DType::F32,
+                mtp: true,
+            },
+        )?;
+        let description = model.description();
+        let pool = StatePool::new(
+            Arc::new(description.clone()),
+            model.device(),
+            PoolConfig {
+                pages: description.pages_for(count),
+                recurrent_slots: 2,
+            },
+        )?;
+        let mut reservation = ModelState::new(&pool).reserve(count, Boundaries::Final)?;
+        reservation.prepare()?;
+        let binding = reservation.binding();
+        let positions: Vec<usize> = (0..count).collect();
+        let mut steps = model.forward(&PackedForward {
+            tokens: &tokens[..count],
+            positions: &positions,
+            sequences: &[SequenceForward {
+                tokens: 0..count,
+                state: &binding,
+                logits: &[],
+                hidden: true,
+            }],
+            pool: &pool,
+        })?;
+        let hidden = steps
+            .pop()
+            .ok_or_else(|| invalid("missing step"))??
+            .hidden
+            .ok_or_else(|| invalid("missing hidden states"))?;
+        let state = reservation.commit(count)?;
+        drop(reservation);
+        let (mut actual, mut start) = (Vec::new(), 0);
+        for &row in &rows {
+            let len = row + 1 - start;
+            let side = state.side(start, len)?;
+            let logits = model
+                .draft(&DraftForward {
+                    tokens: &tokens[start + 1..row + 2],
+                    positions: &positions[start..=row],
+                    sequences: &[DraftSequence {
+                        tokens: 0..len,
+                        state: &side,
+                        hidden: &hidden.narrow(0, start, len)?,
+                        logits: true,
+                    }],
+                    pool: &pool,
+                })?
+                .pop()
+                .ok_or_else(|| invalid("missing draft"))??
+                .ok_or_else(|| invalid("missing draft logits"))?;
+            let row_logits = logits.to_vec2::<f32>()?.remove(0);
+            let best = row_logits
+                .iter()
+                .enumerate()
+                .fold(
+                    (0, f32::NEG_INFINITY),
+                    |b, (i, &v)| if v > b.1 { (i, v) } else { b },
+                )
+                .0;
+            assert_eq!(best as u32, argmax[row], "{execution:?} row {row} argmax");
+            actual.push(row_logits);
+            start = row + 1;
+        }
+        let error = max_relative(&actual, &expected);
+        eprintln!(
+            "MTP {execution:?}: max relative logit error {error:.2e} over {} rows",
+            rows.len()
+        );
+        assert!(error < 1e-4, "{execution:?}: {error}");
     }
     Ok(())
 }

@@ -83,6 +83,26 @@ impl Checkpoint {
         Self::random_config(&config.to_string())
     }
 
+    /// [`Self::random`] with a random native multi-token prediction head.
+    pub fn random_mtp() -> Result<Self> {
+        let config = TINY.replace(r#", "image_token_id": 94"#, "").replace(
+            r#""num_hidden_layers": 4,"#,
+            r#""num_hidden_layers": 4, "mtp_num_hidden_layers": 1,"#,
+        );
+        Self::random_config(&config)
+    }
+
+    /// [`Self::fused`] with a random native multi-token prediction head.
+    #[cfg(feature = "metal")]
+    pub fn fused_mtp() -> Result<Self> {
+        let fixture = Self::fused()?;
+        let path = fixture.0.join("config.json");
+        let mut config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        config["mtp_num_hidden_layers"] = serde_json::json!(1);
+        drop(fixture);
+        Self::random_config(&config.to_string())
+    }
+
     fn random_config(config: &str) -> Result<Self> {
         Self::write(config, |name, count, seed| {
             let scale = if name.contains("norm") { 0.1 } else { 0.5 };
@@ -96,6 +116,11 @@ impl Checkpoint {
         let fixture = Self(dir);
         std::fs::write(fixture.0.join("config.json"), config)?;
         let parsed = Config::from_json(config)?;
+        let parsed = if parsed.supports_mtp() {
+            parsed.with_mtp()?
+        } else {
+            parsed
+        };
         let mut tensors = HashMap::new();
         for (seed, (name, shape)) in parsed.weight_shapes()?.into_iter().enumerate() {
             let values = weights(&name, shape.iter().product(), seed as u64 + 1);
@@ -138,6 +163,7 @@ impl Checkpoint {
             // 16-dimension heads take unscaled formats only.
             kv: KvLayout::new(16, KvFormat::F32),
             recurrent: DType::F32,
+            mtp: false,
         }
     }
 }

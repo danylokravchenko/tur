@@ -17,6 +17,7 @@
 //! `TUR_BENCH_WORKLOADS=arrivals TUR_BENCH_RATE=2,4` runs open-loop Poisson arrivals, and
 //! `TUR_BENCH_WORKLOADS=grammar` grammar-constrained requests.
 //! `TUR_BENCH_WORKLOADS=speculation TUR_BENCH_DRAFT=0,4` compares adaptive prompt lookup
+//! (`TUR_BENCH_MTP=1` adds the native MTP head to drafted configurations)
 //! with ordinary decoding, including acceptance counters, memory and exact token IDs.
 
 use serde_json::{Value, json};
@@ -505,6 +506,7 @@ fn main() -> Result<()> {
         recurrent: std::env::var("TUR_BENCH_STATE")
             .map_or(Ok(DEFAULT_RECURRENT_STATE), |s| parse_recurrent_state(&s))
             .map_err(TurError::Other)?,
+        mtp: false,
     };
     let max = concurrency.iter().copied().max().unwrap_or(1);
     let mut runs = Vec::new();
@@ -622,12 +624,18 @@ fn main() -> Result<()> {
             .first()
             .copied()
             .unwrap_or(3);
+        let mtp = std::env::var("TUR_BENCH_MTP").is_ok_and(|v| v == "1");
         for draft in env_sizes("TUR_BENCH_DRAFT", "0,4")? {
             for &count in &concurrency {
                 let mut config = PipelineConfig::new(count, CHUNK);
                 config.prefix = PrefixConfig::DISABLED;
                 config.device_sampling = device_sampling;
-                config.speculation = SpeculationConfig::new(draft);
+                let with_mtp = mtp && draft > 0;
+                config.speculation = if with_mtp {
+                    SpeculationConfig::with_mtp(draft)
+                } else {
+                    SpeculationConfig::new(draft)
+                };
                 let mut pipeline = InferencePipeline::new(&factory, config)?;
                 for workload in ["repeat", "novel"] {
                     let requests: Vec<_> = (0..count).map(|i| {
@@ -645,11 +653,16 @@ fn main() -> Result<()> {
                     for repeat in 0..repeats {
                         let result = run_requests(&mut pipeline, &requests)?;
                         report(
-                            &format!("speculation {workload} c={count} draft={draft}"),
+                            &format!(
+                                "speculation {workload} c={count} draft={draft}{}",
+                                if with_mtp { "+mtp" } else { "" }
+                            ),
                             &result,
                         );
                         let memory = pipeline.memory_plan();
+                        let stats = pipeline.speculation_stats();
                         runs.push(json!({"workload": workload, "concurrency": count, "draft": draft, "repeat": repeat,
+                            "mtp": with_mtp, "speculation_totals": format!("{stats:?}"),
                             "resident_bytes": memory.resident(), "state_pool_bytes": memory.state_pool, "draft_slots": memory.draft_slots,
                             "cost_fit_seconds": pipeline.draft_costs().line(count),
                             "result": result}));

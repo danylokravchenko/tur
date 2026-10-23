@@ -10,7 +10,8 @@ use super::{
     weights::{Checkpoint, Split},
 };
 use crate::hybrid::{
-    Addresses, Boundaries, HybridModel, PackedForward, SequenceForward, SequenceStep, StatePool,
+    Addresses, Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward,
+    SequenceForward, SequenceStep, StatePool,
 };
 use candle_core::{DType, Device, Tensor, quantized::GgmlDType};
 use std::{path::Path, sync::Arc};
@@ -107,6 +108,8 @@ pub struct LoadOptions {
     pub kv: KvLayout,
     /// Storage of recurrent matrix state (F32, F16 or BF16); part of the state identity.
     pub recurrent: DType,
+    /// Load the checkpoint's native multi-token prediction head ([`Config::with_mtp`]).
+    pub mtp: bool,
 }
 
 struct Attention {
@@ -235,8 +238,21 @@ pub struct Qwen35 {
     shares_embedding: bool,
     norm: Tensor,
     layers: Vec<Layer>,
+    mtp: Option<MtpHead>,
     #[cfg(feature = "metal")]
     fused: Option<fused::Fused>,
+}
+
+/// Native multi-token prediction head: `fc` joins the normalized embedding of the next
+/// token with the normalized final hidden state, then one full-attention decoder layer
+/// and a final norm feed the shared LM head. Its keys and values are the state layer
+/// after every text layer.
+struct MtpHead {
+    fc: PackedLinear,
+    embedding_norm: Tensor,
+    hidden_norm: Tensor,
+    layer: Layer,
+    norm: Tensor,
 }
 
 /// One live sequence's rows within the packed hidden states and its resolved state.
@@ -256,6 +272,31 @@ fn linear(weight: &Tensor, format: WeightFormat, device: &Device) -> Result<Pack
         WeightFormat::Q8_0 => PackedLinear::quantized(weight, GgmlDType::Q8_0, device),
         WeightFormat::Q4K => PackedLinear::quantized(weight, GgmlDType::Q4K, device),
     }
+}
+
+fn load_attention(
+    tensors: &mut Tensors,
+    a: &str,
+    format: WeightFormat,
+    device: &Device,
+) -> Result<Attention> {
+    let k = tensors.take(&format!("{a}.k_proj.weight"))?;
+    let v = tensors.take(&format!("{a}.v_proj.weight"))?;
+    Ok(Attention {
+        q: linear(
+            &tensors.take(&format!("{a}.q_proj.weight"))?,
+            format,
+            device,
+        )?,
+        kv: linear(&Tensor::cat(&[k, v], 0)?, format, device)?,
+        o: linear(
+            &tensors.take(&format!("{a}.o_proj.weight"))?,
+            format,
+            device,
+        )?,
+        q_norm: centred(&tensors.take(&format!("{a}.q_norm.weight"))?, device)?,
+        k_norm: centred(&tensors.take(&format!("{a}.k_norm.weight"))?, device)?,
+    })
 }
 
 fn f32_on(tensor: &Tensor, device: &Device) -> Result<Tensor> {
@@ -289,6 +330,13 @@ impl Qwen35 {
         tokens: usize,
         contexts: &[usize],
     ) -> Result<(ModelDescription, usize, usize)> {
+        let with_mtp;
+        let config = if options.mtp && !config.mtp() {
+            with_mtp = config.clone().with_mtp()?;
+            &with_mtp
+        } else {
+            config
+        };
         let description = config.description(
             format!("{}#{}", options.revision, options.format.tag()),
             options.kv,
@@ -366,6 +414,9 @@ impl Qwen35 {
     /// Validate config and checkpoint headers, then load the text tower onto `options.device`.
     pub fn load(dir: &Path, options: &LoadOptions) -> Result<Self> {
         let mut config = Config::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?;
+        if options.mtp {
+            config = config.with_mtp()?;
+        }
         let (tokenizer_config, tokenizer) = (
             dir.join("tokenizer_config.json"),
             dir.join("tokenizer.json"),
@@ -386,26 +437,12 @@ impl Qwen35 {
         for (i, kind) in config.layer_kinds().iter().enumerate() {
             let p = format!("{prefix}.layers.{i}");
             let mixer = match kind {
-                LayerKind::FullAttention => {
-                    let a = format!("{p}.self_attn");
-                    let k = tensors.take(&format!("{a}.k_proj.weight"))?;
-                    let v = tensors.take(&format!("{a}.v_proj.weight"))?;
-                    Mixer::Attention(Attention {
-                        q: linear(
-                            &tensors.take(&format!("{a}.q_proj.weight"))?,
-                            format,
-                            device,
-                        )?,
-                        kv: linear(&Tensor::cat(&[k, v], 0)?, format, device)?,
-                        o: linear(
-                            &tensors.take(&format!("{a}.o_proj.weight"))?,
-                            format,
-                            device,
-                        )?,
-                        q_norm: centred(&tensors.take(&format!("{a}.q_norm.weight"))?, device)?,
-                        k_norm: centred(&tensors.take(&format!("{a}.k_norm.weight"))?, device)?,
-                    })
-                }
+                LayerKind::FullAttention => Mixer::Attention(load_attention(
+                    &mut tensors,
+                    &format!("{p}.self_attn"),
+                    format,
+                    device,
+                )?),
                 LayerKind::LinearAttention => {
                     let l = format!("{p}.linear_attn");
                     let parts = ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"]
@@ -456,6 +493,42 @@ impl Qwen35 {
                 mlp,
             });
         }
+        let mtp = if config.mtp() {
+            let p = "mtp.layers.0";
+            Some(MtpHead {
+                fc: linear(&tensors.take("mtp.fc.weight")?, format, device)?,
+                embedding_norm: centred(
+                    &tensors.take("mtp.pre_fc_norm_embedding.weight")?,
+                    device,
+                )?,
+                hidden_norm: centred(&tensors.take("mtp.pre_fc_norm_hidden.weight")?, device)?,
+                layer: Layer {
+                    input_norm: centred(
+                        &tensors.take(&format!("{p}.input_layernorm.weight"))?,
+                        device,
+                    )?,
+                    post_norm: centred(
+                        &tensors.take(&format!("{p}.post_attention_layernorm.weight"))?,
+                        device,
+                    )?,
+                    mixer: Mixer::Attention(load_attention(
+                        &mut tensors,
+                        &format!("{p}.self_attn"),
+                        format,
+                        device,
+                    )?),
+                    mlp: Mlp::Dense(DenseMlp::load(
+                        &mut tensors,
+                        &format!("{p}.mlp"),
+                        format,
+                        device,
+                    )?),
+                },
+                norm: centred(&tensors.take("mtp.norm.weight")?, device)?,
+            })
+        } else {
+            None
+        };
         let embed_source = tensors.take(&format!("{prefix}.embed_tokens.weight"))?;
         // Quantized formats keep the lookup table in BF16; only selected rows become F32.
         let embed = match format {
@@ -480,6 +553,7 @@ impl Qwen35 {
             shares_embedding,
             norm,
             layers,
+            mtp,
             #[cfg(feature = "metal")]
             fused: None,
         }
@@ -521,7 +595,14 @@ impl Qwen35 {
         if !self.shares_embedding {
             total += bytes(&self.embed);
         }
-        for layer in &self.layers {
+        if let Some(mtp) = &self.mtp {
+            total += bytes(&mtp.embedding_norm) + bytes(&mtp.hidden_norm) + bytes(&mtp.norm);
+        }
+        for layer in self
+            .layers
+            .iter()
+            .chain(self.mtp.as_ref().map(|m| &m.layer))
+        {
             total += bytes(&layer.input_norm) + bytes(&layer.post_norm);
             if let Mlp::Moe(moe) = &layer.mlp {
                 total += moe.router_bytes();
@@ -550,8 +631,13 @@ impl Qwen35 {
 
     /// Device bytes held by projection weights, all in their packed storage format.
     pub fn projection_bytes(&self) -> usize {
-        let mut total = self.lm_head.resident_bytes();
-        for layer in &self.layers {
+        let mut total = self.lm_head.resident_bytes()
+            + self.mtp.as_ref().map_or(0, |mtp| mtp.fc.resident_bytes());
+        for layer in self
+            .layers
+            .iter()
+            .chain(self.mtp.as_ref().map(|m| &m.layer))
+        {
             let mixer = match &layer.mixer {
                 Mixer::Attention(a) => [&a.q, &a.kv, &a.o]
                     .iter()
@@ -588,6 +674,7 @@ impl Qwen35 {
             tokens: 0..tokens.len(),
             state: &state,
             logits: rows,
+            hidden: false,
         }];
         let batch = PackedForward {
             tokens,
@@ -830,34 +917,40 @@ impl Qwen35 {
             ids,
             positions,
             rows,
+            hidden: spans.iter().any(|span| span.sequence.hidden),
             spans,
             pool: batch.pool,
         };
         #[cfg(feature = "metal")]
-        let logits = match &self.fused {
+        let (logits, hidden) = match &self.fused {
             Some(fused) => self.run_fused(fused, &pass, trace)?,
             None => self.run_reference(&pass, trace)?,
         };
         #[cfg(not(feature = "metal"))]
-        let logits = self.run_reference(&pass, trace)?;
+        let (logits, hidden) = self.run_reference(&pass, trace)?;
         let mut offset = 0;
         let mut steps = Vec::with_capacity(spans.len());
         for span in spans {
             let rows = span.sequence.logits.len();
             steps.push(SequenceStep {
                 logits: logits.narrow(0, offset, rows)?.contiguous()?,
+                hidden: match (&hidden, span.sequence.hidden) {
+                    (Some(hidden), true) => Some(hidden.narrow(0, span.start, span.len)?),
+                    _ => None,
+                },
             });
             offset += rows;
         }
         Ok(steps)
     }
 
-    /// F32 reference body: returns logits for `pass.rows` and writes state into the pool.
+    /// F32 reference body: returns logits for `pass.rows`, and every row's final hidden
+    /// state when `pass.hidden`, and writes state into the pool.
     fn run_reference(
         &self,
         pass: &Pass<'_, '_>,
         mut trace: Option<&mut Vec<Tensor>>,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let d = self.dims;
         let spans = pass.spans;
         let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
@@ -876,16 +969,89 @@ impl Qwen35 {
                 trace.push(x.clone());
             }
         }
+        let hidden = pass
+            .hidden
+            .then(|| math::rms(&x, &self.norm, d.eps))
+            .transpose()?;
         if pass.rows.is_empty() {
-            return Ok(Tensor::zeros(
-                (0, self.description.vocab_size),
-                DType::F32,
-                &self.device,
-            )?);
+            let empty = Tensor::zeros((0, self.description.vocab_size), DType::F32, &self.device)?;
+            return Ok((empty, hidden));
         }
         let index = Tensor::new(pass.rows.as_slice(), &self.device)?;
         let h = math::rms(&x.index_select(&index, 0)?, &self.norm, d.eps)?;
-        self.lm_head.forward(&h)
+        Ok((self.lm_head.forward(&h)?, hidden))
+    }
+
+    /// Validate a draft-head sequence; returns its span at packed row `start`.
+    fn check_draft<'a>(
+        &self,
+        batch: &DraftForward<'_>,
+        sequence: &DraftSequence<'_>,
+        forward: &'a SequenceForward<'a>,
+        start: usize,
+    ) -> Result<Span<'a>> {
+        let len = sequence.tokens.len();
+        let positions = batch
+            .positions
+            .get(sequence.tokens.clone())
+            .filter(|_| len > 0 && batch.tokens.get(sequence.tokens.clone()).is_some())
+            .ok_or_else(|| invalid("draft range outside packed input"))?;
+        let past = positions[0];
+        let state = sequence.state;
+        if positions.iter().enumerate().any(|(i, &p)| p != past + i)
+            || state.past() != past
+            || state.tokens() != len
+            || sequence.hidden.dims() != [len, self.config.text.hidden_size]
+        {
+            return Err(invalid("draft state, positions or hidden rows disagree"));
+        }
+        let addresses = state.resolve(batch.pool)?;
+        if addresses.pages.len() < self.description.pages_for(past + len)
+            || !addresses.writes.is_empty()
+        {
+            return Err(invalid(
+                "draft state does not cover its committed positions",
+            ));
+        }
+        Ok(Span {
+            start,
+            len,
+            past,
+            every: false,
+            addresses,
+            sequence: forward,
+        })
+    }
+
+    /// Reference body of a draft-head pass: logits for `pass.rows`.
+    fn draft_reference(
+        &self,
+        mtp: &MtpHead,
+        pass: &Pass<'_, '_>,
+        hidden: &Tensor,
+    ) -> Result<Tensor> {
+        let d = self.dims;
+        let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
+        let embedded = self.embed.index_select(&ids, 0)?.to_dtype(DType::F32)?;
+        let joined = Tensor::cat(
+            &[
+                math::rms(&embedded, &mtp.embedding_norm, d.eps)?,
+                math::rms(hidden, &mtp.hidden_norm, d.eps)?,
+            ],
+            1,
+        )?;
+        let mut x = mtp.fc.forward(&joined)?;
+        let Mixer::Attention(a) = &mtp.layer.mixer else {
+            return Err(invalid("draft head layer is not attention"));
+        };
+        let rotary = math::rotary_tables(&pass.positions, d.rotary_dim, d.theta, &self.device)?;
+        let h = math::rms(&x, &mtp.layer.input_norm, d.eps)?;
+        x = (x + self.attention(a, &h, &rotary, pass.pool, self.layers.len(), pass.spans)?)?;
+        let h = math::rms(&x, &mtp.layer.post_norm, d.eps)?;
+        x = (&x + Self::mlp(&mtp.layer, &h)?)?;
+        let index = Tensor::new(pass.rows.as_slice(), &self.device)?;
+        self.lm_head
+            .forward(&math::rms(&x.index_select(&index, 0)?, &mtp.norm, d.eps)?)
     }
 }
 
@@ -895,6 +1061,8 @@ struct Pass<'s, 'a> {
     positions: Vec<usize>,
     /// Packed rows whose logits are returned, in sequence order.
     rows: Vec<u32>,
+    /// Also return every row's final normalized hidden state.
+    hidden: bool,
     spans: &'s [Span<'a>],
     pool: &'s StatePool,
 }
@@ -952,6 +1120,104 @@ impl HybridModel for Qwen35 {
         Ok(results
             .into_iter()
             .map(|r| r.unwrap_or_else(|| Err(invalid("sequence was not executed"))))
+            .collect())
+    }
+
+    /// Native multi-token prediction: the head's keys and values for every given position
+    /// are written to its own state layer, and logits of each requesting sequence's last
+    /// position predict the token after the next.
+    fn draft(&self, batch: &DraftForward<'_>) -> Result<Vec<Result<Option<Tensor>>>> {
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| invalid("model was loaded without its MTP head"))?;
+        if batch.pool.description() != &self.description
+            || !batch.pool.device().same_device(&self.device)
+        {
+            return Err(invalid(
+                "state pool was built for another model layout or device",
+            ));
+        }
+        let last: Vec<Vec<usize>> = batch
+            .sequences
+            .iter()
+            .map(|s| {
+                s.tokens
+                    .end
+                    .checked_sub(1)
+                    .filter(|_| s.logits)
+                    .into_iter()
+                    .collect()
+            })
+            .collect();
+        let forwards: Vec<SequenceForward<'_>> = batch
+            .sequences
+            .iter()
+            .zip(&last)
+            .map(|(s, logits)| SequenceForward {
+                tokens: s.tokens.clone(),
+                state: s.state,
+                logits,
+                hidden: false,
+            })
+            .collect();
+        let mut results: Vec<Option<Result<Option<Tensor>>>> =
+            batch.sequences.iter().map(|_| None).collect();
+        let (mut spans, mut live, mut hidden) = (Vec::new(), Vec::new(), Vec::new());
+        let mut start = 0;
+        for (index, (sequence, forward)) in batch.sequences.iter().zip(&forwards).enumerate() {
+            match self.check_draft(batch, sequence, forward, start) {
+                Ok(span) => {
+                    start += span.len;
+                    spans.push(span);
+                    live.push(index);
+                    hidden.push(sequence.hidden.clone());
+                }
+                Err(error) => results[index] = Some(Err(error)),
+            }
+        }
+        if !spans.is_empty() {
+            let (mut ids, mut positions, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+            for span in &spans {
+                let range = span.sequence.tokens.clone();
+                ids.extend_from_slice(&batch.tokens[range.clone()]);
+                positions.extend_from_slice(&batch.positions[range]);
+                if !span.sequence.logits.is_empty() {
+                    rows.push(
+                        u32::try_from(span.start + span.len - 1)
+                            .map_err(|_| invalid("draft row overflow"))?,
+                    );
+                }
+            }
+            let pass = Pass {
+                ids,
+                positions,
+                rows,
+                hidden: false,
+                spans: &spans,
+                pool: batch.pool,
+            };
+            let hidden = Tensor::cat(&hidden, 0)?.to_dtype(DType::F32)?;
+            #[cfg(feature = "metal")]
+            let logits = match &self.fused {
+                Some(fused) => self.draft_fused(fused, mtp, &pass, &hidden)?,
+                None => self.draft_reference(mtp, &pass, &hidden)?,
+            };
+            #[cfg(not(feature = "metal"))]
+            let logits = self.draft_reference(mtp, &pass, &hidden)?;
+            let mut row = 0;
+            for (span, index) in spans.iter().zip(live) {
+                results[index] = Some(if span.sequence.logits.is_empty() {
+                    Ok(None)
+                } else {
+                    row += 1;
+                    logits.narrow(0, row - 1, 1).map(Some).map_err(Into::into)
+                });
+            }
+        }
+        Ok(results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(invalid("draft sequence was not executed"))))
             .collect())
     }
 }

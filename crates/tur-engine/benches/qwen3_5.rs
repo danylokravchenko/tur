@@ -108,6 +108,7 @@ fn pass(model: &Qwen35, pool: &StatePool, sequences: &[(&ModelState, &[u32])]) -
             tokens: range.clone(),
             state,
             logits,
+            hidden: false,
         })
         .collect();
     for result in model.forward(&PackedForward {
@@ -141,6 +142,7 @@ fn prefilled(model: &Qwen35, pool: &StatePool, prompt: &[u32]) -> Result<ModelSt
                     tokens: 0..piece.len(),
                     state: &binding,
                     logits: &[],
+                    hidden: false,
                 }],
                 pool,
             })?
@@ -298,6 +300,7 @@ fn main() -> Result<()> {
                             execution: Execution::Fused,
                             kv: KvLayout::new(page, kv),
                             recurrent,
+                            mtp: false,
                         },
                     )?;
                     let load_seconds = load_start.elapsed().as_secs_f64();

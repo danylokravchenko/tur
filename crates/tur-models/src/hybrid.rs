@@ -3,7 +3,10 @@
 
 use candle_core::Tensor;
 use std::ops::Range;
-use tur_core::{Result, execution::ModelDescription};
+use tur_core::{
+    Result,
+    execution::{ModelDescription, invalid},
+};
 pub use tur_metal::{
     pool::StatePool,
     state::{Addresses, Boundaries, SequenceState},
@@ -18,6 +21,9 @@ pub struct SequenceForward<'a> {
     pub state: &'a SequenceState,
     /// Strictly increasing packed positions whose logits are required.
     pub logits: &'a [usize],
+    /// Also return the final normalized hidden state of every new token, which a draft
+    /// head consumes ([`HybridModel::draft`]).
+    pub hidden: bool,
 }
 
 /// Variable-length requests packed without padding.
@@ -32,6 +38,31 @@ pub struct PackedForward<'a> {
 /// One request's output: F32 `[logits.len(), vocab]` logits. State is written in place.
 pub struct SequenceStep {
     pub logits: Tensor,
+    /// F32 `[tokens, hidden]` final normalized hidden states, when requested.
+    pub hidden: Option<Tensor>,
+}
+
+/// One request's slice of a draft-head pass over committed positions `p`: the head pairs
+/// each position's final hidden state with the token that followed it, and predicts the
+/// token after that.
+pub struct DraftSequence<'a> {
+    /// Range into [`DraftForward::tokens`] (the token at `p + 1`) and
+    /// [`DraftForward::positions`] (`p`).
+    pub tokens: Range<usize>,
+    /// Side addressing of the committed positions ([`tur_metal::state::ModelState::side`]).
+    pub state: &'a SequenceState,
+    /// F32 `[tokens, hidden]` final normalized hidden states at the positions.
+    pub hidden: &'a Tensor,
+    /// Return logits of the last position: the draft for the token after the next.
+    pub logits: bool,
+}
+
+/// A packed draft-head pass. It writes only the head's own state layers.
+pub struct DraftForward<'a> {
+    pub tokens: &'a [u32],
+    pub positions: &'a [usize],
+    pub sequences: &'a [DraftSequence<'a>],
+    pub pool: &'a StatePool,
 }
 
 /// Shared immutable model weights. All mutable sequence state lives in the pool.
@@ -60,4 +91,11 @@ pub trait HybridModel: Send + Sync + 'static {
     /// each inner result is one sequence, in order, so one request's failure is isolated.
     /// Implementations should only enqueue device work; the engine fences before reading.
     fn forward(&self, batch: &PackedForward<'_>) -> Result<Vec<Result<SequenceStep>>>;
+
+    /// Encode a draft-head pass (native multi-token prediction): per sequence, the F32
+    /// `[1, vocab]` logits of its last position when requested. Models without a head
+    /// reject it.
+    fn draft(&self, _batch: &DraftForward<'_>) -> Result<Vec<Result<Option<Tensor>>>> {
+        Err(invalid("model has no draft head"))
+    }
 }

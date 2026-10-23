@@ -59,6 +59,11 @@ struct Args {
     /// Requires F32 recurrent state; narrower state automatically uses ordinary decoding.
     #[arg(long, default_value_t = 0)]
     speculative_draft: usize,
+    /// Also draft one token per decode from the checkpoint's native multi-token prediction
+    /// (MTP) head when prompt lookup has none. Implies at least one draft; disables prefix
+    /// reuse. Requires F32 recurrent state.
+    #[arg(long)]
+    mtp: bool,
     /// Tokens in one packed pass. Default: one prefill chunk beside every decode.
     #[arg(long)]
     max_batch_tokens: Option<usize>,
@@ -126,18 +131,26 @@ async fn main() -> Result<()> {
         }
     };
     let mut pipeline = PipelineConfig {
-        speculation: SpeculationConfig::new(args.speculative_draft),
+        speculation: if args.mtp {
+            SpeculationConfig::with_mtp(args.speculative_draft.max(1))
+        } else {
+            SpeculationConfig::new(args.speculative_draft)
+        },
         state_bytes: args.state_memory_mb.map(|mb| mb << 20),
         ..PipelineConfig::new(args.max_batch_size, args.prefill_chunk_size)
     };
-    pipeline.prefix = PrefixConfig {
-        spacing: args.prefix_spacing,
-        entries: args.prefix_snapshots.unwrap_or(args.max_batch_size),
-        // An explicit count is honored; the default scales down for large states.
-        state_share: args
-            .prefix_snapshots
-            .is_none()
-            .then_some(PrefixConfig::DEFAULT_STATE_SHARE),
+    pipeline.prefix = if args.mtp {
+        PrefixConfig::DISABLED
+    } else {
+        PrefixConfig {
+            spacing: args.prefix_spacing,
+            entries: args.prefix_snapshots.unwrap_or(args.max_batch_size),
+            // An explicit count is honored; the default scales down for large states.
+            state_share: args
+                .prefix_snapshots
+                .is_none()
+                .then_some(PrefixConfig::DEFAULT_STATE_SHARE),
+        }
     };
     let scheduler = &mut pipeline.scheduler;
     scheduler.max_batch_tokens = args.max_batch_tokens.unwrap_or(scheduler.max_batch_tokens);
@@ -158,6 +171,7 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .map_or(Ok(DEFAULT_RECURRENT_STATE), parse_recurrent_state)
                 .map_err(TurError::Other)?,
+            mtp: false,
         },
         pipeline,
         request_timeout: args.request_timeout_secs.map(Duration::from_secs),

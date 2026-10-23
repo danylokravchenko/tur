@@ -385,8 +385,9 @@ impl Kernels {
             || [tuning.gemv_q8_0_rows, tuning.gemv_q4k_rows]
                 .iter()
                 .any(|&(min, max)| min == 0 || max > 8)
-            || tuning.qmm_q8_0_rows.0 == 0
-            || tuning.qmm_q8_0_rows.1 > 16
+            || [tuning.qmm_q8_0_rows, tuning.qmm_q4k_rows]
+                .iter()
+                .any(|&(min, max)| min == 0 || max > 16)
         {
             return Err(invalid("invalid kernel tuning"));
         }
@@ -1468,16 +1469,19 @@ impl Kernels {
         self.finish(out, (kv.tokens, heads * dim))
     }
 
-    /// Project `x` (`[rows, in]`) through `layer`. Packed `Q8_0` weights with a row count in
-    /// the tuned matrix range use the matrix-unit kernel, and `Q8_0/Q4K` weights in the GEMV
-    /// range the small-batch GEMV; both read each weight once for all rows. Everything else
-    /// uses Candle's dense, one-row GEMV or tiled packed kernels.
+    /// Project `x` (`[rows, in]`) through `layer`. Packed `Q8_0/Q4K` weights with a row count
+    /// in the tuned matrix range use the matrix-unit kernel, and in the GEMV range the
+    /// small-batch GEMV; both read each weight once for all rows. Everything else uses
+    /// Candle's dense, one-row GEMV or tiled packed kernels.
     pub fn linear(&self, layer: &PackedLinear, x: &Tensor) -> Result<Tensor> {
         let rows = x.dim(0)?;
         let range = |(min, max): (usize, usize)| (min..=max).contains(&rows);
         match layer.packed_buffer() {
-            Some((buffer, GgmlDType::Q8_0)) if range(self.tuning.qmm_q8_0_rows) => {
-                self.qmm_q8_0(layer, buffer, x)
+            Some((buffer, format @ GgmlDType::Q8_0)) if range(self.tuning.qmm_q8_0_rows) => {
+                self.qmm(layer, buffer, format, x)
+            }
+            Some((buffer, format @ GgmlDType::Q4K)) if range(self.tuning.qmm_q4k_rows) => {
+                self.qmm(layer, buffer, format, x)
             }
             Some((buffer, format @ GgmlDType::Q8_0)) if range(self.tuning.gemv_q8_0_rows) => {
                 self.gemv(layer, buffer, format, x)
@@ -1489,17 +1493,22 @@ impl Kernels {
         }
     }
 
-    /// Small-batch `Q8_0` projection on the matrix units: up to 16 rows, each weight
-    /// read once, F32 dequantization and accumulation.
-    fn qmm_q8_0(
+    /// Small-batch `Q8_0` or Q4K projection on the matrix units: up to 16 rows, each
+    /// weight read once, F32 dequantization and accumulation.
+    fn qmm(
         &self,
         layer: &PackedLinear,
         weights: &candle_metal_kernels::metal::Buffer,
+        format: GgmlDType,
         x: &Tensor,
     ) -> Result<Tensor> {
         let xv = self.view(x)?;
         let (n, k) = (layer.out_features(), layer.in_features());
-        let format = GgmlDType::Q8_0;
+        let name = match format {
+            GgmlDType::Q8_0 => "q8_0",
+            GgmlDType::Q4K => "q4k",
+            _ => return Err(invalid("small-batch projection supports Q8_0 and Q4K")),
+        };
         if xv.cols != k || xv.rows == 0 || xv.rows > 16 {
             return Err(invalid("small-batch projection input does not match"));
         }
@@ -1521,7 +1530,7 @@ impl Kernels {
             y_stride: to_u32(n, "output stride")?,
             rows: to_u32(xv.rows, "batch rows")?,
         };
-        let pipeline = self.pipeline(&format!("qmm_q8_0_t{tiles}_f32"))?;
+        let pipeline = self.pipeline(&format!("qmm_{name}_t{tiles}_f32"))?;
         // Simdgroups of a threadgroup split k over the same output columns.
         let threads = pipeline.simdgroups(self.tuning.simdgroups).max(1) * 32;
         let groups = n.div_ceil(QMM_COLUMNS);

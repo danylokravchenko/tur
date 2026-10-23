@@ -70,6 +70,7 @@ impl Runner {
                 execution: Execution::Fused,
                 kv: KvLayout::new(16, format),
                 recurrent,
+                mtp: false,
             },
         )?;
         let pool = StatePool::new(
@@ -101,6 +102,7 @@ impl Runner {
                     tokens: 0..chunk.len(),
                     state: &binding,
                     logits: &rows,
+                    hidden: false,
                 }],
                 pool: &self.pool,
             })?

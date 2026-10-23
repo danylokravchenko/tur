@@ -1,9 +1,10 @@
 # P8: speculative verification and expert expansion
 
-2026-10-23. **P8 is in progress.** Prompt-lookup speculation and the Qwen3.5 MoE text
-path are implemented. Native MTP and Gemma 4 execution are disabled. Full Qwen3.6-35B-A3B
-checkpoint execution, trained-model routing traces and quality gates still need a
-larger-memory Mac. This report distinguishes those gates from the small-model evidence.
+2026-10-23. **P8 is in progress.** Prompt-lookup speculation, native multi-token
+prediction (MTP) drafts and the Qwen3.5 MoE text path are implemented. Gemma 4 execution
+is not. Full Qwen3.6-35B-A3B checkpoint execution, trained-model routing traces and quality
+gates still need a larger-memory Mac. This report distinguishes those gates from the
+small-model evidence.
 
 ## Exact verification and proposals
 
@@ -83,12 +84,16 @@ This is an explicit throughput mode: accepted tokens arrive in bursts, with long
 pauses between passes. `PipelineConfig::reproducible` also disables speculation.
 The target-matching sampling guarantee does not promise bit-identical logits between
 different batch/chunk shapes: existing F16-tile and recurrent rounding differences still
-apply. The reproducibility mode fixes those execution choices separately. On the MoE
-fixture, verification logits match one-at-a-time decoding within 7e-7 relative for F32,
-`Q8_0`, and Q4K windows inside its 2–4-row GEMV range. Wider Q4K windows run Candle's
-F16-staged tiles, as batched Q4K decoding of as many rows already does, and drift by
-**1.1e-2**, partly through flipped close routing decisions. A test now bounds this
-instead of avoiding the regime; removing it needs an F32 matrix-unit dense Q4K kernel.
+apply. The reproducibility mode fixes those execution choices separately.
+
+Q4K projections of 5–16 rows used Candle's F16-staged tiles, unlike single-token decoding.
+On the MoE fixture an eight-token verification window therefore drifted **1.1e-2** from
+one-at-a-time decoding, partly through flipped close routing decisions. Q4K now has the F32
+matrix-unit kernel `Q8_0` already had (one template, a shared per-format loader), used at
+4–16 rows: the same window agrees within 2e-4 like F32 and `Q8_0`. It is 1.6–2.0× faster
+than Candle's tiles at 4–8 rows (lm_head, 8 rows: 9.9 → 6.3 ms) and 10–25% slower at 16,
+which is accepted for precision ([artifact](baselines/2026-10-23-m1-p8/packed-linear-q4k-qmm.json)).
+Above sixteen rows, dense projections of every packed format still use Candle's F16 tiles.
 
 ### Serving measurements
 
@@ -131,10 +136,15 @@ about 3.3% of ordinary throughput across the measured cases.
 its bursts can increase p95 inter-token latency substantially. This is why enabling it
 requires an explicit option and why it is not the default.
 
-These measurements predate the later planner, proposal, headroom and mixed-pass changes
-and have not been rerun. The serving bench now also reports burst gaps (between the first
-publications of a request's successive passes) and tokens per burst: ITL p50 is zero
-inside speculative bursts and says little about them.
+A rerun after the planner, proposal, headroom and mixed-pass changes
+([greedy](baselines/2026-10-23-m1-p8/speculation-greedy-v2.json),
+[sampled](baselines/2026-10-23-m1-p8/speculation-sampled-v2.json)) keeps the repetitive
+gains: greedy 3.25× / 1.94× / 1.36× and sampled 3.00× / 1.11× / 1.04× at concurrency
+1 / 4 / 8. Novel prose is now neutral (0.98–1.06×) instead of regressing. It no longer
+drafts at all there (1.00 tokens per burst), and greedy novel ITL p95 at concurrency 4 is
+25.6 ms instead of 40.9 ms. The bench also reports burst gaps (between the first
+publications of a request's successive passes) and tokens per burst, because ITL p50 is
+zero inside speculative bursts and says little about them.
 
 At concurrency eight, the reserved resident plan grows from 3,998,108,236 to
 4,386,671,436 bytes (+371 MiB). Separate processes measured with `/usr/bin/time -l`
@@ -143,6 +153,74 @@ memory footprint of 5.24 → 5.77 GiB. These process peaks include loading, driv
 and allocator caching; they are not a measurement of speculative tensors alone. Both
 runs fit this machine, but the memory experiment does not establish a bound for other
 contexts or sustained churn. See `memory-draft{0,4}.{json,log}` in the artifact directory.
+
+### Native multi-token prediction
+
+Qwen3.5 checkpoints ship an MTP head (`mtp_num_hidden_layers: 1`; 15 `mtp.*` tensors in
+the pinned 0.8B). Transformers ignores these tensors, so
+`scripts/qwen3_5_mtp_reference.py` assembles the head from Transformers' own Qwen3.5
+modules: `fc` joins the normalized embedding of the token at `p + 1` with the normalized
+final hidden state at `p`, followed by one full-attention decoder layer, a final norm and
+the shared LM head, predicting the token at `p + 2`. The weights leave three conventions
+open, so the script scores each candidate by next-next-token accuracy over greedy
+continuations ([log](baselines/2026-10-23-m1-p8/mtp-reference.log)). The backbone's
+normalized output, concatenated after the embedding, predicts **70.8% (prose) and 89.6%
+(code)**. The raw last layer reaches 54%/76%, and the reversed concatenation about 1%.
+That accuracy is evidence independent of tur that the head is assembled correctly.
+
+`--mtp` (`SpeculationConfig::with_mtp`) loads the head
+(`ModelFactory::mtp`/`LoadOptions::mtp`). Its keys and values are one more attention
+state layer after the text layers, so the plan charges them. Passes return the final hidden
+states, and after publication the head runs over each request's newly committed positions
+with the tokens that followed them. It writes its own state layer through side addressing
+of committed pages (`ModelState::side`) and returns a greedy draft for the next pass. A
+snapshot at boundary `B` could not hold the head's entry for `B - 1`, which depends on the
+token sampled after `B`, so MTP requires prefix reuse disabled. The target-matching
+verifier is unchanged and decides every output, so the draft source cannot change results.
+
+Against the saved reference, the head's logits agree within **1.7e-6** relative error on
+the fused and reference paths, with identical argmax at all 16 checked rows
+(`test_mtp_head_matches_transformers_reference`, ignored; needs `TUR_QWEN35_0_8B` and
+`TUR_QWEN35_MTP_GOLDEN`). Offline tests with a random head check that outputs equal
+ordinary decoding (greedy and sampled, reference and fused `Q8_0`), across preemption and
+recomputation. They also check that state is released, and that MTP is rejected without a
+head or with prefix reuse.
+
+**Cost and gating.** On the 0.8B the LM head is about a third of the weights. A head pass
+that computes drafts costs about 6.5 ms beside an 18.5 ms decode at one sequence, and
+holds the device between passes. Drafts are therefore computed only when all of these hold:
+- the request decodes next, greedily and unconstrained;
+- prompt lookup has no proposal, or a less accepted one;
+- the head's acceptance estimate is at least 0.3;
+- a measured head-cost model predicts at least 5% more tokens per second for the next pass;
+- at most four sequences decode.
+Skipped heads still write their keys and values (about 0.7–1 ms) so drafting can resume.
+They retry at an exponentially backed-off interval. Without the last two gates, eight
+sequences lost up to 21%. Verifying one draft per sequence doubles every projection's rows
+past the small-batch kernels, and sampled rows pay full-vocabulary device sampling; the
+linear draft-cost fit cannot see either step. Single-token drafts also exposed a
+draft-cost identification threshold (0.25) that alternating zero- and one-draft passes
+never exceeded, now 0.1.
+
+Final greedy measurements, same setup as above, three-run means
+([gated](baselines/2026-10-23-m1-p8/speculation-mtp-gated-greedy.json),
+[ordinary](baselines/2026-10-23-m1-p8/speculation-mtp-greedy.json)):
+
+| Workload | Concurrency | Ordinary | Lookup + MTP | Tokens per pass | MTP drafts accepted |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Novel | 1 | 50.3 | **58.4 (1.16×)** | 1.47 | 87/121 |
+| Novel | 4 | 148.4 | **164.3 (1.11×)** | 1.45 | 344/452 |
+| Novel | 8 | 235.6 | 225.2 (0.96×) | 1.00 | none computed |
+| Repeat | 1 / 4 / 8 | 49.1 / 134.2 / 203.9 | 144.7 / 249.6 / 276.4 | 4.44 / 4.44 / 2.86 | lookup preferred |
+
+All 36 same-seed comparisons, greedy and sampled, produced identical tokens. The head's
+drafts are accepted 72–76% of the time greedy and 60–78% sampled, yet sampled MTP drafting
+did not pay at any concurrency and is disabled. After the gated run, the head stopped
+running at all for sampled and constrained requests, which removes the 4–5% upkeep cost
+measured for them; that last change was not re-measured. The 4% loss at eight greedy
+sequences is the head's key/value upkeep. ITL p95 rises at concurrency 1 and 4 (20 → 26 ms,
+24 → 35 ms), so like lookup this is an opt-in throughput mode. A larger model, whose LM head
+is a smaller share of its weights, should benefit more; not measured here.
 
 ## Qwen3.6-35B-A3B text path
 
@@ -210,9 +288,9 @@ per token and kept one expert's outputs, about 32× the necessary work for 256 e
 
 The pinned Qwen config and **all 693 text tensor names/shapes** are checked against
 actual shard headers. `scripts/p8_reference_headers.py` fetches headers only and records
-their SHA-256 hashes; it downloads no model payloads. Nineteen MTP tensors are present,
-but the proposal algorithm and its tensor execution are unimplemented, so MTP remains
-disabled despite `mtp_num_hidden_layers: 1`.
+their SHA-256 hashes; it downloads no model payloads. Nineteen MTP tensors are present;
+the flagship's head has an expert MLP, which the MTP implementation above (one dense
+layer) rejects until it can be run and validated on the flagship.
 
 An offline deterministic two-layer hybrid fixture has eight routed experts and one
 shared expert. Its BF16 checkpoint values come from a fixed LCG. Independent
@@ -226,53 +304,59 @@ F32/Q8_0/Q4K grouped GEMM matches scalar F64 accumulation over dequantized weigh
 skews, 4,800-assignment multi-block routing, routed (permutation-read) inputs, the fused
 shared expert and nonfinite routing rows. Hybrid tests accept a partial speculative prefix
 and continue after rollback in all three formats. A separate test measures verification
-against one-at-a-time decoding inside and beyond the Q4K GEMV range (see above).
+against one-at-a-time decoding inside and beyond the Q4K GEMV range (see above). Groups
+above sixteen rows stage weights in F16 and are checked within 2e-3.
 
 ### Expert projection performance gate: open
 
-[Kernel artifacts](baselines/2026-10-23-m1-p8/moe-kernels-grouped.json) use the flagship's
+[Kernel artifacts](baselines/2026-10-23-m1-p8/moe-kernels-wide.json) use the flagship's
 gate/up shape: 256 experts, top-8, input 2048, output 1024. Random scores disperse
 assignments; the concentrated case sends every token to the same eight experts. Both are
 synthetic. Grouped timings include device routing, with inputs read through the
 permutation. The individual baseline already has its selected input rows prepared, so
 routing, readback and gather are excluded for it. Each cell is the median of fifteen
 completed-work samples with three warmups. Earlier layouts are kept as
-`moe-kernels.*` (first grouped version), `moe-kernels-initial.*` and
-`moe-kernels-table-search.*`.
+`moe-kernels.*` (first grouped version), `moe-kernels-grouped.*` (F32 tiles only),
+`moe-kernels-initial.*` and `moe-kernels-table-search.*`.
+
+Within a pass, an expert with at most sixteen rows gets one tile: a GEMV for at most three
+rows (as many outputs per simdgroup as the dense GEMV, two for Q4K's super-block layout),
+F32 matrix units otherwise. An expert with more rows gets 32-row wide tiles: each
+32-wide reduction slice of weights is dequantized once into threadgroup memory as F16 and
+four simdgroups multiply against F32 activations with F32 accumulation (ggml's `mul_mm`
+layout). This mirrors the dense precision policy, where projections above sixteen rows use
+Candle's F16 tiles; verification windows stay in the F32 kernels.
 
 | Tokens | Routing | `Q8_0` grouped (first version) | `Q8_0` individual | Q4K grouped (first version) | Q4K individual |
 | ---: | --- | ---: | ---: | ---: | ---: |
-| 1 | Dispersed | 0.375 (0.584) ms | 0.373 ms | 0.319 (0.458) ms | 0.211 ms |
-| 8 | Dispersed | 2.65 (2.83) ms | 2.93 ms | 2.28 ms | 1.69 ms |
-| 32 | Dispersed | 7.20 (7.24) ms | 7.67 ms | 7.35 ms | 5.99 ms |
-| 128 | Dispersed | 14.96 (17.24) ms | 14.52 ms | 19.14 ms | 18.61 ms |
-| 512 | Dispersed | 24.6 (27.3) ms | 22.3 ms | 32.1 ms | 23.4 ms |
-| 2048 | Dispersed | 80.5 (93.2) ms | 51.3 ms | 105.9 ms | 57.7 ms |
-| 8 | Concentrated | 0.674 (0.988) ms | 0.472 ms | 0.943 ms | 0.788 ms |
-| 128 | Concentrated | 4.60 (6.23) ms | 2.56 ms | 6.36 ms | 2.87 ms |
-| 2048 | Concentrated | 73.4 (85.2) ms | 55.2 ms | 97.2 ms | 57.2 ms |
+| 1 | Dispersed | 0.351 (0.584) ms | 0.345 ms | 0.321 (0.458) ms | 0.180–0.262 ms |
+| 8 | Dispersed | 2.54 (2.83) ms | 2.74 ms | 2.29 ms | 1.60 ms |
+| 32 | Dispersed | 6.91 (7.24) ms | 7.35 ms | 7.43 ms | 5.71 ms |
+| 128 | Dispersed | 14.9 (17.2) ms | 12.7 ms | 19.1 ms | 13.4 ms |
+| 512 | Dispersed | 22.4 (27.3) ms | 21.6 ms | 28.0 ms | 25.8 ms |
+| 2048 | Dispersed | 71.4 (93.2) ms | 48.7 ms | 83.1 ms | 56.7 ms |
+| 8 | Concentrated | 0.682 (0.988) ms | 0.424 ms | 0.981 ms | 0.442 ms |
+| 128 | Concentrated | 3.75 (6.23) ms | 2.46 ms | 4.61 ms | 2.80 ms |
+| 2048 | Concentrated | 59.1 (85.2) ms | 45.8 ms | 69.8 ms | 54.1 ms |
 
-Routing (top-k, histograms, permutation and a scatter) now costs 0.02 ms for one token and
-0.24 ms for 2,048 tokens; the parenthesized first-version timings include its slower
-routing and gather.
+Routing (top-k, histograms, permutation and a scatter) costs 0.02 ms for one token and
+0.23 ms for 2,048 tokens. The first version ranked every score against every other and
+built the permutation with serial per-expert scans.
 
 **No expert-kernel speedup is claimed.** `Q8_0` decode is at parity with individual
-projections and 8–32 dispersed tokens are slightly faster. Q4K decode is about 1.5×
-slower than Candle's dense Q4K GEMV. Concentrated groups and prefill-sized passes remain
-1.4–1.8× slower: above sixteen rows Candle stages individual groups in F16, while the
-grouped kernels accumulate in F32, so those cells also compare different arithmetic.
-Two rejected attempts are recorded here: 32×32 register tiles (149 ms at 2,048 dispersed
-tokens, from register pressure) and threadgroup-staged 32-wide reduction slices
-(239 ms, barrier-bound with lower occupancy). An F16-staged or larger-K tiled grouped GEMM
-is the open next step. F32 is measured at 64 experts
-([artifact](baselines/2026-10-23-m1-p8/moe-kernels-grouped-f32.json)), since a full F32
-bank does not fit beside its host copy here: 1.20 vs 1.29 ms at one token, 9.5 vs 11.8 ms
-at 32 dispersed tokens, and 114 vs 61 ms at 2,048. An earlier F32 run was killed because
-`PackedLinear::dense` uploaded each per-expert row view with Candle's `to_device`, which
-transfers a view's whole underlying storage (the full bank, 64 times). Dense uploads now
-copy only the view. The MoE model path remains experimental, with its performance exit gate
-open. Trained routing traces and full-model measurements remain necessary before claiming
-a useful MoE serving regime.
+projections and 8–32 dispersed tokens are 6–8% faster. Q4K decode is about 1.5× slower
+than Candle's dense Q4K GEMV. Large groups improved by 11–28% with the wide tiles but
+remain 1.3–1.5× slower than Candle's per-expert tiled GEMM. Rejected layouts, all slower:
+32×32 register tiles (149 ms at 2,048 dispersed tokens, register pressure), 32-row × 16-output
+register tiles (144 ms), F32 threadgroup-staged 32-wide slices with eight simdgroups
+(239 ms, barrier-bound) and padded threadgroup strides for the wide tiles (+5%). F32 is
+measured at 64 experts ([artifact](baselines/2026-10-23-m1-p8/moe-kernels-grouped-f32.json),
+before wide tiles), since a full F32 bank does not fit beside its host copy here. An earlier
+F32 run was killed because `PackedLinear::dense` uploaded each per-expert row view with
+Candle's `to_device`, which transfers a view's whole underlying storage (the full bank, 64
+times); dense uploads now copy only the view. The MoE model path remains experimental, with
+its performance exit gate open. Trained routing traces and full-model measurements remain
+necessary before claiming a useful MoE serving regime.
 
 ### Full-checkpoint boundary
 
@@ -306,8 +390,9 @@ downloaded or executed in this package.
 
 ## Validation and remaining gates
 
-- Offline workspace nextest: **229 passed, seven checkpoint-dependent tests skipped**
-  (after the review fixes; the earlier run in the retained log had 221).
+- Offline workspace nextest: **235 passed, eight checkpoint-dependent tests skipped**
+  (after the review fixes, Q4K matrix kernel, wide expert tiles and MTP; the retained
+  log is from the earlier 221-test run).
 - Strict workspace Clippy, all targets: passed. Workspace checks pass with and without
   default features. Existing `block 0.1.6` future-compatibility notice remains.
 - Target-matching equivalence: 256 seeds compare samples, RNG draws, penalties and every
@@ -317,9 +402,11 @@ downloaded or executed in this package.
   of drafting requests (index rebuilt, outputs equal ordinary decoding), a deadline
   expiring under a drafted pass, and decodes drafting beside a prefill.
 - Metal sampling with penalties preserves seeded output against ordinary decoding.
-- Native MTP execution, full Qwen3.6 conformance/quality, trained routing traces, and
-  Gemma 4 execution remain open. Coverage percentage and long-duration thermal/leak
-  gates were not measured here.
+- Native MTP: the head matches the Transformers-assembled reference within 1.7e-6 on the
+  real checkpoint (ignored test). Offline tests cover output equivalence, preemption,
+  state release and rejection rules. The flagship's expert MTP head remains unsupported.
+- Full Qwen3.6 conformance/quality, trained routing traces and Gemma 4 execution remain
+  open. Coverage percentage and long-duration thermal/leak gates were not measured here.
 
 Reproduction (hardware tests need direct Metal access):
 

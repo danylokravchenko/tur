@@ -5,6 +5,7 @@ use tur::{
     ModelFactory, ModelSource, Result,
     backend::{
         pipeline::{GenerationRequest, InferencePipeline, PipelineConfig},
+        prefix::PrefixConfig,
         speculation::SpeculationConfig,
     },
     core::execution::{KvFormat, KvLayout},
@@ -72,6 +73,11 @@ struct Args {
     /// Requires F32 recurrent state; narrower state automatically uses ordinary decoding.
     #[arg(long, default_value_t = 0)]
     speculative_draft: usize,
+    /// Also draft one token per decode from the checkpoint's native multi-token prediction
+    /// (MTP) head when prompt lookup has none. Implies at least one draft; disables prefix
+    /// reuse. Requires F32 recurrent state.
+    #[arg(long)]
+    mtp: bool,
     /// K/V storage: f32, f16, q8 (one scale per 32 dimensions, half of F16's memory) or
     /// q8_<group>.
     #[arg(long, default_value_t = DEFAULT_KV_LAYOUT.format)]
@@ -116,12 +122,22 @@ fn main() -> Result<()> {
             .as_deref()
             .map_or(Ok(DEFAULT_RECURRENT_STATE), parse_recurrent_state)
             .map_err(tur::TurError::Other)?,
+        mtp: false,
     };
     let mut pipeline = InferencePipeline::new(
         &factory,
         PipelineConfig {
-            speculation: SpeculationConfig::new(args.speculative_draft),
+            speculation: if args.mtp {
+                SpeculationConfig::with_mtp(args.speculative_draft.max(1))
+            } else {
+                SpeculationConfig::new(args.speculative_draft)
+            },
             state_bytes: args.state_memory_mb.map(|mb| mb << 20),
+            prefix: if args.mtp {
+                PrefixConfig::DISABLED
+            } else {
+                PipelineConfig::new(1, args.prefill_chunk_size).prefix
+            },
             ..PipelineConfig::new(1, args.prefill_chunk_size)
         },
     )?;

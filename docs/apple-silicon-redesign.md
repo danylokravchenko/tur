@@ -6,8 +6,12 @@ P8 is in progress (2026-10-23): exact prompt-lookup verification is connected to
 with adaptive draft selection, explicit memory accounting and an opt-in throughput mode.
 The Qwen3.6 expert text path has F32 routing, packed expert weights and device-side
 grouped GEMM, validated on an independent small Transformers fixture and pinned flagship
-headers. Full 35B execution exceeds this 16 GB Mac's capacity; native MTP, flagship
-quality and Gemma 4 execution remain open. See the [P8 report](apple-silicon-p8-speculation-moe.md).
+headers. Native MTP drafts from the checkpoint's own head (validated against a
+Transformers-assembled reference, 71–90% next-next-token accuracy) add 1.16× / 1.11× on
+novel greedy text at one and four sequences and are gated off beyond. Q4K small batches
+now stay in F32 kernels. Full 35B execution exceeds this 16 GB Mac's capacity; flagship
+quality, the flagship's expert MTP head and Gemma 4 execution remain open. See the
+[P8 report](apple-silicon-p8-speculation-moe.md).
 
 P3–P5 review cleanup (2026-10-22) fixed zero-slot budget accounting, activated inherited
 workspace lints, made retained HTTP tests fallible, and removed unused dependencies,

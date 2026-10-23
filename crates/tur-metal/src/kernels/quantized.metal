@@ -86,6 +86,31 @@ static inline uchar2 q4k_scale_min(uint j, device const uchar *q) {
     return uchar2((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4));
 }
 
+// Eight consecutive dequantized weights of `row` from element 32 * chunk + start, where
+// start is a multiple of four below 32. FORMAT: 0 F32, 1 Q8_0, 2 Q4_K.
+template <uint FORMAT> inline void packed_weights8(device const uchar *w, ulong row, uint chunk,
+    uint start, uint width, thread float4 &lo, thread float4 &hi) {
+    if (FORMAT == 0) {
+        device const packed_float4 *v = (device const packed_float4 *)((device const float *)w
+            + row * width + chunk * 32 + start);
+        lo = float4(v[0]); hi = float4(v[1]);
+    } else if (FORMAT == 1) {
+        device const block_q8_0 &b = ((device const block_q8_0 *)w)[row * (width / 32) + chunk];
+        device const packed_char4 *qs = (device const packed_char4 *)(b.qs + start);
+        float d = float(b.d);
+        lo = float4(char4(qs[0])) * d; hi = float4(char4(qs[1])) * d;
+    } else {
+        device const block_q4_k &b = ((device const block_q4_k *)w)[row * (width / 256) + chunk / 8];
+        uint sub = chunk % 8;
+        uchar2 sm = q4k_scale_min(sub, b.scales);
+        float d = float(b.d) * float(sm.x), m = float(b.dmin) * float(sm.y);
+        device const packed_uchar4 *qs = (device const packed_uchar4 *)(b.qs + (sub / 2) * 32 + start);
+        uchar4 q0 = uchar4(qs[0]), q1 = uchar4(qs[1]);
+        if (sub & 1) { q0 >>= 4; q1 >>= 4; } else { q0 &= 15; q1 &= 15; }
+        lo = float4(q0) * d - m; hi = float4(q1) * d - m;
+    }
+}
+
 // Eight lanes share one Q4_K super-block and a simdgroup keeps four blocks in flight.
 // Lane slot s reads 16 packed bytes of 64-element group s/2: low nibbles are 16 values of
 // sub-block 2*group, high nibbles 16 values of sub-block 2*group + 1.
@@ -164,10 +189,11 @@ kernel void qmv_q4k_f32(
     }
 }
 
-// Small-batch Q8_0 matrix multiplication on the matrix units, computed transposed:
-// y^T[n, b] = w[n, :] · x^T[:, b] for up to 8 * BT activation rows. A threadgroup owns
-// 8 * NT output columns; its simdgroups split the Q8_0 blocks along k and reduce once at
-// the end, so even narrow projections fill the GPU.
+// Small-batch Q8_0 and Q4_K matrix multiplication on the matrix units, computed
+// transposed: y^T[n, b] = w[n, :] · x^T[:, b] for up to 8 * BT activation rows. A
+// threadgroup owns 8 * NT output columns; its simdgroups split the 32-element chunks along
+// k and reduce once at the end, so even narrow projections fill the GPU. Dequantization
+// and accumulation are F32, as in the GEMVs, so batch size changes no precision.
 //
 // Fragments load straight from device memory with no staging or barriers. Lane l of an
 // 8x8 fragment holds (r, c) and (r, c + 1), r = (l/4 & 4) + (l/2) % 4, c = (l/4 & 2) * 2 +
@@ -183,9 +209,9 @@ struct QmmParams {
     uint rows;
 };
 
-template <uint BT, uint NT>
-kernel void qmm_q8_0_f32(
-    device const block_q8_0 *w [[buffer(0)]],
+template <uint FORMAT, uint BT, uint NT>
+kernel void qmm_f32(
+    device const uchar *w [[buffer(0)]],
     device const float *x [[buffer(1)]],
     device float *y [[buffer(2)]],
     constant QmmParams &p [[buffer(3)]],
@@ -208,9 +234,9 @@ kernel void qmm_q8_0_f32(
         }
     }
     // This lane's weight rows and activation rows.
-    device const block_q8_0 *wr[NT];
+    ulong wr[NT];
     for (uint t = 0; t < NT; ++t) {
-        wr[t] = w + ulong(min(col0 + t * 8 + fr, p.n - 1)) * blocks;
+        wr[t] = min(col0 + t * 8 + fr, p.n - 1);
     }
     // This lane's activations k = 4 * fr + s of batch rows fc and fc + 1.
     uint xk = 4 * fr;
@@ -226,11 +252,7 @@ kernel void qmm_q8_0_f32(
         }
         float4 q_lo[NT], q_hi[NT];
         for (uint t = 0; t < NT; ++t) {
-            device const block_q8_0 &blk = wr[t][ib];
-            device const packed_char4 *qs = (device const packed_char4 *)(blk.qs + 4 * fc);
-            float d = float(blk.d);
-            q_lo[t] = float4(char4(qs[0])) * d;
-            q_hi[t] = float4(char4(qs[1])) * d;
+            packed_weights8<FORMAT>(w, wr[t], ib, 4 * fc, p.k, q_lo[t], q_hi[t]);
         }
         for (uint s = 0; s < 4; ++s) {
             simdgroup_float8x8 xm[BT];
@@ -272,13 +294,15 @@ kernel void qmm_q8_0_f32(
     }
 }
 
-#define QMM(BT, NT) \
-    template [[host_name("qmm_q8_0_t" #BT "_f32")]] kernel void qmm_q8_0_f32<BT, NT>( \
-        device const block_q8_0 *, device const float *, device float *, constant QmmParams &, \
+#define QMM(FORMAT, NAME, BT, NT) \
+    template [[host_name("qmm_" NAME "_t" #BT "_f32")]] kernel void qmm_f32<FORMAT, BT, NT>( \
+        device const uchar *, device const float *, device float *, constant QmmParams &, \
         threadgroup float *, uint, uint, uint, uint, uint, uint);
 // Two column tiles per threadgroup: four measured no faster on M1 (P6 kernel artifact).
-QMM(1, 2)
-QMM(2, 2)
+QMM(1, "q8_0", 1, 2)
+QMM(1, "q8_0", 2, 2)
+QMM(2, "q4k", 1, 2)
+QMM(2, "q4k", 2, 2)
 
 // Rows per simdgroup shrink with the batch to bound accumulator registers.
 #define QMV(B, NR8, NR4) \

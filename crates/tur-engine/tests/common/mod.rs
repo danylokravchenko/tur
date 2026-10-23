@@ -119,6 +119,7 @@ pub fn forward(
             tokens: range.clone(),
             state,
             logits,
+            hidden: false,
         })
         .collect();
     let steps = model.forward(&PackedForward {
