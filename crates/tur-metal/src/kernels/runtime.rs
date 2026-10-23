@@ -20,7 +20,21 @@ use tur_core::{Result, TurError, execution::invalid};
 /// 3: tiled prefill attention over query tiles.
 pub const LAYOUT_VERSION: u32 = 3;
 
-const SOURCE: &str = include_str!("tur.metal");
+// Runtime Metal compilation has no local include search path, so embed the families as
+// one source string with shared helpers first.
+const SOURCE: &str = concat!(
+    include_str!("common.metal"),
+    "\n",
+    include_str!("normalization.metal"),
+    "\n",
+    include_str!("delta.metal"),
+    "\n",
+    include_str!("attention.metal"),
+    "\n",
+    include_str!("quantized.metal"),
+    "\n",
+    include_str!("sampling.metal"),
+);
 const SIMD_WIDTH: usize = 32;
 
 /// Every function in [`SOURCE`]. Template instantiations encode their shape family

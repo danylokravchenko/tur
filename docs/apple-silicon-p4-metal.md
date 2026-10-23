@@ -80,7 +80,9 @@ the details and measurements.
 
 - **Capability query.** Records the Apple GPU family, Metal 3/4, unified memory,
   threadgroup thread and memory limits, buffer limit and recommended working set.
-- **Pipelines.** One MSL library ([`tur.metal`](../crates/tur-metal/src/kernels/tur.metal))
+- **Pipelines.** The shared helpers and normalization, DeltaNet, attention, quantized
+  matrix and sampling sources are embedded as one source string in
+  [`runtime.rs`](../crates/tur-metal/src/kernels/runtime.rs). One MSL library
   is compiled per device with `MTLMathMode::Safe`, and every pipeline is built at model
   load, so no request pays compilation. Each variant's name encodes its dtype and shape
   family (`attention_r8_f32`, `qmv_q4k_b3_f32`). The runtime belongs to one device, and
