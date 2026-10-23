@@ -1,0 +1,670 @@
+{
+  "schema_version": 3,
+  "workload": "synthetic kernel shapes from Qwen3.5-0.8B and Qwen3.8-27B; not model or serving throughput",
+  "dtype": "f32",
+  "capabilities": "Capabilities { name: \"Apple M1\", architecture: \"applegpu_g13g\", apple_family: 7, metal3: true, metal4: true, unified_memory: true, max_threads_per_threadgroup: 1024, threadgroup_memory_bytes: 32768, max_buffer_bytes: 9534832640, recommended_working_set_bytes: 12713115648 }",
+  "tuning": "Tuning { row_threads: 256, simdgroups: 4, scan_simdgroups: 2, elementwise_threads: 256, attention_parallelism: 1024, min_split_keys: 64, attention_tiled_groups: 16, gemv_q8_0_rows: (2, 3), gemv_q4k_rows: (2, 2), qmm_q8_0_rows: (4, 16), qmm_q4k_rows: (2, 16), delta_step: true }",
+  "layout_version": 3,
+  "warmup": 3,
+  "samples": 15,
+  "timing": "host wall time per operation over an adaptive batch of reps ending at Device::synchronize; outputs are recycled through the pool between reps",
+  "cases": {
+    "norm": [],
+    "delta_net": [],
+    "attention": [],
+    "paged_attention": [],
+    "tiled_attention": [],
+    "packed_linear": [],
+    "sampling": [],
+    "moe": [
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 1,
+        "skewed": false,
+        "active_experts": 8,
+        "weights": "q8_0",
+        "resident_bytes": 570425344,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.0003451940684931507,
+          "p90_seconds": 0.00038839327397260275,
+          "reps_per_sample": 73
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.00002179505,
+          "p90_seconds": 0.0000239862,
+          "reps_per_sample": 160
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.00034507708750000003,
+          "p90_seconds": 0.0003514046875,
+          "reps_per_sample": 80
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 1,
+        "skewed": true,
+        "active_experts": 8,
+        "weights": "q8_0",
+        "resident_bytes": 570425344,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.00034116095890410956,
+          "p90_seconds": 0.0003474737397260274,
+          "reps_per_sample": 73
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.00002210971223021583,
+          "p90_seconds": 0.000022472719424460432,
+          "reps_per_sample": 139
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.00036493935443037974,
+          "p90_seconds": 0.0003796397594936709,
+          "reps_per_sample": 79
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 8,
+        "skewed": false,
+        "active_experts": 63,
+        "weights": "q8_0",
+        "resident_bytes": 570425344,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.002445641222222222,
+          "p90_seconds": 0.0024825000000000003,
+          "reps_per_sample": 18
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.000027365355371900824,
+          "p90_seconds": 0.000027820586776859504,
+          "reps_per_sample": 121
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.0027985865384615384,
+          "p90_seconds": 0.0028566346153846155,
+          "reps_per_sample": 13
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 8,
+        "skewed": true,
+        "active_experts": 8,
+        "weights": "q8_0",
+        "resident_bytes": 570425344,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.0006822155652173914,
+          "p90_seconds": 0.000687086043478261,
+          "reps_per_sample": 46
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.0000288746,
+          "p90_seconds": 0.000029041666666666667,
+          "reps_per_sample": 105
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.0004266678823529412,
+          "p90_seconds": 0.00045979411764705884,
+          "reps_per_sample": 34
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 32,
+        "skewed": false,
+        "active_experts": 161,
+        "weights": "q8_0",
+        "resident_bytes": 570425344,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.006754738142857143,
+          "p90_seconds": 0.006986642857142857,
+          "reps_per_sample": 7
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.000043167708333333335,
+          "p90_seconds": 0.000043828475,
+          "reps_per_sample": 120
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.007007666714285715,
+          "p90_seconds": 0.007212137,
+          "reps_per_sample": 7
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 32,
+        "skewed": true,
+        "active_experts": 8,
+        "weights": "q8_0",
+        "resident_bytes": 570425344,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.0012167069333333333,
+          "p90_seconds": 0.0012677430333333335,
+          "reps_per_sample": 30
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.000043572450450450454,
+          "p90_seconds": 0.00004524925225225225,
+          "reps_per_sample": 111
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.0007716064722222221,
+          "p90_seconds": 0.0007983657222222222,
+          "reps_per_sample": 36
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 128,
+        "skewed": false,
+        "active_experts": 251,
+        "weights": "q8_0",
+        "resident_bytes": 570425344,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.01474304175,
+          "p90_seconds": 0.01519334375,
+          "reps_per_sample": 4
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.00005020416666666667,
+          "p90_seconds": 0.00005127916666666667,
+          "reps_per_sample": 120
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.0121741145,
+          "p90_seconds": 0.01259808325,
+          "reps_per_sample": 4
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 128,
+        "skewed": true,
+        "active_experts": 8,
+        "weights": "q8_0",
+        "resident_bytes": 570425344,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.0038327459,
+          "p90_seconds": 0.0038724542,
+          "reps_per_sample": 10
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.000053947635135135136,
+          "p90_seconds": 0.00005479560810810811,
+          "reps_per_sample": 74
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.002543485142857143,
+          "p90_seconds": 0.002570360142857143,
+          "reps_per_sample": 14
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 512,
+        "skewed": false,
+        "active_experts": 256,
+        "weights": "q8_0",
+        "resident_bytes": 570425344,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.022501569666666665,
+          "p90_seconds": 0.022975041666666668,
+          "reps_per_sample": 3
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.00008467925000000001,
+          "p90_seconds": 0.00008913194791666667,
+          "reps_per_sample": 96
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.02189493066666667,
+          "p90_seconds": 0.022137472000000002,
+          "reps_per_sample": 3
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 512,
+        "skewed": true,
+        "active_experts": 8,
+        "weights": "q8_0",
+        "resident_bytes": 570425344,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.01437240625,
+          "p90_seconds": 0.01449809375,
+          "reps_per_sample": 4
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.0000908007,
+          "p90_seconds": 0.0000953111,
+          "reps_per_sample": 60
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.010671052,
+          "p90_seconds": 0.01080696875,
+          "reps_per_sample": 4
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 2048,
+        "skewed": false,
+        "active_experts": 256,
+        "weights": "q8_0",
+        "resident_bytes": 570425344,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.072618875,
+          "p90_seconds": 0.074238584,
+          "reps_per_sample": 1
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.00022123848684210524,
+          "p90_seconds": 0.00023921656578947367,
+          "reps_per_sample": 76
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.050297292,
+          "p90_seconds": 0.050668708,
+          "reps_per_sample": 1
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 2048,
+        "skewed": true,
+        "active_experts": 8,
+        "weights": "q8_0",
+        "resident_bytes": 570425344,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.06039025,
+          "p90_seconds": 0.062210834,
+          "reps_per_sample": 1
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.00023741228070175437,
+          "p90_seconds": 0.00024611694736842107,
+          "reps_per_sample": 57
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.052445666,
+          "p90_seconds": 0.053727083,
+          "reps_per_sample": 1
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 1,
+        "skewed": false,
+        "active_experts": 8,
+        "weights": "q4k",
+        "resident_bytes": 301989888,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.00030927055844155846,
+          "p90_seconds": 0.0003142727272727273,
+          "reps_per_sample": 77
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.000022608117647058824,
+          "p90_seconds": 0.000022776411764705883,
+          "reps_per_sample": 153
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.00020488435955056178,
+          "p90_seconds": 0.0002246413820224719,
+          "reps_per_sample": 89
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 1,
+        "skewed": true,
+        "active_experts": 8,
+        "weights": "q4k",
+        "resident_bytes": 301989888,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.00031042618571428573,
+          "p90_seconds": 0.00031825475714285717,
+          "reps_per_sample": 70
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.000023104508196721312,
+          "p90_seconds": 0.000024739754098360658,
+          "reps_per_sample": 122
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.000195451171875,
+          "p90_seconds": 0.000196165359375,
+          "reps_per_sample": 64
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 8,
+        "skewed": false,
+        "active_experts": 63,
+        "weights": "q4k",
+        "resident_bytes": 301989888,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.00227188545,
+          "p90_seconds": 0.00234602915,
+          "reps_per_sample": 20
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.000026583089285714286,
+          "p90_seconds": 0.00002677901785714286,
+          "reps_per_sample": 168
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.00158100205,
+          "p90_seconds": 0.0016237583,
+          "reps_per_sample": 20
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 8,
+        "skewed": true,
+        "active_experts": 8,
+        "weights": "q4k",
+        "resident_bytes": 301989888,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.0009409977567567568,
+          "p90_seconds": 0.0009531891891891892,
+          "reps_per_sample": 37
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.00002794194262295082,
+          "p90_seconds": 0.00002819227868852459,
+          "reps_per_sample": 122
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.0003549507727272727,
+          "p90_seconds": 0.00037577177272727274,
+          "reps_per_sample": 44
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 32,
+        "skewed": false,
+        "active_experts": 161,
+        "weights": "q4k",
+        "resident_bytes": 301989888,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.007424166571428571,
+          "p90_seconds": 0.007592101142857142,
+          "reps_per_sample": 7
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.0000420998322147651,
+          "p90_seconds": 0.000042415543624161074,
+          "reps_per_sample": 149
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.00503669275,
+          "p90_seconds": 0.0051279895,
+          "reps_per_sample": 8
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 32,
+        "skewed": true,
+        "active_experts": 8,
+        "weights": "q4k",
+        "resident_bytes": 301989888,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.00157813836,
+          "p90_seconds": 0.00159705168,
+          "reps_per_sample": 25
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.00004314875438596491,
+          "p90_seconds": 0.00004535343859649123,
+          "reps_per_sample": 114
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.0008511931818181818,
+          "p90_seconds": 0.0008703421818181818,
+          "reps_per_sample": 33
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 128,
+        "skewed": false,
+        "active_experts": 251,
+        "weights": "q4k",
+        "resident_bytes": 301989888,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.01918506966666667,
+          "p90_seconds": 0.019720319333333333,
+          "reps_per_sample": 3
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.000051401249999999995,
+          "p90_seconds": 0.000051794170000000004,
+          "reps_per_sample": 100
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.0094440332,
+          "p90_seconds": 0.0095703334,
+          "reps_per_sample": 5
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 128,
+        "skewed": true,
+        "active_experts": 8,
+        "weights": "q4k",
+        "resident_bytes": 301989888,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.004710726888888889,
+          "p90_seconds": 0.004737268555555556,
+          "reps_per_sample": 9
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.000052557656565656564,
+          "p90_seconds": 0.000053300505050505054,
+          "reps_per_sample": 99
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.0028503506666666665,
+          "p90_seconds": 0.002930993083333333,
+          "reps_per_sample": 12
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 512,
+        "skewed": false,
+        "active_experts": 256,
+        "weights": "q4k",
+        "resident_bytes": 301989888,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.0284620625,
+          "p90_seconds": 0.0287643335,
+          "reps_per_sample": 2
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.00008629012345679012,
+          "p90_seconds": 0.00008745781481481481,
+          "reps_per_sample": 81
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.0236433125,
+          "p90_seconds": 0.0239672295,
+          "reps_per_sample": 2
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 512,
+        "skewed": true,
+        "active_experts": 8,
+        "weights": "q4k",
+        "resident_bytes": 301989888,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.017259278,
+          "p90_seconds": 0.017436861,
+          "reps_per_sample": 3
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.00008878154285714287,
+          "p90_seconds": 0.0000901119,
+          "reps_per_sample": 70
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.01180678125,
+          "p90_seconds": 0.0121002915,
+          "reps_per_sample": 4
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 2048,
+        "skewed": false,
+        "active_experts": 256,
+        "weights": "q4k",
+        "resident_bytes": 301989888,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.083375042,
+          "p90_seconds": 0.084671875,
+          "reps_per_sample": 1
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.00022041722666666665,
+          "p90_seconds": 0.00022678944000000003,
+          "reps_per_sample": 75
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.057285667,
+          "p90_seconds": 0.057657958,
+          "reps_per_sample": 1
+        }
+      },
+      {
+        "experts": 256,
+        "top_k": 8,
+        "input": 2048,
+        "output": 1024,
+        "tokens": 2048,
+        "skewed": true,
+        "active_experts": 8,
+        "weights": "q4k",
+        "resident_bytes": 301989888,
+        "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+        "grouped_including_routing": {
+          "median_seconds": 0.070937459,
+          "p90_seconds": 0.071963,
+          "reps_per_sample": 1
+        },
+        "routing_and_scatter_only": {
+          "median_seconds": 0.00023110661764705882,
+          "p90_seconds": 0.00023750307352941175,
+          "reps_per_sample": 68
+        },
+        "individual_prepared_inputs": {
+          "median_seconds": 0.054769542,
+          "p90_seconds": 0.057825416,
+          "reps_per_sample": 1
+        }
+      }
+    ]
+  }
+}

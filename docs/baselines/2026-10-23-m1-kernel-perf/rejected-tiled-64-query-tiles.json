@@ -1,0 +1,850 @@
+{
+  "schema_version": 3,
+  "workload": "synthetic kernel shapes from Qwen3.5-0.8B and Qwen3.8-27B; not model or serving throughput",
+  "dtype": "f32",
+  "capabilities": "Capabilities { name: \"Apple M1\", architecture: \"applegpu_g13g\", apple_family: 7, metal3: true, metal4: true, unified_memory: true, max_threads_per_threadgroup: 1024, threadgroup_memory_bytes: 32768, max_buffer_bytes: 9534832640, recommended_working_set_bytes: 12713115648 }",
+  "tuning": "Tuning { row_threads: 256, simdgroups: 4, scan_simdgroups: 2, elementwise_threads: 256, attention_parallelism: 1024, min_split_keys: 64, attention_tiled_groups: 16, gemv_q8_0_rows: (2, 3), gemv_q4k_rows: (2, 2), qmm_q8_0_rows: (4, 16), qmm_q4k_rows: (2, 16), delta_step: true }",
+  "layout_version": 3,
+  "warmup": 3,
+  "samples": 15,
+  "timing": "host wall time per operation over an adaptive batch of reps ending at Device::synchronize; outputs are recycled through the pool between reps",
+  "cases": {
+    "norm": [],
+    "delta_net": [],
+    "attention": [],
+    "paged_attention": [],
+    "tiled_attention": [
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 16",
+        "kv_format": "f32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 16,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.000038557320441988947,
+          "p90_seconds": 0.00004150644198895028,
+          "reps_per_sample": 181
+        },
+        "per_query": {
+          "median_seconds": 0.000011489688118811882,
+          "p90_seconds": 0.000011643772277227723,
+          "reps_per_sample": 202
+        },
+        "speedup": 0.2979897977116585
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 16",
+        "kv_format": "f16",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 16,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.00003945104375,
+          "p90_seconds": 0.00003974296875,
+          "reps_per_sample": 160
+        },
+        "per_query": {
+          "median_seconds": 0.000011537429378531074,
+          "p90_seconds": 0.000011714920903954801,
+          "reps_per_sample": 177
+        },
+        "speedup": 0.292449280978303
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 16",
+        "kv_format": "q8_32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 16,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.00004107120253164557,
+          "p90_seconds": 0.00004305142405063291,
+          "reps_per_sample": 158
+        },
+        "per_query": {
+          "median_seconds": 0.000015981085526315788,
+          "p90_seconds": 0.000016421052631578946,
+          "reps_per_sample": 152
+        },
+        "speedup": 0.3891068325550556
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 32",
+        "kv_format": "f32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 32,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.000046616246376811594,
+          "p90_seconds": 0.0000477623768115942,
+          "reps_per_sample": 138
+        },
+        "per_query": {
+          "median_seconds": 0.00002917994074074074,
+          "p90_seconds": 0.0000307503037037037,
+          "reps_per_sample": 135
+        },
+        "speedup": 0.6259607542158472
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 32",
+        "kv_format": "f16",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 32,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.000047712701612903226,
+          "p90_seconds": 0.00005208232258064516,
+          "reps_per_sample": 124
+        },
+        "per_query": {
+          "median_seconds": 0.000025162829787234042,
+          "p90_seconds": 0.000026214829787234042,
+          "reps_per_sample": 141
+        },
+        "speedup": 0.5273822050862261
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 32",
+        "kv_format": "q8_32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 32,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.00005059544680851064,
+          "p90_seconds": 0.0000554281914893617,
+          "reps_per_sample": 141
+        },
+        "per_query": {
+          "median_seconds": 0.000034021521978021975,
+          "p90_seconds": 0.000035673076923076926,
+          "reps_per_sample": 182
+        },
+        "speedup": 0.6724226017171812
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 64",
+        "kv_format": "f32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 64,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.00007629015942028985,
+          "p90_seconds": 0.00007873007246376811,
+          "reps_per_sample": 138
+        },
+        "per_query": {
+          "median_seconds": 0.00008299404761904762,
+          "p90_seconds": 0.00008608003174603175,
+          "reps_per_sample": 126
+        },
+        "speedup": 1.0878735638999704
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 64",
+        "kv_format": "f16",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 64,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.00007671765734265733,
+          "p90_seconds": 0.00007765646853146854,
+          "reps_per_sample": 143
+        },
+        "per_query": {
+          "median_seconds": 0.00006323757258064516,
+          "p90_seconds": 0.0000670144435483871,
+          "reps_per_sample": 124
+        },
+        "speedup": 0.824289671648813
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 64",
+        "kv_format": "q8_32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 64,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.0000832672018348624,
+          "p90_seconds": 0.00008382798165137615,
+          "reps_per_sample": 109
+        },
+        "per_query": {
+          "median_seconds": 0.000100583,
+          "p90_seconds": 0.0001032486746031746,
+          "reps_per_sample": 126
+        },
+        "speedup": 1.2079546061782973
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 128",
+        "kv_format": "f32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 128,
+        "sequences": 1,
+        "tiles": 2,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.00020017995652173913,
+          "p90_seconds": 0.0002029190724637681,
+          "reps_per_sample": 69
+        },
+        "per_query": {
+          "median_seconds": 0.00030073754545454544,
+          "p90_seconds": 0.0003029707792207792,
+          "reps_per_sample": 77
+        },
+        "speedup": 1.5023359515111392
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 128",
+        "kv_format": "f16",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 128,
+        "sequences": 1,
+        "tiles": 2,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.00019815022368421052,
+          "p90_seconds": 0.00020211184210526314,
+          "reps_per_sample": 76
+        },
+        "per_query": {
+          "median_seconds": 0.00019788567073170734,
+          "p90_seconds": 0.00020136991463414635,
+          "reps_per_sample": 82
+        },
+        "speedup": 0.99866488693485
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 128",
+        "kv_format": "q8_32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 128,
+        "sequences": 1,
+        "tiles": 2,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.000220792328125,
+          "p90_seconds": 0.00022275325,
+          "reps_per_sample": 64
+        },
+        "per_query": {
+          "median_seconds": 0.00034324746969696966,
+          "p90_seconds": 0.0003468888939393939,
+          "reps_per_sample": 66
+        },
+        "speedup": 1.554616832078706
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 512",
+        "kv_format": "f32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 512,
+        "sequences": 1,
+        "tiles": 8,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.0021957017368421055,
+          "p90_seconds": 0.0022704144736842105,
+          "reps_per_sample": 19
+        },
+        "per_query": {
+          "median_seconds": 0.005049805555555556,
+          "p90_seconds": 0.005122407444444445,
+          "reps_per_sample": 9
+        },
+        "speedup": 2.2998595259200685
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 512",
+        "kv_format": "f16",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 512,
+        "sequences": 1,
+        "tiles": 8,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.0021333518333333332,
+          "p90_seconds": 0.0021472824444444447,
+          "reps_per_sample": 18
+        },
+        "per_query": {
+          "median_seconds": 0.0026764833333333335,
+          "p90_seconds": 0.0027127694666666665,
+          "reps_per_sample": 15
+        },
+        "speedup": 1.2545906828464224
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 512",
+        "kv_format": "q8_32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 512,
+        "sequences": 1,
+        "tiles": 8,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.002357925,
+          "p90_seconds": 0.002378391666666667,
+          "reps_per_sample": 15
+        },
+        "per_query": {
+          "median_seconds": 0.004945463000000001,
+          "p90_seconds": 0.00499911111111111,
+          "reps_per_sample": 9
+        },
+        "speedup": 2.097379263547399
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 2048",
+        "kv_format": "f32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2048,
+        "sequences": 1,
+        "tiles": 32,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.029934229,
+          "p90_seconds": 0.0305813545,
+          "reps_per_sample": 2
+        },
+        "per_query": {
+          "median_seconds": 0.150586833,
+          "p90_seconds": 0.153749625,
+          "reps_per_sample": 1
+        },
+        "speedup": 5.030589997824898
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 2048",
+        "kv_format": "f16",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2048,
+        "sequences": 1,
+        "tiles": 32,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.029614333,
+          "p90_seconds": 0.030160875,
+          "reps_per_sample": 2
+        },
+        "per_query": {
+          "median_seconds": 0.057666125,
+          "p90_seconds": 0.058803208,
+          "reps_per_sample": 1
+        },
+        "speedup": 1.947237001758574
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 2048",
+        "kv_format": "q8_32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2048,
+        "sequences": 1,
+        "tiles": 32,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.03244825,
+          "p90_seconds": 0.0327782705,
+          "reps_per_sample": 2
+        },
+        "per_query": {
+          "median_seconds": 0.077139875,
+          "p90_seconds": 0.07820225,
+          "reps_per_sample": 1
+        },
+        "speedup": 2.377320040371977
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 8192",
+        "kv_format": "f32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 8192,
+        "sequences": 1,
+        "tiles": 128,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.454376709,
+          "p90_seconds": 0.459078834,
+          "reps_per_sample": 1
+        },
+        "per_query": {
+          "median_seconds": 3.663225625,
+          "p90_seconds": 3.7267010000000003,
+          "reps_per_sample": 1
+        },
+        "speedup": 8.062089346661473
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 8192",
+        "kv_format": "f16",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 8192,
+        "sequences": 1,
+        "tiles": 128,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.451364375,
+          "p90_seconds": 0.453534292,
+          "reps_per_sample": 1
+        },
+        "per_query": {
+          "median_seconds": 1.089849792,
+          "p90_seconds": 1.109736875,
+          "reps_per_sample": 1
+        },
+        "speedup": 2.414567591870759
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "prefill 8192",
+        "kv_format": "q8_32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 8192,
+        "sequences": 1,
+        "tiles": 128,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.493598333,
+          "p90_seconds": 0.495302042,
+          "reps_per_sample": 1
+        },
+        "per_query": {
+          "median_seconds": 1.207255709,
+          "p90_seconds": 1.212241417,
+          "reps_per_sample": 1
+        },
+        "speedup": 2.4458261470668297
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "chunk 16 after 2048",
+        "kv_format": "f32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2064,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.0017145572916666667,
+          "p90_seconds": 0.0017248055833333333,
+          "reps_per_sample": 24
+        },
+        "per_query": {
+          "median_seconds": 0.00113715625,
+          "p90_seconds": 0.0011605044642857142,
+          "reps_per_sample": 28
+        },
+        "speedup": 0.6632360758820759
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "chunk 16 after 2048",
+        "kv_format": "f16",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2064,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.0016806787916666668,
+          "p90_seconds": 0.0016935399166666668,
+          "reps_per_sample": 24
+        },
+        "per_query": {
+          "median_seconds": 0.0007714664444444445,
+          "p90_seconds": 0.0007900625,
+          "reps_per_sample": 36
+        },
+        "speedup": 0.4590207529657763
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "chunk 16 after 2048",
+        "kv_format": "q8_32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2064,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.0018322517826086955,
+          "p90_seconds": 0.0018476594347826088,
+          "reps_per_sample": 23
+        },
+        "per_query": {
+          "median_seconds": 0.0013508493461538461,
+          "p90_seconds": 0.0013628621923076924,
+          "reps_per_sample": 26
+        },
+        "speedup": 0.7372618539524926
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "chunk 64 after 2048",
+        "kv_format": "f32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2112,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.001818955882352941,
+          "p90_seconds": 0.0018272181764705884,
+          "reps_per_sample": 17
+        },
+        "per_query": {
+          "median_seconds": 0.006301053571428571,
+          "p90_seconds": 0.006936101285714286,
+          "reps_per_sample": 7
+        },
+        "speedup": 3.4641046726640434
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "chunk 64 after 2048",
+        "kv_format": "f16",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2112,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.0017896875,
+          "p90_seconds": 0.001807528409090909,
+          "reps_per_sample": 22
+        },
+        "per_query": {
+          "median_seconds": 0.003452552083333333,
+          "p90_seconds": 0.003486066,
+          "reps_per_sample": 12
+        },
+        "speedup": 1.9291368372038877
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "chunk 64 after 2048",
+        "kv_format": "q8_32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2112,
+        "sequences": 1,
+        "tiles": 1,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.0019376309523809522,
+          "p90_seconds": 0.0019569404761904763,
+          "reps_per_sample": 21
+        },
+        "per_query": {
+          "median_seconds": 0.004982861111111111,
+          "p90_seconds": 0.005028643444444444,
+          "reps_per_sample": 9
+        },
+        "speedup": 2.5716254712943107
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "chunk 256 after 8192",
+        "kv_format": "f32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 8448,
+        "sequences": 1,
+        "tiles": 4,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.028583042,
+          "p90_seconds": 0.0289188125,
+          "reps_per_sample": 2
+        },
+        "per_query": {
+          "median_seconds": 0.184582458,
+          "p90_seconds": 0.209024375,
+          "reps_per_sample": 1
+        },
+        "speedup": 6.457761143827868
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "chunk 256 after 8192",
+        "kv_format": "f16",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 8448,
+        "sequences": 1,
+        "tiles": 4,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.028145771,
+          "p90_seconds": 0.028857583,
+          "reps_per_sample": 2
+        },
+        "per_query": {
+          "median_seconds": 0.084310542,
+          "p90_seconds": 0.094883666,
+          "reps_per_sample": 1
+        },
+        "speedup": 2.9954959130449827
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "chunk 256 after 8192",
+        "kv_format": "q8_32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 8448,
+        "sequences": 1,
+        "tiles": 4,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.0310720835,
+          "p90_seconds": 0.0315882295,
+          "reps_per_sample": 2
+        },
+        "per_query": {
+          "median_seconds": 0.07718725,
+          "p90_seconds": 0.078716375,
+          "reps_per_sample": 1
+        },
+        "speedup": 2.484134995324662
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "chunk 32 x4 after 1024",
+        "kv_format": "f32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 1056,
+        "sequences": 4,
+        "tiles": 4,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.0035456249999999997,
+          "p90_seconds": 0.0035730192307692307,
+          "reps_per_sample": 13
+        },
+        "per_query": {
+          "median_seconds": 0.006728702428571429,
+          "p90_seconds": 0.006983636857142857,
+          "reps_per_sample": 7
+        },
+        "speedup": 1.8977479086399236
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "chunk 32 x4 after 1024",
+        "kv_format": "f16",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 1056,
+        "sequences": 4,
+        "tiles": 4,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.0035195865384615383,
+          "p90_seconds": 0.003539048076923077,
+          "reps_per_sample": 13
+        },
+        "per_query": {
+          "median_seconds": 0.0026606666875,
+          "p90_seconds": 0.0026718203125,
+          "reps_per_sample": 16
+        },
+        "speedup": 0.7559600136051821
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "chunk 32 x4 after 1024",
+        "kv_format": "q8_32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 1056,
+        "sequences": 4,
+        "tiles": 4,
+        "default_kernel": "tiled",
+        "tiled": {
+          "median_seconds": 0.003864711833333333,
+          "p90_seconds": 0.003892354166666667,
+          "reps_per_sample": 12
+        },
+        "per_query": {
+          "median_seconds": 0.0048916875,
+          "p90_seconds": 0.0049177459,
+          "reps_per_sample": 10
+        },
+        "speedup": 1.265731498480417
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "f32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2048,
+        "sequences": 8,
+        "tiles": 8,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.01330440625,
+          "p90_seconds": 0.01358058325,
+          "reps_per_sample": 4
+        },
+        "per_query": {
+          "median_seconds": 0.001276488769230769,
+          "p90_seconds": 0.001307889423076923,
+          "reps_per_sample": 26
+        },
+        "speedup": 0.09594481296230481
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "f16",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2048,
+        "sequences": 8,
+        "tiles": 8,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.0135257395,
+          "p90_seconds": 0.01358683325,
+          "reps_per_sample": 4
+        },
+        "per_query": {
+          "median_seconds": 0.0006581356666666667,
+          "p90_seconds": 0.0006800673076923077,
+          "reps_per_sample": 39
+        },
+        "speedup": 0.04865801730594225
+      },
+      {
+        "operation": "attention_tiled",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "q8_32",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2048,
+        "sequences": 8,
+        "tiles": 8,
+        "default_kernel": "per_query",
+        "tiled": {
+          "median_seconds": 0.0147719375,
+          "p90_seconds": 0.0152628645,
+          "reps_per_sample": 4
+        },
+        "per_query": {
+          "median_seconds": 0.00068471875,
+          "p90_seconds": 0.00069080596875,
+          "reps_per_sample": 32
+        },
+        "speedup": 0.04635267039276331
+      }
+    ],
+    "packed_linear": [],
+    "sampling": [],
+    "moe": []
+  }
+}

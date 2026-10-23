@@ -29,6 +29,10 @@ places the crossover at 64 queries with eight heads. Tuning value 0 forces tiled
 execution for supported layouts; `usize::MAX` selects the per-query path. Runs
 with non-consecutive positions sharing a page table use the per-query path.
 
+Update (2026-10-23): the [kernel performance pass](apple-silicon-kernel-performance.md) made the per-query kernel faster (Q8 decode
+1.4–1.5×). The crossover was rechecked and left unchanged; 64-query tiles were measured
+and rejected (0.86–0.89× on long prefill).
+
 ## Reproduction and scope
 
 ```sh

@@ -1,0 +1,498 @@
+    Finished `pre-release` profile [optimized] target(s) in 0.27s
+────────────
+ Nextest run ID f0e5dd25-8c4d-4608-8d56-af408ecb4ebe with nextest profile: default
+    Starting 136 tests across 7 binaries (6 tests skipped)
+        PASS [   0.010s] (  1/136) tur-engine backend::memory::tests::test_budget_boundaries_fit_without_overallocating_the_zero_slot
+        PASS [   0.008s] (  2/136) tur-engine backend::memory::tests::test_concurrent_leases_never_exceed_the_limit
+        PASS [   0.008s] (  3/136) tur-engine backend::memory::tests::test_default_budget_sizes_contexts_and_fits_the_device_limit
+        PASS [   0.008s] (  4/136) tur-engine backend::memory::tests::test_explicit_budget_beyond_the_device_limit_is_rejected
+        PASS [   0.008s] (  5/136) tur-engine backend::memory::tests::test_models_sharing_a_device_budget_cannot_overcommit
+        PASS [   0.008s] (  6/136) tur-engine backend::pipeline::tests::test_sampling_uses_checkpoint_defaults_and_explicit_greedy
+        PASS [   0.010s] (  7/136) tur-engine backend::prefix::tests::test_a_whole_prompt_hit_needs_the_snapshot_logits
+        PASS [   0.008s] (  8/136) tur-engine backend::prefix::tests::test_disabled_cache_never_aligns_or_stores
+        PASS [   0.008s] (  9/136) tur-engine backend::prefix::tests::test_eviction_prefers_unused_entries_and_releases_leases
+        PASS [   0.009s] ( 10/136) tur-engine backend::prefix::tests::test_hash_matches_are_verified_against_tokens
+        PASS [   0.008s] ( 11/136) tur-engine backend::prefix::tests::test_lookup_returns_the_deepest_verified_admissible_prefix
+        PASS [   0.008s] ( 12/136) tur-engine backend::scheduler::tests::test_aged_prefill_reclaims_younger_state_and_running_slots
+        PASS [   0.008s] ( 13/136) tur-engine backend::scheduler::tests::test_config_validation_rejects_passes_without_decode_room
+        PASS [   0.008s] ( 14/136) tur-engine backend::scheduler::tests::test_cost_samples_are_normalized_for_ragged_token_counts
+        PASS [   0.008s] ( 15/136) tur-engine backend::scheduler::tests::test_decodes_run_first_and_prefill_keeps_its_minimum
+        PASS [   0.008s] ( 16/136) tur-engine backend::scheduler::tests::test_measured_costs_shrink_prefill_by_bounded_steps
+        PASS [   0.008s] ( 17/136) tur-engine backend::scheduler::tests::test_memory_shortage_preempts_the_newest_running_request
+        PASS [   0.008s] ( 18/136) tur-engine backend::scheduler::tests::test_replay_chunks_remain_indivisible_under_cost_and_token_pressure
+        PASS [   0.010s] ( 19/136) tur-engine backend::scheduler::tests::test_skipped_decodes_rotate_to_the_front
+        PASS [   0.008s] ( 20/136) tur-engine backend::scheduler::tests::test_waiting_queue_limits_requests_and_tokens
+        PASS [   0.008s] ( 21/136) tur-engine backend::speculation::tests::test_acceptance_rises_with_accepted_drafts_and_recovers_towards_the_prior
+        PASS [   0.008s] ( 22/136) tur-engine backend::speculation::tests::test_config_validation
+        PASS [   0.008s] ( 23/136) tur-engine backend::speculation::tests::test_cost_fit_separates_base_and_draft_costs
+        PASS [   0.009s] ( 24/136) tur-engine backend::speculation::tests::test_head_drafts_only_when_their_cost_repays_them
+        PASS [   0.008s] ( 25/136) tur-engine backend::speculation::tests::test_identified_costs_survive_passes_without_drafts
+        PASS [   0.009s] ( 26/136) tur-engine backend::speculation::tests::test_incremental_index_matches_rebuilt_index
+        PASS [   0.011s] ( 27/136) tur-engine backend::speculation::tests::test_long_history_lookup_has_a_bounded_index
+        PASS [   0.009s] ( 28/136) tur-engine backend::speculation::tests::test_longest_latest_suffix_match_proposes_its_continuation
+        PASS [   0.008s] ( 29/136) tur-engine backend::speculation::tests::test_plan_drafts_while_expected_throughput_rises
+        PASS [   0.008s] ( 30/136) tur-engine backend::speculation::tests::test_unmeasured_costs_alternate_between_drafting_and_not
+        PASS [   0.008s] ( 31/136) tur-engine hybrid::tests::test_greedy_fast_path_keeps_the_first_maximum_and_rejects_nonfinite_rows
+        PASS [   0.008s] ( 32/136) tur-engine hybrid::tests::test_invalid_sampling_options_do_not_allocate_requests
+        PASS [   0.008s] ( 33/136) tur-engine hybrid::tests::test_penalty_history_counts_samples_and_rolls_back
+        PASS [   0.008s] ( 34/136) tur-engine hybrid::tests::test_revision_overflow_rejects_submission_and_restore_without_changes
+        PASS [   0.008s] ( 35/136) tur-engine hybrid::tests::test_rng_counter_overflow_leaves_bookkeeping_unchanged
+        PASS [   0.008s] ( 36/136) tur-engine hybrid::tests::test_rollback_restores_history_and_draws
+        PASS [   0.011s] ( 37/136) tur-engine::hybrid_contracts test_cancellation_holds_shared_model_until_completion
+        PASS [   0.009s] ( 38/136) tur-engine::hybrid_contracts test_cancellation_retains_inflight_state_and_does_not_publish_outputs
+        PASS [   0.009s] ( 39/136) tur-engine::hybrid_contracts test_checkpoint_fork_restore_crosses_partial_attention_pages_and_all_recurrent_layers
+        PASS [   0.008s] ( 40/136) tur-engine::hybrid_contracts test_checkpoint_tensor_inspection_cannot_mutate_shared_state
+        PASS [   0.028s] ( 41/136) tur-engine::hybrid_contracts test_deterministic_drafts_preserve_target_sampling_rng_penalties_and_every_layer
+        PASS [   0.018s] ( 42/136) tur-engine::hybrid_contracts test_grammar_parser_fork_speculation_restore_and_terminal_state_are_atomic
+        PASS [   0.009s] ( 43/136) tur-engine::hybrid_contracts test_incompatible_restore_and_foreign_handles_leave_state_unchanged
+        PASS [   0.008s] ( 44/136) tur-engine::hybrid_contracts test_independent_requests_match_single_execution_after_batch_reordering
+        PASS [   0.008s] ( 45/136) tur-engine::hybrid_contracts test_invalid_descriptors_are_rejected_before_model_execution
+        PASS [   0.009s] ( 46/136) tur-engine::hybrid_contracts test_invalid_output_is_isolated_and_its_state_writes_are_never_published
+        PASS [   0.014s] ( 47/136) tur-engine::hybrid_contracts test_no_output_positions_advance_only_model_state
+        PASS [   0.009s] ( 48/136) tur-engine::hybrid_contracts test_one_request_failure_does_not_affect_others
+        PASS [   0.009s] ( 49/136) tur-engine::hybrid_contracts test_ordinary_execution_retains_only_final_recurrent_boundary
+        PASS [   0.009s] ( 50/136) tur-engine::hybrid_contracts test_packed_prefill_matches_incremental_decode
+        PASS [   0.008s] ( 51/136) tur-engine::hybrid_contracts test_pool_exhaustion_fails_the_pass_before_execution_and_leaves_state_unchanged
+        PASS [   0.008s] ( 52/136) tur-engine::hybrid_contracts test_position_overflow_and_limit_are_checked
+        PASS [   0.009s] ( 53/136) tur-engine::hybrid_contracts test_published_descriptors_are_invalidated
+        PASS [   0.009s] ( 54/136) tur-engine::hybrid_contracts test_released_pages_and_slots_are_reclaimed_after_completion
+        PASS [   0.008s] ( 55/136) tur-engine::hybrid_contracts test_speculative_acceptance_follows_sampled_tokens
+        PASS [   0.008s] ( 56/136) tur-engine::hybrid_contracts test_speculative_rejection_keeps_only_the_verified_token
+        PASS [   0.011s] ( 57/136) tur-engine::hybrid_contracts test_terminal_grammar_does_not_fail_other_requests
+        PASS [   0.008s] ( 58/136) tur-engine::hybrid_contracts test_whole_batch_model_error_leaves_every_request_unchanged
+        PASS [   0.032s] ( 59/136) tur-engine::qwen3_5 test_batch_members_entering_and_leaving_do_not_leak_state
+        PASS [   0.019s] ( 60/136) tur-engine::qwen3_5 test_q8_projection_storage_tracks_f32
+        PASS [   0.019s] ( 61/136) tur-engine::qwen3_5 test_speculative_verification_reproduces_greedy_decode
+        PASS [   0.014s] ( 62/136) tur-engine::qwen3_5 test_vision_placeholders_fail_only_their_request
+        PASS [   0.080s] ( 63/136) tur-engine::qwen3_5 test_whole_chunked_and_incremental_prefill_agree
+        PASS [   0.358s] ( 64/136) tur-engine::qwen3_5_fused test_cached_last_logits_sample_like_the_pass_that_produced_them
+        PASS [   0.252s] ( 65/136) tur-engine::qwen3_5_fused test_decode_reads_pages_in_place_without_rebuilding_the_cache
+        FAIL [   0.169s] ( 66/136) tur-engine::qwen3_5_fused test_execution_selection_and_declared_workspace
+  stdout ───
+
+    running 1 test
+    test test_execution_selection_and_declared_workspace ... FAILED
+
+    failures:
+
+    failures:
+        test_execution_selection_and_declared_workspace
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.16s
+
+  stderr ───
+    2026-10-23 21:27:11.368 qwen3_5_fused-7f092a3bf250b613[1121:7519160] Metal API Validation Enabled
+    2026-10-23 21:27:11.368 qwen3_5_fused-7f092a3bf250b613[1121:7519160] Metal GPU Validation Enabled
+
+    thread 'test_execution_selection_and_declared_workspace' (7519160) panicked at crates/tur-engine/tests/qwen3_5_fused.rs:511:5:
+    grew 11010048, plan 5783552 + logits 524288
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        PASS [   0.571s] ( 67/136) tur-engine::qwen3_5_fused test_f16_recurrent_state_halves_slot_memory_and_tracks_f32_state
+        PASS [   0.456s] ( 68/136) tur-engine::qwen3_5_fused test_f16_replay_with_original_boundaries_preserves_next_logits
+     SIGABRT [   0.357s] ( 69/136) tur-engine::qwen3_5_fused test_full_and_partial_prefix_forks_and_restores_continue_exactly
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:12.553 qwen3_5_fused-7f092a3bf250b613[1131:7519199] Metal API Validation Enabled
+    2026-10-23 21:27:12.553 qwen3_5_fused-7f092a3bf250b613[1131:7519199] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(1) * threadsPerThreadgroup.height(1024) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+     SIGABRT [   0.215s] ( 70/136) tur-engine::qwen3_5_fused test_fused_batch_matches_each_sequence_alone
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:12.910 qwen3_5_fused-7f092a3bf250b613[1132:7519215] Metal API Validation Enabled
+    2026-10-23 21:27:12.910 qwen3_5_fused-7f092a3bf250b613[1132:7519215] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(1) * threadsPerThreadgroup.height(1024) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+     SIGABRT [   0.186s] ( 71/136) tur-engine::qwen3_5_fused test_fused_chunked_and_incremental_prefill_match_reference_whole_prefill
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:13.125 qwen3_5_fused-7f092a3bf250b613[1133:7519227] Metal API Validation Enabled
+    2026-10-23 21:27:13.125 qwen3_5_fused-7f092a3bf250b613[1133:7519227] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(32) * threadsPerThreadgroup.height(32) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+        FAIL [   0.309s] ( 72/136) tur-engine::qwen3_5_fused test_fused_decode_reaches_a_stable_allocation_bound
+  stdout ───
+
+    running 1 test
+    test test_fused_decode_reaches_a_stable_allocation_bound ... FAILED
+
+    failures:
+
+    failures:
+        test_fused_decode_reaches_a_stable_allocation_bound
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.30s
+
+  stderr ───
+    2026-10-23 21:27:13.312 qwen3_5_fused-7f092a3bf250b613[1135:7519236] Metal API Validation Enabled
+    2026-10-23 21:27:13.313 qwen3_5_fused-7f092a3bf250b613[1135:7519236] Metal GPU Validation Enabled
+
+    thread 'test_fused_decode_reaches_a_stable_allocation_bound' (7519236) panicked at crates/tur-engine/tests/qwen3_5_fused.rs:657:5:
+    assertion `left == right` failed
+      left: 182091776
+     right: 69500928
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+     SIGABRT [   0.182s] ( 73/136) tur-engine::qwen3_5_fused test_fused_every_token_boundaries_match_reference
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:13.624 qwen3_5_fused-7f092a3bf250b613[1137:7519280] Metal API Validation Enabled
+    2026-10-23 21:27:13.624 qwen3_5_fused-7f092a3bf250b613[1137:7519280] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(16) * threadsPerThreadgroup.height(64) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+     SIGABRT [   0.184s] ( 74/136) tur-engine::qwen3_5_fused test_fused_layers_and_logits_match_reference_across_page_and_chunk_boundaries
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:13.805 qwen3_5_fused-7f092a3bf250b613[1138:7519286] Metal API Validation Enabled
+    2026-10-23 21:27:13.805 qwen3_5_fused-7f092a3bf250b613[1138:7519286] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(32) * threadsPerThreadgroup.height(32) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+     SIGABRT [   0.186s] ( 75/136) tur-engine::qwen3_5_fused test_fused_packed_formats_track_reference
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:13.988 qwen3_5_fused-7f092a3bf250b613[1146:7519309] Metal API Validation Enabled
+    2026-10-23 21:27:13.988 qwen3_5_fused-7f092a3bf250b613[1146:7519309] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(16) * threadsPerThreadgroup.height(64) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+        PASS [   0.144s] ( 76/136) tur-engine::qwen3_5_fused test_grammar_masks_are_applied_on_the_device
+     SIGABRT [   0.653s] ( 77/136) tur-engine::qwen3_5_fused test_kv_formats_and_page_sizes_on_the_fused_path
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:14.314 qwen3_5_fused-7f092a3bf250b613[1148:7519324] Metal API Validation Enabled
+    2026-10-23 21:27:14.314 qwen3_5_fused-7f092a3bf250b613[1148:7519324] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(32) * threadsPerThreadgroup.height(32) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+        FAIL [   0.115s] ( 78/136) tur-engine::qwen3_5_fused test_memory_pressure_fails_new_work_without_corrupting_live_requests
+  stdout ───
+
+    running 1 test
+    test test_memory_pressure_fails_new_work_without_corrupting_live_requests ... FAILED
+
+    failures:
+
+    failures:
+        test_memory_pressure_fails_new_work_without_corrupting_live_requests
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.10s
+
+  stderr ───
+    2026-10-23 21:27:14.970 qwen3_5_fused-7f092a3bf250b613[1149:7519336] Metal API Validation Enabled
+    2026-10-23 21:27:14.970 qwen3_5_fused-7f092a3bf250b613[1149:7519336] Metal GPU Validation Enabled
+    Error: InvalidExecution("nonfinite model logits")
+
+        PASS [   0.115s] ( 79/136) tur-engine::qwen3_5_fused test_preload_weight_plans_match_every_format_and_tied_embedding_layout
+        PASS [   0.015s] ( 80/136) tur-engine::qwen3_5_moe test_moe_config_and_weight_mapping_match_the_pinned_checkpoint
+     SIGABRT [   0.254s] ( 81/136) tur-engine::qwen3_5_moe test_moe_fused_packed_prefill_decode_and_rollback_match_reference
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:15.222 qwen3_5_moe-887e9154602fe9e5[1153:7519352] Metal API Validation Enabled
+    2026-10-23 21:27:15.222 qwen3_5_moe-887e9154602fe9e5[1153:7519352] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(1) * threadsPerThreadgroup.height(1024) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+        PASS [   0.038s] ( 82/136) tur-engine::qwen3_5_moe test_moe_reference_matches_independent_transformers_layers_and_logits
+        PASS [   0.442s] ( 83/136) tur-engine::qwen3_5_moe test_verification_windows_bound_drift_from_sequential_decoding
+        PASS [   0.015s] ( 84/136) tur-metal completion::tests::test_completion_retains_resources_until_fence
+        PASS [   0.008s] ( 85/136) tur-metal completion::tests::test_dropped_completion_releases_after_wait
+        PASS [   0.008s] ( 86/136) tur-metal completion::tests::test_failed_drop_quarantines_resources_until_fence_retry
+        PASS [   0.008s] ( 87/136) tur-metal completion::tests::test_failed_wait_keeps_resources_until_successful_retry
+        PASS [   0.008s] ( 88/136) tur-metal completion::tests::test_mutation_after_fence_requires_another_wait
+        PASS [   0.010s] ( 89/136) tur-metal completion::tests::test_notified_completion_reports_its_time_and_failures
+        PASS [   0.010s] ( 90/136) tur-metal completion::tests::test_quarantine_is_isolated_per_owner
+        PASS [   0.009s] ( 91/136) tur-metal kernels::tests::test_query_tiles_preserve_sequence_boundaries_and_tails
+        PASS [   0.009s] ( 92/136) tur-metal kernels::tests::test_query_tiles_reject_gaps_at_tile_boundaries_and_overflow
+        PASS [   0.011s] ( 93/136) tur-metal packed::tests::test_stacked_parts_and_row_ranges_match_the_whole_matrix
+        PASS [   0.009s] ( 94/136) tur-metal pool::tests::test_budget_includes_zero_slot_at_page_and_recurrent_boundaries
+        PASS [   0.027s] ( 95/136) tur-metal pool::tests::test_budget_splits_slots_then_pages_and_rejects_starved_pools
+        PASS [   0.008s] ( 96/136) tur-metal pool::tests::test_leases_retire_on_drop_and_reclaim_bumps_generations
+        PASS [   0.011s] ( 97/136) tur-metal pool::tests::test_q8_roundtrip_is_within_half_a_step_and_f16_is_exact_to_half
+        PASS [   0.011s] ( 98/136) tur-metal pool::tests::test_scatter_and_gather_follow_the_page_table_for_every_format
+        PASS [   0.050s] ( 99/136) tur-metal sampling::tests::test_categorical_draws_match_truncated_distributions
+        PASS [   0.009s] (100/136) tur-metal sampling::tests::test_explicit_fallback_samples_the_same_truncated_set
+        PASS [   0.009s] (101/136) tur-metal sampling::tests::test_penalties_follow_repetition_presence_and_frequency_rules
+        PASS [   0.009s] (102/136) tur-metal sampling::tests::test_ties_masks_and_invalid_rows
+        PASS [   0.008s] (103/136) tur-metal sampling::tests::test_uniform_is_reproducible_and_covers_the_unit_interval
+        PASS [   0.010s] (104/136) tur-metal sampling::tests::test_vectorizable_exponential_matches_the_standard_one
+        PASS [   0.008s] (105/136) tur-metal scratch::tests::test_empty_regions_reserve_nothing_and_overflow_is_rejected
+        PASS [   0.008s] (106/136) tur-metal scratch::tests::test_peak_tracks_overlapping_regions_with_pool_rounding
+        PASS [   0.008s] (107/136) tur-metal state::tests::test_appends_fill_the_tail_page_in_place_when_exclusive
+        PASS [   0.008s] (108/136) tur-metal state::tests::test_exhaustion_is_an_explicit_error_and_reclaim_restores_capacity
+        PASS [   0.008s] (109/136) tur-metal state::tests::test_partial_accept_selects_the_exact_boundary_and_releases_the_rest
+        PASS [   0.009s] (110/136) tur-metal state::tests::test_released_bindings_become_stale_after_reclaim
+        PASS [   0.008s] (111/136) tur-metal state::tests::test_reservations_validate_lengths_and_count_new_bytes
+        PASS [   0.008s] (112/136) tur-metal state::tests::test_shared_tail_is_copied_before_append_and_snapshots_stay_exact
+        PASS [   0.082s] (113/136) tur-metal::kernels test_add_rms_norm_returns_sum_and_normalized_sum
+        PASS [   0.088s] (114/136) tur-metal::kernels test_argmax_keeps_the_first_maximum_and_flags_nonfinite_rows
+        PASS [   0.167s] (115/136) tur-metal::kernels test_attention_paged_gqa_matches_reference_for_every_format_and_split
+        PASS [   0.073s] (116/136) tur-metal::kernels test_capabilities_and_pipelines_compile
+        PASS [   0.075s] (117/136) tur-metal::kernels test_completion_retains_kernel_outputs_until_the_fence
+        PASS [   0.077s] (118/136) tur-metal::kernels test_delta_conv_runs_ragged_sequences_in_one_dispatch
+        PASS [   0.448s] (119/136) tur-metal::kernels test_delta_scan_matches_scalar_recurrence_over_ragged_sequences
+        PASS [  10.515s] (120/136) tur-metal::kernels test_device_and_host_sampling_match_truncated_vocabulary_distributions
+        PASS [   0.216s] (121/136) tur-metal::kernels test_device_draws_match_exact_truncated_distributions
+     SIGABRT [   0.169s] (122/136) tur-metal::kernels test_device_penalties_match_the_reference_and_invalid_rows_are_flagged
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:28.020 kernels-7ce8988e4851fe4f[1241:7519856] Metal API Validation Enabled
+    2026-10-23 21:27:28.021 kernels-7ce8988e4851fe4f[1241:7519856] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(2) * threadsPerThreadgroup.height(512) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+        PASS [   0.122s] (123/136) tur-metal::kernels test_gemv_matches_dequantized_reference_for_every_batch_size
+        PASS [   0.156s] (124/136) tur-metal::kernels test_grammar_masks_restrict_argmax_and_sampling_to_allowed_tokens
+        PASS [   0.531s] (125/136) tur-metal::kernels test_grouped_expert_gemm_preserves_routing_skew_ties_and_packed_weights
+        PASS [   0.077s] (126/136) tur-metal::kernels test_invalid_inputs_are_rejected_before_encoding
+        PASS [   0.082s] (127/136) tur-metal::kernels test_kv_write_quantizes_into_paged_slots_like_the_host_reference
+        PASS [   0.083s] (128/136) tur-metal::kernels test_penalties_on_allocated_copies_repeat_exactly_in_any_entry_order
+        PASS [   0.076s] (129/136) tur-metal::kernels test_qk_norm_rope_reads_interleaved_heads_and_rotates_partially
+        PASS [   0.215s] (130/136) tur-metal::kernels test_quantized_kv_attention_stays_close_to_f32_attention
+        FAIL [   0.092s] (131/136) tur-metal::kernels test_repeated_passes_reach_a_stable_allocation_bound
+  stdout ───
+
+    running 1 test
+    test test_repeated_passes_reach_a_stable_allocation_bound ... FAILED
+
+    failures:
+
+    failures:
+        test_repeated_passes_reach_a_stable_allocation_bound
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.08s
+
+  stderr ───
+    2026-10-23 21:27:29.516 kernels-7ce8988e4851fe4f[1257:7519939] Metal API Validation Enabled
+    2026-10-23 21:27:29.516 kernels-7ce8988e4851fe4f[1257:7519939] Metal GPU Validation Enabled
+
+    thread 'test_repeated_passes_reach_a_stable_allocation_bound' (7519939) panicked at crates/tur-metal/tests/kernels.rs:1688:5:
+    assertion `left == right` failed
+      left: 89915392
+     right: 47972352
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        PASS [   0.077s] (132/136) tur-metal::kernels test_rms_norm_matches_reference_on_strided_rows
+        PASS [   1.342s] (133/136) tur-metal::kernels test_sampling_repeats_exactly_for_identical_inputs
+        PASS [   0.119s] (134/136) tur-metal::kernels test_swiglu_and_gated_rms_match_reference
+        PASS [   0.113s] (135/136) tur-metal::kernels test_tiled_attention_dispatch_preserves_decode_parallelism
+        PASS [   0.408s] (136/136) tur-metal::kernels test_tiled_attention_matches_reference_for_every_format_and_tile_shape
+────────────
+     Summary [  21.629s] 136 tests run: 123 passed, 13 failed, 6 skipped
+        FAIL [   0.169s] ( 66/136) tur-engine::qwen3_5_fused test_execution_selection_and_declared_workspace
+  stdout ───
+
+    running 1 test
+    test test_execution_selection_and_declared_workspace ... FAILED
+
+    failures:
+
+    failures:
+        test_execution_selection_and_declared_workspace
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.16s
+
+  stderr ───
+    2026-10-23 21:27:11.368 qwen3_5_fused-7f092a3bf250b613[1121:7519160] Metal API Validation Enabled
+    2026-10-23 21:27:11.368 qwen3_5_fused-7f092a3bf250b613[1121:7519160] Metal GPU Validation Enabled
+
+    thread 'test_execution_selection_and_declared_workspace' (7519160) panicked at crates/tur-engine/tests/qwen3_5_fused.rs:511:5:
+    grew 11010048, plan 5783552 + logits 524288
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+     SIGABRT [   0.357s] ( 69/136) tur-engine::qwen3_5_fused test_full_and_partial_prefix_forks_and_restores_continue_exactly
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:12.553 qwen3_5_fused-7f092a3bf250b613[1131:7519199] Metal API Validation Enabled
+    2026-10-23 21:27:12.553 qwen3_5_fused-7f092a3bf250b613[1131:7519199] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(1) * threadsPerThreadgroup.height(1024) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+     SIGABRT [   0.215s] ( 70/136) tur-engine::qwen3_5_fused test_fused_batch_matches_each_sequence_alone
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:12.910 qwen3_5_fused-7f092a3bf250b613[1132:7519215] Metal API Validation Enabled
+    2026-10-23 21:27:12.910 qwen3_5_fused-7f092a3bf250b613[1132:7519215] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(1) * threadsPerThreadgroup.height(1024) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+     SIGABRT [   0.186s] ( 71/136) tur-engine::qwen3_5_fused test_fused_chunked_and_incremental_prefill_match_reference_whole_prefill
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:13.125 qwen3_5_fused-7f092a3bf250b613[1133:7519227] Metal API Validation Enabled
+    2026-10-23 21:27:13.125 qwen3_5_fused-7f092a3bf250b613[1133:7519227] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(32) * threadsPerThreadgroup.height(32) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+        FAIL [   0.309s] ( 72/136) tur-engine::qwen3_5_fused test_fused_decode_reaches_a_stable_allocation_bound
+  stdout ───
+
+    running 1 test
+    test test_fused_decode_reaches_a_stable_allocation_bound ... FAILED
+
+    failures:
+
+    failures:
+        test_fused_decode_reaches_a_stable_allocation_bound
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.30s
+
+  stderr ───
+    2026-10-23 21:27:13.312 qwen3_5_fused-7f092a3bf250b613[1135:7519236] Metal API Validation Enabled
+    2026-10-23 21:27:13.313 qwen3_5_fused-7f092a3bf250b613[1135:7519236] Metal GPU Validation Enabled
+
+    thread 'test_fused_decode_reaches_a_stable_allocation_bound' (7519236) panicked at crates/tur-engine/tests/qwen3_5_fused.rs:657:5:
+    assertion `left == right` failed
+      left: 182091776
+     right: 69500928
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+     SIGABRT [   0.182s] ( 73/136) tur-engine::qwen3_5_fused test_fused_every_token_boundaries_match_reference
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:13.624 qwen3_5_fused-7f092a3bf250b613[1137:7519280] Metal API Validation Enabled
+    2026-10-23 21:27:13.624 qwen3_5_fused-7f092a3bf250b613[1137:7519280] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(16) * threadsPerThreadgroup.height(64) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+     SIGABRT [   0.184s] ( 74/136) tur-engine::qwen3_5_fused test_fused_layers_and_logits_match_reference_across_page_and_chunk_boundaries
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:13.805 qwen3_5_fused-7f092a3bf250b613[1138:7519286] Metal API Validation Enabled
+    2026-10-23 21:27:13.805 qwen3_5_fused-7f092a3bf250b613[1138:7519286] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(32) * threadsPerThreadgroup.height(32) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+     SIGABRT [   0.186s] ( 75/136) tur-engine::qwen3_5_fused test_fused_packed_formats_track_reference
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:13.988 qwen3_5_fused-7f092a3bf250b613[1146:7519309] Metal API Validation Enabled
+    2026-10-23 21:27:13.988 qwen3_5_fused-7f092a3bf250b613[1146:7519309] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(16) * threadsPerThreadgroup.height(64) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+     SIGABRT [   0.653s] ( 77/136) tur-engine::qwen3_5_fused test_kv_formats_and_page_sizes_on_the_fused_path
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:14.314 qwen3_5_fused-7f092a3bf250b613[1148:7519324] Metal API Validation Enabled
+    2026-10-23 21:27:14.314 qwen3_5_fused-7f092a3bf250b613[1148:7519324] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(32) * threadsPerThreadgroup.height(32) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+        FAIL [   0.115s] ( 78/136) tur-engine::qwen3_5_fused test_memory_pressure_fails_new_work_without_corrupting_live_requests
+  stdout ───
+
+    running 1 test
+    test test_memory_pressure_fails_new_work_without_corrupting_live_requests ... FAILED
+
+    failures:
+
+    failures:
+        test_memory_pressure_fails_new_work_without_corrupting_live_requests
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.10s
+
+  stderr ───
+    2026-10-23 21:27:14.970 qwen3_5_fused-7f092a3bf250b613[1149:7519336] Metal API Validation Enabled
+    2026-10-23 21:27:14.970 qwen3_5_fused-7f092a3bf250b613[1149:7519336] Metal GPU Validation Enabled
+    Error: InvalidExecution("nonfinite model logits")
+
+     SIGABRT [   0.254s] ( 81/136) tur-engine::qwen3_5_moe test_moe_fused_packed_prefill_decode_and_rollback_match_reference
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:15.222 qwen3_5_moe-887e9154602fe9e5[1153:7519352] Metal API Validation Enabled
+    2026-10-23 21:27:15.222 qwen3_5_moe-887e9154602fe9e5[1153:7519352] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(1) * threadsPerThreadgroup.height(1024) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+     SIGABRT [   0.169s] (122/136) tur-metal::kernels test_device_penalties_match_the_reference_and_invalid_rows_are_flagged
+  stdout ───
+
+    running 1 test
+  stderr ───
+    2026-10-23 21:27:28.020 kernels-7ce8988e4851fe4f[1241:7519856] Metal API Validation Enabled
+    2026-10-23 21:27:28.021 kernels-7ce8988e4851fe4f[1241:7519856] Metal GPU Validation Enabled
+    -[MTLDebugComputeCommandEncoder _validateThreadsPerThreadgroup:]:1310: failed assertion `(threadsPerThreadgroup.width(2) * threadsPerThreadgroup.height(512) * threadsPerThreadgroup.depth(1))(1024) must be <= 896. (kernel threadgroup size limit)'
+
+    (test aborted with signal 6: SIGABRT)
+
+        FAIL [   0.092s] (131/136) tur-metal::kernels test_repeated_passes_reach_a_stable_allocation_bound
+  stdout ───
+
+    running 1 test
+    test test_repeated_passes_reach_a_stable_allocation_bound ... FAILED
+
+    failures:
+
+    failures:
+        test_repeated_passes_reach_a_stable_allocation_bound
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.08s
+
+  stderr ───
+    2026-10-23 21:27:29.516 kernels-7ce8988e4851fe4f[1257:7519939] Metal API Validation Enabled
+    2026-10-23 21:27:29.516 kernels-7ce8988e4851fe4f[1257:7519939] Metal GPU Validation Enabled
+
+    thread 'test_repeated_passes_reach_a_stable_allocation_bound' (7519939) panicked at crates/tur-metal/tests/kernels.rs:1688:5:
+    assertion `left == right` failed
+      left: 89915392
+     right: 47972352
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+error: test run failed

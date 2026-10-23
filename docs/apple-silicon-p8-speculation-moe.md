@@ -94,6 +94,9 @@ matrix-unit kernel `Q8_0` already had (one template, a shared per-format loader)
 than Candle's tiles at 4–8 rows (lm_head, 8 rows: 9.9 → 6.3 ms) and 10–25% slower at 16,
 which is accepted for precision ([artifact](baselines/2026-10-23-m1-p8/packed-linear-q4k-qmm.json)).
 Above sixteen rows, dense projections of every packed format still use Candle's F16 tiles.
+Update (2026-10-23): the [kernel performance pass](apple-silicon-kernel-performance.md) gives Q4K a dedicated super-block matrix-unit
+kernel, used for 2–16 rows. It is 1.4–1.8× faster than the shared one (LM head, 8 rows:
+6.3 → 4.1 ms) and now beats Candle's tiles at 16 rows too.
 
 ### Serving measurements
 
@@ -346,7 +349,10 @@ built the permutation with serial per-expert scans.
 **No expert-kernel speedup is claimed.** `Q8_0` decode is at parity with individual
 projections and 8–32 dispersed tokens are 6–8% faster. Q4K decode is about 1.5× slower
 than Candle's dense Q4K GEMV. Large groups improved by 11–28% with the wide tiles but
-remain 1.3–1.5× slower than Candle's per-expert tiled GEMM. Rejected layouts, all slower:
+remain 1.3–1.5× slower than Candle's per-expert tiled GEMM. Update (2026-10-23): after the
+[kernel performance pass](apple-silicon-kernel-performance.md), Q4K decode matches Candle (0.31 → 0.20 ms for one token) and Q4K
+groups of 4–16 rows are up to 2.3× faster; the wide tier is unchanged and the gate stays
+open. Rejected layouts, all slower:
 32×32 register tiles (149 ms at 2,048 dispersed tokens, register pressure), 32-row × 16-output
 register tiles (144 ms), F32 threadgroup-staged 32-wide slices with eight simdgroups
 (239 ms, barrier-bound) and padded threadgroup strides for the wide tiles (+5%). F32 is

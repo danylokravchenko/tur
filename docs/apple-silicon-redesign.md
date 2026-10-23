@@ -13,6 +13,20 @@ now stay in F32 kernels. Full 35B execution exceeds this 16 GB Mac's capacity; f
 quality, the flagship's expert MTP head and Gemma 4 execution remain open. See the
 [P8 report](apple-silicon-p8-speculation-moe.md).
 
+A kernel performance pass followed P8 (2026-10-23). Q4K uses a dedicated matrix-unit
+kernel for 2–16 rows (1.4–1.8× faster), the recurrent decode step is 1.35–1.7× faster,
+the token-serial DeltaNet scan was rewritten (2.0–2.7×), Q8 decode attention is
+1.4–1.5× faster and Q4K single-token expert projections match Candle. On the 0.8B
+checkpoint, 2K prefill is 1.13–1.14× faster and Q4K batched decode 1.11–1.32×; Q8_0
+decode gains 0–9%. Chunked DeltaNet prefill and the MoE wide-tier gap remain open. See
+the [kernel performance report](apple-silicon-kernel-performance.md).
+
+Post-P8 roadmap added on 2026-10-23: P9 establishes a fresh comparative baseline;
+P10–P15 evaluate kernel, quantization, execution, speculation and prefix-scheduling
+improvements; production release moves from P9 to P16. These packages are planned,
+not implemented. Their performance ranges are engineering targets, not measured
+speedups; see [Post-P8 performance expectations](#post-p8-performance-expectations).
+
 P3–P5 review cleanup (2026-10-22) fixed zero-slot budget accounting, activated inherited
 workspace lints, made retained HTTP tests fallible, and removed unused dependencies,
 CUDA features and obsolete errors. Validation and the remaining limits are recorded
@@ -150,6 +164,13 @@ DeepInfer targets NVIDIA SM100 and Ascend 950, and its release supports DeepSeek
 
 Also evaluate rotation-based low-bit cache quantization such as TurboQuant against simple groupwise KV formats. Count transform, packing, decode and scratch costs on Metal; published accelerator speedups cannot be assumed locally. [Google Research](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)
 
+Implementation audit (2026-10-23): TurboQuant and KIVI are absent; attention storage is
+F32/F16/symmetric groupwise Q8. P8 adapts verification using historical acceptance and
+measured costs, without DSpark's per-position confidence head. P7 overlaps intake and
+cancellation with device work, but selects the next pass only after current outputs
+are known. Its reproducibility mode serializes requests rather than making concurrent
+kernels batch-invariant. P10–P15 below turn these distinctions into explicit experiments.
+
 ## Model shortlist
 
 These are integration candidates, not claims of existing Tur support or a measured quality ranking. Weight estimates below are mathematical 4-bit payload floors: parameter count × 0.5 bytes, before metadata, unquantized tensors, runtime state and OS memory.
@@ -178,7 +199,7 @@ Require quantized quality evaluation on held-out language, code, tools and long-
 
 ## Detailed work packages for Sol
 
-Complete these sequentially along the dependency graph. Each package should leave a buildable tree, update this document's status, and report tests and measured limitations. Do not mark a model supported merely because its config parses or a synthetic forward pass succeeds.
+Follow the dependency graph and the post-P8 sequencing below. Each package should leave a buildable tree, update this document's status, and report tests and measured limitations. Do not mark a model supported merely because its config parses or a synthetic forward pass succeeds. A research package may close with a measured rejection; implementing every candidate is not a release requirement.
 
 ### P0 — Establish evidence and resolve platform capabilities
 
@@ -426,7 +447,214 @@ For Qwen3.6-35B-A3B, add routing/top-k, shared experts where applicable, grouped
 
 Exit: exact rollback tests, sampling equivalence tests, actual speedups in enabled regimes, and independent model conformance. Disable optimizations automatically outside validated beneficial ranges.
 
-### P9 — Production release and positioning
+### P9 — Establish the post-P8 baseline and select experiments
+
+Planned. Freeze an explicitly recorded source revision and worktree diff after relevant
+P8 changes settle. Preserve P8's open flagship correctness, MoE performance and hardware
+gates; later work does not implicitly close them. Small-model experiments can proceed
+while larger-memory hardware is unavailable, with their scope recorded.
+
+1. Re-run the representative benchmark matrix on the development M1, then each available
+   target Mac: prompts 128/2K/8K/32K, concurrency 1/2/4/8/16 where memory permits,
+   cold/warm prefixes, novel prose/code/tools, mixed arrivals and sustained load. Record
+   unavailable cases rather than silently shrinking the matrix.
+2. Pin MLX-LM and llama.cpp and compare supported common checkpoints. Match quantization
+   exactly where possible; otherwise compare at a declared quality and memory budget,
+   identifying format differences. Add vLLM Metal for serving comparisons and BaseRT
+   where architecture support permits; no synthetic flagship substitute.
+3. Attribute completed time to projections, attention, recurrence, routing, sampling,
+   encoding, scheduling and idle gaps. Record weight/KV/recurrent/snapshot/scratch bytes,
+   loading peaks, effective bandwidth, dispatch count and allocation activity.
+4. Set held-out quality budgets before tuning: language, code, tool/JSON correctness,
+   long-context retrieval, and decode-length error growth. Separate calibration data.
+   Report repeated-run spreads or confidence intervals and thermal conditions.
+5. Rank P10–P15 experiments by measured time or memory share, estimated benefit and
+   implementation cost. Record their baseline, acceptance threshold and stop condition.
+
+Exit: a reproducible baseline report and ranked experiment list. At least one real
+checkpoint must have matched peer-runtime measurements. Flagship claims remain blocked
+until that checkpoint runs. Sources: [MLX-LM](https://github.com/ml-explore/mlx-lm),
+[llama.cpp](https://github.com/ggml-org/llama.cpp),
+[vLLM Metal](https://docs.vllm.ai/projects/vllm-metal/en/stable/),
+[BaseRT](https://arxiv.org/html/2607.00501v1).
+
+### P10 — Finish parallel prefill and tune native Metal math
+
+Depends on P9. Work in `tur-metal` kernels and `tur-models`' fused Qwen path, using
+the existing `math::delta_chunked` reference and state contracts.
+
+1. Implement chunkwise gated DeltaNet prefill using the WY/UT formulation and matrix
+   operations. Sweep chunk sizes such as 32/64/128; retain recurrent scan for decode
+   and short inputs. Handle partial chunks and ragged batches without padding the
+   entire batch to its longest sequence.
+2. Verify final and requested intermediate states against the recurrence. Cover prefix
+   snapshot boundaries, speculative rejection, replay, cancellation, extreme decay
+   values and long contexts. Do not change state-rounding semantics accidentally.
+3. Benchmark GQA kernels that reuse K/V loads across query heads. Tune tiled attention,
+   split-K and projection crossovers by device, shape and dtype. Direct GQA addressing
+   already exists; the experiment is additional reuse, not first-time GQA support.
+4. Close P8's grouped-MoE performance gap with expert-dependent tile selection, weight
+   reuse and routing/gather/scatter fusion where profiling justifies it. Use trained
+   routing traces and include routing cost in both sides of comparisons.
+5. Evaluate Metal TensorOps for projections, attention and chunked recurrence, including
+   quantized inputs and cooperative tensors. Check OS/toolchain capabilities and safe
+   host binding access first. M5 GPU neural accelerators need separate measurements;
+   they are not the separate Apple Neural Engine. Keep existing kernels on unsupported
+   or slower configurations. Any dependency change needs a concrete approval proposal.
+6. Treat F16/BF16 activation or tile changes as numerical experiments with their own
+   quality gates. Keep sensitive reductions and recurrence accumulation in F32 unless
+   independently justified; packed storage alone does not imply native low-bit math.
+
+Exit: boundary-state differential tests pass; winning dispatch regimes improve beyond
+noise at model/serving level; losing regimes retain their prior kernels. Publish a
+capability/dispatch table and rejected variants. References:
+[Gated DeltaNet](https://arxiv.org/abs/2412.06464),
+[Flash Linear Attention](https://github.com/fla-org/flash-linear-attention),
+[Apple Metal TensorOps](https://developer.apple.com/videos/play/wwdc2026/330/).
+
+### P11 — Calibrated weights and bounded loading
+
+Depends on P9; coordinate execution formats with P10. Extend existing checkpoint and
+packed-weight machinery rather than introducing a competing loader or weight hierarchy.
+
+1. Compare current Q4K/Q8_0 conversion with calibrated AWQ/GPTQ and sensitivity-based
+   mixed precision. Evaluate DWQ only if simpler calibration misses the quality budget.
+   These are offline preparation options, not dependencies in the serving hot path.
+2. Measure sensitivity by tensor/layer, including embeddings/output projection, recurrent
+   projections and MoE routing. Allocate precision under a total byte budget; preserve
+   routing precision until independently validated.
+3. Choose only formats with efficient measured Metal execution. Existing MLX artifacts
+   are not automatically GGML-compatible. Document conversion, scales, packing and
+   reference numerics before adding a format.
+4. Load validated prepacked artifacts directly, with pinned model/quantizer identities,
+   format versions and checked shapes. Bound staging memory and avoid whole-checkpoint
+   expansion. Use existing safe APIs; no unsafe mmap workaround.
+5. Measure cold load time and peak process memory separately from steady-state decode.
+   Publish quality-versus-resident-bytes curves, not just nominal bits per weight.
+
+Exit: held-out quality gates and packed-kernel conformance pass; the selected artifact
+improves quality at equal bytes or reduces bytes at equal quality. Same-bit calibration
+alone is not a speedup claim. Reference:
+[MLX-LM learned quantization](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LEARNED_QUANTS.md).
+
+### P12 — Low-bit KV and hybrid-state memory
+
+Depends on P9 and stable P10 attention interfaces. TurboQuant is an experiment in this
+package, not a predetermined replacement for Q8.
+
+1. Compare F16/Q8 against simple groupwise Q4, KIVI-style asymmetric keys/values and
+   TurboQuant rotation/scalar quantization with the appropriate residual correction
+   for inner products. Identify the exact algorithm variant; a plain int4 cache is
+   not TurboQuant. Test any recent high-precision region as a separate variable.
+2. Fuse packing on write and dequantization/score correction on read into page-native
+   kernels. Count rotations, codebooks, scales, residuals, padding and scratch. Do not
+   materialize a full dequantized cache or conflate attention-kernel and engine gains.
+3. Version state identities and cover page boundaries, copy-on-write, prefix restore,
+   speculation, cancellation and completion-gated reclamation for every format.
+4. Evaluate language/code/retrieval quality across context lengths and attention scales.
+   Include multi-turn reuse and generated continuations, not only teacher-forced logits.
+   Published quality neutrality on other architectures is not a Tur guarantee.
+5. Reassess F16 recurrent state separately from KV compression: long-decode error,
+   snapshot retention and compatibility with speculative rounding. P6 already supplies
+   stochastic rounding; P8 currently requires F32 state for speculation. Retain F32
+   fallback and do not add low-bit recurrent storage without supporting quality evidence.
+6. Select by whole-process memory and useful throughput at a fixed quality/latency
+   budget. KV savings may increase context or admission capacity without improving
+   single-request decode. Count only attention layers in KV estimates.
+
+Exit: one winning low-bit format or a documented rejection; full quality and lifecycle
+tests; memory accounting includes all metadata. References:
+[TurboQuant](https://arxiv.org/abs/2504.19874),
+[KIVI](https://github.com/jy-yuan/KIVI),
+[Open-TQ-Metal](https://arxiv.org/html/2604.16957v1). Open-TQ-Metal's large attention
+speedups use a dequantize-then-attend baseline; Tur already reads packed pages directly.
+
+### P13 — Reusable execution plans, overlap and batch invariance
+
+Depends on P9; specialize plans for validated P10/P12 variants. Build on current
+completion ownership, scratch planning and device sampling.
+
+1. Instrument host allocations and GPU buffer reuse after warmup. Reuse packed-plan
+   vectors, page metadata, sampling buffers and activation scratch for bounded shape
+   classes. Account for retained capacity; distinguish pooled allocation from no
+   allocation. Preserve dynamic admission and page-native memory.
+2. Separate reusable planning from execution, with invalidation on layout, shape,
+   capability and kernel changes. Evaluate command/argument reuse only if safe APIs
+   and measured encoding costs justify it; do not assume CUDA graph APIs exist on Metal.
+3. Overlap next-pass preparation with current execution where dependencies permit.
+   Sampled tokens, accepted draft lengths and state ownership still gate final bindings.
+   Evaluate device-resident token handoff and a bounded submission depth, initially no
+   more than two, only after lifetime/cancellation tests cover the new ordering.
+4. Add a distinct concurrent batch-invariance experiment: fixed per-request arithmetic
+   and reduction ordering across batch size, ordering and chunk shapes. Test logits,
+   tokens, RNG, preemption and speculation. Report its throughput cost separately from
+   the existing serial reproducibility mode; do not promise cross-device bit identity.
+
+Exit: measured reduction in allocations/encoding/idle time with no stale state,
+unbounded buffering or latency-budget violation. Keep the one-pass path when overlap
+does not pay. References: [FlashInfer planning](https://docs.flashinfer.ai/api/attention),
+[BaseRT](https://arxiv.org/html/2607.00501v1),
+[DeepInfer scheduling](https://github.com/deepseek-ai/DeepInfer/blob/main/doc/inference_deployment_qa.md).
+
+### P14 — Confidence-aware and learned speculative decoding
+
+Depends on P8 correctness and P9 measurements; re-profile after P10–P13 because their
+changes alter verification costs. This package is optional if no compatible drafter pays.
+
+1. Establish the best existing P8 policy per workload, including ordinary decode and
+   prompt lookup. Measure native MTP upkeep, accepted tokens per pass, burst gaps and
+   total state/logit/draft memory. Resolve native MTP/prefix-cache state compatibility
+   only with a precise boundary-state design; disabling prefix reuse has an opportunity cost.
+2. Extend verification costs beyond a single linear slope: capture projection-kernel
+   crossovers, context, sampling mode and batch occupancy. Evaluate per-position
+   acceptance estimates, then a calibrated confidence head when a compatible checkpoint
+   exists. Select prefixes by expected accepted tokens per total pass time, with fairness
+   and latency limits; historical mean acceptance is not DSpark's confidence mechanism.
+3. Evaluate a compatible small draft model and one learned candidate from EAGLE-3,
+   DFlash or DSpark. Verify architecture, tokenizer, feature and head compatibility first.
+   Public ordinary-Qwen3 drafts do not establish hybrid-Qwen compatibility. Training or
+   acquiring a matching draft is a separately sized prerequisite, not assumed available.
+4. If stochastic proposals are introduced, implement and statistically validate their
+   target/proposal correction. Keep deterministic target matching as its own algorithm.
+   Roll back recurrent/attention state, RNG, penalties and grammar together. Add trees
+   only after linear verification wins and branch-state costs justify them.
+5. Test novel prose/code, repetitive text, sampled and constrained outputs, mixed traffic
+   and increasing concurrency. Disable drafting when total throughput or latency loses.
+   Test combinations with quantized KV, prefix reuse and recurrent precision explicitly.
+
+Exit: measured improvement over the best applicable P8 baseline at matched quality and
+latency, with a bounded memory increase and automatic fallback. Repetitive prompt-lookup
+gains are not evidence for learned drafting on novel text. References:
+[DSpark](https://arxiv.org/abs/2607.05147),
+[DeepSpec](https://github.com/deepseek-ai/DeepSpec),
+[DFlash](https://arxiv.org/abs/2602.06036),
+[EAGLE-3](https://arxiv.org/abs/2503.01840).
+
+### P15 — Prefix-aware scheduling and retention
+
+Depends on P9 and P7; integrate with P14 only where their state semantics are compatible.
+
+1. Measure shared-prefix locality, lookup cost, saved prefill time and retained state
+   bytes on multi-turn, shared-system-prompt and agent workloads. Existing prefix reuse
+   is the baseline; do not count its historical 18× TTFT gain again.
+2. Evaluate admission ordering that favors reusable prefixes, bounded by deadlines and
+   queue-age fairness. Avoid concurrently recomputing the same cold prefix when waiting
+   for its in-flight producer is cheaper and cancellation is handled correctly.
+3. Compare current never-hit-first/LRU eviction with saved-compute-per-retained-byte
+   estimates, and tune checkpoint spacing from reuse and recurrent snapshot costs.
+   A radix index is an option only if it beats the existing verified hash lookup.
+4. Preserve namespace isolation, collision verification, exact recurrent boundaries and
+   copy-on-write behavior. Evaluate cold, low-reuse and adversarial churn workloads too.
+
+Exit: fewer recomputed tokens and improved TTFT/throughput at the same state budget,
+without starving unrelated requests or regressing low-reuse traffic beyond its budget.
+Reference: [SGLang RadixAttention](https://www.lmsys.org/blog/2024-01-17-sglang/).
+
+### P16 — Production release and positioning
+
+Formerly P9. Production hardening can proceed alongside experiments; release does not
+require every research candidate to win. Each candidate must be accepted with evidence,
+rejected, or explicitly deferred, and only validated combinations become defaults.
 
 CUDA feature wiring and obsolete legacy errors were removed during the P3–P5 cleanup, and every member now inherits workspace lints (unsafe Rust forbidden; unwrap/expect and explicit panic paths denied). Retained HTTP tests propagate setup/task errors; test assertions have a scoped lint allowance. Document the chosen macOS/Apple Silicon capability floor, preserve CPU reference math as a development aid, and run unit tests with cargo-nextest plus checkpoint-dependent suites on an appropriate Mac.
 
@@ -435,6 +663,74 @@ Add health/readiness reporting, bounded startup loading, failure reporting, requ
 Publish the benchmark matrix, quality evaluations, reproducible commands, known limitations and supported model/quantization combinations. Replace unsupported README speedup claims with measured results. Describe performance separately for single-user latency, prefill throughput and concurrent serving throughput.
 
 Exit: release gates below pass and every marketed feature has an end-to-end test or benchmark.
+
+## Post-P8 performance expectations
+
+These are planning hypotheses as of 2026-10-23, not benchmark results or guaranteed
+forecasts. Use P9's frozen current implementation as the baseline, not the old P3
+reference or a competitor's unoptimized kernel. Compare the same Mac, checkpoint,
+workload, quality budget, cache state and service latency target. Report speculative
+and ordinary decoding separately. No improvement remains a possible experiment outcome.
+
+| Work and regime | Working target or bound | Basis and limitation |
+| --- | --- | --- |
+| P10 chunked DeltaNet, long prefill | About 1.06–1.10× whole-model throughput **if** the chunked kernel is 2–4× faster than the current scan | Revised after the 2026-10-23 kernel pass: the rewritten token-serial scan is about 12% of 2K prefill (18 × 10.4 ms of ~1.6 s), down from about 21%; removing it entirely would give at most about 1.14× |
+| P10–P13 combined, M1 prefill | Aim for 1.10–1.30× prompt tokens/s at unchanged quality | Engineering target; projections already ran near the measured M1 F32 ceiling in P4, limiting gains without changing precision or workload |
+| P10–P13 combined, ordinary M1 decode | Aim for 1.05–1.15× tokens/s in selected beneficial regimes | Engineering target; weight/state bandwidth and already-small host scheduling costs limit general gains. Batch-1 improvement may be negligible |
+| P12 low-bit KV versus Q8 group 32 | Roughly 1.7–2.4× smaller **KV storage**, subject to measured metadata/padding | Q8 uses 8.5 bits/value including one F16 scale per 32 values. Illustrative 5–3.5 effective-bit candidates give this range; formats and quality still need validation |
+| P12 F16 recurrent matrices versus F32 | 2× smaller matrix payload; less than 2× smaller total recurrent state | Already available in P6, not a new gain. Historical serving throughput improved only 4–5% at concurrency 8–16; long-context quality and speculative compatibility remain constraints |
+| P11 calibrated weights | Better quality at equal bytes, or fewer bytes at equal quality; no fixed speedup forecast | Same-bit calibration may change no runtime cost. Lower precision helps only if corresponding kernels win and sensitive tensors retain adequate precision |
+| P14 learned/confidence speculation, novel text at low concurrency | Exploratory goal: 1.20–1.50× tokens/s over the best applicable P8 policy | Low confidence until a compatible drafter and total cost are measured. At high concurrency the desired result may simply be neutral fallback |
+| P15 prefix-aware scheduling | Lower TTFT and fewer recomputed tokens on reuse-heavy traffic; no universal multiplier | P7 already captures large prefix wins. Additional benefit depends on hit rate, queue contention and snapshot memory; no gain is expected with no reuse |
+| Metal TensorOps on newer Macs; full flagship MoE | No numerical forecast yet | Requires same-device before/after measurements and real checkpoint execution. Changing hardware is not a software speedup |
+
+The [kernel performance pass](apple-silicon-kernel-performance.md) predates P9 and is
+part of its baseline; the targets above are incremental to it, not to the P8 state.
+
+The prefill/decode targets above are incremental **combined** targets, not sums or
+products of package estimates. P14's exploratory target is also not a multiplier to
+apply to them: faster verification changes draft economics and the best baseline.
+P9 must revise these targets using measured bottlenecks, including downward revisions.
+
+For a fraction `f` of baseline runtime accelerated by factor `s`, the whole-pass bound is
+`speedup = 1 / ((1 - f) + f / s)`. At the scan's measured `f ≈ 0.12` after the kernel
+pass, even eliminating it entirely cannot exceed about 1.14×. Similarly, eliminating a genuinely measured 5% idle fraction alone
+cannot exceed 1.053×; it does not establish the size of all encoding or synchronization
+costs. These bounds explain why kernel speedups should not become engine promises.
+
+Memory savings also apply to a component, not the entire process. If KV is 20% of resident
+memory and its storage halves, total memory falls only 10%, holding other components
+fixed. For a hybrid Qwen checkpoint, weights and recurrent matrices can dominate.
+More available memory can increase context or concurrency, but not necessarily useful
+throughput at the same p95 latency. No compression experiment guarantees that a flagship
+fits a 16 GB Mac.
+
+Historical evidence to retain separately: [P8 native MTP](apple-silicon-p8-speculation-moe.md)
+measured 1.16× / 1.11× over ordinary decoding on novel greedy text at concurrency 1 / 4;
+prompt lookup reached 3.25× on a repetitive single-request workload. Those gains already
+exist, involve different baselines, and are not additional post-P8 expectations. The
+throughput mode's burst-gap/p95 tradeoff must remain visible.
+
+### Experiment sequencing and deferred research
+
+Run P9 first, then prioritize P10's unfinished prefill work. P11 and P12 follow the
+measured weight/state bottleneck; P13 follows measured allocation/encoding/idle costs.
+Re-profile before P14. P15 needs representative reuse traffic and may proceed independently
+of learned drafting. Carry P8 correctness gates forward; begin P16 hardening without
+waiting for optional research to succeed. Existing ARM64 host work remains profile-driven;
+audit hot compiler output and QoS only where P9 exposes material host cost.
+
+Keep SnapKV-style token eviction and sparse attention as explicit approximate modes for
+future evaluation, not replacements for exact full-attention semantics. FlashAttention-4
+and SageAttention supply algorithmic ideas, not directly portable NVIDIA kernel speedups.
+DeepInfer SWA bounded replay requires compatible model state semantics. Distributed
+prefill/decode, expert parallelism, SSD spill and separate Neural Engine execution remain
+deferred until a measured workload justifies their complexity. New attention architectures
+such as MLA require matching checkpoints; they are not switches for the current Qwen model.
+References: [SnapKV](https://arxiv.org/abs/2404.14469),
+[FlashAttention-4](https://pytorch.org/blog/flexattention-flashattention-4-fast-and-flexible/),
+[SageAttention](https://arxiv.org/abs/2410.02367),
+[DeepInfer](https://github.com/deepseek-ai/DeepInfer).
 
 ## Quantitative gates to set before optimization
 
@@ -450,6 +746,11 @@ These are proposed project gates, not claims that they have been met:
 
 ## Handoff instructions
 
-Start with P0 and P1. Keep the public-contract decisions visible before P2. Implement one end-to-end small hybrid model path before expanding the supported-model list. Complete Qwen3.8-27B correctness and packed quantized execution before speculative decoding or unrelated model families. Do not spend the first iteration implementing every research idea.
+P0–P7 are historical milestones; do not restart the workspace migration or completed
+model/runtime work. Read P8's current report, preserve in-progress work and record its
+remaining gates. Start post-P8 work with P9 and the experiment sequencing above. Validate
+the flagship on suitable hardware before claiming support, while allowing small-model
+experiments to proceed with explicit scope. Keep public-contract decisions visible and
+do not implement every research idea merely because it appears in this plan.
 
 The user has explicitly authorized a `crates/` layout and breaking changes of any kind, including Rust, HTTP and CLI APIs; do not spend effort on backwards compatibility. New third-party dependencies still follow AGENTS.md: obtain approval of the concrete dependency proposal. No exception to the no-unsafe rule is proposed. Hardware-specific performance claims require target-Mac measurements, and pending machine preferences must not be replaced by invented requirements.

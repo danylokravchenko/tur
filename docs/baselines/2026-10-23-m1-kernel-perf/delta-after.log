@@ -1,0 +1,2 @@
+    Finished `pre-release` profile [optimized] target(s) in 0.36s
+     Running benches/kernels.rs (target/pre-release/deps/kernels-8e031daffce7b8e3)

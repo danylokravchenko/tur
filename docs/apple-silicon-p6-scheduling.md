@@ -249,7 +249,8 @@ Four changes, each tested against references:
 | Greedy reduction on the device | For greedy, grammar-free requests the engine enqueues `argmax_f32` (first maximum and a finiteness flag per row), copying 8 bytes per row. Other requests keep full rows. The host greedy path is a chunked, vectorizable scan. `HybridModel::kernels` lets the engine reuse the model's compiled kernels | Host work at batch 8: about 1.4 ms per pass against 17 ms |
 
 `Q4K` has no matrix-unit kernel yet: above its 2–4-row GEMV range it still uses Candle's
-F16-tile GEMM.
+F16-tile GEMM. (Historical: P8 added one, and the [kernel performance pass](apple-silicon-kernel-performance.md) made Q4K use
+`qmm_q4k` for 2–16 rows.)
 
 **Model decode pass**, 128-token context, Q8_0, F16 K/V
 ([model](baselines/2026-10-22-m1-p6-batch-decode/qwen3_5.json)):
@@ -357,7 +358,8 @@ F16 precision.
 
 - **Recurrent state bandwidth bounds decode scaling.** With F32 state every sequence
   reads and writes about 36 MB per token on 0.8B (much more on 27B). That is about
-  7.5 ms of a batch-8 pass and 15 ms at batch 16, linear in batch at ~39 GB/s. F16
+  7.5 ms of a batch-8 pass and 15 ms at batch 16, linear in batch at ~39 GB/s (47–53 GB/s
+  after the [kernel performance pass](apple-silicon-kernel-performance.md), which gives each step simdgroup 16 key rows). F16
   state trims 6–7% at a measured quality cost (above). An in-register multi-token
   decode path only applies to speculation (P8).
 - **9–16 rows are bound by F32 matrix-unit throughput** (above). Only F16 activations

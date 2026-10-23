@@ -1,0 +1,16 @@
+    Finished `pre-release` profile [optimized] target(s) in 0.16s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+────────────
+ Nextest run ID 11affc42-9d6a-4fc4-a1cf-cb354b2f294a with nextest profile: default
+    Starting 8 tests across 21 binaries (235 tests skipped)
+        PASS [   6.205s] (1/8) tur-engine::qwen3_5 test_f32_greedy_generation_matches_transformers
+        PASS [   3.901s] (2/8) tur-engine::qwen3_5 test_mtp_head_matches_transformers_reference
+        PASS [  17.214s] (3/8) tur-engine::qwen3_5 test_quantized_generation_is_coherent
+        PASS [   7.783s] (4/8) tur-engine::qwen3_5_fused test_real_checkpoint_fused_greedy_generation_matches_reference
+        PASS [  13.547s] (5/8) tur-engine::qwen3_5_fused test_real_checkpoint_fused_matches_reference
+        PASS [  28.326s] (6/8) tur-engine::qwen3_5_fused test_real_checkpoint_kv_formats_keep_attention_quality
+        PASS [   2.333s] (7/8) tur-models::qwen3_5 test_f32_layers_and_logits_match_transformers
+        PASS [   0.219s] (8/8) tur-models::qwen3_5 test_tokenizer_matches_reference_ids
+────────────
+     Summary [  79.539s] 8 tests run: 8 passed, 235 skipped

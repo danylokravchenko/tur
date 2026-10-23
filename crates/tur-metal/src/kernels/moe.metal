@@ -152,48 +152,58 @@ inline device const float *expert_input(device const float *x, device const floa
     return x + ulong(row) * p.stride;
 }
 
-// Q4_K GEMV over up to three rows, laid out like the dense kernel: eight lanes share a
-// super-block, each reading 16 packed bytes (16 values of two sub-blocks), and the minima
-// fold into one activation sum per sub-block.
+// Q4_K GEMV over up to three rows in ggml's mul_mv_q4_K layout: eight lanes share a
+// super-block and lane (iq, ir) takes eight values from each of sub-blocks 2iq, 2iq+1,
+// 2iq+4 and 2iq+5. Quants are masked in place from 16-bit words (a nibble's 16, 256 or
+// 4096 multiple is folded into the per-sub-block sums), scales and minima unpack from
+// three 16-bit words, and the minima fold into activation sums, so each weight costs one
+// mask, one conversion and one multiply-add. Each row's activations load once for NR rows.
 template <uint NR> inline void expert_gemv_q4k(device const uchar *w, ulong base, uint col, uint out, uint width,
     thread device const float *const (&xs)[3], uint count, uint lane, thread float (&acc)[NR][3]) {
-    uint blocks = width / 256, ix = lane / 8, slot = lane % 8, group = slot / 2, off = 16 * (slot % 2);
+    uint blocks = width / 256, ix = lane / 8, iq = (lane % 8) / 4, ir = lane % 4;
+    device const block_q4_k *rows[NR];
+    for (uint r = 0; r < NR; ++r) rows[r] = (device const block_q4_k *)w + (base + min(col + r, out - 1)) * blocks;
     for (uint ib = ix; ib < blocks; ib += 4) {
-        uint4 packed[NR];
-        float d_lo[NR], m_lo[NR], d_hi[NR], m_hi[NR];
-        for (uint r = 0; r < NR; ++r) {
-            device const block_q4_k &blk = ((device const block_q4_k *)w)[(base + min(col + r, out - 1)) * blocks + ib];
-            float d = float(blk.d), dmin = float(blk.dmin);
-            uchar2 first = q4k_scale_min(2 * group, blk.scales), second = q4k_scale_min(2 * group + 1, blk.scales);
-            d_lo[r] = d * float(first.x); m_lo[r] = dmin * float(first.y);
-            d_hi[r] = d * float(second.x); m_hi[r] = dmin * float(second.y);
-            packed[r] = *((device const uint4 *)(blk.qs + 32 * group + off));
-        }
         for (uint b = 0; b < 3; ++b) {
             if (b >= count) break;
-            device const packed_float4 *xl = (device const packed_float4 *)(xs[b] + ib * 256 + 64 * group + off);
-            float4 lo_x[4], hi_x[4];
-            float sum_lo = 0.0f, sum_hi = 0.0f;
-            for (uint i = 0; i < 4; ++i) {
-                lo_x[i] = float4(xl[i]); hi_x[i] = float4(xl[i + 8]);
-                sum_lo += lo_x[i].x + lo_x[i].y + lo_x[i].z + lo_x[i].w;
-                sum_hi += hi_x[i].x + hi_x[i].y + hi_x[i].z + hi_x[i].w;
-            }
+            device const packed_float4 *y = (device const packed_float4 *)(xs[b] + ib * 256 + 64 * iq + 8 * ir);
+            float4 yl[4] = {float4(y[0]), float4(y[1]), float4(y[8]), float4(y[9])};
+            float4 yh[4] = {float4(y[32]), float4(y[33]), float4(y[40]), float4(y[41])};
+            float4 sumy = float4(dot(yl[0] + yl[1], float4(1.0f)), dot(yl[2] + yl[3], float4(1.0f)),
+                dot(yh[0] + yh[1], float4(1.0f)), dot(yh[2] + yh[3], float4(1.0f)));
             for (uint r = 0; r < NR; ++r) {
-                float dot_lo = 0.0f, dot_hi = 0.0f;
-                for (uint i = 0; i < 4; ++i) {
-                    uint word = packed[r][i];
-                    dot_lo += dot(float4(word & 0xF, (word >> 8) & 0xF, (word >> 16) & 0xF, (word >> 24) & 0xF), lo_x[i]);
-                    dot_hi += dot(float4((word >> 4) & 0xF, (word >> 12) & 0xF, (word >> 20) & 0xF, word >> 28), hi_x[i]);
-                }
-                acc[r][b] += d_lo[r] * dot_lo - m_lo[r] * sum_lo + d_hi[r] * dot_hi - m_hi[r] * sum_hi;
+                device const block_q4_k &blk = rows[r][ib];
+                device const ushort *sc = (device const ushort *)blk.scales + iq;
+                ushort4 sc16 = ushort4(sc[0] & 0x3F3F, sc[2] & 0x3F3F,
+                    (sc[4] & 0x0F0F) | ((sc[0] & 0xC0C0) >> 2), ((sc[4] >> 4) & 0x0F0F) | ((sc[2] & 0xC0C0) >> 2));
+                uchar4 s_lo = as_type<uchar4>(as_type<uint2>(sc16).x);
+                uchar4 s_hi = as_type<uchar4>(as_type<uint2>(sc16).y);
+                device const ushort4 *q1 = (device const ushort4 *)(blk.qs + 32 * iq + 8 * ir);
+                ushort4 a = q1[0], c = q1[8];
+                // Element pairs (i, i + 1) of the low nibbles, then (32 + i, 33 + i) of the high.
+                float4 lo_l = float4(a & 0x000F), lo_h = float4(a & 0x0F00);
+                float4 hi_l = float4(a & 0x00F0), hi_h = float4(a & 0xF000);
+                float4 lo2_l = float4(c & 0x000F), lo2_h = float4(c & 0x0F00);
+                float4 hi2_l = float4(c & 0x00F0), hi2_h = float4(c & 0xF000);
+                float4 e0 = float4(yl[0].xz, yl[1].xz), o0 = float4(yl[0].yw, yl[1].yw);
+                float4 e1 = float4(yl[2].xz, yl[3].xz), o1 = float4(yl[2].yw, yl[3].yw);
+                float4 e2 = float4(yh[0].xz, yh[1].xz), o2 = float4(yh[0].yw, yh[1].yw);
+                float4 e3 = float4(yh[2].xz, yh[3].xz), o3 = float4(yh[2].yw, yh[3].yw);
+                float sub0 = dot(e0, lo_l) + dot(o0, lo_h) * (1.0f / 256.0f);
+                float sub1 = dot(e1, hi_l) + dot(o1, hi_h) * (1.0f / 256.0f);
+                float sub4 = dot(e2, lo2_l) + dot(o2, lo2_h) * (1.0f / 256.0f);
+                float sub5 = dot(e3, hi2_l) + dot(o3, hi2_h) * (1.0f / 256.0f);
+                acc[r][b] += float(blk.d) * (sub0 * float(s_lo.x) + sub1 * float(s_lo.y) * (1.0f / 16.0f)
+                                             + sub4 * float(s_hi.x) + sub5 * float(s_hi.y) * (1.0f / 16.0f))
+                    - float(blk.dmin) * (sumy.x * float(s_lo.z) + sumy.y * float(s_lo.w)
+                                         + sumy.z * float(s_hi.z) + sumy.w * float(s_hi.w));
             }
         }
     }
 }
 
 // GEMV over small-group tiles of at most three rows; larger ones are left to moe_gemm. One simdgroup
-// computes NR outputs (four, or two for Q4_K), as many as the dense GEMV, so decode keeps
+// computes NR = 4 outputs, as many as the dense Q8_0 GEMV and ggml's Q4_K one, so decode keeps
 // its parallelism.
 template <uint FORMAT, uint NR> kernel void moe_gemv(device const uchar *w [[buffer(0)]],
     device const float *x [[buffer(1)]], device const float *tiles [[buffer(2)]],
@@ -238,10 +248,94 @@ template <uint FORMAT, uint NR> kernel void moe_gemv(device const uchar *w [[buf
     }
 }
 
-// Matrix-unit GEMM over small-group tiles of four or more rows (F32 throughout).
-// Each simdgroup owns a sixteen-row tile's 32 outputs over the whole reduction, reusing
-// its vector-loaded weights across sixteen rows and its activations across 32 outputs,
-// with no threadgroup memory or barriers.
+// One expert group tile on the matrix units: BT 8-row fragments of activations against
+// four 8-output weight tiles, over the whole reduction. Q4_K walks one super-block per
+// step with its header and scales in registers, each 8-byte quant load serving two
+// sub-blocks (as qmm_q4k_f32); other formats dequantize per 32-element chunk.
+template <uint FORMAT, uint BT> inline void moe_gemm_tile(device const uchar *w, device const float *x,
+    device float *y, constant ExpertParams &p, device const float *order, ulong base, uint col0,
+    uint offset, uint count, uint lane) {
+    uint qid = lane / 4;
+    uint fr = (qid & 4) + (lane / 2) % 4, fc = (qid & 2) * 2 + (lane % 2) * 2;
+    simdgroup_float8x8 acc[4][BT];
+    for (uint t = 0; t < 4; ++t) for (uint b = 0; b < BT; ++b) acc[t][b] = simdgroup_float8x8(0.0f);
+    device const float *xs[BT][2];
+    bool live[BT][2];
+    for (uint b = 0; b < BT; ++b) {
+        for (uint e = 0; e < 2; ++e) {
+            uint row = b * 8 + fc + e;
+            live[b][e] = row < count;
+            xs[b][e] = expert_input(x, order, p, offset + min(row, count - 1)) + 4 * fr;
+        }
+    }
+    ulong wr[4];
+    for (uint t = 0; t < 4; ++t) wr[t] = base + min(col0 + t * 8 + fr, p.out - 1);
+    // Lane (fr, fc) holds weights 4·fc..4·fc+7 of its row; reduction index j of step s is
+    // element 4j + s, matching the activations loaded at 4·fr + s.
+    auto chunk = [&](uint c, thread const float4 (&lo)[4], thread const float4 (&hi)[4]) {
+        float4 xv[BT][2];
+        for (uint b = 0; b < BT; ++b) {
+            for (uint e = 0; e < 2; ++e) {
+                device const packed_float4 *v = (device const packed_float4 *)(xs[b][e] + c * 32);
+                xv[b][e] = live[b][e] ? float4(v[0]) : float4(0.0f);
+            }
+        }
+        qmm_chunk<BT, 4>(acc, lo, hi, xv);
+    };
+    if (FORMAT == 2) {
+        uint blocks = p.width / 256;
+        for (uint ib = 0; ib < blocks; ++ib) {
+            float d[4], dmin[4];
+            uint scales[4][3];
+            device const uchar *qs[4];
+            for (uint t = 0; t < 4; ++t) {
+                device const block_q4_k &blk = ((device const block_q4_k *)w)[wr[t] * blocks + ib];
+                d[t] = float(blk.d);
+                dmin[t] = float(blk.dmin);
+                device const uint *packed = (device const uint *)blk.scales;
+                for (uint i = 0; i < 3; ++i) scales[t][i] = packed[i];
+                qs[t] = blk.qs + 4 * fc;
+            }
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < 4; ++j) {
+                uint2 q[4];
+                for (uint t = 0; t < 4; ++t) q[t] = *((device const uint2 *)(qs[t] + 32 * j));
+                #pragma clang loop unroll(full)
+                for (uint h = 0; h < 2; ++h) {
+                    float4 lo[4], hi[4];
+                    for (uint t = 0; t < 4; ++t) {
+                        float2 sm = q4k_scale_min_reg(scales[t], 2 * j + h);
+                        float scale = d[t] * sm.x, minimum = dmin[t] * sm.y;
+                        uint2 nib = (q[t] >> (4 * h)) & 0x0F0F0F0Fu;
+                        lo[t] = float4(as_type<uchar4>(nib.x)) * scale - minimum;
+                        hi[t] = float4(as_type<uchar4>(nib.y)) * scale - minimum;
+                    }
+                    chunk(ib * 8 + 2 * j + h, lo, hi);
+                }
+            }
+        }
+    } else {
+        for (uint c = 0; c < p.width / 32; ++c) {
+            float4 lo[4], hi[4];
+            for (uint t = 0; t < 4; ++t) packed_weights8<FORMAT>(w, wr[t], c, 4 * fc, p.width, lo[t], hi[t]);
+            chunk(c, lo, hi);
+        }
+    }
+    for (uint t = 0; t < 4; ++t) {
+        for (uint b = 0; b < BT; ++b) {
+            for (uint i = 0; i < 2; ++i) {
+                uint row = b * 8 + fc + i, col = col0 + t * 8 + fr;
+                if (row < count && col < p.out) y[ulong(offset + row) * p.out + col] = acc[t][b].thread_elements()[i];
+            }
+        }
+    }
+}
+
+// Matrix-unit GEMM over small-group tiles of four to sixteen rows (F32 throughout).
+// Each simdgroup owns a tile's 32 outputs over the whole reduction, reusing its
+// vector-loaded weights across the tile's rows and its activations across 32 outputs, with
+// no threadgroup memory or barriers. Tiles of at most eight rows multiply one activation
+// fragment instead of two.
 template <uint FORMAT> kernel void moe_gemm(device const uchar *w [[buffer(0)]],
     device const float *x [[buffer(1)]], device const float *tiles [[buffer(2)]],
     device float *y [[buffer(3)]], constant ExpertParams &p [[buffer(4)]],
@@ -254,50 +348,10 @@ template <uint FORMAT> kernel void moe_gemm(device const uchar *w [[buffer(0)]],
     if (d[0] < 0.0f || d[3] != 0.0f || d[2] <= 3.0f || col0 >= p.out) return;
     uint expert = uint(d[0]), offset = uint(d[1]), count = uint(d[2]);
     ulong base = ulong(expert) * p.out;
-    uint qid = lane / 4;
-    uint fr = (qid & 4) + (lane / 2) % 4, fc = (qid & 2) * 2 + (lane % 2) * 2;
-    simdgroup_float8x8 acc[4][2];
-    for (uint t = 0; t < 4; ++t) for (uint b = 0; b < 2; ++b) acc[t][b] = simdgroup_float8x8(0.0f);
-    device const float *xs[2][2];
-    bool live[2][2];
-    for (uint b = 0; b < 2; ++b) {
-        for (uint e = 0; e < 2; ++e) {
-            uint row = b * 8 + fc + e;
-            live[b][e] = row < count;
-            xs[b][e] = expert_input(x, order, p, offset + min(row, count - 1)) + 4 * fr;
-        }
-    }
-    ulong wr[4];
-    for (uint t = 0; t < 4; ++t) wr[t] = base + min(col0 + t * 8 + fr, p.out - 1);
-    for (uint chunk = 0; chunk < p.width / 32; ++chunk) {
-        float4 xv[2][2];
-        for (uint b = 0; b < 2; ++b) {
-            for (uint e = 0; e < 2; ++e) {
-                device const float *v = xs[b][e] + chunk * 32;
-                xv[b][e] = live[b][e] ? float4(v[0], v[1], v[2], v[3]) : float4(0.0f);
-            }
-        }
-        // Lane (fr, fc) holds weights 4·fc..4·fc+7 of its row; reduction index j of
-        // step s is element 4j + s, matching the activations loaded at 4·fr + s.
-        float4 lo[4], hi[4];
-        for (uint t = 0; t < 4; ++t) packed_weights8<FORMAT>(w, wr[t], chunk, 4 * fc, p.width, lo[t], hi[t]);
-        for (uint s = 0; s < 4; ++s) {
-            simdgroup_float8x8 xm[2];
-            for (uint b = 0; b < 2; ++b) { xm[b].thread_elements()[0] = xv[b][0][s]; xm[b].thread_elements()[1] = xv[b][1][s]; }
-            for (uint t = 0; t < 4; ++t) {
-                simdgroup_float8x8 wm;
-                wm.thread_elements()[0] = lo[t][s]; wm.thread_elements()[1] = hi[t][s];
-                for (uint b = 0; b < 2; ++b) simdgroup_multiply_accumulate(acc[t][b], wm, xm[b], acc[t][b]);
-            }
-        }
-    }
-    for (uint t = 0; t < 4; ++t) {
-        for (uint b = 0; b < 2; ++b) {
-            for (uint i = 0; i < 2; ++i) {
-                uint row = b * 8 + fc + i, col = col0 + t * 8 + fr;
-                if (row < count && col < p.out) y[ulong(offset + row) * p.out + col] = acc[t][b].thread_elements()[i];
-            }
-        }
+    if (count > 8) {
+        moe_gemm_tile<FORMAT, 2>(w, x, y, p, order, base, col0, offset, count, lane);
+    } else {
+        moe_gemm_tile<FORMAT, 1>(w, x, y, p, order, base, col0, offset, count, lane);
     }
 }
 
@@ -373,7 +427,7 @@ template [[host_name("moe_gemm_wide_" SUFFIX)]] kernel void moe_gemm_wide<FORMAT
     threadgroup char *, uint, uint, uint);
 EXPERT_GEMM(0, 4, "f32")
 EXPERT_GEMM(1, 4, "q8_0")
-EXPERT_GEMM(2, 2, "q4k")
+EXPERT_GEMM(2, 4, "q4k")
 
 // One threadgroup per token: its experts are ranked by ID once, then every column sums
 // them in ascending ID order without floating-point atomics. An optional shared expert

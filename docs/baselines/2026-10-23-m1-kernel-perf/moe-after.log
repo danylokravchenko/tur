@@ -1,0 +1,26 @@
+    Finished `pre-release` profile [optimized] target(s) in 0.36s
+     Running benches/kernels.rs (target/pre-release/deps/kernels-8e031daffce7b8e3)
+MoE q8_0 1 tokens, skew false: grouped 0.337 ms (routing 0.022 ms), individual 0.344 ms
+MoE q8_0 1 tokens, skew true: grouped 0.343 ms (routing 0.022 ms), individual 0.361 ms
+MoE q8_0 8 tokens, skew false: grouped 2.470 ms (routing 0.027 ms), individual 2.727 ms
+MoE q8_0 8 tokens, skew true: grouped 0.538 ms (routing 0.028 ms), individual 0.421 ms
+MoE q8_0 32 tokens, skew false: grouped 6.541 ms (routing 0.042 ms), individual 7.045 ms
+MoE q8_0 32 tokens, skew true: grouped 1.215 ms (routing 0.042 ms), individual 0.773 ms
+MoE q8_0 128 tokens, skew false: grouped 12.164 ms (routing 0.051 ms), individual 12.379 ms
+MoE q8_0 128 tokens, skew true: grouped 3.756 ms (routing 0.051 ms), individual 2.462 ms
+MoE q8_0 512 tokens, skew false: grouped 22.066 ms (routing 0.084 ms), individual 21.980 ms
+MoE q8_0 512 tokens, skew true: grouped 14.086 ms (routing 0.089 ms), individual 10.103 ms
+MoE q8_0 2048 tokens, skew false: grouped 73.486 ms (routing 0.222 ms), individual 50.016 ms
+MoE q8_0 2048 tokens, skew true: grouped 60.459 ms (routing 0.237 ms), individual 49.786 ms
+MoE q4k 1 tokens, skew false: grouped 0.202 ms (routing 0.023 ms), individual 0.183 ms
+MoE q4k 1 tokens, skew true: grouped 0.201 ms (routing 0.023 ms), individual 0.215 ms
+MoE q4k 8 tokens, skew false: grouped 1.399 ms (routing 0.026 ms), individual 1.571 ms
+MoE q4k 8 tokens, skew true: grouped 0.401 ms (routing 0.028 ms), individual 0.358 ms
+MoE q4k 32 tokens, skew false: grouped 4.902 ms (routing 0.042 ms), individual 5.068 ms
+MoE q4k 32 tokens, skew true: grouped 1.364 ms (routing 0.044 ms), individual 0.857 ms
+MoE q4k 128 tokens, skew false: grouped 9.738 ms (routing 0.050 ms), individual 9.547 ms
+MoE q4k 128 tokens, skew true: grouped 4.347 ms (routing 0.054 ms), individual 2.909 ms
+MoE q4k 512 tokens, skew false: grouped 25.318 ms (routing 0.085 ms), individual 22.936 ms
+MoE q4k 512 tokens, skew true: grouped 16.478 ms (routing 0.086 ms), individual 11.612 ms
+MoE q4k 2048 tokens, skew false: grouped 82.596 ms (routing 0.221 ms), individual 56.874 ms
+MoE q4k 2048 tokens, skew true: grouped 69.127 ms (routing 0.241 ms), individual 55.360 ms

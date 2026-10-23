@@ -294,6 +294,10 @@ Profile notes:
 - **DeltaNet scan threadgroups.** The sweep over 1/2/4/8 simdgroups is flat within
   ~5%, and 2 is the default.
 
+Update (2026-10-23, [kernel performance pass](apple-silicon-kernel-performance.md)): Q4K now uses a matrix-unit kernel for 2–16 rows
+instead of its GEMV, and the DeltaNet scan was rewritten (21.0 → 10.4 ms at 2,048 tokens
+on 0.8B shapes). The figures above are the P4 measurements.
+
 ## Relation to cited research
 
 P4 uses established kernel techniques:

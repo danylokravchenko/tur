@@ -267,7 +267,7 @@ impl Kernels {
         // GEMV outputs per simdgroup match the dense GEMV kernels.
         let (suffix, gemv_rows, packed) = match layer.packed_buffer() {
             Some((buffer, GgmlDType::Q8_0)) => ("q8_0", 4, Some(buffer)),
-            Some((buffer, GgmlDType::Q4K)) => ("q4k", 2, Some(buffer)),
+            Some((buffer, GgmlDType::Q4K)) => ("q4k", 4, Some(buffer)),
             None if layer.format().is_none() => ("f32", 4, None),
             _ => return Err(invalid("unsupported expert weight format")),
         };
@@ -291,21 +291,30 @@ impl Kernels {
         // use F16-staged weights. Each launches over all tiles and skips the others.
         let gemv = self.pipeline(&format!("moe_gemv_{suffix}"))?;
         let gemv_simdgroups = gemv.simdgroups(self.tuning.simdgroups).max(1);
-        for (pipeline, simdgroups, outputs, stage) in [
-            (gemv, gemv_simdgroups, gemv_rows * gemv_simdgroups, 0),
+        // A token selects each expert at most once, so no group has more rows than the
+        // pass has tokens: the GEMM (4–16 rows) and wide (17+) tiers are skipped when no
+        // tile can reach them, instead of launching grids that all exit.
+        let tiers = [
+            (gemv, gemv_simdgroups, gemv_rows * gemv_simdgroups, 0, 1),
             (
                 self.pipeline(&format!("moe_gemm_{suffix}"))?,
                 GEMM_SIMDGROUPS,
                 32 * GEMM_SIMDGROUPS,
                 0,
+                4,
             ),
             (
                 self.pipeline(&format!("moe_gemm_wide_{suffix}"))?,
                 4,
                 64,
                 WIDE_STAGE_BYTES,
+                TILE + 1,
             ),
-        ] {
+        ];
+        for (pipeline, simdgroups, outputs, stage, smallest) in tiers {
+            if routes.tokens < smallest {
+                continue;
+            }
             let launch = tiles
                 .rows
                 .checked_mul(out_width.div_ceil(outputs))

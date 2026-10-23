@@ -1,0 +1,50 @@
+{
+  "date": "2026-10-23",
+  "hardware": {
+    "chip": "Apple M1",
+    "gpu_cores": 8,
+    "unified_memory_gb": 16
+  },
+  "os": "26.6.2",
+  "source_base_commit": "e7ce15aca53fefc30cc4c7b8d4509e0eb175d059",
+  "source_state": "uncommitted kernel performance changes on top of the base commit (files below); 'before' artifacts ran the base commit unchanged, except moe-before, which already skipped unreachable MoE GEMM tiers (kernels unchanged)",
+  "source_sha256": {
+    "crates/tur-metal/src/kernels/attention.metal": "20933b9c4df89ee048282c0ce1b815d3179d8746fe2f1c20425b07e90f749781",
+    "crates/tur-metal/src/kernels/delta.metal": "2fff092b5f381687fa7c8b23345cdc63705c7fe57a8f678ef2ac74e19efe93c6",
+    "crates/tur-metal/src/kernels/mod.rs": "a6f2498599ebc2612996177df792aba01f75f1eb1df14da53c19c563b9ceed6e",
+    "crates/tur-metal/src/kernels/moe.metal": "1eb62bd76596ba368ddf4dbdb58eddbe14a09300df99f537a7262d2c992abed4",
+    "crates/tur-metal/src/kernels/moe.rs": "9ae35aeecbe07a1803a90e45c016283b15b124befbe42accf8047c20dbaa05f4",
+    "crates/tur-metal/src/kernels/quantized.metal": "43e23793e3ff16d2d22bf186f665d4003eb0fa672ee1eb206f5c70eae3933852",
+    "crates/tur-metal/src/kernels/runtime.rs": "7d872902b925f04cb962d43bf91a144fc06c3a68635eff1076c94317bfb18b9e",
+    "crates/tur-models/src/models/qwen3_5/model/fused.rs": "899da54b0a185354e0932a1a9ad45c6e2adc5bf6bebc44b73cc71ba4da0379b8",
+    "crates/tur-metal/benches/kernels.rs": "d431451e19d5d13c824fed9e79edb94af9f13238fa117c2214cdc1f05a59f661",
+    "crates/tur-engine/benches/qwen3_5.rs": "781aa708a66290eefab39da058e5ad40db6b572fa175e78f928fc10f14741356"
+  },
+  "compiler": [
+    "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "binary: rustc",
+    "commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4",
+    "commit-date: 2026-09-28",
+    "host: aarch64-apple-darwin",
+    "release: 1.99.0",
+    "LLVM version: 23.1.1"
+  ],
+  "profile": "pre-release (release without LTO)",
+  "checkpoint": {
+    "model": "Qwen/Qwen3.5-0.8B",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17"
+  },
+  "commands": {
+    "kernels": "TUR_BENCH_ONLY=<linear|delta|paged|tiled|moe> [TUR_BENCH_MOE=q8_0,q4k] cargo bench --offline -p tur-metal --bench kernels --profile pre-release",
+    "model": "TUR_QWEN35_0_8B=<snapshot> TUR_BENCH_FORMATS=q8_0,q4k TUR_BENCH_KV=f16,q8 TUR_BENCH_PAGES=16 TUR_BENCH_PREFILL=2048 TUR_BENCH_CONTEXTS=8192 cargo bench --offline -p tur-engine --bench qwen3_5 --profile pre-release",
+    "tests": "cargo nextest run --offline --cargo-profile pre-release --workspace --test-threads 1",
+    "checkpoint_tests": "TUR_QWEN35_0_8B=<snapshot> TUR_QWEN35_GOLDEN=<golden> TUR_QWEN35_MTP_GOLDEN=<mtp golden> cargo nextest run --offline --cargo-profile pre-release --workspace --run-ignored ignored-only --test-threads 1",
+    "shader_validation": "MTL_SHADER_VALIDATION=1 MTL_DEBUG_LAYER=1 cargo nextest run --offline --cargo-profile pre-release -p tur-metal -p tur-engine --test-threads 1 --no-fail-fast"
+  },
+  "notes": [
+    "Timing covers completed GPU work: kernel cases are medians of 15 samples after 3 warmups; model cases use the benchmark's 2 warmups.",
+    "Prefill medians come from two samples. model-after-q8_0-f16-rerun.json repeats the first configuration alone after a high first sample in model-after.json.",
+    "Shader validation fails the same four allocation/workspace tests on the base commit and on this state; they are not regressions.",
+    "rejected-* files are measured variants that lost and were not kept."
+  ]
+}

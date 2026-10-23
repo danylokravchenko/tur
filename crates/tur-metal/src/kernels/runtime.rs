@@ -63,6 +63,7 @@ const FUNCTIONS: &[&str] = &[
     "swiglu_f32",
     "gated_rms_f32",
     "delta_conv_f32",
+    "delta_conv4_f32",
     "kv_write_r2_f32",
     "kv_write_r2_f16",
     "kv_write_r2_q8",
@@ -105,24 +106,28 @@ const FUNCTIONS: &[&str] = &[
     "qmm_q8_0_t2_f32",
     "qmm_q4k_t1_f32",
     "qmm_q4k_t2_f32",
-    "delta_scan_r2_f32",
-    "delta_scan_r2_f16",
-    "delta_scan_r2_bf16",
-    "delta_scan_r4_f32",
-    "delta_scan_r4_f16",
-    "delta_scan_r4_bf16",
-    "delta_scan_r8_f32",
-    "delta_scan_r8_f16",
-    "delta_scan_r8_bf16",
-    "delta_step_d64_f32",
-    "delta_step_d64_f16",
-    "delta_step_d64_bf16",
-    "delta_step_d128_f32",
-    "delta_step_d128_f16",
-    "delta_step_d128_bf16",
-    "delta_step_d256_f32",
-    "delta_step_d256_f16",
-    "delta_step_d256_bf16",
+    "delta_prepare_f32",
+    "delta_scan_f32",
+    "delta_scan_f16",
+    "delta_scan_bf16",
+    "delta_step_d64_r16_f32",
+    "delta_step_d64_r32_f32",
+    "delta_step_d64_r16_f16",
+    "delta_step_d64_r32_f16",
+    "delta_step_d64_r16_bf16",
+    "delta_step_d64_r32_bf16",
+    "delta_step_d128_r16_f32",
+    "delta_step_d128_r32_f32",
+    "delta_step_d128_r16_f16",
+    "delta_step_d128_r32_f16",
+    "delta_step_d128_r16_bf16",
+    "delta_step_d128_r32_bf16",
+    "delta_step_d256_r16_f32",
+    "delta_step_d256_r32_f32",
+    "delta_step_d256_r16_f16",
+    "delta_step_d256_r32_f16",
+    "delta_step_d256_r16_bf16",
+    "delta_step_d256_r32_bf16",
     "argmax_f32",
     "penalize_f32",
     "mask_f32",
@@ -200,8 +205,7 @@ pub struct Tuning {
     pub row_threads: usize,
     /// Simdgroups per threadgroup for one-item-per-simdgroup kernels.
     pub simdgroups: usize,
-    /// Simdgroups per delta-scan threadgroup. Reduced automatically when the staged state
-    /// tile exceeds threadgroup memory.
+    /// Simdgroups per delta-scan threadgroup; each simdgroup scans its own state columns.
     pub scan_simdgroups: usize,
     /// Threads per threadgroup for elementwise kernels.
     pub elementwise_threads: usize,
@@ -242,14 +246,15 @@ impl Tuning {
             // Measured crossovers on M1 (P4 and P6 kernel artifacts): Candle's one-row GEMV
             // wins at one row. For Q8_0 the custom GEMV wins at 2–3 rows and the
             // matrix-unit kernel from 4 (1.3–2.6× at 5–8 rows, F32 parity with Candle's
-            // F16-tile GEMM at 16). Q4K uses its GEMV at 2–3 rows and its matrix-unit
-            // kernel at 4–16: 1.6–2.0× faster than Candle's F16-staged tiles at 4–8 rows and
-            // 10–25% slower at 16, kept for F32 precision so that small batches and
-            // verification windows compute what single-token decoding does (P8 artifact).
+            // F16-tile GEMM at 16). Q4K uses its matrix-unit kernel at 2–16 rows: it beats
+            // the Q4K GEMV from two rows and Candle's F16-staged tiles by 2.4–2.6× at 2–8
+            // rows and ~5% at 16, in F32 so that small batches and verification windows
+            // compute what single-token decoding does. The Q4K GEMV range stays reachable
+            // through tuning overrides only.
             gemv_q8_0_rows: (2, 3),
-            gemv_q4k_rows: (2, 4),
+            gemv_q4k_rows: (2, 2),
             qmm_q8_0_rows: (4, 16),
-            qmm_q4k_rows: (4, 16),
+            qmm_q4k_rows: (2, 16),
             delta_step: true,
         }
     }
@@ -437,6 +442,25 @@ impl Runtime {
     /// Upload host indices; validated by the caller before reaching the GPU.
     pub(super) fn indices(&self, values: &[u32]) -> Result<Tensor> {
         Ok(Tensor::from_slice(values, values.len(), &self.device)?)
+    }
+
+    /// Upload several non-empty index lists as one buffer and return a view of each. Every
+    /// upload creates a fresh `MTLBuffer` and residency-set entry before the pass's first
+    /// commit, so a pass's addressing goes up in one.
+    pub(super) fn indices_packed<const N: usize>(&self, parts: [&[u32]; N]) -> Result<[Tensor; N]> {
+        if parts.iter().any(|part| part.is_empty()) {
+            return Err(invalid("packed index lists must be non-empty"));
+        }
+        let all = self.indices(&parts.concat())?;
+        let mut offset = 0;
+        let mut views = Vec::with_capacity(N);
+        for part in parts {
+            views.push(all.narrow(0, offset, part.len())?);
+            offset += part.len();
+        }
+        views
+            .try_into()
+            .map_err(|_| invalid("packed index views do not match their lists"))
     }
 }
 

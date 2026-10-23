@@ -1,0 +1,3 @@
+   Compiling tur-metal v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-metal)
+    Finished `pre-release` profile [optimized] target(s) in 4.13s
+     Running benches/kernels.rs (target/pre-release/deps/kernels-8e031daffce7b8e3)

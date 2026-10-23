@@ -1,0 +1,39 @@
+   Compiling tur-metal v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-metal)
+    Finished `pre-release` profile [optimized] target(s) in 6.06s
+     Running benches/kernels.rs (target/pre-release/deps/kernels-8e031daffce7b8e3)
+prefill 16              f32: tiled    0.038 ms  per-query    0.011 ms  x0.30
+prefill 16              f16: tiled    0.040 ms  per-query    0.013 ms  x0.32
+prefill 16              q8_32: tiled    0.045 ms  per-query    0.014 ms  x0.30
+prefill 32              f32: tiled    0.047 ms  per-query    0.027 ms  x0.58
+prefill 32              f16: tiled    0.047 ms  per-query    0.024 ms  x0.50
+prefill 32              q8_32: tiled    0.053 ms  per-query    0.036 ms  x0.67
+prefill 64              f32: tiled    0.086 ms  per-query    0.084 ms  x0.97
+prefill 64              f16: tiled    0.087 ms  per-query    0.063 ms  x0.73
+prefill 64              q8_32: tiled    0.096 ms  per-query    0.102 ms  x1.07
+prefill 128             f32: tiled    0.197 ms  per-query    0.303 ms  x1.54
+prefill 128             f16: tiled    0.196 ms  per-query    0.197 ms  x1.00
+prefill 128             q8_32: tiled    0.218 ms  per-query    0.343 ms  x1.57
+prefill 512             f32: tiled    1.899 ms  per-query    5.167 ms  x2.72
+prefill 512             f16: tiled    1.861 ms  per-query    2.696 ms  x1.45
+prefill 512             q8_32: tiled    2.089 ms  per-query    4.940 ms  x2.36
+prefill 2048            f32: tiled   26.552 ms  per-query  155.197 ms  x5.85
+prefill 2048            f16: tiled   25.857 ms  per-query   59.245 ms  x2.29
+prefill 2048            q8_32: tiled   28.772 ms  per-query   77.765 ms  x2.70
+prefill 8192            f32: tiled  404.334 ms  per-query 3558.418 ms  x8.80
+prefill 8192            f16: tiled  406.406 ms  per-query 1103.232 ms  x2.71
+prefill 8192            q8_32: tiled  457.001 ms  per-query 1206.228 ms  x2.64
+chunk 16 after 2048     f32: tiled    2.005 ms  per-query    1.166 ms  x0.58
+chunk 16 after 2048     f16: tiled    1.971 ms  per-query    0.794 ms  x0.40
+chunk 16 after 2048     q8_32: tiled    2.147 ms  per-query    1.360 ms  x0.63
+chunk 64 after 2048     f32: tiled    2.180 ms  per-query    6.949 ms  x3.19
+chunk 64 after 2048     f16: tiled    2.164 ms  per-query    3.464 ms  x1.60
+chunk 64 after 2048     q8_32: tiled    2.452 ms  per-query    5.019 ms  x2.05
+chunk 256 after 8192    f32: tiled   27.402 ms  per-query  201.104 ms  x7.34
+chunk 256 after 8192    f16: tiled   26.972 ms  per-query   86.301 ms  x3.20
+chunk 256 after 8192    q8_32: tiled   30.709 ms  per-query   77.273 ms  x2.52
+chunk 32 x4 after 1024  f32: tiled    2.300 ms  per-query    6.779 ms  x2.95
+chunk 32 x4 after 1024  f16: tiled    2.295 ms  per-query    2.667 ms  x1.16
+chunk 32 x4 after 1024  q8_32: tiled    2.583 ms  per-query    4.900 ms  x1.90
+decode ctx 2048 x8      f32: tiled    6.231 ms  per-query    1.281 ms  x0.21
+decode ctx 2048 x8      f16: tiled    6.310 ms  per-query    0.668 ms  x0.11
+decode ctx 2048 x8      q8_32: tiled    7.106 ms  per-query    0.664 ms  x0.09

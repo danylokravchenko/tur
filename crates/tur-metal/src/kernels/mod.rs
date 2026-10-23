@@ -23,8 +23,11 @@ use tur_core::{
     execution::{KvFormat, invalid},
 };
 
-/// Columns of value state owned by one delta-scan simdgroup (`COLS` in the MSL).
-const SCAN_COLUMNS: usize = 4;
+/// Key rows owned by one delta-step simdgroup, in order of preference: 16 is fastest on M1
+/// and 32 needs half the threads, for pipelines that cannot run `dk / 16` simdgroups.
+const DELTA_STEP_ROWS: [usize; 2] = [16, 32];
+/// Key rows held by one delta-scan lane (`SCAN_ROWS` in the MSL).
+const DELTA_SCAN_ROWS: usize = 32;
 /// Output rows per GEMV simdgroup (`NR` in the MSL `QMV` instantiations).
 fn gemv_rows(format: GgmlDType, batch: usize) -> usize {
     match format {
@@ -90,6 +93,7 @@ struct ScanParams {
     proj_stride: u32,
     b_col: u32,
     a_col: u32,
+    prep_stride: u32,
 }
 
 #[repr(C)]
@@ -124,6 +128,8 @@ struct TiledParams {
 /// Query tokens per tile (8 rows per simdgroup), key block and staged dimensions of the
 /// tiled kernel (`TQ`, `TK`, `TD` in the MSL).
 const TILE_QUERIES: usize = 32;
+/// Threads of one tiled-attention threadgroup: a simdgroup per eight query rows.
+const TILE_THREADS: usize = TILE_QUERIES / 8 * 32;
 const TILE_KEYS: usize = 32;
 const TILE_DIMS: usize = 64;
 
@@ -181,8 +187,13 @@ struct QmmParams {
     rows: u32,
 }
 
-/// Output columns per threadgroup of the small-batch matrix kernel (`8 * NT` in the MSL).
-const QMM_COLUMNS: usize = 16;
+/// Output columns per threadgroup of the small-batch matrix kernels (`8 * NT` in the MSL).
+fn qmm_columns(format: GgmlDType) -> usize {
+    match format {
+        GgmlDType::Q4K => 32,
+        _ => 16,
+    }
+}
 
 #[repr(C)]
 struct QmvParams {
@@ -857,20 +868,32 @@ impl Kernels {
         let (single, multi): (Vec<u32>, Vec<u32>) = all
             .iter()
             .partition(|&&i| spans.get(i as usize).is_some_and(|span| span.tokens == 1));
+        let counts = [single.len(), multi.len(), all.len()];
         // Uploads are never empty; an unused order list is a placeholder of one entry.
-        let order = |ids: Vec<u32>| -> Result<(Tensor, usize)> {
-            let count = ids.len();
-            let ids = if ids.is_empty() { vec![0] } else { ids };
-            Ok((self.runtime.indices(&ids)?, count))
+        let placeholder = |ids: &[u32]| {
+            if ids.is_empty() {
+                vec![0]
+            } else {
+                ids.to_vec()
+            }
         };
+        let [table_view, rows_view, slots_view, single, multi, all] =
+            self.runtime.indices_packed([
+                &table,
+                &rows,
+                &slots,
+                &placeholder(&single),
+                &placeholder(&multi),
+                &placeholder(&all),
+            ])?;
         Ok(RecurrentSpans {
-            spans: self.runtime.indices(&table)?,
+            spans: table_view,
             tokens: rows.len(),
-            rows: self.runtime.indices(&rows)?,
-            slots: self.runtime.indices(&slots)?,
-            single: order(single)?,
-            multi: order(multi)?,
-            all: order(all)?,
+            rows: rows_view,
+            slots: slots_view,
+            single: (single, counts[0]),
+            multi: (multi, counts[1]),
+            all: (all, counts[2]),
             sequences: spans.len(),
             max_slot,
         })
@@ -915,12 +938,22 @@ impl Kernels {
         let rows = self.runtime.view(&spans.rows, DType::U32)?;
         let slots = self.runtime.view(&spans.slots, DType::U32)?;
         let out = self.output(xv.rows, channels)?;
-        let pipeline = self.pipeline("delta_conv_f32")?;
+        // Four channels per thread when every row of the input and history stays 16-byte
+        // aligned.
+        let vector = channels.is_multiple_of(4)
+            && xv.row_stride.is_multiple_of(4)
+            && xv.offset().is_multiple_of(16)
+            && hv.offset().is_multiple_of(16);
+        let (pipeline, items) = if vector {
+            (self.pipeline("delta_conv4_f32")?, count / 4)
+        } else {
+            (self.pipeline("delta_conv_f32")?, count)
+        };
         let threads = pipeline.threads(self.tuning.elementwise_threads);
         self.runtime.dispatch(
             pipeline,
             "tur_delta_conv",
-            count.div_ceil(threads),
+            items.div_ceil(threads),
             threads,
             |e| {
                 xv.bind(e, 0)?;
@@ -971,16 +1004,13 @@ impl Kernels {
         if shape.key_heads == 0 || !heads.is_multiple_of(shape.key_heads) {
             return Err(invalid("value heads must be a multiple of key heads"));
         }
-        let (name, step) = match dk {
-            64 => ("r2", "d64"),
-            128 => ("r4", "d128"),
-            256 => ("r8", "d256"),
-            _ => return Err(invalid(format!("no delta scan kernel for key dim {dk}"))),
-        };
-        let (name, step) = (
-            format!("delta_scan_{name}_{storage}"),
-            format!("delta_step_{step}_{storage}"),
-        );
+        if !matches!(dk, 64 | 128 | 256) {
+            return Err(invalid(format!("no delta scan kernel for key dim {dk}")));
+        }
+        let name = format!("delta_scan_{storage}");
+        // Prepared row: normalised q and k, q·k per key head, (decay, beta) per value head;
+        // rounded to whole float4s so the scan's vector reads stay aligned.
+        let prep_stride = (2 * shape.key_width() + shape.key_heads + 2 * heads).next_multiple_of(4);
         bv.expect(1, heads, "dt bias")?;
         av.expect(1, heads, "decay rate")?;
         if pool.dims().get(1..) != Some(&[heads, dk, dv][..]) {
@@ -1014,6 +1044,7 @@ impl Kernels {
                 proj_stride: to_u32(pv.row_stride, "projection stride")?,
                 b_col: to_u32(shape.b_col, "b column")?,
                 a_col: to_u32(shape.a_col, "a column")?,
+                prep_stride: to_u32(prep_stride, "prepared stride")?,
             })
         };
         let table = self.runtime.view(&spans.spans, DType::U32)?;
@@ -1036,7 +1067,17 @@ impl Kernels {
             Ok(())
         };
         if stepped_count > 0 {
-            let pipeline = self.pipeline(&step)?;
+            // One simdgroup per `rows` key rows; each stages 32 float2 partials.
+            let (pipeline, threads) = DELTA_STEP_ROWS
+                .iter()
+                .map(|rows| -> Result<_> {
+                    let pipeline = self.pipeline(&format!("delta_step_d{dk}_r{rows}_{storage}"))?;
+                    Ok((pipeline, dk / rows * 32))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .find(|(pipeline, threads)| pipeline.threads(*threads) == *threads)
+                .ok_or_else(|| invalid("no delta step pipeline fits a threadgroup"))?;
             if !dv.is_multiple_of(2) {
                 return Err(invalid("the delta step kernel needs an even value dim"));
             }
@@ -1047,38 +1088,50 @@ impl Kernels {
             let order = self.runtime.view(&stepped.0, DType::U32)?;
             let params = params(stepped_count)?;
             self.runtime
-                .dispatch(pipeline, "tur_delta_step", groups, dk, |e| {
+                .dispatch(pipeline, "tur_delta_step", groups, threads, |e| {
                     bind(e, &params, &order)?;
-                    e.set_threadgroup_memory_length(0, dk * 8);
+                    e.set_threadgroup_memory_length(0, threads * 8);
                     Ok(())
                 })?;
         }
         if scanned.1 > 0 {
+            let params = params(scanned.1)?;
+            let rows = to_u32(mv.rows, "rows")?;
+            let prep = self.output(mv.rows, prep_stride)?;
+            let pipeline = self.pipeline("delta_prepare_f32")?;
+            let (groups, threads) = self.simdgroup_launch(pipeline, mv.rows * shape.key_heads);
+            self.runtime
+                .dispatch(pipeline, "tur_delta_prepare", groups, threads, |e| {
+                    mv.bind(e, 0)?;
+                    pv.bind(e, 1)?;
+                    bv.bind(e, 2)?;
+                    av.bind(e, 3)?;
+                    prep.bind(e, 4);
+                    e.set_bytes(5, &params);
+                    e.set_bytes(6, &rows);
+                    Ok(())
+                })?;
             let pipeline = self.pipeline(&name)?;
-            // Halve the threadgroup until its padded state tile fits threadgroup memory.
-            let tile_bytes =
-                |simdgroups: usize| (dk * (simdgroups * SCAN_COLUMNS + 1) * 4).next_multiple_of(16);
-            let mut simdgroups = pipeline.simdgroups(self.tuning.scan_simdgroups).max(1);
-            while simdgroups > 1
-                && tile_bytes(simdgroups) > self.capabilities().threadgroup_memory_bytes
-            {
-                simdgroups /= 2;
-            }
-            if tile_bytes(simdgroups) > self.capabilities().threadgroup_memory_bytes {
-                return Err(invalid("delta state tile exceeds threadgroup memory"));
-            }
-            let per_head = dv.div_ceil(SCAN_COLUMNS).div_ceil(simdgroups);
-            let groups = scanned
+            // dk / DELTA_SCAN_ROWS lanes share a value column.
+            let columns = 32 * DELTA_SCAN_ROWS / dk;
+            let items = scanned
                 .1
-                .checked_mul(heads * per_head)
+                .checked_mul(heads * dv.div_ceil(columns))
                 .ok_or_else(|| invalid("delta scan grid overflow"))?;
+            let simdgroups = pipeline.simdgroups(self.tuning.scan_simdgroups).max(1);
+            let groups = items.div_ceil(simdgroups);
             to_u32(groups, "delta scan threadgroups")?;
             let order = self.runtime.view(&scanned.0, DType::U32)?;
-            let params = params(scanned.1)?;
             self.runtime
                 .dispatch(pipeline, "tur_delta_scan", groups, simdgroups * 32, |e| {
-                    bind(e, &params, &order)?;
-                    e.set_threadgroup_memory_length(0, tile_bytes(simdgroups));
+                    mv.bind(e, 0)?;
+                    e.set_input_buffer(1, Some(prep.buffer()), 0);
+                    sv.bind_mut(e, 2)?;
+                    out.bind(e, 3);
+                    e.set_bytes(4, &params);
+                    table.bind(e, 5)?;
+                    slots.bind(e, 6)?;
+                    order.bind(e, 7)?;
                     Ok(())
                 })?;
         }
@@ -1111,15 +1164,21 @@ impl Kernels {
             }
             max_visible = max_visible.max(keys as usize);
         }
-        let tiles = query_tiles(first_block, visible)
-            .map(|tiles| -> Result<(Tensor, usize)> {
-                Ok((self.runtime.indices(&tiles)?, tiles.len() / 2))
-            })
-            .transpose()?;
+        let (table_view, first_view, visible_view, tiles) =
+            if let Some(tiles) = query_tiles(first_block, visible) {
+                let [table, first, keys, uploaded] =
+                    self.runtime
+                        .indices_packed([table, first_block, visible, &tiles])?;
+                (table, first, keys, Some((uploaded, tiles.len() / 2)))
+            } else {
+                let [table, first, keys] =
+                    self.runtime.indices_packed([table, first_block, visible])?;
+                (table, first, keys, None)
+            };
         Ok(PagedKv {
-            table: self.runtime.indices(table)?,
-            first_block: self.runtime.indices(first_block)?,
-            visible: self.runtime.indices(visible)?,
+            table: table_view,
+            first_block: first_view,
+            visible: visible_view,
             tiles,
             page,
             slots,
@@ -1159,7 +1218,7 @@ impl Kernels {
                 && (self.tuning.attention_tiled_groups == 0
                     || kv.tokens >= tiles.saturating_mul(TILE_QUERIES / 2))
                 && matches!(dim, 64 | 128 | 256)
-                && self.capabilities().max_threads_per_threadgroup >= 128
+                && self.capabilities().max_threads_per_threadgroup >= TILE_THREADS
                 && Self::tiled_memory_bytes() <= self.capabilities().threadgroup_memory_bytes
         })
     }
@@ -1344,6 +1403,13 @@ impl Kernels {
                 (v_data, v_scales),
             );
         }
+        // The per-query kernel addresses pool rows (slot × K/V head) in 32 bits.
+        to_u32(
+            kv.slots
+                .checked_mul(kv_heads)
+                .ok_or_else(|| invalid("K/V pool rows overflow"))?,
+            "K/V pool rows",
+        )?;
         let table = self.runtime.view(&kv.table, DType::U32)?;
         let first = self.runtime.view(&kv.first_block, DType::U32)?;
         let visible = self.runtime.view(&kv.visible, DType::U32)?;
@@ -1438,8 +1504,10 @@ impl Kernels {
             scale: (dim as f64).sqrt().recip() as f32,
         };
         let pipeline = self.pipeline(&Self::kv_kernel("attention_tiled", dim, pool.format)?)?;
-        if pipeline.threads(128) != 128 {
-            return Err(invalid("tiled attention needs 128-thread threadgroups"));
+        if pipeline.threads(TILE_THREADS) != TILE_THREADS {
+            return Err(invalid(
+                "tiled attention pipeline cannot run a full query tile",
+            ));
         }
         let tiles = self.runtime.view(tiles, DType::U32)?;
         let table = self.runtime.view(&kv.table, DType::U32)?;
@@ -1450,7 +1518,7 @@ impl Kernels {
             .checked_mul(heads)
             .ok_or_else(|| invalid("tile count overflow"))?;
         self.runtime
-            .dispatch(pipeline, "tur_attention_tiled", groups, 128, |e| {
+            .dispatch(pipeline, "tur_attention_tiled", groups, TILE_THREADS, |e| {
                 qv.bind(e, 0)?;
                 k_data.bind(e, 1)?;
                 v_data.bind(e, 2)?;
@@ -1533,8 +1601,9 @@ impl Kernels {
         let pipeline = self.pipeline(&format!("qmm_{name}_t{tiles}_f32"))?;
         // Simdgroups of a threadgroup split k over the same output columns.
         let threads = pipeline.simdgroups(self.tuning.simdgroups).max(1) * 32;
-        let groups = n.div_ceil(QMM_COLUMNS);
-        let shared = threads / 32 * QMM_COLUMNS * tiles * 8 * 4;
+        let columns = qmm_columns(format);
+        let groups = n.div_ceil(columns);
+        let shared = threads / 32 * columns * tiles * 8 * 4;
         if shared > self.capabilities().threadgroup_memory_bytes {
             return Err(invalid(
                 "small-batch projection partials exceed threadgroup memory",

@@ -431,7 +431,19 @@ pub(super) fn workspace(
                 kinds.1 = true;
                 let proj = plan.reserve(elements(projection_width)?, f)?;
                 let mixed = plan.reserve(elements(d.channels)?, f)?;
+                // The scan's prepared rows (normalised q|k, q·k and gates) live beside
+                // its output.
+                let prepared = d
+                    .key_heads
+                    .checked_mul(d.key_dim)
+                    .and_then(|key_width| key_width.checked_mul(2))
+                    .and_then(|width| width.checked_add(d.key_heads))
+                    .and_then(|width| width.checked_add(d.value_heads.checked_mul(2)?))
+                    .map(|width| width.next_multiple_of(4))
+                    .ok_or_else(|| invalid("recurrent scan scratch overflow"))?;
+                let prepared = plan.reserve(elements(prepared)?, f)?;
                 let core = plan.reserve(elements(d.value_width)?, f)?;
+                plan.release(prepared);
                 let gated = plan.reserve(elements(d.value_width)?, f)?;
                 for region in [mixed, core, proj] {
                     plan.release(region);
