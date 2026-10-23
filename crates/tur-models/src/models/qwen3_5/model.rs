@@ -16,7 +16,7 @@ use candle_core::{DType, Device, Tensor, quantized::GgmlDType};
 use std::{collections::HashMap, path::Path, sync::Arc};
 use tur_core::{
     Result,
-    execution::{KvFormat, KvLayout, ModelDescription, invalid},
+    execution::{KvFormat, KvLayout, ModelDescription, checked_elements, invalid},
 };
 use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
 
@@ -158,6 +158,28 @@ struct Dims {
     theta: f64,
 }
 
+impl Dims {
+    fn new(config: &Config) -> Result<Self> {
+        let t = &config.text;
+        Ok(Self {
+            heads: t.num_attention_heads,
+            kv_heads: t.num_key_value_heads,
+            head_dim: t.head_dim,
+            key_heads: t.linear_num_key_heads,
+            value_heads: t.linear_num_value_heads,
+            key_dim: t.linear_key_head_dim,
+            value_dim: t.linear_value_head_dim,
+            key_width: config.key_width()?,
+            value_width: config.value_width()?,
+            channels: config.conv_channels()?,
+            intermediate: t.intermediate_size,
+            eps: t.rms_norm_eps,
+            rotary_dim: config.rotary_dim(),
+            theta: t.rope_parameters.rope_theta,
+        })
+    }
+}
+
 /// Qwen3.5 dense hybrid decoder (text tower only). Weights are immutable after load.
 pub struct Qwen35 {
     config: Config,
@@ -213,6 +235,85 @@ impl Tensors {
 }
 
 impl Qwen35 {
+    /// Description, resident weight bytes and peak workspace computed from validated
+    /// metadata, before reading weight payloads or uploading weights. `contexts` bounds
+    /// each sequence's resulting position, and `tokens` bounds the packed pass.
+    pub fn memory_requirements(
+        config: &Config,
+        options: &LoadOptions,
+        tokens: usize,
+        contexts: &[usize],
+    ) -> Result<(ModelDescription, usize, usize)> {
+        let description = config.description(
+            format!("{}#{}", options.revision, options.format.tag()),
+            options.kv,
+            options.recurrent,
+        )?;
+        description.validate()?;
+        let quant = match options.format {
+            WeightFormat::F32 => None,
+            WeightFormat::Q8_0 => Some(GgmlDType::Q8_0),
+            WeightFormat::Q4K => Some(GgmlDType::Q4K),
+        };
+        let projection_bytes = |shape: &[usize]| -> Result<usize> {
+            let elements = checked_elements(shape)?;
+            if let Some(format) = quant {
+                if shape
+                    .last()
+                    .is_none_or(|width| !width.is_multiple_of(format.block_size()))
+                {
+                    return Err(invalid(
+                        "projection width does not fit its quantization block",
+                    ));
+                }
+                (elements / format.block_size()).checked_mul(format.type_size())
+            } else {
+                elements.checked_mul(4)
+            }
+            .ok_or_else(|| invalid("weight size overflow"))
+        };
+        let mut weights = 0usize;
+        for (name, shape) in config.weight_shapes()? {
+            let embedding = name.ends_with("embed_tokens.weight");
+            // Every other rank-two checkpoint tensor is a projection, including the
+            // in_proj_qkv/z/a/b matrices that are concatenated by the loader.
+            let bytes = if shape.len() == 2 && !embedding {
+                projection_bytes(&shape)?
+            } else {
+                let element_bytes = if embedding && quant.is_some() { 2 } else { 4 };
+                checked_elements(&shape)?
+                    .checked_mul(element_bytes)
+                    .ok_or_else(|| invalid("weight size overflow"))?
+            };
+            weights = weights
+                .checked_add(bytes)
+                .ok_or_else(|| invalid("weight total overflow"))?;
+        }
+        if config.tied_embeddings() && quant.is_some() {
+            weights = weights
+                .checked_add(projection_bytes(&[
+                    config.text.vocab_size,
+                    config.text.hidden_size,
+                ])?)
+                .ok_or_else(|| invalid("tied head size overflow"))?;
+        }
+        let scratch = {
+            #[cfg(feature = "metal")]
+            if options.execution == Execution::Fused && matches!(options.device, Device::Metal(_)) {
+                let kernels = tur_metal::kernels::Kernels::new(&options.device)?;
+                fused::workspace(config, &kernels, options.kv.page_tokens, tokens, contexts)?
+            } else {
+                0
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                let _ = (tokens, contexts);
+                0
+            }
+        };
+        Ok((description, weights, scratch))
+    }
+
     /// Validate config and checkpoint headers, then load the text tower onto `options.device`.
     pub fn load(dir: &Path, options: &LoadOptions) -> Result<Self> {
         let mut config = Config::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?;
@@ -230,23 +331,7 @@ impl Qwen35 {
         let mut tensors = Tensors(checkpoint.load()?);
         let device = &options.device;
         let format = options.format;
-        let t = &config.text;
-        let dims = Dims {
-            heads: t.num_attention_heads,
-            kv_heads: t.num_key_value_heads,
-            head_dim: t.head_dim,
-            key_heads: t.linear_num_key_heads,
-            value_heads: t.linear_num_value_heads,
-            key_dim: t.linear_key_head_dim,
-            value_dim: t.linear_value_head_dim,
-            key_width: config.key_width()?,
-            value_width: config.value_width()?,
-            channels: config.conv_channels()?,
-            intermediate: t.intermediate_size,
-            eps: t.rms_norm_eps,
-            rotary_dim: config.rotary_dim(),
-            theta: t.rope_parameters.rope_theta,
-        };
+        let dims = Dims::new(&config)?;
         let prefix = config.text_prefix().to_string();
         let mut layers = Vec::with_capacity(config.layer_kinds().len());
         for (i, kind) in config.layer_kinds().iter().enumerate() {

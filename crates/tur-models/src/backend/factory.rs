@@ -107,6 +107,17 @@ impl ModelFactory {
     /// `Q8_0/Q4K` explicitly convert `SafeTensors` matrices into packed resident weights;
     /// legacy ordinary-attention GGUF checkpoints are unsupported.
     pub fn create_model(&self) -> Result<(Qwen35, Tokenizer, ChatTemplate, GenerationDefaults)> {
+        let (model, tokenizer, template, defaults, ()) = self.create_model_with(|_, _| Ok(()))?;
+        Ok((model, tokenizer, template, defaults))
+    }
+
+    /// Validate serving metadata, then reserve resources before loading any weight
+    /// payload or uploading tensors. The reservation is returned with the model and is
+    /// dropped automatically on a loading failure.
+    pub fn create_model_with<R>(
+        &self,
+        reserve: impl FnOnce(&Config, &LoadOptions) -> Result<R>,
+    ) -> Result<(Qwen35, Tokenizer, ChatTemplate, GenerationDefaults, R)> {
         let dir = self.resolve()?;
         let config = Config::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?;
         let generation = match std::fs::read_to_string(dir.join("generation_config.json")) {
@@ -144,23 +155,22 @@ impl ModelFactory {
             }
         }
         let template = ChatTemplate::from_model_dir(&dir)?;
-        let model = Qwen35::load(
-            &dir,
-            &LoadOptions {
-                revision: match &self.source {
-                    ModelSource::HuggingFace(id) => format!("{id}@{}", self.revision),
-                    ModelSource::LocalPath(path) => {
-                        format!("{}@{}", path.canonicalize()?.display(), self.revision)
-                    }
-                },
-                format: self.format,
-                device: self.device.clone(),
-                execution: Execution::Fused,
-                kv: self.kv,
-                recurrent: self.recurrent,
+        let options = LoadOptions {
+            revision: match &self.source {
+                ModelSource::HuggingFace(id) => format!("{id}@{}", self.revision),
+                ModelSource::LocalPath(path) => {
+                    format!("{}@{}", path.canonicalize()?.display(), self.revision)
+                }
             },
-        )?;
-        Ok((model, tokenizer, template, defaults))
+            format: self.format,
+            device: self.device.clone(),
+            execution: Execution::Fused,
+            kv: self.kv,
+            recurrent: self.recurrent,
+        };
+        let reservation = reserve(&config, &options)?;
+        let model = Qwen35::load(&dir, &options)?;
+        Ok((model, tokenizer, template, defaults, reservation))
     }
 }
 

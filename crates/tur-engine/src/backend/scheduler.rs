@@ -4,10 +4,11 @@
 //! Each iteration selects one packed pass. Running decodes come first, one token each,
 //! rotated by when they last ran when the token budget cannot hold them all. Prefill chunks
 //! follow in arrival order within a budget sized from measured pass costs. While prefill
-//! work exists every pass grants it at least `min_prefill_tokens`, and a request older than
-//! `max_queue_wait` gets a full chunk whatever the cost target. The caller checks memory
+//! work fits every pass reserves at least `min_prefill_tokens`, or an indivisible replay
+//! chunk. The oldest prefill beyond `max_queue_wait` ignores the cost target within the
+//! token cap and may reclaim resources from younger running requests. The caller checks memory
 //! per chunk: a decode that does not fit preempts the newest running request, which later
-//! recomputes its tokens, so the oldest request always progresses.
+//! recomputes its tokens. Waiting behind older work is not bounded by the queue-age cap.
 
 use std::time::{Duration, Instant};
 use tur_core::{Result, TurError, execution::invalid};
@@ -75,9 +76,12 @@ impl SchedulerConfig {
 #[derive(Clone, Copy, Debug)]
 pub struct Candidate {
     pub id: Uuid,
-    /// Tokens not yet in model state: one for a decode; the prompt, or the prompt and
-    /// generated tokens after a preemption, otherwise.
+    /// Tokens available for the next chunk: one for a decode, remaining prompt tokens,
+    /// or the next original chunk during recomputation.
     pub pending: usize,
+    /// Minimum indivisible chunk. Recompute uses the original pass boundary so narrow
+    /// recurrent state is rounded at the same positions as before preemption.
+    pub minimum: usize,
     /// Its single pending token is a sampled output.
     pub decoding: bool,
     /// Holds model state; otherwise admitting it counts against `max_running`.
@@ -116,7 +120,7 @@ const CONTEXT_BUCKETS: usize = 8;
 /// Weight of the newest sample in each bucket's moving average.
 const SMOOTHING: f64 = 0.25;
 
-/// Measured pass durations, as moving averages over (packed tokens, context) buckets of
+/// Measured seconds per token, as moving averages over (packed tokens, context) buckets of
 /// powers of two. Unmeasured shapes are estimated from the nearest measured token bucket
 /// of the nearest measured context bucket, scaled linearly by tokens.
 #[derive(Clone, Debug, Default)]
@@ -139,17 +143,18 @@ impl CostModel {
             return;
         }
         let cell = &mut self.cells[token_bucket(tokens)][context_bucket(context)];
-        *cell = Some(cell.map_or(seconds, |mean| SMOOTHING.mul_add(seconds - mean, mean)));
+        let per_token = seconds / tokens as f64;
+        *cell = Some(cell.map_or(per_token, |mean| SMOOTHING.mul_add(per_token - mean, mean)));
     }
 
     /// Estimated seconds of a pass of `tokens` packed tokens at `context`, if measured.
     pub fn estimate(&self, tokens: usize, context: usize) -> Option<f64> {
         let (column, bucket) = (context_bucket(context), token_bucket(tokens));
-        let (_, measured, mean) = (0..TOKEN_BUCKETS)
+        let (_, _, mean) = (0..TOKEN_BUCKETS)
             .flat_map(|b| (0..CONTEXT_BUCKETS).map(move |c| (b, c)))
             .filter_map(|(b, c)| self.cells[b][c].map(|mean| (c, b, mean)))
             .min_by_key(|(c, b, _)| (c.abs_diff(column), b.abs_diff(bucket)))?;
-        Some(mean * tokens as f64 / (1usize << measured) as f64)
+        Some(mean * tokens as f64)
     }
 }
 
@@ -194,8 +199,8 @@ impl Scheduler {
         if waiting >= self.config.max_waiting
             || waiting_tokens.saturating_add(tokens) > self.config.max_waiting_tokens
         {
-            return Err(TurError::Other(format!(
-                "request queue is full ({waiting} requests, {waiting_tokens} tokens waiting)"
+            return Err(TurError::QueueFull(format!(
+                "{waiting} requests, {waiting_tokens} tokens waiting"
             )));
         }
         Ok(())
@@ -244,6 +249,14 @@ impl Scheduler {
         if candidates.is_empty() {
             return Ok(Decision::Run(Vec::new()));
         }
+        if candidates
+            .iter()
+            .any(|c| c.minimum == 0 || c.minimum > c.pending || c.minimum > self.config.max_chunk)
+        {
+            return Err(invalid(
+                "candidate minimum must fit its pending tokens and the chunk limit",
+            ));
+        }
         let newest_running = candidates
             .iter()
             .filter(|c| c.running)
@@ -259,14 +272,27 @@ impl Scheduler {
             .filter(|c| !c.decoding && c.pending > 0)
             .collect();
         prefills.sort_by_key(|c| (c.arrival, c.id));
+        let aged = prefills.first().copied().filter(|oldest| {
+            now.saturating_duration_since(oldest.arrival) >= self.config.max_queue_wait
+        });
+        let younger_victim = aged.and_then(|oldest| {
+            newest_running
+                .filter(|victim| (victim.arrival, victim.id) > (oldest.arrival, oldest.id))
+        });
+        if let (Some(oldest), Some(victim)) = (aged, younger_victim)
+            && !oldest.running
+            && running >= self.config.max_running
+        {
+            return Ok(Decision::Preempt(victim.id));
+        }
 
         // Hold back the prefill minimum only for prefill that can run: a waiting request
         // with no free running slot leaves the whole pass to decodes.
-        let reserve = if prefills
+        let eligible = prefills
             .iter()
-            .any(|p| p.running || running < self.config.max_running)
-        {
-            self.config.min_prefill_tokens
+            .find(|p| p.running || running < self.config.max_running);
+        let reserve = if let Some(prefill) = eligible {
+            self.config.min_prefill_tokens.max(prefill.minimum)
         } else {
             0
         };
@@ -291,10 +317,14 @@ impl Scheduler {
             let cap = self.config.max_batch_tokens - chunks.len();
             let context = candidates
                 .iter()
-                .map(|c| c.context + c.pending.min(self.config.max_chunk))
+                .map(|c| {
+                    c.context
+                        .saturating_add(c.pending.min(self.config.max_chunk))
+                })
                 .max()
                 .unwrap_or(0);
             let mut budget = self.prefill_budget(chunks.len(), context, cap);
+            budget = budget.max(oldest.minimum.min(cap));
             if now.saturating_duration_since(oldest.arrival) >= self.config.max_queue_wait {
                 budget = budget.max(self.config.max_chunk.min(cap));
             }
@@ -312,10 +342,19 @@ impl Scheduler {
                     admit: !prefill.running,
                     ticket: 0,
                 };
+                if chunk.tokens < prefill.minimum {
+                    continue;
+                }
                 if fits(&chunk)? {
                     budget -= chunk.tokens;
                     admitted += usize::from(chunk.admit);
                     chunks.push(chunk);
+                } else if aged.is_some_and(|oldest| oldest.id == prefill.id)
+                    && let Some(victim) = younger_victim
+                {
+                    // An age guard on cost alone cannot unblock a prefill whose pages
+                    // are held by younger decodes. Discard this pass and reclaim them.
+                    return Ok(Decision::Preempt(victim.id));
                 }
             }
         }
@@ -370,6 +409,7 @@ mod tests {
         Candidate {
             id: Uuid::from_u128(index),
             pending,
+            minimum: 1,
             decoding: running && pending == 1,
             running,
             context: 10,
@@ -585,6 +625,80 @@ mod tests {
             scheduler.plan(&[], Instant::now(), |_| Ok(true))?,
             Decision::Run(vec![])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_cost_samples_are_normalized_for_ragged_token_counts() {
+        let mut costs = CostModel::default();
+        costs.record(7, 10, 0.070);
+        assert!((costs.estimate(7, 10).unwrap_or_default() - 0.070).abs() < 1e-12);
+        costs.record(5, 10, 0.050);
+        assert!((costs.estimate(6, 10).unwrap_or_default() - 0.060).abs() < 1e-12);
+        costs.record(0, 10, 1.0);
+        costs.record(6, 10, f64::NAN);
+        assert!((costs.estimate(6, 10).unwrap_or_default() - 0.060).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_aged_prefill_reclaims_younger_state_and_running_slots() -> Result<()> {
+        let start = Instant::now();
+        let mut scheduler = Scheduler::new(config())?;
+        let mut older = candidate(1, start, 16, true);
+        older.decoding = false;
+        let younger = candidate(2, start, 1, true);
+        let now = start + Duration::from_secs(2);
+        assert_eq!(
+            scheduler.plan(&[older, younger], now, |c| Ok(c.id == younger.id))?,
+            Decision::Preempt(younger.id)
+        );
+        older.running = false;
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_running: 1,
+            ..config()
+        })?;
+        assert_eq!(
+            scheduler.plan(&[older, younger], now, |_| Ok(true))?,
+            Decision::Preempt(younger.id)
+        );
+        // Younger waiting work cannot evict the older running request.
+        let mut waiting = candidate(3, start, 16, false);
+        waiting.arrival = start + Duration::from_millis(3);
+        let selected = chunks(scheduler.plan(&[younger, waiting], now, |_| Ok(true))?)?;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, younger.id);
+        Ok(())
+    }
+
+    #[test]
+    fn test_replay_chunks_remain_indivisible_under_cost_and_token_pressure() -> Result<()> {
+        let start = Instant::now();
+        let mut scheduler = Scheduler::new(config())?;
+        scheduler.record(16, 10, Duration::from_secs(1));
+        let mut replay = candidate(1, start, 16, true);
+        replay.minimum = 16;
+        replay.decoding = false;
+        let mut candidates = vec![replay];
+        candidates.extend((2..=9).map(|id| candidate(id, start, 1, true)));
+        let selected = chunks(scheduler.plan(&candidates, start, |_| Ok(true))?)?;
+        assert_eq!(selected.iter().map(|c| c.tokens).sum::<usize>(), 20);
+        assert_eq!(
+            selected.last().map(|c| (c.id, c.tokens)),
+            Some((replay.id, 16))
+        );
+        // A replay waiting for a running slot must not reserve its large chunk at
+        // the expense of decodes when only a different, ordinary prefill can run.
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_running: 20,
+            ..config()
+        })?;
+        replay.running = false;
+        let mut candidates = vec![replay];
+        candidates.extend((2..=20).map(|id| candidate(id, start, 1, true)));
+        candidates.push(candidate(21, start, 16, true));
+        let selected = chunks(scheduler.plan(&candidates, start, |_| Ok(true))?)?;
+        assert_eq!(selected.len(), 17);
+        assert_eq!(selected.last().map(|c| c.tokens), Some(4));
         Ok(())
     }
 }

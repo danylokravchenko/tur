@@ -23,7 +23,7 @@ use crate::{
     server::{
         AppState,
         types::{
-            ApiErrorResponse, AssistantFunction, AssistantToolCall, ChatChoice,
+            ApiErrorBody, ApiErrorResponse, AssistantFunction, AssistantToolCall, ChatChoice,
             ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
             ChatResponseMessage, ChunkChoice, DeltaFunction, DeltaMessage, DeltaToolCall,
             MessageContent, ResponseFunction, ResponseToolCall, Usage,
@@ -31,6 +31,52 @@ use crate::{
         worker::WorkerMsg,
     },
 };
+
+fn execution_error(error: &crate::TurError) -> (StatusCode, ApiErrorResponse) {
+    use crate::TurError;
+    let (status, error_type, code) = match error {
+        TurError::QueueFull(_) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "queue_full",
+        ),
+        TurError::DeadlineExceeded => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout_error",
+            "deadline_exceeded",
+        ),
+        TurError::MemoryAllocation(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "insufficient_memory",
+        ),
+        TurError::WorkerUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "worker_unavailable",
+        ),
+        TurError::InvalidExecution(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_request",
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "internal_error",
+        ),
+    };
+    (
+        status,
+        ApiErrorResponse {
+            error: ApiErrorBody {
+                message: error.to_string(),
+                error_type,
+                code: Some(code),
+            },
+        },
+    )
+}
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -191,6 +237,7 @@ pub async fn chat_completions(
             },
             seed: req.seed.unwrap_or(299_792_458),
             timeout: None,
+            submitted_at: None,
             render: RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.thinking,
@@ -203,11 +250,8 @@ pub async fn chat_completions(
     };
 
     if let Err(e) = worker.send(worker_msg).await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ApiErrorResponse::internal(e.to_string())),
-        )
-            .into_response();
+        let (status, body) = execution_error(&e);
+        return (status, Json(body)).into_response();
     }
 
     if req.stream {
@@ -229,11 +273,8 @@ async fn blocking_response(
     let stats = match result_rx.await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorResponse::internal(e.to_string())),
-            )
-                .into_response();
+            let (status, body) = execution_error(&e);
+            return (status, Json(body)).into_response();
         }
         Err(_) => {
             return (
@@ -361,7 +402,14 @@ fn stream_response(
 
         let stats = match result_rx.await {
             Ok(Ok(s)) => s,
-            Ok(Err(e)) => { warn!("pipeline error: {e}"); return; }
+            Ok(Err(e)) => {
+                let (_, body) = execution_error(&e);
+                if let Ok(data) = serde_json::to_string(&body) {
+                    yield Ok(Event::default().data(data));
+                }
+                yield Ok(Event::default().data("[DONE]"));
+                return;
+            }
             Err(_) => { warn!("result channel dropped"); return; }
         };
 

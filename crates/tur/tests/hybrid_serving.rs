@@ -229,3 +229,89 @@ async fn test_http_rejects_unsupported_media_and_invalid_controls() -> Result<()
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     Ok(())
 }
+
+#[tokio::test]
+async fn test_http_maps_admission_and_deadline_failures_and_streams_error_codes() -> Result<()> {
+    for (error, status, code) in [
+        (
+            TurError::QueueFull("waiting tokens".into()),
+            StatusCode::TOO_MANY_REQUESTS,
+            "queue_full",
+        ),
+        (
+            TurError::DeadlineExceeded,
+            StatusCode::GATEWAY_TIMEOUT,
+            "deadline_exceeded",
+        ),
+        (
+            TurError::MemoryAllocation("state pool".into()),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "insufficient_memory",
+        ),
+        (
+            TurError::WorkerUnavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worker_unavailable",
+        ),
+    ] {
+        let (tx, mut rx) = mpsc::channel::<WorkerMsg>(1);
+        let router = build_router(AppState {
+            workers: HashMap::from([("tiny".into(), PipelineWorker::from_sender(tx))]),
+            default_model: "tiny".into(),
+        });
+        let backend = tokio::spawn(async move {
+            if let Some(msg) = rx.recv().await {
+                drop(msg.token_tx);
+                let _ = msg.result_tx.send(Err(error));
+            }
+        });
+        let response = router
+            .oneshot(request(
+                &json!({"messages":[{"role":"user","content":"t10"}]}),
+            )?)
+            .await
+            .map_err(|error| TurError::Other(error.to_string()))?;
+        assert_eq!(response.status(), status);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|error| TurError::Other(error.to_string()))?
+            .to_bytes();
+        let body: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(body["error"]["code"], code);
+        backend
+            .await
+            .map_err(|error| TurError::Other(error.to_string()))?;
+    }
+    let (tx, mut rx) = mpsc::channel::<WorkerMsg>(1);
+    let router = build_router(AppState {
+        workers: HashMap::from([("tiny".into(), PipelineWorker::from_sender(tx))]),
+        default_model: "tiny".into(),
+    });
+    let backend = tokio::spawn(async move {
+        if let Some(msg) = rx.recv().await {
+            drop(msg.token_tx);
+            let _ = msg.result_tx.send(Err(TurError::DeadlineExceeded));
+        }
+    });
+    let response = router
+        .oneshot(request(
+            &json!({"stream":true,"messages":[{"role":"user","content":"t10"}]}),
+        )?)
+        .await
+        .map_err(|error| TurError::Other(error.to_string()))?;
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|error| TurError::Other(error.to_string()))?
+        .to_bytes();
+    let text = std::str::from_utf8(&bytes).map_err(|error| TurError::Other(error.to_string()))?;
+    assert!(text.contains("deadline_exceeded"));
+    assert!(text.contains("[DONE]"));
+    backend
+        .await
+        .map_err(|error| TurError::Other(error.to_string()))?;
+    Ok(())
+}

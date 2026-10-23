@@ -84,6 +84,7 @@ fn burst(pipeline: &mut InferencePipeline, case: &Burst) -> Result<Value> {
         ids.insert(pipeline.submit_request(&request)?, index);
     }
     let mut emitted: Vec<Vec<f64>> = vec![Vec::new(); ids.len()];
+    let mut ttft = Vec::with_capacity(ids.len());
     let (mut generated, mut prompt_tokens, mut passes) = (0, 0, 0);
     let mut pass_seconds = Vec::new();
     while pipeline.active_request_count() > 0 {
@@ -91,20 +92,25 @@ fn burst(pipeline: &mut InferencePipeline, case: &Burst) -> Result<Value> {
         let output = pipeline.step_streaming()?;
         pass_seconds.push(step.elapsed().as_secs_f64());
         passes += 1;
-        let now = start.elapsed().as_secs_f64();
-        for (id, _) in &output.new_tokens {
+        for (id, _, sampled_at) in &output.sampled_tokens {
             if let Some(&index) = ids.get(id) {
-                emitted[index].push(now);
+                emitted[index].push(sampled_at.saturating_duration_since(start).as_secs_f64());
             }
         }
         for (_, result) in output.completed {
             let stats = result?;
+            ttft.push(stats.first_token.as_secs_f64());
             generated += stats.generated_tokens;
             prompt_tokens += stats.prompt_tokens;
         }
     }
     let wall = start.elapsed().as_secs_f64();
-    let ttft: Vec<f64> = emitted.iter().filter_map(|t| t.first().copied()).collect();
+    let observed: usize = emitted.iter().map(Vec::len).sum();
+    if observed != generated {
+        return Err(invalid(
+            "sample timestamps do not cover every generated token",
+        ));
+    }
     let itl: Vec<f64> = emitted
         .iter()
         .flat_map(|t| t.windows(2).map(|w| w[1] - w[0]))
@@ -187,6 +193,8 @@ fn main() -> Result<()> {
             "benchmark": "serving", "checkpoint": dir, "weights": "q8_0",
             "kv": format!("{:?}", DEFAULT_KV_LAYOUT), "prefill_chunk": CHUNK,
             "output_tokens": output, "workload": "closed-loop bursts submitted at once; greedy sampling",
+            "latency_basis": "sampled tokens including EOS; TTFT from request submission; ITL between token publication times",
+            "recurrent_state": format!("{:?}", factory.recurrent),
             "runs": runs,
         }))?
     );

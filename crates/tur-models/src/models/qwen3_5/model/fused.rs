@@ -8,10 +8,13 @@
 //! format) and reads every key in place through one page table shared by all layers; no
 //! committed key is copied.
 
-use super::{Attention, DeltaNet, Mixer, Pass, Qwen35};
+use super::{Attention, Config, DeltaNet, Dims, LayerKind, Mixer, Pass, Qwen35};
 use crate::hybrid::PackedForward;
 use candle_core::{DType, Tensor};
-use tur_core::{Result, execution::invalid};
+use tur_core::{
+    Result,
+    execution::{checked_elements, invalid},
+};
 use tur_metal::{
     kernels::{DeltaShape, Heads, Kernels, PagedKv, RecurrentSpan, RecurrentSpans},
     scratch::ScratchPlan,
@@ -290,62 +293,117 @@ impl Qwen35 {
         n: usize,
         contexts: &[usize],
     ) -> Result<usize> {
-        let d = self.dims;
-        let f = DType::F32;
-        let hidden = self.embed.dim(1)?;
-        let pages: usize = contexts.iter().map(|c| c.div_ceil(fused.page)).sum();
-        let max_visible = contexts.iter().copied().max().unwrap_or(0);
-        let mut plan = ScratchPlan::new();
-        // Uploaded ids, positions, logit rows, page addressing and recurrent slots.
-        plan.transient(4 * n + pages + 2 * contexts.len(), DType::U32)?;
-        let x = plan.reserve(n * hidden, f)?;
-        let h = plan.reserve(n * hidden, f)?;
-        let mut kinds = (false, false);
-        for layer in &self.layers {
-            match &layer.mixer {
-                Mixer::Attention(a) if !kinds.0 => {
-                    kinds.0 = true;
-                    let q_gate = plan.reserve(n * a.q.out_features(), f)?;
-                    let kv = plan.reserve(n * a.kv.out_features(), f)?;
-                    let q = plan.reserve(n * d.heads * d.head_dim, f)?;
-                    let key = plan.reserve(n * d.kv_heads * d.head_dim, f)?;
-                    let split =
-                        fused
-                            .kernels
-                            .attention_scratch_bytes(n, d.heads, d.head_dim, max_visible);
-                    plan.transient(split, DType::U8)?;
-                    let attended = plan.reserve(n * d.heads * d.head_dim, f)?;
-                    for region in [q, key, kv, q_gate] {
-                        plan.release(region);
-                    }
-                    plan.transient(n * hidden, f)?;
-                    plan.release(attended);
-                }
-                Mixer::Delta(net) if !kinds.1 => {
-                    kinds.1 = true;
-                    let proj = plan.reserve(n * net.proj.out_features(), f)?;
-                    let mixed = plan.reserve(n * d.channels, f)?;
-                    let core = plan.reserve(n * d.value_width, f)?;
-                    let gated = plan.reserve(n * d.value_width, f)?;
-                    for region in [mixed, core, proj] {
-                        plan.release(region);
-                    }
-                    plan.transient(n * hidden, f)?;
-                    plan.release(gated);
-                }
-                _ => {}
-            }
-        }
-        // Residual sum and post-norm, then the MLP: gate|up, activation and down.
-        let sum = plan.reserve(n * hidden, f)?;
-        let normed = plan.reserve(n * hidden, f)?;
-        let gate_up = plan.reserve(n * 2 * d.intermediate, f)?;
-        let act = plan.reserve(n * d.intermediate, f)?;
-        plan.release(gate_up);
-        plan.transient(n * hidden, f)?;
-        for region in [act, normed, sum, h, x] {
-            plan.release(region);
-        }
-        Ok(plan.peak_bytes())
+        workspace(&self.config, &fused.kernels, fused.page, n, contexts)
     }
+}
+
+/// The same live-set calculation before and after weight loading.
+pub(super) fn workspace(
+    config: &Config,
+    kernels: &Kernels,
+    page: usize,
+    n: usize,
+    contexts: &[usize],
+) -> Result<usize> {
+    let d = Dims::new(config)?;
+    let f = DType::F32;
+    let hidden = config.text.hidden_size;
+    let pages = contexts.iter().try_fold(0usize, |total, context| {
+        total
+            .checked_add(context.div_ceil(page))
+            .ok_or_else(|| invalid("page table size overflow"))
+    })?;
+    let elements = |width| checked_elements(&[n, width]);
+    let q_width = checked_elements(&[d.heads, d.head_dim])?;
+    let kv_width = checked_elements(&[d.kv_heads, d.head_dim])?;
+    let projection_width = d
+        .value_heads
+        .checked_mul(2)
+        .and_then(|gates| gates.checked_add(d.value_width))
+        .and_then(|width| width.checked_add(d.channels))
+        .ok_or_else(|| invalid("recurrent projection width overflow"))?;
+    let max_visible = contexts.iter().copied().max().unwrap_or(0);
+    let mut plan = ScratchPlan::new();
+    // Addressing stays live for the whole pass. Bound each upload's allocator rounding,
+    // including recurrent span/order tables and attention query tiles.
+    let rounded = |value: usize| {
+        if value == 0 {
+            Some(0)
+        } else {
+            value.checked_next_power_of_two()
+        }
+    };
+    let addressing = rounded(n)
+        .and_then(|tokens| tokens.checked_mul(7))
+        .and_then(|tokens| tokens.checked_add(rounded(pages)?))
+        .and_then(|total| total.checked_add(rounded(contexts.len())?.checked_mul(16)?))
+        .ok_or_else(|| invalid("addressing size overflow"))?;
+    let addressing = plan.reserve(addressing, DType::U32)?;
+    let x = plan.reserve(elements(hidden)?, f)?;
+    let h = plan.reserve(elements(hidden)?, f)?;
+    let mut kinds = (false, false);
+    for layer in config.layer_kinds() {
+        match layer {
+            LayerKind::FullAttention if !kinds.0 => {
+                kinds.0 = true;
+                let q_gate = plan.reserve(
+                    elements(
+                        q_width
+                            .checked_mul(2)
+                            .ok_or_else(|| invalid("query width overflow"))?,
+                    )?,
+                    f,
+                )?;
+                let kv = plan.reserve(
+                    elements(
+                        kv_width
+                            .checked_mul(2)
+                            .ok_or_else(|| invalid("K/V width overflow"))?,
+                    )?,
+                    f,
+                )?;
+                let q = plan.reserve(elements(q_width)?, f)?;
+                let key = plan.reserve(elements(kv_width)?, f)?;
+                let split = kernels.attention_scratch_bytes(n, d.heads, d.head_dim, max_visible);
+                plan.transient(split, DType::U8)?;
+                let attended = plan.reserve(elements(q_width)?, f)?;
+                for region in [q, key, kv, q_gate] {
+                    plan.release(region);
+                }
+                plan.transient(elements(hidden)?, f)?;
+                plan.release(attended);
+            }
+            LayerKind::LinearAttention if !kinds.1 => {
+                kinds.1 = true;
+                let proj = plan.reserve(elements(projection_width)?, f)?;
+                let mixed = plan.reserve(elements(d.channels)?, f)?;
+                let core = plan.reserve(elements(d.value_width)?, f)?;
+                let gated = plan.reserve(elements(d.value_width)?, f)?;
+                for region in [mixed, core, proj] {
+                    plan.release(region);
+                }
+                plan.transient(elements(hidden)?, f)?;
+                plan.release(gated);
+            }
+            _ => {}
+        }
+    }
+    // Residual sum and post-norm, then the MLP: gate|up, activation and down.
+    let sum = plan.reserve(elements(hidden)?, f)?;
+    let normed = plan.reserve(elements(hidden)?, f)?;
+    let gate_up = plan.reserve(
+        elements(
+            d.intermediate
+                .checked_mul(2)
+                .ok_or_else(|| invalid("MLP width overflow"))?,
+        )?,
+        f,
+    )?;
+    let act = plan.reserve(elements(d.intermediate)?, f)?;
+    plan.release(gate_up);
+    plan.transient(elements(hidden)?, f)?;
+    for region in [act, normed, sum, h, x, addressing] {
+        plan.release(region);
+    }
+    Ok(plan.peak_bytes())
 }

@@ -24,4 +24,13 @@ pub enum TurError {
     InvalidExecution(String),
     #[error("Memory allocation error: {0}")]
     MemoryAllocation(String),
+    /// Admission rejected a request because a bounded queue is full.
+    #[error("Request queue is full: {0}")]
+    QueueFull(String),
+    /// A request did not finish before its submission deadline.
+    #[error("Request deadline exceeded")]
+    DeadlineExceeded,
+    /// The execution owner is no longer accepting requests.
+    #[error("Inference worker unavailable")]
+    WorkerUnavailable,
 }

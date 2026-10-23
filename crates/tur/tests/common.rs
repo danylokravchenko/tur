@@ -61,7 +61,30 @@ impl Checkpoint {
     /// misplaced state changes generated text.
     pub fn random() -> Result<Self> {
         let config = TINY.replace(r#", "image_token_id": 94"#, "");
-        Self::write(&config, |name, count, seed| {
+        Self::random_config(&config)
+    }
+
+    /// Random fixture using head sizes supported by the fused Metal kernels.
+    #[cfg(feature = "metal")]
+    pub fn fused() -> Result<Self> {
+        let mut config: serde_json::Value = serde_json::from_str(TINY)?;
+        for (name, value) in [
+            ("hidden_size", 256),
+            ("intermediate_size", 512),
+            ("head_dim", 64),
+            ("linear_key_head_dim", 64),
+            ("linear_value_head_dim", 64),
+        ] {
+            config[name] = serde_json::json!(value);
+        }
+        if let Some(object) = config.as_object_mut() {
+            object.remove("image_token_id");
+        }
+        Self::random_config(&config.to_string())
+    }
+
+    fn random_config(config: &str) -> Result<Self> {
+        Self::write(config, |name, count, seed| {
             let scale = if name.contains("norm") { 0.1 } else { 0.5 };
             values(count, seed, scale)
         })

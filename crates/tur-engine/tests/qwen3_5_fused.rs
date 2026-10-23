@@ -478,6 +478,21 @@ fn test_execution_selection_and_declared_workspace() -> Result<()> {
     let (one, many) = (workspace(1, &model)?, workspace(512, &model)?);
     assert!(one > 0 && many > 100 * one, "{one} {many}");
     assert_eq!(model.planned_workspace_bytes(512, &[512])?, many);
+    let (_, planned_weights, planned_workspace) = Qwen35::memory_requirements(
+        model.config(),
+        &LoadOptions {
+            revision: "preflight".into(),
+            format: WeightFormat::F32,
+            device: device.clone(),
+            execution: Execution::Fused,
+            kv: F32_KV,
+            recurrent: DType::F32,
+        },
+        512,
+        &[512],
+    )?;
+    assert_eq!(planned_weights, model.weight_bytes());
+    assert_eq!(planned_workspace, many);
     // The plan bounds the device memory one pass adds beyond its logits: pools are
     // allocated up front and the pass writes state into them.
     let Device::Metal(raw) = &device else {
@@ -496,6 +511,62 @@ fn test_execution_selection_and_declared_workspace() -> Result<()> {
     );
     let reference = model.with_execution(Execution::Reference)?;
     assert_eq!(workspace(512, &reference)?, 0);
+    Ok(())
+}
+
+#[test]
+fn test_preload_weight_plans_match_every_format_and_tied_embedding_layout() -> Result<()> {
+    for tied in [false, true] {
+        let config = SMALL.replace(
+            "\"tie_word_embeddings\": false",
+            &format!("\"tie_word_embeddings\": {tied}"),
+        );
+        let checkpoint = common::checkpoint(&config, 0.08, 0.1)?;
+        let parsed = tur_models::models::qwen3_5::Config::from_json(&config)?;
+        for format in [WeightFormat::F32, WeightFormat::Q8_0, WeightFormat::Q4K] {
+            let options = LoadOptions {
+                revision: "preflight".into(),
+                format,
+                device: Device::Cpu,
+                execution: Execution::Fused,
+                kv: F32_KV,
+                recurrent: DType::F16,
+            };
+            let (description, weights, scratch) =
+                Qwen35::memory_requirements(&parsed, &options, 512, &[512])?;
+            let model = Qwen35::load(&checkpoint.0, &options)?;
+            assert_eq!(description, model.description());
+            assert_eq!(weights, model.weight_bytes(), "{format:?}, tied {tied}");
+            assert_eq!(scratch, 0);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_f16_replay_with_original_boundaries_preserves_next_logits() -> Result<()> {
+    let _gpu = GPU.lock();
+    let checkpoint = small()?;
+    let device = metal()?;
+    let model = load_state(
+        &checkpoint.0,
+        WeightFormat::F32,
+        &device,
+        Execution::Fused,
+        F32_KV,
+        DType::F16,
+    )?;
+    let tokens = prompt(40, 0);
+    let storage = pool(&model)?;
+    let (_, initial) = prefill(&model, ModelState::new(&storage), &tokens[..8], 8)?;
+    let (incremental, _) = prefill(&model, initial, &tokens[8..], 1)?;
+    let (_, replayed_prompt) = prefill(&model, ModelState::new(&storage), &tokens[..8], 8)?;
+    let (replayed, _) = prefill(&model, replayed_prompt, &tokens[8..], 1)?;
+    assert_eq!(incremental, replayed);
+    // The same tokens with their rounding boundaries removed are a different numerical
+    // computation. Keep this counterexample beside the preserved-boundary regression.
+    let (merged, _) = prefill(&model, ModelState::new(&storage), &tokens, 40)?;
+    assert_ne!(incremental.last(), merged.last());
     Ok(())
 }
 

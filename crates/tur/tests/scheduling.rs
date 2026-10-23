@@ -257,8 +257,166 @@ fn test_queue_limits_and_deadlines_fail_requests_and_release_state() -> Result<(
             }
         }
     }
-    assert!(matches!(outcome, Some(Err(TurError::Other(message))) if message.contains("deadline")));
+    assert!(matches!(outcome, Some(Err(TurError::DeadlineExceeded))));
     let usage = pipeline.memory()?;
     assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn test_deadlines_include_intake_and_never_publish_a_late_completion() -> Result<()> {
+    let fixture = Checkpoint::new()?;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), PipelineConfig::new(1, 256))?;
+    let mut request = GenerationRequest::new("t10".into(), 1);
+    request.timeout = Some(Duration::from_secs(1));
+    request.submitted_at = Some(
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .ok_or_else(|| TurError::Other("fixture arrival underflow".into()))?,
+    );
+    assert!(matches!(
+        pipeline.submit_request(&request),
+        Err(TurError::DeadlineExceeded)
+    ));
+    assert_eq!(pipeline.active_request_count(), 0);
+
+    request = GenerationRequest::new(vec!["t10"; 256].join(" "), 1);
+    let timeout = Duration::from_millis(1);
+    request.timeout = Some(timeout);
+    let mut streamed = String::new();
+    match pipeline.run(&request, |text| streamed.push_str(text)) {
+        Ok(stats) => assert!(
+            stats.elapsed < timeout,
+            "late completion: {:?}",
+            stats.elapsed
+        ),
+        Err(TurError::DeadlineExceeded) => assert_eq!(streamed, ""),
+        Err(error) => return Err(error),
+    }
+    let usage = pipeline.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn test_sample_timestamps_include_tokens_that_text_decoding_buffers() -> Result<()> {
+    let fixture = Checkpoint::new()?;
+    // A punctuation token is buffered until completion by TokenOutputStream.
+    let path = fixture.0.join("tokenizer.json");
+    let mut tokenizer: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let vocab = tokenizer["model"]["vocab"]
+        .as_object_mut()
+        .ok_or_else(|| TurError::Other("missing fixture vocabulary".into()))?;
+    vocab.remove("t5");
+    vocab.insert("!".into(), serde_json::json!(5));
+    std::fs::write(path, tokenizer.to_string())?;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), PipelineConfig::new(1, 16))?;
+    pipeline.submit_request(&GenerationRequest::new("t10".into(), 4))?;
+    let (mut sampled, mut fragments) = (Vec::new(), 0);
+    while pipeline.active_request_count() > 0 {
+        let output = pipeline.step_streaming()?;
+        fragments += output.new_tokens.len();
+        sampled.extend(output.sampled_tokens);
+        for (_, result) in output.completed {
+            assert_eq!(result?.generated_tokens, 4);
+        }
+    }
+    assert_eq!(sampled.len(), 4);
+    assert_eq!(fragments, 1);
+    assert!(sampled.iter().all(|(_, token, _)| *token == 5));
+    assert!(sampled.windows(2).all(|pair| pair[0].2 <= pair[1].2));
+    Ok(())
+}
+
+#[test]
+fn test_loaded_models_share_a_budget_and_failed_loads_return_reservations() -> Result<()> {
+    use tur::backend::memory::DeviceBudget;
+    let fixture = Checkpoint::new()?;
+    let mut config = PipelineConfig::new(1, 16);
+    let probe = InferencePipeline::new(&fixture.factory(), config)?;
+    config.state_bytes = Some(probe.memory_plan().state_pool);
+    let budget = DeviceBudget::new(Some(probe.memory_plan().resident() * 3));
+    drop(probe);
+    let first = InferencePipeline::with_budget(&fixture.factory(), config, &budget)?;
+    let second = InferencePipeline::with_budget(&fixture.factory(), config, &budget)?;
+    assert_eq!(
+        budget.leased(),
+        first.memory_plan().resident() + second.memory_plan().resident()
+    );
+    assert!(matches!(
+        InferencePipeline::with_budget(&fixture.factory(), config, &budget),
+        Err(TurError::MemoryAllocation(_))
+    ));
+    drop(first);
+    drop(second);
+    assert_eq!(budget.leased(), 0);
+    // A failed weight load releases the reservation made before touching its payload.
+    std::fs::write(fixture.0.join("model.safetensors"), [])?;
+    assert!(InferencePipeline::with_budget(&fixture.factory(), config, &budget).is_err());
+    assert_eq!(budget.leased(), 0);
+    // With no budget, memory admission must win even over the corrupt weight file.
+    let empty = DeviceBudget::new(Some(0));
+    assert!(matches!(
+        InferencePipeline::with_budget(&fixture.factory(), config, &empty),
+        Err(TurError::MemoryAllocation(_))
+    ));
+    assert_eq!(empty.leased(), 0);
+    Ok(())
+}
+
+#[test]
+fn test_f16_recompute_under_pressure_preserves_sampled_continuations() -> Result<()> {
+    let fixture = Checkpoint::random()?;
+    let mut factory = fixture.factory();
+    factory.recurrent = candle_core::DType::F16;
+    // Each prompt alone needs three pages. Two prompts fill the four-page pool
+    // before either can finish prefill, forcing preemption independently of EOS.
+    let requests: Vec<_> = (0..3)
+        .map(|i| {
+            let prompt = (0..33 + i)
+                .map(|t| format!("t{}", 2 + (t * 7 + i) % 80))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut request = GenerationRequest::new(prompt, 8);
+            request.seed = i as u64;
+            if i % 2 == 1 {
+                request.sampling.temperature = Some(0.9);
+            }
+            request
+        })
+        .collect();
+    let expected = {
+        let mut solo = InferencePipeline::new(&factory, tight())?;
+        requests
+            .iter()
+            .map(|request| Ok(solo.run(request, |_| {})?.generated_text))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let config = tight();
+    let usage = InferencePipeline::new(&factory, config)?.memory()?;
+    let bytes = (2 * config.scheduler.max_running + 1) * usage.slot_bytes + 4 * usage.page_bytes;
+    let mut pipeline = InferencePipeline::new(
+        &factory,
+        PipelineConfig {
+            state_bytes: Some(bytes),
+            ..config
+        },
+    )?;
+    let mut run = drive(
+        &mut pipeline,
+        &requests,
+        &vec![0; requests.len()],
+        &HashMap::new(),
+    )?;
+    let mut preemptions = 0;
+    for (index, expected) in expected.iter().enumerate() {
+        let stats = run
+            .outcomes
+            .remove(&index)
+            .ok_or_else(|| TurError::Other("missing completion".into()))??;
+        assert_eq!(&stats.generated_text, expected, "request {index}");
+        preemptions += stats.preemptions;
+    }
+    assert!(preemptions > 0);
     Ok(())
 }
