@@ -26,7 +26,8 @@ pub enum Modality {
 }
 
 /// State required by one model layer. Attention storage follows the model's [`KvLayout`];
-/// recurrent state declares its own dtype.
+/// recurrent layers declare the storage dtype of their matrix state, while the short
+/// convolution history is always F32.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayerStateKind {
     Attention {
@@ -39,6 +40,9 @@ pub enum LayerStateKind {
         heads: usize,
         key_dim: usize,
         value_dim: usize,
+        /// Storage of the `[heads, key_dim, value_dim]` matrix state: F32, F16 or BF16.
+        /// Updates always accumulate in F32; a narrower dtype rounds the state each time
+        /// it is stored.
         dtype: DType,
     },
 }
@@ -215,7 +219,7 @@ impl LayerStateKind {
                 dtype,
             } => {
                 let bytes = state_dtype_bytes(dtype)?;
-                checked_elements(&[conv_channels, conv_width, bytes])?
+                checked_elements(&[conv_channels, conv_width, DType::F32.size_in_bytes()])?
                     .checked_add(checked_elements(&[heads, key_dim, value_dim, bytes])?)
                     .ok_or_else(|| invalid("recurrent payload overflow"))
             }
@@ -630,6 +634,29 @@ mod tests {
         assert_eq!(model.page_bytes()?, 2 * 6 * 2 * 544);
         assert_eq!(model.recurrent_slot_bytes()?, 18 * 12);
         assert_eq!(model.pages_for(5), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_recurrent_dtype_sizes_the_matrix_and_keeps_the_history_f32() -> Result<()> {
+        let layer = |dtype| LayerStateKind::Recurrent {
+            conv_channels: 6,
+            conv_width: 3,
+            heads: 2,
+            key_dim: 4,
+            value_dim: 8,
+            dtype,
+        };
+        // History: 3 × 6 F32 values; matrix: 2 × 4 × 8 values of the declared dtype.
+        assert_eq!(layer(DType::F32).recurrent_boundary_bytes()?, 72 + 256);
+        for dtype in [DType::F16, DType::BF16] {
+            assert_eq!(layer(dtype).recurrent_boundary_bytes()?, 72 + 128);
+            assert!(
+                description(vec![layer(dtype)], KvFormat::F32)
+                    .validate()
+                    .is_ok()
+            );
+        }
         Ok(())
     }
 

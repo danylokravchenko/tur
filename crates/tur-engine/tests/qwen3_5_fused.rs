@@ -17,7 +17,7 @@
 
 mod common;
 
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use common::{Checkpoint, forward, max_relative, prefill, rows};
 use std::{path::Path, sync::Arc};
 use tur_core::{
@@ -71,6 +71,17 @@ fn load_kv(
     execution: Execution,
     kv: KvLayout,
 ) -> Result<Qwen35> {
+    load_state(dir, format, device, execution, kv, DType::F32)
+}
+
+fn load_state(
+    dir: &Path,
+    format: WeightFormat,
+    device: &Device,
+    execution: Execution,
+    kv: KvLayout,
+    recurrent: DType,
+) -> Result<Qwen35> {
     Qwen35::load(
         dir,
         &LoadOptions {
@@ -79,6 +90,7 @@ fn load_kv(
             device: device.clone(),
             execution,
             kv,
+            recurrent,
         },
     )
 }
@@ -488,6 +500,41 @@ fn test_execution_selection_and_declared_workspace() -> Result<()> {
 }
 
 #[test]
+fn test_f16_recurrent_state_halves_slot_memory_and_tracks_f32_state() -> Result<()> {
+    let _gpu = GPU.lock();
+    let checkpoint = small()?;
+    let device = metal()?;
+    let exact = load(&checkpoint.0, WeightFormat::F32, &device, Execution::Fused)?;
+    let narrow = load_state(
+        &checkpoint.0,
+        WeightFormat::F32,
+        &device,
+        Execution::Fused,
+        F32_KV,
+        DType::F16,
+    )?;
+    let (f32_slot, f16_slot) = (
+        exact.description().recurrent_slot_bytes()?,
+        narrow.description().recurrent_slot_bytes()?,
+    );
+    assert!(
+        f16_slot * 2 > f32_slot && f16_slot * 3 < f32_slot * 2,
+        "{f16_slot} vs {f32_slot}"
+    );
+    // A chunked prefill, then token-by-token decode: every decode step stores the state.
+    let tokens = prompt(120, 21);
+    let mut logits = Vec::new();
+    for model in [&exact, &narrow] {
+        let pool = pool(model)?;
+        let (_, state) = prefill(model, ModelState::new(&pool), &tokens[..80], 40)?;
+        logits.push(prefill(model, state, &tokens[80..], 1)?.0);
+    }
+    let error = max_relative(&logits[1], &logits[0]);
+    assert!(error > 0.0 && error < 1e-2, "F16 state decode {error}");
+    Ok(())
+}
+
+#[test]
 fn test_fused_decode_reaches_a_stable_allocation_bound() -> Result<()> {
     let _gpu = GPU.lock();
     let checkpoint = small()?;
@@ -741,6 +788,7 @@ fn real(format: WeightFormat, execution: Execution, kv: KvLayout) -> Result<Qwen
             device: metal()?,
             execution,
             kv,
+            recurrent: DType::F32,
         },
     )
 }

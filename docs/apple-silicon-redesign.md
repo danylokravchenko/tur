@@ -353,6 +353,12 @@ The batch-8 model pass falls from 43.4 to 28.6 ms, and greedy serving output at 
 concurrent requests rises 1.72× and 1.66×. F32 recurrent-state bandwidth is now the
 main per-sequence cost.
 
+Recurrent state can also be stored as F16, with stochastic rounding (opt-in,
+`--recurrent-state f16`): 6–7% faster batched decode and half the recurrent memory.
+Decode KL from F32 state is 5.2e-5 nats on average but grows with context, so F32
+remains the default. Projections at 9–16 rows are bound by F32 matrix-unit throughput,
+and no precision-preserving variant beat the current kernel.
+
 Refactor the existing scheduler and batch manager around validated execution plans. Combine projections across variable-length requests, track actual token boundaries, gather only required logits and eliminate padding from the main path. Separate decode and prefill kernels may share one scheduling iteration; a single monolithic kernel is not required.
 
 Start with decode-priority scheduling plus bounded prefill progress. Estimate chunk cost from measured shape/context buckets; bound adaptive changes so noisy timing cannot starve requests. Charge recurrent snapshots and speculative branches to admission. Add maximum queue length, request/token limits, deadlines, cancellation and explicit preemption/recompute policy.

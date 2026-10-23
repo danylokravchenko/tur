@@ -20,7 +20,9 @@ use tur_engine::backend::{
     factory::{ModelFactory, ModelSource},
     pipeline::{GenerationRequest, InferencePipeline, PipelineConfig},
 };
-use tur_models::models::qwen3_5::{DEFAULT_KV_LAYOUT, WeightFormat};
+use tur_models::models::qwen3_5::{
+    DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, WeightFormat, parse_recurrent_state,
+};
 
 const CHUNK: usize = 256;
 
@@ -134,6 +136,9 @@ fn main() -> Result<()> {
         format: WeightFormat::Q8_0,
         device: candle_core::Device::new_metal(0)?,
         kv: DEFAULT_KV_LAYOUT,
+        recurrent: std::env::var("TUR_BENCH_STATE")
+            .map_or(Ok(DEFAULT_RECURRENT_STATE), |s| parse_recurrent_state(&s))
+            .map_err(TurError::Other)?,
     };
     let max = concurrency.iter().copied().max().unwrap_or(1);
     let mut pipeline = InferencePipeline::new(&factory, PipelineConfig::new(max, CHUNK))?;

@@ -79,6 +79,21 @@ pub const DEFAULT_KV_LAYOUT: KvLayout = KvLayout {
     version: tur_core::execution::KV_LAYOUT_VERSION,
 };
 
+/// Recurrent matrix storage. F32 until a quality evaluation justifies a narrower format.
+pub const DEFAULT_RECURRENT_STATE: DType = DType::F32;
+
+/// Parse a recurrent state storage name: `f32`, `f16` or `bf16`.
+pub fn parse_recurrent_state(name: &str) -> std::result::Result<DType, String> {
+    match name {
+        "f32" => Ok(DType::F32),
+        "f16" => Ok(DType::F16),
+        "bf16" => Ok(DType::BF16),
+        _ => Err(format!(
+            "recurrent state must be f32, f16 or bf16, not '{name}'"
+        )),
+    }
+}
+
 /// How to place a checkpoint.
 #[derive(Clone, Debug)]
 pub struct LoadOptions {
@@ -89,6 +104,8 @@ pub struct LoadOptions {
     pub execution: Execution,
     /// Paged K/V page size and storage format; part of the state identity.
     pub kv: KvLayout,
+    /// Storage of recurrent matrix state (F32, F16 or BF16); part of the state identity.
+    pub recurrent: DType,
 }
 
 struct Attention {
@@ -312,7 +329,7 @@ impl Qwen35 {
         let norm = centred(&tensors.take(&format!("{prefix}.norm.weight"))?, device)?;
         let revision = format!("{}#{}", options.revision, format.tag());
         Self {
-            description: config.description(revision, options.kv)?,
+            description: config.description(revision, options.kv, options.recurrent)?,
             config,
             device: device.clone(),
             dims,

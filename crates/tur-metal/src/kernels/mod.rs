@@ -266,6 +266,9 @@ fn query_tiles(first_block: &[u32], visible: &[u32]) -> Option<Vec<u32>> {
 #[derive(Clone, Copy, Debug)]
 pub struct RecurrentSpan<'a> {
     pub tokens: usize,
+    /// Committed tokens before this pass. Seeds the stochastic rounding of 16-bit state,
+    /// so stored values depend only on the request, not on batch composition or slots.
+    pub position: usize,
     pub read: u32,
     pub writes: &'a [u32],
 }
@@ -274,7 +277,8 @@ pub struct RecurrentSpan<'a> {
 /// packed row. Uploaded once per pass and shared by every recurrent layer, whose pools
 /// have equal slot counts, so each layer's convolution and scan is one dispatch.
 pub struct RecurrentSpans {
-    /// `[row, tokens, read, first write, every]` per sequence (`RecurrentSpan` in the MSL).
+    /// `[row, tokens, read, first write, every, position]` per sequence (`RecurrentSpan`
+    /// in the MSL).
     spans: Tensor,
     /// Sequence of each packed row.
     rows: Tensor,
@@ -639,7 +643,7 @@ impl Kernels {
         if spans.is_empty() {
             return Err(invalid("a pass has at least one recurrent sequence"));
         }
-        let mut table = Vec::with_capacity(spans.len() * 5);
+        let mut table = Vec::with_capacity(spans.len() * 6);
         let mut rows = Vec::new();
         let mut slots = Vec::new();
         for (index, span) in spans.iter().enumerate() {
@@ -654,6 +658,7 @@ impl Kernels {
                 span.read,
                 to_u32(slots.len(), "slot offset")?,
                 u32::from(span.writes.len() > 1),
+                to_u32(span.position, "position")?,
             ]);
             rows.resize(rows.len() + span.tokens, to_u32(index, "sequence")?);
             slots.extend_from_slice(span.writes);
@@ -761,8 +766,9 @@ impl Kernels {
 
     /// Gated delta rule over every sequence of a packed pass: `mixed` holds the convolved
     /// `q | k | v` rows, `proj` the same rows' `b`/`a` gates. Each sequence starts from
-    /// its committed slot of `pool` (`[slots, heads, key_dim, value_dim]`) and writes its
-    /// state after the last token, or after every token, into its written slots. Returns
+    /// its committed slot of `pool` (`[slots, heads, key_dim, value_dim]`, F32, F16 or
+    /// BF16; updates accumulate in F32) and writes its state after the last token, or
+    /// after every token, into its written slots, rounded to the pool's dtype. Returns
     /// `[rows * heads, value_dim]`. Single-token sequences take one coalesced step dispatch
     /// (unless tuning disables it) and the rest one scan dispatch.
     #[allow(clippy::too_many_arguments)]
@@ -780,18 +786,28 @@ impl Kernels {
         let pv = self.view(proj)?;
         let bv = self.view(dt_bias)?;
         let av = self.view(neg_a)?;
-        let sv = self.view(pool)?;
+        let storage = match pool.dtype() {
+            DType::F32 => "f32",
+            DType::F16 => "f16",
+            DType::BF16 => "bf16",
+            other => return Err(invalid(format!("no delta kernels for {other:?} state"))),
+        };
+        let sv = self.runtime.view(pool, pool.dtype())?;
         let heads = shape.value_heads;
         let (dk, dv) = (shape.key_dim, shape.value_dim);
         if shape.key_heads == 0 || !heads.is_multiple_of(shape.key_heads) {
             return Err(invalid("value heads must be a multiple of key heads"));
         }
         let (name, step) = match dk {
-            64 => ("delta_scan_r2_f32", "delta_step_d64_f32"),
-            128 => ("delta_scan_r4_f32", "delta_step_d128_f32"),
-            256 => ("delta_scan_r8_f32", "delta_step_d256_f32"),
+            64 => ("r2", "d64"),
+            128 => ("r4", "d128"),
+            256 => ("r8", "d256"),
             _ => return Err(invalid(format!("no delta scan kernel for key dim {dk}"))),
         };
+        let (name, step) = (
+            format!("delta_scan_{name}_{storage}"),
+            format!("delta_step_{step}_{storage}"),
+        );
         bv.expect(1, heads, "dt bias")?;
         av.expect(1, heads, "decay rate")?;
         if pool.dims().get(1..) != Some(&[heads, dk, dv][..]) {
@@ -847,7 +863,7 @@ impl Kernels {
             Ok(())
         };
         if stepped_count > 0 {
-            let pipeline = self.pipeline(step)?;
+            let pipeline = self.pipeline(&step)?;
             if !dv.is_multiple_of(2) {
                 return Err(invalid("the delta step kernel needs an even value dim"));
             }
@@ -865,7 +881,7 @@ impl Kernels {
                 })?;
         }
         if scanned.1 > 0 {
-            let pipeline = self.pipeline(name)?;
+            let pipeline = self.pipeline(&name)?;
             // Halve the threadgroup until its padded state tile fits threadgroup memory.
             let tile_bytes =
                 |simdgroups: usize| (dk * (simdgroups * SCAN_COLUMNS + 1) * 4).next_multiple_of(16);

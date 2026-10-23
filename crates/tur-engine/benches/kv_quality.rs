@@ -4,14 +4,18 @@
     reason = "benchmarks emit JSON artifacts and timing summaries"
 )]
 #![forbid(unsafe_code)]
-//! K/V storage quality on a real checkpoint: teacher-forced next-token prediction over a
-//! long held-out text, every K/V format against F32 K/V on identical weights. Reports,
-//! by position bucket, the KL divergence from the F32-K/V distribution, top-1 agreement
-//! and the mean negative log-likelihood. Prints one JSON document.
+//! State storage quality on a real checkpoint: teacher-forced next-token prediction over a
+//! long held-out text, each K/V format and recurrent state dtype against F32 K/V and F32
+//! state on identical weights. Reports, by position bucket, the KL divergence from the
+//! reference distribution, top-1 agreement and the mean negative log-likelihood. Prints
+//! one JSON document.
 //!
 //! `TUR_QWEN35_0_8B=<snapshot> TUR_EVAL_TEXT=<file> cargo bench --offline -p tur-engine
-//! --bench kv_quality > out.json`; `TUR_EVAL_TOKENS` (default 8192) bounds the context and
-//! `TUR_EVAL_KV` (default `f16,q8,q8_64,q8_256`) selects formats.
+//! --bench kv_quality > out.json`; `TUR_EVAL_TOKENS` (default 8192) bounds the context,
+//! `TUR_EVAL_KV` (default `f16,q8,q8_64,q8_256`, F32 state) and `TUR_EVAL_STATE` (default
+//! none, F32 K/V; e.g. `f16,bf16`) select variants, and `TUR_EVAL_CHUNK` (default 256)
+//! sets tokens per pass. A chunk of 1 stores recurrent state after every token, as decode
+//! does; longer chunks keep it in F32 registers within a chunk.
 
 use candle_core::{D, DType, Device, Tensor};
 use serde_json::{Value, json};
@@ -26,9 +30,10 @@ use tur_core::{
 use tur_engine::hybrid::{
     Boundaries, HybridModel, ModelState, PackedForward, PoolConfig, SequenceForward, StatePool,
 };
-use tur_models::models::qwen3_5::{Execution, LoadOptions, Qwen35, WeightFormat};
+use tur_models::models::qwen3_5::{
+    Execution, LoadOptions, Qwen35, WeightFormat, parse_recurrent_state,
+};
 
-const CHUNK: usize = 256;
 const BUCKETS: [usize; 5] = [0, 1024, 2048, 4096, 8192];
 
 fn env_path(name: &str) -> Result<PathBuf> {
@@ -51,7 +56,11 @@ struct Runner {
 }
 
 impl Runner {
-    fn new(dir: &Path, device: &Device, format: KvFormat, tokens: usize) -> Result<Self> {
+    fn new(dir: &Path, device: &Device, variant: Variant, tokens: usize) -> Result<Self> {
+        let Variant {
+            kv: format,
+            state: recurrent,
+        } = variant;
         let model = Qwen35::load(
             dir,
             &LoadOptions {
@@ -60,6 +69,7 @@ impl Runner {
                 device: device.clone(),
                 execution: Execution::Fused,
                 kv: KvLayout::new(16, format),
+                recurrent,
             },
         )?;
         let pool = StatePool::new(
@@ -105,6 +115,22 @@ impl Runner {
     }
 }
 
+/// K/V format and recurrent state dtype of one evaluated model.
+#[derive(Clone, Copy, Debug)]
+struct Variant {
+    kv: KvFormat,
+    state: DType,
+}
+
+fn env_list(name: &str, default: &str) -> Vec<String> {
+    std::env::var(name)
+        .unwrap_or_else(|_| default.into())
+        .split(',')
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 #[derive(Default, Clone)]
 struct Bucket {
     positions: usize,
@@ -135,11 +161,28 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| "8192".into())
         .parse()
         .map_err(|_| invalid("TUR_EVAL_TOKENS"))?;
-    let formats = std::env::var("TUR_EVAL_KV")
-        .unwrap_or_else(|_| "f16,q8,q8_64,q8_256".into())
-        .split(',')
-        .map(|f| f.parse::<KvFormat>().map_err(TurError::Other))
+    let chunk_tokens: usize = std::env::var("TUR_EVAL_CHUNK")
+        .unwrap_or_else(|_| "256".into())
+        .parse()
+        .ok()
+        .filter(|&c| c > 0)
+        .ok_or_else(|| invalid("TUR_EVAL_CHUNK"))?;
+    let mut variants = env_list("TUR_EVAL_KV", "f16,q8,q8_64,q8_256")
+        .iter()
+        .map(|f| {
+            Ok(Variant {
+                kv: f.parse::<KvFormat>().map_err(TurError::Other)?,
+                state: DType::F32,
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
+    for state in env_list("TUR_EVAL_STATE", "") {
+        variants.push(Variant {
+            kv: KvFormat::F32,
+            state: parse_recurrent_state(&state).map_err(TurError::Other)?,
+        });
+    }
+    let formats = variants;
     let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
         .map_err(|e| TurError::Tokenizer(e.to_string()))?;
     let mut tokens = tokenizer
@@ -150,15 +193,19 @@ fn main() -> Result<()> {
     tokens.truncate(limit + 1);
     let evaluated = tokens.len() - 1;
     let device = Device::new_metal(0)?;
-    let mut reference = Runner::new(&dir, &device, KvFormat::F32, evaluated)?;
+    let exact = Variant {
+        kv: KvFormat::F32,
+        state: DType::F32,
+    };
+    let mut reference = Runner::new(&dir, &device, exact, evaluated)?;
     let mut runners = formats
         .iter()
         .map(|&format| Runner::new(&dir, &device, format, evaluated))
         .collect::<Result<Vec<_>>>()?;
     let mut buckets = vec![vec![Bucket::default(); BUCKETS.len() - 1]; formats.len()];
     let inputs = &tokens[..evaluated];
-    for (index, chunk) in inputs.chunks(CHUNK).enumerate() {
-        let first = index * CHUNK;
+    for (index, chunk) in inputs.chunks(chunk_tokens).enumerate() {
+        let first = index * chunk_tokens;
         let targets =
             Tensor::new(&tokens[first + 1..first + 1 + chunk.len()], &device)?.unsqueeze(1)?;
         let exact = reference.advance(chunk)?;
@@ -198,7 +245,9 @@ fn main() -> Result<()> {
                 bucket.reference_nll += f64::from(exact_nll[i]);
             }
         }
-        eprintln!("evaluated {} of {evaluated} positions", first + chunk.len());
+        if (first + chunk.len()).is_multiple_of(512) || first + chunk.len() == evaluated {
+            eprintln!("evaluated {} of {evaluated} positions", first + chunk.len());
+        }
     }
     let results: Vec<Value> = formats
         .iter()
@@ -213,7 +262,8 @@ fn main() -> Result<()> {
                 reference_nll: a.reference_nll + b.reference_nll,
             });
             json!({
-                "kv_format": format.to_string(),
+                "kv_format": format.kv.to_string(),
+                "recurrent_state": format!("{:?}", format.state).to_lowercase(),
                 "all": total.json(0, evaluated),
                 "buckets": buckets
                     .iter()
@@ -227,10 +277,10 @@ fn main() -> Result<()> {
     let document = json!({
         "schema_version": 1,
         "checkpoint": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
-        "weights": "q8_0", "reference_kv": "f32", "page_tokens": 16,
+        "weights": "q8_0", "reference_kv": "f32", "reference_state": "f32", "page_tokens": 16,
         "text": text_path.file_name().map(|n| n.to_string_lossy().into_owned()),
-        "text_bytes": text.len(), "evaluated_positions": evaluated, "chunk": CHUNK,
-        "metric": "teacher-forced next-token distributions; KL(F32-K/V || format) in nats",
+        "text_bytes": text.len(), "evaluated_positions": evaluated, "chunk": chunk_tokens,
+        "metric": "teacher-forced next-token distributions; KL(F32 reference || variant) in nats",
         "results": results,
     });
     let output = serde_json::to_string_pretty(&document)?;

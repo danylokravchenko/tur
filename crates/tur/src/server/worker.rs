@@ -180,7 +180,7 @@ mod tests {
     use super::*;
     use crate::{
         ModelSource,
-        models::qwen3_5::{DEFAULT_KV_LAYOUT, WeightFormat},
+        models::qwen3_5::{DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, WeightFormat},
     };
     use candle_core::Device;
 
@@ -193,6 +193,7 @@ mod tests {
                 format: WeightFormat::F32,
                 device: Device::Cpu,
                 kv: DEFAULT_KV_LAYOUT,
+                recurrent: DEFAULT_RECURRENT_STATE,
             },
             pipeline: PipelineConfig::new(1, 64),
             budget: DeviceBudget::new(None),

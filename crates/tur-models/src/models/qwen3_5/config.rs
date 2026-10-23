@@ -250,7 +250,11 @@ impl Config {
             eos,
         };
         config
-            .description("validation".into(), KvLayout::new(1, KvFormat::F32))?
+            .description(
+                "validation".into(),
+                KvLayout::new(1, KvFormat::F32),
+                DType::F32,
+            )?
             .validate()?;
         // Validate every weight product before any file payload is read.
         config.weight_shapes()?;
@@ -382,7 +386,13 @@ impl Config {
 
     /// State layout with K/V stored as `kv`. F32 recurrent state matches the reference's
     /// `mamba_ssm_dtype` and FP32 accumulation.
-    pub(super) fn description(&self, revision: String, kv: KvLayout) -> Result<ModelDescription> {
+    /// State layout with K/V stored per `kv` and recurrent matrices stored as `recurrent`.
+    pub(super) fn description(
+        &self,
+        revision: String,
+        kv: KvLayout,
+        recurrent: DType,
+    ) -> Result<ModelDescription> {
         let t = &self.text;
         let layers = t
             .layer_types
@@ -399,7 +409,7 @@ impl Config {
                         heads: t.linear_num_value_heads,
                         key_dim: t.linear_key_head_dim,
                         value_dim: t.linear_value_head_dim,
-                        dtype: DType::F32,
+                        dtype: recurrent,
                     },
                 })
             })
@@ -551,8 +561,11 @@ mod tests {
     fn test_pinned_configs_parse_with_hybrid_layout() -> Result<()> {
         for (json, layers, attention) in [(SMALL, 24, 6), (FLAGSHIP, 64, 16)] {
             let config = Config::from_json(json)?;
-            let description =
-                config.description("fixture".into(), KvLayout::new(16, KvFormat::Q8))?;
+            let description = config.description(
+                "fixture".into(),
+                KvLayout::new(16, KvFormat::Q8),
+                DType::F32,
+            )?;
             description.validate()?;
             assert_eq!(description.layers.len(), layers);
             let full = description

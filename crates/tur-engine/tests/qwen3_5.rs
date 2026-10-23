@@ -64,6 +64,7 @@ fn load(dir: &Path, format: WeightFormat, device: Device) -> Result<Arc<Qwen35>>
             device,
             execution: Execution::Fused,
             kv: EXACT_KV,
+            recurrent: candle_core::DType::F32,
         },
     )?))
 }
@@ -382,6 +383,7 @@ fn real(format: WeightFormat) -> Result<Real> {
             device: device()?,
             execution: Execution::Fused,
             kv: EXACT_KV,
+            recurrent: candle_core::DType::F32,
         },
     )?);
     let generation = std::fs::read_to_string(dir.join("generation_config.json")).ok();

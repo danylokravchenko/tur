@@ -479,6 +479,7 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
             let state = random(device, &[2, value_heads, 128, 128], 13, 0.1)?;
             let writes = kernels.recurrent_spans(&[RecurrentSpan {
                 tokens,
+                position: 0,
                 read: 0,
                 writes: &[1],
             }])?;
@@ -537,6 +538,7 @@ fn delta_decode_cases(
             .enumerate()
             .map(|(i, w)| RecurrentSpan {
                 tokens: 1,
+                position: 100,
                 read: i as u32,
                 writes: w,
             })

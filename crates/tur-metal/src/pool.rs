@@ -399,7 +399,7 @@ impl StatePool {
                 } => LayerPool::Recurrent(RecurrentPool {
                     convolution: Tensor::zeros(
                         (recurrent_slots, conv_width, conv_channels),
-                        dtype,
+                        DType::F32,
                         device,
                     )?,
                     state: Tensor::zeros(
@@ -677,22 +677,24 @@ impl AttentionPool {
 }
 
 impl RecurrentPool {
-    /// Zero-copy `[conv_width, conv_channels]` and `[heads, key_dim, value_dim]` views of
-    /// `slot`. Callers must not write through them.
+    /// F32 `[conv_width, conv_channels]` and `[heads, key_dim, value_dim]` state of `slot`:
+    /// zero-copy views when stored as F32, widened copies otherwise. Callers must not write
+    /// through them.
     pub fn read(&self, slot: u32) -> Result<(Tensor, Tensor)> {
         Ok((
             self.convolution.get(slot as usize)?,
-            self.state.get(slot as usize)?,
+            self.state.get(slot as usize)?.to_dtype(DType::F32)?,
         ))
     }
 
-    /// Reference write of boundary `b` of `[boundaries, ...]` outputs into `slot`.
+    /// Reference write of boundary `b` of `[boundaries, ...]` F32 outputs into `slot`,
+    /// rounding the matrix state to its storage dtype.
     pub fn write(&self, slot: u32, convolution: &Tensor, state: &Tensor, b: usize) -> Result<()> {
         let slot = slot as usize;
         self.convolution
             .slice_set(&convolution.narrow(0, b, 1)?.contiguous()?, 0, slot)?;
-        self.state
-            .slice_set(&state.narrow(0, b, 1)?.contiguous()?, 0, slot)?;
+        let state = state.narrow(0, b, 1)?.to_dtype(self.state.dtype())?;
+        self.state.slice_set(&state.contiguous()?, 0, slot)?;
         Ok(())
     }
 }

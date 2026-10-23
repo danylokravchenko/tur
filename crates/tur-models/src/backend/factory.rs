@@ -30,6 +30,8 @@ pub struct ModelFactory {
     pub device: Device,
     /// Paged K/V page size and storage format.
     pub kv: KvLayout,
+    /// Recurrent matrix storage: F32, F16 or BF16.
+    pub recurrent: candle_core::DType,
 }
 
 fn hub_error(error: impl std::fmt::Display) -> TurError {
@@ -155,6 +157,7 @@ impl ModelFactory {
                 device: self.device.clone(),
                 execution: Execution::Fused,
                 kv: self.kv,
+                recurrent: self.recurrent,
             },
         )?;
         Ok((model, tokenizer, template, defaults))
@@ -186,6 +189,7 @@ mod tests {
             format: WeightFormat::F32,
             device: Device::Cpu,
             kv: crate::models::qwen3_5::DEFAULT_KV_LAYOUT,
+            recurrent: crate::models::qwen3_5::DEFAULT_RECURRENT_STATE,
         };
         assert!(factory.resolve().is_err());
     }

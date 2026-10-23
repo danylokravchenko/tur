@@ -255,6 +255,7 @@ fn spans(ragged: &Ragged) -> Vec<RecurrentSpan<'_>> {
         .iter()
         .map(|(tokens, read, writes)| RecurrentSpan {
             tokens: *tokens,
+            position: 7,
             read: *read,
             writes,
         })
@@ -417,10 +418,18 @@ fn scan_reference(
 fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<()> {
     let (device, kernels, _gpu) = setup()?;
     // Single-token sequences take the step kernel, or the scan when tuning disables it.
-    for (dk, delta_step) in [64usize, 128, 256]
-        .into_iter()
-        .flat_map(|dk| [(dk, true), (dk, false)])
-    {
+    // Narrow storage rounds each stored state once; a pass accumulates in F32, so outputs
+    // match a reference started from the rounded committed state.
+    for (dk, delta_step, dtype) in [64usize, 128, 256].into_iter().flat_map(|dk| {
+        [DType::F32, DType::F16, DType::BF16]
+            .into_iter()
+            .flat_map(move |dtype| [(dk, true, dtype), (dk, false, dtype)])
+    }) {
+        let stored = match dtype {
+            DType::F32 => 1e-5,
+            DType::F16 => 1e-3,
+            _ => 8e-3,
+        };
         let kernels = kernels.clone().with_tuning(Tuning {
             delta_step,
             ..kernels.tuning()
@@ -452,7 +461,11 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
         let proj = values(rows * case.proj_cols, 16, 3.0);
         let dt_bias = values(4, 17, 1.0);
         let neg_a: Vec<f32> = values(4, 18, 1.0).iter().map(|v| -v.abs() - 0.1).collect();
-        let (pool, initial) = committed_pool(&device, 14, &[4, dk, 22], &ragged, 0.1)?;
+        let (pool, _) = committed_pool(&device, 14, &[4, dk, 22], &ragged, 0.1)?;
+        let pool = pool.to_dtype(dtype)?;
+        let widen =
+            |slot: usize| -> Result<Vec<f32>> { read(&pool.get(slot)?.to_dtype(DType::F32)?) };
+        let initial: Vec<Vec<f32>> = (0..14).map(widen).collect::<Result<_>>()?;
         let out = kernels.delta_scan(
             &upload(&device, &mixed, &[rows, case.mixed_cols])?,
             &upload(&device, &proj, &[rows, case.proj_cols])?,
@@ -478,7 +491,7 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
             let error = relative_error(&actual, &expected_out);
             assert!(
                 error < 1e-5,
-                "dk {dk} step {delta_step} tokens {tokens}: output {error}"
+                "{dtype:?} dk {dk} step {delta_step} tokens {tokens}: output {error}"
             );
             let boundaries: Vec<&Vec<f64>> = if writes.len() > 1 {
                 expected_states.iter().collect()
@@ -486,16 +499,16 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
                 expected_states.last().into_iter().collect()
             };
             for (&slot, expected) in writes.iter().zip(boundaries) {
-                let error = relative_error(&read(&pool.get(slot as usize)?)?, expected);
+                let error = relative_error(&widen(slot as usize)?, expected);
                 assert!(
-                    error < 1e-5,
-                    "dk {dk} step {delta_step} tokens {tokens}: state {error}"
+                    error < stored,
+                    "{dtype:?} dk {dk} step {delta_step} tokens {tokens}: state {error}"
                 );
             }
-            assert_eq!(read(&pool.get(*slot as usize)?)?, initial[*slot as usize]);
+            assert_eq!(widen(*slot as usize)?, initial[*slot as usize]);
             row += tokens;
         }
-        assert!(read(&pool.get(13)?)?.iter().all(|v| v.is_nan()));
+        assert!(widen(13)?.iter().all(|v| v.is_nan()));
     }
     Ok(())
 }
@@ -1095,6 +1108,7 @@ fn test_invalid_inputs_are_rejected_before_encoding() -> Result<()> {
     let ones = Tensor::ones(1, DType::F32, &device)?;
     let span = |tokens: usize, read: u32, writes: &'static [u32]| RecurrentSpan {
         tokens,
+        position: 0,
         read,
         writes,
     };

@@ -122,6 +122,7 @@ impl Qwen35 {
                 .iter()
                 .map(|span| RecurrentSpan {
                     tokens: span.len,
+                    position: span.past,
                     read: span.addresses.read,
                     writes: &span.addresses.writes,
                 })

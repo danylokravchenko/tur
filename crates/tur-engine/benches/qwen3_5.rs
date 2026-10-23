@@ -25,7 +25,9 @@ use tur_engine::hybrid::{
     Boundaries, HybridEngine, HybridModel, ModelState, PackedForward, PoolConfig, Reservation,
     SamplingOptions, SequenceForward, StatePool,
 };
-use tur_models::models::qwen3_5::{Execution, LoadOptions, Qwen35, WeightFormat};
+use tur_models::models::qwen3_5::{
+    Execution, LoadOptions, Qwen35, WeightFormat, parse_recurrent_state,
+};
 
 const SHORT_CONTEXT: usize = 128;
 const DECODE_STEPS: usize = 12;
@@ -283,40 +285,45 @@ fn main() -> Result<()> {
         let format: WeightFormat = name.parse().map_err(TurError::Other)?;
         for kv in env_list("TUR_BENCH_KV", "f32,f16,q8") {
             let kv: KvFormat = kv.parse().map_err(TurError::Other)?;
-            for &page in &pages {
-                let load_start = Instant::now();
-                let model = Qwen35::load(
-                    &dir,
-                    &LoadOptions {
-                        revision: "Qwen/Qwen3.5-0.8B@2fc06364".into(),
-                        format,
-                        device: device.clone(),
-                        execution: Execution::Fused,
-                        kv: KvLayout::new(page, kv),
-                    },
-                )?;
-                let load_seconds = load_start.elapsed().as_secs_f64();
-                let mut result = run(&model, &prefill, &contexts)?;
-                result["format"] = json!(name);
-                result["execution"] = json!("Fused");
-                result["load_seconds"] = json!(load_seconds);
-                runs.push(result);
-                if reference && kv == KvFormat::F32 {
-                    let model = model.with_execution(Execution::Reference)?;
-                    let mut result = run(&model, &prefill, &[])?;
+            for state in env_list("TUR_BENCH_STATE", "f32") {
+                let recurrent = parse_recurrent_state(&state).map_err(TurError::Other)?;
+                for &page in &pages {
+                    let load_start = Instant::now();
+                    let model = Qwen35::load(
+                        &dir,
+                        &LoadOptions {
+                            revision: "Qwen/Qwen3.5-0.8B@2fc06364".into(),
+                            format,
+                            device: device.clone(),
+                            execution: Execution::Fused,
+                            kv: KvLayout::new(page, kv),
+                            recurrent,
+                        },
+                    )?;
+                    let load_seconds = load_start.elapsed().as_secs_f64();
+                    let mut result = run(&model, &prefill, &contexts)?;
                     result["format"] = json!(name);
-                    result["execution"] = json!("Reference");
+                    result["recurrent_state"] = json!(state);
+                    result["execution"] = json!("Fused");
+                    result["load_seconds"] = json!(load_seconds);
                     runs.push(result);
-                    let model = Arc::new(model.with_execution(Execution::Fused)?);
-                    runs.push(json!({
-                        "format": name, "execution": "Fused", "kv_format": kv.to_string(),
-                        "page_tokens": page, "engine": engine_case(model, 32)?,
-                    }));
-                } else {
-                    runs.push(json!({
-                        "format": name, "execution": "Fused", "kv_format": kv.to_string(),
-                        "page_tokens": page, "engine": engine_case(Arc::new(model), 32)?,
-                    }));
+                    if reference && kv == KvFormat::F32 {
+                        let model = model.with_execution(Execution::Reference)?;
+                        let mut result = run(&model, &prefill, &[])?;
+                        result["format"] = json!(name);
+                        result["execution"] = json!("Reference");
+                        runs.push(result);
+                        let model = Arc::new(model.with_execution(Execution::Fused)?);
+                        runs.push(json!({
+                            "format": name, "execution": "Fused", "kv_format": kv.to_string(),
+                            "page_tokens": page, "engine": engine_case(model, 32)?,
+                        }));
+                    } else {
+                        runs.push(json!({
+                            "format": name, "execution": "Fused", "kv_format": kv.to_string(),
+                            "page_tokens": page, "engine": engine_case(Arc::new(model), 32)?,
+                        }));
+                    }
                 }
             }
         }

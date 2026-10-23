@@ -5,7 +5,9 @@ use tur::{
     ModelFactory, ModelSource, Result, TurError,
     backend::{memory::DeviceBudget, pipeline::PipelineConfig},
     core::execution::{KvFormat, KvLayout},
-    models::qwen3_5::{DEFAULT_KV_LAYOUT, WeightFormat},
+    models::qwen3_5::{
+        DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, WeightFormat, parse_recurrent_state,
+    },
     server::{
         AppState, run_server,
         worker::{PipelineWorker, WorkerConfig},
@@ -68,6 +70,10 @@ struct Args {
     /// Tokens per K/V page.
     #[arg(long, default_value_t = DEFAULT_KV_LAYOUT.page_tokens)]
     kv_page_tokens: usize,
+    /// Recurrent matrix state storage: f32 (default) or f16, which halves recurrent memory
+    /// and traffic with stochastic rounding but adds error that grows with decode length.
+    #[arg(long, value_parser = ["f32", "f16"])]
+    recurrent_state: Option<String>,
     /// Memory for K/V pages and recurrent state, in MiB. Default: room for each concurrent
     /// request's 8K-token context within the device's working set.
     #[arg(long)]
@@ -116,6 +122,11 @@ async fn main() -> Result<()> {
             format: args.weight_format,
             device,
             kv: KvLayout::new(args.kv_page_tokens, args.kv_format),
+            recurrent: args
+                .recurrent_state
+                .as_deref()
+                .map_or(Ok(DEFAULT_RECURRENT_STATE), parse_recurrent_state)
+                .map_err(TurError::Other)?,
         },
         pipeline,
         request_timeout: args.request_timeout_secs.map(Duration::from_secs),

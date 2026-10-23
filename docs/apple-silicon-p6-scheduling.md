@@ -243,15 +243,81 @@ Correctness:
 - **Real checkpoint:** the reference comparisons and greedy generation (now through the
   device argmax) pass.
 
+## Recurrent state storage
+
+Recurrent matrices can now be stored as F16 or BF16 (`--recurrent-state f16`;
+`LoadOptions::recurrent`, `ModelFactory::recurrent`):
+
+- **Updates:** the scan and step kernels still accumulate in F32 and round only when
+  storing.
+- **History:** the convolution history stays F32 (about 7% of a slot).
+- **Identity:** the dtype is part of the state layout, so checkpoints from another layout
+  are rejected.
+- **Rounding:** 16-bit stores round stochastically. Random bits come from a hash of the
+  token position and element, so rounding is unbiased yet deterministic per request:
+  identical across batch compositions, step-versus-scan dispatch and recompute
+  preemption. The CPU reference rounds to nearest.
+
+**Quality** was measured on the P5 held-out text (8,192 tokens, SHA-256 `d4b954c2…`),
+against F32 state with F32 K/V
+([artifacts](baselines/2026-10-22-m1-p6-state-quality/)). A 256-token chunk keeps the
+state in F32 registers within each chunk. Chunk 1 stores it after every token, as decode
+does, so rounding error compounds:
+
+| Pass | State | Mean KL | KL 0–1K → 4–8K | Top-1 | Mean NLL (F32: 3.6998) |
+| --- | --- | --- | --- | --- | --- |
+| 256-token chunks, nearest | f16 | 1.1e-7 | 2.0e-8 → 1.6e-7 | 99.98% | 3.6997 |
+| 256-token chunks, nearest | bf16 | 7.2e-6 | 1.2e-6 → 1.1e-5 | 99.88% | 3.6999 |
+| Decode, nearest | f16 | 1.2e-4 | 4.5e-6 → 2.1e-4 | 99.40% | 3.7014 |
+| Decode, nearest | bf16 | 6.2e-3 | 3.6e-4 → 1.0e-2 | 95.42% | 3.7014 |
+| Decode, stochastic | f16 | 5.2e-5 | 9.8e-6 → 7.7e-5 | 99.43% | 3.6999 |
+| Decode, stochastic | bf16 | 2.5e-3 | 4.9e-4 → 3.5e-3 | 96.98% | 3.6957 |
+
+Stochastic rounding halves F16's decode error and removes its NLL bias, but the error
+still grows about 8× from the first 1K tokens to 4–8K. BF16's 7-bit mantissa is not
+usable for decode.
+
+**Speed:** F16 state saves 6–7% of a batch-8/16 decode pass (31.3 → 29.5 ms and
+51.5 → 47.8 ms) and adds 4–5% of serving throughput at 8–16 requests. Batch 1–2 is
+unchanged or up to 3% slower from the rounding hash. The saving is smaller than halving the
+state traffic would suggest (about 4 ms at batch 8): the step kernel does not reach
+twice its element rate with 16-bit storage. That was not investigated further.
+
+**Decision:** F32 stays the default (`DEFAULT_RECURRENT_STATE`). F16 is an opt-in
+capacity option, like Q8 K/V: on average it is closer to F32 than Q8 K/V is to F16
+(5.2e-5 vs 9.7e-5 nats), and it nearly halves recurrent memory per request: about 9 MB
+less on 0.8B and 73 MB less on 27B (P5: 20.2 MB and 157 MB with F32). Its context-growing error is not bounded beyond 8K tokens. The
+CLI and server accept `f32` and `f16` only; BF16 remains in the kernels and benches.
+
+## Small-batch projections beyond 8 rows
+
+At 16 rows the matrix-unit kernel costs about twice 8 rows (LM head 9.4 against
+5.4 ms). Diagnostics on the LM head:
+
+| Variant | 16-row LM head | Finding |
+| --- | --- | --- |
+| Current (two row tiles, two column tiles) | 9.4 ms | — |
+| Second tile's multiplies and loads removed (invalid output) | 5.7 ms | The second tile's work costs 3.7 ms for 2G multiply-adds |
+| Second tile's activation loads removed (invalid output) | 7.8 ms | Loads and registers account for a share |
+| Contiguous K permutation (`k = 4c + s`): half the activation loads, none wasted | 9.6 ms | Kept (neutral; every loaded value used), not a gain |
+| One column tile per threadgroup (fewer registers) | 11.8 ms | Worse: amortizing activations over columns matters more |
+| Half-precision weight fragments of exact codes, block scale on F32 partials | 33.3 ms | Mixed half × F32 matrix multiplies are much slower on the M1 |
+
+None of the precision-preserving variants improves 9–16 rows; the kernel sits near the
+M1's F32 matrix-unit throughput there. It stays the dispatch for 4–16 rows: faster than
+Candle's F16-tile GEMM on narrow projections (`down` 0.15 against 0.19 ms), at parity
+on `gate_up` and DeltaNet `in_proj`, 7% slower on the LM head, and in F32 rather than
+F16 precision.
+
 ## Limits
 
-- **Recurrent state bandwidth bounds decode scaling.** Every sequence reads and writes
-  its F32 recurrent state each token: about 36 MB per token on 0.8B and much more on
-  27B. That is about 7.5 ms of a batch-8 pass and 15 ms at batch 16, linear in batch at
-  ~39 GB/s. Storing it as F16/BF16 would halve the traffic but needs the separate
-  quality evaluation the plan requires for recurrent state.
-- **9–16 rows are MMA-bound** at F32 (16 rows cost twice 8). F16 MMA tiles would
-  double throughput at Candle's precision; not adopted without a quality budget.
+- **Recurrent state bandwidth bounds decode scaling.** With F32 state every sequence
+  reads and writes about 36 MB per token on 0.8B (much more on 27B). That is about
+  7.5 ms of a batch-8 pass and 15 ms at batch 16, linear in batch at ~39 GB/s. F16
+  state trims 6–7% at a measured quality cost (above). An in-register multi-token
+  decode path only applies to speculation (P8).
+- **9–16 rows are bound by F32 matrix-unit throughput** (above). Only F16 activations
+  would go faster, at Candle's precision; not adopted without a quality budget.
 - **Sampled requests** (temperature, top-k/top-p, grammars) still copy full rows and
   sample on the CPU, about 0.8 ms per sequence plus one shared copy. GPU sampling is P7.
 - **Typed errors.** Queue-full and deadline failures use `TurError::Other`, so HTTP
@@ -273,4 +339,6 @@ TUR_BENCH_ONLY=delta cargo bench --offline -p tur-metal --bench kernels
 TUR_BENCH_ONLY=linear cargo bench --offline -p tur-metal --bench kernels
 TUR_QWEN35_0_8B=<snapshot> TUR_BENCH_FORMATS=q8_0 TUR_BENCH_KV=f16 TUR_BENCH_PAGES=16 TUR_BENCH_PREFILL=128 TUR_BENCH_CONTEXTS=2048 cargo bench --offline -p tur-engine --bench qwen3_5
 TUR_QWEN35_0_8B=<snapshot> cargo bench --offline -p tur-engine --bench serving
+TUR_QWEN35_0_8B=<snapshot> TUR_EVAL_TEXT=<text> TUR_EVAL_KV= TUR_EVAL_STATE=f16,bf16 TUR_EVAL_CHUNK=1 cargo bench --offline -p tur-engine --bench kv_quality
+TUR_QWEN35_0_8B=<snapshot> TUR_BENCH_STATE=f32,f16 cargo bench --offline -p tur-engine --bench qwen3_5
 ```
