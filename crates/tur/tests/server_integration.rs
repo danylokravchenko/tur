@@ -63,6 +63,8 @@ fn mock_worker(response_text: &'static str) -> PipelineWorker {
                 elapsed: Duration::from_millis(1),
                 first_token: Duration::from_millis(1),
                 preemptions: 0,
+                draft_tokens: 0,
+                accepted_draft_tokens: 0,
                 tool_calls: vec![],
                 generated_text: response_text.to_string(),
             }));
@@ -93,6 +95,8 @@ fn mock_tool_call_worker(
                 elapsed: Duration::from_millis(1),
                 first_token: Duration::from_millis(1),
                 preemptions: 0,
+                draft_tokens: 0,
+                accepted_draft_tokens: 0,
                 tool_calls: vec![tc],
                 generated_text: String::new(),
             }));

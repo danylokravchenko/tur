@@ -2,6 +2,13 @@
 
 Status: P0's development-Mac evidence/capability gate and P1's workspace move are complete (2026-10-21). P2's four-crate extraction and explicit hybrid state and packed execution contracts are implemented (revised after review); see [P2 contracts and validation](apple-silicon-p2-contracts.md). Safe dispatch and pinned model/HTTP evidence remain in [the baseline report](apple-silicon-baseline.md). The baseline checkpoint suite retains its guided-JSON failure (68/69 pass); it was not rerun or fixed in P2. The legacy models (ordinary Qwen3, Granite 4.1), their execution/cache path and model runners have been removed; see [Breaking changes and legacy removal](#breaking-changes-and-legacy-removal). P3's model work is complete (2026-10-22): the Qwen3.5 dense hybrid text model matches Transformers on the real Qwen3.5-0.8B checkpoint on CPU and Metal, with Q8_0/Q4K packed execution; Qwen3.8-27B shares that path and is validated against its pinned config, tensor headers and template but has not been executed on this hardware; see [P3 report](apple-silicon-p3-qwen.md). P3's deferred legacy deletion and CLI/server migration are now complete: both adapters use the packed hybrid text pipeline, with checkpoint templates/defaults, independent outcomes, EOS and cancellation. P4's Metal runtime and first fused kernels are implemented (2026-10-22): the fused Qwen3.5 path matches the F32 reference on the real 0.8B checkpoint (≤ 3.8e-6) and is the default on Metal for the engine, CLI and server; chunked DeltaNet prefill remains open; matrix-unit attention prefill is now implemented in the [tiled attention report](apple-silicon-tiled-attention.md); see [P4 report](apple-silicon-p4-metal.md). P5's paged and quantized memory is implemented (2026-10-22): K/V and recurrent state live in persistent device pools read in place through page tables, with generation-tagged leases, copy-on-write tails, completion-gated reclamation, F32/F16/Q8 K/V quantized on write, and a budgeted memory plan with explicit out-of-memory errors; see [P5 report](apple-silicon-p5-memory.md). P6's packed execution and scheduling are implemented (2026-10-22): packed recurrent dispatches over the whole batch, decode-priority scheduling with cost-adaptive bounded prefill, recompute preemption, queue limits, deadlines and a shared device budget; see [P6 report](apple-silicon-p6-scheduling.md). P7 is implemented (2026-10-23): verified zero-copy prefix snapshots at aligned boundaries, GPU penalties and top-k/top-p sampling with per-request RNG, an off-thread completion fence that also returns outputs, and bounded streaming with a slow-client policy. Follow-ups moved grammar masks to the GPU (constrained passes now cost the same as unconstrained ones), added prompt-end snapshots with retained logits (an exact repeat needs no prefill pass), sized snapshot retention by state memory, and measured overlap under streaming arrivals (TTFT p50 −13–14%); see [P7 report](apple-silicon-p7-serving.md). Production serving hardening, performance and quality gates remain open.
 
+P8 is in progress (2026-10-23): exact prompt-lookup verification is connected to serving,
+with adaptive draft selection, explicit memory accounting and an opt-in throughput mode.
+The Qwen3.6 expert text path has F32 routing, packed expert weights and device-side
+grouped GEMM, validated on an independent small Transformers fixture and pinned flagship
+headers. Full 35B execution exceeds this 16 GB Mac's capacity; native MTP, flagship
+quality and Gemma 4 execution remain open. See the [P8 report](apple-silicon-p8-speculation-moe.md).
+
 P3–P5 review cleanup (2026-10-22) fixed zero-slot budget accounting, activated inherited
 workspace lints, made retained HTTP tests fallible, and removed unused dependencies,
 CUDA features and obsolete errors. Validation and the remaining limits are recorded
@@ -403,6 +410,9 @@ Implement GPU greedy/top-k/top-p/temperature/penalty operations and per-request 
 Exit: warmed prefix reuse produces equivalent continuations and measurable saved work; no leaked state after disconnects; reproducibility behavior documented; bounded streaming memory under stalled clients.
 
 ### P8 — Speculation and MoE expansion
+
+In progress; implemented behavior, conformance evidence, measured tradeoffs and remaining
+hardware/model gates are in the [P8 report](apple-silicon-p8-speculation-moe.md).
 
 Add an exact verification path before optimizing proposals. Verify all proposed positions, track accepted length, roll back every layer's state, and apply the correct target/proposal sampling correction. For recurrent layers, retain bounded intermediate checkpoints or recompute the accepted prefix from the pre-draft checkpoint.
 

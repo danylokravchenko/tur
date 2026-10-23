@@ -6,6 +6,11 @@ kernels (P4) over persistent, paged and optionally quantized K/V and recurrent s
 pools (P5). The CLI and HTTP worker use this path. Ordinary Qwen3, Granite 4.1 and
 their legacy engine, cache, tests and benchmark have been removed.
 
+An experimental Qwen3.5 MoE text path also implements Qwen3.6-35B-A3B's expert layout.
+Small-model conformance and pinned checkpoint headers pass; full 35B execution,
+expert-kernel performance and quality gates remain open. See the
+[P8 report](docs/apple-silicon-p8-speculation-moe.md).
+
 The real Qwen3.5-0.8B checkpoint was validated against Transformers on CPU and Metal.
 Qwen3.8-27B shares the implementation and has pinned config, tensor-header and
 template validation; it has **not been executed** on the development Mac. Measurements
@@ -40,7 +45,9 @@ Fallible tests allow assertions while propagating setup and task errors with `?`
 
 Use a fully qualified Hugging Face repository and an immutable commit. Checkpoint
 architecture fields determine support; model names do not select an architecture.
-The loader rejects ordinary Qwen3, Granite, MoE and unsupported tensor layouts.
+The loader rejects ordinary Qwen3, Granite and unsupported architectures or tensor
+layouts. Qwen3.5 MoE is experimental; its 35B Q4K text weights alone exceed the
+development Mac's 16 GB memory. Native MTP and Gemma 4 execution are disabled.
 
 ```sh
 cargo run --bin tur -- \
@@ -71,14 +78,20 @@ Omitting them preserves the template's defaults. No `/think` suffix is injected.
 `--tools /path/to/tools.json` accepts an array of `{name, description, parameters}`
 function definitions. `--prefill-chunk-size` defaults to 256.
 
+`--speculative-draft 4` enables adaptive prompt-lookup speculation on either binary.
+It is disabled by default. This throughput mode can accelerate repetitive output but
+delivers tokens in bursts with longer pauses, uses extra state memory, and automatically
+falls back to ordinary decoding with F16/BF16 recurrent state. Measurements and exact
+verification semantics are in the [P8 report](docs/apple-silicon-p8-speculation-moe.md).
+
 K/V state is paged: `--kv-format f32|f16|q8|q8_<group>` (default `f16`) selects storage
 and `--kv-page-tokens` (default 16) the page size. `q8` halves K/V memory relative to
 `f16` with a small, measured quality cost. `--state-memory-mb` sets the memory for K/V
 pages and recurrent state; by default each concurrent request gets room for an 8K-token
 context within the device's working set, and a budget beyond the working set is
 rejected. The budget includes the permanent zero recurrent slot, two usable recurrent
-slots per concurrent request, and whole K/V pages; page rounding stays within the
-requested bytes.
+slots per concurrent request, retained snapshots, speculative checkpoints when enabled,
+and whole K/V pages; page rounding stays within the requested bytes.
 
 ## HTTP server
 
@@ -119,11 +132,11 @@ are `stop`, `length`, or `tool_calls`.
 The worker bounds intake and live request counts, packs one prefill chunk or decode
 token per sequence, isolates per-request failures, and releases state on completion
 or client cancellation. The server takes the same K/V and state-memory flags as the
-CLI. Requests that can never fit the state pool are rejected; requests whose next chunk
-does not fit wait; if nothing fits, the newest request fails with a memory error.
-Preemption with recompute, prefix reuse, production scheduling, bounded streaming
-output and comprehensive serving controls remain P6/P7/P9 work.
-There are no performance or production-readiness claims.
+CLI. Requests that can never fit the state pool are rejected. Memory pressure can evict
+prefix snapshots and preempt running state for recomputation. Packed scheduling, prefix
+reuse, device sampling and bounded streaming are implemented; see the
+[P6](docs/apple-silicon-p6-scheduling.md) and [P7](docs/apple-silicon-p7-serving.md) reports.
+Production hardening and release gates remain open; measurements are development evidence.
 
 ## Workspace
 

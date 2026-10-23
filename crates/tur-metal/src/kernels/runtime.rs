@@ -33,6 +33,8 @@ const SOURCE: &str = concat!(
     "\n",
     include_str!("quantized.metal"),
     "\n",
+    include_str!("moe.metal"),
+    "\n",
     include_str!("sampling.metal"),
 );
 const SIMD_WIDTH: usize = 32;
@@ -40,6 +42,15 @@ const SIMD_WIDTH: usize = 32;
 /// Every function in [`SOURCE`]. Template instantiations encode their shape family
 /// (`r4` = 4 registers per lane, `b3` = 3 batch rows) and dtype or K/V format in the name.
 const FUNCTIONS: &[&str] = &[
+    "moe_route_f32",
+    "moe_counts_f32",
+    "moe_offsets_f32",
+    "moe_order_f32",
+    "moe_gather_f32",
+    "moe_scatter_f32",
+    "moe_gemm_f32",
+    "moe_qmm_q8_0",
+    "moe_gemm_q4k",
     "rms_norm_f32",
     "add_rms_norm_f32",
     "qk_norm_rope_f32",

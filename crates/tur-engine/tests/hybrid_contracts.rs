@@ -495,6 +495,48 @@ fn test_speculative_rejection_keeps_only_the_verified_token() -> Result<()> {
 }
 
 #[test]
+fn test_deterministic_drafts_preserve_target_sampling_rng_penalties_and_every_layer() -> Result<()>
+{
+    let (mut speculative, _) = engine(fixture())?;
+    let (mut direct, _) = engine(fixture())?;
+    let options = SamplingOptions {
+        temperature: Some(0.8),
+        top_k: Some(6),
+        top_p: Some(0.9),
+        repetition_penalty: Some(1.2),
+        presence_penalty: Some(0.3),
+        frequency_penalty: Some(0.2),
+    };
+    let mut accepted_total = 0;
+    for seed in 0..256 {
+        let a = speculative.allocate(seed, options, None)?;
+        let b = direct.allocate(seed, options, None)?;
+        let input = [1, 7, 6, 5];
+        let batch = packed(&speculative, &[(a, &input)], true)?;
+        let commit = commits(submit_all(&mut speculative, batch)?)?
+            .pop()
+            .ok_or_else(|| invalid("missing commit"))?;
+        accepted_total += commit.accepted_tokens - 1;
+        let mut sampled = Vec::new();
+        for token in &input[..commit.accepted_tokens] {
+            sampled.extend(run(&mut direct, &[(b, std::slice::from_ref(token))])?);
+        }
+        assert_eq!(tokens(&commit.outputs), tokens(&sampled), "seed {seed}");
+        equivalent(&checkpoint(&speculative, a)?, &checkpoint(&direct, b)?)?;
+        // RNG and penalties after a rejection must still match on the next pass.
+        assert_eq!(
+            tokens(&run(&mut speculative, &[(a, &[3])])?),
+            tokens(&run(&mut direct, &[(b, &[3])])?)
+        );
+        equivalent(&checkpoint(&speculative, a)?, &checkpoint(&direct, b)?)?;
+        speculative.cancel(handle(&speculative, a)?)?;
+        direct.cancel(handle(&direct, b)?)?;
+    }
+    assert!(accepted_total > 0);
+    Ok(())
+}
+
+#[test]
 fn test_published_descriptors_are_invalidated() -> Result<()> {
     let (mut engine, _) = engine(fixture())?;
     let a = allocate(&mut engine, 99)?;

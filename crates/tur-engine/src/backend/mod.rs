@@ -4,4 +4,5 @@ pub mod memory;
 pub mod pipeline;
 pub mod prefix;
 pub mod scheduler;
+pub mod speculation;
 pub mod tokenizer;

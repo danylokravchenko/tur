@@ -31,7 +31,7 @@ pub struct MemoryPlan {
     pub state_pool: usize,
     /// Kernel scratch of the largest planned pass.
     pub scratch_peak: usize,
-    /// Packed inputs and logits of the largest planned pass.
+    /// Packed inputs and logits of the largest pass, plus bounded host proposal indices.
     pub in_flight: usize,
     /// Reserve for the runtime, allocator rounding and the OS.
     pub overhead: usize,
@@ -41,6 +41,8 @@ pub struct MemoryPlan {
     pub reserved: usize,
     /// Snapshot slots the pool holds beyond live sequences, after the share cap.
     pub retained: usize,
+    /// Recurrent slots held beyond live sequences and snapshots for speculative drafts.
+    pub draft_slots: usize,
 }
 
 /// What the plan must hold besides the state pool.
@@ -56,6 +58,9 @@ pub struct PlanInputs {
     /// Most of the state pool's bytes that retained snapshots may take; `None` keeps
     /// `retained` as given.
     pub retained_share: Option<f64>,
+    /// Recurrent slots for the per-token boundaries of speculative drafts, one per
+    /// drafted token, so one sequence can verify its longest draft beside full snapshots.
+    pub draft_slots: usize,
     /// Explicit state pool budget in bytes; otherwise sized for [`DEFAULT_CONTEXT_TOKENS`]
     /// per sequence within the device limit.
     pub state_bytes: Option<usize>,
@@ -101,6 +106,7 @@ impl MemoryPlan {
                     .sequences
                     .checked_mul(2)
                     .and_then(|slots| slots.checked_add(inputs.retained))
+                    .and_then(|slots| slots.checked_add(inputs.draft_slots))
                     .ok_or_else(|| invalid("recurrent slot count overflow"))?,
             }
             .bytes(description)?;
@@ -117,7 +123,15 @@ impl MemoryPlan {
             }
             _ => inputs.retained,
         };
-        let config = PoolConfig::for_budget(description, bytes, inputs.sequences, retained)?;
+        let draft_slots = if description.has_recurrent() {
+            inputs.draft_slots
+        } else {
+            0
+        };
+        let extra = retained
+            .checked_add(draft_slots)
+            .ok_or_else(|| invalid("recurrent slot count overflow"))?;
+        let config = PoolConfig::for_budget(description, bytes, inputs.sequences, extra)?;
         let plan = Self {
             weights: inputs.weights,
             state_pool: config.bytes(description)?,
@@ -127,6 +141,7 @@ impl MemoryPlan {
             limit: inputs.limit,
             reserved: inputs.reserved,
             retained,
+            draft_slots,
         };
         if let Some(limit) = inputs.limit
             && plan.resident().saturating_add(plan.reserved) > limit
@@ -267,6 +282,7 @@ mod tests {
             sequences: 2,
             retained: 0,
             retained_share: None,
+            draft_slots: 0,
             state_bytes,
             limit,
             reserved: 0,
@@ -291,6 +307,17 @@ mod tests {
         };
         let (plan, with_snapshots) = MemoryPlan::new(&model, retained)?;
         assert_eq!((with_snapshots.recurrent_slots, plan.retained), (7, 3));
+        // Draft slots add one each, beside snapshots and outside their share cap.
+        let drafts = PlanInputs {
+            draft_slots: 4,
+            retained_share: Some(0.0),
+            ..retained
+        };
+        let (plan, with_drafts) = MemoryPlan::new(&model, drafts)?;
+        assert_eq!(
+            (with_drafts.recurrent_slots, plan.retained, plan.draft_slots),
+            (8, 0, 4)
+        );
         // A share cap keeps snapshots to that fraction of the pool's bytes.
         let budget = 4 * page + 40 * slot;
         let cap = budget / 8 / slot;

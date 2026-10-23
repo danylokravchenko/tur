@@ -16,6 +16,8 @@
 //! `TUR_BENCH_WORKLOADS=prefix TUR_BENCH_SPACING=0,256` runs the prefix-reuse workloads;
 //! `TUR_BENCH_WORKLOADS=arrivals TUR_BENCH_RATE=2,4` runs open-loop Poisson arrivals, and
 //! `TUR_BENCH_WORKLOADS=grammar` grammar-constrained requests.
+//! `TUR_BENCH_WORKLOADS=speculation TUR_BENCH_DRAFT=0,4` compares adaptive prompt lookup
+//! with ordinary decoding, including acceptance counters, memory and exact token IDs.
 
 use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, time::Instant};
@@ -28,6 +30,7 @@ use tur_engine::{
         guidance::TopLevelGrammar,
         pipeline::{GenerationRequest, InferencePipeline, PipelineConfig},
         prefix::PrefixConfig,
+        speculation::SpeculationConfig,
     },
     hybrid::SamplingOptions,
 };
@@ -117,8 +120,10 @@ fn run_requests(pipeline: &mut InferencePipeline, requests: &[GenerationRequest]
         ids.insert(pipeline.submit_request(request)?, index);
     }
     let mut emitted: Vec<Vec<f64>> = vec![Vec::new(); ids.len()];
+    let mut token_ids: Vec<Vec<u32>> = vec![Vec::new(); ids.len()];
     let mut ttft = vec![0.0; ids.len()];
     let mut cached = 0;
+    let (mut drafted, mut accepted, mut draft_passes, mut draft_seconds) = (0, 0, 0, 0.0);
     let (mut generated, mut prompt_tokens, mut passes, mut packed) = (0, 0, 0, 0);
     let mut phases: HashMap<&str, Vec<f64>> = HashMap::new();
     while pipeline.active_request_count() > 0 {
@@ -126,6 +131,10 @@ fn run_requests(pipeline: &mut InferencePipeline, requests: &[GenerationRequest]
         if let Some(t) = output.timing {
             passes += 1;
             packed += t.tokens;
+            if t.drafts > 0 {
+                draft_passes += 1;
+                draft_seconds += t.device.as_secs_f64();
+            }
             for (name, value) in [
                 ("schedule", t.schedule),
                 ("encode", t.encode),
@@ -146,9 +155,10 @@ fn run_requests(pipeline: &mut InferencePipeline, requests: &[GenerationRequest]
                     .push(idle.as_secs_f64());
             }
         }
-        for (id, _, sampled_at) in &output.sampled_tokens {
+        for (id, token, sampled_at) in &output.sampled_tokens {
             if let Some(&index) = ids.get(id) {
                 emitted[index].push(sampled_at.saturating_duration_since(start).as_secs_f64());
+                token_ids[index].push(*token);
             }
         }
         for (id, result) in output.completed {
@@ -159,6 +169,8 @@ fn run_requests(pipeline: &mut InferencePipeline, requests: &[GenerationRequest]
             generated += stats.generated_tokens;
             prompt_tokens += stats.prompt_tokens;
             cached += stats.cached_tokens;
+            drafted += stats.draft_tokens;
+            accepted += stats.accepted_draft_tokens;
         }
     }
     let wall = start.elapsed().as_secs_f64();
@@ -184,6 +196,8 @@ fn run_requests(pipeline: &mut InferencePipeline, requests: &[GenerationRequest]
         "phase_seconds": phases.iter().map(|(k, v)| (k.to_string(), summary(v))).collect::<serde_json::Map<_, _>>(),
         "device_idle_fraction_lower_bound": idle / wall,
         "sampling": format!("{:?}", pipeline.sampling_stats()),
+        "speculation": {"drafted": drafted, "accepted": accepted, "passes": draft_passes, "device_seconds": draft_seconds},
+        "token_ids": token_ids,
     }))
 }
 
@@ -584,6 +598,47 @@ fn main() -> Result<()> {
     if workloads.contains("prefix") {
         for spacing in env_sizes("TUR_BENCH_SPACING", "0,64,128,256,512")? {
             runs.extend(prefix_runs(&factory, &tokenizer, spacing, options)?);
+        }
+    }
+    if workloads.contains("speculation") {
+        let repeats = env_sizes("TUR_BENCH_REPEATS", "3")?
+            .first()
+            .copied()
+            .unwrap_or(3);
+        for draft in env_sizes("TUR_BENCH_DRAFT", "0,4")? {
+            for &count in &concurrency {
+                let mut config = PipelineConfig::new(count, CHUNK);
+                config.prefix = PrefixConfig::DISABLED;
+                config.device_sampling = device_sampling;
+                config.speculation = SpeculationConfig::new(draft);
+                let mut pipeline = InferencePipeline::new(&factory, config)?;
+                for workload in ["repeat", "novel"] {
+                    let requests: Vec<_> = (0..count).map(|i| {
+                        let text = if workload == "repeat" {
+                            format!("Request {i}. Continue this pattern exactly for 200 words, without an introduction:\n{}", "red green blue yellow orange purple ".repeat(12))
+                        } else { format!("Request {i}. Explain how a database recovers from a power failure during a transaction. Be specific about write-ahead logs, checkpoints and isolation.") };
+                        let mut request = GenerationRequest::new(text, output);
+                        request.seed = i as u64;
+                        request.render.enable_thinking = Some(false);
+                        request.sampling = options;
+                        request
+                    }).collect();
+                    // Warm execution separately; adaptive draft selection remains active.
+                    run_requests(&mut pipeline, &requests)?;
+                    for repeat in 0..repeats {
+                        let result = run_requests(&mut pipeline, &requests)?;
+                        report(
+                            &format!("speculation {workload} c={count} draft={draft}"),
+                            &result,
+                        );
+                        let memory = pipeline.memory_plan();
+                        runs.push(json!({"workload": workload, "concurrency": count, "draft": draft, "repeat": repeat,
+                            "resident_bytes": memory.resident(), "state_pool_bytes": memory.state_pool, "draft_slots": memory.draft_slots,
+                            "cost_fit_seconds": pipeline.draft_costs().line(count),
+                            "result": result}));
+                    }
+                }
+            }
         }
     }
     println!(

@@ -9,7 +9,7 @@
 //! enqueues `reps` operations and then synchronizes.
 //!
 //! `cargo bench --offline -p tur-metal --bench kernels > out.json`
-//! `TUR_BENCH_ONLY=delta|linear|paged|tiled|sample` restricts the run to one group.
+//! `TUR_BENCH_ONLY=delta|linear|paged|tiled|sample|moe` restricts the run to one group.
 //! `TUR_BENCH_SHAPE=<substring>` selects tiled attention shapes for focused tuning.
 
 use candle_core::{D, DType, Device, Tensor, quantized::GgmlDType};
@@ -703,6 +703,75 @@ fn skip(group: &str) -> bool {
     std::env::var("TUR_BENCH_ONLY").is_ok_and(|v| v != group)
 }
 
+/// Grouped expert projection including device routing/gather versus individually
+/// submitted expert projections with routing and gather already prepared for them.
+fn moe_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+    let (experts, input, output, top_k) = (256, 2048, 1024, 8);
+    let weight = random(&Device::Cpu, &[experts * output, input], 314, 0.02)?;
+    let grouped = PackedLinear::quantized(&weight, GgmlDType::Q8_0, device)?;
+    let mut cases = Vec::new();
+    for tokens in [1, 8, 32, 128] {
+        for skewed in [false, true] {
+            let x = random(device, &[tokens, input], 315, 1.0)?;
+            let scores = if skewed {
+                (0..tokens)
+                    .flat_map(|_| (0..experts).map(|e| -(e as f32)))
+                    .collect::<Vec<_>>()
+            } else {
+                values(tokens * experts, 316, 2.0)
+            };
+            let logits = Tensor::from_slice(&scores, (tokens, experts), device)?;
+            let mut assignments = vec![Vec::new(); experts];
+            for token in 0..tokens {
+                let mut ids: Vec<_> = (0..experts).collect();
+                ids.sort_unstable_by(|&a, &b| {
+                    scores[token * experts + b]
+                        .total_cmp(&scores[token * experts + a])
+                        .then(a.cmp(&b))
+                });
+                for &expert in &ids[..top_k] {
+                    assignments[expert].push(token as u32);
+                }
+            }
+            let mut separate = Vec::new();
+            for (expert, ids) in assignments
+                .iter()
+                .enumerate()
+                .filter(|(_, ids)| !ids.is_empty())
+            {
+                let w = PackedLinear::quantized(
+                    &weight.narrow(0, expert * output, output)?.contiguous()?,
+                    GgmlDType::Q8_0,
+                    device,
+                )?;
+                let selected = x.index_select(&Tensor::new(ids.as_slice(), device)?, 0)?;
+                separate.push((w, selected));
+            }
+            let individual = time(device, || {
+                let outputs = separate
+                    .iter()
+                    .map(|(w, x)| kernels.linear(w, x))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Tensor::cat(&outputs, 0)?)
+            })?;
+            let batched = time(device, || {
+                let routes = kernels.route(&logits, top_k)?;
+                kernels.expert_linear(&grouped, &kernels.expert_gather(&x, &routes)?, &routes)
+            })?;
+            eprintln!(
+                "MoE {tokens} tokens, skew {skewed}: grouped {:.3} ms, individual {:.3} ms",
+                batched["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
+                individual["median_seconds"].as_f64().unwrap_or(0.0) * 1e3
+            );
+            cases.push(json!({"experts": experts, "top_k": top_k, "input": input, "output": output, "tokens": tokens,
+                "skewed": skewed, "active_experts": separate.len(), "weights": "q8_0", "resident_bytes": grouped.resident_bytes(),
+                "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+                "grouped_including_routing_gather": batched, "individual_prepared_inputs": individual}));
+        }
+    }
+    Ok(cases)
+}
+
 fn main() -> Result<()> {
     let device = Device::new_metal(0)?;
     let kernels = Kernels::new(&device)?;
@@ -723,6 +792,7 @@ fn main() -> Result<()> {
             "tiled_attention": if skip("tiled") { json!([]) } else { json!(tiled_cases(&device, &kernels)?) },
             "packed_linear": if skip("linear") { json!([]) } else { json!(gemv_cases(&device, &kernels)?) },
             "sampling": if skip("sample") { json!([]) } else { json!(sample_cases(&device, &kernels)?) },
+            "moe": if skip("moe") { json!([]) } else { json!(moe_cases(&device, &kernels)?) },
         },
     });
     let text = serde_json::to_string_pretty(&document)?;

@@ -3,7 +3,10 @@ use clap::Parser;
 use std::{io::Write, path::PathBuf};
 use tur::{
     ModelFactory, ModelSource, Result,
-    backend::pipeline::{GenerationRequest, InferencePipeline, PipelineConfig},
+    backend::{
+        pipeline::{GenerationRequest, InferencePipeline, PipelineConfig},
+        speculation::SpeculationConfig,
+    },
     core::execution::{KvFormat, KvLayout},
     models::qwen3_5::{
         DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, WeightFormat, parse_recurrent_state,
@@ -64,6 +67,11 @@ struct Args {
     tools: Option<PathBuf>,
     #[arg(long, default_value_t = 256)]
     prefill_chunk_size: usize,
+    /// Maximum prompt-lookup drafts per decode. Opt-in throughput mode: tokens arrive in
+    /// bursts and pauses can grow. Zero disables it; draft length adapts to measured cost.
+    /// Requires F32 recurrent state; narrower state automatically uses ordinary decoding.
+    #[arg(long, default_value_t = 0)]
+    speculative_draft: usize,
     /// K/V storage: f32, f16, q8 (one scale per 32 dimensions, half of F16's memory) or
     /// q8_<group>.
     #[arg(long, default_value_t = DEFAULT_KV_LAYOUT.format)]
@@ -112,6 +120,7 @@ fn main() -> Result<()> {
     let mut pipeline = InferencePipeline::new(
         &factory,
         PipelineConfig {
+            speculation: SpeculationConfig::new(args.speculative_draft),
             state_bytes: args.state_memory_mb.map(|mb| mb << 20),
             ..PipelineConfig::new(1, args.prefill_chunk_size)
         },

@@ -236,6 +236,8 @@ async fn test_http_preserves_sampling_thinking_and_tool_history() -> Result<()> 
                 elapsed: Duration::ZERO,
                 first_token: Duration::ZERO,
                 preemptions: 0,
+                draft_tokens: 0,
+                accepted_draft_tokens: 0,
                 generated_text: String::new(),
                 tool_calls: Vec::new(),
                 finish_reason: "stop",

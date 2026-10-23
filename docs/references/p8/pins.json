@@ -1,0 +1,16 @@
+{
+  "qwen3.6": "995ad96eacd98c81ed38be0c5b274b04031597b0",
+  "transformers": "ea52711b4850c332be3f778396ce882ab84a9011",
+  "gemma4": "24548b62aa021d562695c04aaf7758a1ea47990b",
+  "files": {
+    "configuration_qwen3_5_moe.py": "697f1db9b92e91f39492d70b91f53f7eba4d84d1f19fec2f0d3b7053a0943110",
+    "gemma4-config.json": "0364256c5de7863a22b5dd666043d542d42b681c02fd83eb67dc7b483d859e96",
+    "modeling_gemma4.py": "a6d2bf3da6693806d91c29c8da34378565d6f1159cc2a483308228ded411ea55",
+    "modeling_qwen3_5_moe.py": "d7af486212a195a301ef30a4358054492e461e4597d830c25a5727e036a4c6c2",
+    "qwen3.6-chat_template.jinja": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+    "qwen3.6-config.json": "93a4693fa9d8392fbfccd4b3c9873f4bfdcb14fdede978b123d07d19675efe99",
+    "qwen3.6-generation_config.json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+    "qwen3.6-model.safetensors.index.json": "41b9356101ebf8e7519e150dc811f80c4226e727301fbb032b890f006ed0be83",
+    "qwen3.6-text-tensors.json": "69424424f4f9251cc32aa97d078426021ea14a85f196bfe0845060dbcee49951"
+  }
+}

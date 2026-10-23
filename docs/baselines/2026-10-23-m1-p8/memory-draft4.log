@@ -1,0 +1,20 @@
+speculation repeat c=8 draft=4: 195.1 out tok/s, TTFT p50 786 ms, ITL p50/p95 0.0/52.3 ms, pass p50 51.5 ms (schedule 0.03, encode 2.23, wait 49.3, publish 0.11, idle 0.14), cached 0
+speculation novel c=8 draft=4: 195.8 out tok/s, TTFT p50 377 ms, ITL p50/p95 29.4/30.2 ms, pass p50 29.4 ms (schedule 0.02, encode 1.92, wait 27.2, publish 0.08, idle 0.10), cached 0
+        9.55 real         2.39 user         1.05 sys
+          4036411392  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              332576  page reclaims
+                 318  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 177  voluntary context switches
+               18387  involuntary context switches
+         23003654972  instructions retired
+          9652173225  cycles elapsed
+          6199829888  peak memory footprint

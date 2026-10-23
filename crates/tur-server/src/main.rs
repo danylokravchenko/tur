@@ -3,7 +3,10 @@ use clap::Parser;
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration};
 use tur::{
     ModelFactory, ModelSource, Result, TurError,
-    backend::{memory::DeviceBudget, pipeline::PipelineConfig, prefix::PrefixConfig},
+    backend::{
+        memory::DeviceBudget, pipeline::PipelineConfig, prefix::PrefixConfig,
+        speculation::SpeculationConfig,
+    },
     core::execution::{KvFormat, KvLayout},
     models::qwen3_5::{
         DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, WeightFormat, parse_recurrent_state,
@@ -51,6 +54,11 @@ struct Args {
     /// Largest prefill chunk of one request in one pass.
     #[arg(long, default_value_t = 256)]
     prefill_chunk_size: usize,
+    /// Maximum prompt-lookup drafts per decode. Opt-in throughput mode: tokens arrive in
+    /// bursts and pauses can grow. Zero disables it; draft length adapts to measured cost.
+    /// Requires F32 recurrent state; narrower state automatically uses ordinary decoding.
+    #[arg(long, default_value_t = 0)]
+    speculative_draft: usize,
     /// Tokens in one packed pass. Default: one prefill chunk beside every decode.
     #[arg(long)]
     max_batch_tokens: Option<usize>,
@@ -118,6 +126,7 @@ async fn main() -> Result<()> {
         }
     };
     let mut pipeline = PipelineConfig {
+        speculation: SpeculationConfig::new(args.speculative_draft),
         state_bytes: args.state_memory_mb.map(|mb| mb << 20),
         ..PipelineConfig::new(args.max_batch_size, args.prefill_chunk_size)
     };

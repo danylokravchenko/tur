@@ -1,0 +1,10 @@
+    Blocking waiting for file lock on build directory
+    Checking tur-metal v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-metal)
+    Checking tur-models v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-models)
+    Checking tur-engine v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-engine)
+    Checking tur v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur)
+    Checking tur-cli v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-cli)
+    Checking tur-server v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.65s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

@@ -1,0 +1,149 @@
+   Compiling tur-metal v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-metal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.00s
+     Running tests/kernels.rs (target/debug/deps/kernels-4f1939bb12d1f1a2)
+
+running 1 test
+test test_grouped_expert_gemm_preserves_routing_skew_ties_and_packed_weights ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 3.05s
+
+    Blocking waiting for file lock on build directory
+   Compiling tur-engine v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.14s
+     Running unittests src/lib.rs (target/debug/deps/tur_engine-940d8655c0705d17)
+
+running 34 tests
+test backend::memory::tests::test_budget_boundaries_fit_without_overallocating_the_zero_slot ... ok
+test backend::memory::tests::test_concurrent_leases_never_exceed_the_limit ... ok
+test backend::memory::tests::test_default_budget_sizes_contexts_and_fits_the_device_limit ... ok
+test backend::memory::tests::test_explicit_budget_beyond_the_device_limit_is_rejected ... ok
+test backend::memory::tests::test_models_sharing_a_device_budget_cannot_overcommit ... ok
+test backend::pipeline::tests::test_sampling_uses_checkpoint_defaults_and_explicit_greedy ... ok
+test backend::prefix::tests::test_a_whole_prompt_hit_needs_the_snapshot_logits ... ok
+test backend::prefix::tests::test_disabled_cache_never_aligns_or_stores ... ok
+test backend::prefix::tests::test_eviction_prefers_unused_entries_and_releases_leases ... ok
+test backend::prefix::tests::test_hash_matches_are_verified_against_tokens ... ok
+test backend::prefix::tests::test_lookup_returns_the_deepest_verified_admissible_prefix ... ok
+test backend::scheduler::tests::test_aged_prefill_reclaims_younger_state_and_running_slots ... ok
+test backend::scheduler::tests::test_config_validation_rejects_passes_without_decode_room ... ok
+test backend::scheduler::tests::test_cost_samples_are_normalized_for_ragged_token_counts ... ok
+test backend::scheduler::tests::test_decodes_run_first_and_prefill_keeps_its_minimum ... ok
+test backend::scheduler::tests::test_measured_costs_shrink_prefill_by_bounded_steps ... ok
+test backend::scheduler::tests::test_memory_shortage_preempts_the_newest_running_request ... ok
+test backend::scheduler::tests::test_replay_chunks_remain_indivisible_under_cost_and_token_pressure ... ok
+test backend::scheduler::tests::test_skipped_decodes_rotate_to_the_front ... ok
+test backend::scheduler::tests::test_waiting_queue_limits_requests_and_tokens ... ok
+test backend::speculation::tests::test_acceptance_rises_with_accepted_drafts_and_recovers_towards_the_prior ... ok
+test backend::speculation::tests::test_config_validation ... ok
+test backend::speculation::tests::test_cost_fit_separates_base_and_draft_costs ... ok
+test backend::speculation::tests::test_incremental_index_matches_rebuilt_index ... ok
+test backend::speculation::tests::test_long_history_lookup_has_a_bounded_index ... ok
+test backend::speculation::tests::test_longest_latest_suffix_match_proposes_its_continuation ... ok
+test backend::speculation::tests::test_plan_drafts_while_expected_throughput_rises ... ok
+test backend::speculation::tests::test_unmeasured_costs_alternate_between_drafting_and_not ... ok
+test hybrid::tests::test_greedy_fast_path_keeps_the_first_maximum_and_rejects_nonfinite_rows ... ok
+test hybrid::tests::test_invalid_sampling_options_do_not_allocate_requests ... ok
+test hybrid::tests::test_penalty_history_counts_samples_and_rolls_back ... ok
+test hybrid::tests::test_revision_overflow_rejects_submission_and_restore_without_changes ... ok
+test hybrid::tests::test_rng_counter_overflow_leaves_bookkeeping_unchanged ... ok
+test hybrid::tests::test_rollback_restores_history_and_draws ... ok
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/hybrid_contracts.rs (target/debug/deps/hybrid_contracts-afdacd89b73f9d1e)
+
+running 22 tests
+test test_cancellation_holds_shared_model_until_completion ... ok
+test test_cancellation_retains_inflight_state_and_does_not_publish_outputs ... ok
+test test_checkpoint_fork_restore_crosses_partial_attention_pages_and_all_recurrent_layers ... ok
+test test_checkpoint_tensor_inspection_cannot_mutate_shared_state ... ok
+test test_deterministic_drafts_preserve_target_sampling_rng_penalties_and_every_layer ... ok
+test test_grammar_parser_fork_speculation_restore_and_terminal_state_are_atomic ... ok
+test test_incompatible_restore_and_foreign_handles_leave_state_unchanged ... ok
+test test_independent_requests_match_single_execution_after_batch_reordering ... ok
+test test_invalid_descriptors_are_rejected_before_model_execution ... ok
+test test_invalid_output_is_isolated_and_its_state_writes_are_never_published ... ok
+test test_no_output_positions_advance_only_model_state ... ok
+test test_one_request_failure_does_not_affect_others ... ok
+test test_ordinary_execution_retains_only_final_recurrent_boundary ... ok
+test test_packed_prefill_matches_incremental_decode ... ok
+test test_pool_exhaustion_fails_the_pass_before_execution_and_leaves_state_unchanged ... ok
+test test_position_overflow_and_limit_are_checked ... ok
+test test_published_descriptors_are_invalidated ... ok
+test test_released_pages_and_slots_are_reclaimed_after_completion ... ok
+test test_speculative_acceptance_follows_sampled_tokens ... ok
+test test_speculative_rejection_keeps_only_the_verified_token ... ok
+test test_terminal_grammar_does_not_fail_other_requests ... ok
+test test_whole_batch_model_error_leaves_every_request_unchanged ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/qwen3_5_moe.rs (target/debug/deps/qwen3_5_moe-0510249c81b04786)
+
+running 3 tests
+test test_moe_config_and_weight_mapping_match_the_pinned_checkpoint ... ok
+test test_moe_fused_packed_prefill_decode_and_rollback_match_reference ... ok
+test test_moe_reference_matches_independent_transformers_layers_and_logits ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.11s
+
+   Compiling tur-metal v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-metal)
+   Compiling tur-models v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-models)
+   Compiling tur-engine v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-engine)
+   Compiling tur v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.77s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/speculation.rs (target/debug/deps/speculation-ca31a72f6fe7c829)
+
+running 7 tests
+test test_batch_drafts_share_a_bound_and_cancel_without_leaks ... ok
+test test_constraints_and_eos_do_not_publish_extra_draft_outputs ... ok
+test test_draft_reservation_does_not_overcommit_an_explicit_state_budget ... ok
+test test_lookup_verification_matches_target_sampling_and_request_limits ... ok
+test test_narrow_recurrent_state_automatically_disables_speculation ... ok
+test test_prefix_snapshots_remain_at_the_accepted_boundary ... ok
+test test_speculative_device_sampling_preserves_seeded_penalties_and_outputs ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.40s
+
+   Compiling tur-core v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-core)
+   Compiling tur-metal v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-metal)
+   Compiling tur-models v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-models)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.34s
+     Running unittests src/lib.rs (target/debug/deps/tur_models-b2cf6c5e85127948)
+
+running 1 test
+test models::qwen3_5::weights::tests::test_streaming_headers_validate_layout_and_payload_length_before_reading_weights ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.54s
+     Running unittests src/lib.rs (target/debug/deps/tur_models-b2cf6c5e85127948)
+
+running 22 tests
+test backend::tools::tests::test_parse_no_tool_calls ... ok
+test backend::factory::tests::test_checkpoint_paths_cannot_escape_snapshot ... ok
+test backend::factory::tests::test_mutable_remote_revision_rejected_without_network ... ok
+test backend::tools::tests::test_parse_multiple_tool_calls ... ok
+test backend::tools::tests::test_parse_single_tool_call ... ok
+test backend::tools::tests::test_parse_malformed_json_skipped ... ok
+test backend::tools::tests::test_xml_calls_preserve_schema_types_and_reject_incomplete_calls ... ok
+test backend::chat_template::tests::test_invalid_template_is_rejected ... ok
+test models::qwen3_5::config::tests::test_generation_defaults_merge_eos_and_sampling ... ok
+test backend::chat_template::tests::test_unset_thinking_differs_from_explicit_false ... ok
+test models::qwen3_5::math::tests::test_convolution_matches_stepwise_window_and_histories ... ok
+test models::qwen3_5::config::tests::test_pinned_configs_parse_with_hybrid_layout ... ok
+test models::qwen3_5::math::tests::test_norms_follow_reference_formulas ... ok
+test models::qwen3_5::config::tests::test_unsupported_layouts_are_rejected ... ok
+test models::qwen3_5::math::tests::test_rotary_rotates_leading_halves_and_passes_tail ... ok
+test models::qwen3_5::model::moe::tests::test_top_k_preserves_precision_ties_and_normalized_probabilities ... ok
+test models::qwen3_5::config::tests::test_tokenizer_modality_placeholders_are_forbidden ... ok
+test models::qwen3_5::math::tests::test_delta_split_sequence_equals_whole_sequence ... ok
+test models::qwen3_5::math::tests::test_attention_prefill_matches_incremental_queries ... ok
+test models::qwen3_5::weights::tests::test_streaming_headers_validate_layout_and_payload_length_before_reading_weights ... ok
+test models::qwen3_5::config::tests::test_flagship_weight_shapes_match_pinned_checkpoint_headers ... ok
+test models::qwen3_5::math::tests::test_chunked_delta_matches_recurrence_across_partial_chunks ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+

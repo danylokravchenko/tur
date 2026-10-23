@@ -1,4 +1,4 @@
-//! Validated configuration for the dense, text-only Qwen3.5 architecture (also Qwen3.8).
+//! Validated text configuration for dense and expert Qwen3.5 architectures (3.8/3.6).
 
 use candle_core::DType;
 use serde::Deserialize;
@@ -33,6 +33,7 @@ pub(super) struct Rope {
 pub(super) struct TextConfig {
     pub model_type: String,
     pub hidden_size: usize,
+    #[serde(default)]
     pub intermediate_size: usize,
     pub vocab_size: usize,
     pub num_hidden_layers: usize,
@@ -94,9 +95,18 @@ struct RawGeneration {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub(super) text: TextConfig,
+    pub(super) moe: Option<MoeConfig>,
     pub(super) prefix: String,
     forbidden_tokens: Vec<u32>,
     eos: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub(super) struct MoeConfig {
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub moe_intermediate_size: usize,
+    pub shared_expert_intermediate_size: usize,
 }
 
 impl Config {
@@ -121,31 +131,87 @@ impl Config {
             (Some("qwen3_5_text"), Some(a)) if a == &[serde_json::json!("Qwen3_5ForCausalLM")] => {
                 (&raw, "model")
             }
+            (Some("qwen3_5_moe"), Some(a))
+                if a == &[serde_json::json!("Qwen3_5MoeForConditionalGeneration")] =>
+            {
+                (
+                    raw.get("text_config")
+                        .ok_or_else(|| invalid("qwen3_5_moe requires text_config"))?,
+                    "model.language_model",
+                )
+            }
+            (Some("qwen3_5_moe_text"), Some(a))
+                if a == &[serde_json::json!("Qwen3_5MoeForCausalLM")] =>
+            {
+                (&raw, "model")
+            }
             _ => {
                 return Err(invalid(
-                    "unsupported architecture: expected dense Qwen3_5 conditional generation or text causal LM",
+                    "unsupported architecture: expected Qwen3_5 dense or MoE conditional generation or text causal LM",
                 ));
             }
         };
+        let is_moe = matches!(
+            raw["model_type"].as_str(),
+            Some("qwen3_5_moe" | "qwen3_5_moe_text")
+        );
+        let moe: Option<MoeConfig> = if is_moe {
+            let moe: MoeConfig = serde_json::from_value(text.clone())?;
+            if moe.num_experts == 0
+                || moe.num_experts > 256
+                || moe.num_experts_per_tok == 0
+                || moe.num_experts_per_tok > moe.num_experts
+                || moe.moe_intermediate_size == 0
+                || moe.shared_expert_intermediate_size == 0
+            {
+                return Err(invalid("invalid Qwen3.5 MoE expert count, top-k or width"));
+            }
+            Some(moe)
+        } else {
+            None
+        };
         for settings in [&raw, text] {
-            for key in [
-                "quantization_config",
-                "rope_scaling",
-                "num_experts",
-                "moe_intermediate_size",
-                "sliding_window",
-            ] {
+            for key in ["quantization_config", "rope_scaling", "sliding_window"] {
                 if settings.get(key).is_some_and(|v| !v.is_null()) {
                     return Err(invalid(format!("unsupported Qwen3.5 setting: {key}")));
                 }
+            }
+            if !is_moe
+                && [
+                    "num_experts",
+                    "moe_intermediate_size",
+                    "shared_expert_intermediate_size",
+                    "num_experts_per_tok",
+                ]
+                .iter()
+                .any(|key| settings.get(key).is_some_and(|v| !v.is_null()))
+            {
+                return Err(invalid("MoE settings require an explicit MoE architecture"));
+            }
+            if settings.get("norm_topk_prob").is_some_and(|v| v != true)
+                || settings.get("decoder_sparse_step").is_some_and(|v| v != 1)
+            {
+                return Err(invalid(
+                    "unsupported MoE routing normalization or sparse layer interval",
+                ));
             }
             let mlp_only = settings.get("mlp_only_layers").filter(|v| !v.is_null());
             if mlp_only.is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty())) {
                 return Err(invalid("MLP-only layers are unsupported"));
             }
         }
-        let text: TextConfig = serde_json::from_value(text.clone())?;
-        if text.model_type != "qwen3_5_text"
+        let mut text: TextConfig = serde_json::from_value(text.clone())?;
+        if let Some(moe) = &moe {
+            text.intermediate_size = moe
+                .moe_intermediate_size
+                .max(moe.shared_expert_intermediate_size);
+        }
+        if text.model_type
+            != if is_moe {
+                "qwen3_5_moe_text"
+            } else {
+                "qwen3_5_text"
+            }
             || text.hidden_act != "silu"
             || text.attention_bias
             || text.attention_dropout != 0.0
@@ -248,6 +314,7 @@ impl Config {
         }
         let config = Self {
             text,
+            moe,
             prefix: prefix.into(),
             forbidden_tokens,
             eos,
@@ -453,16 +520,49 @@ impl Config {
             for n in ["input_layernorm", "post_attention_layernorm"] {
                 shapes.insert(format!("{p}.{n}.weight"), vec![t.hidden_size]);
             }
-            for n in ["gate_proj", "up_proj"] {
+            if let Some(moe) = &self.moe {
                 shapes.insert(
-                    format!("{p}.mlp.{n}.weight"),
-                    vec![t.intermediate_size, t.hidden_size],
+                    format!("{p}.mlp.gate.weight"),
+                    vec![moe.num_experts, t.hidden_size],
+                );
+                shapes.insert(
+                    format!("{p}.mlp.experts.gate_up_proj"),
+                    vec![
+                        moe.num_experts,
+                        checked_elements(&[2, moe.moe_intermediate_size])?,
+                        t.hidden_size,
+                    ],
+                );
+                shapes.insert(
+                    format!("{p}.mlp.experts.down_proj"),
+                    vec![moe.num_experts, t.hidden_size, moe.moe_intermediate_size],
+                );
+                shapes.insert(
+                    format!("{p}.mlp.shared_expert_gate.weight"),
+                    vec![1, t.hidden_size],
+                );
+                for n in ["gate_proj", "up_proj"] {
+                    shapes.insert(
+                        format!("{p}.mlp.shared_expert.{n}.weight"),
+                        vec![moe.shared_expert_intermediate_size, t.hidden_size],
+                    );
+                }
+                shapes.insert(
+                    format!("{p}.mlp.shared_expert.down_proj.weight"),
+                    vec![t.hidden_size, moe.shared_expert_intermediate_size],
+                );
+            } else {
+                for n in ["gate_proj", "up_proj"] {
+                    shapes.insert(
+                        format!("{p}.mlp.{n}.weight"),
+                        vec![t.intermediate_size, t.hidden_size],
+                    );
+                }
+                shapes.insert(
+                    format!("{p}.mlp.down_proj.weight"),
+                    vec![t.hidden_size, t.intermediate_size],
                 );
             }
-            shapes.insert(
-                format!("{p}.mlp.down_proj.weight"),
-                vec![t.hidden_size, t.intermediate_size],
-            );
             let entries = match kind {
                 LayerKind::FullAttention => vec![
                     (

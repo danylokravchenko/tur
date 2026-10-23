@@ -116,6 +116,114 @@ fn test_capabilities_and_pipelines_compile() -> Result<()> {
 }
 
 #[test]
+fn test_grouped_expert_gemm_preserves_routing_skew_ties_and_packed_weights() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    let (width, out) = (256, 37);
+    for experts in [9, 256] {
+        let weights = upload(
+            &device,
+            &values(experts * out * width, 42, 0.2),
+            &[experts * out, width],
+        )?;
+        for format in [
+            None,
+            Some(candle_core::quantized::GgmlDType::Q8_0),
+            Some(candle_core::quantized::GgmlDType::Q4K),
+        ] {
+            let layer = match format {
+                Some(format) => PackedLinear::quantized(&weights, format, &device)?,
+                None => PackedLinear::dense(&weights, &device)?,
+            };
+            let dense = match format {
+                Some(format) => candle_core::quantized::QTensor::quantize(
+                    &weights.to_device(&Device::Cpu)?,
+                    format,
+                )?
+                .dequantize(&Device::Cpu)?,
+                None => weights.to_device(&Device::Cpu)?,
+            }
+            .to_vec2::<f32>()?;
+            for (tokens, top_k, skewed) in
+                [(1, 2, true), (7, 8, false), (19, 2, false), (19, 2, true)]
+            {
+                let x = upload(
+                    &device,
+                    &values(tokens * (width + 7), 77, 1.0),
+                    &[tokens, width + 7],
+                )?
+                .narrow(1, 3, width)?;
+                let scores: Vec<f32> = (0..tokens)
+                    .flat_map(|t| {
+                        (0..experts).map(move |e| {
+                            if skewed {
+                                1000.0 - e as f32
+                            } else {
+                                ((t * 13 + e * 7) % experts) as f32
+                            }
+                        })
+                    })
+                    .collect();
+                let logits = upload(&device, &scores, &[tokens, experts])?;
+                let routes = kernels.route(&logits, top_k)?;
+                let gathered = kernels.expert_gather(&x, &routes)?;
+                let output = kernels
+                    .expert_scatter(&kernels.expert_linear(&layer, &gathered, &routes)?, &routes)?;
+                let host_x = x.to_vec2::<f32>()?;
+                let mut expected = Vec::new();
+                for t in 0..tokens {
+                    let mut chosen: Vec<_> = (0..experts).collect();
+                    chosen.sort_unstable_by(|&a, &b| {
+                        scores[t * experts + b]
+                            .total_cmp(&scores[t * experts + a])
+                            .then(a.cmp(&b))
+                    });
+                    chosen.truncate(top_k);
+                    let max = scores[t * experts + chosen[0]];
+                    let sum: f32 = chosen
+                        .iter()
+                        .map(|&e| (scores[t * experts + e] - max).exp())
+                        .sum();
+                    chosen.sort_unstable();
+                    for col in 0..out {
+                        expected.push(
+                            chosen
+                                .iter()
+                                .map(|&e| {
+                                    let value: f64 = host_x[t]
+                                        .iter()
+                                        .zip(&dense[e * out + col])
+                                        .map(|(&x, &w)| f64::from(x) * f64::from(w))
+                                        .sum();
+                                    value * f64::from((scores[t * experts + e] - max).exp() / sum)
+                                })
+                                .sum(),
+                        );
+                    }
+                }
+                let error = relative_error(&read(&output)?, &expected);
+                assert!(
+                    error < 2e-5,
+                    "{format:?}, {tokens} tokens, skew {skewed}: {error}"
+                );
+            }
+        }
+    }
+    // An invalid routing row never becomes an out-of-bounds expert or permutation index.
+    let logits = upload(&device, &[1.0, 1.0, f32::INFINITY, 0.0], &[2, 2])?;
+    let routes = kernels.route(&logits, 1)?;
+    let x = upload(&device, &[2.0, 4.0], &[2, 1])?;
+    let gathered = kernels.expert_gather(&x, &routes)?;
+    let output = kernels
+        .expert_scatter(&gathered, &routes)?
+        .to_vec2::<f32>()?;
+    assert_eq!(output[0], [2.0]);
+    assert!(output[1][0].is_nan());
+    assert!(kernels.route(&logits, 0).is_err());
+    assert!(kernels.route(&logits, 3).is_err());
+    Ok(())
+}
+
+#[test]
 fn test_rms_norm_matches_reference_on_strided_rows() -> Result<()> {
     let (device, kernels, _gpu) = setup()?;
     let (rows, stride, width) = (5, 1030, 1000);

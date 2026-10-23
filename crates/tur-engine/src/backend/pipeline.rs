@@ -24,6 +24,9 @@ use super::{
     memory::{BudgetLease, DeviceBudget, MemoryPlan, PlanInputs},
     prefix::{PrefixCache, PrefixConfig, PrefixKeys, PrefixStats},
     scheduler::{Candidate, Chunk, Decision, Scheduler, SchedulerConfig},
+    speculation::{
+        self, Acceptance, DraftCosts, NgramIndex, Proposal, SpeculationConfig, SpeculationStats,
+    },
     tokenizer::TokenOutputStream,
 };
 use crate::{
@@ -84,6 +87,9 @@ pub struct GenerationStats {
     pub first_token: Duration,
     /// Times the request's state was released under memory pressure and recomputed.
     pub preemptions: usize,
+    /// Speculative draft tokens verified, and how many of them the target accepted.
+    pub draft_tokens: usize,
+    pub accepted_draft_tokens: usize,
     pub tool_calls: Vec<ToolCall>,
     pub generated_text: String,
     /// `stop` for EOS, `length` for the request limit.
@@ -108,6 +114,8 @@ pub struct BatchStepOutput {
 pub struct PassTiming {
     pub tokens: usize,
     pub sequences: usize,
+    /// Speculative draft tokens among `tokens`.
+    pub drafts: usize,
     /// Expiry, prefix restore, scheduling and packing.
     pub schedule: Duration,
     /// Validation, reservation and encoding.
@@ -128,6 +136,10 @@ pub struct PassTiming {
 /// A submitted pass awaiting `finish_step`.
 struct InFlight {
     chunks: Vec<Chunk>,
+    /// Speculative drafts appended to each chunk's single decode token.
+    drafts: Vec<Vec<u32>>,
+    /// Every chunk is a decode, so the pass's cost feeds the draft cost fit.
+    decode_only: bool,
     context: usize,
     started: Instant,
     submitted: Instant,
@@ -159,6 +171,12 @@ struct Pending {
     last_run: u64,
     preemptions: usize,
     tools: Vec<ToolDefinition>,
+    /// Grammar-constrained: never drafted, so masks stay on the device.
+    constrained: bool,
+    ngrams: NgramIndex,
+    acceptance: Acceptance,
+    drafted: usize,
+    accepted_drafts: usize,
 }
 
 impl Pending {
@@ -207,6 +225,9 @@ pub struct PipelineConfig {
     /// Penalize and sample unconstrained rows on the device (when the model runs on Metal
     /// kernels); otherwise every full row is copied to the host sampler.
     pub device_sampling: bool,
+    /// Opt-in throughput mode using drafts from each request's own history. Tokens arrive
+    /// in bursts; longer pauses can increase p95 inter-token latency. Disabled by default.
+    pub speculation: SpeculationConfig,
     /// Bytes for K/V pages and recurrent state. `None` sizes the pool for
     /// `max_running` contexts of [`super::memory::DEFAULT_CONTEXT_TOKENS`] tokens, within
     /// what the device budget leaves.
@@ -226,17 +247,20 @@ impl PipelineConfig {
                 state_share: Some(PrefixConfig::DEFAULT_STATE_SHARE),
             },
             device_sampling: true,
+            speculation: SpeculationConfig::DISABLED,
             state_bytes: None,
         }
     }
 
     /// Reproducibility mode: one request at a time in fixed `prefill_chunk_size` chunks,
-    /// without prefix reuse, so a request's computation (and with its seed, its tokens)
-    /// does not depend on other traffic. Batched passes can change logits in their last
-    /// bits through batch-dependent kernels; this mode trades throughput to rule that out.
+    /// without prefix reuse or speculation, so a request's computation (and with its seed,
+    /// its tokens) does not depend on other traffic. Batched passes can change logits in
+    /// their last bits through batch-dependent kernels; this mode trades throughput to rule
+    /// that out.
     pub fn reproducible(prefill_chunk_size: usize) -> Self {
         Self {
             prefix: PrefixConfig::DISABLED,
+            speculation: SpeculationConfig::DISABLED,
             ..Self::new(1, prefill_chunk_size)
         }
     }
@@ -264,6 +288,11 @@ pub struct InferencePipeline {
     staged: BatchStepOutput,
     /// Grammar parser factory over the tokenizer, built on the first constrained request.
     guidance: Option<Arc<ParserFactory>>,
+    speculation: SpeculationConfig,
+    draft_costs: DraftCosts,
+    /// Pipeline-wide acceptance, the starting estimate of new requests.
+    acceptance: Acceptance,
+    speculation_stats: SpeculationStats,
 }
 
 fn sampling(overrides: SamplingOptions, defaults: &GenerationDefaults) -> SamplingOptions {
@@ -291,7 +320,29 @@ impl InferencePipeline {
         budget: &DeviceBudget,
     ) -> Result<Self> {
         let scheduler = Scheduler::new(config.scheduler)?;
+        config.speculation.validate()?;
+        // Narrow state rounds at ordinary pass boundaries; a multi-token verification
+        // keeps F32 intermediates between drafts, so it is not the same target process.
+        let config = PipelineConfig {
+            speculation: if factory.recurrent == candle_core::DType::F32 {
+                config.speculation
+            } else {
+                SpeculationConfig::DISABLED
+            },
+            ..config
+        };
         let limits = config.scheduler;
+        let draft_rows = config
+            .speculation
+            .max_pass_drafts
+            .min(
+                config
+                    .speculation
+                    .max_draft
+                    .saturating_mul(limits.max_running),
+            )
+            .min(limits.max_batch_tokens.saturating_sub(1));
+        let draft_slots = draft_rows;
         let (model, tokenizer, template, defaults, (plan, pool, lease)) = factory
             .create_model_with(|architecture, options| {
                 let tokens = limits.max_batch_tokens;
@@ -302,12 +353,13 @@ impl InferencePipeline {
                     tokens,
                     &vec![architecture.max_position(); sequences],
                 )?;
-                // Full model logits and their gathered copy coexist for sampled requests.
+                // Full model logits and their gathered copy coexist for sampled requests;
+                // every drafted token adds an output row.
                 let in_flight = description
                     .vocab_size
                     .checked_mul(8)
                     .and_then(|row| row.checked_add(16))
-                    .and_then(|row| sequences.checked_mul(row))
+                    .and_then(|row| sequences.checked_add(draft_rows)?.checked_mul(row))
                     .and_then(|logits| logits.checked_add(tokens.checked_mul(12)?))
                     // Prompt-end snapshots keep one F32 logit row each.
                     .and_then(|bytes| {
@@ -319,6 +371,13 @@ impl InferencePipeline {
                         )
                     })
                     .ok_or_else(|| invalid("in-flight size overflow"))?;
+                let in_flight = in_flight
+                    .checked_add(
+                        config
+                            .speculation
+                            .index_bytes(sequences, architecture.max_position())?,
+                    )
+                    .ok_or_else(|| invalid("draft index reservation overflow"))?;
                 let (plan, pool) = MemoryPlan::new(
                     &description,
                     PlanInputs {
@@ -328,6 +387,7 @@ impl InferencePipeline {
                         sequences: limits.max_running,
                         retained: config.prefix.entries,
                         retained_share: config.prefix.state_share,
+                        draft_slots,
                         state_bytes: config.state_bytes,
                         limit: budget.limit(),
                         reserved: budget.leased(),
@@ -364,6 +424,10 @@ impl InferencePipeline {
             in_flight: None,
             staged: BatchStepOutput::default(),
             guidance: None,
+            speculation: config.speculation,
+            draft_costs: DraftCosts::default(),
+            acceptance: Acceptance::default(),
+            speculation_stats: SpeculationStats::default(),
         })
     }
 
@@ -394,6 +458,16 @@ impl InferencePipeline {
     /// Prefix reuse counters.
     pub fn prefix_stats(&self) -> PrefixStats {
         self.prefix.stats()
+    }
+
+    /// Speculative decoding counters.
+    pub fn speculation_stats(&self) -> SpeculationStats {
+        self.speculation_stats
+    }
+
+    /// Measured device cost of decode-only passes against their drafted tokens.
+    pub fn draft_costs(&self) -> &DraftCosts {
+        &self.draft_costs
     }
 
     /// Drop every prefix snapshot; their pages and slots return once no request shares
@@ -469,6 +543,7 @@ impl InferencePipeline {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(TurError::DeadlineExceeded);
         }
+        let constrained = request.grammar.is_some();
         let guidance = request
             .grammar
             .clone()
@@ -514,6 +589,11 @@ impl InferencePipeline {
                 last_run: 0,
                 preemptions: 0,
                 tools: request.tools.clone(),
+                constrained,
+                ngrams: NgramIndex::default(),
+                acceptance: self.acceptance,
+                drafted: 0,
+                accepted_drafts: 0,
             },
         );
         Ok(handle.request)
@@ -549,6 +629,7 @@ impl InferencePipeline {
         pending.handle = self.engine.release_state(pending.handle)?;
         pending.consumed = 0;
         pending.running = false;
+        pending.ngrams = NgramIndex::default();
         pending.preemptions += 1;
         tracing::debug!(request = %id, tokens = pending.tokens.len(), "preempted for recompute");
         Ok(())
@@ -589,18 +670,8 @@ impl InferencePipeline {
         let prompt_end = commit.accepted_tokens > 0
             && pending.consumed == pending.prompt_tokens
             && pending.tokens.len() == pending.prompt_tokens;
-        if self.prefix.is_boundary(pending.consumed) || prompt_end {
-            let prefix = &pending.tokens[..pending.consumed];
-            self.prefix.extend(&mut pending.keys, prefix);
-            let state = self.engine.model_state(pending.handle)?;
-            let logits = logits
-                .filter(|_| prompt_end)
-                // An allocated copy: `Tensor::copy` shares storage on Metal.
-                .map(|logits| logits.force_contiguous())
-                .transpose()?;
-            self.prefix
-                .insert(&pending.keys, prefix, &state, logits.as_ref())?;
-        }
+        // Accepted drafts are consumed before they are known tokens: the outputs that
+        // equal them are appended below.
         let mut finished = commit.finished;
         let mut reason = "stop";
         for token in commit.outputs {
@@ -617,7 +688,21 @@ impl InferencePipeline {
             if eos || pending.generated() >= pending.max_tokens {
                 finished = true;
                 reason = if eos { "stop" } else { "length" };
+                break;
             }
+        }
+        if (self.prefix.is_boundary(pending.consumed) || prompt_end)
+            && let Some(prefix) = pending.tokens.get(..pending.consumed)
+        {
+            self.prefix.extend(&mut pending.keys, prefix);
+            let state = self.engine.model_state(pending.handle)?;
+            let logits = logits
+                .filter(|_| prompt_end)
+                // An allocated copy: `Tensor::copy` shares storage on Metal.
+                .map(|logits| logits.force_contiguous())
+                .transpose()?;
+            self.prefix
+                .insert(&pending.keys, prefix, &state, logits.as_ref())?;
         }
         if !finished {
             return Ok(());
@@ -645,13 +730,17 @@ impl InferencePipeline {
             elapsed,
             first_token: pending.first_token.unwrap_or(elapsed),
             preemptions: pending.preemptions,
+            draft_tokens: pending.drafted,
+            accepted_draft_tokens: pending.accepted_drafts,
             generated_text,
             tool_calls,
             finish_reason: reason,
         };
         // The reply's state lets a conversation's next turn resume after it.
-        if pending.consumed > 0 && self.prefix.config().enabled() {
-            let consumed = &pending.tokens[..pending.consumed];
+        if pending.consumed > 0
+            && self.prefix.config().enabled()
+            && let Some(consumed) = pending.tokens.get(..pending.consumed)
+        {
             self.prefix.extend(&mut pending.keys, consumed);
             let state = self.engine.model_state(pending.handle)?;
             self.prefix.insert(&pending.keys, consumed, &state, None)?;
@@ -827,16 +916,138 @@ impl InferencePipeline {
         }
     }
 
+    /// Drafts for each chunk of a decode-only pass, and whether the pass is decode-only.
+    /// Proposals come from each request's own history and are capped so that every
+    /// output stays within its request's limit, the model context and the next prefix
+    /// snapshot boundary; they never contain EOS. [`speculation::plan`] chooses how many
+    /// to verify. Drafts take only what the scheduled pass left: pass tokens, and pages
+    /// and recurrent slots beyond one page of growth per running sequence.
+    fn draft(&mut self, chunks: &[Chunk]) -> Result<(Vec<Vec<u32>>, bool)> {
+        let mut drafts = vec![Vec::new(); chunks.len()];
+        let decode_only = !chunks.is_empty()
+            && chunks.iter().all(|chunk| {
+                self.pending.get(&chunk.id).is_some_and(|p| {
+                    !chunk.admit
+                        && chunk.tokens == 1
+                        && p.running
+                        && p.generated() > 0
+                        && p.tokens.len() == p.consumed + 1
+                })
+            });
+        if !decode_only || !self.speculation.enabled() {
+            return Ok((drafts, decode_only));
+        }
+        let mut proposed = Vec::with_capacity(chunks.len());
+        for (index, chunk) in chunks.iter().enumerate() {
+            let pending = self
+                .pending
+                .get_mut(&chunk.id)
+                .ok_or_else(|| invalid("missing pipeline request"))?;
+            if pending.constrained {
+                continue;
+            }
+            // Outputs number drafts + 1 and occupy positions up to consumed + drafts.
+            let remaining = pending.max_tokens.saturating_sub(pending.generated());
+            let mut cap = self
+                .speculation
+                .max_draft
+                .min(self.speculation.max_pass_drafts)
+                .min(
+                    self.scheduler
+                        .config()
+                        .max_batch_tokens
+                        .saturating_sub(chunks.len()),
+                )
+                .min(remaining.saturating_sub(1))
+                .min(
+                    self.max_position
+                        .saturating_sub(pending.consumed.saturating_add(1)),
+                );
+            if let Some(boundary) = self.prefix.next_boundary(pending.consumed) {
+                cap = cap.min(boundary.saturating_sub(pending.consumed + 1));
+            }
+            let eos = &self.defaults.eos_tokens;
+            let proposal: Vec<u32> = pending
+                .ngrams
+                .propose(&pending.tokens, &self.speculation, cap)
+                .iter()
+                .take_while(|token| !eos.contains(token))
+                .copied()
+                .collect();
+            if !proposal.is_empty() {
+                proposed.push((index, proposal, pending.acceptance));
+            }
+        }
+        if proposed.is_empty() {
+            return Ok((drafts, decode_only));
+        }
+        let proposals: Vec<Proposal> = proposed
+            .iter()
+            .map(|(_, tokens, acceptance)| Proposal {
+                tokens: tokens.len(),
+                acceptance: *acceptance,
+            })
+            .collect();
+        let limit = self.speculation.max_pass_drafts.min(
+            self.scheduler
+                .config()
+                .max_batch_tokens
+                .saturating_sub(chunks.len()),
+        );
+        let counts = speculation::plan(&proposals, chunks.len(), &self.draft_costs, limit);
+        let usage = self.engine.memory()?;
+        let mut demand = Demand {
+            pages: self.pending.values().filter(|p| p.running).count(),
+            slots: 0,
+        };
+        let mut plain = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let handle = self
+                .pending
+                .get(&chunk.id)
+                .ok_or_else(|| invalid("missing pipeline request"))?
+                .handle;
+            let one = self.engine.demand(handle, 1, false)?;
+            demand = demand + one;
+            plain.push(one);
+        }
+        for ((index, proposal, _), &count) in proposed.into_iter().zip(&counts) {
+            let pending = self
+                .pending
+                .get_mut(&chunks[index].id)
+                .ok_or_else(|| invalid("missing pipeline request"))?;
+            let mut count = count;
+            while count > 0 {
+                let verify = self.engine.demand(pending.handle, count + 1, true)?;
+                let needed = Demand {
+                    pages: demand.pages - plain[index].pages + verify.pages,
+                    slots: demand.slots - plain[index].slots + verify.slots,
+                };
+                if needed.fits(&usage) {
+                    demand = needed;
+                    break;
+                }
+                count -= 1;
+            }
+            if count == 0 {
+                pending.acceptance.recover(self.acceptance);
+            }
+            drafts[index] = proposal.get(..count).unwrap_or_default().to_vec();
+        }
+        Ok((drafts, decode_only))
+    }
+
     /// Pack the selected chunks: each sequence's next unconsumed tokens, with logits at its
-    /// last known token. Returns the plan and its longest resulting context.
-    fn pack(&self, chunks: &[Chunk]) -> Result<(PackedExecution, usize)> {
+    /// last known token. A drafted decode appends its drafts and needs logits at every
+    /// position, for verification. Returns the plan and its longest resulting context.
+    fn pack(&self, chunks: &[Chunk], drafts: &[Vec<u32>]) -> Result<(PackedExecution, usize)> {
         let mut plan = PackedExecution {
             tokens: Vec::new(),
             positions: Vec::new(),
             sequences: Vec::with_capacity(chunks.len()),
         };
         let mut context = 0;
-        for chunk in chunks {
+        for (chunk, draft) in chunks.iter().zip(drafts) {
             let pending = self
                 .pending
                 .get(&chunk.id)
@@ -851,16 +1062,23 @@ impl InferencePipeline {
                 .ok_or_else(|| invalid("chunk beyond the request's tokens"))?;
             let start = plan.tokens.len();
             plan.tokens.extend_from_slice(input);
+            plan.tokens.extend_from_slice(draft);
+            let end = end
+                .checked_add(draft.len())
+                .ok_or_else(|| invalid("draft position overflow"))?;
             plan.positions.extend(pending.consumed..end);
+            let speculative = !draft.is_empty();
             plan.sequences.push(SequenceDescriptor {
                 state: pending.handle,
                 tokens: start..plan.tokens.len(),
-                outputs: if end == pending.tokens.len() {
+                outputs: if speculative {
+                    (start..plan.tokens.len()).collect()
+                } else if end == pending.tokens.len() {
                     vec![plan.tokens.len() - 1]
                 } else {
                     Vec::new()
                 },
-                speculative: false,
+                speculative,
             });
             context = context.max(end);
         }
@@ -892,19 +1110,24 @@ impl InferencePipeline {
         if chunks.is_empty() {
             return Ok(false);
         }
-        let (plan, context) = self.pack(&chunks)?;
+        let (drafts, decode_only) = self.draft(&chunks)?;
+        let chunk_tokens = chunks.iter().map(|chunk| chunk.tokens).sum::<usize>();
+        let (plan, context) = self.pack(&chunks, &drafts)?;
         let (tokens, sequences) = (plan.tokens.len(), plan.sequences.len());
         let started = Instant::now();
         self.engine.submit(plan)?;
         let submitted = Instant::now();
         self.in_flight = Some(InFlight {
             chunks,
+            drafts,
+            decode_only,
             context,
             started,
             submitted,
             timing: PassTiming {
                 tokens,
                 sequences,
+                drafts: tokens - chunk_tokens,
                 schedule: started.saturating_duration_since(begin),
                 encode: submitted.saturating_duration_since(started),
                 idle_before: self
@@ -937,6 +1160,23 @@ impl InferencePipeline {
         // Pass costs exclude host work that overlapped the device.
         self.scheduler
             .record(timing.tokens, flight.context, timing.device);
+        if flight.decode_only {
+            self.draft_costs.record(
+                flight.chunks.len(),
+                timing.drafts,
+                timing.device.as_secs_f64(),
+            );
+        }
+        if timing.drafts > 0 {
+            self.speculation_stats.passes += 1;
+        }
+        let drafted: HashMap<Uuid, usize> = flight
+            .chunks
+            .iter()
+            .zip(&flight.drafts)
+            .filter(|(_, draft)| !draft.is_empty())
+            .map(|(chunk, draft)| (chunk.id, draft.len()))
+            .collect();
         for chunk in &flight.chunks {
             if let Some(pending) = self.pending.get_mut(&chunk.id) {
                 pending.running = true;
@@ -947,6 +1187,20 @@ impl InferencePipeline {
             let id = result.request;
             if !self.pending.contains_key(&id) {
                 continue;
+            }
+            if let (Some(&drafted), Ok(commit)) = (drafted.get(&id), &result.outcome) {
+                // Every accepted input after the decode token is an accepted draft.
+                let accepted = commit.accepted_tokens.saturating_sub(1).min(drafted);
+                if let Some(pending) = self.pending.get_mut(&id) {
+                    pending.acceptance.observe(drafted, accepted);
+                    pending.drafted += drafted;
+                    pending.accepted_drafts += accepted;
+                }
+                self.acceptance.observe(drafted, accepted);
+                let stats = &mut self.speculation_stats;
+                stats.sequences += 1;
+                stats.drafted += drafted as u64;
+                stats.accepted += accepted as u64;
             }
             let logits = result.logits;
             let outcome = result

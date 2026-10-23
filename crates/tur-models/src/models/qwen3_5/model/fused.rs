@@ -8,7 +8,7 @@
 //! format) and reads every key in place through one page table shared by all layers; no
 //! committed key is copied.
 
-use super::{Attention, Config, DeltaNet, Dims, LayerKind, Mixer, Pass, Qwen35};
+use super::{Attention, Config, DeltaNet, Dims, LayerKind, Mixer, Mlp, Pass, Qwen35};
 use crate::hybrid::PackedForward;
 use candle_core::{DType, Tensor};
 use tur_core::{
@@ -157,8 +157,12 @@ impl Qwen35 {
                 }
             };
             let (sum, normed) = k.add_rms_norm(&x, &mixed, &layer.post_norm, d.eps)?;
-            let act = k.swiglu(&k.linear(&layer.gate_up, &normed)?)?;
-            let mlp = k.linear(&layer.down, &act)?;
+            let mlp = match &layer.mlp {
+                Mlp::Dense(mlp) => {
+                    k.linear(&mlp.down, &k.swiglu(&k.linear(&mlp.gate_up, &normed)?)?)?
+                }
+                Mlp::Moe(moe) => moe.fused(k, &normed)?,
+            };
             // The residual add fuses with the next layer's input norm, or the final norm.
             let next = self
                 .layers
@@ -400,6 +404,25 @@ pub(super) fn workspace(
         f,
     )?;
     let act = plan.reserve(elements(d.intermediate)?, f)?;
+    if let Some(moe) = config.moe {
+        // Routing logits, top-k pairs, counts/offsets and both permutation maps coexist
+        // with gathered inputs and grouped expert activations. Include allocator rounding.
+        let assigned = checked_elements(&[n, moe.num_experts_per_tok])?;
+        let extra = checked_elements(&[
+            assigned,
+            d.intermediate
+                .checked_mul(3)
+                .and_then(|v| v.checked_add(hidden))
+                .and_then(|v| v.checked_add(hidden))
+                .and_then(|v| v.checked_add(8))
+                .ok_or_else(|| invalid("MoE workspace overflow"))?,
+        ])?
+        .checked_add(elements(moe.num_experts)?)
+        .and_then(|v| v.checked_add(moe.num_experts.checked_mul(8)?))
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| invalid("MoE workspace overflow"))?;
+        plan.transient(extra, f)?;
+    }
     plan.release(gate_up);
     plan.transient(elements(hidden)?, f)?;
     for region in [act, normed, sum, h, x, addressing] {

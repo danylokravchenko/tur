@@ -5,7 +5,9 @@
 //! ranges) before encoding; nothing falls back to the CPU. Kernels only enqueue work: the
 //! caller fences with [`crate::completion::Completion`] before reading results.
 
+mod moe;
 mod runtime;
+pub use moe::ExpertRoutes;
 
 use crate::{
     packed::PackedLinear,

@@ -102,6 +102,31 @@ impl PackedLinear {
         })
     }
 
+    /// Reference projection through a contiguous output-row range. Dense weights select
+    /// the rows before multiplication; packed weights use the backend then select outputs.
+    /// Production routed execution uses the grouped device kernel instead.
+    pub fn forward_rows(&self, x: &Tensor, start: usize, rows: usize) -> Result<Tensor> {
+        if rows == 0
+            || start
+                .checked_add(rows)
+                .is_none_or(|end| end > self.out_features)
+        {
+            return Err(invalid("projection row range outside weights"));
+        }
+        Ok(match &self.weights {
+            Weights::Dense(weight) => x.matmul(&weight.narrow(0, start, rows)?.t()?)?,
+            Weights::Packed { matmul, .. } => matmul.forward(x)?.narrow(1, start, rows)?,
+        })
+    }
+
+    #[cfg(feature = "metal")]
+    pub(crate) fn dense_tensor(&self) -> Option<&Tensor> {
+        match &self.weights {
+            Weights::Dense(weight) => Some(weight),
+            Weights::Packed { .. } => None,
+        }
+    }
+
     #[cfg(feature = "metal")]
     pub(crate) fn packed_buffer(
         &self,

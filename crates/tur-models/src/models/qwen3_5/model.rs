@@ -13,7 +13,7 @@ use crate::hybrid::{
     Addresses, Boundaries, HybridModel, PackedForward, SequenceForward, SequenceStep, StatePool,
 };
 use candle_core::{DType, Device, Tensor, quantized::GgmlDType};
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 use tur_core::{
     Result,
     execution::{KvFormat, KvLayout, ModelDescription, checked_elements, invalid},
@@ -22,6 +22,7 @@ use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
 
 #[cfg(feature = "metal")]
 mod fused;
+mod moe;
 
 /// Storage for projection matrices. Norms, gates, convolution and state stay F32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,9 +136,49 @@ struct Layer {
     input_norm: Tensor,
     post_norm: Tensor,
     mixer: Mixer,
+    mlp: Mlp,
+}
+
+struct DenseMlp {
     /// Fused `gate_proj | up_proj`.
     gate_up: PackedLinear,
     down: PackedLinear,
+}
+
+enum Mlp {
+    Dense(DenseMlp),
+    Moe(Box<moe::Moe>),
+}
+
+impl DenseMlp {
+    fn load(
+        tensors: &mut Tensors,
+        prefix: &str,
+        format: WeightFormat,
+        device: &Device,
+    ) -> Result<Self> {
+        let gate = tensors.take(&format!("{prefix}.gate_proj.weight"))?;
+        let up = tensors.take(&format!("{prefix}.up_proj.weight"))?;
+        Ok(Self {
+            gate_up: linear(&Tensor::cat(&[gate, up], 0)?, format, device)?,
+            down: linear(
+                &tensors.take(&format!("{prefix}.down_proj.weight"))?,
+                format,
+                device,
+            )?,
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        self.gate_up.resident_bytes() + self.down.resident_bytes()
+    }
+
+    fn forward(&self, h: &Tensor) -> Result<Tensor> {
+        let i = self.down.in_features();
+        let gate_up = self.gate_up.forward(h)?;
+        let act = (candle_nn::ops::silu(&gate_up.narrow(1, 0, i)?)? * gate_up.narrow(1, i, i)?)?;
+        self.down.forward(&act)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -152,6 +193,7 @@ struct Dims {
     key_width: usize,
     value_width: usize,
     channels: usize,
+    #[cfg(feature = "metal")]
     intermediate: usize,
     eps: f64,
     rotary_dim: usize,
@@ -172,6 +214,7 @@ impl Dims {
             key_width: config.key_width()?,
             value_width: config.value_width()?,
             channels: config.conv_channels()?,
+            #[cfg(feature = "metal")]
             intermediate: t.intermediate_size,
             eps: t.rms_norm_eps,
             rotary_dim: config.rotary_dim(),
@@ -180,7 +223,7 @@ impl Dims {
     }
 }
 
-/// Qwen3.5 dense hybrid decoder (text tower only). Weights are immutable after load.
+/// Qwen3.5 dense or expert hybrid decoder (text tower only). Weights stay immutable.
 pub struct Qwen35 {
     config: Config,
     description: ModelDescription,
@@ -224,13 +267,11 @@ fn centred(tensor: &Tensor, device: &Device) -> Result<Tensor> {
     Ok((tensor.to_dtype(DType::F32)? + 1.0)?.to_device(device)?)
 }
 
-struct Tensors(HashMap<String, Tensor>);
+struct Tensors(Checkpoint);
 
 impl Tensors {
     fn take(&mut self, name: &str) -> Result<Tensor> {
-        self.0
-            .remove(name)
-            .ok_or_else(|| invalid(format!("missing tensor {name}")))
+        self.0.take(name)
     }
 }
 
@@ -277,7 +318,11 @@ impl Qwen35 {
             let embedding = name.ends_with("embed_tokens.weight");
             // Every other rank-two checkpoint tensor is a projection, including the
             // in_proj_qkv/z/a/b matrices that are concatenated by the loader.
-            let bytes = if shape.len() == 2 && !embedding {
+            let router = name.ends_with("mlp.gate.weight")
+                || name.ends_with("mlp.shared_expert_gate.weight");
+            let expert = name.ends_with("mlp.experts.gate_up_proj")
+                || name.ends_with("mlp.experts.down_proj");
+            let bytes = if (shape.len() == 2 || expert) && !embedding && !router {
                 projection_bytes(&shape)?
             } else {
                 let element_bytes = if embedding && quant.is_some() { 2 } else { 4 };
@@ -328,7 +373,7 @@ impl Qwen35 {
             )?;
         }
         let checkpoint = Checkpoint::open(dir, &config)?;
-        let mut tensors = Tensors(checkpoint.load()?);
+        let mut tensors = Tensors(checkpoint);
         let device = &options.device;
         let format = options.format;
         let dims = Dims::new(&config)?;
@@ -379,8 +424,21 @@ impl Qwen35 {
                     })
                 }
             };
-            let gate = tensors.take(&format!("{p}.mlp.gate_proj.weight"))?;
-            let up = tensors.take(&format!("{p}.mlp.up_proj.weight"))?;
+            let mlp = match config.moe {
+                Some(settings) => Mlp::Moe(Box::new(moe::Moe::load(
+                    &mut tensors,
+                    &format!("{p}.mlp"),
+                    settings,
+                    format,
+                    device,
+                )?)),
+                None => Mlp::Dense(DenseMlp::load(
+                    &mut tensors,
+                    &format!("{p}.mlp"),
+                    format,
+                    device,
+                )?),
+            };
             layers.push(Layer {
                 input_norm: centred(
                     &tensors.take(&format!("{p}.input_layernorm.weight"))?,
@@ -391,12 +449,7 @@ impl Qwen35 {
                     device,
                 )?,
                 mixer,
-                gate_up: linear(&Tensor::cat(&[gate, up], 0)?, format, device)?,
-                down: linear(
-                    &tensors.take(&format!("{p}.mlp.down_proj.weight"))?,
-                    format,
-                    device,
-                )?,
+                mlp,
             });
         }
         let embed_source = tensors.take(&format!("{prefix}.embed_tokens.weight"))?;
@@ -466,6 +519,9 @@ impl Qwen35 {
         }
         for layer in &self.layers {
             total += bytes(&layer.input_norm) + bytes(&layer.post_norm);
+            if let Mlp::Moe(moe) = &layer.mlp {
+                total += moe.router_bytes();
+            }
             total += match &layer.mixer {
                 Mixer::Attention(a) => bytes(&a.q_norm) + bytes(&a.k_norm),
                 Mixer::Delta(net) => {
@@ -499,7 +555,11 @@ impl Qwen35 {
                     .sum::<usize>(),
                 Mixer::Delta(net) => net.proj.resident_bytes() + net.out.resident_bytes(),
             };
-            total += mixer + layer.gate_up.resident_bytes() + layer.down.resident_bytes();
+            total += mixer
+                + match &layer.mlp {
+                    Mlp::Dense(mlp) => mlp.bytes(),
+                    Mlp::Moe(moe) => moe.projection_bytes(),
+                };
         }
         total
     }
@@ -723,11 +783,11 @@ impl Qwen35 {
         net.out.forward(&gated.reshape((n, d.value_width))?)
     }
 
-    fn mlp(&self, layer: &Layer, h: &Tensor) -> Result<Tensor> {
-        let i = self.dims.intermediate;
-        let gate_up = layer.gate_up.forward(h)?;
-        let act = (candle_nn::ops::silu(&gate_up.narrow(1, 0, i)?)? * gate_up.narrow(1, i, i)?)?;
-        layer.down.forward(&act)
+    fn mlp(layer: &Layer, h: &Tensor) -> Result<Tensor> {
+        match &layer.mlp {
+            Mlp::Dense(mlp) => mlp.forward(h),
+            Mlp::Moe(moe) => moe.reference(h),
+        }
     }
 
     fn run(
@@ -807,7 +867,7 @@ impl Qwen35 {
             };
             x = (x + mixed)?;
             let h = math::rms(&x, &layer.post_norm, d.eps)?;
-            x = (&x + self.mlp(layer, &h)?)?;
+            x = (&x + Self::mlp(layer, &h)?)?;
             if let Some(trace) = trace.as_mut() {
                 trace.push(x.clone());
             }
