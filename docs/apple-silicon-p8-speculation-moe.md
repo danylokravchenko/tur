@@ -17,8 +17,11 @@ Cancellation cannot publish the pending transaction.
 
 Proposals are deterministic prompt lookup: match the longest suffix n-gram in the
 request's own prompt/output history, verify hash hits against tokens, then propose its
-earlier continuation. Defaults when enabled: n-grams 1–4, up to four drafts per request
-and sixteen across a pass. Limits remain configurable through `SpeculationConfig`.
+earlier continuation. A continuation that reaches the end of the history repeats with the
+period between the two occurrences, so a short cycle (`4 4 4`, `a b a b`) fills the draft
+limit instead of proposing a single period. Defaults when enabled: n-grams 1–4, up to four
+drafts per request and sixteen across a pass. Limits remain configurable through
+`SpeculationConfig`.
 
 The sampling rule is **target matching**, not a probabilistic draft-model interface:
 
@@ -45,14 +48,27 @@ Output, context, packed-pass and prefix-boundary limits cap drafting before subm
 Each request tracks conditional draft acceptance. A decaying linear fit of completed
 decode-only pass time against total drafts is kept separately per decode count. The
 planner chooses draft depths in order of expected acceptance while predicted tokens per
-second improve. Unidentified fits explore drafted and ordinary passes; unsuccessful
-requests recover toward the shared prior so they can be retried. Mixed prefill/decode
-passes are never drafted.
+second improve. A fit that was never identified explores drafted and ordinary passes.
+Afterwards, the last identified per-draft cost stands in whenever recent passes stop
+varying their drafts, while the base keeps following recent passes. Previously the fit
+forgot its slope roughly 80 undrafted passes later and forced a full-draft exploration
+pass, matching the p95 spikes measured on low-reuse prompts. Unsuccessful requests
+recover toward the shared prior so they can be retried.
+
+Decodes also draft beside prefill chunks once costs are identified: the scheduler's
+estimate for the prefill tokens joins the pass base, so drafts are weighed against the
+whole pass they lengthen. Mixed passes never explore unidentified costs and do not feed
+the draft fit. The scheduler's prefill cost model receives drafted passes as their
+undrafted tokens and time (fitted per-draft cost removed), or not at all before that
+cost is known.
 
 Memory planning charges **all simultaneously possible drafts**, capped by running
 sequences and the pass limit. It reserves their recurrent checkpoints and logit rows
-before loading weights. Scheduling additionally checks actual page and slot demand,
-leaving room for ordinary decodes. Proposals yield to state pressure.
+before loading weights. Scheduling additionally checks actual page and slot demand
+beside the pass's ordinary demand; proposals shrink or yield when it does not fit. No
+growth headroom is held back for drafts: rejected drafts return their leases when the
+pass completes, and accepted ones are progress a decode would lease anyway. (Holding
+admission's page-per-sequence headroom disabled drafting entirely under page pressure.)
 
 The host n-gram index retains at most two 8K-token windows, pruning periodically. Its
 hash-table capacity is charged to the shared memory budget; preemption drops the index
@@ -60,14 +76,19 @@ and rebuilds it on resume. Context size cannot create an unbounded proposal inde
 The request's complete token history remains available for normal recomputation.
 
 **Default: disabled.** Both adapters expose `--speculative-draft N` (zero by default).
-Narrow recurrent state automatically disables drafting: its ordinary per-pass rounding
+Narrow recurrent state automatically disables drafting, with a warning: its ordinary per-pass rounding
 is not reproduced by the F32 intermediates of a multi-token verification. The validated
 speculation path requires F32 recurrent state.
 This is an explicit throughput mode: accepted tokens arrive in bursts, with longer
 pauses between passes. `PipelineConfig::reproducible` also disables speculation.
 The target-matching sampling guarantee does not promise bit-identical logits between
 different batch/chunk shapes: existing F16-tile and recurrent rounding differences still
-apply. The reproducibility mode fixes those execution choices separately.
+apply. The reproducibility mode fixes those execution choices separately. On the MoE
+fixture, verification logits match one-at-a-time decoding within 7e-7 relative for F32,
+`Q8_0`, and Q4K windows inside its 2–4-row GEMV range. Wider Q4K windows run Candle's
+F16-staged tiles, as batched Q4K decoding of as many rows already does, and drift by
+**1.1e-2**, partly through flipped close routing decisions. A test now bounds this
+instead of avoiding the regime; removing it needs an F32 matrix-unit dense Q4K kernel.
 
 ### Serving measurements
 
@@ -110,6 +131,11 @@ about 3.3% of ordinary throughput across the measured cases.
 its bursts can increase p95 inter-token latency substantially. This is why enabling it
 requires an explicit option and why it is not the default.
 
+These measurements predate the later planner, proposal, headroom and mixed-pass changes
+and have not been rerun. The serving bench now also reports burst gaps (between the first
+publications of a request's successive passes) and tokens per burst: ITL p50 is zero
+inside speculative bursts and says little about them.
+
 At concurrency eight, the reserved resident plan grows from 3,998,108,236 to
 4,386,671,436 bytes (+371 MiB). Separate processes measured with `/usr/bin/time -l`
 and a 40-token output limit observed maximum RSS of 2.83 → 3.76 GiB and peak macOS
@@ -129,13 +155,23 @@ Qwen3.5 attention and DeltaNet implementations are reused with a distinct expert
 - Packed expert banks: `[experts, 2*intermediate, hidden]` gate/up and
   `[experts, hidden, intermediate]` down projections. F32, Q8_0 and Q4K storage is
   supported; router and shared gate stay F32.
-- Routing, per-expert counts, prefix offsets, permutation construction, token gather,
-  grouped matrix-unit GEMM and weighted scatter stay on the device. Expert groups have
-  their actual row counts; no uniform routing or per-expert host submission is assumed.
-- Q8 groups use direct device-built tile descriptors, a GEMV for at most three rows and
-  vector-loaded matrix tiles for larger groups. Tile lookup never searches all experts.
-- Scatter accumulates in expert-ID order without floating-point atomics. Invalid router
-  scores propagate an invalid result without becoming an unchecked expert index.
+- Routing, per-expert counts, prefix offsets, permutation construction, grouped GEMM and
+  weighted scatter stay on the device. Expert groups have their actual row counts; no
+  uniform routing or per-expert host submission is assumed.
+- Top-k is k simdgroup max reductions over register-held scores (previously every score
+  was ranked against every other, O(experts²) device reads per token). The stable
+  permutation comes from per-block histograms of 256 assignments, one scan and a
+  parallel scatter; previously single threads scanned every assignment per expert.
+- Every format (F32, `Q8_0`, Q4K) uses device-built sixteen-row tile descriptors with two
+  kernels. A GEMV handles tiles of at most three rows, with the dense GEMV's outputs per
+  simdgroup (two for Q4K's vectorized super-block layout). A matrix-unit kernel handles
+  larger tiles: each simdgroup owns 32 outputs over the whole reduction, with no
+  threadgroup memory. The gate/up projection reads each token through the permutation,
+  so no gathered `[tokens·k, hidden]` copy is made.
+- Scatter ranks each token's experts once per threadgroup and accumulates in expert-ID
+  order without floating-point atomics; the sigmoid-gated shared expert is added in the
+  same pass. Invalid router scores propagate an invalid result without becoming an
+  unchecked expert index.
 
 Config identifiers, head layout, quantization widths, routing limits, tensor names,
 shapes and dtypes are validated. Unsupported routing normalization and sparse-layer
@@ -145,9 +181,22 @@ there is no separate dense-model alias pretending to implement MoE.
 The checkpoint loader validates every shard header with SafeTensors metadata validation
 before reading any payload. It then seeks directly to each needed tensor. Packing a
 layer releases its host payload before the next layer is read, avoiding retention of
-the complete BF16 checkpoint. Index filenames must remain in the checkpoint directory.
-Transient loading memory still scales with the largest tensor being converted and is
-not yet measured on the full 35B checkpoint.
+the complete BF16 checkpoint. Expert banks stream one expert at a time: each expert's
+payload is read, converted to F32 and quantized before the next, and the packed bytes
+are uploaded once. For a Qwen3.6 gate/up bank, full-precision transients fall from about
+6 GiB (BF16 read, its copy and a full F32 conversion) to about 16 MiB per expert; the
+packed bank itself (about 0.3 GiB in Q4K) is held on the host until its upload. Other tensors
+still transiently hold their payload twice; the largest is the embedding (about 1 GiB of
+BF16). Index filenames must remain in the checkpoint directory. Loading memory is not yet
+measured on the full 35B checkpoint.
+
+GGML quantization reads a tensor's storage buffer rather than its layout, so quantizing an
+F32 row-range view packed the wrong rows. Weights loaded from BF16 checkpoints were
+unaffected (conversion copies), but packing now always quantizes an owned host copy.
+
+The CPU reference path routes on the host, then projects each selected expert's tokens
+at once through only that expert's packed rows. It previously multiplied the whole bank
+per token and kept one expert's outputs, about 32× the necessary work for 256 experts.
 
 ### Pins and independent conformance
 
@@ -174,44 +223,56 @@ weights. The fixture does not stand in for a full-checkpoint quality evaluation.
 
 F32/Q8_0/Q4K grouped GEMM matches scalar F64 accumulation over dequantized weights within
 2e-5 relative error, including strided inputs, partial output tiles, different routing
-skews and nonfinite routing rows. Hybrid tests accept a partial speculative prefix and
-continue after rollback in all three formats. They preserve the initial chunk boundaries
-and keep the Q4K verification window within its F32 GEMV regime: switching between
-Candle's F16 tiles and single-token GEMV can change close routing decisions. Earlier
-comparisons across those different execution paths differed by about 0.5%; that is not
-evidence of a rollback defect or a new numerical tolerance for the kernel.
+skews, 4,800-assignment multi-block routing, routed (permutation-read) inputs, the fused
+shared expert and nonfinite routing rows. Hybrid tests accept a partial speculative prefix
+and continue after rollback in all three formats. A separate test measures verification
+against one-at-a-time decoding inside and beyond the Q4K GEMV range (see above).
 
 ### Expert projection performance gate: open
 
-[Kernel artifacts](baselines/2026-10-23-m1-p8/moe-kernels.json) use the flagship's actual
-gate/up shape: 256 experts, top-8, input 2048, output 1024, Q8_0. Random scores disperse
-assignments; the concentrated case sends every token to the same eight experts. Both
-are synthetic. The grouped timing includes device routing and gather. The individual
-baseline already has its selected input rows prepared, so routing/readback/gather costs
-are excluded for that baseline. Each cell is the median of fifteen completed-work
-samples with three warmups.
+[Kernel artifacts](baselines/2026-10-23-m1-p8/moe-kernels-grouped.json) use the flagship's
+gate/up shape: 256 experts, top-8, input 2048, output 1024. Random scores disperse
+assignments; the concentrated case sends every token to the same eight experts. Both are
+synthetic. Grouped timings include device routing, with inputs read through the
+permutation. The individual baseline already has its selected input rows prepared, so
+routing, readback and gather are excluded for it. Each cell is the median of fifteen
+completed-work samples with three warmups. Earlier layouts are kept as
+`moe-kernels.*` (first grouped version), `moe-kernels-initial.*` and
+`moe-kernels-table-search.*`.
 
-| Tokens | Routing | Grouped, including routing/gather | Individual, prepared inputs |
-| ---: | --- | ---: | ---: |
-| 1 | Dispersed | 0.584 ms | 0.360 ms |
-| 8 | Dispersed | 2.828 ms | 2.784 ms |
-| 32 | Dispersed | 7.237 ms | 7.245 ms |
-| 128 | Dispersed | 17.235 ms | 12.617 ms |
-| 8 | Concentrated | 0.988 ms | 0.438 ms |
-| 32 | Concentrated | 1.826 ms | 0.776 ms |
-| 128 | Concentrated | 6.234 ms | 2.488 ms |
+| Tokens | Routing | `Q8_0` grouped (first version) | `Q8_0` individual | Q4K grouped (first version) | Q4K individual |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | Dispersed | 0.375 (0.584) ms | 0.373 ms | 0.319 (0.458) ms | 0.211 ms |
+| 8 | Dispersed | 2.65 (2.83) ms | 2.93 ms | 2.28 ms | 1.69 ms |
+| 32 | Dispersed | 7.20 (7.24) ms | 7.67 ms | 7.35 ms | 5.99 ms |
+| 128 | Dispersed | 14.96 (17.24) ms | 14.52 ms | 19.14 ms | 18.61 ms |
+| 512 | Dispersed | 24.6 (27.3) ms | 22.3 ms | 32.1 ms | 23.4 ms |
+| 2048 | Dispersed | 80.5 (93.2) ms | 51.3 ms | 105.9 ms | 57.7 ms |
+| 8 | Concentrated | 0.674 (0.988) ms | 0.472 ms | 0.943 ms | 0.788 ms |
+| 128 | Concentrated | 4.60 (6.23) ms | 2.56 ms | 6.36 ms | 2.87 ms |
+| 2048 | Concentrated | 73.4 (85.2) ms | 55.2 ms | 97.2 ms | 57.2 ms |
 
-**No expert-kernel speedup is claimed.** Direct tile indexing removed the repeated
-expert-table search and improved the initial prototype substantially, but parity at
-8–32 dispersed tokens is not a win beyond noise. Large and concentrated groups still
-need work; small groups also pay the metadata dispatch cost. Candle uses F16 staging
-for individual groups above sixteen rows, while the custom kernel accumulates in F32,
-so those concentrated large-group timings also compare different arithmetic paths.
-F32/Q4K grouped math passes correctness tests but has no performance selection evidence.
-The new MoE model path remains experimental, with its performance exit gate open.
-Rejected layouts are retained as `moe-kernels-initial.*` and
-`moe-kernels-table-search.*`. Trained routing traces and full-model measurements remain
-necessary before claiming a useful MoE serving regime.
+Routing (top-k, histograms, permutation and a scatter) now costs 0.02 ms for one token and
+0.24 ms for 2,048 tokens; the parenthesized first-version timings include its slower
+routing and gather.
+
+**No expert-kernel speedup is claimed.** `Q8_0` decode is at parity with individual
+projections and 8–32 dispersed tokens are slightly faster. Q4K decode is about 1.5×
+slower than Candle's dense Q4K GEMV. Concentrated groups and prefill-sized passes remain
+1.4–1.8× slower: above sixteen rows Candle stages individual groups in F16, while the
+grouped kernels accumulate in F32, so those cells also compare different arithmetic.
+Two rejected attempts are recorded here: 32×32 register tiles (149 ms at 2,048 dispersed
+tokens, from register pressure) and threadgroup-staged 32-wide reduction slices
+(239 ms, barrier-bound with lower occupancy). An F16-staged or larger-K tiled grouped GEMM
+is the open next step. F32 is measured at 64 experts
+([artifact](baselines/2026-10-23-m1-p8/moe-kernels-grouped-f32.json)), since a full F32
+bank does not fit beside its host copy here: 1.20 vs 1.29 ms at one token, 9.5 vs 11.8 ms
+at 32 dispersed tokens, and 114 vs 61 ms at 2,048. An earlier F32 run was killed because
+`PackedLinear::dense` uploaded each per-expert row view with Candle's `to_device`, which
+transfers a view's whole underlying storage (the full bank, 64 times). Dense uploads now
+copy only the view. The MoE model path remains experimental, with its performance exit gate
+open. Trained routing traces and full-model measurements remain necessary before claiming
+a useful MoE serving regime.
 
 ### Full-checkpoint boundary
 
@@ -245,15 +306,16 @@ downloaded or executed in this package.
 
 ## Validation and remaining gates
 
-- Offline workspace nextest: **221 passed, seven checkpoint-dependent tests skipped**.
-  Final targeted checks cover subsequent kernel tuning, streaming-header validation and
-  automatic fallback with narrow recurrent state; see the retained test logs.
+- Offline workspace nextest: **229 passed, seven checkpoint-dependent tests skipped**
+  (after the review fixes; the earlier run in the retained log had 221).
 - Strict workspace Clippy, all targets: passed. Workspace checks pass with and without
   default features. Existing `block 0.1.6` future-compatibility notice remains.
 - Target-matching equivalence: 256 seeds compare samples, RNG draws, penalties and every
   attention/convolution/recurrent value after rejection and continuation.
 - Pipeline tests cover output limits, prefix snapshots, grammar/EOS exclusion, batch
-  draft caps, explicit budget rejection, cancellation and resource reclamation.
+  draft caps, explicit budget rejection, cancellation, resource reclamation, preemption
+  of drafting requests (index rebuilt, outputs equal ordinary decoding), a deadline
+  expiring under a drafted pass, and decodes drafting beside a prefill.
 - Metal sampling with penalties preserves seeded output against ordinary decoding.
 - Native MTP execution, full Qwen3.6 conformance/quality, trained routing traces, and
   Gemma 4 execution remain open. Coverage percentage and long-duration thermal/leak
@@ -265,7 +327,7 @@ Reproduction (hardware tests need direct Metal access):
 cargo nextest run --offline --workspace --test-threads 1
 cargo clippy --offline --workspace --all-targets -- -D warnings
 cargo check --offline --workspace --all-targets --no-default-features
-TUR_BENCH_ONLY=moe cargo bench --offline -p tur-metal --bench kernels
+TUR_BENCH_ONLY=moe TUR_BENCH_MOE=q8_0,q4k cargo bench --offline -p tur-metal --bench kernels
 TUR_QWEN35_0_8B=<pinned-snapshot> TUR_BENCH_WORKLOADS=speculation TUR_BENCH_CONCURRENCY=1,4,8 TUR_BENCH_OUTPUT=80 TUR_BENCH_REPEATS=3 cargo bench --offline -p tur-engine --bench serving
 # Same command with TUR_BENCH_SAMPLING=0.7,20,0.95 for sampled output.
 ```

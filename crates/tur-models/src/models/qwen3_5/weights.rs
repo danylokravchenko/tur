@@ -163,6 +163,61 @@ impl Checkpoint {
             &Device::Cpu,
         )?)
     }
+
+    /// Read a rank-three tensor one leading index at a time, as `[dims[1], dims[2]]`
+    /// matrices: an expert bank streams one expert's payload instead of the whole bank.
+    pub(super) fn take_split(&mut self, name: &str) -> Result<Split> {
+        let entry = self
+            .entries
+            .remove(name)
+            .ok_or_else(|| invalid(format!("missing tensor {name}")))?;
+        let &[count, rows, cols] = entry.shape.as_slice() else {
+            return Err(invalid(format!("{name} is not a stack of matrices")));
+        };
+        let mut file = std::fs::File::open(&self.files[entry.file])?;
+        file.seek(SeekFrom::Start(entry.offset))?;
+        Ok(Split {
+            file,
+            dtype: entry.dtype,
+            shape: [rows, cols],
+            bytes: entry.bytes.checked_div(count).unwrap_or(0),
+            remaining: count,
+        })
+    }
+}
+
+/// Matrices of one stacked checkpoint tensor, read in order on demand.
+pub(super) struct Split {
+    file: std::fs::File,
+    dtype: DType,
+    shape: [usize; 2],
+    bytes: usize,
+    remaining: usize,
+}
+
+impl Iterator for Split {
+    type Item = Result<Tensor>;
+
+    fn next(&mut self) -> Option<Result<Tensor>> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let mut bytes = vec![0u8; self.bytes];
+        Some(
+            self.file
+                .read_exact(&mut bytes)
+                .map_err(Into::into)
+                .and_then(|()| {
+                    Ok(Tensor::from_raw_buffer(
+                        &bytes,
+                        self.dtype,
+                        &self.shape,
+                        &Device::Cpu,
+                    )?)
+                }),
+        )
+    }
 }
 
 #[cfg(test)]

@@ -14,7 +14,11 @@
 //! and stops where the expected tokens per second of the pass would fall, so batching
 //! that makes verification slower disables speculation by itself.
 
-use std::{collections::HashMap, ops::RangeInclusive};
+use std::{
+    collections::HashMap,
+    hash::{BuildHasherDefault, Hasher},
+    ops::RangeInclusive,
+};
 use tur_core::{Result, execution::invalid};
 
 /// Prune periodically to retain at most two windows of lookup history.
@@ -87,11 +91,31 @@ impl SpeculationConfig {
     }
 }
 
+/// Keys are already n-gram hashes; hashing them again would only cost time.
+#[derive(Clone, Copy, Debug, Default)]
+struct Prehashed(u64);
+
+impl Hasher for Prehashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0.rotate_left(8)) ^ u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
 /// Latest earlier occurrence of every short n-gram of one request's tokens.
 #[derive(Clone, Debug, Default)]
 pub struct NgramIndex {
     /// N-gram hash → end (exclusive) of its latest occurrence that has a follower.
-    ends: HashMap<u64, usize>,
+    ends: HashMap<u64, usize, BuildHasherDefault<Prehashed>>,
     /// Occurrences ending before this position are indexed.
     next_end: usize,
 }
@@ -120,18 +144,20 @@ impl NgramIndex {
 
     /// Up to `limit` tokens that followed the latest earlier occurrence of the longest
     /// matching suffix of `tokens`; empty without a match or for disabled/invalid limits.
-    pub fn propose<'a>(
+    /// A continuation that reaches the end of the history repeats with the period between
+    /// the two occurrences, so a short cycle still fills the whole limit.
+    pub fn propose(
         &mut self,
-        tokens: &'a [u32],
+        tokens: &[u32],
         config: &SpeculationConfig,
         limit: usize,
-    ) -> &'a [u32] {
+    ) -> Vec<u32> {
         if !config.enabled() || config.validate().is_err() {
-            return &[];
+            return Vec::new();
         }
         self.update(tokens, config.lengths());
         if limit == 0 {
-            return &[];
+            return Vec::new();
         }
         for n in config.lengths().rev() {
             let Some(suffix) = tokens
@@ -146,12 +172,13 @@ impl NgramIndex {
             };
             // Hash hits are verified; only occurrences with a follower are indexed.
             if end >= n && tokens.get(end - n..end) == Some(suffix) {
-                return tokens
-                    .get(end..tokens.len().min(end.saturating_add(limit)))
-                    .unwrap_or_default();
+                let Some(cycle) = tokens.get(end..) else {
+                    continue;
+                };
+                return cycle.iter().copied().cycle().take(limit).collect();
             }
         }
-        &[]
+        Vec::new()
     }
 }
 
@@ -212,6 +239,10 @@ struct CostFit {
     y: f64,
     xx: f64,
     xy: f64,
+    /// Per-draft cost of the latest identified fit. When recent passes stop varying their
+    /// drafts (planning chose none), the base still tracks recent passes and this slope
+    /// keeps the line identified, so no exploratory full-draft pass is forced.
+    slope: Option<f64>,
 }
 
 impl CostFit {
@@ -230,6 +261,9 @@ impl CostFit {
         self.y += seconds;
         self.xx = drafts.mul_add(drafts, self.xx);
         self.xy = drafts.mul_add(seconds, self.xy);
+        if let Some((_, slope)) = self.line() {
+            self.slope = Some(slope);
+        }
     }
 
     fn mean_drafts(&self) -> f64 {
@@ -249,10 +283,11 @@ impl CostFit {
         let mean_x = self.x / self.weight;
         let mean_y = self.y / self.weight;
         let variance = mean_x.mul_add(-mean_x, self.xx / self.weight);
-        if variance < MIN_DRAFT_VARIANCE {
-            return None;
-        }
-        let slope = (mean_x.mul_add(-mean_y, self.xy / self.weight) / variance).max(1e-6);
+        let slope = if variance < MIN_DRAFT_VARIANCE {
+            self.slope?
+        } else {
+            (mean_x.mul_add(-mean_y, self.xy / self.weight) / variance).max(1e-6)
+        };
         let base = slope.mul_add(-mean_x, mean_y);
         (base > 0.0).then_some((base, slope))
     }
@@ -288,8 +323,8 @@ impl DraftCosts {
         self.fits.get(Self::bucket(decodes))?.line()
     }
 
-    /// Whether an unidentified fit should next sample a pass without drafts: it alternates
-    /// with drafted passes until base and per-draft costs separate.
+    /// Whether a never-identified fit should next sample a pass without drafts: it
+    /// alternates with drafted passes until base and per-draft costs first separate.
     fn explore_without(&self, decodes: usize) -> bool {
         self.fits
             .get(Self::bucket(decodes))
@@ -307,13 +342,18 @@ pub struct Proposal {
 
 /// Drafts per proposal for a decode-only pass of `decodes` sequences, at most `limit` in
 /// total. Depth `i` of a proposal is expected to add `rate^i` tokens; depths are taken
-/// most likely first while the expected tokens per second of the pass rise. Before the
-/// costs are identified, passes alternate between drafting everything and nothing.
+/// most likely first while the expected tokens per second of the pass rise. Until the
+/// costs are first identified, passes alternate between drafting everything and nothing;
+/// afterwards the last identified per-draft cost stands in for missing variation.
+///
+/// `prefill` is the estimated extra time of a mixed pass's prefill tokens: it joins the
+/// base cost, and a mixed pass never explores unidentified costs.
 pub fn plan(
     proposals: &[Proposal],
     decodes: usize,
     costs: &DraftCosts,
     limit: usize,
+    prefill: Option<f64>,
 ) -> Vec<usize> {
     let mut depths: Vec<(f64, usize, usize)> = proposals
         .iter()
@@ -326,7 +366,10 @@ pub fn plan(
     // Most likely first; a shallower depth of the same proposal never sorts after a deeper.
     depths.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     depths.truncate(limit);
-    let take = match costs.line(decodes) {
+    let line = costs
+        .line(decodes)
+        .map(|(base, per_draft)| (base + prefill.unwrap_or(0.0), per_draft));
+    let take = match line {
         Some((base, per_draft)) => {
             let (mut best, mut best_rate, mut gain) = (0, decodes as f64 / base, 0.0);
             for (taken, (expected, _, _)) in depths.iter().enumerate() {
@@ -338,7 +381,7 @@ pub fn plan(
             }
             best
         }
-        None if costs.explore_without(decodes) => 0,
+        None if prefill.is_some() || costs.explore_without(decodes) => 0,
         None => depths.len(),
     };
     let mut counts = vec![0; proposals.len()];
@@ -369,9 +412,7 @@ mod tests {
 
     fn propose(tokens: &[u32], limit: usize) -> Vec<u32> {
         let mut index = NgramIndex::default();
-        index
-            .propose(tokens, &SpeculationConfig::new(8), limit)
-            .to_vec()
+        index.propose(tokens, &SpeculationConfig::new(8), limit)
     }
 
     #[test]
@@ -382,7 +423,9 @@ mod tests {
         // A longer suffix outranks a later one-token match: "5 6" → 7, not "6" → 1.
         assert_eq!(propose(&[5, 6, 7, 6, 1, 5, 6], 3), [7, 6, 1]);
         // Proposals stop at the end of the history and need a match.
-        assert_eq!(propose(&[4, 4], 5), [4]);
+        // A continuation reaching the end repeats with its period.
+        assert_eq!(propose(&[4, 4], 5), [4; 5]);
+        assert_eq!(propose(&[1, 2, 3, 1, 2, 3], 5), [1, 2, 3, 1, 2]);
         assert_eq!(propose(&[1, 2, 3], 4), [] as [u32; 0]);
         assert_eq!(propose(&[1, 2, 1], 0), [] as [u32; 0]);
         assert_eq!(propose(&[], 2), [] as [u32; 0]);
@@ -394,7 +437,7 @@ mod tests {
         let config = SpeculationConfig::new(4);
         let mut incremental = NgramIndex::default();
         for len in 0..=tokens.len() {
-            let grown = incremental.propose(&tokens[..len], &config, 4).to_vec();
+            let grown = incremental.propose(&tokens[..len], &config, 4);
             let mut rebuilt = NgramIndex::default();
             assert_eq!(grown, rebuilt.propose(&tokens[..len], &config, 4), "{len}");
         }
@@ -448,17 +491,44 @@ mod tests {
         };
         // Cheap drafts: every certain depth pays; 5% depths do not beside a 20 ms pass.
         let cheap = costs(2, 0.020, 0.001);
-        assert_eq!(plan(&[certain, unlikely], 2, &cheap, 16), [4, 0]);
+        assert_eq!(plan(&[certain, unlikely], 2, &cheap, 16, None), [4, 0]);
         // The pass limit keeps the most likely depths.
-        assert_eq!(plan(&[unlikely, certain], 2, &cheap, 3), [0, 3]);
+        assert_eq!(plan(&[unlikely, certain], 2, &cheap, 3, None), [0, 3]);
         // Drafts that cost as much as a sequence's share of the pass are not worth 50%.
         let even = Proposal {
             tokens: 4,
             acceptance: Acceptance(0.5),
         };
         let dear = costs(2, 0.020, 0.010);
-        assert_eq!(plan(&[even, even], 2, &dear, 16), [0, 0]);
-        assert_eq!(plan(&[even, even], 2, &cheap, 16), [2, 2]);
+        assert_eq!(plan(&[even, even], 2, &dear, 16, None), [0, 0]);
+        assert_eq!(plan(&[even, even], 2, &cheap, 16, None), [2, 2]);
+        // A mixed pass's prefill time lengthens the base, so drafts become relatively
+        // cheaper; without identified costs a mixed pass never drafts.
+        assert_eq!(plan(&[even, even], 2, &dear, 16, Some(0.200)), [2, 2]);
+        assert_eq!(
+            plan(&[certain], 2, &DraftCosts::default(), 16, Some(0.1)),
+            [0]
+        );
+    }
+
+    #[test]
+    fn test_identified_costs_survive_passes_without_drafts() -> Result<()> {
+        let mut costs = costs(2, 0.020, 0.001);
+        let (_, slope) = costs.line(2).ok_or_else(|| invalid("unfitted"))?;
+        // Planning chose no drafts for a long time: the drafted samples decay away, but the
+        // last slope keeps the line identified while its base follows recent passes.
+        for _ in 0..500 {
+            costs.record(2, 0, 0.020);
+        }
+        let (base, kept) = costs.line(2).ok_or_else(|| invalid("forgot the fit"))?;
+        assert!((kept - slope).abs() < 1e-9 && (base - 0.020).abs() < 1e-9);
+        assert!(!costs.explore_without(2));
+        let certain = Proposal {
+            tokens: 4,
+            acceptance: Acceptance(1.0),
+        };
+        assert_eq!(plan(&[certain], 2, &costs, 16, None), [4]);
+        Ok(())
     }
 
     #[test]
@@ -468,9 +538,9 @@ mod tests {
             acceptance: Acceptance(0.5),
         };
         let mut costs = DraftCosts::default();
-        assert_eq!(plan(&[proposal], 1, &costs, 8), [3]);
+        assert_eq!(plan(&[proposal], 1, &costs, 8, None), [3]);
         costs.record(1, 3, 0.02);
-        assert_eq!(plan(&[proposal], 1, &costs, 8), [0]);
+        assert_eq!(plan(&[proposal], 1, &costs, 8, None), [0]);
         costs.record(1, 0, 0.018);
         costs.record(1, 0, 0.018);
         assert!(costs.line(1).is_some());

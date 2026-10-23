@@ -1,11 +1,9 @@
 #![forbid(unsafe_code)]
 //! Projection weights kept in their packed storage format.
 
-#[cfg(feature = "metal")]
-use candle_core::quantized::QStorage;
 use candle_core::{
     DType, Device, Module, Tensor,
-    quantized::{GgmlDType, QMatMul, QTensor},
+    quantized::{GgmlDType, QMatMul, QStorage, QTensor},
 };
 use tur_core::{Result, execution::invalid};
 
@@ -34,10 +32,15 @@ pub struct PackedLinear {
 
 impl PackedLinear {
     /// Full-precision F32 weights for reference execution. An F32 tensor already on
-    /// `device` is shared, not copied.
+    /// `device` is shared, not copied; one uploaded from the host is copied as just its
+    /// own elements, since a transfer would copy a view's whole underlying storage.
     pub fn dense(weight: &Tensor, device: &Device) -> Result<Self> {
         let (out_features, in_features) = weight.dims2()?;
-        let weight = weight.to_dtype(DType::F32)?.to_device(device)?;
+        let weight = if weight.device().same_device(device) {
+            weight.to_dtype(DType::F32)?
+        } else {
+            host_f32(weight)?.to_device(device)?
+        };
         Ok(Self {
             weights: Weights::Dense(weight),
             out_features,
@@ -54,10 +57,64 @@ impl PackedLinear {
                 "input width {in_features} is not a multiple of the {format:?} block size"
             )));
         }
-        let host = weight.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
-        let packed = QTensor::quantize(&host, format)?;
+        let packed = QTensor::quantize(&host_f32(weight)?, format)?;
         let resident_bytes = packed.storage_size_in_bytes();
         let (qtensor, buffer) = upload(packed, device)?;
+        #[cfg(not(feature = "metal"))]
+        let () = buffer;
+        Ok(Self {
+            weights: Weights::Packed {
+                matmul: QMatMul::from_qtensor(qtensor)?,
+                format,
+                #[cfg(feature = "metal")]
+                buffer,
+            },
+            out_features,
+            in_features,
+            resident_bytes,
+        })
+    }
+
+    /// Stack `[rows, in]` parts into one `[Σ rows, in]` projection, converting and
+    /// quantizing one part at a time so the host never holds more than one full-precision
+    /// part. GGML blocks never span rows, so the packed bytes equal quantizing the whole
+    /// matrix. `format` `None` keeps dense F32 weights.
+    pub fn stacked(
+        parts: impl IntoIterator<Item = Result<Tensor>>,
+        format: Option<GgmlDType>,
+        device: &Device,
+    ) -> Result<Self> {
+        let (mut out_features, mut in_features) = (0, None);
+        let (mut dense, mut packed) = (Vec::new(), Vec::new());
+        for part in parts {
+            let part = part?;
+            let (rows, width) = part.dims2()?;
+            if *in_features.get_or_insert(width) != width {
+                return Err(invalid("stacked projection parts differ in input width"));
+            }
+            out_features += rows;
+            let host = host_f32(&part)?;
+            match format {
+                None => dense.extend(host.flatten_all()?.to_vec1::<f32>()?),
+                Some(format) => {
+                    if !width.is_multiple_of(format.block_size()) {
+                        return Err(invalid(format!(
+                            "input width {width} is not a multiple of the {format:?} block size"
+                        )));
+                    }
+                    packed.extend_from_slice(&QTensor::quantize(&host, format)?.data()?);
+                }
+            }
+        }
+        let in_features = in_features.ok_or_else(|| invalid("empty stacked projection"))?;
+        let Some(format) = format else {
+            return Self::dense(
+                &Tensor::from_vec(dense, (out_features, in_features), device)?,
+                device,
+            );
+        };
+        let resident_bytes = packed.len();
+        let (qtensor, buffer) = upload_bytes(&packed, format, (out_features, in_features), device)?;
         #[cfg(not(feature = "metal"))]
         let () = buffer;
         Ok(Self {
@@ -102,8 +159,9 @@ impl PackedLinear {
         })
     }
 
-    /// Reference projection through a contiguous output-row range. Dense weights select
-    /// the rows before multiplication; packed weights use the backend then select outputs.
+    /// Reference projection through a contiguous output-row range. Dense weights and
+    /// host-packed weights multiply only those rows; Metal-packed weights (a test oracle,
+    /// whose bytes stay on the device) multiply every row and select the outputs.
     /// Production routed execution uses the grouped device kernel instead.
     pub fn forward_rows(&self, x: &Tensor, start: usize, rows: usize) -> Result<Tensor> {
         if rows == 0
@@ -115,6 +173,19 @@ impl PackedLinear {
         }
         Ok(match &self.weights {
             Weights::Dense(weight) => x.matmul(&weight.narrow(0, start, rows)?.t()?)?,
+            Weights::Packed {
+                matmul: QMatMul::QTensor(packed),
+                format,
+                ..
+            } if packed.device().is_cpu() => {
+                let row = self.in_features / format.block_size() * format.type_size();
+                let data = packed.data()?;
+                let bytes = data
+                    .get(start * row..(start + rows) * row)
+                    .ok_or_else(|| invalid("packed rows outside weights"))?;
+                let (slice, _) = upload_bytes(bytes, *format, (rows, self.in_features), &Device::Cpu)?;
+                QMatMul::from_qtensor(slice)?.forward(x)?
+            }
             Weights::Packed { matmul, .. } => matmul.forward(x)?.narrow(1, start, rows)?,
         })
     }
@@ -142,6 +213,21 @@ impl PackedLinear {
     }
 }
 
+/// A host F32 copy that owns its storage from offset zero: GGML quantization and device
+/// transfers read the storage buffer, not the layout, so a row-range view would quantize
+/// the wrong rows or upload the whole buffer.
+fn host_f32(weight: &Tensor) -> Result<Tensor> {
+    let host = weight.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+    let owned = {
+        let (storage, layout) = host.storage_and_layout();
+        layout.start_offset() == 0
+            && layout.is_contiguous()
+            && matches!(&*storage, candle_core::Storage::Cpu(candle_core::CpuStorage::F32(v))
+                if v.len() == host.elem_count())
+    };
+    Ok(if owned { host } else { host.force_contiguous()? })
+}
+
 #[cfg(feature = "metal")]
 type Handle = Option<candle_metal_kernels::metal::Buffer>;
 #[cfg(not(feature = "metal"))]
@@ -151,15 +237,80 @@ type Handle = ();
 fn upload(packed: QTensor, device: &Device) -> Result<(QTensor, Handle)> {
     match device {
         Device::Cpu => Ok((packed, Handle::default())),
+        _ => upload_bytes(&packed.data()?, packed.dtype(), packed.shape().clone(), device),
+    }
+}
+
+/// Packed GGML blocks of `format` and `shape` as a tensor on `device`.
+fn upload_bytes(
+    bytes: &[u8],
+    format: GgmlDType,
+    shape: impl Into<candle_core::Shape>,
+    device: &Device,
+) -> Result<(QTensor, Handle)> {
+    let storage = QStorage::from_data(std::borrow::Cow::Borrowed(bytes), device, format)?;
+    match &storage {
+        QStorage::Cpu(_) => Ok((QTensor::new(storage, shape)?, Handle::default())),
         #[cfg(feature = "metal")]
-        Device::Metal(_) => {
-            let storage = QStorage::from_data(packed.data()?, device, packed.dtype())?;
-            let QStorage::Metal(metal) = &storage else {
-                return Err(invalid("packed upload did not produce Metal storage"));
-            };
+        QStorage::Metal(metal) => {
             let buffer = metal.buffer().clone();
-            Ok((QTensor::new(storage, packed.shape().clone())?, Some(buffer)))
+            Ok((QTensor::new(storage, shape)?, Some(buffer)))
         }
         _ => Err(invalid("packed weights support CPU and Metal devices")),
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert outcomes after fallible setup"
+)]
+mod tests {
+    use super::*;
+
+    fn weights(rows: usize, cols: usize) -> Result<Tensor> {
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+            .collect();
+        Ok(Tensor::from_vec(values, (rows, cols), &Device::Cpu)?)
+    }
+
+    #[test]
+    fn test_stacked_parts_and_row_ranges_match_the_whole_matrix() -> Result<()> {
+        let (rows, cols) = (24, 256);
+        let whole = weights(rows, cols)?;
+        let x = weights(3, cols)?;
+        for format in [None, Some(GgmlDType::Q8_0), Some(GgmlDType::Q4K)] {
+            let single = match format {
+                Some(format) => PackedLinear::quantized(&whole, format, &Device::Cpu)?,
+                None => PackedLinear::dense(&whole, &Device::Cpu)?,
+            };
+            let stacked = PackedLinear::stacked(
+                (0..3).map(|part| Ok(whole.narrow(0, part * 8, 8)?)),
+                format,
+                &Device::Cpu,
+            )?;
+            assert_eq!(stacked.resident_bytes(), single.resident_bytes());
+            assert_eq!(
+                stacked.forward(&x)?.to_vec2::<f32>()?,
+                single.forward(&x)?.to_vec2::<f32>()?
+            );
+            // Only the requested rows are multiplied, with the same packed blocks.
+            let full = single.forward(&x)?.narrow(1, 8, 8)?.to_vec2::<f32>()?;
+            let rows = single.forward_rows(&x, 8, 8)?.to_vec2::<f32>()?;
+            for (a, b) in full.iter().flatten().zip(rows.iter().flatten()) {
+                assert!((a - b).abs() <= 1e-5 * a.abs().max(1.0), "{format:?}: {a} {b}");
+            }
+            assert!(single.forward_rows(&x, 20, 8).is_err());
+        }
+        assert!(
+            PackedLinear::stacked(
+                [weights(2, 64), weights(2, 32)],
+                None,
+                &Device::Cpu
+            )
+            .is_err()
+        );
+        Ok(())
     }
 }

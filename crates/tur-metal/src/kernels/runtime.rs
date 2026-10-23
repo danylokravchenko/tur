@@ -43,13 +43,16 @@ const SIMD_WIDTH: usize = 32;
 /// (`r4` = 4 registers per lane, `b3` = 3 batch rows) and dtype or K/V format in the name.
 const FUNCTIONS: &[&str] = &[
     "moe_route_f32",
-    "moe_counts_f32",
+    "moe_histogram_f32",
     "moe_offsets_f32",
     "moe_order_f32",
     "moe_gather_f32",
     "moe_scatter_f32",
+    "moe_gemv_f32",
+    "moe_gemv_q8_0",
+    "moe_gemv_q4k",
     "moe_gemm_f32",
-    "moe_qmm_q8_0",
+    "moe_gemm_q8_0",
     "moe_gemm_q4k",
     "rms_norm_f32",
     "add_rms_norm_f32",

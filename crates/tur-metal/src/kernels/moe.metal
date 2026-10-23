@@ -1,99 +1,133 @@
 struct MoeRouteParams { uint tokens, experts, top_k, stride; };
-struct ExpertParams { uint rows, experts, top_k, width, stride, out; };
+struct ExpertParams { uint rows, experts, top_k, width, stride, out, routed; };
+struct ScatterParams { uint tokens, top_k, width, stride, shared, shared_stride, gate_stride; };
 
-// One simdgroup per token; sorting ranks retain exact F32 scores and break ties by ID.
+// Assignments per histogram block; also the threads of the histogram, offset and scatter
+// threadgroups, which cover up to 256 experts with one thread each.
+#define MOE_BLOCK 256u
+#define MOE_LANE_EXPERTS 8u
+#define MOE_TILE 16u
+
+// One simdgroup per token; each lane keeps eight scores in registers. Top-k takes k
+// simdgroup max reductions over exact F32 scores, ties to the lowest expert ID (both
+// signs of zero compare equal), and normalizes in rank order as the host reference does.
 kernel void moe_route_f32(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
     constant MoeRouteParams &p [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
+    float scores[MOE_LANE_EXPERTS];
+    bool taken[MOE_LANE_EXPERTS];
     bool valid = true;
-    float maximum = -INFINITY;
-    for (uint e = lane; e < p.experts; e += 32) {
-        float score = x[ulong(row) * p.stride + e];
-        valid = valid && isfinite(score);
-        maximum = max(maximum, score);
+    for (uint i = 0; i < MOE_LANE_EXPERTS; ++i) {
+        uint e = lane + 32 * i;
+        taken[i] = e >= p.experts;
+        scores[i] = taken[i] ? -INFINITY : x[ulong(row) * p.stride + e];
+        valid = valid && (taken[i] || isfinite(scores[i]));
     }
     valid = simd_all(valid);
-    maximum = simd_max(maximum);
+    device float *out = y + ulong(row) * p.top_k * 2;
     if (!valid) {
         for (uint i = lane; i < p.top_k; i += 32) {
             // Keep every permutation row initialized even for a failed token. NaN
             // weights mark its output invalid without producing unchecked addresses.
-            y[(ulong(row) * p.top_k + i) * 2] = float(i);
-            y[(ulong(row) * p.top_k + i) * 2 + 1] = NAN;
+            out[i * 2] = float(i);
+            out[i * 2 + 1] = NAN;
         }
         return;
     }
-    float sum = 0.0f;
-    for (uint e = lane; e < p.experts; e += 32) {
-        float score = x[ulong(row) * p.stride + e];
-        uint rank = 0;
-        for (uint j = 0; j < p.experts; ++j) {
-            float other = x[ulong(row) * p.stride + j];
-            rank += other > score || (other == score && j < e);
+    float top = 0.0f, sum = 0.0f;
+    for (uint n = 0; n < p.top_k; ++n) {
+        float best = -INFINITY;
+        uint best_id = 0xFFFFFFFFu;
+        for (uint i = 0; i < MOE_LANE_EXPERTS; ++i) {
+            if (!taken[i] && (best_id == 0xFFFFFFFFu || scores[i] > best)) {
+                best = scores[i];
+                best_id = lane + 32 * i;
+            }
         }
-        if (rank < p.top_k) {
-            float weight = exp(score - maximum);
-            y[(ulong(row) * p.top_k + rank) * 2] = float(e);
-            y[(ulong(row) * p.top_k + rank) * 2 + 1] = weight;
-            sum += weight;
-        }
+        float m = simd_max(best);
+        uint id = simd_min(best_id != 0xFFFFFFFFu && best == m ? best_id : 0xFFFFFFFFu);
+        for (uint i = 0; i < MOE_LANE_EXPERTS; ++i) taken[i] = taken[i] || lane + 32 * i == id;
+        top = n == 0 ? m : top;
+        float weight = exp(m - top);
+        sum += weight;
+        if (lane == 0) { out[n * 2] = float(id); out[n * 2 + 1] = weight; }
     }
-    sum = simd_sum(sum);
-    threadgroup_barrier(mem_flags::mem_device);
-    for (uint i = lane; i < p.top_k; i += 32) {
-        y[(ulong(row) * p.top_k + i) * 2 + 1] /= sum;
-    }
+    if (lane == 0) for (uint n = 0; n < p.top_k; ++n) out[n * 2 + 1] /= sum;
 }
 
-kernel void moe_counts_f32(device const float *selected [[buffer(0)]], device float *counts [[buffer(1)]],
-    constant MoeRouteParams &p [[buffer(2)]], uint expert [[thread_position_in_grid]]) {
-    if (expert >= p.experts) return;
-    uint count = 0;
-    for (uint i = 0; i < p.tokens * p.top_k; ++i) count += selected[ulong(i) * 2] == float(expert);
-    counts[expert] = float(count);
-}
-
-kernel void moe_offsets_f32(device const float *counts [[buffer(0)]], device float *groups [[buffer(1)]],
-    device float *tiles [[buffer(2)]], device float *wide_tiles [[buffer(3)]],
-    constant MoeRouteParams &p [[buffer(4)]], uint tid [[thread_position_in_grid]]) {
-    if (tid != 0) return;
-    uint offset = 0, tile = 0, wide_tile = 0;
-    for (uint e = 0; e < p.experts; ++e) {
-        uint count = uint(counts[e]);
-        groups[e * 6] = float(offset); groups[e * 6 + 1] = float(count);
-        groups[e * 6 + 2] = float(tile); groups[e * 6 + 3] = float((count + 7) / 8);
-        groups[e * 6 + 4] = float(wide_tile); groups[e * 6 + 5] = float((count + 15) / 16);
-        for (uint row = 0; row < count; row += 8) {
-            tiles[(tile + row / 8) * 3] = float(e);
-            tiles[(tile + row / 8) * 3 + 1] = float(offset + row);
-            tiles[(tile + row / 8) * 3 + 2] = float(min(8u, count - row));
-        }
-        for (uint row = 0; row < count; row += 16) {
-            wide_tiles[(wide_tile + row / 16) * 3] = float(e);
-            wide_tiles[(wide_tile + row / 16) * 3 + 1] = float(offset + row);
-            wide_tiles[(wide_tile + row / 16) * 3 + 2] = float(min(16u, count - row));
-        }
-        offset += count; tile += (count + 7) / 8; wide_tile += (count + 15) / 16;
-    }
-    uint rows = p.tokens * p.top_k;
-    uint tile_cap = min(rows, (rows + 7) / 8 + p.experts - 1);
-    uint wide_cap = min(rows, (rows + 15) / 16 + p.experts - 1);
-    for (; tile < tile_cap; ++tile) { tiles[tile * 3] = -1.0f; tiles[tile * 3 + 1] = 0.0f; tiles[tile * 3 + 2] = 0.0f; }
-    for (; wide_tile < wide_cap; ++wide_tile) { wide_tiles[wide_tile * 3] = -1.0f; wide_tiles[wide_tile * 3 + 1] = 0.0f; wide_tiles[wide_tile * 3 + 2] = 0.0f; }
-}
-
-kernel void moe_order_f32(device const float *selected [[buffer(0)]], device const float *groups [[buffer(1)]],
+// Per block of assignments: each expert's count, and each assignment's rank among the
+// earlier assignments of its expert in the block (kept in its permutation slot).
+kernel void moe_histogram_f32(device const float *selected [[buffer(0)]], device float *hist [[buffer(1)]],
     device float *order [[buffer(2)]], constant MoeRouteParams &p [[buffer(3)]],
-    uint expert [[thread_position_in_grid]]) {
-    if (expert >= p.experts) return;
-    uint row = uint(groups[expert * 6]);
-    for (uint i = 0; i < p.tokens * p.top_k; ++i) {
-        if (selected[ulong(i) * 2] == float(expert)) {
-            order[ulong(row) * 3] = float(i); order[ulong(row) * 3 + 1] = float(expert);
-            order[ulong(i) * 3 + 2] = float(row);
-            ++row;
+    uint block [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup uint ids[MOE_BLOCK];
+    uint total = p.tokens * p.top_k, a = block * MOE_BLOCK + tid;
+    ids[tid] = a < total ? uint(selected[ulong(a) * 2]) : 0xFFFFFFFFu;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (a < total) {
+        uint rank = 0;
+        for (uint j = 0; j < tid; ++j) rank += ids[j] == ids[tid];
+        order[ulong(a) * 3 + 2] = float(rank);
+    }
+    if (tid < p.experts) {
+        uint count = 0;
+        for (uint j = 0; j < MOE_BLOCK; ++j) count += ids[j] == tid;
+        hist[ulong(block) * p.experts + tid] = float(count);
+    }
+}
+
+// One threadgroup: block counts become per-expert exclusive prefixes, then expert offsets
+// and tile starts are scanned across experts and every expert writes its own
+// tiles. Unused tile slots up to the bound get a negative expert and are skipped.
+kernel void moe_offsets_f32(device float *hist [[buffer(0)]], device float *groups [[buffer(1)]],
+    device float *tiles [[buffer(2)]], constant MoeRouteParams &p [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup uint2 scan[MOE_BLOCK];
+    uint total = p.tokens * p.top_k, blocks = (total + MOE_BLOCK - 1) / MOE_BLOCK;
+    uint count = 0;
+    if (tid < p.experts) {
+        for (uint b = 0; b < blocks; ++b) {
+            ulong at = ulong(b) * p.experts + tid;
+            uint c = uint(hist[at]);
+            hist[at] = float(count);
+            count += c;
         }
     }
+    uint2 own = uint2(count, (count + MOE_TILE - 1) / MOE_TILE);
+    scan[tid] = own;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 1; step < MOE_BLOCK; step *= 2) {
+        uint2 add = tid >= step ? scan[tid - step] : uint2(0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        scan[tid] += add;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint2 start = scan[tid] - own;
+    if (tid < p.experts) {
+        groups[tid] = float(start.x);
+        for (uint row = 0; row < count; row += MOE_TILE) {
+            ulong t = ulong(start.y + row / MOE_TILE) * 3;
+            tiles[t] = float(tid); tiles[t + 1] = float(start.x + row); tiles[t + 2] = float(min(MOE_TILE, count - row));
+        }
+    }
+    uint used = scan[MOE_BLOCK - 1].y;
+    uint cap = min(total, (total + MOE_TILE - 1) / MOE_TILE + p.experts - 1);
+    for (uint t = used + tid; t < cap; t += MOE_BLOCK) {
+        tiles[ulong(t) * 3] = -1.0f; tiles[ulong(t) * 3 + 1] = 0.0f; tiles[ulong(t) * 3 + 2] = 0.0f;
+    }
+}
+
+// Rows of one expert keep ascending assignment order, so the permutation (and which rows
+// share a tile) is deterministic. Slot 2 holds the block rank on entry, the row on exit.
+kernel void moe_order_f32(device const float *selected [[buffer(0)]], device const float *hist [[buffer(1)]],
+    device const float *groups [[buffer(2)]], device float *order [[buffer(3)]],
+    constant MoeRouteParams &p [[buffer(4)]], uint a [[thread_position_in_grid]]) {
+    if (a >= p.tokens * p.top_k) return;
+    uint expert = uint(selected[ulong(a) * 2]);
+    uint row = uint(groups[expert]) + uint(hist[ulong(a / MOE_BLOCK) * p.experts + expert])
+        + uint(order[ulong(a) * 3 + 2]);
+    order[ulong(row) * 3] = float(a); order[ulong(row) * 3 + 1] = float(expert);
+    order[ulong(a) * 3 + 2] = float(row);
 }
 
 kernel void moe_gather_f32(device const float *x [[buffer(0)]], device const float *order [[buffer(1)]],
@@ -103,169 +137,219 @@ kernel void moe_gather_f32(device const float *x [[buffer(0)]], device const flo
     y[tid] = x[ulong(uint(order[ulong(row) * 3]) / p.top_k) * p.stride + col];
 }
 
-template <uint FORMAT> inline float expert_weight(device const uchar *w, ulong row, uint col, uint width) {
-    if (FORMAT == 0) return ((device const float *)w)[row * width + col];
-    if (FORMAT == 1) {
-        device const block_q8_0 &b = ((device const block_q8_0 *)w)[row * (width / 32) + col / 32];
-        return float(b.d) * float(b.qs[col % 32]);
+// Eight consecutive dequantized weights of `row` from element 32 * chunk + start, where
+// start is a multiple of four below 32.
+template <uint FORMAT> inline void expert_weights8(device const uchar *w, ulong row, uint chunk,
+    uint start, uint width, thread float4 &lo, thread float4 &hi) {
+    if (FORMAT == 0) {
+        device const packed_float4 *v = (device const packed_float4 *)((device const float *)w
+            + row * width + chunk * 32 + start);
+        lo = float4(v[0]); hi = float4(v[1]);
+    } else if (FORMAT == 1) {
+        device const block_q8_0 &b = ((device const block_q8_0 *)w)[row * (width / 32) + chunk];
+        device const packed_char4 *qs = (device const packed_char4 *)(b.qs + start);
+        float d = float(b.d);
+        lo = float4(char4(qs[0])) * d; hi = float4(char4(qs[1])) * d;
+    } else {
+        device const block_q4_k &b = ((device const block_q4_k *)w)[row * (width / 256) + chunk / 8];
+        uint sub = chunk % 8;
+        uchar2 sm = q4k_scale_min(sub, b.scales);
+        float d = float(b.d) * float(sm.x), m = float(b.dmin) * float(sm.y);
+        device const packed_uchar4 *qs = (device const packed_uchar4 *)(b.qs + (sub / 2) * 32 + start);
+        uchar4 q0 = uchar4(qs[0]), q1 = uchar4(qs[1]);
+        if (sub & 1) { q0 >>= 4; q1 >>= 4; } else { q0 &= 15; q1 &= 15; }
+        lo = float4(q0) * d - m; hi = float4(q1) * d - m;
     }
-    device const block_q4_k &b = ((device const block_q4_k *)w)[row * (width / 256) + col / 256];
-    uint inner = col % 256, sub = inner / 32;
-    uchar2 scale = q4k_scale_min(sub, b.scales);
-    uchar packed = b.qs[(inner / 64) * 32 + inner % 32];
-    uint quant = (sub & 1) ? packed >> 4 : packed & 15;
-    return float(b.d) * float(scale.x) * float(quant) - float(b.dmin) * float(scale.y);
 }
 
-// One matrix unit tile of one expert per simdgroup. Tile offsets come from the actual
-// routing counts, so skew changes group sizes without padding tokens or host readback.
+// Input row of group row `r`: gathered rows are read directly; routed reads index the
+// token through the permutation, so no gathered copy of the activations is needed.
+inline device const float *expert_input(device const float *x, device const float *order,
+    constant ExpertParams &p, uint r) {
+    uint row = p.routed ? uint(order[ulong(r) * 3]) / p.top_k : r;
+    return x + ulong(row) * p.stride;
+}
+
+// Q4_K GEMV over up to three rows, laid out like the dense kernel: eight lanes share a
+// super-block, each reading 16 packed bytes (16 values of two sub-blocks), and the minima
+// fold into one activation sum per sub-block.
+template <uint NR> inline void expert_gemv_q4k(device const uchar *w, ulong base, uint col, uint out, uint width,
+    thread device const float *const (&xs)[3], uint count, uint lane, thread float (&acc)[NR][3]) {
+    uint blocks = width / 256, ix = lane / 8, slot = lane % 8, group = slot / 2, off = 16 * (slot % 2);
+    for (uint ib = ix; ib < blocks; ib += 4) {
+        uint4 packed[NR];
+        float d_lo[NR], m_lo[NR], d_hi[NR], m_hi[NR];
+        for (uint r = 0; r < NR; ++r) {
+            device const block_q4_k &blk = ((device const block_q4_k *)w)[(base + min(col + r, out - 1)) * blocks + ib];
+            float d = float(blk.d), dmin = float(blk.dmin);
+            uchar2 first = q4k_scale_min(2 * group, blk.scales), second = q4k_scale_min(2 * group + 1, blk.scales);
+            d_lo[r] = d * float(first.x); m_lo[r] = dmin * float(first.y);
+            d_hi[r] = d * float(second.x); m_hi[r] = dmin * float(second.y);
+            packed[r] = *((device const uint4 *)(blk.qs + 32 * group + off));
+        }
+        for (uint b = 0; b < 3; ++b) {
+            if (b >= count) break;
+            device const packed_float4 *xl = (device const packed_float4 *)(xs[b] + ib * 256 + 64 * group + off);
+            float4 lo_x[4], hi_x[4];
+            float sum_lo = 0.0f, sum_hi = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+                lo_x[i] = float4(xl[i]); hi_x[i] = float4(xl[i + 8]);
+                sum_lo += lo_x[i].x + lo_x[i].y + lo_x[i].z + lo_x[i].w;
+                sum_hi += hi_x[i].x + hi_x[i].y + hi_x[i].z + hi_x[i].w;
+            }
+            for (uint r = 0; r < NR; ++r) {
+                float dot_lo = 0.0f, dot_hi = 0.0f;
+                for (uint i = 0; i < 4; ++i) {
+                    uint word = packed[r][i];
+                    dot_lo += dot(float4(word & 0xF, (word >> 8) & 0xF, (word >> 16) & 0xF, (word >> 24) & 0xF), lo_x[i]);
+                    dot_hi += dot(float4((word >> 4) & 0xF, (word >> 12) & 0xF, (word >> 20) & 0xF, word >> 28), hi_x[i]);
+                }
+                acc[r][b] += d_lo[r] * dot_lo - m_lo[r] * sum_lo + d_hi[r] * dot_hi - m_hi[r] * sum_hi;
+            }
+        }
+    }
+}
+
+// GEMV over tiles of at most three rows; larger tiles are left to moe_gemm. One simdgroup
+// computes NR outputs (four, or two for Q4_K), as many as the dense GEMV, so decode keeps
+// its parallelism.
+template <uint FORMAT, uint NR> kernel void moe_gemv(device const uchar *w [[buffer(0)]],
+    device const float *x [[buffer(1)]], device const float *tiles [[buffer(2)]],
+    device float *y [[buffer(3)]], constant ExpertParams &p [[buffer(4)]],
+    device const float *order [[buffer(5)]], uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint sgs [[simdgroups_per_threadgroup]]) {
+    uint columns = (p.out + NR * sgs - 1) / (NR * sgs), tile = tg / columns;
+    uint col = (tg % columns) * NR * sgs + sg * NR;
+    if (tiles[tile * 3] < 0.0f || tiles[tile * 3 + 2] > 3.0f || col >= p.out) return;
+    uint expert = uint(tiles[tile * 3]), offset = uint(tiles[tile * 3 + 1]), count = uint(tiles[tile * 3 + 2]);
+    ulong base = ulong(expert) * p.out;
+    device const float *xs[3];
+    for (uint b = 0; b < 3; ++b) xs[b] = expert_input(x, order, p, offset + min(b, count - 1));
+    float acc[NR][3];
+    for (uint r = 0; r < NR; ++r) for (uint b = 0; b < 3; ++b) acc[r][b] = 0.0f;
+    if (FORMAT == 2) {
+        expert_gemv_q4k<NR>(w, base, col, p.out, p.width, xs, count, lane, acc);
+    } else {
+        uint ix = lane / 4, start = (lane % 4) * 8;
+        for (uint chunk = ix; chunk < p.width / 32; chunk += 8) {
+            float4 lo[NR], hi[NR];
+            for (uint r = 0; r < NR; ++r) {
+                expert_weights8<FORMAT>(w, base + min(col + r, p.out - 1), chunk, start, p.width, lo[r], hi[r]);
+            }
+            for (uint b = 0; b < 3; ++b) {
+                if (b < count) {
+                    device const float *xb = xs[b] + chunk * 32 + start;
+                    float4 xl = float4(xb[0], xb[1], xb[2], xb[3]);
+                    float4 xh = float4(xb[4], xb[5], xb[6], xb[7]);
+                    for (uint r = 0; r < NR; ++r) acc[r][b] += dot(lo[r], xl) + dot(hi[r], xh);
+                }
+            }
+        }
+    }
+    for (uint r = 0; r < NR; ++r) {
+        for (uint b = 0; b < 3; ++b) {
+            float total = simd_sum(acc[r][b]);
+            if (lane == 0 && b < count && col + r < p.out) y[ulong(offset + b) * p.out + col + r] = total;
+        }
+    }
+}
+
+// Matrix-unit GEMM over tiles of four or more rows; smaller tiles are left to moe_gemv.
+// Each simdgroup owns a sixteen-row tile's 32 outputs over the whole reduction, reusing
+// its vector-loaded weights across sixteen rows and its activations across 32 outputs,
+// with no threadgroup memory or barriers.
 template <uint FORMAT> kernel void moe_gemm(device const uchar *w [[buffer(0)]],
     device const float *x [[buffer(1)]], device const float *tiles [[buffer(2)]],
     device float *y [[buffer(3)]], constant ExpertParams &p [[buffer(4)]],
-    uint tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
-    uint columns = (p.out + 7) / 8, tile = tg / columns, col0 = (tg % columns) * 8;
-    if (tiles[tile * 3] < 0.0f) return;
-    uint expert = uint(tiles[tile * 3]), offset = uint(tiles[tile * 3 + 1]), count = uint(tiles[tile * 3 + 2]);
-    uint row0 = 0;
-    uint qid = lane / 4;
-    uint fr = (qid & 4) + (lane / 2) % 4, fc = (qid & 2) * 2 + (lane % 2) * 2;
-    simdgroup_float8x8 acc(0.0f);
-    for (uint k = 0; k < p.width; k += 8) {
-        simdgroup_float8x8 wm, xm;
-        for (uint i = 0; i < 2; ++i) {
-            wm.thread_elements()[i] = col0 + fr < p.out && k + fc + i < p.width
-                ? expert_weight<FORMAT>(w, ulong(expert) * p.out + col0 + fr, k + fc + i, p.width) : 0.0f;
-            xm.thread_elements()[i] = row0 + fc + i < count && k + fr < p.width
-                ? x[ulong(offset + row0 + fc + i) * p.stride + k + fr] : 0.0f;
-        }
-        simdgroup_multiply_accumulate(acc, wm, xm, acc);
-    }
-    for (uint i = 0; i < 2; ++i) {
-        if (row0 + fc + i < count && col0 + fr < p.out) {
-            y[ulong(offset + row0 + fc + i) * p.out + col0 + fr] = acc.thread_elements()[i];
-        }
-    }
-}
-
-#define EXPERT_GEMM(NAME, FORMAT) \
-template [[host_name(NAME)]] kernel void moe_gemm<FORMAT>(device const uchar *, device const float *, \
-    device const float *, device float *, constant ExpertParams &, uint, uint);
-EXPERT_GEMM("moe_gemm_f32", 0)
-EXPERT_GEMM("moe_gemm_q4k", 2)
-
-// Q8 groups use the measured GEMV/matrix split of the dense projection kernels.
-// Each matrix tile reuses vector-loaded weights across sixteen token rows and splits
-// the reduction across the threadgroup's simdgroups; groups of at most three rows use
-// GEMV to avoid mostly empty matrix fragments.
-kernel void moe_qmm_q8_0(device const block_q8_0 *w [[buffer(0)]],
-    device const float *x [[buffer(1)]], device const float *tiles [[buffer(2)]],
-    device float *y [[buffer(3)]], constant ExpertParams &p [[buffer(4)]],
-    threadgroup float *partial [[threadgroup(0)]], uint tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]],
+    device const float *order [[buffer(5)]], uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
     uint sgs [[simdgroups_per_threadgroup]]) {
-    uint columns = (p.out + 15) / 16, tile = tg / columns, col0 = (tg % columns) * 16;
-    if (tiles[tile * 3] < 0.0f) return;
+    uint columns = (p.out + 32 * sgs - 1) / (32 * sgs), tile = tg / columns;
+    uint col0 = (tg % columns) * 32 * sgs + sg * 32;
+    if (tiles[tile * 3] < 0.0f || tiles[tile * 3 + 2] <= 3.0f || col0 >= p.out) return;
     uint expert = uint(tiles[tile * 3]), offset = uint(tiles[tile * 3 + 1]), count = uint(tiles[tile * 3 + 2]);
-    uint row0 = 0;
-    uint blocks = p.width / 32;
-    if (count <= 3) {
-        for (uint part = sg; part < 4; part += sgs) {
-            uint col = col0 + part * 4;
-            float acc[4][3];
-            for (uint r = 0; r < 4; ++r) for (uint b = 0; b < 3; ++b) acc[r][b] = 0.0f;
-            uint ix = lane / 4, il = lane % 4;
-            for (uint ib = ix; ib < blocks; ib += 8) {
-                float4 lo[4], hi[4]; float scale[4];
-                for (uint r = 0; r < 4; ++r) {
-                    device const block_q8_0 &blk = w[(ulong(expert) * p.out + min(col + r, p.out - 1)) * blocks + ib];
-                    device const packed_char4 *qs = (device const packed_char4 *)(blk.qs + il * 8);
-                    scale[r] = float(blk.d); lo[r] = float4(char4(qs[0])); hi[r] = float4(char4(qs[1]));
-                }
-                for (uint b = 0; b < 3; ++b) {
-                    if (b < count) {
-                        device const float *xb = x + ulong(offset + b) * p.stride + ib * 32 + il * 8;
-                        float4 xl = float4(xb[0], xb[1], xb[2], xb[3]);
-                        float4 xh = float4(xb[4], xb[5], xb[6], xb[7]);
-                        for (uint r = 0; r < 4; ++r) acc[r][b] += (dot(lo[r], xl) + dot(hi[r], xh)) * scale[r];
-                    }
-                }
-            }
-            for (uint r = 0; r < 4; ++r) {
-                for (uint b = 0; b < 3; ++b) {
-                    float total = simd_sum(acc[r][b]);
-                    if (lane == 0 && b < count && col + r < p.out) y[ulong(offset + b) * p.out + col + r] = total;
-                }
-            }
-        }
-        return;
-    }
+    ulong base = ulong(expert) * p.out;
     uint qid = lane / 4;
     uint fr = (qid & 4) + (lane / 2) % 4, fc = (qid & 2) * 2 + (lane % 2) * 2;
-    simdgroup_float8x8 acc[2][2];
-    for (uint t = 0; t < 2; ++t) for (uint b = 0; b < 2; ++b) acc[t][b] = simdgroup_float8x8(0.0f);
-    device const block_q8_0 *wr[2];
-    for (uint t = 0; t < 2; ++t) wr[t] = w + (ulong(expert) * p.out + min(col0 + t * 8 + fr, p.out - 1)) * blocks;
-    for (uint ib = sg; ib < blocks; ib += sgs) {
+    simdgroup_float8x8 acc[4][2];
+    for (uint t = 0; t < 4; ++t) for (uint b = 0; b < 2; ++b) acc[t][b] = simdgroup_float8x8(0.0f);
+    device const float *xs[2][2];
+    bool live[2][2];
+    for (uint b = 0; b < 2; ++b) {
+        for (uint e = 0; e < 2; ++e) {
+            uint row = b * 8 + fc + e;
+            live[b][e] = row < count;
+            xs[b][e] = expert_input(x, order, p, offset + min(row, count - 1)) + 4 * fr;
+        }
+    }
+    ulong wr[4];
+    for (uint t = 0; t < 4; ++t) wr[t] = base + min(col0 + t * 8 + fr, p.out - 1);
+    for (uint chunk = 0; chunk < p.width / 32; ++chunk) {
         float4 xv[2][2];
         for (uint b = 0; b < 2; ++b) {
             for (uint e = 0; e < 2; ++e) {
-                uint row = row0 + b * 8 + fc + e;
-                device const float *v = x + ulong(offset + min(row, count - 1)) * p.stride + ib * 32 + 4 * fr;
-                xv[b][e] = row < count ? float4(v[0], v[1], v[2], v[3]) : float4(0.0f);
+                device const float *v = xs[b][e] + chunk * 32;
+                xv[b][e] = live[b][e] ? float4(v[0], v[1], v[2], v[3]) : float4(0.0f);
             }
         }
-        float4 lo[2], hi[2];
-        for (uint t = 0; t < 2; ++t) {
-            device const block_q8_0 &blk = wr[t][ib];
-            device const packed_char4 *qs = (device const packed_char4 *)(blk.qs + 4 * fc);
-            lo[t] = float4(char4(qs[0])) * float(blk.d); hi[t] = float4(char4(qs[1])) * float(blk.d);
-        }
+        // Lane (fr, fc) holds weights 4·fc..4·fc+7 of its row; reduction index j of
+        // step s is element 4j + s, matching the activations loaded at 4·fr + s.
+        float4 lo[4], hi[4];
+        for (uint t = 0; t < 4; ++t) expert_weights8<FORMAT>(w, wr[t], chunk, 4 * fc, p.width, lo[t], hi[t]);
         for (uint s = 0; s < 4; ++s) {
             simdgroup_float8x8 xm[2];
             for (uint b = 0; b < 2; ++b) { xm[b].thread_elements()[0] = xv[b][0][s]; xm[b].thread_elements()[1] = xv[b][1][s]; }
-            for (uint t = 0; t < 2; ++t) {
+            for (uint t = 0; t < 4; ++t) {
                 simdgroup_float8x8 wm;
                 wm.thread_elements()[0] = lo[t][s]; wm.thread_elements()[1] = hi[t][s];
                 for (uint b = 0; b < 2; ++b) simdgroup_multiply_accumulate(acc[t][b], wm, xm[b], acc[t][b]);
             }
         }
     }
-    for (uint t = 0; t < 2; ++t) {
+    for (uint t = 0; t < 4; ++t) {
         for (uint b = 0; b < 2; ++b) {
-            threadgroup float *out = partial + ((sg * 2 + t) * 2 + b) * 64 + fr * 8 + fc;
-            out[0] = acc[t][b].thread_elements()[0]; out[1] = acc[t][b].thread_elements()[1];
+            for (uint i = 0; i < 2; ++i) {
+                uint row = b * 8 + fc + i, col = col0 + t * 8 + fr;
+                if (row < count && col < p.out) y[ulong(offset + row) * p.out + col] = acc[t][b].thread_elements()[i];
+            }
         }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < 256; i += threads) {
-        float total = 0.0f;
-        for (uint g = 0; g < sgs; ++g) total += partial[g * 256 + i];
-        uint t = i / 128, b = (i / 64) % 2;
-        uint col = col0 + t * 8 + (i % 64) / 8, row = row0 + b * 8 + i % 8;
-        if (row < count && col < p.out) y[ulong(offset + row) * p.out + col] = total;
     }
 }
 
+#define EXPERT_GEMM(FORMAT, NR, SUFFIX) \
+template [[host_name("moe_gemv_" SUFFIX)]] kernel void moe_gemv<FORMAT, NR>(device const uchar *, device const float *, \
+    device const float *, device float *, constant ExpertParams &, device const float *, uint, uint, uint, uint); \
+template [[host_name("moe_gemm_" SUFFIX)]] kernel void moe_gemm<FORMAT>(device const uchar *, device const float *, \
+    device const float *, device float *, constant ExpertParams &, device const float *, uint, uint, uint, uint);
+EXPERT_GEMM(0, 4, "f32")
+EXPERT_GEMM(1, 4, "q8_0")
+EXPERT_GEMM(2, 2, "q4k")
+
+// One threadgroup per token: its experts are ranked by ID once, then every column sums
+// them in ascending ID order without floating-point atomics. An optional shared expert
+// is added with its sigmoid gate in the same pass.
 kernel void moe_scatter_f32(device const float *x [[buffer(0)]], device const float *order [[buffer(1)]],
-    device const float *selected [[buffer(2)]], device float *y [[buffer(3)]],
-    constant ExpertParams &p [[buffer(4)]], uint tid [[thread_position_in_grid]]) {
-    if (ulong(tid) >= ulong(p.rows / p.top_k) * p.width) return;
-    uint token = tid / p.width, col = tid % p.width;
-    float sum = 0.0f;
-    // Walk selected experts in ascending ID order without an atomic floating-point sum.
-    int previous = -1;
-    for (uint n = 0; n < p.top_k; ++n) {
-        int best = int(p.experts); uint index = 0;
-        for (uint k = 0; k < p.top_k; ++k) {
-            int expert = int(selected[(ulong(token) * p.top_k + k) * 2]);
-            if (expert < 0) { y[tid] = NAN; return; }
-            if (expert > previous && expert < best) { best = expert; index = k; }
-        }
-        uint assignment = token * p.top_k + index;
-        uint row = uint(order[ulong(assignment) * 3 + 2]);
-        sum += x[ulong(row) * p.stride + col] * selected[ulong(assignment) * 2 + 1];
-        previous = best;
+    device const float *selected [[buffer(2)]], device const float *shared [[buffer(3)]],
+    device const float *gate [[buffer(4)]], device float *y [[buffer(5)]],
+    constant ScatterParams &p [[buffer(6)]], uint token [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]]) {
+    threadgroup uint rows[MOE_BLOCK];
+    threadgroup float weights[MOE_BLOCK];
+    if (tid < p.top_k) {
+        ulong a = ulong(token) * p.top_k + tid;
+        float expert = selected[a * 2];
+        uint rank = 0;
+        for (uint k = 0; k < p.top_k; ++k) rank += selected[(ulong(token) * p.top_k + k) * 2] < expert;
+        rows[rank] = uint(order[a * 3 + 2]);
+        weights[rank] = selected[a * 2 + 1];
     }
-    y[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float g = p.shared ? 1.0f / (1.0f + exp(-gate[ulong(token) * p.gate_stride])) : 0.0f;
+    for (uint col = tid; col < p.width; col += threads) {
+        float sum = 0.0f;
+        for (uint n = 0; n < p.top_k; ++n) sum += x[ulong(rows[n]) * p.stride + col] * weights[n];
+        if (p.shared) sum += g * shared[ulong(token) * p.shared_stride + col];
+        y[ulong(token) * p.width + col] = sum;
+    }
 }

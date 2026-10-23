@@ -7,7 +7,7 @@
 
 mod moe;
 mod runtime;
-pub use moe::ExpertRoutes;
+pub use moe::{ExpertRoutes, SharedExpert};
 
 use crate::{
     packed::PackedLinear,

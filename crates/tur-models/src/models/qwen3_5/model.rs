@@ -7,7 +7,7 @@
 use super::{
     config::{Config, LayerKind},
     math::{self, DeltaInputs},
-    weights::Checkpoint,
+    weights::{Checkpoint, Split},
 };
 use crate::hybrid::{
     Addresses, Boundaries, HybridModel, PackedForward, SequenceForward, SequenceStep, StatePool,
@@ -272,6 +272,10 @@ struct Tensors(Checkpoint);
 impl Tensors {
     fn take(&mut self, name: &str) -> Result<Tensor> {
         self.0.take(name)
+    }
+
+    fn split(&mut self, name: &str) -> Result<Split> {
+        self.0.take_split(name)
     }
 }
 

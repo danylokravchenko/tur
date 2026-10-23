@@ -143,9 +143,16 @@ fn test_grouped_expert_gemm_preserves_routing_skew_ties_and_packed_weights() -> 
                 None => weights.to_device(&Device::Cpu)?,
             }
             .to_vec2::<f32>()?;
-            for (tokens, top_k, skewed) in
-                [(1, 2, true), (7, 8, false), (19, 2, false), (19, 2, true)]
-            {
+            // 600 × 8 assignments span several routing blocks and full sixteen-row tiles.
+            let large = if experts == 256 { 600 } else { 19 };
+            for (tokens, top_k, skewed) in [
+                (1, 2, true),
+                (7, 8, false),
+                (19, 2, false),
+                (19, 2, true),
+                (large, 8, false),
+                (large, 8, true),
+            ] {
                 let x = upload(
                     &device,
                     &values(tokens * (width + 7), 77, 1.0),
@@ -166,8 +173,24 @@ fn test_grouped_expert_gemm_preserves_routing_skew_ties_and_packed_weights() -> 
                 let logits = upload(&device, &scores, &[tokens, experts])?;
                 let routes = kernels.route(&logits, top_k)?;
                 let gathered = kernels.expert_gather(&x, &routes)?;
-                let output = kernels
-                    .expert_scatter(&kernels.expert_linear(&layer, &gathered, &routes)?, &routes)?;
+                let grouped = kernels.expert_linear(&layer, &gathered, &routes)?;
+                // Reading tokens through the permutation is the same computation.
+                assert_eq!(
+                    read(&kernels.expert_linear_routed(&layer, &x, &routes)?)?,
+                    read(&grouped)?
+                );
+                let output = kernels.expert_scatter(&grouped, &routes)?;
+                let shared = upload(&device, &values(tokens * out, 78, 1.0), &[tokens, out])?;
+                let gate = upload(&device, &values(tokens, 79, 3.0), &[tokens, 1])?;
+                let combined = read(&kernels.expert_combine(
+                    &grouped,
+                    &routes,
+                    tur_metal::kernels::SharedExpert {
+                        output: &shared,
+                        gate: &gate,
+                    },
+                )?)?;
+                let (host_shared, host_gate) = (read(&shared)?, read(&gate)?);
                 let host_x = x.to_vec2::<f32>()?;
                 let mut expected = Vec::new();
                 for t in 0..tokens {
@@ -205,6 +228,16 @@ fn test_grouped_expert_gemm_preserves_routing_skew_ties_and_packed_weights() -> 
                     error < 2e-5,
                     "{format:?}, {tokens} tokens, skew {skewed}: {error}"
                 );
+                let with_shared: Vec<f64> = expected
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &routed)| {
+                        let g = 1.0 / (1.0 + (-f64::from(host_gate[i / out])).exp());
+                        g.mul_add(f64::from(host_shared[i]), routed)
+                    })
+                    .collect();
+                let error = relative_error(&combined, &with_shared);
+                assert!(error < 2e-5, "shared {format:?}, {tokens} tokens: {error}");
             }
         }
     }

@@ -405,22 +405,33 @@ pub(super) fn workspace(
     )?;
     let act = plan.reserve(elements(d.intermediate)?, f)?;
     if let Some(moe) = config.moe {
-        // Routing logits, top-k pairs, counts/offsets and both permutation maps coexist
-        // with gathered inputs and grouped expert activations. Include allocator rounding.
-        let assigned = checked_elements(&[n, moe.num_experts_per_tok])?;
-        let extra = checked_elements(&[
-            assigned,
-            d.intermediate
-                .checked_mul(3)
-                .and_then(|v| v.checked_add(hidden))
-                .and_then(|v| v.checked_add(hidden))
-                .and_then(|v| v.checked_add(8))
-                .ok_or_else(|| invalid("MoE workspace overflow"))?,
-        ])?
-        .checked_add(elements(moe.num_experts)?)
-        .and_then(|v| v.checked_add(moe.num_experts.checked_mul(8)?))
-        .and_then(|v| v.checked_mul(2))
-        .ok_or_else(|| invalid("MoE workspace overflow"))?;
+        // The shared expert uses the dense regions above. Coexisting with them: router
+        // logits, the shared output and its gate per token; per assignment the routing
+        // pair, permutation and tile slots, expert gate|up, activation and down rows; and
+        // block histograms plus group offsets. Doubled for allocator rounding.
+        let k = moe.num_experts_per_tok;
+        let assigned = checked_elements(&[n, k])?;
+        let per_assignment = moe
+            .moe_intermediate_size
+            .checked_mul(3)
+            .and_then(|v| v.checked_add(hidden))
+            .and_then(|v| v.checked_add(8))
+            .ok_or_else(|| invalid("MoE workspace overflow"))?;
+        let per_token = moe
+            .num_experts
+            .checked_add(hidden)
+            .and_then(|v| v.checked_add(1))
+            .ok_or_else(|| invalid("MoE workspace overflow"))?;
+        let routing = assigned
+            .div_ceil(256)
+            .checked_add(1)
+            .and_then(|blocks| blocks.checked_mul(moe.num_experts))
+            .ok_or_else(|| invalid("MoE workspace overflow"))?;
+        let extra = checked_elements(&[assigned, per_assignment])?
+            .checked_add(elements(per_token)?)
+            .and_then(|v| v.checked_add(routing))
+            .and_then(|v| v.checked_mul(2))
+            .ok_or_else(|| invalid("MoE workspace overflow"))?;
         plan.transient(extra, f)?;
     }
     plan.release(gate_up);

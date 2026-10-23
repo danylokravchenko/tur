@@ -213,3 +213,107 @@ fn test_speculative_device_sampling_preserves_seeded_penalties_and_outputs() -> 
     assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
     Ok(())
 }
+
+#[test]
+fn test_preempted_drafting_requests_rebuild_their_lookup_and_match_plain_decoding() -> Result<()> {
+    let fixture = Checkpoint::new()?;
+    let request = GenerationRequest::new("t10 t11 t12 t13 t14".into(), 20);
+    let expected = InferencePipeline::new(&fixture.factory(), config(0, 1))?
+        .run(&request, |_| {})?
+        .generated_text;
+    // Two K/V pages beside every recurrent slot (two per sequence plus the drafts'): both
+    // requests start, each needs a second page at position 16, and the newer is preempted.
+    let mut cfg = config(4, 2);
+    let usage = InferencePipeline::new(&fixture.factory(), cfg)?.memory()?;
+    cfg.state_bytes = Some((usage.slots.capacity + 1) * usage.slot_bytes + 2 * usage.page_bytes);
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), cfg)?;
+    for _ in 0..2 {
+        pipeline.submit_request(&request)?;
+    }
+    let (mut preemptions, mut drafted) = (0, 0);
+    while pipeline.active_request_count() > 0 {
+        for (_, result) in pipeline.step_streaming()?.completed {
+            let stats = result?;
+            assert_eq!(stats.generated_text, expected);
+            preemptions += stats.preemptions;
+            drafted += stats.draft_tokens;
+        }
+    }
+    assert!(preemptions > 0, "the pool never forced a preemption");
+    assert!(drafted > 0);
+    let usage = pipeline.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn test_deadline_expiring_during_a_drafted_pass_fails_only_that_request() -> Result<()> {
+    let fixture = Checkpoint::new()?;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), config(4, 1))?;
+    let mut request = GenerationRequest::new("t5 t5 t5 t5 t5 t5 t5 t5".into(), 400);
+    request.timeout = Some(std::time::Duration::from_secs(5));
+    let id = pipeline.submit_request(&request)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut outcome = None;
+    while outcome.is_none() {
+        pipeline.begin_step()?;
+        if pipeline.speculation_stats().passes > 0 {
+            // A drafted pass has completed before; let the deadline pass under this one.
+            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+        }
+        for (finished, result) in pipeline.finish_step()?.completed {
+            assert_eq!(finished, id);
+            outcome = Some(result);
+        }
+    }
+    assert!(matches!(
+        outcome,
+        Some(Err(tur::TurError::DeadlineExceeded))
+    ));
+    assert!(pipeline.speculation_stats().drafted > 0);
+    let usage = pipeline.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn test_decodes_draft_beside_a_prefill_and_match_plain_decoding() -> Result<()> {
+    let fixture = Checkpoint::new()?;
+    let repeat = GenerationRequest::new("t5 t5 t5 t5 t5 t5 t5 t5".into(), 48);
+    let long = GenerationRequest::new(
+        (2..90)
+            .map(|t| format!("t{t}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        8,
+    );
+    let mut plain = InferencePipeline::new(&fixture.factory(), config(0, 1))?;
+    let expected = [
+        plain.run(&repeat, |_| {})?.generated_text,
+        plain.run(&long, |_| {})?.generated_text,
+    ];
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), config(4, 2))?;
+    let first = pipeline.submit_request(&repeat)?;
+    let mut second = None;
+    let mut mixed_drafts = false;
+    let mut texts = std::collections::HashMap::new();
+    while pipeline.active_request_count() > 0 {
+        // Admit the long prompt once the first request's costs are identified, so its
+        // prefill chunks share passes with drafted decodes.
+        if second.is_none() && pipeline.draft_costs().line(1).is_some() {
+            second = Some(pipeline.submit_request(&long)?);
+        }
+        let output = pipeline.step_streaming()?;
+        if let Some(timing) = output.timing {
+            mixed_drafts |= timing.drafts > 0 && timing.tokens - timing.drafts > timing.sequences;
+        }
+        for (id, result) in output.completed {
+            texts.insert(id, result?.generated_text);
+        }
+    }
+    let second = second.ok_or_else(|| invalid("draft costs were never identified"))?;
+    assert_eq!(texts.get(&first), Some(&expected[0]));
+    assert_eq!(texts.get(&second), Some(&expected[1]));
+    assert!(mixed_drafts, "no pass drafted beside a prefill");
+    Ok(())
+}

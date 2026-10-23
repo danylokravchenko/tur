@@ -9,7 +9,8 @@
 //! enqueues `reps` operations and then synchronizes.
 //!
 //! `cargo bench --offline -p tur-metal --bench kernels > out.json`
-//! `TUR_BENCH_ONLY=delta|linear|paged|tiled|sample|moe` restricts the run to one group.
+//! `TUR_BENCH_ONLY=delta|linear|paged|tiled|sample|moe` restricts the run to one group;
+//! `TUR_BENCH_MOE=q8_0,q4k,f32` selects expert weight formats.
 //! `TUR_BENCH_SHAPE=<substring>` selects tiled attention shapes for focused tuning.
 
 use candle_core::{D, DType, Device, Tensor, quantized::GgmlDType};
@@ -703,70 +704,94 @@ fn skip(group: &str) -> bool {
     std::env::var("TUR_BENCH_ONLY").is_ok_and(|v| v != group)
 }
 
-/// Grouped expert projection including device routing/gather versus individually
-/// submitted expert projections with routing and gather already prepared for them.
+/// Grouped expert projection (device routing included, inputs read through the routing
+/// permutation) versus individually submitted expert projections whose selected input rows
+/// are already prepared; routing alone is timed separately. `Q8_0` and Q4K at the flagship
+/// gate/up shape (F32 with fewer experts), from decode to prefill-sized passes.
 fn moe_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
-    let (experts, input, output, top_k) = (256, 2048, 1024, 8);
-    let weight = random(&Device::Cpu, &[experts * output, input], 314, 0.02)?;
-    let grouped = PackedLinear::quantized(&weight, GgmlDType::Q8_0, device)?;
+    let (input, output, top_k) = (2048, 1024, 8);
     let mut cases = Vec::new();
-    for tokens in [1, 8, 32, 128] {
-        for skewed in [false, true] {
-            let x = random(device, &[tokens, input], 315, 1.0)?;
-            let scores = if skewed {
-                (0..tokens)
-                    .flat_map(|_| (0..experts).map(|e| -(e as f32)))
-                    .collect::<Vec<_>>()
-            } else {
-                values(tokens * experts, 316, 2.0)
-            };
-            let logits = Tensor::from_slice(&scores, (tokens, experts), device)?;
-            let mut assignments = vec![Vec::new(); experts];
-            for token in 0..tokens {
-                let mut ids: Vec<_> = (0..experts).collect();
-                ids.sort_unstable_by(|&a, &b| {
-                    scores[token * experts + b]
-                        .total_cmp(&scores[token * experts + a])
-                        .then(a.cmp(&b))
-                });
-                for &expert in &ids[..top_k] {
-                    assignments[expert].push(token as u32);
+    for format in [Some(GgmlDType::Q8_0), Some(GgmlDType::Q4K), None] {
+        let name = format.map_or("f32".to_owned(), |f| format!("{f:?}").to_lowercase());
+        if std::env::var("TUR_BENCH_MOE").is_ok_and(|only| !only.split(',').any(|f| f == name)) {
+            continue;
+        }
+        // F32 banks of all 256 experts (2 GiB, plus per-expert copies) exceed what a
+        // 16 GB machine can hold beside the host weights; F32 uses 64 experts.
+        let experts = if format.is_some() { 256 } else { 64 };
+        let weight = random(&Device::Cpu, &[experts * output, input], 314, 0.02)?;
+        let pack = |w: &Tensor| {
+            format.map_or_else(
+                || PackedLinear::dense(w, device),
+                |format| PackedLinear::quantized(w, format, device),
+            )
+        };
+        let grouped = pack(&weight)?;
+        let individual_weights = (0..experts)
+            .map(|e| pack(&weight.narrow(0, e * output, output)?.contiguous()?))
+            .collect::<Result<Vec<_>>>()?;
+        for tokens in [1, 8, 32, 128, 512, 2048] {
+            for skewed in [false, true] {
+                let x = random(device, &[tokens, input], 315, 1.0)?;
+                let scores = if skewed {
+                    (0..tokens)
+                        .flat_map(|_| (0..experts).map(|e| -(e as f32)))
+                        .collect::<Vec<_>>()
+                } else {
+                    values(tokens * experts, 316, 2.0)
+                };
+                let logits = Tensor::from_slice(&scores, (tokens, experts), device)?;
+                let mut assignments = vec![Vec::new(); experts];
+                for token in 0..tokens {
+                    let mut ids: Vec<_> = (0..experts).collect();
+                    ids.sort_unstable_by(|&a, &b| {
+                        scores[token * experts + b]
+                            .total_cmp(&scores[token * experts + a])
+                            .then(a.cmp(&b))
+                    });
+                    for &expert in &ids[..top_k] {
+                        assignments[expert].push(token as u32);
+                    }
                 }
-            }
-            let mut separate = Vec::new();
-            for (expert, ids) in assignments
-                .iter()
-                .enumerate()
-                .filter(|(_, ids)| !ids.is_empty())
-            {
-                let w = PackedLinear::quantized(
-                    &weight.narrow(0, expert * output, output)?.contiguous()?,
-                    GgmlDType::Q8_0,
-                    device,
-                )?;
-                let selected = x.index_select(&Tensor::new(ids.as_slice(), device)?, 0)?;
-                separate.push((w, selected));
-            }
-            let individual = time(device, || {
-                let outputs = separate
+                let separate = assignments
                     .iter()
-                    .map(|(w, x)| kernels.linear(w, x))
+                    .enumerate()
+                    .filter(|(_, ids)| !ids.is_empty())
+                    .map(|(expert, ids)| {
+                        Ok((
+                            &individual_weights[expert],
+                            x.index_select(&Tensor::new(ids.as_slice(), device)?, 0)?,
+                        ))
+                    })
                     .collect::<Result<Vec<_>>>()?;
-                Ok(Tensor::cat(&outputs, 0)?)
-            })?;
-            let batched = time(device, || {
-                let routes = kernels.route(&logits, top_k)?;
-                kernels.expert_linear(&grouped, &kernels.expert_gather(&x, &routes)?, &routes)
-            })?;
-            eprintln!(
-                "MoE {tokens} tokens, skew {skewed}: grouped {:.3} ms, individual {:.3} ms",
-                batched["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
-                individual["median_seconds"].as_f64().unwrap_or(0.0) * 1e3
-            );
-            cases.push(json!({"experts": experts, "top_k": top_k, "input": input, "output": output, "tokens": tokens,
-                "skewed": skewed, "active_experts": separate.len(), "weights": "q8_0", "resident_bytes": grouped.resident_bytes(),
-                "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
-                "grouped_including_routing_gather": batched, "individual_prepared_inputs": individual}));
+                let individual = time(device, || {
+                    let outputs = separate
+                        .iter()
+                        .map(|(w, x)| kernels.linear(w, x))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Tensor::cat(&outputs, 0)?)
+                })?;
+                let rows = Tensor::zeros((tokens * top_k, 1), DType::F32, device)?;
+                let routing = time(device, || {
+                    kernels.expert_scatter(&rows, &kernels.route(&logits, top_k)?)
+                })?;
+                let batched = time(device, || {
+                    let routes = kernels.route(&logits, top_k)?;
+                    kernels.expert_linear_routed(&grouped, &x, &routes)
+                })?;
+                let ms = |v: &Value| v["median_seconds"].as_f64().unwrap_or(0.0) * 1e3;
+                eprintln!(
+                    "MoE {name} {tokens} tokens, skew {skewed}: grouped {:.3} ms (routing {:.3} ms), individual {:.3} ms",
+                    ms(&batched),
+                    ms(&routing),
+                    ms(&individual)
+                );
+                cases.push(json!({"experts": experts, "top_k": top_k, "input": input, "output": output, "tokens": tokens,
+                    "skewed": skewed, "active_experts": separate.len(), "weights": name, "resident_bytes": grouped.resident_bytes(),
+                    "routing": "synthetic: random scores or every token routed to the same eight experts; not a real routing trace",
+                    "grouped_including_routing": batched, "routing_and_scatter_only": routing,
+                    "individual_prepared_inputs": individual}));
+            }
         }
     }
     Ok(cases)

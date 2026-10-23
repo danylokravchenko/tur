@@ -120,6 +120,7 @@ fn run_requests(pipeline: &mut InferencePipeline, requests: &[GenerationRequest]
         ids.insert(pipeline.submit_request(request)?, index);
     }
     let mut emitted: Vec<Vec<f64>> = vec![Vec::new(); ids.len()];
+    let mut bursts: Vec<Vec<f64>> = vec![Vec::new(); ids.len()];
     let mut token_ids: Vec<Vec<u32>> = vec![Vec::new(); ids.len()];
     let mut ttft = vec![0.0; ids.len()];
     let mut cached = 0;
@@ -155,10 +156,16 @@ fn run_requests(pipeline: &mut InferencePipeline, requests: &[GenerationRequest]
                     .push(idle.as_secs_f64());
             }
         }
+        let mut burst_started = vec![false; ids.len()];
         for (id, token, sampled_at) in &output.sampled_tokens {
             if let Some(&index) = ids.get(id) {
-                emitted[index].push(sampled_at.saturating_duration_since(start).as_secs_f64());
+                let at = sampled_at.saturating_duration_since(start).as_secs_f64();
+                emitted[index].push(at);
                 token_ids[index].push(*token);
+                // One burst per request and pass: speculative passes publish several.
+                if !std::mem::replace(&mut burst_started[index], true) {
+                    bursts[index].push(at);
+                }
             }
         }
         for (id, result) in output.completed {
@@ -184,6 +191,11 @@ fn run_requests(pipeline: &mut InferencePipeline, requests: &[GenerationRequest]
         .iter()
         .flat_map(|t| t.windows(2).map(|w| w[1] - w[0]))
         .collect();
+    let burst_gaps: Vec<f64> = bursts
+        .iter()
+        .flat_map(|t| t.windows(2).map(|w| w[1] - w[0]))
+        .collect();
+    let burst_count: usize = bursts.iter().map(Vec::len).sum();
     let idle: f64 = phases.get("idle_before").map_or(0.0, |v| v.iter().sum());
     Ok(json!({
         "requests": ids.len(), "prompt_tokens": prompt_tokens, "cached_tokens": cached,
@@ -192,6 +204,8 @@ fn run_requests(pipeline: &mut InferencePipeline, requests: &[GenerationRequest]
         "total_tokens_per_second": (generated + prompt_tokens) as f64 / wall,
         "ttft_seconds": {"p50": percentile(&ttft, 0.5), "p95": percentile(&ttft, 0.95), "max": percentile(&ttft, 1.0)},
         "itl_seconds": {"p50": percentile(&itl, 0.5), "p95": percentile(&itl, 0.95), "p99": percentile(&itl, 0.99)},
+        "burst_gap_seconds": {"p50": percentile(&burst_gaps, 0.5), "p95": percentile(&burst_gaps, 0.95), "p99": percentile(&burst_gaps, 0.99)},
+        "tokens_per_burst": generated as f64 / burst_count.max(1) as f64,
         "passes": passes,
         "phase_seconds": phases.iter().map(|(k, v)| (k.to_string(), summary(v))).collect::<serde_json::Map<_, _>>(),
         "device_idle_fraction_lower_bound": idle / wall,
@@ -229,11 +243,14 @@ fn report(label: &str, result: &Value) {
             * 1e3
     };
     eprintln!(
-        "{label}: {:.1} out tok/s, TTFT p50 {:.0} ms, ITL p50/p95 {:.1}/{:.1} ms, pass p50 {:.1} ms (schedule {:.2}, encode {:.2}, wait {:.1}, publish {:.2}, idle {:.2}), cached {}",
+        "{label}: {:.1} out tok/s, TTFT p50 {:.0} ms, ITL p50/p95 {:.1}/{:.1} ms, burst gap p50/p95 {:.1}/{:.1} ms ({:.2} tok/burst), pass p50 {:.1} ms (schedule {:.2}, encode {:.2}, wait {:.1}, publish {:.2}, idle {:.2}), cached {}",
         result["output_tokens_per_second"].as_f64().unwrap_or(0.0),
         ms(&["ttft_seconds", "p50"]),
         ms(&["itl_seconds", "p50"]),
         ms(&["itl_seconds", "p95"]),
+        ms(&["burst_gap_seconds", "p50"]),
+        ms(&["burst_gap_seconds", "p95"]),
+        result["tokens_per_burst"].as_f64().unwrap_or(0.0),
         ms(&["phase_seconds", "pass", "p50"]),
         ms(&["phase_seconds", "schedule", "p50"]),
         ms(&["phase_seconds", "encode", "p50"]),
@@ -648,7 +665,7 @@ fn main() -> Result<()> {
             "kv": format!("{:?}", DEFAULT_KV_LAYOUT), "prefill_chunk": CHUNK,
             "output_tokens": output, "workload": "closed-loop bursts submitted at once",
             "sampling": format!("{options:?}"), "device_sampling": device_sampling,
-            "latency_basis": "sampled tokens including EOS; TTFT from request submission; ITL between token publication times; pass phases from PassTiming",
+            "latency_basis": "sampled tokens including EOS; TTFT from request submission; ITL between token publication times (zero inside a speculative burst); burst gaps between the first publications of successive passes; pass phases from PassTiming",
             "recurrent_state": format!("{:?}", factory.recurrent),
             "runs": runs,
         }))?

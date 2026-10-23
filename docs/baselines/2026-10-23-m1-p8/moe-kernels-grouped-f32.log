@@ -1,0 +1,12 @@
+MoE f32 1 tokens, skew false: grouped 1.201 ms (routing 0.022 ms), individual 1.293 ms
+MoE f32 1 tokens, skew true: grouped 1.230 ms (routing 0.022 ms), individual 1.260 ms
+MoE f32 8 tokens, skew false: grouped 6.505 ms (routing 0.027 ms), individual 7.552 ms
+MoE f32 8 tokens, skew true: grouped 1.251 ms (routing 0.029 ms), individual 1.502 ms
+MoE f32 32 tokens, skew false: grouped 9.498 ms (routing 0.041 ms), individual 11.787 ms
+MoE f32 32 tokens, skew true: grouped 1.689 ms (routing 0.044 ms), individual 1.568 ms
+MoE f32 128 tokens, skew false: grouped 11.858 ms (routing 0.049 ms), individual 11.642 ms
+MoE f32 128 tokens, skew true: grouped 5.815 ms (routing 0.051 ms), individual 2.837 ms
+MoE f32 512 tokens, skew false: grouped 31.426 ms (routing 0.079 ms), individual 18.370 ms
+MoE f32 512 tokens, skew true: grouped 24.806 ms (routing 0.087 ms), individual 11.960 ms
+MoE f32 2048 tokens, skew false: grouped 114.473 ms (routing 0.211 ms), individual 61.027 ms
+MoE f32 2048 tokens, skew true: grouped 98.781 ms (routing 0.231 ms), individual 55.205 ms

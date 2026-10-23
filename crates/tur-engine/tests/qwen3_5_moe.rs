@@ -176,3 +176,49 @@ fn test_moe_fused_packed_prefill_decode_and_rollback_match_reference() -> Result
     }
     Ok(())
 }
+
+/// Verification logits of a `window`-token draft against decoding the same tokens one at
+/// a time. Windows beyond the custom GEMV range run Candle's F16-staged tiles for Q4K, a
+/// different numerical path than single-token decoding; this bounds the resulting drift.
+#[cfg(feature = "metal")]
+#[test]
+fn test_verification_windows_bound_drift_from_sequential_decoding() -> Result<()> {
+    let fixture = checkpoint(CONFIG, 0.03, 0.1)?;
+    let device = Device::new_metal(0)?;
+    let (ids, _, _) = golden()?;
+    for format in [WeightFormat::F32, WeightFormat::Q8_0, WeightFormat::Q4K] {
+        let model = load(&fixture.0, &device, format)?;
+        let start = ids
+            .len()
+            .checked_sub(8)
+            .filter(|&start| start > 0)
+            .ok_or_else(|| invalid("golden too short"))?;
+        for window in [3, 8] {
+            let draft = &ids[start..start + window];
+            let pool = common::pool(&model, 16, 2 + window)?;
+            let (_, base) = common::prefill(&model, ModelState::new(&pool), &ids[..start], 7)?;
+            let (mut steps, reservations) =
+                common::forward(&model, &[(&base, draft, Boundaries::EveryToken)])?;
+            let verified = common::rows(
+                &steps
+                    .pop()
+                    .ok_or_else(|| invalid("missing step"))??
+                    .logits,
+            )?;
+            drop(reservations);
+            let (sequential, _) = common::prefill(&model, base, draft, 1)?;
+            let error = max_relative(&verified, &sequential);
+            // Same F32 kernels as decoding inside the Q4K GEMV range (2–4 rows) and for
+            // F32/Q8_0. Beyond it Q4K projections use Candle's F16-staged tiles, as batched
+            // Q4K decoding of as many rows does, and close routing decisions can flip: about
+            // 1.1e-2 measured on this fixture (Apple M1).
+            let bound = if window > 4 && format == WeightFormat::Q4K {
+                2e-2
+            } else {
+                2e-4
+            };
+            assert!(error < bound, "{format:?} window {window}: {error}");
+        }
+    }
+    Ok(())
+}
