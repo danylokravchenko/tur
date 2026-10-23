@@ -217,15 +217,15 @@ impl ModelState {
                 LayerStateKind::Attention { .. } => {
                     let (key, value) = self.pool.attention(index)?.gather(&pages, self.position)?;
                     LayerSnapshot::Attention {
-                        key: key.copy()?,
-                        value: value.copy()?,
+                        key: key.force_contiguous()?,
+                        value: value.force_contiguous()?,
                     }
                 }
                 LayerStateKind::Recurrent { .. } => {
                     let (convolution, recurrent) = self.pool.recurrent(index)?.read(slot)?;
                     LayerSnapshot::Recurrent {
-                        convolution: convolution.to_dtype(DType::F32)?.copy()?,
-                        recurrent: recurrent.to_dtype(DType::F32)?.copy()?,
+                        convolution: convolution.to_dtype(DType::F32)?.force_contiguous()?,
+                        recurrent: recurrent.to_dtype(DType::F32)?.force_contiguous()?,
                     }
                 }
             });
@@ -293,7 +293,10 @@ impl Reservation {
                 for kv in [&layer.key, &layer.value] {
                     for tensor in std::iter::once(&kv.data).chain(&kv.scales) {
                         // Copy through a temporary: a tensor cannot be both source and target.
-                        let source = tensor.narrow(0, from as usize * page, count)?.copy()?;
+                        // `Tensor::copy` shares storage on Metal; this allocates.
+                        let source = tensor
+                            .narrow(0, from as usize * page, count)?
+                            .force_contiguous()?;
                         tensor.slice_set(&source, 0, to as usize * page)?;
                     }
                 }

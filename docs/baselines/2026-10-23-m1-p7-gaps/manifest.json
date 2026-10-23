@@ -1,0 +1,37 @@
+{
+  "date": "2026-10-23",
+  "hardware": {"chip": "Apple M1", "gpu_cores": 8, "unified_memory_gb": 16},
+  "source_base_commit": "9969217752c9f67c85fc18448e1858bbfb3967c2",
+  "source_state": "uncommitted P7 and gap-closure changes",
+  "source_sha256": {
+    "crates/tur-engine/benches/serving.rs": "dab2cf7a10729a068a94dee339822d9eb6bac902d18fe26d8e76d9bf53fccc17",
+    "crates/tur-metal/src/kernels/tur.metal": "24eb0577f17aa0cc2b0e36eaa210ed24dc5567fa9662076bb27c9cbbce2fcdc0",
+    "crates/tur-metal/src/kernels/mod.rs": "9900d75bf8c57b716d84ae009f11eeb993dfbd3b074bc84e2525b054f2f09199",
+    "crates/tur-engine/src/hybrid.rs": "fd724efd79e46803410f665778e99b2e0c078b57bae8f0b19e2e4f8aed1b87d9",
+    "crates/tur-engine/src/backend/pipeline.rs": "1e17e149b25b6f8456b9381e43fef24b83e0679e3a3cb5aec97a96d9cf93ee19",
+    "crates/tur-engine/src/backend/prefix.rs": "bff62eaca9c408ee7f8caba565baa4b273b8dfff89934e77f7c84b6b6357ffc9",
+    "crates/tur-engine/src/backend/guidance.rs": "2667a07eba5dfdcce8fe4db5c0ee7668e9f56c28d7e7bceb7a1c1075879202ad",
+    "crates/tur-engine/src/backend/memory.rs": "6a00a2586ce3599ae4b9643470d76c9cdc442de6f786bc7042eefdead72cd19b"
+  },
+  "checkpoint_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "weights": "q8_0",
+  "kv": "KvLayout { page_tokens: 16, format: F16, version: 1 }",
+  "recurrent_state": "F32",
+  "prefill_chunk": 256,
+  "sampling": "greedy, or temperature 0.7, top-k 20, top-p 0.95 (seed = request index)",
+  "artifacts": {
+    "serving-greedy-{1,2,3}.json": "TUR_QWEN35_0_8B=<snapshot> cargo bench --offline -p tur-engine --bench serving (prompts unique per burst)",
+    "serving-sampled-{1,2,3}.json": "same with TUR_BENCH_SAMPLING=0.7,20,0.95",
+    "arrivals.json": "TUR_BENCH_WORKLOADS=arrivals TUR_BENCH_RATE=2,4 TUR_BENCH_SAMPLING=0.7,20,0.95",
+    "grammar-device{1,0}.json": "TUR_BENCH_WORKLOADS=grammar TUR_BENCH_CONCURRENCY=1,4,8,16 TUR_BENCH_SAMPLING=0.7,20,0.95 TUR_BENCH_DEVICE_SAMPLING={1,0}",
+    "prefix.json": "TUR_BENCH_WORKLOADS=prefix TUR_BENCH_SAMPLING=0.7,20,0.95 TUR_BENCH_SPACING=0,256",
+    "real-checkpoint-tests.log": "TUR_QWEN35_0_8B=<snapshot> cargo test --offline --release -p tur-engine --test qwen3_5_fused -- --ignored --test-threads 1"
+  },
+  "runs_per_case": {"serving": 3, "other": 1},
+  "validation": {
+    "workspace_tests_passed": 201,
+    "real_checkpoint_ignored_tests_passed": 3,
+    "strict_clippy": "passed",
+    "workspace_check": "passed with and without default features"
+  }
+}

@@ -101,6 +101,8 @@ fn drive(
             }
         }
     }
+    // Finished requests leave prefix snapshots by design; without them nothing is held.
+    pipeline.clear_prefix_cache();
     let usage = pipeline.memory()?;
     assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
     Ok(run)
@@ -262,6 +264,8 @@ fn test_queue_limits_and_deadlines_fail_requests_and_release_state() -> Result<(
         }
     }
     assert!(matches!(outcome, Some(Err(TurError::DeadlineExceeded))));
+    // Finished requests leave prefix snapshots by design; without them nothing is held.
+    pipeline.clear_prefix_cache();
     let usage = pipeline.memory()?;
     assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
     Ok(())
@@ -297,6 +301,8 @@ fn test_deadlines_include_intake_and_never_publish_a_late_completion() -> Result
         Err(TurError::DeadlineExceeded) => assert_eq!(streamed, ""),
         Err(error) => return Err(error),
     }
+    // Finished requests leave prefix snapshots by design; without them nothing is held.
+    pipeline.clear_prefix_cache();
     let usage = pipeline.memory()?;
     assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
     Ok(())
@@ -475,10 +481,10 @@ fn test_cancellation_while_a_pass_is_in_flight_releases_state_and_spares_survivo
             }
         }
         let output = pipeline.finish_step()?;
-        let timing = output
-            .timing
-            .ok_or_else(|| TurError::Other("no pass".into()))?;
-        assert!(timing.tokens > 0 && timing.device >= timing.encode);
+        // A step can also publish a first token from a prompt-end snapshot without a pass.
+        if let Some(timing) = output.timing {
+            assert!(timing.tokens > 0 && timing.device >= timing.encode);
+        }
         for (id, result) in output.completed {
             outcomes.insert(ids[&id], result?.generated_text);
         }
@@ -494,9 +500,73 @@ fn test_cancellation_while_a_pass_is_in_flight_releases_state_and_spares_survivo
         }
         assert_eq!(outcomes.get(&index), Some(expected), "request {index}");
     }
+    // Finished requests leave prefix snapshots by design; without them nothing is held.
+    pipeline.clear_prefix_cache();
     let usage = pipeline.memory()?;
     assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
     assert!(pipeline.begin_step().is_ok_and(|ran| !ran));
     assert!(pipeline.finish_step()?.timing.is_none());
+    Ok(())
+}
+
+#[test]
+fn test_grammar_requests_terminate_with_the_grammar_and_batch_independently() -> Result<()> {
+    use tur::backend::guidance::TopLevelGrammar;
+    let fixture = Checkpoint::random()?;
+    // The grammar needs a byte-level view of tokens; ASCII tokens map to themselves, so
+    // they concatenate without separators in text and inside the grammar.
+    let path = fixture.0.join("tokenizer.json");
+    let mut tokenizer: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    tokenizer["decoder"] = serde_json::json!({
+        "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false
+    });
+    std::fs::write(&path, tokenizer.to_string())?;
+    let constrained = |seed: u64| {
+        let mut request = GenerationRequest::new("t10 t11 t12".into(), 40);
+        request.seed = seed;
+        request.sampling.temperature = Some(1.0);
+        request.grammar = Some(TopLevelGrammar::from_regex("(t2[0-9]){3}t9"));
+        request
+    };
+    let requests = [
+        constrained(1),
+        constrained(2),
+        requests().swap_remove(3),
+        constrained(3),
+    ];
+    let solo = {
+        let mut pipeline = InferencePipeline::new(&fixture.factory(), PipelineConfig::new(1, 4))?;
+        requests
+            .iter()
+            .map(|request| pipeline.run(request, |_| {}))
+            .collect::<Result<Vec<_>>>()?
+    };
+    for (index, stats) in solo.iter().enumerate() {
+        if index == 2 {
+            continue;
+        }
+        let text = &stats.generated_text;
+        let digits: Vec<&str> = text.split('t').skip(1).collect();
+        assert_eq!(digits.len(), 4, "{text}");
+        assert!(
+            digits[..3]
+                .iter()
+                .all(|d| d.len() == 2 && d.starts_with('2')),
+            "{text}"
+        );
+        assert_eq!(digits[3], "9", "{text}");
+        assert_eq!(stats.finish_reason, "stop");
+    }
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), tight())?;
+    let ids: HashMap<Uuid, usize> = requests
+        .iter()
+        .enumerate()
+        .map(|(i, r)| Ok((pipeline.submit_request(r)?, i)))
+        .collect::<Result<_>>()?;
+    while pipeline.active_request_count() > 0 {
+        for (id, result) in pipeline.step_streaming()?.completed {
+            assert_eq!(result?.generated_text, solo[ids[&id]].generated_text);
+        }
+    }
     Ok(())
 }

@@ -149,6 +149,14 @@ struct ArgmaxParams {
 }
 
 #[repr(C)]
+struct MaskArgs {
+    rows: u32,
+    cols: u32,
+    stride: u32,
+    words: u32,
+}
+
+#[repr(C)]
 struct PenaltyArgs {
     entries: u32,
     stride: u32,
@@ -408,8 +416,9 @@ impl Kernels {
         (items.div_ceil(simdgroups), simdgroups * 32)
     }
 
-    /// First maximum of each row of `x` (`[rows, cols]`) and whether the whole row is
-    /// finite: returns F32 `[rows, 2]` of (index, 1.0 or 0.0). Ties keep the lowest index.
+    /// First maximum of each row of `x` (`[rows, cols]`) and whether the row is valid:
+    /// returns F32 `[rows, 2]` of (index, 1.0 or 0.0). −∞ marks a masked token; NaN, +∞ or
+    /// a row of only −∞ is invalid. Ties keep the lowest index.
     pub fn argmax(&self, x: &Tensor) -> Result<Tensor> {
         let xv = self.view(x)?;
         // Indices travel as F32, exact below 2^24.
@@ -435,6 +444,54 @@ impl Kernels {
                 Ok(())
             })?;
         self.finish(out, (xv.rows, 2))
+    }
+
+    /// Apply grammar masks in place: logit row `rows[r]` keeps only the tokens allowed by
+    /// mask `r`, `words` LSB-first `u32` bitset words starting at `bits[r * words]`; every
+    /// other token becomes −∞.
+    pub fn mask(&self, logits: &Tensor, rows: &[u32], bits: &[u32]) -> Result<()> {
+        let xv = self.view(logits)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let words = xv.cols.div_ceil(32);
+        let mut sorted = rows.to_vec();
+        sorted.sort_unstable();
+        if bits.len() != rows.len() * words
+            || sorted.windows(2).any(|pair| pair[0] == pair[1])
+            || sorted.last().is_some_and(|&row| row as usize >= xv.rows)
+        {
+            return Err(invalid(
+                "grammar masks need one full bitset per distinct row inside the batch",
+            ));
+        }
+        let count = rows.len() * xv.cols;
+        let args = MaskArgs {
+            rows: to_u32(rows.len(), "masked rows")?,
+            cols: to_u32(xv.cols, "columns")?,
+            stride: to_u32(xv.row_stride, "row stride")?,
+            words: to_u32(words, "mask words")?,
+        };
+        to_u32(count, "masked elements")?;
+        let rows = self.runtime.indices(rows)?;
+        let bits = self.runtime.indices(bits)?;
+        let rv = self.runtime.view(&rows, DType::U32)?;
+        let bv = self.runtime.view(&bits, DType::U32)?;
+        let pipeline = self.pipeline("mask_f32")?;
+        let threads = pipeline.threads(self.tuning.elementwise_threads);
+        self.runtime.dispatch(
+            pipeline,
+            "tur_mask",
+            count.div_ceil(threads),
+            threads,
+            |e| {
+                xv.bind_mut(e, 0)?;
+                rv.bind(e, 1)?;
+                bv.bind(e, 2)?;
+                e.set_bytes(3, &args);
+                Ok(())
+            },
+        )
     }
 
     /// Penalize rows of `logits` (`[rows, vocab]`) in place: `params[r]` applies to the

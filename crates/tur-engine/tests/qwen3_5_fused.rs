@@ -1078,3 +1078,196 @@ fn test_real_checkpoint_kv_formats_keep_attention_quality() -> Result<()> {
     }
     Ok(())
 }
+
+/// A grammar over the fixture's 160 tokens: `<eos>`, then the letters and letter pairs.
+fn letters_grammar(regex: &str) -> Result<tur_engine::backend::guidance::GuidanceControl> {
+    use tur_engine::backend::guidance::{GuidanceControl, TopLevelGrammar, build_llg_factory};
+    let letters: Vec<String> = (b'a'..=b'z').map(|c| (c as char).to_string()).collect();
+    let mut vocab = serde_json::Map::new();
+    vocab.insert("<eos>".into(), 0.into());
+    let words = letters.iter().cloned().chain(
+        letters
+            .iter()
+            .flat_map(|a| letters.iter().map(move |b| format!("{a}{b}"))),
+    );
+    for (id, word) in words.take(159).enumerate() {
+        vocab.insert(word, (id + 1).into());
+    }
+    let tokenizer = serde_json::json!({
+        "version": "1.0", "truncation": null, "padding": null, "normalizer": null,
+        "pre_tokenizer": null, "post_processor": null,
+        "decoder": {"type":"ByteLevel", "add_prefix_space":false, "trim_offsets":false, "use_regex":false},
+        "added_tokens": [{"id":0,"content":"<eos>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],
+        "model": {"type":"BPE", "merges":[], "vocab": vocab, "unk_token":"<eos>"}
+    });
+    let tokenizer = tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&tokenizer)?)
+        .map_err(|error| TurError::Tokenizer(error.to_string()))?;
+    let mut guidance = GuidanceControl::new(build_llg_factory(tokenizer, Some(160))?);
+    guidance.activate(TopLevelGrammar::from_regex(regex))?;
+    Ok(guidance)
+}
+
+/// Token text of the letters grammar's vocabulary.
+fn letters(token: u32) -> String {
+    let letter = |i: u32| char::from(b'a' + i as u8);
+    match token {
+        1..=26 => letter(token - 1).to_string(),
+        _ => format!("{}{}", letter((token - 27) / 26), letter((token - 27) % 26)),
+    }
+}
+
+#[test]
+fn test_grammar_masks_are_applied_on_the_device() -> Result<()> {
+    let _gpu = GPU.lock();
+    let checkpoint = small()?;
+    let device = metal()?;
+    let model = Arc::new(load(
+        &checkpoint.0,
+        WeightFormat::F32,
+        &device,
+        Execution::Fused,
+    )?);
+    let config = PoolConfig {
+        pages: 64,
+        recurrent_slots: 8,
+    };
+    let mut engine = HybridEngine::new(Arc::clone(&model), device, config)?;
+    let sampled = SamplingOptions {
+        temperature: Some(1.0),
+        presence_penalty: Some(0.3),
+        ..Default::default()
+    };
+    // A forcing grammar and a free one, sampled in the same passes as an unconstrained
+    // request; every row is decided on the device.
+    let forced = engine.allocate(5, sampled, Some(letters_grammar("abc")?))?;
+    let free = engine.allocate(6, sampled, Some(letters_grammar("[a-e]{6}")?))?;
+    let plain = engine.allocate(7, sampled, None)?;
+    let mut texts = vec![String::new(); 2];
+    let mut inputs = [prompt(9, 1), prompt(5, 2), prompt(7, 3)];
+    let mut finished = [false; 2];
+    for _ in 0..12 {
+        let handles: Vec<StateHandle> = [forced, free, plain]
+            .iter()
+            .map(|h| engine.metadata(h.request).map(|m| m.handle))
+            .collect::<Result<_>>()?;
+        let mut plan = PackedExecution {
+            tokens: Vec::new(),
+            positions: Vec::new(),
+            sequences: Vec::new(),
+        };
+        for (index, handle) in handles.iter().enumerate() {
+            if index < 2 && finished[index] {
+                continue;
+            }
+            let position = engine.metadata(handle.request)?.position;
+            let start = plan.tokens.len();
+            plan.tokens.extend(&inputs[index]);
+            plan.positions
+                .extend(position..position + inputs[index].len());
+            plan.sequences.push(SequenceDescriptor {
+                state: *handle,
+                tokens: start..plan.tokens.len(),
+                outputs: vec![plan.tokens.len() - 1],
+                speculative: false,
+            });
+        }
+        engine.submit(plan)?;
+        for result in engine.finish()? {
+            let commit = result.outcome?;
+            let index = [forced, free, plain]
+                .iter()
+                .position(|h| h.request == result.request)
+                .ok_or_else(|| invalid("unknown result"))?;
+            if index < 2 {
+                finished[index] |= commit.finished;
+                texts[index].extend(commit.outputs.iter().map(|o| letters(o.token)));
+            }
+            if let Some(output) = commit.outputs.first() {
+                inputs[index] = vec![output.token];
+            }
+        }
+        if finished.iter().all(|&f| f) {
+            break;
+        }
+    }
+    assert_eq!(texts[0], "abc");
+    assert_eq!(texts[1].len(), 6, "{}", texts[1]);
+    assert!(
+        texts[1].chars().all(|c| ('a'..='e').contains(&c)),
+        "{}",
+        texts[1]
+    );
+    assert!(finished.iter().all(|&f| f));
+    let stats = engine.sampling_stats();
+    assert_eq!(stats.host_rows, 0, "{stats:?}");
+    Ok(())
+}
+
+#[test]
+fn test_cached_last_logits_sample_like_the_pass_that_produced_them() -> Result<()> {
+    let _gpu = GPU.lock();
+    let checkpoint = small()?;
+    let device = metal()?;
+    let model = Arc::new(load(
+        &checkpoint.0,
+        WeightFormat::F32,
+        &device,
+        Execution::Fused,
+    )?);
+    let config = PoolConfig {
+        pages: 64,
+        recurrent_slots: 8,
+    };
+    let mut engine = HybridEngine::new(Arc::clone(&model), device, config)?;
+    let options = SamplingOptions {
+        temperature: Some(1.2),
+        top_k: Some(40),
+        repetition_penalty: Some(1.2),
+        ..Default::default()
+    };
+    let tokens = prompt(21, 4);
+    for seed in 0..8 {
+        let original = engine.allocate(seed, options, None)?;
+        engine.add_context(original, &tokens)?;
+        engine.submit(PackedExecution {
+            positions: (0..tokens.len()).collect(),
+            tokens: tokens.clone(),
+            sequences: vec![SequenceDescriptor {
+                state: original,
+                tokens: 0..tokens.len(),
+                outputs: vec![tokens.len() - 1],
+                speculative: false,
+            }],
+        })?;
+        let result = engine.finish()?.pop().ok_or_else(|| invalid("no result"))?;
+        let logits = result
+            .logits
+            .ok_or_else(|| invalid("no logits"))?
+            .force_contiguous()?;
+        let commit = result.outcome?;
+        // A second request with the same seed restores the state and samples the cached
+        // logits: the same token, with no model pass.
+        let copy = engine.allocate(seed, options, None)?;
+        engine.add_context(copy, &tokens)?;
+        let copy = engine.adopt(copy, &engine.model_state(commit.handle)?)?;
+        let cached = engine.sample_logits(copy, &logits)?;
+        assert_eq!(
+            cached.outputs,
+            commit
+                .outputs
+                .iter()
+                .map(|o| tur_engine::hybrid::TokenOutput {
+                    request: copy.request,
+                    packed_position: 0,
+                    ..o.clone()
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(cached.accepted_tokens, 0);
+        assert_eq!(engine.metadata(copy.request)?.position, tokens.len());
+        engine.cancel(engine.metadata(original.request)?.handle)?;
+        engine.cancel(cached.handle)?;
+    }
+    assert_eq!(engine.sampling_stats().host_rows, 0);
+    Ok(())
+}

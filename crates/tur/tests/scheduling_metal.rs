@@ -248,3 +248,58 @@ fn test_batched_runs_repeat_exactly_and_reproducible_mode_ignores_other_traffic(
     }
     Ok(())
 }
+
+#[test]
+fn test_grammar_requests_are_sampled_on_the_device_and_batch_independently() -> Result<()> {
+    use tur::backend::guidance::TopLevelGrammar;
+    let checkpoint = common::Checkpoint::fused()?;
+    let path = checkpoint.0.join("tokenizer.json");
+    let mut tokenizer: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    tokenizer["decoder"] = serde_json::json!({
+        "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false
+    });
+    std::fs::write(&path, tokenizer.to_string())?;
+    let mut factory = checkpoint.factory();
+    factory.device = Device::new_metal(0)?;
+    let mut requests = sampled_requests();
+    for (index, request) in requests.iter_mut().enumerate() {
+        if index % 2 == 0 {
+            request.grammar = Some(TopLevelGrammar::from_regex("(t2[0-9]){3}t9"));
+            request.max_tokens = 40;
+        }
+    }
+    let mut config = PipelineConfig::new(6, 8);
+    config.scheduler.max_batch_tokens = 24;
+    config.scheduler.min_prefill_tokens = 2;
+    let mut solo = InferencePipeline::new(&factory, config)?;
+    let expected = requests
+        .iter()
+        .map(|request| Ok(solo.run(request, |_| {})?.generated_text))
+        .collect::<Result<Vec<_>>>()?;
+    // The fixture's single-digit tokens can open a pair that no later token completes, so
+    // a text may stop early; it must still be a prefix of the grammar's language.
+    let mut complete = 0;
+    for (index, text) in expected.iter().enumerate().step_by(2) {
+        let mut rest = text.as_str();
+        for _ in 0..3 {
+            let pair = rest.strip_prefix("t2").map(str::chars);
+            match pair
+                .and_then(|mut chars| chars.next().filter(char::is_ascii_digit).map(|_| chars))
+            {
+                Some(chars) => rest = chars.as_str(),
+                None => break,
+            }
+        }
+        assert!(["", "t", "t2", "t9"].contains(&rest), "{index}: {text}");
+        complete += usize::from(rest == "t9");
+    }
+    assert!(complete >= 1, "{expected:?}");
+    let mut batched = InferencePipeline::new(&factory, config)?;
+    let texts = drive(&mut batched, &requests, &[0, 0, 1, 1, 2, 3])?;
+    for (index, expected) in expected.iter().enumerate() {
+        assert_eq!(&texts[&index], expected, "request {index}");
+    }
+    assert_eq!(batched.sampling_stats().host_rows, 0);
+    assert_eq!(solo.sampling_stats().host_rows, 0);
+    Ok(())
+}

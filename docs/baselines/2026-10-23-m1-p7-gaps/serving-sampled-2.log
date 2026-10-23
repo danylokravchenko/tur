@@ -1,0 +1,8 @@
+    Finished `bench` profile [optimized] target(s) in 0.46s
+     Running benches/serving.rs (target/release/deps/serving-e1a1e5fe3c552d2f)
+decode-heavy c=1: 46.7 out tok/s, TTFT p50 163 ms, ITL p50/p95 18.7/20.0 ms, pass p50 18.7 ms (schedule 0.01, encode 2.78, wait 15.8, publish 0.04, idle 0.06), cached 0
+decode-heavy c=2: 80.8 out tok/s, TTFT p50 292 ms, ITL p50/p95 19.7/21.1 ms, pass p50 19.7 ms (schedule 0.01, encode 2.58, wait 17.0, publish 0.07, idle 0.08), cached 0
+decode-heavy c=4: 108.7 out tok/s, TTFT p50 514 ms, ITL p50/p95 24.1/26.3 ms, pass p50 24.1 ms (schedule 0.01, encode 2.57, wait 21.0, publish 0.07, idle 0.09), cached 0
+decode-heavy c=8: 169.9 out tok/s, TTFT p50 1000 ms, ITL p50/p95 28.8/34.0 ms, pass p50 28.8 ms (schedule 0.01, encode 2.83, wait 25.8, publish 0.12, idle 0.13), cached 0
+decode-heavy c=16: 167.0 out tok/s, TTFT p50 2166 ms, ITL p50/p95 52.4/55.5 ms, pass p50 52.4 ms (schedule 0.02, encode 3.64, wait 48.1, publish 0.24, idle 0.27), cached 0
+mixed c=16: 45.9 out tok/s, TTFT p50 9861 ms, ITL p50/p95 265.5/354.1 ms, pass p50 70.9 ms (schedule 0.02, encode 4.99, wait 52.5, publish 0.15, idle 0.25), cached 0

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Chat admission and scheduled packed execution over the single-owner hybrid engine.
 
+use candle_core::Tensor;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -19,6 +20,7 @@ use tur_models::{
 use uuid::Uuid;
 
 use super::{
+    guidance::{GuidanceControl, ParserFactory, TopLevelGrammar, build_llg_factory},
     memory::{BudgetLease, DeviceBudget, MemoryPlan, PlanInputs},
     prefix::{PrefixCache, PrefixConfig, PrefixKeys, PrefixStats},
     scheduler::{Candidate, Chunk, Decision, Scheduler, SchedulerConfig},
@@ -44,6 +46,8 @@ pub struct GenerationRequest {
     pub submitted_at: Option<Instant>,
     /// Prefix-reuse namespace: only requests with the same salt share snapshots.
     pub cache_salt: Option<String>,
+    /// Constrain generation to this grammar; the request completes when it terminates.
+    pub grammar: Option<TopLevelGrammar>,
 }
 
 impl GenerationRequest {
@@ -62,6 +66,7 @@ impl GenerationRequest {
             timeout: None,
             submitted_at: None,
             cache_salt: None,
+            grammar: None,
         }
     }
 }
@@ -171,7 +176,15 @@ impl Pending {
             .get(next)
             .filter(|_| self.consumed >= self.replay_floor)
             .map(|end| end - self.consumed);
-        let aligned = boundary.map_or(unconsumed, |end| unconsumed.min(end - self.consumed));
+        // Below the first restore, chunks also stop there, where replay boundaries begin.
+        let end = boundary.map(|end| {
+            if self.consumed < self.replay_floor {
+                end.min(self.replay_floor)
+            } else {
+                end
+            }
+        });
+        let aligned = end.map_or(unconsumed, |end| unconsumed.min(end - self.consumed));
         Candidate {
             id,
             pending: replay.unwrap_or(aligned),
@@ -210,6 +223,7 @@ impl PipelineConfig {
             prefix: PrefixConfig {
                 spacing: PrefixConfig::DEFAULT_SPACING,
                 entries: max_batch_size,
+                state_share: Some(PrefixConfig::DEFAULT_STATE_SHARE),
             },
             device_sampling: true,
             state_bytes: None,
@@ -248,6 +262,8 @@ pub struct InferencePipeline {
     in_flight: Option<InFlight>,
     /// Outcomes produced before or without a pass, returned by the next `finish_step`.
     staged: BatchStepOutput,
+    /// Grammar parser factory over the tokenizer, built on the first constrained request.
+    guidance: Option<Arc<ParserFactory>>,
 }
 
 fn sampling(overrides: SamplingOptions, defaults: &GenerationDefaults) -> SamplingOptions {
@@ -293,6 +309,15 @@ impl InferencePipeline {
                     .and_then(|row| row.checked_add(16))
                     .and_then(|row| sequences.checked_mul(row))
                     .and_then(|logits| logits.checked_add(tokens.checked_mul(12)?))
+                    // Prompt-end snapshots keep one F32 logit row each.
+                    .and_then(|bytes| {
+                        bytes.checked_add(
+                            description
+                                .vocab_size
+                                .checked_mul(4)?
+                                .checked_mul(config.prefix.entries)?,
+                        )
+                    })
                     .ok_or_else(|| invalid("in-flight size overflow"))?;
                 let (plan, pool) = MemoryPlan::new(
                     &description,
@@ -302,6 +327,7 @@ impl InferencePipeline {
                         in_flight,
                         sequences: limits.max_running,
                         retained: config.prefix.entries,
+                        retained_share: config.prefix.state_share,
                         state_bytes: config.state_bytes,
                         limit: budget.limit(),
                         reserved: budget.leased(),
@@ -331,9 +357,13 @@ impl InferencePipeline {
             plan,
             _lease: lease,
             pending: HashMap::new(),
-            prefix: PrefixCache::new(config.prefix),
+            prefix: PrefixCache::new(PrefixConfig {
+                entries: plan.retained,
+                ..config.prefix
+            }),
             in_flight: None,
             staged: BatchStepOutput::default(),
+            guidance: None,
         })
     }
 
@@ -439,10 +469,27 @@ impl InferencePipeline {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(TurError::DeadlineExceeded);
         }
+        let guidance = request
+            .grammar
+            .clone()
+            .map(|grammar| -> Result<GuidanceControl> {
+                let factory = if let Some(factory) = &self.guidance {
+                    Arc::clone(factory)
+                } else {
+                    let vocab = self.engine.pool().description().vocab_size;
+                    let factory = build_llg_factory(self.tokenizer.clone(), Some(vocab))?;
+                    self.guidance = Some(Arc::clone(&factory));
+                    factory
+                };
+                let mut control = GuidanceControl::new(factory);
+                control.activate(grammar)?;
+                Ok(control)
+            })
+            .transpose()?;
         let handle = self.engine.allocate(
             request.seed,
             sampling(request.sampling, &self.defaults),
-            None,
+            guidance,
         )?;
         self.engine.add_context(handle, &tokens)?;
         let keys = self.prefix.keys(request.cache_salt.as_deref(), &tokens);
@@ -507,10 +554,13 @@ impl InferencePipeline {
         Ok(())
     }
 
+    /// Publish one request's commit. `logits` are the model logits of its last output,
+    /// kept with a snapshot when the commit completes the prompt.
     fn publish(
         &mut self,
         id: Uuid,
         commit: SequenceCommit,
+        logits: Option<Tensor>,
         output: &mut BatchStepOutput,
     ) -> Result<()> {
         let pending = self
@@ -535,11 +585,21 @@ impl InferencePipeline {
         {
             pending.boundaries.push(pending.consumed);
         }
-        if self.prefix.is_boundary(pending.consumed) {
+        // The prompt's own last logits (not a replay's) can serve an identical prompt.
+        let prompt_end = commit.accepted_tokens > 0
+            && pending.consumed == pending.prompt_tokens
+            && pending.tokens.len() == pending.prompt_tokens;
+        if self.prefix.is_boundary(pending.consumed) || prompt_end {
             let prefix = &pending.tokens[..pending.consumed];
             self.prefix.extend(&mut pending.keys, prefix);
             let state = self.engine.model_state(pending.handle)?;
-            self.prefix.insert(&pending.keys, prefix, &state)?;
+            let logits = logits
+                .filter(|_| prompt_end)
+                // An allocated copy: `Tensor::copy` shares storage on Metal.
+                .map(|logits| logits.force_contiguous())
+                .transpose()?;
+            self.prefix
+                .insert(&pending.keys, prefix, &state, logits.as_ref())?;
         }
         let mut finished = commit.finished;
         let mut reason = "stop";
@@ -589,6 +649,13 @@ impl InferencePipeline {
             tool_calls,
             finish_reason: reason,
         };
+        // The reply's state lets a conversation's next turn resume after it.
+        if pending.consumed > 0 && self.prefix.config().enabled() {
+            let consumed = &pending.tokens[..pending.consumed];
+            self.prefix.extend(&mut pending.keys, consumed);
+            let state = self.engine.model_state(pending.handle)?;
+            self.prefix.insert(&pending.keys, consumed, &state, None)?;
+        }
         self.engine.cancel(pending.handle)?;
         self.pending.remove(&id);
         output.completed.push((id, Ok(stats)));
@@ -610,8 +677,9 @@ impl InferencePipeline {
     }
 
     /// Restore the deepest verified snapshot for the oldest waiting requests that have no
-    /// state, while running slots remain. They then run their remaining prompt.
-    fn restore_prefixes(&mut self) -> Result<()> {
+    /// state, while running slots remain. They then run their remaining prompt; a snapshot
+    /// of the whole prompt samples the first output from its logits without a pass.
+    fn restore_prefixes(&mut self, output: &mut BatchStepOutput) -> Result<()> {
         if !self.prefix.config().enabled() {
             return Ok(());
         }
@@ -633,20 +701,37 @@ impl InferencePipeline {
             if pending.prefix_checked == Some(inserted) {
                 continue;
             }
-            let limit = pending.tokens.len() - 1;
-            let Some((length, state)) = self.prefix.lookup(&pending.keys, &pending.tokens, limit)
-            else {
+            // Recomputation keeps its original pass boundaries above the first restore.
+            let (boundaries, floor) = (&pending.boundaries, pending.replay_floor);
+            let accept = |length: usize| {
+                boundaries.is_empty()
+                    || length <= floor
+                    || boundaries.binary_search(&length).is_ok()
+            };
+            let Some(hit) = self.prefix.lookup(&pending.keys, &pending.tokens, accept) else {
                 pending.prefix_checked = Some(inserted);
                 continue;
             };
-            pending.handle = self.engine.adopt(pending.handle, &state)?;
-            pending.consumed = length;
+            pending.handle = self.engine.adopt(pending.handle, &hit.state)?;
+            pending.consumed = hit.length;
             pending.running = true;
             if pending.boundaries.is_empty() {
-                pending.replay_floor = length;
-                pending.cached_tokens = length;
+                pending.replay_floor = hit.length;
+                pending.cached_tokens = hit.length;
             }
-            tracing::debug!(request = %id, tokens = length, "restored prefix snapshot");
+            tracing::debug!(request = %id, tokens = hit.length, "restored prefix snapshot");
+            if hit.length < pending.tokens.len() {
+                continue;
+            }
+            let handle = pending.handle;
+            let first = hit
+                .logits
+                .ok_or_else(|| invalid("whole-prompt snapshot without logits"))
+                .and_then(|logits| self.engine.sample_logits(handle, &logits))
+                .and_then(|commit| self.publish(id, commit, None, output));
+            if let Err(error) = first {
+                self.fail(id, error, output)?;
+            }
         }
         Ok(())
     }
@@ -693,7 +778,7 @@ impl InferencePipeline {
     /// Ask the scheduler for a pass, evicting prefix snapshots before preempting or
     /// failing requests, until one fits.
     fn select(&mut self, output: &mut BatchStepOutput) -> Result<Vec<Chunk>> {
-        self.restore_prefixes()?;
+        self.restore_prefixes(output)?;
         loop {
             let candidates: Vec<Candidate> = self
                 .pending
@@ -863,9 +948,10 @@ impl InferencePipeline {
             if !self.pending.contains_key(&id) {
                 continue;
             }
+            let logits = result.logits;
             let outcome = result
                 .outcome
-                .and_then(|commit| self.publish(id, commit, &mut output));
+                .and_then(|commit| self.publish(id, commit, logits, &mut output));
             if let Err(error) = outcome {
                 self.fail(id, error, &mut output)?;
             }

@@ -255,6 +255,7 @@ pub async fn chat_completions(
             timeout: None,
             submitted_at: None,
             cache_salt: req.cache_salt,
+            grammar: None,
             render: RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.thinking,

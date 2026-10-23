@@ -1332,6 +1332,54 @@ fn test_device_penalties_match_the_reference_and_invalid_rows_are_flagged() -> R
 }
 
 #[test]
+fn test_grammar_masks_restrict_argmax_and_sampling_to_allowed_tokens() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    let cols: usize = 248_320;
+    let words = cols.div_ceil(32);
+    let rows = [
+        values(cols, 71, 4.0),
+        values(cols, 72, 4.0),
+        values(cols, 73, 4.0),
+    ];
+    let logits = upload(&device, &rows.concat(), &[3, cols])?;
+    let allowed = [3usize, 1000, 248_000];
+    let mut bits = vec![0u32; 2 * words];
+    for &token in &allowed {
+        bits[token / 32] |= 1 << (token % 32);
+    }
+    // Row 1 keeps three tokens, row 2 none, row 0 is untouched.
+    kernels.mask(&logits, &[1, 2], &bits)?;
+    let masked = read(&logits)?;
+    assert_eq!(masked[..cols], rows[0][..]);
+    for (token, &value) in masked[cols..2 * cols].iter().enumerate() {
+        if allowed.contains(&token) {
+            assert_eq!(value, rows[1][token]);
+        } else {
+            assert_eq!(value, f32::NEG_INFINITY);
+        }
+    }
+    let best = *allowed
+        .iter()
+        .max_by(|&&a, &&b| rows[1][a].total_cmp(&rows[1][b]))
+        .ok_or_else(|| tur_core::TurError::Other("empty".into()))?;
+    let out = read(&kernels.argmax(&logits)?)?;
+    assert_eq!(out[1], 1.0);
+    assert_eq!(out[2..4], [best as f32, 1.0]);
+    // A row without any allowed token is invalid rather than an arbitrary index.
+    assert_eq!(out[5], 0.0);
+    let row = logits.narrow(0, 1, 1)?;
+    for draw in 0..64 {
+        let pair = read(&kernels.sample(&row, &[sample_params(1.5, 0, 1.0, 9, draw)])?)?;
+        assert_eq!(SampleStatus::from_word(pair[1]), SampleStatus::Sampled);
+        assert!(allowed.contains(&(pair[0] as usize)), "{}", pair[0]);
+    }
+    assert!(kernels.mask(&logits, &[1, 1], &bits).is_err());
+    assert!(kernels.mask(&logits, &[3], &bits[..words]).is_err());
+    assert!(kernels.mask(&logits, &[0], &bits).is_err());
+    Ok(())
+}
+
+#[test]
 fn test_invalid_inputs_are_rejected_before_encoding() -> Result<()> {
     let (device, kernels, _gpu) = setup()?;
     let w = upload(&device, &[1.0; 4], &[4])?;
@@ -1492,5 +1540,65 @@ fn test_completion_retains_kernel_outputs_until_the_fence() -> Result<()> {
         .ok_or_else(|| tur_core::TurError::Other("not retained".into()))?;
     let expected = rms_row(&read(&x)?, &[1.0; 64], 1e-6);
     assert!(relative_error(&read(&out)?, &expected) < 1e-6);
+    Ok(())
+}
+
+#[test]
+fn test_sampling_repeats_exactly_for_identical_inputs() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    for cols in [160usize, 248_320] {
+        let logits = upload(&device, &values(cols, 81, 2.0), &[1, cols])?;
+        for draw in 0..32 {
+            let p = [sample_params(1.2, 40, 1.0, 6, draw)];
+            let first = read(&kernels.sample(&logits, &p)?)?;
+            for _ in 0..8 {
+                assert_eq!(
+                    read(&kernels.sample(&logits, &p)?)?,
+                    first,
+                    "cols {cols} draw {draw}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_penalties_on_allocated_copies_repeat_exactly_in_any_entry_order() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    let cols = 160usize;
+    let logits = upload(&device, &values(cols, 81, 2.0), &[1, cols])?;
+    let penalties = [PenaltyParams {
+        repetition: 1.2,
+        presence: 0.0,
+        frequency: 0.0,
+    }];
+    let mut entries: Vec<(u32, PenaltyEntry)> = (0..21u32)
+        .map(|t| {
+            (
+                0,
+                PenaltyEntry {
+                    token: (t * 37 + 11) % 148 + 2,
+                    count: 0,
+                },
+            )
+        })
+        .collect();
+    entries.sort_by_key(|e| e.1.token);
+    entries.dedup_by_key(|e| e.1.token);
+    let mut outcomes = Vec::new();
+    for rotation in 0..entries.len() {
+        entries.rotate_left(1);
+        // `Tensor::copy` shares storage on Metal: in-place kernels need an allocated copy.
+        let copy = logits.force_contiguous()?;
+        kernels.penalize(&copy, &penalties, &entries)?;
+        let penalized = read(&copy)?;
+        let pair = read(&kernels.sample(&copy, &[sample_params(1.2, 40, 1.0, 6, 0)])?)?;
+        outcomes.push((penalized, pair, rotation));
+    }
+    for (penalized, pair, rotation) in &outcomes {
+        assert_eq!(penalized, &outcomes[0].0, "rotation {rotation}");
+        assert_eq!(pair, &outcomes[0].1, "rotation {rotation}");
+    }
     Ok(())
 }

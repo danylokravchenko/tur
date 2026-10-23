@@ -1,0 +1,11 @@
+   Compiling tur-engine v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-engine)
+    Finished `release` profile [optimized] target(s) in 56.33s
+     Running tests/qwen3_5_fused.rs (target/release/deps/qwen3_5_fused-572e452dea35a953)
+
+running 3 tests
+test test_real_checkpoint_fused_greedy_generation_matches_reference ... ok
+test test_real_checkpoint_fused_matches_reference ... ok
+test test_real_checkpoint_kv_formats_keep_attention_quality ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 56.17s
+

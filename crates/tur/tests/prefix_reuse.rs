@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use tur::{
     InferencePipeline, Result, TurError,
     backend::{
+        chat_template::{ChatMessage, Role},
         pipeline::{GenerationRequest, GenerationStats, PipelineConfig},
         prefix::PrefixConfig,
     },
@@ -42,6 +43,7 @@ fn cached(entries: usize) -> PipelineConfig {
         prefix: PrefixConfig {
             spacing: 16,
             entries,
+            state_share: None,
         },
         ..PipelineConfig::new(4, 64)
     }
@@ -77,20 +79,33 @@ fn test_warmed_prefixes_continue_like_cold_runs_and_skip_their_prefill() -> Resu
     assert_ne!(expected[2], expected[3]);
     let mut pipeline = InferencePipeline::new(&fixture.factory(), cached(8))?;
     let mut stats: Vec<GenerationStats> = Vec::new();
+    let mut passes = Vec::new();
     for request in &requests {
+        let before = pipeline.scheduler().iteration();
         stats.push(pipeline.run(request, |_| {})?);
+        passes.push(pipeline.scheduler().iteration() - before);
     }
     for (index, (stats, expected)) in stats.iter().zip(&expected).enumerate() {
         assert_eq!(&stats.generated_text, expected, "request {index}");
     }
-    // The first prompt left snapshots at 16 and 32 tokens; the repeat restores 32 (one
-    // token must remain to produce logits), as do the 36-token shares.
+    // The first prompt left snapshots at 16 and 32 tokens and at its end, with its last
+    // logits. The repeat restores all 40 tokens and samples its first output from them,
+    // so its outputs take one pass fewer than their count, against three aligned prefill
+    // passes (16 + 16 + 8 tokens) plus the remaining decodes for the cold run; the
+    // 36-token shares restore 32.
     let cached_tokens: Vec<usize> = stats.iter().map(|s| s.cached_tokens).collect();
-    assert_eq!(cached_tokens, [0, 32, 32, 32]);
+    assert_eq!(cached_tokens, [0, 40, 32, 32]);
+    assert_eq!(
+        passes[..2],
+        [
+            stats[0].generated_tokens as u64 + 2,
+            stats[1].generated_tokens as u64 - 1
+        ]
+    );
     let prefix = pipeline.prefix_stats();
     assert_eq!(
         (prefix.hits, prefix.hit_tokens, prefix.collisions),
-        (3, 96, 0)
+        (3, 104, 0)
     );
     // Snapshots hold state after every request finished; clearing them releases it all.
     assert!(pipeline.memory()?.slots.leased > 0);
@@ -114,10 +129,39 @@ fn test_cache_salts_isolate_namespaces() -> Result<()> {
             .cached_tokens,
         0
     );
-    assert_eq!(pipeline.run(&tenant, |_| {})?.cached_tokens, 32);
+    assert_eq!(pipeline.run(&tenant, |_| {})?.cached_tokens, 40);
     let mut other = request(text, 1);
     other.cache_salt = Some("tenant-b".into());
     assert_eq!(pipeline.run(&other, |_| {})?.cached_tokens, 0);
+    Ok(())
+}
+
+#[test]
+fn test_a_next_turn_resumes_after_the_previous_reply() -> Result<()> {
+    let fixture = Checkpoint::random()?;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), cached(8))?;
+    // The fixture's template joins message contents with spaces, and its word-level
+    // tokenizer re-encodes a reply exactly, so the next turn's prompt starts with the
+    // first turn's prompt and reply.
+    let first = request(prompt(20, 0, 0), 1);
+    let reply = pipeline.run(&first, |_| {})?;
+    let prompt_tokens = reply.prompt_tokens;
+    let mut next = first;
+    next.messages.push(ChatMessage::new(
+        Role::Assistant,
+        reply.generated_text.clone(),
+    ));
+    next.messages
+        .push(ChatMessage::new(Role::User, prompt(0, 7, 3)));
+    next.seed = 2;
+    let expected = cold(&fixture, std::slice::from_ref(&next))?;
+    let stats = pipeline.run(&next, |_| {})?;
+    // The reply's last token was sampled but never consumed.
+    assert_eq!(
+        stats.cached_tokens,
+        prompt_tokens + reply.generated_tokens - 1
+    );
+    assert_eq!(stats.generated_text, expected[0]);
     Ok(())
 }
 

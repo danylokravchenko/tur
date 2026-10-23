@@ -13,7 +13,9 @@
 //! narrows with `TUR_BENCH_CONCURRENCY=1,8` and `TUR_BENCH_OUTPUT=64`.
 //! `TUR_BENCH_SAMPLING=0.7,20,0.95` samples instead of greedy decoding,
 //! `TUR_BENCH_DEVICE_SAMPLING=0` samples on the host, and
-//! `TUR_BENCH_WORKLOADS=prefix TUR_BENCH_SPACING=0,256` runs the prefix-reuse workloads.
+//! `TUR_BENCH_WORKLOADS=prefix TUR_BENCH_SPACING=0,256` runs the prefix-reuse workloads;
+//! `TUR_BENCH_WORKLOADS=arrivals TUR_BENCH_RATE=2,4` runs open-loop Poisson arrivals, and
+//! `TUR_BENCH_WORKLOADS=grammar` grammar-constrained requests.
 
 use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, time::Instant};
@@ -23,6 +25,7 @@ use tur_engine::{
     backend::{
         chat_template::{ChatMessage, Role},
         factory::{ModelFactory, ModelSource},
+        guidance::TopLevelGrammar,
         pipeline::{GenerationRequest, InferencePipeline, PipelineConfig},
         prefix::PrefixConfig,
     },
@@ -242,6 +245,7 @@ fn prefix_runs(
         PrefixConfig {
             spacing,
             entries: 16,
+            state_share: None,
         }
     };
     let mut pipeline = InferencePipeline::new(factory, config)?;
@@ -343,6 +347,110 @@ fn prefix_runs(
     Ok(runs)
 }
 
+/// Open-loop Poisson arrivals of 512-token prompts at `rate` requests per second. Each
+/// request is rendered and tokenized when it arrives: before the next pass (`serial`), or
+/// while the device runs the current one (`overlapped`). TTFT starts at the scheduled
+/// arrival, so intake delay counts.
+fn arrivals(
+    factory: &ModelFactory,
+    tokenizer: &Tokenizer,
+    rate: f64,
+    count: usize,
+    overlapped: bool,
+    options: SamplingOptions,
+) -> Result<Value> {
+    let mut pipeline = InferencePipeline::new(factory, PipelineConfig::new(16, CHUNK))?;
+    burst(
+        &mut pipeline,
+        &Burst {
+            prompts: vec![prompt(tokenizer, 64, 99)?],
+            output: 8,
+        },
+        options,
+    )?;
+    let prompts: Vec<String> = (0..count)
+        .map(|i| prompt(tokenizer, 512, 5000 + i))
+        .collect::<Result<_>>()?;
+    // Deterministic exponential gaps.
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut at = 0.0;
+    let schedule: Vec<f64> = (0..count)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let u = ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+            at += -u.ln() / rate;
+            at
+        })
+        .collect();
+    let start = Instant::now();
+    let (mut next, mut ids) = (0, HashMap::new());
+    // Render and tokenize every request due by now; returns the seconds spent.
+    let submit_due = |pipeline: &mut InferencePipeline,
+                      ids: &mut HashMap<_, _>,
+                      next: &mut usize|
+     -> Result<f64> {
+        let begin = Instant::now();
+        while *next < count && start.elapsed().as_secs_f64() >= schedule[*next] {
+            let mut request = GenerationRequest::new(prompts[*next].clone(), 64);
+            request.seed = *next as u64;
+            request.sampling = options;
+            request.submitted_at =
+                start.checked_add(std::time::Duration::from_secs_f64(schedule[*next]));
+            ids.insert(pipeline.submit_request(&request)?, *next);
+            *next += 1;
+        }
+        Ok(begin.elapsed().as_secs_f64())
+    };
+    let (mut ttft, mut emitted, mut intake, mut idle) =
+        (Vec::new(), vec![Vec::new(); count], Vec::new(), 0.0);
+    let mut generated = 0;
+    while next < count || pipeline.active_request_count() > 0 {
+        if pipeline.active_request_count() == 0 {
+            let wait = schedule[next] - start.elapsed().as_secs_f64();
+            if wait > 0.0 {
+                std::thread::sleep(std::time::Duration::from_secs_f64(wait));
+            }
+        }
+        if !overlapped || pipeline.active_request_count() == 0 {
+            intake.push(submit_due(&mut pipeline, &mut ids, &mut next)?);
+        }
+        pipeline.begin_step()?;
+        if overlapped {
+            intake.push(submit_due(&mut pipeline, &mut ids, &mut next)?);
+        }
+        let output = pipeline.finish_step()?;
+        if let Some(t) = output.timing {
+            idle += t.idle_before.map_or(0.0, |d| d.as_secs_f64());
+        }
+        for (id, _, at) in &output.sampled_tokens {
+            if let Some(&index) = ids.get(id) {
+                emitted[index].push(at.saturating_duration_since(start).as_secs_f64());
+            }
+        }
+        for (_, result) in output.completed {
+            let stats = result?;
+            ttft.push(stats.first_token.as_secs_f64());
+            generated += stats.generated_tokens;
+        }
+    }
+    let wall = start.elapsed().as_secs_f64();
+    let itl: Vec<f64> = emitted
+        .iter()
+        .flat_map(|t| t.windows(2).map(|w| w[1] - w[0]))
+        .collect();
+    intake.retain(|&seconds| seconds > 0.0);
+    Ok(json!({
+        "rate": rate, "requests": count, "overlapped": overlapped, "wall_seconds": wall,
+        "output_tokens_per_second": generated as f64 / wall,
+        "ttft_seconds": {"p50": percentile(&ttft, 0.5), "p95": percentile(&ttft, 0.95), "max": percentile(&ttft, 1.0)},
+        "itl_seconds": {"p50": percentile(&itl, 0.5), "p95": percentile(&itl, 0.95), "p99": percentile(&itl, 0.99)},
+        "intake_seconds": summary(&intake),
+        "device_idle_fraction_lower_bound": idle / wall,
+    }))
+}
+
 fn main() -> Result<()> {
     let dir = std::env::var("TUR_QWEN35_0_8B")
         .map(PathBuf::from)
@@ -381,9 +489,10 @@ fn main() -> Result<()> {
         burst(&mut pipeline, &warm, options)?;
         if workloads.contains("decode") {
             for &requests in &concurrency {
+                // Distinct prompts per burst, so no burst restores another's snapshots.
                 let short = Burst {
                     prompts: (0..requests)
-                        .map(|i| prompt(&tokenizer, 128, i))
+                        .map(|i| prompt(&tokenizer, 128, requests * 100 + i))
                         .collect::<Result<_>>()?,
                     output,
                 };
@@ -396,7 +505,7 @@ fn main() -> Result<()> {
             // Mixed: half the requests carry 2K-token prompts, arriving with short ones.
             let mixed = Burst {
                 prompts: (0..max)
-                    .map(|i| prompt(&tokenizer, if i % 2 == 0 { 128 } else { 2048 }, i))
+                    .map(|i| prompt(&tokenizer, if i % 2 == 0 { 128 } else { 2048 }, 10_000 + i))
                     .collect::<Result<_>>()?,
                 output,
             };
@@ -405,6 +514,71 @@ fn main() -> Result<()> {
             runs.push(
                 json!({"workload": "mixed", "prompt": [128, 2048], "concurrency": max, "result": result}),
             );
+        }
+    }
+    if workloads.contains("grammar") {
+        // JSON-like lists that the grammar terminates; every token is masked.
+        let grammar =
+            TopLevelGrammar::from_regex(r#"\{"items": \[("[a-z]{2,10}", ){3,6}"[a-z]{2,10}"\]\}"#);
+        let mut config = PipelineConfig::new(max, CHUNK);
+        config.device_sampling = device_sampling;
+        // Repeated prompts would otherwise restore from prompt-end snapshots.
+        config.prefix = PrefixConfig::DISABLED;
+        let mut pipeline = InferencePipeline::new(&factory, config)?;
+        for &concurrency in &concurrency {
+            let requests: Vec<GenerationRequest> = (0..concurrency)
+                .map(|i| {
+                    let mut request = GenerationRequest::new(
+                        format!("Request {i}. List a few animals as JSON."),
+                        output,
+                    );
+                    request.seed = i as u64;
+                    request.sampling = options;
+                    request.render.enable_thinking = Some(false);
+                    request.grammar = Some(grammar.clone());
+                    request
+                })
+                .collect();
+            // The first run builds the parser factory over the tokenizer; time the second.
+            run_requests(&mut pipeline, &requests)?;
+            let result = run_requests(&mut pipeline, &requests)?;
+            report(&format!("grammar c={concurrency}"), &result);
+            runs.push(json!({"workload": "grammar", "concurrency": concurrency, "result": result}));
+        }
+    }
+    if workloads.contains("arrivals") {
+        let count = env_sizes("TUR_BENCH_REQUESTS", "48")?
+            .first()
+            .copied()
+            .unwrap_or(48);
+        for rate in env_sizes("TUR_BENCH_RATE", "2,4")? {
+            for overlapped in [false, true] {
+                let result = arrivals(
+                    &factory,
+                    &tokenizer,
+                    rate as f64,
+                    count,
+                    overlapped,
+                    options,
+                )?;
+                eprintln!(
+                    "arrivals {rate}/s, {}: {:.1} out tok/s, TTFT p50/p95 {:.0}/{:.0} ms, ITL p50/p95/p99 {:.1}/{:.1}/{:.1} ms, intake p50 {:.2} ms (sum {:.0} ms), idle {:.2}%",
+                    if overlapped { "overlapped" } else { "serial" },
+                    result["output_tokens_per_second"].as_f64().unwrap_or(0.0),
+                    result["ttft_seconds"]["p50"].as_f64().unwrap_or(0.0) * 1e3,
+                    result["ttft_seconds"]["p95"].as_f64().unwrap_or(0.0) * 1e3,
+                    result["itl_seconds"]["p50"].as_f64().unwrap_or(0.0) * 1e3,
+                    result["itl_seconds"]["p95"].as_f64().unwrap_or(0.0) * 1e3,
+                    result["itl_seconds"]["p99"].as_f64().unwrap_or(0.0) * 1e3,
+                    result["intake_seconds"]["p50"].as_f64().unwrap_or(0.0) * 1e3,
+                    result["intake_seconds"]["sum"].as_f64().unwrap_or(0.0) * 1e3,
+                    result["device_idle_fraction_lower_bound"]
+                        .as_f64()
+                        .unwrap_or(0.0)
+                        * 100.0,
+                );
+                runs.push(json!({"workload": "arrivals", "result": result}));
+            }
         }
     }
     if workloads.contains("prefix") {

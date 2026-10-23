@@ -7,6 +7,15 @@ use toktrie_hf_tokenizers::ByteTokenizer;
 use tracing::warn;
 
 pub type ParserFactory = LlgParserFactory;
+
+/// The grammar's constraint on the next token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GrammarMask {
+    /// The grammar is done; nothing more is sampled.
+    Stop,
+    /// Bit `t % 32` of word `t / 32` is set for every allowed token `t`.
+    Allowed(Vec<u32>),
+}
 pub use llguidance::api::TopLevelGrammar;
 
 pub fn build_llg_factory(
@@ -145,6 +154,37 @@ impl GuidanceControl {
         }
 
         Ok(false)
+    }
+
+    /// The allowed-token mask for the next sample without publishing anything, so it can be
+    /// computed while the device runs and applied there. Recomputing before the next
+    /// [`Self::commit`] gives the same mask. `None` without an active constraint.
+    pub fn mask(&mut self) -> Result<Option<GrammarMask>> {
+        if self.stopped {
+            return Ok(Some(GrammarMask::Stop));
+        }
+        let Some(constraint) = self.constraint.as_mut() else {
+            return Ok(None);
+        };
+        // A stop seen by an earlier mask must not be computed again.
+        if constraint.step_result().is_stop() {
+            return Ok(Some(GrammarMask::Stop));
+        }
+        let step = constraint
+            .compute_mask()
+            .map_err(|e| TurError::Guidance(e.to_string()))?;
+        if step.is_stop() {
+            return Ok(Some(GrammarMask::Stop));
+        }
+        Ok(step
+            .sample_mask
+            .as_ref()
+            .map(|mask| GrammarMask::Allowed(mask.as_slice().to_vec())))
+    }
+
+    /// Record that the grammar stopped before sampling, as [`Self::apply_mask`] does.
+    pub fn stop(&mut self) {
+        self.stopped = true;
     }
 
     /// Advance the grammar state after a token has been sampled.

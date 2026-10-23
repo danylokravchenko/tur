@@ -330,19 +330,136 @@ These are breaking changes, authorized in [Breaking changes and legacy removal](
 - `TurError::SlowClient` is a new error variant. `WorkerMsg::token_tx` is now an
   `Option` of a bounded sender, and `WorkerConfig::stream` (`StreamConfig`) is added.
 
+## Gap closure (2026-10-23)
+
+These follow-ups closed the gaps that the first P7 pass left open. Artifacts:
+[baselines/2026-10-23-m1-p7-gaps](baselines/2026-10-23-m1-p7-gaps/). Across the
+workspace, 201 tests and the three real-checkpoint tests pass; strict Clippy passes, as
+do checks with and without default features.
+
+**Grammar masks on the device.**
+
+- **API:** `GenerationRequest::grammar` accepts any llguidance grammar. The parser factory
+  for the tokenizer is built on the first constrained request.
+- **Mask timing:** for a single-output, non-speculative grammar sequence, the engine
+  computes the mask at submission, while the device runs the model. It uploads an
+  LSB-first bitset, and `mask_f32` sets disallowed logits to −∞ after the penalties.
+  Argmax and sampling then run on the device, and the grammar commits at publication.
+  A grammar that stops at submission publishes nothing for that output. Speculative or
+  multi-output grammar sequences still sample on the host, because their later masks
+  depend on tokens sampled within the pass.
+- **Argmax semantics:** −∞ now means a masked token, and a fully masked row is invalid.
+
+The table compares grammar-constrained requests (a JSON-like regex the grammar
+terminates; T=0.7, top-k 20, top-p 0.95) with device and host masking
+([device](baselines/2026-10-23-m1-p7-gaps/grammar-device1.json),
+[host](baselines/2026-10-23-m1-p7-gaps/grammar-device0.json)):
+
+| Concurrency | ITL p50, device vs host | Pass p50 | Encode (mask computation included) | Post-completion host time |
+| --- | --- | --- | --- | --- |
+| 1 | 18.4 vs 23.3 ms | 18.4 vs 23.6 ms | 3.3 vs 1.6 ms | 0.13 vs 4.5 ms |
+| 4 | 24.1 vs 33.0 ms | 24.1 vs 33.0 ms | 4.9 vs 1.0 ms | 0.30 vs 9.3 ms |
+| 8 | 29.0 vs 44.9 ms | 29.1 vs 44.5 ms | 6.0 vs 0.8 ms | 0.52 vs 15.9 ms |
+| 16 | 50.2 vs 81.6 ms | 50.2 vs 81.2 ms | 10.4 vs 1.0 ms | 1.31 vs 31.1 ms |
+
+With masks on the device, constrained passes cost the same as unconstrained ones at
+every concurrency. Mask computation takes about 0.34 ms per request and runs during
+`encode`, while the device executes the committed command buffers.
+
+**Prompt-end and reply snapshots.**
+
+- **Keys:** keys now chain over every token, so snapshots can sit at any committed
+  boundary, not only aligned ones.
+- **Prompt end:** the commit that completes a prompt leaves a snapshot holding an
+  allocated copy of that prompt's last logits. A request whose whole prompt matches
+  restores it, then `HybridEngine::sample_logits` samples its first output with the
+  request's penalties, grammar and RNG stream. That takes no model pass, so the first
+  token arrives at admission.
+- **Reply end:** a finished request leaves a snapshot after its last consumed token.
+- **Snapshot cost:** an unaligned snapshot makes its next appender copy one tail page.
+  The memory plan charges one F32 logit row per retained snapshot.
+- **Replay boundaries:** recomputation accepts only restore lengths that are its own
+  pass boundaries, or that lie at or below its first restore. Below that point, chunks
+  also stop at the first restore, so original pass boundaries are preserved.
+
+Tests:
+
+- An exact repeat restores all 40 tokens, needs one pass fewer than its outputs, and
+  generates the cold run's text.
+- A next turn whose history renders identically restores the prompt plus the reply
+  minus its unconsumed last token, and matches the cold run.
+- On Metal, cached logits sample exactly the token the original pass sampled.
+
+A real Qwen3.5 template re-renders the previous assistant turn without the generation
+prompt's empty think block, so reply snapshots do not match its next turn. On the
+multi-turn workload, reuse is unchanged at 7,168 of 13,765 prompt tokens (last-turn TTFT
+p50 2.91 → 1.28 s with reuse; [prefix](baselines/2026-10-23-m1-p7-gaps/prefix.json)).
+
+**Retained snapshots scale with state size.** `PrefixConfig::state_share` defaults to
+1/8: retained snapshots may take at most that share of the state pool's bytes
+(`MemoryPlan::retained` reports the result). A 27B deployment on a small budget
+therefore keeps proportionally fewer 157 MB states. An explicit `--prefix-snapshots`
+count is honored as given.
+
+**Streaming arrivals.** Open-loop Poisson arrivals of 48 requests with 512-token prompts
+and 64 sampled outputs each. Each request is rendered and tokenized either before the
+next pass (serial) or while the device runs the current one (overlapped). TTFT starts at
+the scheduled arrival ([arrivals](baselines/2026-10-23-m1-p7-gaps/arrivals.json)):
+
+| Rate | Mode | Output tok/s | TTFT p50 / p95 | ITL p50 / p95 / p99 | Device idle (lower bound) |
+| --- | --- | --- | --- | --- | --- |
+| 2/s | serial | 83.0 | 4.62 / 10.66 s | 61.1 / 289.9 / 340.2 ms | 9.4% |
+| 2/s | overlapped | 85.9 | 3.96 / 9.32 s | 60.3 / 268.3 / 290.1 ms | 4.8% |
+| 4/s | serial | 89.2 | 10.48 / 19.13 s | 52.7 / 296.2 / 378.5 ms | 9.6% |
+| 4/s | overlapped | 93.2 | 9.13 / 17.70 s | 52.5 / 290.5 / 345.6 ms | 5.2% |
+
+Rendering and tokenization took 1.6–1.8 s of host time per run, about 36 ms per request.
+Overlapping that work halves device idle time, cuts TTFT p50 by 13–14% and ITL p99 by
+9–15%, and adds 3.5–4.5% throughput. Both rates exceed what the M1 sustains with this
+model, so queues grow and TTFT is in seconds.
+
+**Run-to-run spread.** The closed-loop bursts were run three times each, with prompts
+unique per burst so that no burst restores another's snapshots. Each cell gives the mean,
+then the minimum–maximum
+([greedy](baselines/2026-10-23-m1-p7-gaps/serving-greedy-1.json) and repeats 2–3,
+[sampled](baselines/2026-10-23-m1-p7-gaps/serving-sampled-1.json) and repeats 2–3):
+
+| Workload | Greedy tok/s | Greedy ITL p50 | Sampled tok/s | Sampled ITL p50 | P6 greedy tok/s |
+| --- | --- | --- | --- | --- | --- |
+| c=1 | 46.2 (44.2–47.2) | 18.8 (18.2–19.8) ms | 45.7 (44.6–46.7) | 19.1 (18.6–20.0) ms | 45.9 |
+| c=2 | 78.7 (77.5–80.4) | 20.1 (19.4–21.2) ms | 78.4 (76.7–80.8) | 20.4 (19.7–21.1) ms | 79.9 |
+| c=4 | 114.0 (109.3–116.4) | 24.6 (23.6–26.1) ms | 107.2 (105.5–108.7) | 24.6 (24.1–25.3) ms | 115.4 |
+| c=8 | 168.3 (160.1–173.8) | 29.5 (28.1–31.4) ms | 166.1 (158.7–169.9) | 29.6 (28.6–31.3) ms | 168.8 |
+| c=16 | 185.9 (179.6–190.3) | 50.0 (48.9–51.3) ms | 176.1 (167.0–185.1) | 51.8 (50.2–52.9) ms | 184.7 |
+| Mixed, c=16 | 47.2 (45.9–47.9) | 258.4 (254.3–265.7) ms | 46.5 (45.9–47.8) | 262.3 (255.4–265.9) ms | 46.0 |
+
+Every P6 greedy result lies inside the P7 range, so the 2–6% gain in single runs above is
+within noise. Device idle time is 0.06–0.33 ms per pass (p50). Sampled ITL stays within
+2 ms of greedy.
+
+**Copy semantics.** On Metal, Candle's `Tensor::copy` shares the source buffer instead of
+copying it. In the first P7 pass this let the in-place penalties of a single device row
+write into the model's own logits. Retained logits exposed it: the cached first token
+mismatched for one of eight seeds. Every copy that must be independent now uses
+`force_contiguous`; this covers the device rows, retained logits, the copy-on-write
+temporary, and `ModelState::read_layers`, whose "detached" recurrent tensors had aliased
+pool slots. Kernel tests pin the behavior.
+
 ## Limits
 
-- **One device.** Only the M1 was measured, with one run per case and no confidence
-  intervals. The 27B is not executed.
-- **Snapshot cost.** Each retained snapshot costs a full recurrent slot (20.2 MB on 0.8B,
-  about 157 MB on 27B), so 27B deployments should retain fewer. Snapshots exist only at
-  aligned positions. A repeated prompt restores at most its length minus one, rounded
-  down to the spacing, and there is no snapshot at the exact end of a prompt.
+- **One device.** Only the M1 was measured, three runs per serving case and one per other
+  case, without confidence intervals. The 27B is not executed.
+- **Snapshot memory.** Each retained snapshot costs a full recurrent slot (20.2 MB on
+  0.8B, about 157 MB on 27B), bounded by default to 1/8 of the state pool. Eviction does
+  not rank snapshot kinds: reply snapshots can displace prompt-end snapshots.
+- **Multi-turn reuse on real templates.** Reply snapshots miss when a template re-renders
+  history differently from the generated text, as Qwen's does with its empty think
+  block. Reuse then falls back to aligned snapshots and loses up to 255 tokens per turn.
+  Fixing it would need a pass boundary where the next turn's rendering diverges.
 - **Not implemented:** persisted caches and SSD spill.
 - **Sampling.** The CPU and GPU paths do not give token-identical samples. Uniforms have
   24 bits, so tokens below about 2⁻²⁴ of the remaining mass are effectively never drawn.
-  Grammar-constrained requests still sample on the host; their mask transfer was not
-  measured separately.
+  Speculative or multi-output grammar sequences sample on the host.
 - **Overlap.** In-flight depth is one. Overlap hides only host work that does not depend
   on the current pass.
 
@@ -355,4 +472,6 @@ TUR_BENCH_ONLY=sample cargo bench --offline -p tur-metal --bench kernels
 TUR_QWEN35_0_8B=<snapshot> cargo bench --offline -p tur-engine --bench serving
 TUR_QWEN35_0_8B=<snapshot> TUR_BENCH_SAMPLING=0.7,20,0.95 [TUR_BENCH_DEVICE_SAMPLING=0] cargo bench --offline -p tur-engine --bench serving
 TUR_QWEN35_0_8B=<snapshot> TUR_BENCH_WORKLOADS=prefix TUR_BENCH_SAMPLING=0.7,20,0.95 TUR_BENCH_SPACING=0,64,128,256,512 cargo bench --offline -p tur-engine --bench serving
+TUR_QWEN35_0_8B=<snapshot> TUR_BENCH_WORKLOADS=arrivals TUR_BENCH_RATE=2,4 TUR_BENCH_SAMPLING=0.7,20,0.95 cargo bench --offline -p tur-engine --bench serving
+TUR_QWEN35_0_8B=<snapshot> TUR_BENCH_WORKLOADS=grammar TUR_BENCH_CONCURRENCY=1,4,8,16 TUR_BENCH_SAMPLING=0.7,20,0.95 [TUR_BENCH_DEVICE_SAMPLING=0] cargo bench --offline -p tur-engine --bench serving
 ```

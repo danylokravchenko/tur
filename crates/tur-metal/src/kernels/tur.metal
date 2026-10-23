@@ -103,7 +103,8 @@ kernel void argmax_f32(
     uint nonfinite = 0;
     for (uint c = tid; c < p.cols; c += threads) {
         float s = xr[c];
-        nonfinite |= isfinite(s) ? 0u : 1u;
+        // -inf marks a masked token; NaN and +inf are invalid.
+        nonfinite |= (isnan(s) || s == INFINITY) ? 1u : 0u;
         better(v, i, s, c);
     }
     for (uint offset = SIMD / 2; offset > 0; offset /= 2) {
@@ -125,7 +126,8 @@ kernel void argmax_f32(
         }
         nonfinite = simd_max(nonfinite);
         if (lane == 0) {
-            out[row] = float2(float(i), nonfinite == 0 ? 1.0f : 0.0f);
+            // A row without any unmasked token is invalid too.
+            out[row] = float2(float(i), nonfinite == 0 && v > -INFINITY ? 1.0f : 0.0f);
         }
     }
 }
@@ -1484,6 +1486,31 @@ QMV(8, 4, 2)
 // ---------------------------------------------------------------------------------------
 // Penalties and sampling (host reference: `crate::sampling`)
 // ---------------------------------------------------------------------------------------
+
+struct MaskArgs {
+    uint rows;
+    uint cols;
+    uint stride;
+    uint words;
+};
+
+// Grammar masks, one thread per (mask, token): token t of logit row rows[r] becomes -inf
+// unless bit t % 32 of word t / 32 of mask r is set.
+kernel void mask_f32(
+    device float *x [[buffer(0)]],
+    device const uint *rows [[buffer(1)]],
+    device const uint *bits [[buffer(2)]],
+    constant MaskArgs &p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint r = gid / p.cols;
+    uint c = gid % p.cols;
+    if (r >= p.rows) {
+        return;
+    }
+    if (((bits[r * p.words + c / 32] >> (c % 32)) & 1u) == 0) {
+        x[ulong(rows[r]) * p.stride + c] = -INFINITY;
+    }
+}
 
 struct PenaltyArgs {
     uint entries;

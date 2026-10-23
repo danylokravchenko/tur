@@ -39,6 +39,8 @@ pub struct MemoryPlan {
     pub limit: Option<usize>,
     /// Bytes other resident models had leased from the device budget when planning.
     pub reserved: usize,
+    /// Snapshot slots the pool holds beyond live sequences, after the share cap.
+    pub retained: usize,
 }
 
 /// What the plan must hold besides the state pool.
@@ -51,6 +53,9 @@ pub struct PlanInputs {
     pub sequences: usize,
     /// Recurrent snapshots retained beyond live sequences, one slot each (prefix reuse).
     pub retained: usize,
+    /// Most of the state pool's bytes that retained snapshots may take; `None` keeps
+    /// `retained` as given.
+    pub retained_share: Option<f64>,
     /// Explicit state pool budget in bytes; otherwise sized for [`DEFAULT_CONTEXT_TOKENS`]
     /// per sequence within the device limit.
     pub state_bytes: Option<usize>,
@@ -101,7 +106,18 @@ impl MemoryPlan {
             .bytes(description)?;
             available.map_or(wanted, |available| wanted.min(available))
         };
-        let config = PoolConfig::for_budget(description, bytes, inputs.sequences, inputs.retained)?;
+        // A snapshot costs a whole recurrent state (157 MB on Qwen3.8-27B against 20 MB on
+        // 0.8B), so large models on small budgets retain proportionally fewer.
+        let retained = match inputs.retained_share {
+            Some(share) if description.has_recurrent() => {
+                let slot = description.recurrent_slot_bytes()?.max(1);
+                inputs
+                    .retained
+                    .min((bytes as f64 * share.clamp(0.0, 1.0)) as usize / slot)
+            }
+            _ => inputs.retained,
+        };
+        let config = PoolConfig::for_budget(description, bytes, inputs.sequences, retained)?;
         let plan = Self {
             weights: inputs.weights,
             state_pool: config.bytes(description)?,
@@ -110,6 +126,7 @@ impl MemoryPlan {
             overhead,
             limit: inputs.limit,
             reserved: inputs.reserved,
+            retained,
         };
         if let Some(limit) = inputs.limit
             && plan.resident().saturating_add(plan.reserved) > limit
@@ -249,6 +266,7 @@ mod tests {
             in_flight: 100,
             sequences: 2,
             retained: 0,
+            retained_share: None,
             state_bytes,
             limit,
             reserved: 0,
@@ -271,8 +289,19 @@ mod tests {
             retained: 3,
             ..inputs(None, None)
         };
-        let (_, with_snapshots) = MemoryPlan::new(&model, retained)?;
-        assert_eq!(with_snapshots.recurrent_slots, 7);
+        let (plan, with_snapshots) = MemoryPlan::new(&model, retained)?;
+        assert_eq!((with_snapshots.recurrent_slots, plan.retained), (7, 3));
+        // A share cap keeps snapshots to that fraction of the pool's bytes.
+        let budget = 4 * page + 40 * slot;
+        let cap = budget / 8 / slot;
+        let capped = PlanInputs {
+            retained: cap + 10,
+            retained_share: Some(0.125),
+            ..inputs(Some(budget), None)
+        };
+        let (plan, config) = MemoryPlan::new(&model, capped)?;
+        assert_eq!((plan.retained, config.recurrent_slots), (cap, 4 + cap));
+        assert!(plan.retained * slot <= budget / 8);
         // A device limit shrinks the pool to what remains after weights, scratch,
         // in-flight buffers and a tenth for overhead.
         let limit = 1600 + 10 * page + 5 * slot;

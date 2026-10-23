@@ -1,0 +1,6 @@
+    Finished `bench` profile [optimized] target(s) in 0.36s
+     Running benches/serving.rs (target/release/deps/serving-e1a1e5fe3c552d2f)
+shared system prompt, spacing 0: 20.3 out tok/s, TTFT p50 11313 ms, ITL p50/p95 32.1/34.0 ms, pass p50 32.2 ms (schedule 0.02, encode 4.73, wait 28.3, publish 0.24, idle 0.26), cached 0
+multi-turn, spacing 0: 0 of 13765 prompt tokens cached; last-turn TTFT p50 2909 ms
+shared system prompt, spacing 256: 144.7 out tok/s, TTFT p50 609 ms, ITL p50/p95 31.4/39.1 ms, pass p50 31.5 ms (schedule 0.01, encode 3.26, wait 28.0, publish 0.12, idle 0.14), cached 12288
+multi-turn, spacing 256: 7168 of 13765 prompt tokens cached; last-turn TTFT p50 1277 ms

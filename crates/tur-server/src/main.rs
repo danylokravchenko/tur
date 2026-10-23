@@ -124,6 +124,11 @@ async fn main() -> Result<()> {
     pipeline.prefix = PrefixConfig {
         spacing: args.prefix_spacing,
         entries: args.prefix_snapshots.unwrap_or(args.max_batch_size),
+        // An explicit count is honored; the default scales down for large states.
+        state_share: args
+            .prefix_snapshots
+            .is_none()
+            .then_some(PrefixConfig::DEFAULT_STATE_SHARE),
     };
     let scheduler = &mut pipeline.scheduler;
     scheduler.max_batch_tokens = args.max_batch_tokens.unwrap_or(scheduler.max_batch_tokens);

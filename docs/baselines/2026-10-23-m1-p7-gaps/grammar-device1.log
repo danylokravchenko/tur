@@ -1,0 +1,6 @@
+    Finished `bench` profile [optimized] target(s) in 0.51s
+     Running benches/serving.rs (target/release/deps/serving-e1a1e5fe3c552d2f)
+grammar c=1: 46.1 out tok/s, TTFT p50 63 ms, ITL p50/p95 18.4/19.1 ms, pass p50 18.4 ms (schedule 0.01, encode 3.29, wait 15.0, publish 0.13, idle 0.14), cached 0
+grammar c=4: 115.7 out tok/s, TTFT p50 149 ms, ITL p50/p95 24.1/24.9 ms, pass p50 24.1 ms (schedule 0.01, encode 4.91, wait 18.7, publish 0.30, idle 0.32), cached 0
+grammar c=8: 172.0 out tok/s, TTFT p50 264 ms, ITL p50/p95 29.0/50.0 ms, pass p50 29.1 ms (schedule 0.01, encode 5.96, wait 21.4, publish 0.52, idle 0.54), cached 0
+grammar c=16: 192.2 out tok/s, TTFT p50 496 ms, ITL p50/p95 50.2/71.6 ms, pass p50 50.2 ms (schedule 0.02, encode 10.41, wait 36.8, publish 1.31, idle 1.33), cached 0

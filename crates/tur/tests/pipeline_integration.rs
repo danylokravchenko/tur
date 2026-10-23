@@ -238,6 +238,8 @@ fn test_exhausted_pool_preempts_the_newest_request_and_both_finish() -> Result<(
     }
     assert_eq!(preempted.get(&older), Some(&0));
     assert!(preempted.get(&newer).is_some_and(|&n| n > 0));
+    // Finished requests leave prefix snapshots by design; without them nothing is held.
+    pipeline.clear_prefix_cache();
     let usage = pipeline.memory()?;
     assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
     Ok(())
