@@ -12,15 +12,38 @@ use crate::{
     ModelFactory, Result, TurError,
     backend::{
         memory::DeviceBudget,
-        pipeline::{GenerationRequest, GenerationStats, InferencePipeline, PipelineConfig},
+        pipeline::{
+            BatchStepOutput, GenerationRequest, GenerationStats, InferencePipeline, PipelineConfig,
+        },
     },
 };
 
-/// A validated text conversation and its independent response channels.
+/// A validated text conversation and its independent response channels. Only streaming
+/// requests carry a text channel; it is bounded (see [`StreamConfig`]).
 pub struct WorkerMsg {
     pub request: GenerationRequest,
-    pub token_tx: mpsc::UnboundedSender<String>,
+    pub token_tx: Option<mpsc::Sender<String>>,
     pub result_tx: oneshot::Sender<Result<GenerationStats>>,
+}
+
+/// Bounded delivery of streamed text. Each pass sends at most one coalesced message per
+/// request; text the client has not taken waits in a per-request buffer. A buffer beyond
+/// `max_buffered_bytes` means the client stalled: the request is cancelled with
+/// [`TurError::SlowClient`] and its state released, so a stalled client holds at most
+/// `channel_capacity + 1` messages of at most that size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamConfig {
+    pub channel_capacity: usize,
+    pub max_buffered_bytes: usize,
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            channel_capacity: 64,
+            max_buffered_bytes: 16 << 10,
+        }
+    }
 }
 
 /// Checkpoint, scheduling limits and state budget for one worker. Model operations stay on
@@ -32,11 +55,51 @@ pub struct WorkerConfig {
     pub budget: DeviceBudget,
     /// Deadline for requests that set none.
     pub request_timeout: Option<Duration>,
+    pub stream: StreamConfig,
+}
+
+/// Why streamed text could not be handed over.
+enum Undelivered {
+    Disconnected,
+    Stalled(usize),
+}
+
+/// A streaming client's channel and the text it has not taken yet.
+struct Stream {
+    tx: mpsc::Sender<String>,
+    buffer: String,
+}
+
+impl Stream {
+    /// Send everything buffered as one message, keeping it if the channel is full.
+    fn flush(&mut self, limit: usize) -> std::result::Result<(), Undelivered> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        match self.tx.try_send(std::mem::take(&mut self.buffer)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(text)) => {
+                self.buffer = text;
+                if self.buffer.len() > limit {
+                    Err(Undelivered::Stalled(self.buffer.len()))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Undelivered::Disconnected),
+        }
+    }
 }
 
 struct PendingRequest {
-    token_tx: mpsc::UnboundedSender<String>,
+    stream: Option<Stream>,
     result_tx: oneshot::Sender<Result<GenerationStats>>,
+}
+
+impl PendingRequest {
+    fn disconnected(&self) -> bool {
+        self.result_tx.is_closed() || self.stream.as_ref().is_some_and(|s| s.tx.is_closed())
+    }
 }
 
 /// Handle to a single-owner packed hybrid worker with a bounded intake queue.
@@ -44,6 +107,7 @@ struct PendingRequest {
 pub struct PipelineWorker {
     tx: mpsc::Sender<WorkerMsg>,
     timeout: Option<Duration>,
+    stream: StreamConfig,
 }
 
 const MAX_ADMISSIONS_PER_PASS: usize = 32;
@@ -66,7 +130,7 @@ fn admit(
     pipeline: &mut InferencePipeline,
     pending: &mut HashMap<Uuid, PendingRequest>,
 ) {
-    if msg.result_tx.is_closed() || msg.token_tx.is_closed() {
+    if msg.result_tx.is_closed() || msg.token_tx.as_ref().is_some_and(mpsc::Sender::is_closed) {
         return;
     }
     match pipeline.submit_request(&msg.request) {
@@ -74,7 +138,10 @@ fn admit(
             pending.insert(
                 id,
                 PendingRequest {
-                    token_tx: msg.token_tx,
+                    stream: msg.token_tx.map(|tx| Stream {
+                        tx,
+                        buffer: String::new(),
+                    }),
                     result_tx: msg.result_tx,
                 },
             );
@@ -85,7 +152,75 @@ fn admit(
     }
 }
 
-fn serve(mut rx: mpsc::Receiver<WorkerMsg>, mut pipeline: InferencePipeline) -> Result<()> {
+/// Release every request whose client went away.
+fn release_disconnected(
+    pipeline: &mut InferencePipeline,
+    pending: &mut HashMap<Uuid, PendingRequest>,
+) -> Result<()> {
+    let gone: Vec<Uuid> = pending
+        .iter()
+        .filter(|(_, request)| request.disconnected())
+        .map(|(id, _)| *id)
+        .collect();
+    for id in gone {
+        pipeline.cancel(id)?;
+        pending.remove(&id);
+    }
+    Ok(())
+}
+
+/// Hand one pass's text and completions to their clients: one coalesced message per
+/// streaming request, never waiting on a client.
+fn deliver(
+    step: BatchStepOutput,
+    pipeline: &mut InferencePipeline,
+    pending: &mut HashMap<Uuid, PendingRequest>,
+    config: StreamConfig,
+) -> Result<()> {
+    for (id, text) in step.new_tokens {
+        if let Some(stream) = pending.get_mut(&id).and_then(|r| r.stream.as_mut()) {
+            stream.buffer.push_str(&text);
+        }
+    }
+    for (id, result) in step.completed {
+        if let Some(mut request) = pending.remove(&id) {
+            // A remainder the channel cannot take is recovered by the adapter from the
+            // final text, so completion never waits on the client.
+            if let Some(stream) = &mut request.stream {
+                let _ = stream.flush(usize::MAX);
+            }
+            drop(request.stream);
+            let _ = request.result_tx.send(result);
+        }
+    }
+    let mut cancelled = Vec::new();
+    for (id, request) in pending.iter_mut() {
+        if let Some(stream) = &mut request.stream {
+            match stream.flush(config.max_buffered_bytes) {
+                Ok(()) => {}
+                Err(Undelivered::Disconnected) => cancelled.push((*id, None)),
+                Err(Undelivered::Stalled(bytes)) => cancelled.push((*id, Some(bytes))),
+            }
+        }
+    }
+    for (id, stalled) in cancelled {
+        pipeline.cancel(id)?;
+        if let (Some(request), Some(bytes)) = (pending.remove(&id), stalled) {
+            tracing::warn!(request = %id, bytes, "cancelled a stalled stream");
+            let _ = request.result_tx.send(Err(TurError::SlowClient(format!(
+                "{bytes} bytes undelivered beyond the {}-byte bound",
+                config.max_buffered_bytes
+            ))));
+        }
+    }
+    Ok(())
+}
+
+fn serve(
+    mut rx: mpsc::Receiver<WorkerMsg>,
+    mut pipeline: InferencePipeline,
+    config: StreamConfig,
+) -> Result<()> {
     let mut pending: HashMap<Uuid, PendingRequest> = HashMap::new();
     loop {
         if pending.is_empty() {
@@ -93,18 +228,16 @@ fn serve(mut rx: mpsc::Receiver<WorkerMsg>, mut pipeline: InferencePipeline) -> 
                 return Ok(());
             };
             admit(msg, &mut pipeline, &mut pending);
+            drain_intake(&mut rx, |msg| admit(msg, &mut pipeline, &mut pending));
         }
-        drain_intake(&mut rx, |msg| admit(msg, &mut pipeline, &mut pending));
-        let cancelled: Vec<Uuid> = pending
-            .iter()
-            .filter(|(_, request)| request.result_tx.is_closed() || request.token_tx.is_closed())
-            .map(|(id, _)| *id)
-            .collect();
-        for id in cancelled {
-            pipeline.cancel(id)?;
-            pending.remove(&id);
-        }
-        let step = match pipeline.step_streaming() {
+        // Intake (rendering and tokenization) and disconnects run while the device
+        // executes the submitted pass; the next pass needs its sampled tokens.
+        let step = pipeline.begin_step().and_then(|_| {
+            drain_intake(&mut rx, |msg| admit(msg, &mut pipeline, &mut pending));
+            release_disconnected(&mut pipeline, &mut pending)?;
+            pipeline.finish_step()
+        });
+        let step = match step {
             Ok(step) => step,
             Err(error) => {
                 for (_, request) in pending.drain() {
@@ -115,17 +248,7 @@ fn serve(mut rx: mpsc::Receiver<WorkerMsg>, mut pipeline: InferencePipeline) -> 
                 return Err(error);
             }
         };
-        for (id, text) in step.new_tokens {
-            if let Some(request) = pending.get(&id) {
-                let _ = request.token_tx.send(text);
-            }
-        }
-        for (id, result) in step.completed {
-            if let Some(request) = pending.remove(&id) {
-                drop(request.token_tx);
-                let _ = request.result_tx.send(result);
-            }
-        }
+        deliver(step, &mut pipeline, &mut pending, config)?;
     }
 }
 
@@ -133,6 +256,7 @@ impl PipelineWorker {
     /// Load and validate the checkpoint before reporting readiness. Startup errors propagate.
     pub fn spawn(config: WorkerConfig) -> Result<Self> {
         let timeout = config.request_timeout;
+        let stream = config.stream;
         let (tx, rx) = mpsc::channel(256);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -156,7 +280,7 @@ impl PipelineWorker {
                         if ready_tx.send(Ok(())).is_err() {
                             return;
                         }
-                        if let Err(error) = serve(rx, pipeline) {
+                        if let Err(error) = serve(rx, pipeline, stream) {
                             tracing::warn!("Hybrid worker stopped: {error}");
                         }
                     }
@@ -168,12 +292,25 @@ impl PipelineWorker {
         ready_rx
             .recv()
             .map_err(|error| TurError::Other(format!("Worker startup failed: {error}")))??;
-        Ok(Self { tx, timeout })
+        Ok(Self {
+            tx,
+            timeout,
+            stream,
+        })
     }
 
     /// Wrap a caller-provided sender, allowing HTTP tests to provide deterministic workers.
     pub fn from_sender(tx: mpsc::Sender<WorkerMsg>) -> Self {
-        Self { tx, timeout: None }
+        Self {
+            tx,
+            timeout: None,
+            stream: StreamConfig::default(),
+        }
+    }
+
+    /// Bounded text channel for one streaming request.
+    pub fn stream_channel(&self) -> (mpsc::Sender<String>, mpsc::Receiver<String>) {
+        mpsc::channel(self.stream.channel_capacity.max(1))
     }
 
     /// Enqueue with the original arrival time. A full intake queue fails immediately;
@@ -226,14 +363,15 @@ mod tests {
         let worker = PipelineWorker {
             tx,
             timeout: Some(Duration::from_secs(1)),
+            stream: StreamConfig::default(),
         };
         let message = || {
-            let (token_tx, token_rx) = mpsc::unbounded_channel();
+            let (token_tx, token_rx) = mpsc::channel(1);
             let (result_tx, result_rx) = oneshot::channel();
             (
                 WorkerMsg {
                     request: GenerationRequest::new("t10".into(), 1),
-                    token_tx,
+                    token_tx: Some(token_tx),
                     result_tx,
                 },
                 token_rx,
@@ -280,6 +418,7 @@ mod tests {
             pipeline: PipelineConfig::new(1, 64),
             budget: DeviceBudget::new(None),
             request_timeout: None,
+            stream: StreamConfig::default(),
         });
         assert!(result.is_err());
     }

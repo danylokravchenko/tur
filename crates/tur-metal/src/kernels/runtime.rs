@@ -91,6 +91,8 @@ const FUNCTIONS: &[&str] = &[
     "delta_step_d256_f16",
     "delta_step_d256_bf16",
     "argmax_f32",
+    "penalize_f32",
+    "sample_f32",
     "qmv_q4k_b1_f32",
     "qmv_q4k_b2_f32",
     "qmv_q4k_b3_f32",

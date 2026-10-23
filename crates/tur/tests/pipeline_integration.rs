@@ -7,7 +7,10 @@ mod common;
 use common::Checkpoint;
 use tur::{
     InferencePipeline, Result, TurError,
-    backend::pipeline::{GenerationRequest, PipelineConfig},
+    backend::{
+        pipeline::{GenerationRequest, PipelineConfig},
+        prefix::PrefixConfig,
+    },
 };
 
 #[test]
@@ -156,6 +159,7 @@ fn budgeted(fixture: &Checkpoint, batch: usize, pages: usize) -> Result<Inferenc
         &fixture.factory(),
         PipelineConfig {
             state_bytes: Some(budget),
+            prefix: PrefixConfig::DISABLED,
             ..PipelineConfig::new(batch, 2)
         },
     )?;

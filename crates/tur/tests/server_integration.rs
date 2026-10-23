@@ -47,9 +47,11 @@ fn mock_worker(response_text: &'static str) -> PipelineWorker {
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             // Stream words via token_tx (for SSE/streaming consumers).
-            for word in response_text.split_whitespace() {
-                let _ = msg.token_tx.send(word.to_string());
-                let _ = msg.token_tx.send(" ".to_string());
+            if let Some(token_tx) = &msg.token_tx {
+                for word in response_text.split_whitespace() {
+                    let _ = token_tx.send(word.to_string()).await;
+                    let _ = token_tx.send(" ".to_string()).await;
+                }
             }
             drop(msg.token_tx);
             // generated_text is used by the non-streaming path in blocking_response.
@@ -57,6 +59,7 @@ fn mock_worker(response_text: &'static str) -> PipelineWorker {
                 finish_reason: "stop",
                 generated_tokens: response_text.split_whitespace().count(),
                 prompt_tokens: 0,
+                cached_tokens: 0,
                 elapsed: Duration::from_millis(1),
                 first_token: Duration::from_millis(1),
                 preemptions: 0,
@@ -86,6 +89,7 @@ fn mock_tool_call_worker(
                 finish_reason: "stop",
                 generated_tokens: 1,
                 prompt_tokens: 0,
+                cached_tokens: 0,
                 elapsed: Duration::from_millis(1),
                 first_token: Duration::from_millis(1),
                 preemptions: 0,

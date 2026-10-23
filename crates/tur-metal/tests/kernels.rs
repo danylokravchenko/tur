@@ -22,6 +22,7 @@ use tur_metal::{
     kernels::{DeltaShape, Heads, Kernels, RecurrentSpan, Tuning},
     packed::PackedLinear,
     pool::{AttentionPool, KvPool, dequantize, quantize},
+    sampling::{self, PenaltyEntry, PenaltyParams, SampleParams, SampleStatus},
 };
 
 /// Device-wide allocation counters are shared by every test in the process, so tests in
@@ -1075,6 +1076,257 @@ fn test_argmax_keeps_the_first_maximum_and_flags_nonfinite_rows() -> Result<()> 
     assert_eq!(
         read(&kernels.argmax(&strided)?)?,
         [1000.0, 1.0, (cols - 1) as f32, 1.0]
+    );
+    Ok(())
+}
+
+fn sample_params(temperature: f32, top_k: u32, top_p: f32, seed: u64, draw: u64) -> SampleParams {
+    SampleParams {
+        temperature,
+        top_k,
+        top_p,
+        seed,
+        draw,
+    }
+}
+
+/// Device tokens and status words for each parameter set over rows `logits`.
+fn device_samples(
+    device: &Device,
+    kernels: &Kernels,
+    logits: &[f32],
+    cols: usize,
+    params: &[SampleParams],
+) -> Result<Vec<(u32, SampleStatus)>> {
+    let rows = params.len();
+    let out = read(&kernels.sample(&upload(device, logits, &[rows, cols])?, params)?)?;
+    Ok(out
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[token, word]| (token as u32, SampleStatus::from_word(word)))
+        .collect())
+}
+
+/// Exact truncated probabilities in F64: kept tokens and their renormalized weights.
+fn truncated(logits: &[f32], temperature: f32, top_k: u32, top_p: f32) -> Vec<f64> {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let weights: Vec<f64> = logits
+        .iter()
+        .map(|&l| f64::from((l - max) / temperature).exp())
+        .collect();
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    order.sort_by(|&a, &b| weights[b].total_cmp(&weights[a]));
+    let sum: f64 = weights.iter().sum();
+    let mut kept = vec![0.0; weights.len()];
+    let mut above = 0.0;
+    for (rank, &i) in order.iter().enumerate() {
+        if (top_k != 0 && rank >= top_k as usize) || above >= f64::from(top_p) * sum {
+            break;
+        }
+        kept[i] = weights[i];
+        above += weights[i];
+    }
+    let mass: f64 = kept.iter().sum();
+    kept.iter().map(|w| w / mass).collect()
+}
+
+#[test]
+fn test_device_and_host_sampling_match_truncated_vocabulary_distributions() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    let cols = 248_320;
+    // Peaked like a language model's row: a few dominant logits over a long random tail.
+    let mut row = values(cols, 41, 3.0);
+    let heads = [17, 90_001, 123_456, cols - 1];
+    for (&i, boost) in heads.iter().zip([9.0, 8.5, 8.0, 7.5]) {
+        row[i] += boost;
+    }
+    let batch = 16;
+    let logits = upload(
+        &device,
+        &(0..batch)
+            .flat_map(|_| row.iter().copied())
+            .collect::<Vec<_>>(),
+        &[batch, cols],
+    )?;
+    for (temperature, top_k, top_p) in [
+        (1.0, 0, 1.0),
+        (0.6, 20, 0.95),
+        (1.0, 20, 0.8),
+        (1.5, 50, 1.0),
+    ] {
+        let truth = truncated(&row, temperature, top_k, top_p);
+        // Buckets: each dominant token, then every other kept token.
+        let bucket = |token: usize| {
+            heads
+                .iter()
+                .position(|&h| h == token)
+                .unwrap_or(heads.len())
+        };
+        let mut expected = vec![0.0; heads.len() + 1];
+        for (token, &q) in truth.iter().enumerate() {
+            expected[bucket(token)] += q;
+        }
+        let draws = 2048u64;
+        let mut device_counts = vec![0u64; expected.len()];
+        let mut host_counts = vec![0u64; expected.len()];
+        for launch in 0..draws / batch as u64 {
+            let params: Vec<SampleParams> = (0..batch as u64)
+                .map(|r| sample_params(temperature, top_k, top_p, 99, launch * batch as u64 + r))
+                .collect();
+            let out = read(&kernels.sample(&logits, &params)?)?;
+            for (pair, p) in out.as_chunks::<2>().0.iter().zip(&params) {
+                assert_eq!(SampleStatus::from_word(pair[1]), SampleStatus::Sampled);
+                let token = pair[0] as usize;
+                assert!(truth[token] > 0.0, "device sampled truncated token {token}");
+                device_counts[bucket(token)] += 1;
+                let host = sampling::sample(&row, p)? as usize;
+                assert!(truth[host] > 0.0, "host sampled truncated token {host}");
+                host_counts[bucket(host)] += 1;
+            }
+        }
+        for (path, counts) in [("device", &device_counts), ("host", &host_counts)] {
+            let chi: f64 = expected
+                .iter()
+                .zip(counts)
+                .filter(|(q, _)| **q > 1e-9)
+                .map(|(q, &n)| {
+                    let e = q * draws as f64;
+                    (n as f64 - e).powi(2) / e
+                })
+                .sum();
+            // 99.9th percentile of chi-square with at most 4 degrees of freedom.
+            assert!(
+                chi < 18.5,
+                "{path} T={temperature} k={top_k} p={top_p}: χ²={chi:.1}, {counts:?} vs {expected:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_device_draws_match_exact_truncated_distributions() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    let cols = 10;
+    let logits: Vec<f32> = (0..cols)
+        .map(|i| (((i * 3) % 10) as f32).mul_add(0.35, -1.5))
+        .collect();
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    for &(temperature, top_k, top_p) in
+        &[(1.0, 0, 1.0), (0.8, 4, 1.0), (1.2, 0, 0.7), (1.0, 6, 0.85)]
+    {
+        let weights: Vec<f64> = logits
+            .iter()
+            .map(|&l| f64::from((l - max) / temperature).exp())
+            .collect();
+        let sum: f64 = weights.iter().sum();
+        let kept: Vec<bool> = (0..cols)
+            .map(|j| {
+                let above: Vec<f64> = weights
+                    .iter()
+                    .copied()
+                    .filter(|&w| w > weights[j])
+                    .collect();
+                (top_k == 0 || above.len() < top_k as usize)
+                    && above.iter().sum::<f64>() < f64::from(top_p) * sum
+            })
+            .collect();
+        let mass: f64 = (0..cols).filter(|&i| kept[i]).map(|i| weights[i]).sum();
+        let draws = 20_000;
+        let params: Vec<SampleParams> = (0..draws)
+            .map(|draw| sample_params(temperature, top_k, top_p, 5, draw))
+            .collect();
+        let flat: Vec<f32> = (0..draws).flat_map(|_| logits.iter().copied()).collect();
+        let mut counts = vec![0usize; cols];
+        for (token, status) in device_samples(&device, &kernels, &flat, cols, &params)? {
+            assert_eq!(status, SampleStatus::Sampled);
+            assert!(kept[token as usize], "truncated token {token}");
+            counts[token as usize] += 1;
+        }
+        let chi: f64 = (0..cols)
+            .filter(|&i| kept[i])
+            .map(|i| {
+                let e = weights[i] / mass * draws as f64;
+                (counts[i] as f64 - e).powi(2) / e
+            })
+            .sum();
+        // 99.9th percentile of chi-square with at most 9 degrees of freedom.
+        assert!(
+            chi < 27.9,
+            "T={temperature} k={top_k} p={top_p}: χ²={chi:.1}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_device_penalties_match_the_reference_and_invalid_rows_are_flagged() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    let cols = 1000;
+    let rows = [values(cols, 51, 2.0), values(cols, 52, 2.0)];
+    let params = [
+        PenaltyParams {
+            repetition: 1.3,
+            presence: 0.4,
+            frequency: 0.2,
+        },
+        PenaltyParams::NONE,
+    ];
+    let entries = [
+        (0, PenaltyEntry { token: 3, count: 0 }),
+        (
+            0,
+            PenaltyEntry {
+                token: 999,
+                count: 4,
+            },
+        ),
+        (1, PenaltyEntry { token: 3, count: 1 }),
+    ];
+    // Strided rows: the right half of a wider tensor, penalized in place.
+    let wide: Vec<f32> = rows
+        .iter()
+        .flat_map(|r| r.iter().chain(r))
+        .copied()
+        .collect();
+    let logits = upload(&device, &wide, &[2, 2 * cols])?.narrow(1, cols, cols)?;
+    kernels.penalize(&logits, &params, &entries)?;
+    let mut expected = rows;
+    for (row, entry) in &entries {
+        let r = *row as usize;
+        sampling::penalize(&mut expected[r], &params[r], &[*entry])?;
+    }
+    assert_eq!(read(&logits.contiguous()?)?, expected.concat());
+    let duplicate = [entries[0], entries[0]];
+    assert!(kernels.penalize(&logits, &params, &duplicate).is_err());
+    assert!(
+        kernels
+            .penalize(
+                &logits,
+                &params,
+                &[(2, PenaltyEntry { token: 0, count: 0 })]
+            )
+            .is_err()
+    );
+    let mut bad = values(cols, 53, 1.0);
+    bad[7] = f32::NAN;
+    let p = [sample_params(1.0, 0, 1.0, 1, 0)];
+    assert_eq!(
+        device_samples(&device, &kernels, &bad, cols, &p)?[0].1,
+        SampleStatus::Invalid
+    );
+    assert_eq!(
+        device_samples(&device, &kernels, &vec![f32::NEG_INFINITY; cols], cols, &p)?[0].1,
+        SampleStatus::Invalid
+    );
+    assert!(
+        kernels
+            .sample(
+                &upload(&device, &bad, &[1, cols])?,
+                &[sample_params(0.0, 0, 1.0, 1, 0)]
+            )
+            .is_err()
     );
     Ok(())
 }

@@ -43,6 +43,9 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub top_k: Option<usize>,
+    pub presence_penalty: Option<f64>,
+    pub frequency_penalty: Option<f64>,
+    pub repetition_penalty: Option<f64>,
     pub seed: Option<u64>,
     #[serde(default)]
     pub tools: Vec<OpenAITool>,
@@ -51,6 +54,8 @@ pub struct ChatCompletionRequest {
     pub thinking: Option<bool>,
     pub reasoning_effort: Option<String>,
     pub preserve_thinking: Option<bool>,
+    /// Prefix-reuse namespace: only requests with the same salt share cached prompts.
+    pub cache_salt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,6 +150,13 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    pub prompt_tokens_details: PromptTokensDetails,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromptTokensDetails {
+    /// Prompt tokens restored from a prefix snapshot instead of recomputed.
+    pub cached_tokens: u32,
 }
 
 // ── Streaming chunks ──────────────────────────────────────────────────────────

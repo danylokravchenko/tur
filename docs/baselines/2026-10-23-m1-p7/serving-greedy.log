@@ -1,0 +1,11 @@
+   Compiling tur-metal v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-metal)
+   Compiling tur-models v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-models)
+   Compiling tur-engine v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-engine)
+    Finished `bench` profile [optimized] target(s) in 1m 16s
+     Running benches/serving.rs (target/release/deps/serving-005db0a8eb62f20c)
+decode-heavy c=1: 47.3 out tok/s, TTFT p50 162 ms, ITL p50/p95 18.4/19.6 ms, pass p50 18.4 ms (schedule 0.01, encode 2.59, wait 15.8, publish 0.05, idle 0.06), cached 0
+decode-heavy c=2: 81.8 out tok/s, TTFT p50 290 ms, ITL p50/p95 19.6/20.3 ms, pass p50 19.6 ms (schedule 0.01, encode 2.83, wait 16.9, publish 0.06, idle 0.07), cached 0
+decode-heavy c=4: 121.9 out tok/s, TTFT p50 513 ms, ITL p50/p95 23.6/25.2 ms, pass p50 23.7 ms (schedule 0.01, encode 2.58, wait 21.0, publish 0.07, idle 0.08), cached 0
+decode-heavy c=8: 171.7 out tok/s, TTFT p50 977 ms, ITL p50/p95 29.2/30.6 ms, pass p50 29.2 ms (schedule 0.02, encode 4.45, wait 25.1, publish 0.15, idle 0.18), cached 0
+decode-heavy c=16: 188.5 out tok/s, TTFT p50 1841 ms, ITL p50/p95 49.9/51.4 ms, pass p50 49.9 ms (schedule 0.03, encode 4.93, wait 45.2, publish 0.27, idle 0.31), cached 0
+mixed c=16: 47.4 out tok/s, TTFT p50 9413 ms, ITL p50/p95 254.2/343.3 ms, pass p50 67.3 ms (schedule 0.02, encode 4.30, wait 50.2, publish 0.14, idle 0.17), cached 0

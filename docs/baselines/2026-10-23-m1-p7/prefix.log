@@ -1,0 +1,12 @@
+    Finished `bench` profile [optimized] target(s) in 0.51s
+     Running benches/serving.rs (target/release/deps/serving-005db0a8eb62f20c)
+shared system prompt, spacing 0: 20.9 out tok/s, TTFT p50 11001 ms, ITL p50/p95 32.2/34.3 ms, pass p50 32.5 ms (schedule 0.02, encode 4.14, wait 28.9, publish 0.13, idle 0.16), cached 0
+multi-turn, spacing 0: 0 of 13765 prompt tokens cached; last-turn TTFT p50 2897 ms
+shared system prompt, spacing 64: 143.3 out tok/s, TTFT p50 613 ms, ITL p50/p95 32.1/34.0 ms, pass p50 32.2 ms (schedule 0.02, encode 4.66, wait 27.8, publish 0.20, idle 0.23), cached 12288
+multi-turn, spacing 64: 7936 of 13765 prompt tokens cached; last-turn TTFT p50 1530 ms
+shared system prompt, spacing 128: 141.9 out tok/s, TTFT p50 613 ms, ITL p50/p95 31.4/33.2 ms, pass p50 31.4 ms (schedule 0.01, encode 3.04, wait 28.3, publish 0.12, idle 0.14), cached 12288
+multi-turn, spacing 128: 8192 of 13765 prompt tokens cached; last-turn TTFT p50 1280 ms
+shared system prompt, spacing 256: 145.9 out tok/s, TTFT p50 614 ms, ITL p50/p95 31.0/33.7 ms, pass p50 31.0 ms (schedule 0.01, encode 3.08, wait 28.0, publish 0.13, idle 0.15), cached 12288
+multi-turn, spacing 256: 7168 of 13765 prompt tokens cached; last-turn TTFT p50 1272 ms
+shared system prompt, spacing 512: 143.7 out tok/s, TTFT p50 613 ms, ITL p50/p95 31.7/38.5 ms, pass p50 31.7 ms (schedule 0.01, encode 3.15, wait 28.7, publish 0.12, idle 0.14), cached 12288
+multi-turn, spacing 512: 4096 of 13765 prompt tokens cached; last-turn TTFT p50 1272 ms

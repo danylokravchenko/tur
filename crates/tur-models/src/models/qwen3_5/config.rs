@@ -70,6 +70,7 @@ pub struct GenerationDefaults {
     pub temperature: Option<f64>,
     pub top_k: Option<usize>,
     pub top_p: Option<f64>,
+    pub repetition_penalty: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -84,6 +85,8 @@ struct RawGeneration {
     top_k: Option<usize>,
     #[serde(default)]
     top_p: Option<f64>,
+    #[serde(default)]
+    repetition_penalty: Option<f64>,
 }
 
 /// Architecture-specific settings. Construction validates the complete text layout.
@@ -339,12 +342,16 @@ impl Config {
                     .top_p
                     .is_some_and(|p| !p.is_finite() || p <= 0.0 || p > 1.0)
                 || raw.top_k == Some(0)
+                || raw
+                    .repetition_penalty
+                    .is_some_and(|r| !r.is_finite() || r <= 0.0)
             {
                 return Err(invalid("invalid generation sampling defaults"));
             }
             defaults.temperature = raw.temperature;
             defaults.top_k = raw.top_k;
             defaults.top_p = raw.top_p;
+            defaults.repetition_penalty = raw.repetition_penalty;
         }
         Ok(defaults)
     }

@@ -26,7 +26,7 @@ use crate::{
             ApiErrorBody, ApiErrorResponse, AssistantFunction, AssistantToolCall, ChatChoice,
             ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
             ChatResponseMessage, ChunkChoice, DeltaFunction, DeltaMessage, DeltaToolCall,
-            MessageContent, ResponseFunction, ResponseToolCall, Usage,
+            MessageContent, PromptTokensDetails, ResponseFunction, ResponseToolCall, Usage,
         },
         worker::WorkerMsg,
     },
@@ -55,6 +55,7 @@ fn execution_error(error: &crate::TurError) -> (StatusCode, ApiErrorResponse) {
             "server_error",
             "worker_unavailable",
         ),
+        TurError::SlowClient(_) => (StatusCode::REQUEST_TIMEOUT, "timeout_error", "slow_client"),
         TurError::InvalidExecution(_) => (
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -208,6 +209,13 @@ pub async fn chat_completions(
             .top_p
             .is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 1.0)
         || req.top_k == Some(0)
+        || [req.presence_penalty, req.frequency_penalty]
+            .iter()
+            .flatten()
+            .any(|v| !v.is_finite())
+        || req
+            .repetition_penalty
+            .is_some_and(|v| !v.is_finite() || v <= 0.0)
         || req
             .reasoning_effort
             .as_ref()
@@ -222,7 +230,12 @@ pub async fn chat_completions(
     let tools = to_internal_tools(&req.tools);
     let max_tokens = req.max_tokens.unwrap_or(1024);
 
-    let (token_tx, token_rx) = mpsc::unbounded_channel::<String>();
+    let (token_tx, token_rx) = if req.stream {
+        let (tx, rx) = worker.stream_channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let (result_tx, result_rx) = oneshot::channel();
 
     let worker_msg = WorkerMsg {
@@ -234,10 +247,14 @@ pub async fn chat_completions(
                 temperature: req.temperature,
                 top_p: req.top_p,
                 top_k: req.top_k,
+                repetition_penalty: req.repetition_penalty,
+                presence_penalty: req.presence_penalty,
+                frequency_penalty: req.frequency_penalty,
             },
             seed: req.seed.unwrap_or(299_792_458),
             timeout: None,
             submitted_at: None,
+            cache_salt: req.cache_salt,
             render: RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.thinking,
@@ -254,12 +271,9 @@ pub async fn chat_completions(
         return (status, Json(body)).into_response();
     }
 
-    if req.stream {
-        stream_response(model_id, token_rx, result_rx).into_response()
-    } else {
-        blocking_response(model_id, token_rx, result_rx)
-            .await
-            .into_response()
+    match token_rx {
+        Some(token_rx) => stream_response(model_id, token_rx, result_rx).into_response(),
+        None => blocking_response(model_id, result_rx).await.into_response(),
     }
 }
 
@@ -267,7 +281,6 @@ pub async fn chat_completions(
 
 async fn blocking_response(
     model_id: String,
-    mut token_rx: mpsc::UnboundedReceiver<String>,
     result_rx: oneshot::Receiver<crate::Result<GenerationStats>>,
 ) -> Response {
     let stats = match result_rx.await {
@@ -287,10 +300,6 @@ async fn blocking_response(
         }
     };
 
-    // Drain the token channel (it will be closed by this point) but rely on
-    // stats.generated_text for the actual response content — individual tokens
-    // decoded per-step may be incomplete for BPE tokenizers.
-    while token_rx.try_recv().is_ok() {}
     let full_text = stats.generated_text.clone();
 
     let (content, response_tool_calls) = if stats.tool_calls.is_empty() {
@@ -347,6 +356,9 @@ async fn blocking_response(
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: PromptTokensDetails {
+                cached_tokens: stats.cached_tokens as u32,
+            },
         },
     })
     .into_response()
@@ -356,7 +368,7 @@ async fn blocking_response(
 
 fn stream_response(
     model_id: String,
-    mut token_rx: mpsc::UnboundedReceiver<String>,
+    mut token_rx: mpsc::Receiver<String>,
     result_rx: oneshot::Receiver<crate::Result<GenerationStats>>,
 ) -> Response {
     let id = new_completion_id();
@@ -381,7 +393,21 @@ fn stream_response(
             Err(e) => { yield Err(e.to_string()); return; }
         }
 
+        let delta = |text: String| ChatCompletionChunk {
+            id: id.clone(),
+            object: "chat.completion.chunk",
+            created,
+            model: model_id.clone(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: DeltaMessage { role: None, content: Some(text), tool_calls: vec![] },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let mut streamed = String::new();
         while let Some(token) = token_rx.recv().await {
+            streamed.push_str(&token);
             let chunk = ChatCompletionChunk {
                 id: id.clone(),
                 object: "chat.completion.chunk",
@@ -412,6 +438,16 @@ fn stream_response(
             }
             Err(_) => { warn!("result channel dropped"); return; }
         };
+        // Text the worker could not hand over before completion without waiting on this
+        // client; streamed fragments always concatenate to a prefix of the final text.
+        if let Some(rest) = stats.generated_text.strip_prefix(streamed.as_str())
+            && !rest.is_empty()
+        {
+            match serde_json::to_string(&delta(rest.to_owned())) {
+                Ok(data) => yield Ok(Event::default().data(data)),
+                Err(e) => warn!("chunk serialisation error: {e}"),
+            }
+        }
 
         // Emit parsed tool-call deltas when the model produced any.
         for (idx, tc) in stats.tool_calls.iter().enumerate() {
@@ -464,6 +500,9 @@ fn stream_response(
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
+                prompt_tokens_details: PromptTokensDetails {
+                    cached_tokens: stats.cached_tokens as u32,
+                },
             }),
         };
         match serde_json::to_string(&final_chunk) {

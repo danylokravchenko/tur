@@ -9,7 +9,7 @@
 //! enqueues `reps` operations and then synchronizes.
 //!
 //! `cargo bench --offline -p tur-metal --bench kernels > out.json`
-//! `TUR_BENCH_ONLY=delta|linear|paged|tiled` restricts the run to one group.
+//! `TUR_BENCH_ONLY=delta|linear|paged|tiled|sample` restricts the run to one group.
 //! `TUR_BENCH_SHAPE=<substring>` selects tiled attention shapes for focused tuning.
 
 use candle_core::{D, DType, Device, Tensor, quantized::GgmlDType};
@@ -20,6 +20,7 @@ use tur_metal::{
     kernels::{DeltaShape, Heads, Kernels, PagedKv, RecurrentSpan, Tuning},
     packed::PackedLinear,
     pool::{AttentionPool, KvPool},
+    sampling::{self, PenaltyEntry, PenaltyParams, SampleParams},
 };
 
 const WARMUP: usize = 3;
@@ -611,6 +612,91 @@ fn norm_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     Ok(cases)
 }
 
+/// Sampling a Qwen3.5 vocabulary row: device penalties, argmax and rejection sampling
+/// against copying rows to the host and sampling there (the P6 path for sampled requests).
+fn sample_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+    let vocab = 248_320;
+    let mut cases = Vec::new();
+    for rows in [1, 4, 8, 16] {
+        // Peaked rows like a language model's: a few dominant logits over a random tail.
+        let mut data = values(rows * vocab, 61, 3.0);
+        for r in 0..rows {
+            for (i, boost) in [(17, 9.0), (90_001, 8.5), (123_456, 8.0)] {
+                data[r * vocab + i] += boost;
+            }
+        }
+        let logits = Tensor::from_vec(data, (rows, vocab), device)?;
+        let params: Vec<SampleParams> = (0..rows as u64)
+            .map(|draw| SampleParams {
+                temperature: 0.7,
+                top_k: 20,
+                top_p: 0.95,
+                seed: 3,
+                draw,
+            })
+            .collect();
+        let penalties = vec![
+            PenaltyParams {
+                repetition: 1.1,
+                presence: 0.5,
+                frequency: 0.1,
+            };
+            rows
+        ];
+        // A 1K-token history of distinct tokens per row.
+        let entries: Vec<(u32, PenaltyEntry)> = (0..rows as u32)
+            .flat_map(|r| {
+                (0..1024u32).map(move |t| {
+                    (
+                        r,
+                        PenaltyEntry {
+                            token: t * 97 % 248_320,
+                            count: 1 + t % 3,
+                        },
+                    )
+                })
+            })
+            .collect();
+        let sample = time(device, || kernels.sample(&logits, &params))?;
+        let argmax = time(device, || kernels.argmax(&logits))?;
+        let penalize = time(device, || {
+            kernels.penalize(&logits, &penalties, &entries)?;
+            Ok(logits.clone())
+        })?;
+        // Host path: one copy of every row, then the reference sampler per row.
+        let copy = time(device, || {
+            Ok(Tensor::new(
+                &logits.flatten_all()?.to_vec1::<f32>()?[..1],
+                &Device::Cpu,
+            )?)
+        })?;
+        let host = logits.flatten_all()?.to_vec1::<f32>()?;
+        let start = Instant::now();
+        let mut reps = 0;
+        while start.elapsed().as_secs_f64() < 0.5 {
+            for (row, p) in host.chunks_exact(vocab).zip(&params) {
+                sampling::sample(row, p)?;
+            }
+            reps += 1;
+        }
+        let host_sample = start.elapsed().as_secs_f64() / f64::from(reps);
+        cases.push(json!({
+            "rows": rows, "vocab": vocab, "temperature": 0.7, "top_k": 20, "top_p": 0.95,
+            "device_sample": sample, "device_argmax": argmax, "device_penalize_1k_tokens": penalize,
+            "host_copy": copy, "host_sample_seconds": host_sample,
+        }));
+        eprintln!(
+            "sample rows={rows}: device {:.3} ms, argmax {:.3} ms, penalize {:.3} ms; host copy {:.3} ms + sample {:.3} ms",
+            sample["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
+            argmax["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
+            penalize["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
+            copy["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
+            host_sample * 1e3,
+        );
+    }
+    Ok(cases)
+}
+
 /// `TUR_BENCH_ONLY=delta|linear|paged|tiled` restricts the run to one group (normalization runs
 /// with delta, the F32 attention baseline with paged).
 fn skip(group: &str) -> bool {
@@ -636,6 +722,7 @@ fn main() -> Result<()> {
             "paged_attention": if skip("paged") { json!([]) } else { json!(paged_cases(&device, &kernels)?) },
             "tiled_attention": if skip("tiled") { json!([]) } else { json!(tiled_cases(&device, &kernels)?) },
             "packed_linear": if skip("linear") { json!([]) } else { json!(gemv_cases(&device, &kernels)?) },
+            "sampling": if skip("sample") { json!([]) } else { json!(sample_cases(&device, &kernels)?) },
         },
     });
     let text = serde_json::to_string_pretty(&document)?;

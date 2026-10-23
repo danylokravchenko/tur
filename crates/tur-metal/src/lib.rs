@@ -4,5 +4,6 @@ pub mod completion;
 pub mod kernels;
 pub mod packed;
 pub mod pool;
+pub mod sampling;
 pub mod scratch;
 pub mod state;

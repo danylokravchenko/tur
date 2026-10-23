@@ -1,0 +1,47 @@
+{
+  "date": "2026-10-23",
+  "hardware": {
+    "chip": "Apple M1",
+    "gpu_cores": 8,
+    "unified_memory_gb": 16
+  },
+  "source_base_commit": "59321b67ad481e0aa7ccf6e17b746e94c12edcd5",
+  "source_state": "uncommitted P7 changes; hashes taken after the final lint-only cleanup that followed the measurements (Clippy rewrites, and tie detection by bit pattern instead of float equality, identical for the non-negative finite weights it compares)",
+  "source_sha256": {
+    "crates/tur-engine/benches/serving.rs": "82a5c766fda54d378ebe92df7a0bdddc0ae65ec606b09493a4ea2d026603f808",
+    "crates/tur-metal/benches/kernels.rs": "f82a566948f303d475db842cc023cf27c7aefbd0dc4da62f9655e68564d9eabb",
+    "crates/tur-metal/src/kernels/tur.metal": "c2c685c929415779625a49d7cb3b12d85d9c05bfde533c129c2a9277ffc72aaf",
+    "crates/tur-metal/src/sampling.rs": "6c5754e8d5d12694b8ddae62e49e5c4ec69a89a6e774ee36a4d18c0ee7037fff",
+    "crates/tur-metal/src/completion.rs": "df29f56af7d74ecfcccfe377d419eac97197280da14493e7970aeb8b185962ea",
+    "crates/tur-engine/src/hybrid.rs": "0fb17ab3ea074de6d229c895920e132ed52f4d56e43c70717dc981125f5152e0",
+    "crates/tur-engine/src/backend/pipeline.rs": "9edc35a0a60201dae74b1c84a9380cf9cc7637341dd11d256adf6d92b53ab2ea",
+    "crates/tur-engine/src/backend/prefix.rs": "901cf8000c245568f0ac4b44a24c4018bdcb2b2c728204f5894d2a029e11188e"
+  },
+  "checkpoint_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "weights": "q8_0",
+  "kv": "KvLayout { page_tokens: 16, format: F16, version: 1 }",
+  "recurrent_state": "F32",
+  "prefill_chunk": 256,
+  "output_tokens": 64,
+  "sampling": {
+    "greedy": "temperature 0",
+    "sampled": "temperature 0.7, top-k 20, top-p 0.95; seed = request index"
+  },
+  "artifacts": {
+    "sampling-kernels.json": "TUR_BENCH_ONLY=sample cargo bench --offline -p tur-metal --bench kernels",
+    "sampling-kernels-segmented.json": "rejected first kernel: contiguous per-thread segments (uncoalesced)",
+    "serving-greedy.json": "TUR_QWEN35_0_8B=<snapshot> cargo bench --offline -p tur-engine --bench serving",
+    "serving-greedy-readback-after-fence.json": "same harness before the host copy moved into the fence (intermediate P7 tree)",
+    "serving-sampled-device.json": "TUR_BENCH_SAMPLING=0.7,20,0.95",
+    "serving-sampled-host.json": "TUR_BENCH_SAMPLING=0.7,20,0.95 TUR_BENCH_DEVICE_SAMPLING=0",
+    "prefix.json": "TUR_BENCH_WORKLOADS=prefix TUR_BENCH_SAMPLING=0.7,20,0.95 TUR_BENCH_SPACING=0,64,128,256,512"
+  },
+  "latency_basis": "sampled tokens including EOS; TTFT from request submission; ITL between token publication times; pass phases from PassTiming ending at the completion event",
+  "runs_per_case": 1,
+  "validation": {
+    "workspace_tests_passed": 192,
+    "real_checkpoint_ignored_tests_rerun": 3,
+    "strict_clippy": "passed",
+    "workspace_check": "passed with and without default features"
+  }
+}

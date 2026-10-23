@@ -3,14 +3,14 @@ use clap::Parser;
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration};
 use tur::{
     ModelFactory, ModelSource, Result, TurError,
-    backend::{memory::DeviceBudget, pipeline::PipelineConfig},
+    backend::{memory::DeviceBudget, pipeline::PipelineConfig, prefix::PrefixConfig},
     core::execution::{KvFormat, KvLayout},
     models::qwen3_5::{
         DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, WeightFormat, parse_recurrent_state,
     },
     server::{
         AppState, run_server,
-        worker::{PipelineWorker, WorkerConfig},
+        worker::{PipelineWorker, StreamConfig, WorkerConfig},
     },
 };
 
@@ -78,6 +78,19 @@ struct Args {
     /// request's 8K-token context within the device's working set.
     #[arg(long)]
     state_memory_mb: Option<usize>,
+    /// Prefix snapshots retained beside running requests; each holds one recurrent
+    /// state. Default: one per --max-batch-size; 0 disables prefix reuse.
+    #[arg(long)]
+    prefix_snapshots: Option<usize>,
+    /// Tokens between prefix snapshots; a multiple of --kv-page-tokens.
+    #[arg(long, default_value_t = PrefixConfig::DEFAULT_SPACING)]
+    prefix_spacing: usize,
+    /// Streamed messages a client may leave unread before text is buffered.
+    #[arg(long, default_value_t = 64)]
+    stream_channel_capacity: usize,
+    /// Undelivered text, in KiB, beyond which a stalled streaming client is cancelled.
+    #[arg(long, default_value_t = 16)]
+    stream_buffer_kb: usize,
     /// CPU numerical reference for development checks.
     #[arg(long)]
     cpu_reference: bool,
@@ -108,6 +121,10 @@ async fn main() -> Result<()> {
         state_bytes: args.state_memory_mb.map(|mb| mb << 20),
         ..PipelineConfig::new(args.max_batch_size, args.prefill_chunk_size)
     };
+    pipeline.prefix = PrefixConfig {
+        spacing: args.prefix_spacing,
+        entries: args.prefix_snapshots.unwrap_or(args.max_batch_size),
+    };
     let scheduler = &mut pipeline.scheduler;
     scheduler.max_batch_tokens = args.max_batch_tokens.unwrap_or(scheduler.max_batch_tokens);
     scheduler.max_waiting = args.max_waiting;
@@ -130,6 +147,10 @@ async fn main() -> Result<()> {
         },
         pipeline,
         request_timeout: args.request_timeout_secs.map(Duration::from_secs),
+        stream: StreamConfig {
+            channel_capacity: args.stream_channel_capacity,
+            max_buffered_bytes: args.stream_buffer_kb << 10,
+        },
     })?;
     let default_model = args.served_model_name;
     let workers = HashMap::from([(default_model.clone(), worker)]);

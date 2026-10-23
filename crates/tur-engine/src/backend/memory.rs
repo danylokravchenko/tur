@@ -49,6 +49,8 @@ pub struct PlanInputs {
     pub in_flight: usize,
     /// Concurrent sequences, each needing a committed and an in-flight recurrent slot.
     pub sequences: usize,
+    /// Recurrent snapshots retained beyond live sequences, one slot each (prefix reuse).
+    pub retained: usize,
     /// Explicit state pool budget in bytes; otherwise sized for [`DEFAULT_CONTEXT_TOKENS`]
     /// per sequence within the device limit.
     pub state_bytes: Option<usize>,
@@ -93,12 +95,13 @@ impl MemoryPlan {
                 recurrent_slots: inputs
                     .sequences
                     .checked_mul(2)
+                    .and_then(|slots| slots.checked_add(inputs.retained))
                     .ok_or_else(|| invalid("recurrent slot count overflow"))?,
             }
             .bytes(description)?;
             available.map_or(wanted, |available| wanted.min(available))
         };
-        let config = PoolConfig::for_budget(description, bytes, inputs.sequences)?;
+        let config = PoolConfig::for_budget(description, bytes, inputs.sequences, inputs.retained)?;
         let plan = Self {
             weights: inputs.weights,
             state_pool: config.bytes(description)?,
@@ -245,6 +248,7 @@ mod tests {
             scratch_peak: 500,
             in_flight: 100,
             sequences: 2,
+            retained: 0,
             state_bytes,
             limit,
             reserved: 0,
@@ -262,6 +266,13 @@ mod tests {
         assert_eq!(config.recurrent_slots, 4);
         assert_eq!(plan.state_pool, config.pages * page + 5 * slot);
         assert_eq!(plan.resident(), 1600 + plan.state_pool);
+        // Retained snapshots add one recurrent slot each.
+        let retained = PlanInputs {
+            retained: 3,
+            ..inputs(None, None)
+        };
+        let (_, with_snapshots) = MemoryPlan::new(&model, retained)?;
+        assert_eq!(with_snapshots.recurrent_slots, 7);
         // A device limit shrinks the pool to what remains after weights, scratch,
         // in-flight buffers and a tenth for overhead.
         let limit = 1600 + 10 * page + 5 * slot;

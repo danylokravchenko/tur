@@ -21,7 +21,7 @@ use tur::{
     },
     server::{
         AppState, build_router,
-        worker::{PipelineWorker, WorkerConfig, WorkerMsg},
+        worker::{PipelineWorker, StreamConfig, WorkerConfig, WorkerMsg},
     },
 };
 
@@ -31,6 +31,7 @@ fn worker(fixture: &common::Checkpoint, batch: usize) -> Result<PipelineWorker> 
         pipeline: PipelineConfig::new(batch, 2),
         budget: DeviceBudget::new(None),
         request_timeout: None,
+        stream: StreamConfig::default(),
     })
 }
 
@@ -120,12 +121,12 @@ async fn test_real_stream_stops_at_tokenizer_eos_and_reports_usage() -> Result<(
 async fn test_worker_reclaims_cancelled_request_before_admitting_next() -> Result<()> {
     let fixture = common::Checkpoint::new()?;
     let worker = worker(&fixture, 1)?;
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = worker.stream_channel();
     let (done_tx, done_rx) = oneshot::channel();
     worker
         .send(WorkerMsg {
             request: GenerationRequest::new("t10".into(), 400),
-            token_tx: tx,
+            token_tx: Some(tx),
             result_tx: done_tx,
         })
         .await?;
@@ -135,12 +136,61 @@ async fn test_worker_reclaims_cancelled_request_before_admitting_next() -> Resul
     assert!(token.is_some());
     drop(rx);
     drop(done_rx);
-    let (tx, _rx) = mpsc::unbounded_channel();
     let (done_tx, done_rx) = oneshot::channel();
     worker
         .send(WorkerMsg {
             request: GenerationRequest::new("t20".into(), 2),
-            token_tx: tx,
+            token_tx: None,
+            result_tx: done_tx,
+        })
+        .await?;
+    let stats = tokio::time::timeout(Duration::from_secs(10), done_rx)
+        .await
+        .map_err(|error| TurError::Other(error.to_string()))?
+        .map_err(|error| TurError::Other(error.to_string()))??;
+    assert_eq!(stats.generated_text, "t5 t5");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_stalled_stream_is_cancelled_with_bounded_buffering() -> Result<()> {
+    let fixture = common::Checkpoint::new()?;
+    let worker = PipelineWorker::spawn(WorkerConfig {
+        factory: fixture.factory(),
+        pipeline: PipelineConfig::new(1, 2),
+        budget: DeviceBudget::new(None),
+        request_timeout: None,
+        stream: StreamConfig {
+            channel_capacity: 2,
+            max_buffered_bytes: 32,
+        },
+    })?;
+    // The client never reads: two messages fill its channel, then "t5 " fragments
+    // accumulate until the bound cancels the request.
+    let (tx, rx) = worker.stream_channel();
+    let (done_tx, done_rx) = oneshot::channel();
+    worker
+        .send(WorkerMsg {
+            request: GenerationRequest::new("t10".into(), 400),
+            token_tx: Some(tx),
+            result_tx: done_tx,
+        })
+        .await?;
+    let outcome = tokio::time::timeout(Duration::from_secs(10), done_rx)
+        .await
+        .map_err(|error| TurError::Other(error.to_string()))?
+        .map_err(|error| TurError::Other(error.to_string()))?;
+    assert!(
+        matches!(outcome, Err(TurError::SlowClient(_))),
+        "{outcome:?}"
+    );
+    assert_eq!(rx.len(), 2);
+    // The cancelled request's state was released: the single running slot serves the next.
+    let (done_tx, done_rx) = oneshot::channel();
+    worker
+        .send(WorkerMsg {
+            request: GenerationRequest::new("t20".into(), 2),
+            token_tx: None,
             result_tx: done_tx,
         })
         .await?;
@@ -181,6 +231,7 @@ async fn test_http_preserves_sampling_thinking_and_tool_history() -> Result<()> 
             .result_tx
             .send(Ok(tur::backend::pipeline::GenerationStats {
                 generated_tokens: 0,
+                cached_tokens: 0,
                 prompt_tokens: 0,
                 elapsed: Duration::ZERO,
                 first_token: Duration::ZERO,

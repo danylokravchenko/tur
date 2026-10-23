@@ -10,6 +10,7 @@ mod runtime;
 use crate::{
     packed::PackedLinear,
     pool::{AttentionPool, KvPool},
+    sampling::{MAX_ROUNDS, PenaltyEntry, PenaltyParams, SampleParams},
 };
 use candle_core::{DType, Device, Tensor, quantized::GgmlDType};
 pub use runtime::{Capabilities, LAYOUT_VERSION, Output, Tuning};
@@ -145,6 +146,20 @@ struct ArgmaxParams {
     rows: u32,
     cols: u32,
     stride: u32,
+}
+
+#[repr(C)]
+struct PenaltyArgs {
+    entries: u32,
+    stride: u32,
+}
+
+#[repr(C)]
+struct SampleArgs {
+    rows: u32,
+    cols: u32,
+    stride: u32,
+    rounds: u32,
 }
 
 #[repr(C)]
@@ -410,12 +425,110 @@ impl Kernels {
         };
         let pipeline = self.pipeline("argmax_f32")?;
         let out = self.output(xv.rows, 2)?;
-        let threads = pipeline.threads(self.tuning.row_threads);
+        // One threadgroup per row; the widest group shortens each row's pass.
+        let threads = pipeline.threads(self.capabilities().max_threads_per_threadgroup);
         self.runtime
             .dispatch(pipeline, "tur_argmax", xv.rows, threads, |e| {
                 xv.bind(e, 0)?;
                 out.bind(e, 1);
                 e.set_bytes(2, &params);
+                Ok(())
+            })?;
+        self.finish(out, (xv.rows, 2))
+    }
+
+    /// Penalize rows of `logits` (`[rows, vocab]`) in place: `params[r]` applies to the
+    /// `(row, entry)` pairs of row `r`, which must name distinct tokens. Same arithmetic as
+    /// [`crate::sampling::penalize`].
+    pub fn penalize(
+        &self,
+        logits: &Tensor,
+        params: &[PenaltyParams],
+        entries: &[(u32, PenaltyEntry)],
+    ) -> Result<()> {
+        let xv = self.view(logits)?;
+        if params.len() != xv.rows {
+            return Err(invalid("one penalty parameter set per logit row"));
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+        params.iter().try_for_each(PenaltyParams::validate)?;
+        let mut keys: Vec<(u32, u32)> = entries.iter().map(|(r, e)| (*r, e.token)).collect();
+        keys.sort_unstable();
+        if keys.windows(2).any(|pair| pair[0] == pair[1])
+            || keys
+                .iter()
+                .any(|&(row, token)| row as usize >= xv.rows || token as usize >= xv.cols)
+        {
+            return Err(invalid(
+                "penalty entries must be distinct tokens inside their rows",
+            ));
+        }
+        let words: Vec<u32> = entries
+            .iter()
+            .flat_map(|(row, e)| [*row, e.token, e.count])
+            .collect();
+        let factors: Vec<f32> = params
+            .iter()
+            .flat_map(|p| [p.repetition, p.presence, p.frequency])
+            .collect();
+        let words = self.runtime.indices(&words)?;
+        let factors = Tensor::from_slice(&factors, factors.len(), self.device())?;
+        let wv = self.runtime.view(&words, DType::U32)?;
+        let fv = self.view(&factors)?;
+        let args = PenaltyArgs {
+            entries: to_u32(entries.len(), "penalty entries")?,
+            stride: to_u32(xv.row_stride, "row stride")?,
+        };
+        let pipeline = self.pipeline("penalize_f32")?;
+        let threads = pipeline.threads(self.tuning.elementwise_threads);
+        self.runtime.dispatch(
+            pipeline,
+            "tur_penalize",
+            entries.len().div_ceil(threads),
+            threads,
+            |e| {
+                xv.bind_mut(e, 0)?;
+                wv.bind(e, 1)?;
+                fv.bind(e, 2)?;
+                e.set_bytes(3, &args);
+                Ok(())
+            },
+        )
+    }
+
+    /// Sample one token per row of `logits` (`[rows, vocab]`, penalties applied) with
+    /// [`crate::sampling`]'s algorithm. Returns F32 `[rows, 2]` of (token, status word; see
+    /// [`crate::sampling::SampleStatus::from_word`]).
+    pub fn sample(&self, logits: &Tensor, params: &[SampleParams]) -> Result<Tensor> {
+        let xv = self.view(logits)?;
+        // Token ids travel as F32, exact below 2^24.
+        if xv.rows == 0 || xv.cols == 0 || xv.cols > 1 << 24 || params.len() != xv.rows {
+            return Err(invalid(
+                "sampling needs 1..=2^24 columns and one parameter set per row",
+            ));
+        }
+        params.iter().try_for_each(SampleParams::validate)?;
+        let words: Vec<u32> = params.iter().flat_map(SampleParams::words).collect();
+        let words = self.runtime.indices(&words)?;
+        let pv = self.runtime.view(&words, DType::U32)?;
+        let args = SampleArgs {
+            rows: to_u32(xv.rows, "rows")?,
+            cols: to_u32(xv.cols, "columns")?,
+            stride: to_u32(xv.row_stride, "row stride")?,
+            rounds: MAX_ROUNDS,
+        };
+        let pipeline = self.pipeline("sample_f32")?;
+        let out = self.output(xv.rows, 2)?;
+        // One threadgroup per row: the widest group shortens each row's passes.
+        let threads = pipeline.threads(self.capabilities().max_threads_per_threadgroup);
+        self.runtime
+            .dispatch(pipeline, "tur_sample", xv.rows, threads, |e| {
+                xv.bind(e, 0)?;
+                pv.bind(e, 1)?;
+                out.bind(e, 2);
+                e.set_bytes(3, &args);
                 Ok(())
             })?;
         self.finish(out, (xv.rows, 2))

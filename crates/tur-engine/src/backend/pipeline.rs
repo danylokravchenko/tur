@@ -20,12 +20,13 @@ use uuid::Uuid;
 
 use super::{
     memory::{BudgetLease, DeviceBudget, MemoryPlan, PlanInputs},
+    prefix::{PrefixCache, PrefixConfig, PrefixKeys, PrefixStats},
     scheduler::{Candidate, Chunk, Decision, Scheduler, SchedulerConfig},
     tokenizer::TokenOutputStream,
 };
 use crate::{
     Result, TurError,
-    hybrid::{Demand, HybridEngine, PoolUsage, SamplingOptions, SequenceCommit},
+    hybrid::{Demand, HybridEngine, PoolUsage, SamplingOptions, SamplingStats, SequenceCommit},
 };
 
 /// One text conversation. Unset sampling and thinking controls use checkpoint defaults.
@@ -41,6 +42,8 @@ pub struct GenerationRequest {
     /// Original submission time. The worker sets this before enqueueing so deadlines
     /// include intake waiting; direct callers may leave it unset.
     pub submitted_at: Option<Instant>,
+    /// Prefix-reuse namespace: only requests with the same salt share snapshots.
+    pub cache_salt: Option<String>,
 }
 
 impl GenerationRequest {
@@ -58,6 +61,7 @@ impl GenerationRequest {
             seed: 299_792_458,
             timeout: None,
             submitted_at: None,
+            cache_salt: None,
         }
     }
 }
@@ -67,6 +71,8 @@ impl GenerationRequest {
 pub struct GenerationStats {
     pub generated_tokens: usize,
     pub prompt_tokens: usize,
+    /// Prompt tokens restored from a prefix snapshot when first admitted.
+    pub cached_tokens: usize,
     /// From submission to completion.
     pub elapsed: Duration,
     /// From submission to the first sampled token.
@@ -87,6 +93,40 @@ pub struct BatchStepOutput {
     /// decoding, which can buffer several tokens into one fragment.
     pub sampled_tokens: Vec<(Uuid, u32, Instant)>,
     pub completed: Vec<(Uuid, Result<GenerationStats>)>,
+    /// Host and device time of the pass, if one ran.
+    pub timing: Option<PassTiming>,
+}
+
+/// Where one pass's time went. Host phases are disjoint; `device` overlaps `encode`,
+/// `overlap` and `wait`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PassTiming {
+    pub tokens: usize,
+    pub sequences: usize,
+    /// Expiry, prefix restore, scheduling and packing.
+    pub schedule: Duration,
+    /// Validation, reservation and encoding.
+    pub encode: Duration,
+    /// From submission to `finish_step`: host work beside the running device.
+    pub overlap: Duration,
+    /// Blocked until the device completed.
+    pub wait: Duration,
+    /// After completion: logit copies, host sampling, publication and text decoding.
+    pub publish: Duration,
+    /// From the start of encoding to device completion.
+    pub device: Duration,
+    /// From the previous pass's completion to this pass's encoding: the device had no
+    /// work queued. A lower bound on its idle time; work starts as buffers commit.
+    pub idle_before: Option<Duration>,
+}
+
+/// A submitted pass awaiting `finish_step`.
+struct InFlight {
+    chunks: Vec<Chunk>,
+    context: usize,
+    started: Instant,
+    submitted: Instant,
+    timing: PassTiming,
 }
 
 struct Pending {
@@ -98,6 +138,12 @@ struct Pending {
     /// Original committed pass ends. Replay never splits or combines these chunks:
     /// doing so changes the rounding points of narrow recurrent state.
     boundaries: Vec<usize>,
+    /// Tokens first restored from a prefix snapshot; no pass boundaries exist below.
+    replay_floor: usize,
+    cached_tokens: usize,
+    keys: PrefixKeys,
+    /// Snapshots inserted when a lookup last missed; until more arrive it would miss again.
+    prefix_checked: Option<u64>,
     /// Holds model state. Preemption clears it and `consumed`, so the request recomputes.
     running: bool,
     stream: TokenOutputStream,
@@ -115,13 +161,20 @@ impl Pending {
         self.tokens.len() - self.prompt_tokens
     }
 
-    fn candidate(&self, id: Uuid) -> Candidate {
+    /// Scheduling view. Prefill chunks end at or before `boundary` (the next snapshot
+    /// position), so recurrent state exists at every aligned position.
+    fn candidate(&self, id: Uuid, boundary: Option<usize>) -> Candidate {
         let unconsumed = self.tokens.len() - self.consumed;
         let next = self.boundaries.partition_point(|&end| end <= self.consumed);
-        let replay = self.boundaries.get(next).map(|end| end - self.consumed);
+        let replay = self
+            .boundaries
+            .get(next)
+            .filter(|_| self.consumed >= self.replay_floor)
+            .map(|end| end - self.consumed);
+        let aligned = boundary.map_or(unconsumed, |end| unconsumed.min(end - self.consumed));
         Candidate {
             id,
-            pending: replay.unwrap_or(unconsumed),
+            pending: replay.unwrap_or(aligned),
             minimum: replay.unwrap_or(1),
             decoding: self.running && unconsumed == 1 && self.generated() > 0,
             running: self.running,
@@ -136,6 +189,11 @@ impl Pending {
 #[derive(Clone, Copy, Debug)]
 pub struct PipelineConfig {
     pub scheduler: SchedulerConfig,
+    /// Prefix snapshots: spacing and how many are retained beside running requests.
+    pub prefix: PrefixConfig,
+    /// Penalize and sample unconstrained rows on the device (when the model runs on Metal
+    /// kernels); otherwise every full row is copied to the host sampler.
+    pub device_sampling: bool,
     /// Bytes for K/V pages and recurrent state. `None` sizes the pool for
     /// `max_running` contexts of [`super::memory::DEFAULT_CONTEXT_TOKENS`] tokens, within
     /// what the device budget leaves.
@@ -144,11 +202,28 @@ pub struct PipelineConfig {
 
 impl PipelineConfig {
     /// Default scheduling for `max_batch_size` running sequences and `prefill_chunk_size`
-    /// prefill chunks, with a derived state budget.
+    /// prefill chunks, one retained prefix snapshot per running sequence, and a derived
+    /// state budget.
     pub fn new(max_batch_size: usize, prefill_chunk_size: usize) -> Self {
         Self {
             scheduler: SchedulerConfig::new(max_batch_size, prefill_chunk_size),
+            prefix: PrefixConfig {
+                spacing: PrefixConfig::DEFAULT_SPACING,
+                entries: max_batch_size,
+            },
+            device_sampling: true,
             state_bytes: None,
+        }
+    }
+
+    /// Reproducibility mode: one request at a time in fixed `prefill_chunk_size` chunks,
+    /// without prefix reuse, so a request's computation (and with its seed, its tokens)
+    /// does not depend on other traffic. Batched passes can change logits in their last
+    /// bits through batch-dependent kernels; this mode trades throughput to rule that out.
+    pub fn reproducible(prefill_chunk_size: usize) -> Self {
+        Self {
+            prefix: PrefixConfig::DISABLED,
+            ..Self::new(1, prefill_chunk_size)
         }
     }
 }
@@ -169,6 +244,10 @@ pub struct InferencePipeline {
     plan: MemoryPlan,
     _lease: BudgetLease,
     pending: HashMap<Uuid, Pending>,
+    prefix: PrefixCache,
+    in_flight: Option<InFlight>,
+    /// Outcomes produced before or without a pass, returned by the next `finish_step`.
+    staged: BatchStepOutput,
 }
 
 fn sampling(overrides: SamplingOptions, defaults: &GenerationDefaults) -> SamplingOptions {
@@ -176,6 +255,8 @@ fn sampling(overrides: SamplingOptions, defaults: &GenerationDefaults) -> Sampli
         temperature: overrides.temperature.or(defaults.temperature),
         top_k: overrides.top_k.or(defaults.top_k),
         top_p: overrides.top_p.or(defaults.top_p),
+        repetition_penalty: overrides.repetition_penalty.or(defaults.repetition_penalty),
+        ..overrides
     }
 }
 
@@ -220,6 +301,7 @@ impl InferencePipeline {
                         scratch_peak,
                         in_flight,
                         sequences: limits.max_running,
+                        retained: config.prefix.entries,
                         state_bytes: config.state_bytes,
                         limit: budget.limit(),
                         reserved: budget.leased(),
@@ -234,7 +316,11 @@ impl InferencePipeline {
                 "loaded weights disagree with the pre-load memory plan",
             ));
         }
-        let engine = HybridEngine::new(Arc::new(model), factory.device.clone(), pool)?;
+        let mut engine = HybridEngine::new(Arc::new(model), factory.device.clone(), pool)?;
+        engine.set_device_sampling(config.device_sampling);
+        config
+            .prefix
+            .validate(engine.pool().description().kv.page_tokens)?;
         Ok(Self {
             engine,
             tokenizer,
@@ -245,6 +331,9 @@ impl InferencePipeline {
             plan,
             _lease: lease,
             pending: HashMap::new(),
+            prefix: PrefixCache::new(config.prefix),
+            in_flight: None,
+            staged: BatchStepOutput::default(),
         })
     }
 
@@ -263,8 +352,24 @@ impl InferencePipeline {
         &self.plan
     }
 
+    /// Where output rows have been sampled: on the device or the host.
+    pub fn sampling_stats(&self) -> SamplingStats {
+        self.engine.sampling_stats()
+    }
+
     pub fn scheduler(&self) -> &Scheduler {
         &self.scheduler
+    }
+
+    /// Prefix reuse counters.
+    pub fn prefix_stats(&self) -> PrefixStats {
+        self.prefix.stats()
+    }
+
+    /// Drop every prefix snapshot; their pages and slots return once no request shares
+    /// them.
+    pub fn clear_prefix_cache(&mut self) {
+        self.prefix.clear();
     }
 
     /// Current state pool occupancy, after reclaiming released pages and slots.
@@ -339,6 +444,8 @@ impl InferencePipeline {
             sampling(request.sampling, &self.defaults),
             None,
         )?;
+        self.engine.add_context(handle, &tokens)?;
+        let keys = self.prefix.keys(request.cache_salt.as_deref(), &tokens);
         self.pending.insert(
             handle.request,
             Pending {
@@ -347,6 +454,10 @@ impl InferencePipeline {
                 tokens,
                 consumed: 0,
                 boundaries: Vec::new(),
+                replay_floor: 0,
+                cached_tokens: 0,
+                keys,
+                prefix_checked: None,
                 running: false,
                 stream: TokenOutputStream::new(self.tokenizer.clone()),
                 max_tokens: request.max_tokens,
@@ -424,6 +535,12 @@ impl InferencePipeline {
         {
             pending.boundaries.push(pending.consumed);
         }
+        if self.prefix.is_boundary(pending.consumed) {
+            let prefix = &pending.tokens[..pending.consumed];
+            self.prefix.extend(&mut pending.keys, prefix);
+            let state = self.engine.model_state(pending.handle)?;
+            self.prefix.insert(&pending.keys, prefix, &state)?;
+        }
         let mut finished = commit.finished;
         let mut reason = "stop";
         for token in commit.outputs {
@@ -464,6 +581,7 @@ impl InferencePipeline {
         let stats = GenerationStats {
             generated_tokens: pending.generated(),
             prompt_tokens: pending.prompt_tokens,
+            cached_tokens: pending.cached_tokens,
             elapsed,
             first_token: pending.first_token.unwrap_or(elapsed),
             preemptions: pending.preemptions,
@@ -491,15 +609,99 @@ impl InferencePipeline {
         Ok(())
     }
 
-    /// Ask the scheduler for a pass, preempting or failing requests until one fits.
+    /// Restore the deepest verified snapshot for the oldest waiting requests that have no
+    /// state, while running slots remain. They then run their remaining prompt.
+    fn restore_prefixes(&mut self) -> Result<()> {
+        if !self.prefix.config().enabled() {
+            return Ok(());
+        }
+        let running = self.pending.values().filter(|p| p.running).count();
+        let mut waiting: Vec<(Instant, Uuid)> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| !p.running && p.consumed == 0)
+            .map(|(id, p)| (p.arrival, *id))
+            .collect();
+        waiting.sort_unstable();
+        let free = self.scheduler.config().max_running.saturating_sub(running);
+        let inserted = self.prefix.stats().inserted;
+        for (_, id) in waiting.into_iter().take(free) {
+            let pending = self
+                .pending
+                .get_mut(&id)
+                .ok_or_else(|| invalid("missing pipeline request"))?;
+            if pending.prefix_checked == Some(inserted) {
+                continue;
+            }
+            let limit = pending.tokens.len() - 1;
+            let Some((length, state)) = self.prefix.lookup(&pending.keys, &pending.tokens, limit)
+            else {
+                pending.prefix_checked = Some(inserted);
+                continue;
+            };
+            pending.handle = self.engine.adopt(pending.handle, &state)?;
+            pending.consumed = length;
+            pending.running = true;
+            if pending.boundaries.is_empty() {
+                pending.replay_floor = length;
+                pending.cached_tokens = length;
+            }
+            tracing::debug!(request = %id, tokens = length, "restored prefix snapshot");
+        }
+        Ok(())
+    }
+
+    /// Evict snapshots while they keep the oldest admissible waiting request's next chunk
+    /// (with one page of headroom per running sequence) from fitting.
+    fn relieve_admission(&mut self, candidates: &[Candidate]) -> Result<()> {
+        let running = candidates.iter().filter(|c| c.running).count();
+        let Some(oldest) = candidates
+            .iter()
+            .filter(|c| !c.running && running < self.scheduler.config().max_running)
+            .min_by_key(|c| (c.arrival, c.id))
+        else {
+            return Ok(());
+        };
+        let handle = self
+            .pending
+            .get(&oldest.id)
+            .ok_or_else(|| invalid("missing pipeline request"))?
+            .handle;
+        let tokens = oldest.pending.min(self.scheduler.config().max_chunk);
+        let headroom = Demand {
+            pages: running,
+            slots: 0,
+        };
+        let mut usage = self.engine.memory()?;
+        while self.prefix.stats().entries > 0 {
+            let demand = self.engine.demand(handle, tokens, false)? + headroom;
+            if demand.fits(&usage) {
+                break;
+            }
+            self.prefix.evict();
+            let after = self.engine.memory()?;
+            // Snapshots sharing pages with running requests free only their slot; stop
+            // once evicting no longer helps a page shortage.
+            if demand.slots <= after.slots.free() && after.pages.free() == usage.pages.free() {
+                break;
+            }
+            usage = after;
+        }
+        Ok(())
+    }
+
+    /// Ask the scheduler for a pass, evicting prefix snapshots before preempting or
+    /// failing requests, until one fits.
     fn select(&mut self, output: &mut BatchStepOutput) -> Result<Vec<Chunk>> {
+        self.restore_prefixes()?;
         loop {
-            let usage = self.engine.memory()?;
             let candidates: Vec<Candidate> = self
                 .pending
                 .iter()
-                .map(|(id, p)| p.candidate(*id))
+                .map(|(id, p)| p.candidate(*id, self.prefix.next_boundary(p.consumed)))
                 .collect();
+            self.relieve_admission(&candidates)?;
+            let usage = self.engine.memory()?;
             let running = candidates.iter().filter(|c| c.running).count();
             let (engine, pending) = (&self.engine, &self.pending);
             let mut demand = Demand::default();
@@ -522,6 +724,7 @@ impl InferencePipeline {
             })?;
             match decision {
                 Decision::Run(chunks) => return Ok(chunks),
+                Decision::Preempt(_) | Decision::Stall(_) if self.prefix.evict() => {}
                 Decision::Preempt(id) => self.preempt(id)?,
                 Decision::Stall(id) => self.fail(
                     id,
@@ -579,23 +782,77 @@ impl InferencePipeline {
         Ok((plan, context))
     }
 
-    /// Run one scheduled packed pass: expire deadlines, select decodes and prefill chunks
-    /// (preempting under memory pressure), fence, then publish. A request's model or
-    /// decode error is returned only to that request.
-    pub fn step_streaming(&mut self) -> Result<BatchStepOutput> {
-        let mut output = BatchStepOutput::default();
-        self.expire(Instant::now(), &mut output)?;
-        let chunks = self.select(&mut output)?;
+    /// Expire deadlines, select decodes and prefill chunks (preempting under memory
+    /// pressure) and submit them as one packed pass without waiting for it. Returns whether
+    /// a pass is in flight. Until [`Self::finish_step`], callers may submit and cancel
+    /// requests while the device runs; the next pass cannot be selected before this one's
+    /// tokens are known, so at most one is in flight.
+    pub fn begin_step(&mut self) -> Result<bool> {
+        if self.in_flight.is_some() {
+            return Err(invalid("a pass is already in flight"));
+        }
+        let begin = Instant::now();
+        let mut output = std::mem::take(&mut self.staged);
+        let selected = self
+            .expire(begin, &mut output)
+            .and_then(|()| self.select(&mut output));
+        let chunks = match selected {
+            Ok(chunks) => chunks,
+            Err(error) => {
+                self.staged = output;
+                return Err(error);
+            }
+        };
+        self.staged = output;
         if chunks.is_empty() {
-            return Ok(output);
+            return Ok(false);
         }
         let (plan, context) = self.pack(&chunks)?;
-        let tokens = plan.tokens.len();
+        let (tokens, sequences) = (plan.tokens.len(), plan.sequences.len());
         let started = Instant::now();
         self.engine.submit(plan)?;
+        let submitted = Instant::now();
+        self.in_flight = Some(InFlight {
+            chunks,
+            context,
+            started,
+            submitted,
+            timing: PassTiming {
+                tokens,
+                sequences,
+                schedule: started.saturating_duration_since(begin),
+                encode: submitted.saturating_duration_since(started),
+                idle_before: self
+                    .engine
+                    .completed_at()
+                    .map(|at| started.saturating_duration_since(at)),
+                ..PassTiming::default()
+            },
+        });
+        Ok(true)
+    }
+
+    /// Wait for the pass from [`Self::begin_step`], if any, then publish each request's
+    /// outputs. A request's model or decode error is returned only to that request;
+    /// requests cancelled while the pass ran publish nothing.
+    pub fn finish_step(&mut self) -> Result<BatchStepOutput> {
+        let mut output = std::mem::take(&mut self.staged);
+        let Some(flight) = self.in_flight.take() else {
+            return Ok(output);
+        };
+        let waiting = Instant::now();
         let results = self.engine.finish()?;
-        self.scheduler.record(tokens, context, started.elapsed());
-        for chunk in &chunks {
+        let mut timing = flight.timing;
+        timing.overlap = waiting.saturating_duration_since(flight.submitted);
+        let completed = self.engine.completed_at().unwrap_or_else(Instant::now);
+        timing.wait = completed.saturating_duration_since(waiting);
+        timing.device = completed.saturating_duration_since(flight.started);
+        // Host work after completion, from the engine's sampling on.
+        let published = completed.max(waiting);
+        // Pass costs exclude host work that overlapped the device.
+        self.scheduler
+            .record(timing.tokens, flight.context, timing.device);
+        for chunk in &flight.chunks {
             if let Some(pending) = self.pending.get_mut(&chunk.id) {
                 pending.running = true;
                 pending.last_run = chunk.ticket;
@@ -603,6 +860,9 @@ impl InferencePipeline {
         }
         for result in results {
             let id = result.request;
+            if !self.pending.contains_key(&id) {
+                continue;
+            }
             let outcome = result
                 .outcome
                 .and_then(|commit| self.publish(id, commit, &mut output));
@@ -611,7 +871,16 @@ impl InferencePipeline {
             }
         }
         self.expire(Instant::now(), &mut output)?;
+        timing.publish = published.elapsed();
+        output.timing = Some(timing);
         Ok(output)
+    }
+
+    /// Run one scheduled packed pass to completion: [`Self::begin_step`] then
+    /// [`Self::finish_step`].
+    pub fn step_streaming(&mut self) -> Result<BatchStepOutput> {
+        self.begin_step()?;
+        self.finish_step()
     }
 
     /// Run one request to completion and stream decoded text to a caller-owned callback.
@@ -654,6 +923,7 @@ mod tests {
             temperature: Some(0.7),
             top_k: Some(20),
             top_p: Some(0.8),
+            repetition_penalty: Some(1.1),
             eos_tokens: vec![1],
         };
         let inherited = sampling(SamplingOptions::default(), &defaults);
@@ -665,11 +935,15 @@ mod tests {
                 temperature: Some(0.0),
                 top_k: Some(1),
                 top_p: Some(1.0),
+                presence_penalty: Some(0.5),
+                ..Default::default()
             },
             &defaults,
         );
         assert_eq!(explicit.temperature, Some(0.0));
         assert_eq!(explicit.top_k, Some(1));
         assert_eq!(explicit.top_p, Some(1.0));
+        assert_eq!(explicit.repetition_penalty, Some(1.1));
+        assert_eq!(explicit.presence_penalty, Some(0.5));
     }
 }

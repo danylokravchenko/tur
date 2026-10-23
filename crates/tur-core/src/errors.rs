@@ -33,4 +33,8 @@ pub enum TurError {
     /// The execution owner is no longer accepting requests.
     #[error("Inference worker unavailable")]
     WorkerUnavailable,
+    /// A streaming client left more undelivered output than its bound; the request was
+    /// cancelled rather than buffering without limit.
+    #[error("Stream client too slow: {0}")]
+    SlowClient(String),
 }

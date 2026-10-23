@@ -12,7 +12,10 @@ use common::Checkpoint;
 use std::{collections::HashMap, time::Duration};
 use tur::{
     InferencePipeline, Result, TurError,
-    backend::pipeline::{GenerationRequest, GenerationStats, PipelineConfig},
+    backend::{
+        pipeline::{GenerationRequest, GenerationStats, PipelineConfig},
+        prefix::PrefixConfig,
+    },
 };
 use uuid::Uuid;
 
@@ -153,6 +156,7 @@ fn budgeted(
         &fixture.factory(),
         PipelineConfig {
             state_bytes: Some(budget),
+            prefix: PrefixConfig::DISABLED,
             ..config
         },
     )?;
@@ -399,6 +403,7 @@ fn test_f16_recompute_under_pressure_preserves_sampled_continuations() -> Result
         &factory,
         PipelineConfig {
             state_bytes: Some(bytes),
+            prefix: PrefixConfig::DISABLED,
             ..config
         },
     )?;
@@ -418,5 +423,80 @@ fn test_f16_recompute_under_pressure_preserves_sampled_continuations() -> Result
         preemptions += stats.preemptions;
     }
     assert!(preemptions > 0);
+    Ok(())
+}
+
+#[test]
+fn test_presence_penalty_steers_greedy_decoding_away_from_sampled_tokens() -> Result<()> {
+    // Without penalties the degenerate fixture repeats token 5 forever.
+    let fixture = Checkpoint::new()?;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), PipelineConfig::new(1, 16))?;
+    let plain = pipeline.run(&GenerationRequest::new("t10".into(), 6), |_| {})?;
+    assert_eq!(plain.generated_text, ["t5"; 6].join(" "));
+    let mut request = GenerationRequest::new("t10".into(), 6);
+    request.sampling.presence_penalty = Some(100.0);
+    request.sampling.temperature = Some(0.0);
+    // Every other logit ties, so once token 5 is penalized the first maximum is token 0,
+    // then token 1, the fixture's EOS.
+    let stats = pipeline.run(&request, |_| {})?;
+    assert_eq!(stats.generated_text, "t5 t0");
+    assert_eq!((stats.generated_tokens, stats.finish_reason), (3, "stop"));
+    assert!(pipeline.sampling_stats().host_rows > 0);
+    Ok(())
+}
+
+#[test]
+fn test_cancellation_while_a_pass_is_in_flight_releases_state_and_spares_survivors() -> Result<()> {
+    let fixture = Checkpoint::random()?;
+    let requests = requests();
+    let expected = solo(&fixture, &requests)?;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), tight())?;
+    let mut ids = HashMap::new();
+    for (index, request) in requests.iter().enumerate() {
+        ids.insert(pipeline.submit_request(request)?, index);
+    }
+    let victims: Vec<Uuid> = ids
+        .iter()
+        .filter(|(_, index)| **index % 3 == 0)
+        .map(|(id, _)| *id)
+        .collect();
+    let mut outcomes = HashMap::new();
+    let mut passes = 0;
+    while pipeline.active_request_count() > 0 {
+        let in_flight = pipeline.begin_step()?;
+        // Between submission and completion: cancel some requests, admit nothing new.
+        if passes == 3 {
+            assert!(in_flight);
+            for id in &victims {
+                match pipeline.cancel(*id) {
+                    Ok(()) | Err(TurError::RequestNotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let output = pipeline.finish_step()?;
+        let timing = output
+            .timing
+            .ok_or_else(|| TurError::Other("no pass".into()))?;
+        assert!(timing.tokens > 0 && timing.device >= timing.encode);
+        for (id, result) in output.completed {
+            outcomes.insert(ids[&id], result?.generated_text);
+        }
+        passes += 1;
+    }
+    for (index, expected) in expected.iter().enumerate() {
+        if index % 3 == 0 {
+            // Short requests may finish before the cancellation.
+            if let Some(text) = outcomes.get(&index) {
+                assert_eq!(text, expected);
+            }
+            continue;
+        }
+        assert_eq!(outcomes.get(&index), Some(expected), "request {index}");
+    }
+    let usage = pipeline.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+    assert!(pipeline.begin_step().is_ok_and(|ran| !ran));
+    assert!(pipeline.finish_step()?.timing.is_none());
     Ok(())
 }

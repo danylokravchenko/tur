@@ -41,6 +41,15 @@ struct Args {
     top_p: Option<f64>,
     #[arg(long)]
     top_k: Option<usize>,
+    /// Above 1 discourages every prompt or generated token (divides positive logits).
+    #[arg(long)]
+    repetition_penalty: Option<f64>,
+    /// Subtracted once from the logit of every generated token.
+    #[arg(long)]
+    presence_penalty: Option<f64>,
+    /// Subtracted per occurrence from the logit of every generated token.
+    #[arg(long)]
+    frequency_penalty: Option<f64>,
     #[arg(long, default_value_t = 299_792_458)]
     seed: u64,
     /// Explicit true/false; omission preserves the checkpoint's thinking default.
@@ -121,6 +130,9 @@ fn main() -> Result<()> {
         temperature: args.temperature,
         top_p: args.top_p,
         top_k: args.top_k,
+        repetition_penalty: args.repetition_penalty,
+        presence_penalty: args.presence_penalty,
+        frequency_penalty: args.frequency_penalty,
     };
     request.render.enable_thinking = args.thinking;
     request.render.reasoning_effort = args.reasoning_effort;

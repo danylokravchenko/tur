@@ -1,0 +1,6 @@
+    Finished `bench` profile [optimized] target(s) in 0.35s
+     Running benches/kernels.rs (target/release/deps/kernels-236048afac1a5b32)
+sample rows=1: device 0.155 ms, argmax 0.053 ms, penalize 0.016 ms; host copy 0.329 ms + sample 0.909 ms
+sample rows=4: device 0.334 ms, argmax 0.060 ms, penalize 0.039 ms; host copy 0.664 ms + sample 3.581 ms
+sample rows=8: device 0.564 ms, argmax 0.136 ms, penalize 0.058 ms; host copy 1.179 ms + sample 7.207 ms
+sample rows=16: device 0.828 ms, argmax 0.274 ms, penalize 0.078 ms; host copy 2.057 ms + sample 14.408 ms

@@ -3,10 +3,10 @@
 
 use crate::backend::guidance::GuidanceControl;
 use candle_core::{DType, Device, Tensor};
-use candle_transformers::generation::{LogitsProcessor, Sampling};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Instant,
 };
 use tur_core::{
     Result, TurError,
@@ -15,7 +15,10 @@ use tur_core::{
         StateMetadata, invalid,
     },
 };
-use tur_metal::completion::{Completion, Quarantine};
+use tur_metal::{
+    completion::{Completion, Notifier, Quarantine},
+    sampling::{self, PenaltyEntry, PenaltyParams, SampleParams, SampleStatus},
+};
 pub use tur_metal::{
     pool::{PoolConfig, PoolUsage, StatePool},
     state::{Demand, ModelState, Reservation},
@@ -25,26 +28,92 @@ pub use tur_models::hybrid::{
 };
 use uuid::Uuid;
 
-/// Per-request sampling policy using the existing Candle sampler.
+/// Per-request sampling policy. Unset fields disable their control.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SamplingOptions {
     pub temperature: Option<f64>,
     pub top_k: Option<usize>,
     pub top_p: Option<f64>,
+    /// Divides positive and multiplies negative logits of every prompt or sampled token;
+    /// above 1 discourages repetition.
+    pub repetition_penalty: Option<f64>,
+    /// Subtracted once from the logit of every token sampled so far.
+    pub presence_penalty: Option<f64>,
+    /// Subtracted per occurrence from the logit of every token sampled so far.
+    pub frequency_penalty: Option<f64>,
 }
 
 impl SamplingOptions {
-    /// Greedy below the sampler's temperature floor; otherwise top-k, then top-p.
-    fn sampling(&self) -> Sampling {
-        let Some(temperature) = self.temperature.filter(|t| *t >= 1e-7) else {
-            return Sampling::ArgMax;
-        };
-        match (self.top_k, self.top_p) {
-            (None, None) => Sampling::All { temperature },
-            (Some(k), None) => Sampling::TopK { k, temperature },
-            (None, Some(p)) => Sampling::TopP { p, temperature },
-            (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature },
+    /// Greedy below a temperature of 1e-7, ignoring top-k and top-p.
+    fn greedy(&self) -> bool {
+        self.temperature.is_none_or(|t| t < 1e-7)
+    }
+
+    fn penalties(&self) -> PenaltyParams {
+        PenaltyParams {
+            repetition: self.repetition_penalty.unwrap_or(1.0) as f32,
+            presence: self.presence_penalty.unwrap_or(0.0) as f32,
+            frequency: self.frequency_penalty.unwrap_or(0.0) as f32,
         }
+    }
+
+    fn params(&self, seed: u64, draw: u64) -> SampleParams {
+        SampleParams {
+            temperature: self.temperature.unwrap_or(1.0) as f32,
+            top_k: self
+                .top_k
+                .map_or(0, |k| u32::try_from(k).unwrap_or(u32::MAX)),
+            top_p: self.top_p.unwrap_or(1.0) as f32,
+            seed,
+            draw,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.temperature.is_some_and(|t| !t.is_finite() || t < 0.0)
+            || self.top_k == Some(0)
+            || self
+                .top_p
+                .is_some_and(|p| !p.is_finite() || p <= 0.0 || p > 1.0)
+        {
+            return Err(invalid("invalid sampling options"));
+        }
+        self.penalties().validate()?;
+        if !self.greedy() {
+            self.params(0, 0).validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Penalty parameters and distinct penalized tokens of one output row.
+type Penalties = (PenaltyParams, Vec<PenaltyEntry>);
+
+/// Context tokens and sampled counts of a penalized request.
+#[derive(Clone, Default)]
+struct History {
+    counts: HashMap<u32, u32>,
+    /// Prompt tokens, penalized by the repetition penalty besides sampled ones.
+    context: HashSet<u32>,
+}
+
+impl History {
+    /// Distinct penalized tokens of one output whose position follows `drafts`, tokens of
+    /// this pass that count as sampled if the output is used (speculative drafts).
+    fn entries(&self, penalties: &PenaltyParams, drafts: &[u32]) -> Vec<PenaltyEntry> {
+        let mut counts = self.counts.clone();
+        for &token in drafts {
+            *counts.entry(token).or_default() += 1;
+        }
+        if penalties.uses_context() {
+            for &token in &self.context {
+                counts.entry(token).or_default();
+            }
+        }
+        counts
+            .into_iter()
+            .map(|(token, count)| PenaltyEntry { token, count })
+            .collect()
     }
 }
 
@@ -55,6 +124,8 @@ struct SamplingState {
     guidance: Option<GuidanceControl>,
     tokens: Vec<u32>,
     finished: bool,
+    /// Present while any penalty is active.
+    history: Option<History>,
 }
 
 /// Bookkeeping needed to undo one request's sampling after a mid-sequence error.
@@ -66,32 +137,38 @@ struct SamplingMark {
 }
 
 /// One output position's logits as `finish` delivers them.
-#[derive(Clone, Copy)]
 enum Row<'a> {
+    /// Model logits: the host applies penalties, the grammar mask and the sampler.
     Logits(&'a [f32]),
-    /// Reduced on the device for greedy decoding: first maximum and whether the row is
-    /// finite.
-    Best {
-        index: u32,
-        finite: bool,
-    },
+    /// Penalized on the device, whose rejection rounds did not settle the sample.
+    Penalized(Vec<f32>),
+    /// Decided on the device: argmax for greedy requests, otherwise the sampling kernel.
+    Device { token: u32, status: SampleStatus },
 }
 
-/// First maximum of finite `logits`, as Candle's argmax keeps. Chunked so the finiteness
-/// check and maximum vectorize; only a chunk with a new maximum is searched for its index.
-fn first_max(logits: &[f32]) -> Result<u32> {
+/// First maximum of `logits`; −∞ marks a masked token only when `masked`. Chunked so the
+/// finiteness check and maximum vectorize; only a chunk with a new maximum is searched for
+/// its index.
+fn first_max(logits: &[f32], masked: bool) -> Result<u32> {
     const CHUNK: usize = 64;
     let mut best: Option<(usize, f32)> = None;
     for (chunk_index, chunk) in logits.chunks(CHUNK).enumerate() {
-        let (finite, max) = chunk
+        let (valid, max) = chunk
             .iter()
-            .fold((true, f32::NEG_INFINITY), |(finite, max), &v| {
-                (finite & v.is_finite(), max.max(v))
+            .fold((true, f32::NEG_INFINITY), |(valid, max), &v| {
+                // `v < +∞` also rejects NaN while admitting masked −∞.
+                let admitted = if masked {
+                    v < f32::INFINITY
+                } else {
+                    v.is_finite()
+                };
+                #[allow(clippy::needless_bitwise_bool, reason = "branch-free so it vectorizes")]
+                (valid & admitted, max.max(v))
             });
-        if !finite {
+        if !valid {
             return Err(invalid("nonfinite model logits"));
         }
-        if best.is_none_or(|(_, value)| max > value) {
+        if max > f32::NEG_INFINITY && best.is_none_or(|(_, value)| max > value) {
             // Exact: `max` is one of the chunk's values.
             #[allow(
                 clippy::float_cmp,
@@ -101,15 +178,36 @@ fn first_max(logits: &[f32]) -> Result<u32> {
             best = Some((chunk_index * CHUNK + offset, max));
         }
     }
-    let (index, _) = best.ok_or_else(|| invalid("empty logits"))?;
+    let (index, _) = best.ok_or_else(|| TurError::Guidance("every token is masked".into()))?;
     u32::try_from(index).map_err(|_| invalid("token id exceeds u32"))
 }
 
 impl SamplingState {
-    /// Greedy without a grammar: only the first maximum matters, so the device may reduce
-    /// each row before it reaches the host.
-    fn reduces_to_argmax(&self) -> bool {
-        self.guidance.is_none() && matches!(self.options.sampling(), Sampling::ArgMax)
+    fn new(seed: u64, options: SamplingOptions, guidance: Option<GuidanceControl>) -> Self {
+        Self {
+            seed,
+            draws: 0,
+            history: options.penalties().active().then(History::default),
+            options,
+            guidance,
+            tokens: Vec::new(),
+            finished: false,
+        }
+    }
+
+    /// Without a grammar every row can be decided on the device.
+    fn device_sampled(&self) -> bool {
+        self.guidance.is_none()
+    }
+
+    /// Penalties of an output after `drafts`, or `None` when inactive. They see the
+    /// history committed before the pass, never outputs sampled within it, so the host and
+    /// the device (which builds them at submission) agree.
+    fn penalty_entries(&self, drafts: &[u32]) -> Option<Penalties> {
+        let penalties = self.options.penalties();
+        self.history
+            .as_ref()
+            .map(|history| (penalties, history.entries(&penalties, drafts)))
     }
 
     fn fork(&self) -> Self {
@@ -120,6 +218,7 @@ impl SamplingState {
             guidance: self.guidance.as_ref().map(GuidanceControl::fork),
             tokens: self.tokens.clone(),
             finished: self.finished,
+            history: self.history.clone(),
         }
     }
 
@@ -139,6 +238,16 @@ impl SamplingState {
 
     fn rollback(&mut self, mark: SamplingMark) {
         self.draws = mark.draws;
+        if let Some(history) = &mut self.history {
+            for token in self.tokens.get(mark.tokens..).unwrap_or_default() {
+                if let Some(count) = history.counts.get_mut(token) {
+                    *count -= 1;
+                    if *count == 0 {
+                        history.counts.remove(token);
+                    }
+                }
+            }
+        }
         self.tokens.truncate(mark.tokens);
         self.finished = mark.finished;
         if let Some(guidance) = mark.guidance {
@@ -146,8 +255,9 @@ impl SamplingState {
         }
     }
 
-    /// Sample one output, or `None` once the grammar has reached a terminal state.
-    fn sample(&mut self, row: Row<'_>) -> Result<Option<u32>> {
+    /// Sample one output with its precomputed penalties (see [`Self::penalty_entries`]),
+    /// or `None` once the grammar has reached a terminal state.
+    fn sample(&mut self, row: Row<'_>, penalties: Option<&Penalties>) -> Result<Option<u32>> {
         if self.finished {
             return Ok(None);
         }
@@ -155,55 +265,53 @@ impl SamplingState {
             .draws
             .checked_add(1)
             .ok_or_else(|| invalid("RNG counter overflow"))?;
-        let logits = match row {
-            Row::Best { index, finite } => {
-                if !self.reduces_to_argmax() {
-                    return Err(invalid("reduced logits for a non-greedy request"));
+        let token = match row {
+            Row::Device { token, status } => match status {
+                SampleStatus::Sampled if self.device_sampled() => token,
+                SampleStatus::Sampled => {
+                    return Err(invalid("device-sampled row for a constrained request"));
                 }
-                if !finite {
-                    return Err(invalid("nonfinite model logits"));
+                SampleStatus::Invalid => return Err(invalid("nonfinite model logits")),
+                SampleStatus::Unconverged => {
+                    return Err(invalid("unsettled device sample without its row"));
                 }
-                self.draws = next_draw;
-                self.tokens.push(index);
-                return Ok(Some(index));
+            },
+            Row::Penalized(values) => {
+                sampling::sample(&values, &self.options.params(self.seed, self.draws))?
             }
-            Row::Logits(logits) if self.reduces_to_argmax() => {
-                let token = first_max(logits)?;
-                self.draws = next_draw;
-                self.tokens.push(token);
-                return Ok(Some(token));
+            Row::Logits(logits) => {
+                let plain = self.guidance.is_none() && self.history.is_none();
+                if plain && self.options.greedy() {
+                    first_max(logits, false)?
+                } else {
+                    if logits.iter().any(|value| !value.is_finite()) {
+                        return Err(invalid("nonfinite model logits"));
+                    }
+                    let mut values = logits.to_vec();
+                    if let Some((params, entries)) = penalties {
+                        sampling::penalize(&mut values, params, entries)?;
+                    }
+                    if let Some(guidance) = &mut self.guidance
+                        && guidance.apply_mask(&mut values)?
+                    {
+                        self.finished = true;
+                        return Ok(None);
+                    }
+                    if self.options.greedy() {
+                        first_max(&values, true)?
+                    } else {
+                        sampling::sample(&values, &self.options.params(self.seed, self.draws))?
+                    }
+                }
             }
-            Row::Logits(logits) => logits,
         };
-        // SplitMix64's specified modular arithmetic derives a stable per-draw stream.
-        // The request counter itself is checked and never wraps or depends on batch order.
-        let mut seed = self
-            .seed
-            .wrapping_add(self.draws.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        seed ^= seed >> 31;
-        if logits.iter().any(|value| !value.is_finite()) {
-            return Err(invalid("nonfinite model logits"));
-        }
-        let mut values = logits.to_vec();
-        if let Some(guidance) = &mut self.guidance
-            && guidance.apply_mask(&mut values)?
-        {
-            self.finished = true;
-            return Ok(None);
-        }
-        if !values.iter().any(|v| v.is_finite()) {
-            return Err(TurError::Guidance("grammar disallows every token".into()));
-        }
-        let vocab = values.len();
-        let masked = Tensor::from_vec(values, vocab, &Device::Cpu)?;
-        let mut sampler = LogitsProcessor::from_sampling(seed, self.options.sampling());
-        let token = sampler.sample(&masked)?;
         if let Some(guidance) = &mut self.guidance
             && guidance.commit(token)?
         {
             self.finished = true;
+        }
+        if let Some(history) = &mut self.history {
+            *history.counts.entry(token).or_default() += 1;
         }
         self.draws = next_draw;
         self.tokens.push(token);
@@ -291,6 +399,32 @@ pub struct SequenceResult {
     pub outcome: Result<SequenceCommit>,
 }
 
+/// Output rows sampled since the engine was created, by where they were decided.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SamplingStats {
+    /// Penalized, reduced or sampled on the device; only the token returns to the host.
+    pub device_rows: u64,
+    /// Copied in full for the host sampler (grammar-constrained requests, or no kernels).
+    pub host_rows: u64,
+    /// Device rows whose rejection rounds did not settle, resampled on the host.
+    pub fallback_rows: u64,
+}
+
+/// Where a sequence's output rows went before the fence.
+#[derive(Clone, Copy)]
+enum Placement {
+    /// No outputs, or the model failed this sequence.
+    None,
+    /// Full logit rows from this row of the host copy.
+    Host(usize),
+    /// Token/status pairs from this row of the device-decided copy.
+    #[cfg_attr(
+        not(feature = "metal"),
+        allow(dead_code, reason = "without Metal every row stays on the host")
+    )]
+    Device(usize),
+}
+
 struct Batch<M> {
     // Weights, every page and slot the pass reads or writes, and logits stay alive across
     // the completion fence.
@@ -298,14 +432,30 @@ struct Batch<M> {
     plan: PackedExecution,
     reservations: Vec<Reservation>,
     logits: Vec<Result<Tensor>>,
-    /// Where each sequence's rows went: full logit rows for the host sampler, or (for
-    /// greedy requests on a device with kernels) argmax pairs reduced on the device.
-    reduced: Vec<bool>,
-    /// Full rows and argmax pairs of every sequence, each concatenated on the device before
-    /// the fence, so `finish` copies them to the host once rather than once per sequence.
-    packed: Option<Tensor>,
-    best: Option<Tensor>,
+    placement: Vec<Placement>,
+    /// Full rows for the host sampler and token/status pairs decided on the device, each
+    /// concatenated before the fence, so `finish` copies them to the host once.
+    host: Option<Tensor>,
+    pairs: Option<Tensor>,
+    /// Penalized device rows, read back only for samples the device could not settle.
+    device_rows: Option<Tensor>,
     error: Option<TurError>,
+}
+
+impl<M> Batch<M> {
+    /// Host rows then device pairs, flattened into one tensor for a single host copy.
+    fn readback(&mut self) -> Result<Option<Tensor>> {
+        let parts = [&self.host, &self.pairs]
+            .into_iter()
+            .flatten()
+            .map(Tensor::flatten_all)
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        Ok(match parts.len() {
+            0 => None,
+            1 => parts.into_iter().next(),
+            _ => Some(Tensor::cat(&parts, 0)?),
+        })
+    }
 }
 
 /// One execution owner with at most one in-flight batch. No locks are held during execution.
@@ -321,7 +471,14 @@ pub struct HybridEngine<M: HybridModel> {
     requests: HashMap<Uuid, Request>,
     pending: Option<Completion<Batch<M>>>,
     pending_handles: HashSet<Uuid>,
-    /// The model's kernels, for reducing greedy rows on the device.
+    /// Observes completion of the pending batch off the execution thread.
+    notifier: Notifier,
+    /// When the device finished the last completed batch.
+    completed_at: Option<Instant>,
+    stats: SamplingStats,
+    /// Decide unconstrained rows on the device when kernels exist.
+    device_sampling: bool,
+    /// The model's kernels, for penalizing and sampling rows on the device.
     #[cfg(feature = "metal")]
     kernels: Option<tur_metal::kernels::Kernels>,
 }
@@ -336,32 +493,15 @@ fn validate_logits(logits: &Tensor, rows: usize, vocab: usize, device: &Device) 
     Ok(())
 }
 
-/// This sequence's rows as `finish` copied them: full logits (`[outputs, vocab]`, flat)
-/// or argmax pairs (`[outputs, 2]`, flat).
-#[derive(Clone, Copy)]
-enum Rows<'a> {
-    Logits(&'a [f32], usize),
-    Best(&'a [f32]),
-}
-
-impl<'a> Rows<'a> {
-    fn iter(self) -> impl Iterator<Item = Row<'a>> {
-        let (logits, best) = match self {
-            Self::Logits(rows, vocab) => (Some(rows.chunks_exact(vocab.max(1))), None),
-            Self::Best(pairs) => (None, Some(pairs.as_chunks::<2>().0)),
-        };
-        logits
-            .into_iter()
-            .flatten()
-            .map(Row::Logits)
-            .chain(
-                best.into_iter()
-                    .flatten()
-                    .map(|&[index, finite]| Row::Best {
-                        index: index as u32,
-                        finite: finite != 0.0,
-                    }),
-            )
+/// Speculative drafts at or before packed `position`: they count as sampled tokens for
+/// that output's penalties, because the output is used only if every draft was accepted.
+fn drafts<'a>(sequence: &SequenceDescriptor, tokens: &'a [u32], position: usize) -> &'a [u32] {
+    if sequence.speculative {
+        tokens
+            .get(sequence.tokens.start + 1..=position)
+            .unwrap_or_default()
+    } else {
+        &[]
     }
 }
 
@@ -370,12 +510,23 @@ fn sample_sequence(
     sampling: &mut SamplingState,
     sequence: &SequenceDescriptor,
     tokens: &[u32],
-    rows: Rows<'_>,
+    rows: Vec<Row<'_>>,
 ) -> Result<(usize, Vec<TokenOutput>)> {
     let length = sequence.tokens.len();
+    let penalties: Vec<Option<Penalties>> = sequence
+        .outputs
+        .iter()
+        .map(|&position| sampling.penalty_entries(drafts(sequence, tokens, position)))
+        .collect();
     let mut outputs = Vec::with_capacity(sequence.outputs.len());
-    for (index, (&position, row)) in sequence.outputs.iter().zip(rows.iter()).enumerate() {
-        let Some(token) = sampling.sample(row)? else {
+    for (index, ((&position, row), penalties)) in sequence
+        .outputs
+        .iter()
+        .zip(rows)
+        .zip(&penalties)
+        .enumerate()
+    {
+        let Some(token) = sampling.sample(row, penalties.as_ref())? else {
             return Ok((
                 if sequence.speculative {
                     index + 1
@@ -432,7 +583,7 @@ fn publish(
     sequence: &SequenceDescriptor,
     tokens: &[u32],
     reservation: &Reservation,
-    rows: Rows<'_>,
+    rows: Vec<Row<'_>>,
 ) -> Result<SequenceCommit> {
     let revision = request
         .handle
@@ -474,10 +625,29 @@ impl<M: HybridModel> HybridEngine<M> {
             requests: HashMap::new(),
             pending: None,
             pending_handles: HashSet::new(),
+            notifier: Notifier::new()?,
+            completed_at: None,
+            stats: SamplingStats::default(),
+            device_sampling: true,
             #[cfg(feature = "metal")]
             kernels: model.kernels(),
             model,
         })
+    }
+
+    /// When the device finished the most recently completed batch.
+    pub fn completed_at(&self) -> Option<Instant> {
+        self.completed_at
+    }
+
+    /// Whether a submitted batch awaits `finish`.
+    pub fn in_flight(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Where output rows have been sampled so far.
+    pub fn sampling_stats(&self) -> SamplingStats {
+        self.stats
     }
 
     /// Persistent state storage shared by every request of this engine.
@@ -511,28 +681,30 @@ impl<M: HybridModel> HybridEngine<M> {
         if let Some(guidance) = &guidance {
             guidance.validate_token_contract(self.description.vocab_size)?;
         }
-        if options
-            .temperature
-            .is_some_and(|t| !t.is_finite() || t < 0.0)
-            || options.top_k == Some(0)
-            || options
-                .top_p
-                .is_some_and(|p| !p.is_finite() || p <= 0.0 || p > 1.0)
-        {
-            return Err(invalid("invalid sampling options"));
-        }
+        options.validate()?;
         let snapshot = Snapshot {
             model: ModelState::new(&self.pool),
-            sampling: SamplingState {
-                seed,
-                draws: 0,
-                options,
-                guidance,
-                tokens: Vec::new(),
-                finished: false,
-            },
+            sampling: SamplingState::new(seed, options, guidance),
         };
         self.insert(snapshot)
+    }
+
+    /// Record prompt tokens that the repetition penalty treats like sampled ones. Without
+    /// that penalty nothing is stored.
+    pub fn add_context(&mut self, handle: StateHandle, tokens: &[u32]) -> Result<()> {
+        self.request(handle)?;
+        let sampling = &mut self
+            .requests
+            .get_mut(&handle.request)
+            .ok_or_else(|| invalid("request disappeared"))?
+            .snapshot
+            .sampling;
+        if sampling.options.penalties().uses_context()
+            && let Some(history) = &mut sampling.history
+        {
+            history.context.extend(tokens);
+        }
+        Ok(())
     }
 
     fn insert(&mut self, snapshot: Snapshot) -> Result<StateHandle> {
@@ -620,6 +792,37 @@ impl<M: HybridModel> HybridEngine<M> {
             .get_mut(&handle.request)
             .ok_or_else(|| invalid("request disappeared"))?;
         request.snapshot = snapshot;
+        request.handle.revision = revision;
+        Ok(request.handle)
+    }
+
+    /// The committed model state of a request, sharing its pages and slot; holding it
+    /// keeps them leased. Pending candidate state is never visible.
+    pub fn model_state(&self, handle: StateHandle) -> Result<ModelState> {
+        Ok(self.request(handle)?.snapshot.model.clone())
+    }
+
+    /// Start a request that holds no tokens from a committed model state of this engine,
+    /// such as a prefix-cache snapshot. RNG, sampled history and grammar are unchanged.
+    /// Invalidates every descriptor with the previous revision.
+    pub fn adopt(&mut self, handle: StateHandle, state: &ModelState) -> Result<StateHandle> {
+        if !state.pool().same_pool(&self.pool) {
+            return Err(invalid("model state belongs to another engine"));
+        }
+        if self.request(handle)?.snapshot.model.position() != 0
+            || self.pending_handles.contains(&handle.request)
+        {
+            return Err(invalid("only an idle request without state can adopt one"));
+        }
+        let revision = handle
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| invalid("request revision overflow"))?;
+        let request = self
+            .requests
+            .get_mut(&handle.request)
+            .ok_or_else(|| invalid("request disappeared"))?;
+        request.snapshot.model = state.clone();
         request.handle.revision = revision;
         Ok(request.handle)
     }
@@ -739,9 +942,10 @@ impl<M: HybridModel> HybridEngine<M> {
                 plan,
                 reservations,
                 logits: Vec::new(),
-                reduced: Vec::new(),
-                packed: None,
-                best: None,
+                placement: Vec::new(),
+                host: None,
+                pairs: None,
+                device_rows: None,
                 error: None,
             },
         );
@@ -789,59 +993,139 @@ impl<M: HybridModel> HybridEngine<M> {
             .iter()
             .map(|s| s.state.request)
             .collect();
+        // Commit the encoded tail now and copy the host rows and device decisions as
+        // part of the fence; without a notifier `finish` fences and copies directly.
+        let output = completion
+            .resources_mut()
+            .map(Batch::readback)
+            .transpose()?
+            .flatten();
+        if let Err(error) = completion.notify(&self.notifier, output) {
+            tracing::warn!("fencing on the execution thread: {error}");
+        }
         self.pending = Some(completion);
         Ok(requirements)
     }
 
-    /// Enqueue, before the fence, one concatenation of every full logit row and one of every
-    /// device-reduced argmax pair, so `finish` makes at most two host copies.
-    fn gather(&self, batch: &mut Batch<M>) -> Result<()> {
-        let mut full = Vec::new();
-        let mut best = Vec::new();
-        batch.reduced = Vec::with_capacity(batch.logits.len());
-        for (sequence, logits) in batch.plan.sequences.iter().zip(&batch.logits) {
-            let Ok(logits) = logits else {
-                batch.reduced.push(false);
+    /// Sample every row on the host instead (`false`), e.g. to compare paths. Both draw
+    /// from the same distribution with the same per-request stream.
+    pub fn set_device_sampling(&mut self, enabled: bool) {
+        self.device_sampling = enabled;
+    }
+
+    /// Whether rows can be penalized and sampled on the device.
+    fn has_kernels(&self) -> bool {
+        #[cfg(feature = "metal")]
+        return self.device_sampling && self.kernels.is_some();
+        #[cfg(not(feature = "metal"))]
+        false
+    }
+
+    /// Enqueue, before the fence, one concatenation of every row the host samples
+    /// (constrained requests, or no kernels) and the device's decisions for every other
+    /// row, so `finish` makes at most two host copies.
+    fn gather(&mut self, batch: &mut Batch<M>) -> Result<()> {
+        let mut host = Vec::new();
+        let mut host_rows = 0;
+        // Device-decided sequences: (index, logits, greedy).
+        let mut device = Vec::new();
+        batch.placement = vec![Placement::None; batch.logits.len()];
+        for (index, (sequence, logits)) in
+            batch.plan.sequences.iter().zip(&batch.logits).enumerate()
+        {
+            let (Ok(logits), Some(request)) = (logits, self.requests.get(&sequence.state.request))
+            else {
                 continue;
             };
-            let greedy = self
-                .requests
-                .get(&sequence.state.request)
-                .is_some_and(|r| r.snapshot.sampling.reduces_to_argmax());
-            let pairs = self.reduce(logits, greedy && !sequence.outputs.is_empty())?;
-            let reduced = pairs.is_some();
-            if let Some(pairs) = pairs {
-                best.push(pairs);
-            } else if !sequence.outputs.is_empty() {
-                full.push(logits.clone());
+            if sequence.outputs.is_empty() {
+                continue;
             }
-            batch.reduced.push(reduced);
+            let sampling = &request.snapshot.sampling;
+            if self.has_kernels() && sampling.device_sampled() {
+                device.push((index, logits.clone(), sampling.options.greedy()));
+            } else {
+                batch.placement[index] = Placement::Host(host_rows);
+                host_rows += sequence.outputs.len();
+                host.push(logits.clone());
+            }
         }
-        if !full.is_empty() {
-            batch.packed = Some(Tensor::cat(&full, 0)?);
+        if !host.is_empty() {
+            batch.host = Some(Tensor::cat(&host, 0)?);
         }
-        if !best.is_empty() {
-            batch.best = Some(Tensor::cat(&best, 0)?);
+        if !device.is_empty() {
+            self.decide(batch, device)?;
         }
+        let device_rows = batch.plan.sequences.iter().zip(&batch.placement);
+        let device_rows = device_rows
+            .filter(|(_, p)| matches!(p, Placement::Device(_)))
+            .map(|(s, _)| s.outputs.len() as u64)
+            .sum::<u64>();
+        self.stats.device_rows += device_rows;
+        self.stats.host_rows += host_rows as u64;
         Ok(())
     }
 
-    /// Argmax pairs of `logits` on the device, when wanted and kernels are available.
-    #[cfg_attr(
-        not(feature = "metal"),
-        allow(
-            clippy::unused_self,
-            clippy::unnecessary_wraps,
-            reason = "without Metal every row stays on the host"
-        )
-    )]
-    fn reduce(&self, logits: &Tensor, wanted: bool) -> Result<Option<Tensor>> {
-        #[cfg(feature = "metal")]
-        if wanted && let Some(kernels) = &self.kernels {
-            return Ok(Some(kernels.argmax(logits)?));
+    /// Penalize every device row in one dispatch, then take the argmax of greedy rows and
+    /// sample the rest in one dispatch each. Rows are ordered greedy first.
+    #[cfg(feature = "metal")]
+    fn decide(&self, batch: &mut Batch<M>, mut device: Vec<(usize, Tensor, bool)>) -> Result<()> {
+        let kernels = self
+            .kernels
+            .as_ref()
+            .ok_or_else(|| invalid("device sampling without kernels"))?;
+        device.sort_by_key(|&(_, _, greedy)| !greedy);
+        let (mut rows, mut penalties, mut entries, mut params) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut at, mut greedy_rows) = (0, 0);
+        for (index, logits, greedy) in device {
+            let sequence = batch
+                .plan
+                .sequences
+                .get(index)
+                .ok_or_else(|| invalid("device row outside the plan"))?;
+            let sampling = &self.request(sequence.state)?.snapshot.sampling;
+            batch.placement[index] = Placement::Device(at);
+            for (offset, &position) in sequence.outputs.iter().enumerate() {
+                let row = u32::try_from(at + offset).map_err(|_| invalid("row exceeds u32"))?;
+                match sampling.penalty_entries(drafts(sequence, &batch.plan.tokens, position)) {
+                    Some((p, e)) => {
+                        penalties.push(p);
+                        entries.extend(e.into_iter().map(|entry| (row, entry)));
+                    }
+                    None => penalties.push(PenaltyParams::NONE),
+                }
+                if !greedy {
+                    let draw = sampling.draws.wrapping_add(offset as u64);
+                    params.push(sampling.options.params(sampling.seed, draw));
+                }
+            }
+            at += sequence.outputs.len();
+            if greedy {
+                greedy_rows = at;
+            }
+            rows.push(logits);
         }
-        let _ = (logits, wanted);
-        Ok(None)
+        let all = Tensor::cat(&rows, 0)?;
+        kernels.penalize(&all, &penalties, &entries)?;
+        let mut pairs = Vec::with_capacity(2);
+        if greedy_rows > 0 {
+            pairs.push(kernels.argmax(&all.narrow(0, 0, greedy_rows)?)?);
+        }
+        if at > greedy_rows {
+            pairs.push(kernels.sample(&all.narrow(0, greedy_rows, at - greedy_rows)?, &params)?);
+        }
+        batch.pairs = Some(Tensor::cat(&pairs, 0)?);
+        batch.device_rows = Some(all);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "metal"))]
+    #[allow(
+        clippy::unused_self,
+        reason = "without Metal every row stays on the host"
+    )]
+    fn decide(&self, _: &mut Batch<M>, _: Vec<(usize, Tensor, bool)>) -> Result<()> {
+        Err(invalid("device sampling without kernels"))
     }
 
     /// Fence the pending batch, then sample and publish each request independently.
@@ -852,7 +1136,18 @@ impl<M: HybridModel> HybridEngine<M> {
             .pending
             .as_mut()
             .ok_or_else(|| invalid("no batch in flight"))?;
-        completion.wait()?;
+        if let Err(error) = completion.wait() {
+            // A retried fence can succeed without the work having run correctly, so
+            // the retry must not publish this batch's outputs.
+            if let Some(batch) = completion.resources_mut() {
+                batch
+                    .error
+                    .get_or_insert_with(|| invalid(format!("device completion failed: {error}")));
+            }
+            return Err(error);
+        }
+        self.completed_at = completion.completed_at().or_else(|| Some(Instant::now()));
+        let copied = completion.take_copy();
         let batch = completion
             .take()
             .ok_or_else(|| invalid("incomplete submission"))?;
@@ -862,9 +1157,10 @@ impl<M: HybridModel> HybridEngine<M> {
             plan,
             reservations,
             logits,
-            reduced,
-            packed,
-            best,
+            placement,
+            host,
+            pairs,
+            device_rows,
             error,
             ..
         } = batch;
@@ -875,37 +1171,64 @@ impl<M: HybridModel> HybridEngine<M> {
             return Err(error);
         }
         let vocab = self.description.vocab_size;
-        // One host copy each of the full rows and the argmax pairs, sliced in order.
-        let host = |tensor: Option<Tensor>| -> Result<Vec<f32>> {
-            tensor.map_or(Ok(Vec::new()), |t| Ok(t.flatten_all()?.to_vec1::<f32>()?))
+        // One host copy of the full rows then the device decisions, made with the fence or
+        // here when no notifier ran.
+        let host_len = host.as_ref().map_or(0, Tensor::elem_count);
+        let mut full = match copied {
+            Some(copied) => copied,
+            None => [host, pairs]
+                .into_iter()
+                .flatten()
+                .map(|t| Ok(t.flatten_all()?.to_vec1::<f32>()?))
+                .collect::<Result<Vec<_>>>()?
+                .concat(),
         };
-        let (full, pairs) = (host(packed)?, host(best)?);
-        let (mut full_at, mut pairs_at) = (0, 0);
+        if full.len() < host_len {
+            return Err(invalid("host copy is shorter than the logit rows"));
+        }
+        let pairs = full.split_off(host_len);
+        let outside = || invalid("logit rows outside the copied batch");
+        let mut fallbacks = 0;
         let mut results = Vec::with_capacity(plan.sequences.len());
-        for (((sequence, reservation), logits), reduced) in plan
+        for (((sequence, reservation), logits), placement) in plan
             .sequences
             .iter()
             .zip(&reservations)
             .zip(logits)
-            .zip(reduced)
+            .zip(placement)
         {
-            let rows = logits.and_then(|_| {
-                let outputs = sequence.outputs.len();
-                let (source, at, width) = if reduced {
-                    (&pairs, &mut pairs_at, 2)
-                } else {
-                    (&full, &mut full_at, vocab)
-                };
-                let start = *at;
-                *at += outputs * width;
-                let rows = source
-                    .get(start..*at)
-                    .ok_or_else(|| invalid("logit rows outside the copied batch"))?;
-                Ok(if reduced {
-                    Rows::Best(rows)
-                } else {
-                    Rows::Logits(rows, vocab)
-                })
+            let n = sequence.outputs.len();
+            let rows = logits.and_then(|_| match placement {
+                Placement::None => Ok(Vec::new()),
+                Placement::Host(first) => Ok(full
+                    .get(first * vocab..(first + n) * vocab)
+                    .ok_or_else(outside)?
+                    .chunks_exact(vocab.max(1))
+                    .map(Row::Logits)
+                    .collect()),
+                Placement::Device(first) => pairs
+                    .get(first * 2..(first + n) * 2)
+                    .ok_or_else(outside)?
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, &[token, word])| {
+                        let status = SampleStatus::from_word(word);
+                        if status != SampleStatus::Unconverged {
+                            return Ok(Row::Device {
+                                token: token as u32,
+                                status,
+                            });
+                        }
+                        let row = device_rows
+                            .as_ref()
+                            .ok_or_else(outside)?
+                            .get(first + offset)?;
+                        fallbacks += 1;
+                        Ok(Row::Penalized(row.to_vec1::<f32>()?))
+                    })
+                    .collect(),
             });
             let id = sequence.state.request;
             let Some(request) = self.requests.get_mut(&id).filter(|r| !r.cancelled) else {
@@ -918,6 +1241,7 @@ impl<M: HybridModel> HybridEngine<M> {
                 outcome,
             });
         }
+        self.stats.fallback_rows += fallbacks;
         self.requests.retain(|_, request| !request.cancelled);
         // Unaccepted pages, superseded slots and cancelled states retire here; their work
         // has completed, and publishing enqueued none.
@@ -968,15 +1292,9 @@ mod tests {
 
     #[test]
     fn test_rng_counter_overflow_leaves_bookkeeping_unchanged() {
-        let mut state = SamplingState {
-            seed: 1,
-            draws: u64::MAX,
-            options: SamplingOptions::default(),
-            guidance: None,
-            tokens: vec![],
-            finished: false,
-        };
-        assert!(state.sample(Row::Logits(&[1.0, 2.0])).is_err());
+        let mut state = SamplingState::new(1, SamplingOptions::default(), None);
+        state.draws = u64::MAX;
+        assert!(state.sample(Row::Logits(&[1.0, 2.0]), None).is_err());
         assert_eq!(state.draws, u64::MAX);
         assert_eq!(state.tokens, [] as [u32; 0]);
     }
@@ -1043,42 +1361,84 @@ mod tests {
 
     #[test]
     fn test_greedy_fast_path_keeps_the_first_maximum_and_rejects_nonfinite_rows() {
-        let mut state = SamplingState {
-            seed: 3,
-            draws: 0,
-            options: SamplingOptions::default(),
-            guidance: None,
-            tokens: vec![],
-            finished: false,
-        };
+        let mut state = SamplingState::new(3, SamplingOptions::default(), None);
+        state.draws = 0;
         assert!(matches!(
-            state.sample(Row::Logits(&[1.0, 3.0, 3.0, -2.0])),
+            state.sample(Row::Logits(&[1.0, 3.0, 3.0, -2.0]), None),
             Ok(Some(1))
         ));
         assert!(matches!(
-            state.sample(Row::Logits(&[-5.0, -5.0])),
+            state.sample(Row::Logits(&[-5.0, -5.0]), None),
             Ok(Some(0))
         ));
-        assert!(state.sample(Row::Logits(&[1.0, f32::INFINITY])).is_err());
+        assert!(
+            state
+                .sample(Row::Logits(&[1.0, f32::INFINITY]), None)
+                .is_err()
+        );
         assert_eq!((state.draws, state.tokens.as_slice()), (2, &[1, 0][..]));
     }
 
     #[test]
-    fn test_rollback_restores_history_and_draws() {
-        let mut state = SamplingState {
-            seed: 3,
-            draws: 0,
-            options: SamplingOptions::default(),
-            guidance: None,
-            tokens: vec![],
-            finished: false,
+    fn test_penalty_history_counts_samples_and_rolls_back() -> Result<()> {
+        let options = SamplingOptions {
+            frequency_penalty: Some(1.5),
+            repetition_penalty: Some(2.0),
+            ..Default::default()
         };
+        let mut state = SamplingState::new(3, options, None);
+        let row = [4.0, 3.9, -1.0];
+        assert_eq!(
+            state.sample(Row::Logits(&row), state.penalty_entries(&[]).as_ref())?,
+            Some(0)
+        );
+        // Token 0 is now penalized twice over: 4 / 2 - 1.5 = 0.5 < 3.9.
+        let mark = state.mark();
+        assert_eq!(
+            state.sample(Row::Logits(&row), state.penalty_entries(&[]).as_ref())?,
+            Some(1)
+        );
+        let entries = |state: &SamplingState| {
+            let mut e = state
+                .penalty_entries(&[])
+                .map(|(_, e)| e)
+                .unwrap_or_default();
+            e.sort_by_key(|e| e.token);
+            e
+        };
+        assert_eq!(
+            entries(&state),
+            [
+                PenaltyEntry { token: 0, count: 1 },
+                PenaltyEntry { token: 1, count: 1 }
+            ]
+        );
+        state.rollback(mark);
+        assert_eq!(entries(&state), [PenaltyEntry { token: 0, count: 1 }]);
+        // Drafts count as sampled for the output they precede; prompt context adds
+        // unsampled entries for the repetition penalty.
+        let drafted = state
+            .penalty_entries(&[2, 2])
+            .map(|(_, e)| e)
+            .unwrap_or_default();
+        assert!(drafted.contains(&PenaltyEntry { token: 2, count: 2 }));
+        if let Some(history) = &mut state.history {
+            history.context.insert(7);
+        }
+        assert!(entries(&state).contains(&PenaltyEntry { token: 7, count: 0 }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_rollback_restores_history_and_draws() {
+        let mut state = SamplingState::new(3, SamplingOptions::default(), None);
+        state.draws = 0;
         let mark = state.mark();
         assert!(matches!(
-            state.sample(Row::Logits(&[0.0, 1.0])),
+            state.sample(Row::Logits(&[0.0, 1.0]), None),
             Ok(Some(1))
         ));
-        assert!(state.sample(Row::Logits(&[f32::NAN, 1.0])).is_err());
+        assert!(state.sample(Row::Logits(&[f32::NAN, 1.0]), None).is_err());
         state.rollback(mark);
         assert_eq!(state.draws, 0);
         assert_eq!(state.tokens, [] as [u32; 0]);
