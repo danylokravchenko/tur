@@ -1,0 +1,48 @@
+{
+  "benchmark": "prefix",
+  "spacing": 256,
+  "rows": [
+    {
+      "entries": 8,
+      "prompt_tokens": 2048,
+      "keys_seconds": 0.0000777112453416149,
+      "hit_seconds": 0.000011729591836734694,
+      "miss_seconds": 0.000018189796289559838
+    },
+    {
+      "entries": 8,
+      "prompt_tokens": 8192,
+      "keys_seconds": 0.00014713676470588235,
+      "hit_seconds": 0.0000372682868852459,
+      "miss_seconds": 0.00007150607142857143
+    },
+    {
+      "entries": 8,
+      "prompt_tokens": 32768,
+      "keys_seconds": 0.0015235454545454545,
+      "hit_seconds": 0.00015201671732522796,
+      "miss_seconds": 0.00029367446198830407
+    },
+    {
+      "entries": 64,
+      "prompt_tokens": 2048,
+      "keys_seconds": 0.00003603869452449568,
+      "hit_seconds": 9.756682926829268e-6,
+      "miss_seconds": 0.000018595729267385647
+    },
+    {
+      "entries": 64,
+      "prompt_tokens": 8192,
+      "keys_seconds": 0.00014873157863501483,
+      "hit_seconds": 0.000037939523520485586,
+      "miss_seconds": 0.00007258345428156749
+    },
+    {
+      "entries": 64,
+      "prompt_tokens": 32768,
+      "keys_seconds": 0.0006012554642857143,
+      "hit_seconds": 0.0001636128790849673,
+      "miss_seconds": 0.00030265210843373496
+    }
+  ]
+}

@@ -38,6 +38,10 @@ harness = false
 required-features = ["metal"]
 
 [[bench]]
+name = "prefix"
+harness = false
+
+[[bench]]
 name = "kv_quality"
 harness = false
 required-features = ["metal"]

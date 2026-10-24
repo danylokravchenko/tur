@@ -162,7 +162,8 @@ every position anyway.
   again until a new snapshot is inserted.
 - **Memory:** each retained snapshot adds one recurrent slot to the plan
   (`PlanInputs::retained`; 20.2 MB on 0.8B). Pages are shared with live requests.
-- **Pressure:** eviction removes never-hit entries first, then the least recently used.
+- **Pressure:** eviction removes never-hit entries first, then the least recently used
+  (superseded in [P15](apple-silicon-p15-prefix.md) by saved compute per retained byte).
   It runs before the scheduler preempts or fails a request, and while snapshots keep the
   oldest admissible request's next chunk from fitting. That second case stops once
   evicting no longer frees pages.

@@ -1,0 +1,35 @@
+--- a/crates/tur-engine/src/backend/pipeline.rs
++++ b/crates/tur-engine/src/backend/pipeline.rs
+@@ -877,6 +877,11 @@
+             .config()
+             .max_running
+             .saturating_sub(producers.len());
++        // Restored requests pass older misses until the oldest waiting request reaches the
++        // queue-age limit.
++        let hits_first = waiting.first().is_some_and(|(arrival, _)| {
++            now.saturating_duration_since(*arrival) < self.scheduler.config().max_queue_wait
++        });
+         let inserted = self.prefix.stats().inserted;
+         for (_, id) in waiting {
+             if free == 0 {
+@@ -893,7 +898,9 @@
+                 continue;
+             }
+             producers.push(id);
+-            free -= 1;
++            if !hits_first {
++                free -= 1;
++            }
+             let pending = self
+                 .pending
+                 .get_mut(&id)
+@@ -912,6 +919,9 @@
+                 pending.prefix_checked = Some(inserted);
+                 continue;
+             };
++            if hits_first {
++                free -= 1;
++            }
+             pending.handle = self.engine.adopt(pending.handle, &hit.state)?;
+             pending.consumed = hit.length;
+             pending.running = true;

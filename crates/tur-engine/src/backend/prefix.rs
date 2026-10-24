@@ -21,13 +21,19 @@
 //! after comparing every token. The pool pins model identity and state layout, so entries
 //! cannot cross models, quantizations or positional settings.
 //!
-//! Eviction removes the least recently used entry, never-hit entries first. Pages and
-//! slots return to the pool only when no request still shares them and no unfenced work
-//! references them (see [`tur_metal::pool`]).
+//! A lookup probes only the lengths at which entries exist, so its cost follows the
+//! number of entries, not the prompt's length.
+//!
+//! Eviction removes the entry that saves the fewest tokens per retained byte: the tokens
+//! it covers beyond the deepest retained entry it extends, times how often its prefix was
+//! recently computed or restored, over its recurrent slot and the pages only it holds.
+//! Counts are halved periodically, so prefixes that stop recurring lose their protection.
+//! A new entry is always kept. Pages and slots return to the pool only when no request
+//! still shares them and no unfenced work references them (see [`tur_metal::pool`]).
 
 use candle_core::Tensor;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     hash::{BuildHasher, RandomState},
     sync::Arc,
 };
@@ -93,12 +99,18 @@ pub struct PrefixStats {
 
 struct Entry {
     tokens: Arc<[u32]>,
+    /// Chain keys of every prefix of `tokens`, to find the entries it extends.
+    keys: Box<[u64]>,
     state: ModelState,
     /// `[1, vocab]` model logits after the last token, for prompt-end snapshots.
     logits: Option<Tensor>,
     last_use: u64,
-    hits: u64,
 }
+
+/// Events (insertions and hits) per entry of capacity between halvings of the reuse
+/// counts; at least [`MIN_AGING_EVENTS`].
+const AGING_EVENTS_PER_ENTRY: u64 = 32;
+const MIN_AGING_EVENTS: u64 = 256;
 
 /// Per-token chain hashes of one request's tokens, extended as it generates.
 #[derive(Clone, Debug, Default)]
@@ -118,6 +130,27 @@ impl PrefixKeys {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+
+    /// Key of the first `length` tokens, if covered.
+    pub fn get(&self, length: usize) -> Option<u64> {
+        self.keys.get(length.checked_sub(1)?).copied()
+    }
+
+    /// Longest prefix both key chains cover with equal keys. Chained keys agree on every
+    /// shorter prefix, so this is a binary search; equal keys still need their tokens
+    /// compared before use.
+    pub fn shared(&self, other: &Self) -> usize {
+        let (mut low, mut high) = (0, self.keys.len().min(other.keys.len()));
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.keys[middle] == other.keys[middle] {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low
+    }
 }
 
 /// A verified snapshot of a request's first `length` tokens.
@@ -133,6 +166,14 @@ pub struct PrefixCache {
     config: PrefixConfig,
     hasher: RandomState,
     map: HashMap<u64, Entry>,
+    /// Entries per token length, so lookups probe only lengths that exist.
+    lengths: BTreeMap<usize, usize>,
+    /// Recent insertions and hits per key, including evicted keys: a prefix computed
+    /// again after its eviction counts as reused.
+    reuse: HashMap<u64, u32>,
+    events: u64,
+    /// Bytes of one K/V page and one recurrent slot, from the first snapshot's pool.
+    unit: Option<(usize, usize)>,
     tick: u64,
     stats: PrefixStats,
 }
@@ -143,6 +184,10 @@ impl PrefixCache {
             config,
             hasher: RandomState::new(),
             map: HashMap::with_capacity(config.entries),
+            lengths: BTreeMap::new(),
+            reuse: HashMap::new(),
+            events: 0,
+            unit: None,
             tick: 0,
             stats: PrefixStats::default(),
         }
@@ -194,6 +239,54 @@ impl PrefixCache {
         self.config.enabled() && position > 0 && position.is_multiple_of(self.config.spacing)
     }
 
+    /// Deepest snapshot a request computing a `prompt`-token prompt will insert within the
+    /// first `shared` tokens of its sequence: its prompt end, or an aligned boundary.
+    pub fn reachable(&self, shared: usize, prompt: usize) -> usize {
+        if !self.config.enabled() {
+            0
+        } else if shared >= prompt {
+            prompt
+        } else {
+            shared - shared % self.config.spacing
+        }
+    }
+
+    /// Key and length of the deepest verified entry for a prefix of `tokens` whose length
+    /// `accept` admits, counting rejected hash matches. A snapshot of all of `tokens`
+    /// needs its logits, since an output must come from them.
+    fn find(
+        &self,
+        keys: &PrefixKeys,
+        tokens: &[u32],
+        accept: impl Fn(usize) -> bool,
+        collisions: &mut u64,
+    ) -> Option<(u64, usize)> {
+        let longest = tokens.len().min(keys.keys.len());
+        for (&length, _) in self.lengths.range(1..=longest).rev() {
+            let key = keys.keys[length - 1];
+            let Some(entry) = self.map.get(&key) else {
+                continue;
+            };
+            if tokens.get(..length) != Some(&entry.tokens[..]) {
+                *collisions += 1;
+                continue;
+            }
+            if accept(length) && (length < tokens.len() || entry.logits.is_some()) {
+                return Some((key, length));
+            }
+        }
+        None
+    }
+
+    /// Tokens of `tokens` a lookup could restore now, without counting it as one.
+    pub fn depth(&self, keys: &PrefixKeys, tokens: &[u32]) -> usize {
+        if !self.config.enabled() {
+            return 0;
+        }
+        self.find(keys, tokens, |_| true, &mut 0)
+            .map_or(0, |(_, length)| length)
+    }
+
     /// Deepest verified snapshot of a prefix of `tokens` whose length `accept` admits. A
     /// snapshot of all of `tokens` needs its logits, since an output must come from them.
     pub fn lookup(
@@ -206,30 +299,38 @@ impl PrefixCache {
             return None;
         }
         self.stats.lookups += 1;
-        let longest = tokens.len().min(keys.keys.len());
-        for length in (1..=longest).rev() {
-            let Some(entry) = self.map.get_mut(&keys.keys[length - 1]) else {
-                continue;
-            };
-            if tokens.get(..length) != Some(&entry.tokens[..]) {
-                self.stats.collisions += 1;
-                continue;
-            }
-            if !accept(length) || (length == tokens.len() && entry.logits.is_none()) {
-                continue;
-            }
-            self.tick += 1;
-            entry.last_use = self.tick;
-            entry.hits += 1;
-            self.stats.hits += 1;
-            self.stats.hit_tokens += length as u64;
-            return Some(Restored {
-                length,
-                state: entry.state.clone(),
-                logits: entry.logits.clone(),
+        let mut collisions = 0;
+        let found = self.find(keys, tokens, accept, &mut collisions);
+        self.stats.collisions += collisions;
+        let (key, length) = found?;
+        self.tick += 1;
+        self.observe(key);
+        let entry = self.map.get_mut(&key)?;
+        entry.last_use = self.tick;
+        self.stats.hits += 1;
+        self.stats.hit_tokens += length as u64;
+        Some(Restored {
+            length,
+            state: entry.state.clone(),
+            logits: entry.logits.clone(),
+        })
+    }
+
+    /// Count one insertion or hit of `key`, halving every count once enough accumulated.
+    fn observe(&mut self, key: u64) {
+        let count = self.reuse.entry(key).or_default();
+        *count = count.saturating_add(1);
+        self.events += 1;
+        let period = (self.config.entries as u64)
+            .saturating_mul(AGING_EVENTS_PER_ENTRY)
+            .max(MIN_AGING_EVENTS);
+        if self.events >= period {
+            self.events = 0;
+            self.reuse.retain(|_, count| {
+                *count /= 2;
+                *count > 0
             });
         }
-        None
     }
 
     /// Retain `state`, committed after exactly `tokens` (covered by `keys`), with the
@@ -251,7 +352,19 @@ impl PrefixCache {
         let Some(&key) = keys.keys.get(tokens.len() - 1) else {
             return Err(invalid("prefix keys do not cover the snapshot"));
         };
+        if self.unit.is_none() {
+            let description = state.description();
+            self.unit = Some((
+                description.page_bytes()?,
+                if description.has_recurrent() {
+                    description.recurrent_slot_bytes()?
+                } else {
+                    0
+                },
+            ));
+        }
         self.tick += 1;
+        self.observe(key);
         if let Some(entry) = self.map.get_mut(&key) {
             if entry.tokens[..] == *tokens {
                 entry.last_use = self.tick;
@@ -272,36 +385,68 @@ impl PrefixCache {
             key,
             Entry {
                 tokens: tokens.into(),
+                keys: keys.keys[..tokens.len()].into(),
                 state: state.clone(),
                 logits: logits.cloned(),
                 last_use: self.tick,
-                hits: 0,
             },
         );
+        *self.lengths.entry(tokens.len()).or_default() += 1;
         self.stats.inserted += 1;
         Ok(())
     }
 
-    /// Drop the least valuable entry: never-hit before hit, then least recently used.
-    /// Returns whether one was dropped.
+    /// Recently saved tokens per retained byte. A request matching the entry would
+    /// otherwise restore the deepest retained entry it extends, so it saves the tokens
+    /// beyond that one, once per recent insertion or hit of its prefix; the bytes are its
+    /// slot and the pages only it holds. Ancestors are found by key, without comparing
+    /// tokens: a collision only misjudges an eviction.
+    fn value(&self, key: u64, entry: &Entry) -> f64 {
+        let (page_bytes, slot_bytes) = self.unit.unwrap_or((1, 1));
+        let length = entry.tokens.len();
+        let ancestor = self
+            .lengths
+            .range(1..length)
+            .rev()
+            .map(|(&shorter, _)| shorter)
+            .find(|&shorter| self.map.contains_key(&entry.keys[shorter - 1]))
+            .unwrap_or(0);
+        let reuse = self.reuse.get(&key).copied().unwrap_or(0).max(1);
+        let bytes = entry.state.exclusive().pages * page_bytes + slot_bytes;
+        (length - ancestor) as f64 * f64::from(reuse) / bytes.max(1) as f64
+    }
+
+    /// Drop the entry saving the fewest tokens per retained byte, the least recently used
+    /// among equals. Returns whether one was dropped.
     pub fn evict(&mut self) -> bool {
         let Some(key) = self
             .map
             .iter()
-            .min_by_key(|(_, e)| (e.hits > 0, e.last_use))
-            .map(|(key, _)| *key)
+            .map(|(key, entry)| (self.value(*key, entry), entry.last_use, *key))
+            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+            .map(|(_, _, key)| key)
         else {
             return false;
         };
-        self.map.remove(&key);
+        if let Some(entry) = self.map.remove(&key)
+            && let Some(count) = self.lengths.get_mut(&entry.tokens.len())
+        {
+            *count -= 1;
+            if *count == 0 {
+                self.lengths.remove(&entry.tokens.len());
+            }
+        }
         self.stats.evicted += 1;
         true
     }
 
-    /// Drop every entry.
+    /// Drop every entry and reuse count.
     pub fn clear(&mut self) {
         self.stats.evicted += self.map.len() as u64;
         self.map.clear();
+        self.lengths.clear();
+        self.reuse.clear();
+        self.events = 0;
     }
 }
 
@@ -472,6 +617,121 @@ mod tests {
         let usage = pool.usage()?;
         assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
         assert!(!cache.evict());
+        Ok(())
+    }
+
+    #[test]
+    fn test_lookups_probe_only_retained_lengths_and_depth_counts_nothing() -> Result<()> {
+        let pool = pool()?;
+        let mut cache = cache(3);
+        let prompt: Vec<u32> = (0..12).collect();
+        let keys = cache.keys(None, &prompt);
+        for length in [4, 8, 9] {
+            cache.insert(&keys, &prompt[..length], &state(&pool, length)?, None)?;
+        }
+        assert_eq!(cache.depth(&keys, &prompt), 9);
+        assert_eq!(cache.depth(&keys, &prompt[..8]), 4);
+        assert_eq!(cache.stats().lookups, 0);
+        // Evicting the 9-token entry (it saves one token beyond the 8-token one) leaves
+        // the length index consistent.
+        assert!(cache.evict());
+        assert_eq!(length(cache.lookup(&keys, &prompt, |_| true)), Some(8));
+        cache.clear();
+        assert_eq!(cache.depth(&keys, &prompt), 0);
+        cache.insert(&keys, &prompt[..4], &state(&pool, 4)?, None)?;
+        assert_eq!(length(cache.lookup(&keys, &prompt, |_| true)), Some(4));
+        Ok(())
+    }
+
+    #[test]
+    fn test_shared_keys_and_reachable_snapshots() {
+        let cache = cache(2);
+        let prompt: Vec<u32> = (0..10).collect();
+        let mut other = prompt.clone();
+        other[6] = 99;
+        let (keys, other_keys) = (cache.keys(None, &prompt), cache.keys(None, &other));
+        assert_eq!(keys.shared(&other_keys), 6);
+        assert_eq!(keys.shared(&cache.keys(None, &prompt[..3])), 3);
+        assert_eq!(keys.shared(&cache.keys(Some("tenant"), &prompt)), 0);
+        assert_eq!(keys.get(6), other_keys.get(6));
+        assert_eq!(keys.get(0), None);
+        // A producer inserts aligned snapshots and its prompt end.
+        assert_eq!(cache.reachable(6, 10), 4);
+        assert_eq!(cache.reachable(10, 10), 10);
+        assert_eq!(cache.reachable(12, 7), 7);
+        assert_eq!(cache.reachable(3, 10), 0);
+        assert_eq!(PrefixCache::new(PrefixConfig::DISABLED).reachable(8, 8), 0);
+    }
+
+    #[test]
+    fn test_eviction_keeps_entries_saving_the_most_recurring_work() -> Result<()> {
+        let pool = pool()?;
+        let mut cache = cache(2);
+        let prompts: Vec<Vec<u32>> = (0..4u32)
+            .map(|p| (0..8).map(|t| t + p * 8).collect())
+            .collect();
+        let keys: Vec<_> = prompts.iter().map(|p| cache.keys(None, p)).collect();
+        // The first prefix is computed, evicted by two single-use prefixes, then computed
+        // again: the repeat outranks newer single-use entries.
+        cache.insert(&keys[0], &prompts[0][..4], &state(&pool, 4)?, None)?;
+        cache.insert(&keys[1], &prompts[1][..4], &state(&pool, 4)?, None)?;
+        cache.insert(&keys[2], &prompts[2][..4], &state(&pool, 4)?, None)?;
+        assert!(cache.lookup(&keys[0], &prompts[0], |_| true).is_none());
+        cache.insert(&keys[0], &prompts[0][..4], &state(&pool, 4)?, None)?;
+        cache.insert(&keys[3], &prompts[3][..4], &state(&pool, 4)?, None)?;
+        assert_eq!(
+            length(cache.lookup(&keys[0], &prompts[0], |_| true)),
+            Some(4)
+        );
+        // An extension saves only its tokens beyond the entry it extends. A new entry is
+        // always kept; at the next insertion the extension goes before either full
+        // prefix, although it is newer and longer than the one it extends.
+        drop(cache);
+        pool.reclaim();
+        let mut wider = self::cache(3);
+        wider.insert(&keys[0], &prompts[0][..4], &state(&pool, 4)?, None)?;
+        wider.insert(&keys[0], &prompts[0][..6], &state(&pool, 6)?, None)?;
+        wider.insert(&keys[1], &prompts[1][..4], &state(&pool, 4)?, None)?;
+        wider.insert(&keys[2], &prompts[2][..4], &state(&pool, 4)?, None)?;
+        assert_eq!(
+            length(wider.lookup(&keys[0], &prompts[0], |_| true)),
+            Some(4)
+        );
+        assert_eq!(
+            length(wider.lookup(&keys[1], &prompts[1], |_| true)),
+            Some(4)
+        );
+        assert_eq!(wider.stats().evicted, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_reuse_counts_age_away() -> Result<()> {
+        let pool = pool()?;
+        let mut cache = cache(2);
+        let stale: Vec<u32> = (0..8).collect();
+        let stale_keys = cache.keys(None, &stale);
+        cache.insert(&stale_keys, &stale[..4], &state(&pool, 4)?, None)?;
+        for _ in 0..20 {
+            assert!(cache.lookup(&stale_keys, &stale, |_| true).is_some());
+        }
+        // A stream of single-use prefixes halves the stale count (21) every aging period
+        // until it ties them and, as the least recently used, goes.
+        let mut evicted_at = None;
+        for salt in 1..=(16 * MIN_AGING_EVENTS as u32) {
+            pool.reclaim();
+            let fresh: Vec<u32> = (0..4).map(|t| t + salt * 8).collect();
+            let keys = cache.keys(None, &fresh);
+            cache.insert(&keys, &fresh, &state(&pool, 4)?, None)?;
+            if cache.depth(&stale_keys, &stale) == 0 {
+                evicted_at = Some(salt);
+                break;
+            }
+        }
+        assert!(
+            evicted_at.is_some_and(|salt| salt > 3 * MIN_AGING_EVENTS as u32),
+            "evicted after {evicted_at:?} fresh prefixes"
+        );
         Ok(())
     }
 

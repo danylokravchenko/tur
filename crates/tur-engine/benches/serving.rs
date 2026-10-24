@@ -13,7 +13,8 @@
 //! narrows with `TUR_BENCH_CONCURRENCY=1,8` and `TUR_BENCH_OUTPUT=64`.
 //! `TUR_BENCH_SAMPLING=0.7,20,0.95` samples instead of greedy decoding,
 //! `TUR_BENCH_DEVICE_SAMPLING=0` samples on the host, and
-//! `TUR_BENCH_WORKLOADS=prefix TUR_BENCH_SPACING=0,256` runs the prefix-reuse workloads;
+//! `TUR_BENCH_WORKLOADS=prefix TUR_BENCH_SPACING=0,256` runs the prefix-reuse workloads and
+//! `TUR_BENCH_WORKLOADS=reuse` the prefix-scheduling ones on default pipelines;
 //! `TUR_BENCH_WORKLOADS=arrivals TUR_BENCH_RATE=2,4` runs open-loop Poisson arrivals, and
 //! `TUR_BENCH_WORKLOADS=grammar` grammar-constrained requests.
 //! `TUR_BENCH_WORKLOADS=speculation TUR_BENCH_DRAFT=0,4` compares adaptive prompt lookup
@@ -126,6 +127,7 @@ fn run_requests(pipeline: &mut InferencePipeline, requests: &[GenerationRequest]
     let mut bursts: Vec<Vec<f64>> = vec![Vec::new(); ids.len()];
     let mut token_ids: Vec<Vec<u32>> = vec![Vec::new(); ids.len()];
     let mut ttft = vec![0.0; ids.len()];
+    let mut cached_each = vec![0; ids.len()];
     let mut cached = 0;
     let (mut drafted, mut accepted, mut draft_passes, mut draft_seconds) = (0, 0, 0, 0.0);
     let (mut generated, mut prompt_tokens, mut passes, mut packed) = (0, 0, 0, 0);
@@ -175,6 +177,7 @@ fn run_requests(pipeline: &mut InferencePipeline, requests: &[GenerationRequest]
             let stats = result?;
             if let Some(&index) = ids.get(&id) {
                 ttft[index] = stats.first_token.as_secs_f64();
+                cached_each[index] = stats.cached_tokens;
             }
             generated += stats.generated_tokens;
             prompt_tokens += stats.prompt_tokens;
@@ -206,6 +209,7 @@ fn run_requests(pipeline: &mut InferencePipeline, requests: &[GenerationRequest]
         "wall_seconds": wall, "output_tokens_per_second": generated as f64 / wall,
         "total_tokens_per_second": (generated + prompt_tokens) as f64 / wall,
         "ttft_seconds": {"p50": percentile(&ttft, 0.5), "p95": percentile(&ttft, 0.95), "max": percentile(&ttft, 1.0)},
+        "ttft_each": ttft, "cached_each": cached_each,
         "itl_seconds": {"p50": percentile(&itl, 0.5), "p95": percentile(&itl, 0.95), "p99": percentile(&itl, 0.99)},
         "burst_gap_seconds": {"p50": percentile(&burst_gaps, 0.5), "p95": percentile(&burst_gaps, 0.95), "p99": percentile(&burst_gaps, 0.99)},
         "tokens_per_burst": generated as f64 / burst_count.max(1) as f64,
@@ -378,6 +382,247 @@ fn prefix_runs(
         json!({"workload": "multi_turn", "spacing": spacing, "conversations": 4, "turns": turns,
         "prefix": format!("{prefix:?}"), "snapshot_slot_bytes": slot_bytes}),
     );
+    Ok(runs)
+}
+
+/// A user turn of about `tokens` tokens behind an optional system prompt.
+fn turn(
+    tokenizer: &Tokenizer,
+    system: Option<&str>,
+    tokens: usize,
+    salt: usize,
+    output: usize,
+    options: SamplingOptions,
+) -> Result<GenerationRequest> {
+    let mut request = GenerationRequest::new(prompt(tokenizer, tokens, salt)?, output);
+    if let Some(system) = system {
+        request
+            .messages
+            .insert(0, ChatMessage::new(Role::System, system.to_owned()));
+    }
+    request.seed = salt as u64;
+    request.sampling = options;
+    Ok(request)
+}
+
+/// A default pipeline for `running` sequences, with warmed kernels and an empty cache.
+fn reuse_pipeline(
+    factory: &ModelFactory,
+    tokenizer: &Tokenizer,
+    running: usize,
+    options: SamplingOptions,
+) -> Result<InferencePipeline> {
+    let mut pipeline = InferencePipeline::new(factory, PipelineConfig::new(running, CHUNK))?;
+    let warm = Burst {
+        prompts: vec![prompt(tokenizer, 300, 99)?],
+        output: 8,
+    };
+    burst(&mut pipeline, &warm, options)?;
+    pipeline.clear_prefix_cache();
+    Ok(pipeline)
+}
+
+/// Mean of `values` at `indices`.
+fn mean_at(values: &Value, indices: impl Iterator<Item = usize>) -> f64 {
+    let picked: Vec<f64> = indices.filter_map(|i| values[i].as_f64()).collect();
+    picked.iter().sum::<f64>() / picked.len().max(1) as f64
+}
+
+/// Prefix-scheduling workloads on the default pipeline configuration (P15): a cold shared
+/// system prompt reached by a burst, queue contention between warm and cold prompts, an
+/// agent loop, a change of hot prefix under churn, and traffic with little or no reuse.
+fn reuse_runs(
+    factory: &ModelFactory,
+    tokenizer: &Tokenizer,
+    options: SamplingOptions,
+) -> Result<Vec<Value>> {
+    let mut runs = Vec::new();
+    let record =
+        |runs: &mut Vec<Value>, name: &str, pipeline: &InferencePipeline, result: Value| {
+            report(name, &result);
+            let prefix = pipeline.prefix_stats();
+            eprintln!("  {prefix:?}, {} retained", pipeline.memory_plan().retained);
+            runs.push(json!({"workload": name, "prefix": format!("{prefix:?}"),
+            "retained_entries": pipeline.memory_plan().retained, "result": result}));
+        };
+
+    // Eight users reach one cold 1.5K-token system prompt together.
+    let mut pipeline = reuse_pipeline(factory, tokenizer, 8, options)?;
+    let system = prompt(tokenizer, 1536, 17)?;
+    let users = (0..8)
+        .map(|u| turn(tokenizer, Some(&system), 48, 4000 + u, 32, options))
+        .collect::<Result<Vec<_>>>()?;
+    let result = run_requests(&mut pipeline, &users)?;
+    record(&mut runs, "cold_shared", &pipeline, result);
+
+    // Four running slots, sixteen requests at once: even ones share a warmed 1K-token
+    // system prompt, odd ones are cold 1K-token prompts.
+    drop(pipeline);
+    let mut pipeline = reuse_pipeline(factory, tokenizer, 4, options)?;
+    let system = prompt(tokenizer, 1024, 18)?;
+    run_requests(
+        &mut pipeline,
+        &[turn(tokenizer, Some(&system), 32, 4100, 8, options)?],
+    )?;
+    let requests = (0..16)
+        .map(|i| {
+            if i % 2 == 0 {
+                turn(tokenizer, Some(&system), 32, 4200 + i, 32, options)
+            } else {
+                turn(tokenizer, None, 1056, 4200 + i, 32, options)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let result = run_requests(&mut pipeline, &requests)?;
+    eprintln!(
+        "contention TTFT mean: warm {:.0} ms, cold {:.0} ms",
+        mean_at(&result["ttft_each"], (0..16).step_by(2)) * 1e3,
+        mean_at(&result["ttft_each"], (1..16).step_by(2)) * 1e3
+    );
+    record(&mut runs, "contention", &pipeline, result);
+
+    // Four agents share a 1K-token tool manual; each step appends the reply and a
+    // 128-token tool result.
+    drop(pipeline);
+    let mut pipeline = reuse_pipeline(factory, tokenizer, 8, options)?;
+    let manual = prompt(tokenizer, 1024, 19)?;
+    let mut agents: Vec<Vec<ChatMessage>> = (0..4)
+        .map(|a| -> Result<Vec<ChatMessage>> {
+            Ok(vec![
+                ChatMessage::new(Role::System, manual.clone()),
+                ChatMessage::new(Role::User, prompt(tokenizer, 64, 4300 + a)?),
+            ])
+        })
+        .collect::<Result<_>>()?;
+    let mut steps = Vec::new();
+    for step in 0..5 {
+        let requests: Vec<GenerationRequest> = agents
+            .iter()
+            .enumerate()
+            .map(|(a, messages)| {
+                let mut request = GenerationRequest::new(String::new(), 48);
+                request.messages.clone_from(messages);
+                request.render.enable_thinking = Some(false);
+                request.seed = (a * 100 + step) as u64;
+                request.sampling = options;
+                request
+            })
+            .collect();
+        let mut ids = HashMap::new();
+        for (a, request) in requests.iter().enumerate() {
+            ids.insert(pipeline.submit_request(request)?, a);
+        }
+        let start = Instant::now();
+        let (mut ttft, mut prompt_tokens, mut cached) = (Vec::new(), 0, 0);
+        let mut replies = vec![String::new(); requests.len()];
+        while pipeline.active_request_count() > 0 {
+            for (id, result) in pipeline.step_streaming()?.completed {
+                let stats = result?;
+                ttft.push(stats.first_token.as_secs_f64());
+                prompt_tokens += stats.prompt_tokens;
+                cached += stats.cached_tokens;
+                replies[ids[&id]] = stats.generated_text;
+            }
+        }
+        for (a, reply) in replies.into_iter().enumerate() {
+            agents[a].push(ChatMessage::new(Role::Assistant, reply));
+            agents[a].push(ChatMessage::new(
+                Role::Tool,
+                prompt(tokenizer, 128, 4400 + a * 10 + step)?,
+            ));
+        }
+        steps.push(
+            json!({"step": step, "prompt_tokens": prompt_tokens, "cached_tokens": cached,
+            "ttft_seconds": {"p50": percentile(&ttft, 0.5), "max": percentile(&ttft, 1.0)},
+            "wall_seconds": start.elapsed().as_secs_f64()}),
+        );
+    }
+    let (prompt_total, cached_total, wall) = steps.iter().fold((0, 0, 0.0), |(p, c, w), s| {
+        (
+            p + s["prompt_tokens"].as_u64().unwrap_or(0),
+            c + s["cached_tokens"].as_u64().unwrap_or(0),
+            w + s["wall_seconds"].as_f64().unwrap_or(0.0),
+        )
+    });
+    let prefix = pipeline.prefix_stats();
+    eprintln!(
+        "agent: {cached_total} of {prompt_total} prompt tokens cached, {wall:.2} s; {prefix:?}"
+    );
+    runs.push(
+        json!({"workload": "agent", "steps": steps, "prefix": format!("{prefix:?}"),
+        "retained_entries": pipeline.memory_plan().retained}),
+    );
+
+    // One hot 1K-token prefix per phase beside three cold 1K-token prompts per wave; the
+    // hot prefix changes after five waves.
+    drop(pipeline);
+    let mut pipeline = reuse_pipeline(factory, tokenizer, 4, options)?;
+    let mut phases = Vec::new();
+    for phase in 0..2 {
+        let system = prompt(tokenizer, 1024, 20 + phase)?;
+        let (mut hot_cached, mut cold_cached, mut wall) = (0, 0, 0.0);
+        for wave in 0..5 {
+            let mut requests = vec![turn(
+                tokenizer,
+                Some(&system),
+                32,
+                4500 + phase * 100 + wave,
+                16,
+                options,
+            )?];
+            for cold in 0..3 {
+                requests.push(turn(
+                    tokenizer,
+                    None,
+                    1056,
+                    4600 + phase * 100 + wave * 10 + cold,
+                    16,
+                    options,
+                )?);
+            }
+            let result = run_requests(&mut pipeline, &requests)?;
+            hot_cached += result["cached_each"][0].as_u64().unwrap_or(0);
+            cold_cached += (1..4)
+                .map(|i| result["cached_each"][i].as_u64().unwrap_or(0))
+                .sum::<u64>();
+            wall += result["wall_seconds"].as_f64().unwrap_or(0.0);
+        }
+        eprintln!(
+            "churn phase {phase}: hot cached {hot_cached}, cold cached {cold_cached}, {wall:.2} s"
+        );
+        phases.push(json!({"phase": phase, "hot_cached_tokens": hot_cached,
+            "cold_cached_tokens": cold_cached, "wall_seconds": wall}));
+    }
+    let prefix = pipeline.prefix_stats();
+    eprintln!(
+        "  churn {prefix:?}, {} retained",
+        pipeline.memory_plan().retained
+    );
+    runs.push(
+        json!({"workload": "churn", "phases": phases, "prefix": format!("{prefix:?}"),
+        "retained_entries": pipeline.memory_plan().retained}),
+    );
+
+    // Sixteen distinct 512-token prompts at eight running: only the template header is
+    // shared.
+    drop(pipeline);
+    let mut pipeline = reuse_pipeline(factory, tokenizer, 8, options)?;
+    let requests = (0..16)
+        .map(|i| turn(tokenizer, None, 512, 4700 + i, 32, options))
+        .collect::<Result<Vec<_>>>()?;
+    let result = run_requests(&mut pipeline, &requests)?;
+    record(&mut runs, "no_reuse", &pipeline, result);
+
+    // Eight users share a cold 300-token system prompt, just over one snapshot boundary,
+    // then distinct 256-token turns.
+    drop(pipeline);
+    let mut pipeline = reuse_pipeline(factory, tokenizer, 8, options)?;
+    let system = prompt(tokenizer, 300, 21)?;
+    let users = (0..8)
+        .map(|u| turn(tokenizer, Some(&system), 256, 4800 + u, 32, options))
+        .collect::<Result<Vec<_>>>()?;
+    let result = run_requests(&mut pipeline, &users)?;
+    record(&mut runs, "short_shared", &pipeline, result);
     Ok(runs)
 }
 
@@ -622,14 +867,17 @@ fn main() -> Result<()> {
             runs.extend(prefix_runs(&factory, &tokenizer, spacing, options)?);
         }
     }
+    if workloads.contains("reuse") {
+        runs.extend(reuse_runs(&factory, &tokenizer, options)?);
+    }
     if workloads.contains("speculation") {
         let repeats = env_sizes("TUR_BENCH_REPEATS", "3")?
             .first()
             .copied()
             .unwrap_or(3);
         let heads = env_sizes("TUR_BENCH_MTP", "0")?;
-        let prompts = std::env::var("TUR_BENCH_SPECULATION")
-            .unwrap_or_else(|_| "repeat,novel".into());
+        let prompts =
+            std::env::var("TUR_BENCH_SPECULATION").unwrap_or_else(|_| "repeat,novel".into());
         let configs = env_sizes("TUR_BENCH_DRAFT", "0,4")?
             .into_iter()
             .flat_map(|draft| {

@@ -71,6 +71,17 @@ sequences and on repetitive text the head's upkeep costs 3–4%, so MTP stays op
 compatible learned drafter exists for this checkpoint. See the
 [P14 report](apple-silicon-p14-speculation.md).
 
+P15 ran on 2026-10-24, on the M1 and the 0.8B checkpoint only. Requests reaching a
+cold shared prefix together now wait for the oldest to compute it instead of computing it
+concurrently: eight users behind a cold 1.5K-token system prompt get their first token
+5.6× sooner (9.58 → 1.72 s). Eviction now keeps the snapshots that save the most
+recomputation per retained byte, so a recurring prefix survives churn (restored in 3 of
+5 waves; P7's LRU order: none). An agent loop caches 83% of its prompt instead of 72%
+and runs 1.25× faster. Lookups probe only lengths that hold entries (32K-token hit 152 →
+6.6 µs). Admitting restorable prefixes first was rejected for starving cold requests.
+Low-reuse, decode and mixed traffic are unchanged. See the
+[P15 report](apple-silicon-p15-prefix.md).
+
 Post-P8 roadmap added on 2026-10-23: P9 establishes a fresh comparative baseline;
 P10–P15 evaluate kernel, quantization, execution, speculation and prefix-scheduling
 improvements; production release moves from P9 to P16. These packages are planned,
@@ -706,6 +717,11 @@ gains are not evidence for learned drafting on novel text. References:
 
 ### P15 — Prefix-aware scheduling and retention
 
+Measured on the M1 and 0.8B checkpoint (2026-10-24): waiting for in-flight producers and
+eviction by saved compute per retained byte are kept; admitting restorable prefixes first
+is rejected (patch kept), spacing stays 256 and a radix index is rejected by bound.
+Results are in the [P15 report](apple-silicon-p15-prefix.md).
+
 Depends on P9 and P7; integrate with P14 only where their state semantics are compatible.
 
 1. Measure shared-prefix locality, lookup cost, saved prefill time and retained state
@@ -755,7 +771,7 @@ and ordinary decoding separately. No improvement remains a possible experiment o
 | P12 F16 recurrent matrices versus F32 | 2× smaller matrix payload; less than 2× smaller total recurrent state | Already available in P6, not a new gain. Historical serving throughput improved only 4–5% at concurrency 8–16; long-context quality and speculative compatibility remain constraints |
 | P11 calibrated weights | Better quality at equal bytes, or fewer bytes at equal quality; no fixed speedup forecast | Same-bit calibration may change no runtime cost. Lower precision helps only if corresponding kernels win and sensitive tensors retain adequate precision. **Measured 2026-10-24 (0.8B, M1): GPTQ halved Q4K's KL at equal bytes with unchanged speed; the tied-head embedding cut Q4K weights 2.2× at equal quality** |
 | P14 learned/confidence speculation, novel text at low concurrency | Exploratory goal: 1.20–1.50× tokens/s over the best applicable P8 policy | Low confidence until a compatible drafter and total cost are measured. At high concurrency the desired result may simply be neutral fallback. **Measured 2026-10-24 (0.8B, M1): 1.09–1.36× over the best P8 policy (1.20–1.38× over ordinary) at one to four sequences, from a cheaper native MTP head, not a learned drafter; −3–4% at eight sequences, where MTP stays opt-in** |
-| P15 prefix-aware scheduling | Lower TTFT and fewer recomputed tokens on reuse-heavy traffic; no universal multiplier | P7 already captures large prefix wins. Additional benefit depends on hit rate, queue contention and snapshot memory; no gain is expected with no reuse |
+| P15 prefix-aware scheduling | Lower TTFT and fewer recomputed tokens on reuse-heavy traffic; no universal multiplier | P7 already captures large prefix wins. Additional benefit depends on hit rate, queue contention and snapshot memory; no gain is expected with no reuse. **Measured 2026-10-24 (0.8B, M1): cold shared burst TTFT 5.6× lower with 5.7× fewer prefill tokens; agent loop 1.25×; recurring prefix kept under churn (−7.6% wall); no-reuse, decode and mixed traffic unchanged** |
 | Metal TensorOps on newer Macs; full flagship MoE | No numerical forecast yet | Requires same-device before/after measurements and real checkpoint execution. Changing hardware is not a software speedup |
 
 The [kernel performance pass](apple-silicon-kernel-performance.md) predates P9 and is

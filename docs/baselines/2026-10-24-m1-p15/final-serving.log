@@ -1,0 +1,7 @@
+    Finished `pre-release` profile [optimized] target(s) in 0.41s
+     Running benches/serving.rs (target/pre-release/deps/serving-3b78293a235d75d6)
+decode-heavy c=1: 48.9 out tok/s, TTFT p50 151 ms, ITL p50/p95 17.8/18.8 ms, burst gap p50/p95 17.8/18.8 ms (1.00 tok/burst), pass p50 17.8 ms (schedule 0.01, encode 3.38, wait 14.6, publish 0.06, idle 0.08), cached 0
+decode-heavy c=4: 117.7 out tok/s, TTFT p50 472 ms, ITL p50/p95 23.0/23.8 ms, burst gap p50/p95 23.0/23.8 ms (1.00 tok/burst), pass p50 23.0 ms (schedule 0.02, encode 3.88, wait 18.9, publish 0.13, idle 0.16), cached 0
+decode-heavy c=8: 183.5 out tok/s, TTFT p50 879 ms, ITL p50/p95 27.2/27.9 ms, burst gap p50/p95 27.2/27.9 ms (1.00 tok/burst), pass p50 27.2 ms (schedule 0.02, encode 4.43, wait 22.7, publish 0.21, idle 0.25), cached 0
+decode-heavy c=16: 199.6 out tok/s, TTFT p50 1686 ms, ITL p50/p95 46.3/48.0 ms, burst gap p50/p95 46.3/48.0 ms (1.00 tok/burst), pass p50 46.3 ms (schedule 0.04, encode 4.51, wait 41.4, publish 0.38, idle 0.44), cached 0
+mixed c=16: 55.1 out tok/s, TTFT p50 8251 ms, ITL p50/p95 217.6/287.9 ms, burst gap p50/p95 217.6/287.9 ms (1.00 tok/burst), pass p50 68.3 ms (schedule 0.03, encode 5.39, wait 46.4, publish 0.26, idle 0.33), cached 0

@@ -1,0 +1,16 @@
+   Compiling tur-engine v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-engine)
+    Finished `pre-release` profile [optimized] target(s) in 9.68s
+     Running benches/serving.rs (target/pre-release/deps/serving-3b78293a235d75d6)
+cold_shared: 89.6 out tok/s, TTFT p50 1730 ms, ITL p50/p95 28.9/49.9 ms, burst gap p50/p95 28.9/49.9 ms (1.00 tok/burst), pass p50 29.0 ms (schedule 0.03, encode 4.42, wait 24.5, publish 0.21, idle 0.25), cached 10752
+  PrefixStats { lookups: 7, hits: 7, hit_tokens: 10752, inserted: 25, evicted: 17, collisions: 0, entries: 8 }, 8 retained
+contention TTFT mean: warm 4371 ms, cold 5502 ms
+contention: 44.4 out tok/s, TTFT p50 4913 ms, ITL p50/p95 24.4/221.6 ms, burst gap p50/p95 24.4/221.6 ms (1.00 tok/burst), pass p50 25.5 ms (schedule 0.03, encode 3.88, wait 20.3, publish 0.14, idle 0.18), cached 8192
+  PrefixStats { lookups: 16, hits: 8, hit_tokens: 8192, inserted: 73, evicted: 69, collisions: 0, entries: 4 }, 4 retained
+agent: 24825 of 29895 prompt tokens cached, 9.87 s; PrefixStats { lookups: 19, hits: 19, hit_tokens: 24825, inserted: 61, evicted: 53, collisions: 0, entries: 8 }
+churn phase 0: hot cached 3072, cold cached 0, 16.28 s
+churn phase 1: hot cached 3072, cold cached 0, 16.33 s
+  churn PrefixStats { lookups: 36, hits: 6, hit_tokens: 6144, inserted: 219, evicted: 215, collisions: 0, entries: 4 }, 4 retained
+no_reuse: 57.0 out tok/s, TTFT p50 3846 ms, ITL p50/p95 27.1/212.3 ms, burst gap p50/p95 27.1/212.3 ms (1.00 tok/burst), pass p50 27.5 ms (schedule 0.03, encode 3.90, wait 23.4, publish 0.20, idle 0.25), cached 0
+  PrefixStats { lookups: 45, hits: 0, hit_tokens: 0, inserted: 67, evicted: 59, collisions: 0, entries: 8 }, 8 retained
+short_shared: 80.2 out tok/s, TTFT p50 2110 ms, ITL p50/p95 27.5/34.7 ms, burst gap p50/p95 27.5/34.7 ms (1.00 tok/burst), pass p50 27.5 ms (schedule 0.03, encode 4.35, wait 23.1, publish 0.21, idle 0.25), cached 1792
+  PrefixStats { lookups: 7, hits: 7, hit_tokens: 1792, inserted: 28, evicted: 20, collisions: 0, entries: 8 }, 8 retained

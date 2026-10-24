@@ -3,7 +3,7 @@
 
 use candle_core::Tensor;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -300,6 +300,8 @@ pub struct InferencePipeline {
     _lease: BudgetLease,
     pending: HashMap<Uuid, Pending>,
     prefix: PrefixCache,
+    /// Waiting requests left unscheduled this pass for a producer of a shared prefix.
+    awaiting: HashSet<Uuid>,
     in_flight: Option<InFlight>,
     /// Outcomes produced before or without a pass, returned by the next `finish_step`.
     staged: BatchStepOutput,
@@ -470,6 +472,7 @@ impl InferencePipeline {
                 entries: plan.retained,
                 ..config.prefix
             }),
+            awaiting: HashSet::new(),
             in_flight: None,
             staged: BatchStepOutput::default(),
             guidance: None,
@@ -822,24 +825,73 @@ impl InferencePipeline {
         Ok(())
     }
 
-    /// Restore the deepest verified snapshot for the oldest waiting requests that have no
-    /// state, while running slots remain. They then run their remaining prompt; a snapshot
-    /// of the whole prompt samples the first output from its logits without a pass.
+    /// Whether waiting request `waiter` should wait for one of `producers` (running or
+    /// admitted by this pass) to compute a prefix both share, instead of computing it
+    /// concurrently: a producer has not yet reached the deepest snapshot it will insert
+    /// within the shared tokens, and the cache holds nothing as deep. Only first
+    /// admissions younger than the queue-age limit wait.
+    fn awaits(&self, waiter: &Pending, producers: &[Uuid], now: Instant) -> bool {
+        if !waiter.boundaries.is_empty()
+            || now.saturating_duration_since(waiter.arrival)
+                >= self.scheduler.config().max_queue_wait
+        {
+            return false;
+        }
+        let mut cached = None;
+        producers.iter().any(|id| {
+            self.pending.get(id).is_some_and(|producer| {
+                let shared = waiter.keys.shared(&producer.keys).min(waiter.prompt_tokens);
+                let depth = self.prefix.reachable(shared, producer.prompt_tokens);
+                depth > producer.consumed
+                    && depth
+                        > *cached
+                            .get_or_insert_with(|| self.prefix.depth(&waiter.keys, &waiter.tokens))
+                    && waiter.tokens.get(..depth) == producer.tokens.get(..depth)
+            })
+        })
+    }
+
+    /// For the oldest waiting requests without state, while running slots remain, restore
+    /// their deepest verified snapshot, or let them wait for a producer (see
+    /// [`Self::awaits`]); a waiting one takes no slot. Restored requests run their remaining
+    /// prompt; a snapshot of the whole prompt samples the first output from its logits
+    /// without a pass.
     fn restore_prefixes(&mut self, output: &mut BatchStepOutput) -> Result<()> {
         if !self.prefix.config().enabled() {
             return Ok(());
         }
-        let running = self.pending.values().filter(|p| p.running).count();
-        let mut waiting: Vec<(Instant, Uuid)> = self
-            .pending
-            .iter()
-            .filter(|(_, p)| !p.running && p.consumed == 0)
-            .map(|(id, p)| (p.arrival, *id))
-            .collect();
+        let now = Instant::now();
+        self.awaiting.clear();
+        let mut producers = Vec::with_capacity(self.scheduler.config().max_running);
+        let mut waiting = Vec::new();
+        for (id, pending) in &self.pending {
+            if pending.running {
+                producers.push(*id);
+            } else if pending.consumed == 0 {
+                waiting.push((pending.arrival, *id));
+            }
+        }
         waiting.sort_unstable();
-        let free = self.scheduler.config().max_running.saturating_sub(running);
+        let mut free = self
+            .scheduler
+            .config()
+            .max_running
+            .saturating_sub(producers.len());
         let inserted = self.prefix.stats().inserted;
-        for (_, id) in waiting.into_iter().take(free) {
+        for (_, id) in waiting {
+            if free == 0 {
+                break;
+            }
+            let pending = self
+                .pending
+                .get(&id)
+                .ok_or_else(|| invalid("missing pipeline request"))?;
+            if self.awaits(pending, &producers, now) {
+                self.awaiting.insert(id);
+                continue;
+            }
+            producers.push(id);
+            free -= 1;
             let pending = self
                 .pending
                 .get_mut(&id)
@@ -929,6 +981,7 @@ impl InferencePipeline {
             let candidates: Vec<Candidate> = self
                 .pending
                 .iter()
+                .filter(|(id, _)| !self.awaiting.contains(*id))
                 .map(|(id, p)| p.candidate(*id, self.prefix.next_boundary(p.consumed)))
                 .collect();
             self.relieve_admission(&candidates)?;
@@ -1345,8 +1398,7 @@ impl InferencePipeline {
                         stats.mtp_drafted += drafted as u64;
                         stats.mtp_accepted += accepted as u64;
                         if let Some(confidence) = confidence {
-                            self.calibration[usize::from(greedy)]
-                                .observe(confidence, accepted > 0);
+                            self.calibration[usize::from(greedy)].observe(confidence, accepted > 0);
                             stats.observe_confidence(confidence, accepted > 0);
                         }
                     }
@@ -1356,10 +1408,7 @@ impl InferencePipeline {
                 stats.accepted += accepted as u64;
             }
             // Constrained requests never take the head's drafts; it runs for no other.
-            let drafts_from_head = self
-                .pending
-                .get(&id)
-                .is_some_and(|p| !p.constrained);
+            let drafts_from_head = self.pending.get(&id).is_some_and(|p| !p.constrained);
             if let (Some(hidden), Ok(commit)) = (&result.hidden, &result.outcome)
                 && commit.accepted_tokens > 0
                 && drafts_from_head

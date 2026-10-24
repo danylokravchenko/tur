@@ -1,0 +1,15 @@
+    Finished `pre-release` profile [optimized] target(s) in 0.38s
+     Running benches/serving.rs (target/pre-release/deps/serving-3b78293a235d75d6)
+cold_shared: 23.5 out tok/s, TTFT p50 9596 ms, ITL p50/p95 29.5/50.2 ms, burst gap p50/p95 29.5/50.2 ms (1.00 tok/burst), pass p50 29.7 ms (schedule 0.03, encode 4.66, wait 25.5, publish 0.20, idle 0.24), cached 0
+  PrefixStats { lookups: 0, hits: 0, hit_tokens: 0, inserted: 25, evicted: 17, collisions: 0, entries: 8 }, 8 retained
+contention TTFT mean: warm 4486 ms, cold 5602 ms
+contention: 44.5 out tok/s, TTFT p50 5019 ms, ITL p50/p95 24.0/221.3 ms, burst gap p50/p95 24.0/221.3 ms (1.00 tok/burst), pass p50 24.3 ms (schedule 0.03, encode 3.83, wait 20.3, publish 0.13, idle 0.18), cached 8192
+  PrefixStats { lookups: 16, hits: 8, hit_tokens: 8192, inserted: 73, evicted: 69, collisions: 0, entries: 4 }, 4 retained
+agent: 21570 of 29895 prompt tokens cached, 12.38 s; PrefixStats { lookups: 16, hits: 16, hit_tokens: 21570, inserted: 64, evicted: 56, collisions: 0, entries: 8 }
+churn phase 0: hot cached 0, cold cached 0, 17.63 s
+churn phase 1: hot cached 0, cold cached 0, 17.67 s
+  churn PrefixStats { lookups: 36, hits: 0, hit_tokens: 0, inserted: 243, evicted: 239, collisions: 0, entries: 4 }, 4 retained
+no_reuse: 56.8 out tok/s, TTFT p50 3842 ms, ITL p50/p95 27.7/212.5 ms, burst gap p50/p95 27.7/212.5 ms (1.00 tok/burst), pass p50 27.9 ms (schedule 0.03, encode 4.24, wait 23.4, publish 0.21, idle 0.27), cached 0
+  PrefixStats { lookups: 45, hits: 0, hit_tokens: 0, inserted: 67, evicted: 59, collisions: 0, entries: 8 }, 8 retained
+short_shared: 58.9 out tok/s, TTFT p50 3312 ms, ITL p50/p95 27.8/34.8 ms, burst gap p50/p95 27.8/34.8 ms (1.00 tok/burst), pass p50 27.8 ms (schedule 0.02, encode 3.98, wait 23.7, publish 0.21, idle 0.24), cached 0
+  PrefixStats { lookups: 0, hits: 0, hit_tokens: 0, inserted: 28, evicted: 20, collisions: 0, entries: 8 }, 8 retained

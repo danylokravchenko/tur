@@ -130,6 +130,20 @@ impl ModelState {
         self.pages.len()
     }
 
+    /// Pages and slot that only this snapshot holds: what dropping it would release.
+    pub fn exclusive(&self) -> Demand {
+        Demand {
+            pages: self
+                .pages
+                .iter()
+                .filter(|page| Arc::strong_count(page) == 1)
+                .count(),
+            slots: usize::from(
+                matches!(&self.slot, Slot::Leased(slot) if Arc::strong_count(slot) == 1),
+            ),
+        }
+    }
+
     /// Whether appending must first copy a shared, partially filled tail page.
     fn copies_tail(&self, tokens: usize) -> bool {
         let page = self.description().kv.page_tokens;
@@ -671,6 +685,23 @@ mod tests {
             state.demand(3, Boundaries::EveryToken)?.bytes(&usage),
             reservation.bytes()?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_exclusive_counts_only_what_dropping_a_snapshot_releases() -> Result<()> {
+        let pool = pool(8, 4)?;
+        let prefix = pass(&ModelState::new(&pool), &[1.0; 4], Boundaries::Final, 4)?;
+        assert_eq!(prefix.exclusive(), Demand { pages: 2, slots: 1 });
+        // A continuation shares both full pages; each keeps its own slot.
+        let longer = pass(&prefix, &[2.0; 3], Boundaries::Final, 3)?;
+        assert_eq!(prefix.exclusive(), Demand { pages: 0, slots: 1 });
+        assert_eq!(longer.exclusive(), Demand { pages: 2, slots: 1 });
+        let copy = longer.clone();
+        assert_eq!(longer.exclusive(), Demand::default());
+        drop((longer, copy));
+        assert_eq!(prefix.exclusive().pages, 2);
+        assert_eq!(ModelState::new(&pool).exclusive(), Demand::default());
         Ok(())
     }
 }

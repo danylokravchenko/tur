@@ -6,10 +6,11 @@
 //! Prefix reuse through the scheduled pipeline on random weights, where restoring the
 //! wrong state changes generated text: warmed prefixes continue like cold runs, save
 //! their prefill, stay inside their namespace, yield memory before running requests do,
-//! and leave no state behind.
+//! and leave no state behind. Requests reaching a cold shared prefix together wait for
+//! the oldest to compute it.
 mod common;
 use common::Checkpoint;
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 use tur::{
     InferencePipeline, Result, TurError,
     backend::{
@@ -118,7 +119,8 @@ fn test_warmed_prefixes_continue_like_cold_runs_and_skip_their_prefill() -> Resu
 #[test]
 fn test_cache_salts_isolate_namespaces() -> Result<()> {
     let fixture = Checkpoint::random()?;
-    let mut pipeline = InferencePipeline::new(&fixture.factory(), cached(8))?;
+    // Room for both namespaces' snapshots, so none is evicted.
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), cached(16))?;
     let text = prompt(40, 0, 0);
     let mut tenant = request(text.clone(), 1);
     tenant.cache_salt = Some("tenant-a".into());
@@ -225,5 +227,136 @@ fn test_snapshots_yield_memory_and_concurrent_reuse_matches_cold_runs() -> Resul
     pipeline.clear_prefix_cache();
     let usage = pipeline.memory()?;
     assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+    Ok(())
+}
+
+/// Submit every request at once and step until all finish; `before_step(pass, pipeline,
+/// ids)` runs before each pass. Returns each request's outcome by index.
+fn burst(
+    pipeline: &mut InferencePipeline,
+    requests: &[GenerationRequest],
+    mut before_step: impl FnMut(
+        usize,
+        &mut InferencePipeline,
+        &HashMap<uuid::Uuid, usize>,
+    ) -> Result<()>,
+) -> Result<HashMap<usize, Result<GenerationStats>>> {
+    let mut ids = HashMap::new();
+    for (index, request) in requests.iter().enumerate() {
+        ids.insert(pipeline.submit_request(request)?, index);
+    }
+    let mut outcomes = HashMap::new();
+    for pass in 0..10_000 {
+        if pipeline.active_request_count() == 0 {
+            break;
+        }
+        before_step(pass, pipeline, &ids)?;
+        for (id, result) in pipeline.step_streaming()?.completed {
+            outcomes.insert(ids[&id], result);
+        }
+    }
+    Ok(outcomes)
+}
+
+/// Four prompts sharing 48 tokens, with distinct tails.
+fn shared_burst() -> Vec<GenerationRequest> {
+    (0..4)
+        .map(|i| request(prompt(48, 3 + i, i), 20 + i as u64))
+        .collect()
+}
+
+#[test]
+fn test_a_cold_shared_prefix_is_computed_once_and_waiters_restore_it() -> Result<()> {
+    let fixture = Checkpoint::random()?;
+    let requests = shared_burst();
+    let expected = cold(&fixture, &requests)?;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), cached(16))?;
+    let mut waiting = Vec::new();
+    let outcomes = burst(&mut pipeline, &requests, |pass, pipeline, _| {
+        if pass == 1 {
+            waiting.push(pipeline.waiting_request_count());
+        }
+        Ok(())
+    })?;
+    // After the first pass only the oldest request runs; the others wait for its
+    // snapshot at the deepest aligned boundary they share, then restore it.
+    assert_eq!(waiting, [3]);
+    let mut cached = Vec::new();
+    for (index, expected) in expected.iter().enumerate() {
+        let stats = outcomes
+            .get(&index)
+            .ok_or_else(|| TurError::Other(format!("request {index} did not finish")))?
+            .as_ref()
+            .map_err(|error| TurError::Other(error.to_string()))?;
+        assert_eq!(&stats.generated_text, expected, "request {index}");
+        cached.push(stats.cached_tokens);
+    }
+    assert_eq!(cached[0], 0);
+    assert!(cached[1..].iter().all(|&tokens| tokens >= 48), "{cached:?}");
+    assert_eq!(pipeline.prefix_stats().hits, 3);
+    pipeline.clear_prefix_cache();
+    let usage = pipeline.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn test_waiters_proceed_when_their_producer_is_cancelled() -> Result<()> {
+    let fixture = Checkpoint::random()?;
+    let requests = shared_burst();
+    let expected = cold(&fixture, &requests)?;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), cached(16))?;
+    let outcomes = burst(&mut pipeline, &requests, |pass, pipeline, ids| {
+        if pass == 1
+            && let Some((&producer, _)) = ids.iter().find(|(_, index)| **index == 0)
+        {
+            pipeline.cancel(producer)?;
+        }
+        Ok(())
+    })?;
+    assert!(!outcomes.contains_key(&0));
+    for (index, expected) in expected.iter().enumerate().skip(1) {
+        let stats = outcomes
+            .get(&index)
+            .ok_or_else(|| TurError::Other(format!("request {index} did not finish")))?
+            .as_ref()
+            .map_err(|error| TurError::Other(error.to_string()))?;
+        assert_eq!(&stats.generated_text, expected, "request {index}");
+    }
+    pipeline.clear_prefix_cache();
+    let usage = pipeline.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn test_aged_requests_and_other_namespaces_never_wait() -> Result<()> {
+    let fixture = Checkpoint::random()?;
+    let mut config = cached(16);
+    config.scheduler.max_queue_wait = Duration::ZERO;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), config)?;
+    let outcomes = burst(&mut pipeline, &shared_burst(), |_, _, _| Ok(()))?;
+    assert_eq!(outcomes.len(), 4);
+    for outcome in outcomes.values() {
+        let stats = outcome
+            .as_ref()
+            .map_err(|error| TurError::Other(error.to_string()))?;
+        assert_eq!(stats.cached_tokens, 0);
+    }
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), cached(16))?;
+    let salted: Vec<GenerationRequest> = shared_burst()
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut request)| {
+            request.cache_salt = Some(format!("tenant-{index}"));
+            request
+        })
+        .collect();
+    for outcome in burst(&mut pipeline, &salted, |_, _, _| Ok(()))?.values() {
+        let stats = outcome
+            .as_ref()
+            .map_err(|error| TurError::Other(error.to_string()))?;
+        assert_eq!(stats.cached_tokens, 0);
+    }
     Ok(())
 }

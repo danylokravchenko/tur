@@ -1,0 +1,6 @@
+    Finished `pre-release` profile [optimized] target(s) in 0.39s
+     Running benches/serving.rs (target/pre-release/deps/serving-3b78293a235d75d6)
+shared system prompt, spacing 128: 154.6 out tok/s, TTFT p50 560 ms, ITL p50/p95 29.0/32.4 ms, burst gap p50/p95 29.0/32.4 ms (1.00 tok/burst), pass p50 29.1 ms (schedule 0.03, encode 4.25, wait 24.7, publish 0.23, idle 0.28), cached 12288
+multi-turn, spacing 128: 8064 of 13765 prompt tokens cached; last-turn TTFT p50 1127 ms
+shared system prompt, spacing 256: 156.3 out tok/s, TTFT p50 563 ms, ITL p50/p95 28.8/35.7 ms, burst gap p50/p95 28.8/35.7 ms (1.00 tok/burst), pass p50 28.8 ms (schedule 0.03, encode 4.16, wait 24.4, publish 0.21, idle 0.26), cached 12288
+multi-turn, spacing 256: 7168 of 13765 prompt tokens cached; last-turn TTFT p50 1128 ms
