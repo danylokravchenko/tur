@@ -415,6 +415,7 @@ mod tests {
                 kv: DEFAULT_KV_LAYOUT,
                 recurrent: DEFAULT_RECURRENT_STATE,
                 mtp: false,
+                draft_vocab: None,
             },
             pipeline: PipelineConfig::new(1, 64),
             budget: DeviceBudget::new(None),

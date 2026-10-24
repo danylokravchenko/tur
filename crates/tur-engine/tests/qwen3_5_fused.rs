@@ -92,6 +92,7 @@ fn load_state(
             kv,
             recurrent,
             mtp: false,
+            draft_vocab: None,
         },
     )
 }
@@ -490,6 +491,7 @@ fn test_execution_selection_and_declared_workspace() -> Result<()> {
             kv: F32_KV,
             recurrent: DType::F32,
             mtp: false,
+            draft_vocab: None,
         },
         512,
         &[512],
@@ -535,6 +537,7 @@ fn test_preload_weight_plans_match_every_format_and_tied_embedding_layout() -> R
                 kv: F32_KV,
                 recurrent: DType::F16,
                 mtp: false,
+                draft_vocab: None,
             };
             let (description, weights, scratch) =
                 Qwen35::memory_requirements(&parsed, &options, 512, &[512])?;
@@ -865,6 +868,7 @@ fn real(format: WeightFormat, execution: Execution, kv: KvLayout) -> Result<Qwen
             kv,
             recurrent: DType::F32,
             mtp: false,
+            draft_vocab: None,
         },
     )
 }

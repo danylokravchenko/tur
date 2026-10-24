@@ -44,6 +44,9 @@ pub struct ModelFactory {
     /// Load the checkpoint's native multi-token prediction head. The inference pipeline
     /// sets it from its speculation config.
     pub mtp: bool,
+    /// Draft from token IDs below this bound only ([`LoadOptions::draft_vocab`]). The
+    /// inference pipeline sets it from its speculation config.
+    pub draft_vocab: Option<usize>,
 }
 
 fn hub_error(error: impl std::fmt::Display) -> TurError {
@@ -191,6 +194,7 @@ impl ModelFactory {
             kv: self.kv,
             recurrent: self.recurrent,
             mtp: self.mtp,
+            draft_vocab: self.draft_vocab,
         };
         let config = if self.mtp { config.with_mtp()? } else { config };
         let reservation = reserve(&config, &options)?;
@@ -226,6 +230,7 @@ mod tests {
             kv: crate::models::qwen3_5::DEFAULT_KV_LAYOUT,
             recurrent: crate::models::qwen3_5::DEFAULT_RECURRENT_STATE,
             mtp: false,
+            draft_vocab: None,
         };
         assert!(factory.resolve().is_err());
     }

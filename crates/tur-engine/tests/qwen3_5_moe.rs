@@ -34,6 +34,7 @@ fn load(path: &Path, device: &Device, format: WeightFormat) -> Result<Qwen35> {
             kv: KvLayout::new(16, KvFormat::F32),
             recurrent: DType::F32,
             mtp: false,
+            draft_vocab: None,
         },
     )
 }
@@ -170,6 +171,7 @@ fn test_moe_fused_packed_prefill_decode_and_rollback_match_reference() -> Result
                 kv: KvLayout::new(16, KvFormat::F32),
                 recurrent: DType::F32,
                 mtp: false,
+                draft_vocab: None,
             },
             32,
             &[32],

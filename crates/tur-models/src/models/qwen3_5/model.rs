@@ -197,6 +197,10 @@ pub struct LoadOptions {
     pub recurrent: DType,
     /// Load the checkpoint's native multi-token prediction head ([`Config::with_mtp`]).
     pub mtp: bool,
+    /// Draft only token IDs below this bound: the head projects onto a copy of the LM
+    /// head's leading rows instead of the whole vocabulary. Byte-level BPE assigns IDs in
+    /// merge order, so low IDs are the frequent tokens. `None` uses the whole LM head.
+    pub draft_vocab: Option<usize>,
 }
 
 struct Attention {
@@ -333,6 +337,14 @@ struct MtpHead {
     hidden_norm: Tensor,
     layer: Layer,
     norm: Tensor,
+    /// Leading rows of the LM head ([`LoadOptions::draft_vocab`]); `None` shares it whole.
+    head: Option<PackedLinear>,
+}
+
+impl MtpHead {
+    fn lm_head<'a>(&'a self, shared: &'a PackedLinear) -> &'a PackedLinear {
+        self.head.as_ref().unwrap_or(shared)
+    }
 }
 
 /// Input embedding storage.
@@ -364,6 +376,16 @@ fn load_attention(tensors: &Tensors, a: &str, device: &Device) -> Result<Attenti
         q_norm: centred(&tensors.take(&format!("{a}.q_norm.weight"))?, device)?,
         k_norm: centred(&tensors.take(&format!("{a}.k_norm.weight"))?, device)?,
     })
+}
+
+/// Rows of a separate draft LM head: [`LoadOptions::draft_vocab`] when the head is loaded
+/// and the bound excludes part of the vocabulary.
+fn draft_vocab(config: &Config, options: &LoadOptions) -> Result<Option<usize>> {
+    match options.draft_vocab {
+        Some(0) => Err(invalid("draft vocabulary must not be empty")),
+        Some(rows) if options.mtp && rows < config.vocab_size() => Ok(Some(rows)),
+        _ => Ok(None),
+    }
 }
 
 fn f32_on(tensor: &Tensor, device: &Device) -> Result<Tensor> {
@@ -539,6 +561,14 @@ impl Qwen35 {
         let plan = options.weights.plan(config)?;
         plan.validate(config)?;
         let mut weights = plan.bytes(config)?;
+        if let Some(rows) = draft_vocab(config, options)? {
+            weights = plan
+                .precision("lm_head")?
+                .bytes(rows, config.hidden_size())
+                .ok()
+                .and_then(|bytes| weights.checked_add(bytes))
+                .ok_or_else(|| invalid("weight total overflow"))?;
+        }
         let mut stacked: std::collections::BTreeSet<String> = config
             .projections()?
             .into_iter()
@@ -660,11 +690,19 @@ impl Qwen35 {
                     mlp: Mlp::Dense(DenseMlp::load(&tensors, &format!("{p}.mlp"))?),
                 },
                 norm: centred(&tensors.take("mtp.norm.weight")?, device)?,
+                head: None,
             })
         } else {
             None
         };
         let lm_head = tensors.projection("lm_head")?;
+        let mtp = match (mtp, draft_vocab(&config, options)?) {
+            (Some(mtp), Some(rows)) => Some(MtpHead {
+                head: Some(lm_head.leading_rows(rows)?),
+                ..mtp
+            }),
+            (mtp, _) => mtp,
+        };
         let embed = tensors.embedding(&config)?;
         let norm = centred(&tensors.take(&format!("{prefix}.norm.weight"))?, device)?;
         let revision = format!("{}#{}", options.revision, options.weights.tag());
@@ -759,7 +797,9 @@ impl Qwen35 {
     /// Device bytes held by projection weights, all in their packed storage format.
     pub fn projection_bytes(&self) -> usize {
         let mut total = self.lm_head.resident_bytes()
-            + self.mtp.as_ref().map_or(0, |mtp| mtp.fc.resident_bytes());
+            + self.mtp.as_ref().map_or(0, |mtp| {
+                mtp.fc.resident_bytes() + mtp.head.as_ref().map_or(0, PackedLinear::resident_bytes)
+            });
         for layer in self
             .layers
             .iter()
@@ -1305,7 +1345,7 @@ impl Qwen35 {
         let h = math::rms(&x, &mtp.layer.post_norm, d.eps)?;
         x = (&x + Self::mlp(&mtp.layer, &h, None)?)?;
         let index = Tensor::new(pass.rows.as_slice(), &self.device)?;
-        self.lm_head
+        mtp.lm_head(&self.lm_head)
             .forward(&math::rms(&x.index_select(&index, 0)?, &mtp.norm, d.eps)?)
     }
 }

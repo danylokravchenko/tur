@@ -515,6 +515,15 @@ pub struct DraftRequest {
     pub draft: bool,
 }
 
+/// The draft head's greedy draft.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Draft {
+    pub token: u32,
+    /// The head's softmax probability of `token` over its vocabulary: a confidence to be
+    /// calibrated against observed acceptance, not an acceptance probability itself.
+    pub confidence: f32,
+}
+
 /// Output rows sampled since the engine was created, by where they were decided.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SamplingStats {
@@ -1152,11 +1161,12 @@ impl<M: HybridModel> HybridEngine<M> {
     /// positions, writing the head's own state layer, and return its greedy draft where
     /// requested. Requests fail independently; the pages a request's positions occupy
     /// must not be shared with a snapshot. Waits for the device only to read drafts.
-    pub fn draft(&mut self, requests: &[DraftRequest]) -> Result<Vec<Result<Option<u32>>>> {
+    pub fn draft(&mut self, requests: &[DraftRequest]) -> Result<Vec<Result<Option<Draft>>>> {
         if self.pending.is_some() {
             return Err(invalid("the draft head runs between passes"));
         }
-        let mut results: Vec<Option<Result<Option<u32>>>> = requests.iter().map(|_| None).collect();
+        let mut results: Vec<Option<Result<Option<Draft>>>> =
+            requests.iter().map(|_| None).collect();
         let (mut tokens, mut positions, mut live, mut states) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (index, request) in requests.iter().enumerate() {
@@ -1212,20 +1222,28 @@ impl<M: HybridModel> HybridEngine<M> {
                     Err(error) => results[*index] = Some(Err(error)),
                 }
             }
-            let drafts = if rows.is_empty() {
+            let (drafts, mass) = if rows.is_empty() {
                 // Nothing waits: later passes, and the reuse of any page released meanwhile,
                 // are encoded after these writes on the same queue.
-                Vec::new()
+                (Vec::new(), Vec::new())
             } else {
-                self.argmax(&Tensor::cat(&rows, 0)?)?
+                let rows = Tensor::cat(&rows, 0)?;
+                // Σ exp(logit - max): the draft's probability is its reciprocal.
+                let mass = rows
+                    .broadcast_sub(&rows.max_keepdim(1)?)?
+                    .exp()?
+                    .sum_keepdim(1)?;
+                let drafts = self.argmax(&rows)?;
+                (drafts, mass.flatten_all()?.to_vec1::<f32>()?)
             };
             for (index, row) in wanted {
                 results[index] = Some(
-                    row.map(|row| {
-                        drafts
-                            .get(row)
-                            .copied()
-                            .ok_or_else(|| invalid("missing draft row"))
+                    row.map(|row| match (drafts.get(row), mass.get(row)) {
+                        (Some(&token), Some(&mass)) => Ok(Draft {
+                            token,
+                            confidence: mass.recip(),
+                        }),
+                        _ => Err(invalid("missing draft row")),
                     })
                     .transpose(),
                 );

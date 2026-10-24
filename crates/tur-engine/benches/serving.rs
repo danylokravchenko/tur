@@ -17,8 +17,10 @@
 //! `TUR_BENCH_WORKLOADS=arrivals TUR_BENCH_RATE=2,4` runs open-loop Poisson arrivals, and
 //! `TUR_BENCH_WORKLOADS=grammar` grammar-constrained requests.
 //! `TUR_BENCH_WORKLOADS=speculation TUR_BENCH_DRAFT=0,4` compares adaptive prompt lookup
-//! (`TUR_BENCH_MTP=1` adds the native MTP head to drafted configurations)
-//! with ordinary decoding, including acceptance counters, memory and exact token IDs.
+//! (`TUR_BENCH_MTP=1` adds the native MTP head to drafted configurations, `0,1` runs both)
+//! with ordinary decoding, including acceptance counters, memory and exact token IDs, on
+//! `TUR_BENCH_SPECULATION=repeat,novel,code` prompts. `TUR_BENCH_MTP_VOCAB` sets the
+//! head's leading draft token IDs (default 32768, 0 for the whole vocabulary).
 
 use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, time::Instant};
@@ -507,6 +509,7 @@ fn main() -> Result<()> {
             .map_or(Ok(DEFAULT_RECURRENT_STATE), |s| parse_recurrent_state(&s))
             .map_err(TurError::Other)?,
         mtp: false,
+        draft_vocab: None,
     };
     let max = concurrency.iter().copied().max().unwrap_or(1);
     let mut runs = Vec::new();
@@ -624,24 +627,39 @@ fn main() -> Result<()> {
             .first()
             .copied()
             .unwrap_or(3);
-        let mtp = std::env::var("TUR_BENCH_MTP").is_ok_and(|v| v == "1");
-        for draft in env_sizes("TUR_BENCH_DRAFT", "0,4")? {
+        let heads = env_sizes("TUR_BENCH_MTP", "0")?;
+        let prompts = std::env::var("TUR_BENCH_SPECULATION")
+            .unwrap_or_else(|_| "repeat,novel".into());
+        let configs = env_sizes("TUR_BENCH_DRAFT", "0,4")?
+            .into_iter()
+            .flat_map(|draft| {
+                let heads = if draft == 0 { vec![0] } else { heads.clone() };
+                heads.into_iter().map(move |mtp| (draft, mtp == 1))
+            });
+        for (draft, with_mtp) in configs {
             for &count in &concurrency {
                 let mut config = PipelineConfig::new(count, CHUNK);
                 config.prefix = PrefixConfig::DISABLED;
                 config.device_sampling = device_sampling;
-                let with_mtp = mtp && draft > 0;
                 config.speculation = if with_mtp {
-                    SpeculationConfig::with_mtp(draft)
+                    SpeculationConfig {
+                        mtp_vocab: env_sizes("TUR_BENCH_MTP_VOCAB", "32768")?
+                            .first()
+                            .copied()
+                            .filter(|&rows| rows > 0),
+                        ..SpeculationConfig::with_mtp(draft)
+                    }
                 } else {
                     SpeculationConfig::new(draft)
                 };
                 let mut pipeline = InferencePipeline::new(&factory, config)?;
-                for workload in ["repeat", "novel"] {
+                for workload in prompts.split(',') {
                     let requests: Vec<_> = (0..count).map(|i| {
-                        let text = if workload == "repeat" {
-                            format!("Request {i}. Continue this pattern exactly for 200 words, without an introduction:\n{}", "red green blue yellow orange purple ".repeat(12))
-                        } else { format!("Request {i}. Explain how a database recovers from a power failure during a transaction. Be specific about write-ahead logs, checkpoints and isolation.") };
+                        let text = match workload {
+                            "repeat" => format!("Request {i}. Continue this pattern exactly for 200 words, without an introduction:\n{}", "red green blue yellow orange purple ".repeat(12)),
+                            "code" => format!("Request {i}. Write a Rust function that parses an INI file into a map of sections to key-value pairs, with error handling for malformed lines. Only output code."),
+                            _ => format!("Request {i}. Explain how a database recovers from a power failure during a transaction. Be specific about write-ahead logs, checkpoints and isolation."),
+                        };
                         let mut request = GenerationRequest::new(text, output);
                         request.seed = i as u64;
                         request.render.enable_thinking = Some(false);

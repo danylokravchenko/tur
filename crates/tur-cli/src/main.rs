@@ -6,7 +6,7 @@ use tur::{
     backend::{
         pipeline::{GenerationRequest, InferencePipeline, PipelineConfig},
         prefix::PrefixConfig,
-        speculation::SpeculationConfig,
+        speculation::{self, SpeculationConfig},
     },
     core::execution::{KvFormat, KvLayout},
     models::qwen3_5::{
@@ -80,6 +80,10 @@ struct Args {
     /// reuse. Requires F32 recurrent state.
     #[arg(long)]
     mtp: bool,
+    /// Token IDs the MTP head drafts from: a copy of the LM head's leading rows, which
+    /// makes the head's projection proportionally cheaper. Zero uses the whole vocabulary.
+    #[arg(long, default_value_t = speculation::MTP_VOCAB)]
+    mtp_vocab: usize,
     /// K/V storage: f32, f16, q8 (one scale per 32 dimensions, half of F16's memory) or
     /// q8_<group>.
     #[arg(long, default_value_t = DEFAULT_KV_LAYOUT.format)]
@@ -125,12 +129,16 @@ fn main() -> Result<()> {
             .map_or(Ok(DEFAULT_RECURRENT_STATE), parse_recurrent_state)
             .map_err(tur::TurError::Other)?,
         mtp: false,
+        draft_vocab: None,
     };
     let mut pipeline = InferencePipeline::new(
         &factory,
         PipelineConfig {
             speculation: if args.mtp {
-                SpeculationConfig::with_mtp(args.speculative_draft.max(1))
+                SpeculationConfig {
+                    mtp_vocab: (args.mtp_vocab > 0).then_some(args.mtp_vocab),
+                    ..SpeculationConfig::with_mtp(args.speculative_draft.max(1))
+                }
             } else {
                 SpeculationConfig::new(args.speculative_draft)
             },

@@ -5,7 +5,7 @@ use tur::{
     ModelFactory, ModelSource, Result, TurError,
     backend::{
         memory::DeviceBudget, pipeline::PipelineConfig, prefix::PrefixConfig,
-        speculation::SpeculationConfig,
+        speculation::{self, SpeculationConfig},
     },
     core::execution::{KvFormat, KvLayout},
     models::qwen3_5::{
@@ -66,6 +66,10 @@ struct Args {
     /// reuse. Requires F32 recurrent state.
     #[arg(long)]
     mtp: bool,
+    /// Token IDs the MTP head drafts from: a copy of the LM head's leading rows, which
+    /// makes the head's projection proportionally cheaper. Zero uses the whole vocabulary.
+    #[arg(long, default_value_t = speculation::MTP_VOCAB)]
+    mtp_vocab: usize,
     /// Tokens in one packed pass. Default: one prefill chunk beside every decode.
     #[arg(long)]
     max_batch_tokens: Option<usize>,
@@ -134,7 +138,10 @@ async fn main() -> Result<()> {
     };
     let mut pipeline = PipelineConfig {
         speculation: if args.mtp {
-            SpeculationConfig::with_mtp(args.speculative_draft.max(1))
+            SpeculationConfig {
+                mtp_vocab: (args.mtp_vocab > 0).then_some(args.mtp_vocab),
+                ..SpeculationConfig::with_mtp(args.speculative_draft.max(1))
+            }
         } else {
             SpeculationConfig::new(args.speculative_draft)
         },
@@ -174,6 +181,7 @@ async fn main() -> Result<()> {
                 .map_or(Ok(DEFAULT_RECURRENT_STATE), parse_recurrent_state)
                 .map_err(TurError::Other)?,
             mtp: false,
+            draft_vocab: None,
         },
         pipeline,
         request_timeout: args.request_timeout_secs.map(Duration::from_secs),

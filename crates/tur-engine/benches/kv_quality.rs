@@ -85,6 +85,7 @@ impl Runner {
                 kv: KvLayout::new(16, format),
                 recurrent,
                 mtp: false,
+                draft_vocab: None,
             },
         )?;
         let pool = StatePool::new(

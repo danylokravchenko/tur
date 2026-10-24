@@ -361,6 +361,7 @@ fn main() -> Result<()> {
                             kv: KvLayout::new(page, kv),
                             recurrent,
                             mtp: false,
+                            draft_vocab: None,
                         },
                     )?;
                     let load_seconds = load_start.elapsed().as_secs_f64();

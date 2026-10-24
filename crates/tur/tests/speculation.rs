@@ -319,7 +319,7 @@ fn test_decodes_draft_beside_a_prefill_and_match_plain_decoding() -> Result<()> 
 }
 
 /// Lookup needs eight-token matches, which the random fixtures' text rarely repeats, so the
-/// head drafts.
+/// head drafts. The fixtures' 96 tokens are below the default draft vocabulary.
 fn mtp_config(drafts: usize, batch: usize) -> PipelineConfig {
     PipelineConfig {
         prefix: PrefixConfig::DISABLED,
@@ -333,10 +333,23 @@ fn mtp_config(drafts: usize, batch: usize) -> PipelineConfig {
 }
 
 /// Multi-token prediction drafts verified by the target: whatever the (random) head
-/// predicts, outputs equal ordinary decoding, and every page and slot is returned.
+/// predicts, from the whole vocabulary or its leading token IDs, outputs equal ordinary
+/// decoding, and every page and slot is returned.
 fn assert_mtp_preserves_outputs(factory: &tur::ModelFactory) -> Result<()> {
+    for vocab in [None, Some(40)] {
+        let mut config = mtp_config(4, 1);
+        config.speculation.mtp_vocab = vocab;
+        assert_mtp_preserves_outputs_with(factory, config)?;
+    }
+    Ok(())
+}
+
+fn assert_mtp_preserves_outputs_with(
+    factory: &tur::ModelFactory,
+    mtp: PipelineConfig,
+) -> Result<()> {
     let mut plain = InferencePipeline::new(factory, config(0, 1))?;
-    let mut drafted = InferencePipeline::new(factory, mtp_config(4, 1))?;
+    let mut drafted = InferencePipeline::new(factory, mtp)?;
     // Novel token sequences give prompt lookup nothing, so the head drafts.
     let prompt = (2..40)
         .map(|t| format!("t{t}"))
@@ -365,6 +378,12 @@ fn assert_mtp_preserves_outputs(factory: &tur::ModelFactory) -> Result<()> {
     }
     let stats = drafted.speculation_stats();
     assert!(stats.mtp_passes > 0 && stats.mtp_drafted > 0, "{stats:?}");
+    // Sampled requests draft too, and every verified draft is calibrated by confidence.
+    assert_eq!(
+        stats.confidence_drafted.iter().sum::<u64>(),
+        stats.mtp_drafted,
+        "{stats:?}"
+    );
     let usage = drafted.memory()?;
     assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
     Ok(())
@@ -398,6 +417,18 @@ fn test_mtp_needs_a_head_and_no_prefix_reuse() -> Result<()> {
     let plain = InferencePipeline::new(&with_head.factory(), config(4, 1))?;
     let drafted = InferencePipeline::new(&with_head.factory(), mtp_config(4, 1))?;
     assert!(drafted.memory_plan().weights > plain.memory_plan().weights);
+    // A reduced draft vocabulary is a copy of that many F32 LM-head rows of 64 values; the
+    // pipeline checks the plan against the loaded weights.
+    let mut reduced = mtp_config(4, 1);
+    reduced.speculation.mtp_vocab = Some(40);
+    let reduced = InferencePipeline::new(&with_head.factory(), reduced)?;
+    assert_eq!(
+        reduced.memory_plan().weights - drafted.memory_plan().weights,
+        40 * 64 * 4
+    );
+    let mut empty = mtp_config(4, 1);
+    empty.speculation.mtp_vocab = Some(0);
+    assert!(InferencePipeline::new(&with_head.factory(), empty).is_err());
     Ok(())
 }
 

@@ -25,7 +25,7 @@ use super::{
     prefix::{PrefixCache, PrefixConfig, PrefixKeys, PrefixStats},
     scheduler::{Candidate, Chunk, Decision, Scheduler, SchedulerConfig},
     speculation::{
-        self, Acceptance, DraftCosts, DraftSource, HeadCosts, NgramIndex, Proposal,
+        self, Acceptance, Calibration, DraftCosts, DraftSource, HeadCosts, NgramIndex, Proposal,
         SpeculationConfig, SpeculationStats,
     },
     tokenizer::TokenOutputStream,
@@ -33,7 +33,7 @@ use super::{
 use crate::{
     Result, TurError,
     hybrid::{
-        Demand, DraftRequest, HybridEngine, PoolUsage, SamplingOptions, SamplingStats,
+        Demand, Draft, DraftRequest, HybridEngine, PoolUsage, SamplingOptions, SamplingStats,
         SequenceCommit,
     },
 };
@@ -181,15 +181,17 @@ struct Pending {
     tools: Vec<ToolDefinition>,
     /// Grammar-constrained: never drafted, so masks stay on the device.
     constrained: bool,
-    /// Greedy decoding, the regime where draft-head drafts were measured to pay.
+    /// Greedy decoding: its drafts' acceptance is calibrated separately from sampling's.
     greedy: bool,
     ngrams: NgramIndex,
     acceptance: Acceptance,
     /// Positions whose draft-head keys and values are written, and the head's draft for
     /// the token after the pending one, valid while `mtp_done == consumed`.
     mtp_done: usize,
-    mtp_draft: Option<u32>,
+    mtp_draft: Option<Draft>,
     mtp_acceptance: Acceptance,
+    /// Confidence of the head's draft in the pass in flight.
+    mtp_verifying: Option<f32>,
     drafted: usize,
     accepted_drafts: usize,
 }
@@ -313,6 +315,8 @@ pub struct InferencePipeline {
     /// Pipeline-wide acceptance, the starting estimate of new requests, per source.
     acceptance: Acceptance,
     mtp_acceptance: Acceptance,
+    /// Draft-head acceptance by confidence, for sampled and greedy requests.
+    calibration: [Calibration; 2],
     speculation_stats: SpeculationStats,
 }
 
@@ -367,6 +371,10 @@ impl InferencePipeline {
         }
         let factory = &ModelFactory {
             mtp: config.speculation.mtp_enabled(),
+            draft_vocab: config
+                .speculation
+                .mtp_vocab
+                .filter(|_| config.speculation.mtp_enabled()),
             ..factory.clone()
         };
         let limits = config.scheduler;
@@ -472,6 +480,7 @@ impl InferencePipeline {
             head_explore: speculation::HEAD_EXPLORE_PASSES,
             acceptance: Acceptance::default(),
             mtp_acceptance: Acceptance::default(),
+            calibration: [Calibration::default(); 2],
             speculation_stats: SpeculationStats::default(),
         })
     }
@@ -638,6 +647,7 @@ impl InferencePipeline {
                 mtp_done: 0,
                 mtp_draft: None,
                 mtp_acceptance: self.mtp_acceptance,
+                mtp_verifying: None,
                 drafted: 0,
                 accepted_drafts: 0,
             },
@@ -1057,19 +1067,22 @@ impl InferencePipeline {
                 .take_while(|token| !eos.contains(token))
                 .collect();
             let mut source = DraftSource::Lookup;
-            // The head's draft replaces a lookup proposal whose acceptance is lower.
-            if (proposal.is_empty() || pending.mtp_acceptance.rate() > pending.acceptance.rate())
-                && cap > 0
-                && pending.mtp_done == pending.consumed
-                && let Some(token) = pending.mtp_draft.filter(|token| !eos.contains(token))
+            let mut acceptance = pending.acceptance;
+            pending.mtp_verifying = None;
+            if let Some(draft) = pending
+                .mtp_draft
+                .filter(|draft| !eos.contains(&draft.token))
+                .filter(|_| cap > 0 && pending.mtp_done == pending.consumed)
             {
-                (proposal, source) = (vec![token], DraftSource::Mtp);
+                let head =
+                    self.calibration[usize::from(pending.greedy)].acceptance(draft.confidence);
+                // The head's draft replaces a lookup proposal whose acceptance is lower.
+                if proposal.is_empty() || head.rate() > acceptance.rate() {
+                    (proposal, source, acceptance) = (vec![draft.token], DraftSource::Mtp, head);
+                    pending.mtp_verifying = Some(draft.confidence);
+                }
             }
             if !proposal.is_empty() {
-                let acceptance = match source {
-                    DraftSource::Lookup => pending.acceptance,
-                    DraftSource::Mtp => pending.mtp_acceptance,
-                };
                 proposed.push((index, proposal, acceptance, source));
             }
         }
@@ -1303,32 +1316,50 @@ impl InferencePipeline {
                 // Every accepted input after the decode token is an accepted draft.
                 let accepted = commit.accepted_tokens.saturating_sub(1).min(drafted);
                 if let Some(pending) = self.pending.get_mut(&id) {
+                    // A sampled request's head estimate follows its drafts' calibrated
+                    // confidence instead (see `draft_head`).
                     match source {
                         DraftSource::Lookup => pending.acceptance.observe(drafted, accepted),
-                        DraftSource::Mtp => pending.mtp_acceptance.observe(drafted, accepted),
+                        DraftSource::Mtp if pending.greedy => {
+                            pending.mtp_acceptance.observe(drafted, accepted);
+                        }
+                        DraftSource::Mtp => {}
                     }
                     pending.drafted += drafted;
                     pending.accepted_drafts += accepted;
                 }
+                let (confidence, greedy) = self
+                    .pending
+                    .get_mut(&id)
+                    .map_or((None, false), |p| (p.mtp_verifying.take(), p.greedy));
                 let stats = &mut self.speculation_stats;
                 match source {
-                    DraftSource::Lookup => self.acceptance.observe(drafted, accepted),
+                    DraftSource::Lookup => {
+                        self.acceptance.observe(drafted, accepted);
+                        stats.observe_depths(drafted, accepted);
+                    }
                     DraftSource::Mtp => {
-                        self.mtp_acceptance.observe(drafted, accepted);
+                        if greedy {
+                            self.mtp_acceptance.observe(drafted, accepted);
+                        }
                         stats.mtp_drafted += drafted as u64;
                         stats.mtp_accepted += accepted as u64;
+                        if let Some(confidence) = confidence {
+                            self.calibration[usize::from(greedy)]
+                                .observe(confidence, accepted > 0);
+                            stats.observe_confidence(confidence, accepted > 0);
+                        }
                     }
                 }
                 stats.sequences += 1;
                 stats.drafted += drafted as u64;
                 stats.accepted += accepted as u64;
             }
-            // Only greedy, unconstrained requests ever take the head's drafts; it runs for
-            // no other.
+            // Constrained requests never take the head's drafts; it runs for no other.
             let drafts_from_head = self
                 .pending
                 .get(&id)
-                .is_some_and(|p| p.greedy && !p.constrained);
+                .is_some_and(|p| !p.constrained);
             if let (Some(hidden), Ok(commit)) = (&result.hidden, &result.outcome)
                 && commit.accepted_tokens > 0
                 && drafts_from_head
@@ -1453,6 +1484,16 @@ impl InferencePipeline {
                 Ok(draft) => {
                     pending.mtp_done = pending.consumed;
                     pending.mtp_draft = draft;
+                    // Whether the head is worth running for a sampled request follows the
+                    // expected acceptance of its drafts. Its verification outcomes also count
+                    // the unlikely drafts planning chose to verify, whose rejections stopped
+                    // the head computing its likely ones; greedy requests, whose drafts are
+                    // rarely unlikely, did better on verification outcomes (P14 report).
+                    if let Some(draft) = draft.filter(|_| !pending.greedy) {
+                        let expected = self.calibration[0].acceptance(draft.confidence).rate();
+                        pending.mtp_acceptance.expect(expected);
+                        self.mtp_acceptance.expect(expected);
+                    }
                 }
                 Err(error) => tracing::debug!(request = %id, "draft head failed: {error}"),
             }

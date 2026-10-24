@@ -48,6 +48,7 @@ fn main() -> Result<()> {
             kv: KvLayout::new(16, KvFormat::F16),
             recurrent: DType::F32,
             mtp: false,
+            draft_vocab: None,
         },
     )?;
     device.synchronize()?;

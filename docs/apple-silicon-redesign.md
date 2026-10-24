@@ -61,6 +61,16 @@ and 0.59–0.87× single-sequence decode, so it is preserved as a patch, not kep
 benchmark now reports encode, submit, post-completion and idle time. See the
 [P13 report](apple-silicon-p13-execution.md).
 
+P14 ran on 2026-10-24, on the M1 and the 0.8B checkpoint only. The native MTP head now
+drafts from the 32K lowest token IDs through a copy of the LM head's leading rows, cutting
+its pass from about 6.5 to 2.4–3.1 ms at unchanged acceptance. Each draft carries its
+calibrated probability, and the head now also drafts for sampled requests. Lookup + MTP
+is 1.20–1.38× ordinary decoding on novel prose and code at one to four sequences, greedy
+and sampled (1.09–1.36× over the best P8 policy), with identical outputs. At eight
+sequences and on repetitive text the head's upkeep costs 3–4%, so MTP stays opt-in. No
+compatible learned drafter exists for this checkpoint. See the
+[P14 report](apple-silicon-p14-speculation.md).
+
 Post-P8 roadmap added on 2026-10-23: P9 establishes a fresh comparative baseline;
 P10–P15 evaluate kernel, quantization, execution, speculation and prefix-scheduling
 improvements; production release moves from P9 to P16. These packages are planned,
@@ -656,6 +666,12 @@ does not pay. References: [FlashInfer planning](https://docs.flashinfer.ai/api/a
 
 ### P14 — Confidence-aware and learned speculative decoding
 
+Measured on the M1 and 0.8B checkpoint (2026-10-24): a reduced draft vocabulary and
+calibrated per-draft confidence make native MTP pay on novel text, greedy and sampled,
+at one to four sequences; learned drafters, a kernel-tier cost model, stochastic
+proposals and trees were not built. Results are in the
+[P14 report](apple-silicon-p14-speculation.md); chained MTP drafts are the next candidate.
+
 Depends on P8 correctness and P9 measurements; re-profile after P10–P13 because their
 changes alter verification costs. This package is optional if no compatible drafter pays.
 
@@ -738,7 +754,7 @@ and ordinary decoding separately. No improvement remains a possible experiment o
 | P12 low-bit KV versus Q8 group 32 | Roughly 1.7–2.4× smaller **KV storage**, subject to measured metadata/padding | Q8 uses 8.5 bits/value including one F16 scale per 32 values. Illustrative 5–3.5 effective-bit candidates give this range; formats and quality still need validation. **Measured 2026-10-24 (0.8B, M1): 4-bit formats were 10–30× over the quality budget; the best passing format saved 1.17× and decoded 2–7% slower; rejected** |
 | P12 F16 recurrent matrices versus F32 | 2× smaller matrix payload; less than 2× smaller total recurrent state | Already available in P6, not a new gain. Historical serving throughput improved only 4–5% at concurrency 8–16; long-context quality and speculative compatibility remain constraints |
 | P11 calibrated weights | Better quality at equal bytes, or fewer bytes at equal quality; no fixed speedup forecast | Same-bit calibration may change no runtime cost. Lower precision helps only if corresponding kernels win and sensitive tensors retain adequate precision. **Measured 2026-10-24 (0.8B, M1): GPTQ halved Q4K's KL at equal bytes with unchanged speed; the tied-head embedding cut Q4K weights 2.2× at equal quality** |
-| P14 learned/confidence speculation, novel text at low concurrency | Exploratory goal: 1.20–1.50× tokens/s over the best applicable P8 policy | Low confidence until a compatible drafter and total cost are measured. At high concurrency the desired result may simply be neutral fallback |
+| P14 learned/confidence speculation, novel text at low concurrency | Exploratory goal: 1.20–1.50× tokens/s over the best applicable P8 policy | Low confidence until a compatible drafter and total cost are measured. At high concurrency the desired result may simply be neutral fallback. **Measured 2026-10-24 (0.8B, M1): 1.09–1.36× over the best P8 policy (1.20–1.38× over ordinary) at one to four sequences, from a cheaper native MTP head, not a learned drafter; −3–4% at eight sequences, where MTP stays opt-in** |
 | P15 prefix-aware scheduling | Lower TTFT and fewer recomputed tokens on reuse-heavy traffic; no universal multiplier | P7 already captures large prefix wins. Additional benefit depends on hit rate, queue contention and snapshot memory; no gain is expected with no reuse |
 | Metal TensorOps on newer Macs; full flagship MoE | No numerical forecast yet | Requires same-device before/after measurements and real checkpoint execution. Changing hardware is not a software speedup |
 

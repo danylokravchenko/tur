@@ -24,6 +24,12 @@ use tur_core::{Result, execution::invalid};
 /// Prune periodically to retain at most two windows of lookup history.
 const INDEX_WINDOW: usize = 8192;
 
+/// Token IDs the draft head drafts from by default. Byte-level BPE numbers tokens in merge
+/// order, so these are the most frequent: on Qwen3.5-0.8B they kept the head's acceptance
+/// on prose and code at a seventh of its projection cost; 16K lost prose drafts and 64K
+/// added cost (P14 report).
+pub const MTP_VOCAB: usize = 32_768;
+
 /// Speculative decoding limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpeculationConfig {
@@ -36,10 +42,15 @@ pub struct SpeculationConfig {
     /// Longest suffix n-gram matched against the history; longer matches are tried first.
     pub max_ngram: usize,
     /// Also draft one token from the checkpoint's native multi-token prediction head when
-    /// prompt lookup has no proposal or a less accepted one. Drafts are computed for greedy
-    /// requests in passes of at most [`MTP_MAX_DECODES`] decodes. Needs prefix reuse
+    /// prompt lookup has no proposal or a less accepted one. Drafts are computed for
+    /// unconstrained requests in passes of at most [`MTP_MAX_DECODES`] decodes, and each
+    /// is weighed by its calibrated confidence ([`Calibration`]). Needs prefix reuse
     /// disabled.
     pub mtp: bool,
+    /// Draft-head drafts only from token IDs below this bound, through a copy of the LM
+    /// head's leading rows, which makes the head's projection proportionally cheaper.
+    /// `None` projects onto the whole vocabulary.
+    pub mtp_vocab: Option<usize>,
 }
 
 impl SpeculationConfig {
@@ -50,6 +61,7 @@ impl SpeculationConfig {
         min_ngram: 1,
         max_ngram: 1,
         mtp: false,
+        mtp_vocab: None,
     };
 
     /// Up to `max_draft` drafts per sequence and four sequences' worth per pass, from
@@ -61,13 +73,16 @@ impl SpeculationConfig {
             min_ngram: 1,
             max_ngram: 4,
             mtp: false,
+            mtp_vocab: None,
         }
     }
 
-    /// [`Self::new`] plus one-token drafts from the native multi-token prediction head.
+    /// [`Self::new`] plus one-token drafts from the native multi-token prediction head,
+    /// over the leading [`MTP_VOCAB`] token IDs.
     pub const fn with_mtp(max_draft: usize) -> Self {
         Self {
             mtp: true,
+            mtp_vocab: Some(MTP_VOCAB),
             ..Self::new(max_draft)
         }
     }
@@ -238,6 +253,11 @@ impl Acceptance {
         }
     }
 
+    /// Fold in a draft expected to be accepted with probability `rate`.
+    pub fn expect(&mut self, rate: f64) {
+        self.0 = ACCEPTANCE_SMOOTHING.mul_add(rate.clamp(0.0, 1.0) - self.0, self.0);
+    }
+
     /// Move towards `prior` after a pass in which a proposal existed but was not drafted.
     pub fn recover(&mut self, prior: Self) {
         self.0 = ACCEPTANCE_RECOVERY.mul_add(prior.0 - self.0, self.0);
@@ -254,9 +274,9 @@ const MIN_DRAFT_VARIANCE: f64 = 0.1;
 /// written) and the estimate recovers towards the pipeline-wide rate.
 pub const MTP_MIN_RATE: f64 = 0.3;
 /// Most decoding sequences of a pass for which draft-head drafts are computed. On the M1
-/// with Qwen3.5-0.8B they paid at one to four greedy sequences and lost at eight, where a
-/// one-draft verification doubles every projection's rows past the small-batch kernels
-/// (P8 report); the linear draft cost fit cannot see that step.
+/// with Qwen3.5-0.8B they paid at one to four sequences and did not at eight, where a
+/// verified draft costs about three quarters of a decode token's share of the pass even
+/// with a reduced draft vocabulary (P8 and P14 reports).
 pub const MTP_MAX_DECODES: usize = 4;
 /// Decode counts above this share one fit.
 const COST_BUCKETS: usize = 64;
@@ -421,6 +441,52 @@ pub fn plan(
     counts
 }
 
+/// Confidence bins of a [`Calibration`].
+const CONFIDENCE_BINS: usize = 10;
+/// Observations a bin's prior, its own confidence, counts as.
+const CONFIDENCE_PRIOR: f64 = 4.0;
+/// Weight kept by a bin's older observations per new one (a window of about 200).
+const CONFIDENCE_DECAY: f64 = 0.995;
+
+/// Observed acceptance of draft-head drafts by the head's own probability of its draft,
+/// so a draft is verified on its own expected acceptance rather than its request's
+/// history. Each bin starts at its confidence and learns from verified drafts.
+#[derive(Clone, Copy, Debug)]
+pub struct Calibration {
+    /// Decayed `(accepted, drafted)` per confidence bin.
+    bins: [(f64, f64); CONFIDENCE_BINS],
+}
+
+impl Default for Calibration {
+    fn default() -> Self {
+        Self {
+            bins: [(0.0, 0.0); CONFIDENCE_BINS],
+        }
+    }
+}
+
+impl Calibration {
+    fn bin(confidence: f32) -> usize {
+        let scaled = f64::from(confidence).clamp(0.0, 1.0) * CONFIDENCE_BINS as f64;
+        (scaled as usize).min(CONFIDENCE_BINS - 1)
+    }
+
+    /// Expected acceptance of a draft the head gave probability `confidence`.
+    pub fn acceptance(&self, confidence: f32) -> Acceptance {
+        let bin = Self::bin(confidence);
+        let (accepted, drafted) = self.bins[bin];
+        let prior = (bin as f64 + 0.5) / CONFIDENCE_BINS as f64;
+        Acceptance(CONFIDENCE_PRIOR.mul_add(prior, accepted) / (drafted + CONFIDENCE_PRIOR))
+    }
+
+    /// Record whether a draft of `confidence` was accepted.
+    pub fn observe(&mut self, confidence: f32, accepted: bool) {
+        let (hits, total) = &mut self.bins[Self::bin(confidence)];
+        *hits = CONFIDENCE_DECAY.mul_add(*hits, f64::from(u8::from(accepted)));
+        *total = CONFIDENCE_DECAY.mul_add(*total, 1.0);
+    }
+}
+
 /// Weight of one observation in a draft-head cost estimate.
 const HEAD_SMOOTHING: f64 = 0.2;
 /// Draft-head passes skipped as unprofitable before one computes drafts anyway, so the
@@ -495,6 +561,34 @@ pub struct SpeculationStats {
     /// Draft-head passes run between ordinary passes, and their device seconds.
     pub mtp_passes: u64,
     pub mtp_seconds: f64,
+    /// Prompt-lookup drafts verified and accepted at each depth (the last counts deeper
+    /// ones too), for per-position acceptance.
+    pub depth_drafted: [u64; STAT_DEPTHS],
+    pub depth_accepted: [u64; STAT_DEPTHS],
+    /// Draft-head drafts verified and accepted per confidence decile.
+    pub confidence_drafted: [u64; CONFIDENCE_BINS],
+    pub confidence_accepted: [u64; CONFIDENCE_BINS],
+}
+
+/// Depths [`SpeculationStats`] distinguishes.
+pub const STAT_DEPTHS: usize = 8;
+
+impl SpeculationStats {
+    /// Count a prompt-lookup verification of `drafted` drafts, `accepted` of them accepted.
+    pub fn observe_depths(&mut self, drafted: usize, accepted: usize) {
+        for depth in 0..drafted {
+            let bin = depth.min(STAT_DEPTHS - 1);
+            self.depth_drafted[bin] += 1;
+            self.depth_accepted[bin] += u64::from(depth < accepted);
+        }
+    }
+
+    /// Count a verified draft-head draft of `confidence`.
+    pub fn observe_confidence(&mut self, confidence: f32, accepted: bool) {
+        let bin = Calibration::bin(confidence);
+        self.confidence_drafted[bin] += 1;
+        self.confidence_accepted[bin] += u64::from(accepted);
+    }
 }
 
 #[cfg(test)]
@@ -549,6 +643,9 @@ mod tests {
         let mut low = Acceptance(0.0);
         low.recover(Acceptance(0.8));
         assert!((low.rate() - 0.04).abs() < 1e-12);
+        let mut expected = Acceptance(0.5);
+        expected.expect(1.0);
+        assert!((expected.rate() - 0.6).abs() < 1e-12);
     }
 
     fn costs(decodes: usize, base: f64, per_draft: f64) -> DraftCosts {
@@ -654,6 +751,30 @@ mod tests {
         head.record(1, 0.006);
         assert!(!head.worthwhile(&[0.2], 4, &costs));
         assert!(!head.worthwhile(&[], 4, &costs));
+    }
+
+    #[test]
+    fn test_calibration_starts_at_confidence_and_learns_observed_acceptance() {
+        let mut calibration = Calibration::default();
+        assert!((calibration.acceptance(0.93).rate() - 0.95).abs() < 1e-12);
+        assert!((calibration.acceptance(0.0).rate() - 0.05).abs() < 1e-12);
+        // An overconfident bin: drafts at 0.92 are accepted half the time.
+        for i in 0..400 {
+            calibration.observe(0.92, i % 2 == 0);
+        }
+        assert!((calibration.acceptance(0.95).rate() - 0.5).abs() < 0.02);
+        // Other bins keep their prior.
+        assert!((calibration.acceptance(0.45).rate() - 0.45).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_stats_count_acceptance_per_depth() {
+        let mut stats = SpeculationStats::default();
+        stats.observe_depths(3, 1);
+        stats.observe_depths(10, 10);
+        assert_eq!(stats.depth_drafted[..3], [2, 2, 2]);
+        assert_eq!(stats.depth_accepted[..3], [2, 1, 1]);
+        assert_eq!(stats.depth_drafted[STAT_DEPTHS - 1], 3);
     }
 
     #[test]

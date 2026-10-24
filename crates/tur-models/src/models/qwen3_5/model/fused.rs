@@ -216,15 +216,16 @@ impl Qwen35 {
         };
         let out = k.linear(&mlp.down, &k.swiglu(&k.linear(&mlp.gate_up, &normed)?)?)?;
         let (_, h) = k.add_rms_norm(&sum, &out, &mtp.norm, d.eps)?;
+        let head = mtp.lm_head(&self.lm_head);
         if pass.rows.is_empty() {
             return Ok(Tensor::zeros(
-                (0, self.description.vocab_size),
+                (0, head.out_features()),
                 DType::F32,
                 &self.device,
             )?);
         }
         let rows = Tensor::new(pass.rows.as_slice(), &self.device)?;
-        k.linear(&self.lm_head, &h.index_select(&rows, 0)?)
+        k.linear(head, &h.index_select(&rows, 0)?)
     }
 
     #[allow(clippy::too_many_arguments)]

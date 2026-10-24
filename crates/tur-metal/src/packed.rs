@@ -130,6 +130,38 @@ impl PackedLinear {
         Self::from_blocks(&packed, format, (out_features, in_features), device)
     }
 
+    /// A copy of the first `rows` output rows as their own projection, in the same format.
+    /// GGML blocks never span rows, so the packed bytes are a prefix of this projection's.
+    pub fn leading_rows(&self, rows: usize) -> Result<Self> {
+        if rows == 0 || rows > self.out_features {
+            return Err(invalid("leading projection rows outside weights"));
+        }
+        match &self.weights {
+            Weights::Dense(weight) => {
+                let device = weight.device().clone();
+                Self::dense(&weight.narrow(0, 0, rows)?.copy()?, &device)
+            }
+            Weights::Packed {
+                matmul: QMatMul::QTensor(packed),
+                format,
+                ..
+            } => {
+                let bytes = crate::quantize::packed_bytes(*format, rows, self.in_features)?;
+                let data = packed.data()?;
+                let prefix = data
+                    .get(..bytes)
+                    .ok_or_else(|| invalid("packed rows outside weights"))?;
+                Self::from_blocks(
+                    prefix,
+                    *format,
+                    (rows, self.in_features),
+                    &packed.device(),
+                )
+            }
+            Weights::Packed { .. } => Err(invalid("packed weights lost their blocks")),
+        }
+    }
+
     pub fn out_features(&self) -> usize {
         self.out_features
     }
@@ -340,6 +372,13 @@ mod tests {
                 );
             }
             assert!(single.forward_rows(&x, 20, 8).is_err());
+            let leading = single.leading_rows(10)?;
+            assert_eq!(leading.out_features(), 10);
+            assert_eq!(
+                leading.forward(&x)?.to_vec2::<f32>()?,
+                single.forward_rows(&x, 0, 10)?.to_vec2::<f32>()?
+            );
+            assert!(single.leading_rows(0).is_err() && single.leading_rows(25).is_err());
         }
         assert!(
             PackedLinear::stacked([weights(2, 64), weights(2, 32)], None, &Device::Cpu).is_err()

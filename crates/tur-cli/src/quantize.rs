@@ -120,6 +120,7 @@ fn main() -> Result<()> {
                 kv: KvLayout::new(16, KvFormat::F32),
                 recurrent: DEFAULT_RECURRENT_STATE,
                 mtp: false,
+                draft_vocab: None,
             },
         )?;
         let calibration = model.calibrate(&samples, args.method == Method::Gptq)?;

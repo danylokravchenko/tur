@@ -56,6 +56,7 @@ fn options(weights: Weights, device: &Device) -> LoadOptions {
         kv: KvLayout::new(16, KvFormat::F32),
         recurrent: DType::F32,
         mtp: false,
+        draft_vocab: None,
     }
 }
 
