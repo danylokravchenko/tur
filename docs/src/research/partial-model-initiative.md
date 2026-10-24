@@ -147,8 +147,9 @@ negative results if selection collapses quality or SSD transfers dominate latenc
 
 ## Fit with existing Tur work
 
-- [Design decisions](decisions.md): packed experts and grouped Metal dispatch (full 35B
-  quality gates remain open), calibrated quantization, sensitivity allocation and
+- [Metal kernels](../architecture/kernels.md), [Prepacked weights](../guide/quantization.md)
+  and [State memory](../architecture/memory.md): packed experts and grouped Metal dispatch
+  (full 35B quality gates remain open), calibrated quantization, sensitivity allocation,
   prepacked artifacts, and the single memory budget. Extend that accounting to
   resident/offloaded weights and staging rather than creating a competing budget system.
 - Existing implementation starting points:

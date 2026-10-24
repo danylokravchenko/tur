@@ -158,7 +158,7 @@ pub enum Execution {
     Reference,
 }
 
-/// K/V storage chosen from M1 measurements (`docs/decisions.md`): F16 was the
+/// K/V storage chosen from M1 measurements (`docs/src/architecture/memory.md`): F16 was the
 /// fastest format end to end and indistinguishable from F32 in quality; page sizes of
 /// 16–128 tokens performed alike, and 16 wastes the least tail memory. Q8 halves K/V
 /// memory again for capacity-bound deployments.

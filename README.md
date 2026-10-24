@@ -1,124 +1,117 @@
 # Tur
 
-Tur is a Rust inference engine for Apple Silicon. It runs Qwen3.5/3.8 dense hybrid
-text models (Gated DeltaNet plus gated attention) on fused Metal kernels, over paged
-and optionally quantized K/V and recurrent state. It also does packed continuous
-batching, prefix reuse, device sampling and exact speculative decoding.
+Tur is a Rust inference engine for hybrid language models on Apple Silicon. It runs
+Qwen3.5-family checkpoints, which interleave Gated DeltaNet recurrent layers with gated
+attention, on fused Metal kernels:
 
-The Qwen3.5-0.8B checkpoint is validated against Transformers on CPU and Metal.
-Qwen3.8-27B shares the code path but has not been executed. The Qwen3.6 MoE path is
-experimental. Every measurement so far comes from one M1. See
-[design decisions](docs/decisions.md) for what was chosen, what was rejected and what
-is still open.
+- **Packed continuous batching:** one pass per step for every scheduled request, with no
+  padding.
+- **Paged state:** persistent K/V and recurrent state pools; K/V in F32, F16 or Q8.
+- **Prefix reuse:** zero-copy snapshots at exact token boundaries.
+- **Device sampling:** temperature, top-k, top-p, penalties and grammar masks on the GPU.
+- **Exact speculative decoding:** drafts from prompt lookup and the checkpoint's own MTP
+  head, verified so output matches ordinary decoding.
+- **Calibrated quantization:** GPTQ, importance-weighted and mixed-precision prepacked
+  weights.
 
-## Build and test
+It ships as one `tur` binary (`run`, `serve`, `quantize`), an OpenAI-style HTTP API,
+and a Rust library.
 
-Rust 1.99 or later. Metal is enabled by default; `--no-default-features` builds the
-CPU reference only.
+| Model | Status |
+| --- | --- |
+| Qwen3.5-0.8B | Validated against Transformers per layer and in logits, on CPU and Metal |
+| Qwen3.8-27B | Same code path, config and headers validated; not yet executed (needs more than 16 GB) |
+| Qwen3.6-35B-A3B (MoE) | Experimental |
 
-```sh
-cargo check --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all -- --check
-cargo nextest run --workspace
-cargo build --release --bin tur
-```
+Text input only. All measurements so far come from one M1 with 16 GB.
 
-Integration tests for every crate are linked into one binary,
-`crates/tur/tests/integration`, with fixtures in `crates/tur/tests/fixtures`. Test builds
-optimize dependencies, `tur-metal` and `tur-models`, because their host reference math
-dominates test time otherwise. Benchmarks and measurement tools are one binary as well:
-`cargo bench -p tur --bench perf -- <kernels|model|serving|prefix|kv_quality|tensorops|load_weights>`.
+## Performance
 
-The offline suite uses small tensor and tokenizer fixtures. Real-checkpoint tests are
-`#[ignore]`d and read `TUR_QWEN35_0_8B` (a local snapshot of the pinned 0.8B), plus
-`TUR_QWEN35_GOLDEN` and `TUR_QWEN35_MTP_GOLDEN`, which are written by
-`scripts/qwen3_5_reference.py` and `scripts/qwen3_5_mtp_reference.py`.
+Qwen3.5-0.8B with Q8_0 weights on an M1 (16 GB), serving 128-token prompts with 64 sampled
+output tokens:
 
-## Usage
+| Concurrent requests | Output tok/s | TTFT p50 | Inter-token p50 |
+| --- | --- | --- | --- |
+| 1 | 49 | 0.15 s | 17.8 ms |
+| 4 | 118 | 0.47 s | 23.0 ms |
+| 8 | 184 | 0.88 s | 27.2 ms |
+| 16 | 200 | 1.69 s | 46.3 ms |
 
-One binary, three commands:
+- Single-sequence decode: 57 tok/s with Q8_0, 91 tok/s with Q4K.
+- Prefill: about 1,300 tok/s at 2K tokens.
+- Prefix reuse: a cold shared 1.5K-token prompt reached by eight users gets its first
+  token in 1.7 s instead of 9.6 s.
+- Speculation: prompt lookup reaches up to 2.9× on repetitive output.
 
-```sh
-tur run      --model <dir|org/name> --revision <rev> [--prompt ...]   # one completion to stdout
-tur serve    --model <dir|org/name> --revision <rev> [--listen ...]   # OpenAI-style HTTP API
-tur quantize --model <dir> --revision <rev> --output <dir>            # prepack weights offline
-```
+All tables, with sources and settings: [Measured performance](docs/src/guide/performance.md).
 
-`--model` is a local checkpoint directory or a fully qualified Hugging Face repository.
-A remote `--revision` must be a 40-character commit. For a local directory it is the
-identity you assign. A directory needs `config.json`, `tokenizer.json`,
-`tokenizer_config.json` and SafeTensors weights. `chat_template.jinja` and
-`generation_config.json` are optional. `TUR_MODEL` and `TUR_REVISION` set both flags
-from the environment.
+## Quickstart
 
 ```sh
-cargo run --release --bin tur -- run \
-  --model Qwen/Qwen3.5-0.8B --revision 2fc06364715b967f1860aea9cf38778875588b17 \
-  --prompt 'Write one sentence about the Moon.' --temperature 0 --max-tokens 64
+cargo install --path crates/tur-cli
+
+export TUR_MODEL=Qwen/Qwen3.5-0.8B
+export TUR_REVISION=2fc06364715b967f1860aea9cf38778875588b17
+
+tur run --prompt 'Write one sentence about the Moon.' --temperature 0 -n 64 --thinking false
+tur serve --served-model-name qwen        # http://127.0.0.1:8080/v1/chat/completions
 ```
-
-### Shared by `run` and `serve`
-
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `--weight-format f32\|q8_0\|q4k` | `q8_0` | Convert SafeTensors projections at load time. Omit it for a prepacked artifact |
-| `--kv-format f32\|f16\|q8\|q8_<group>` | `f16` | K/V storage; `q8` halves memory at a small measured quality cost |
-| `--kv-page-tokens` | 16 | Tokens per K/V page |
-| `--recurrent-state f32\|f16` | `f32` | F16 halves recurrent memory; its error grows with decode length |
-| `--state-memory-mb` | derived | K/V and recurrent memory; default fits an 8K context per concurrent request |
-| `--prefill-chunk-size` | 256 | Largest prefill chunk of one request per pass |
-| `--speculative-draft N` | 0 | Prompt-lookup drafts per decode. Throughput mode: tokens arrive in bursts |
-| `--mtp` | off | Also draft with the checkpoint's MTP head; disables prefix reuse |
-| `--cpu-reference` | off | Run the CPU numerical reference |
-
-`run` also takes the sampling flags `--temperature`, `--top-k` and `--top-p`, the
-penalty flags, and `--seed`. Sampling flags you omit inherit the checkpoint's defaults;
-`--temperature 0` is greedy. It also takes `--thinking`, `--reasoning-effort` and
-`--preserve-thinking`, which are passed to the checkpoint template, and `--tools` with
-a JSON array of `{name, description, parameters}`.
-
-### Serving
 
 ```sh
-cargo run --release --bin tur -- serve \
-  --model /path/to/checkpoint --revision my-checkpoint --served-model-name qwen-hybrid \
-  --max-batch-size 8 --listen 127.0.0.1:8080
-
-curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"qwen-hybrid","messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"Say hi"}],"max_tokens":32}'
 ```
 
-The model loads and validates before the listener binds. `serve` also takes
-`--max-batch-tokens`, `--max-waiting`, `--request-timeout-secs` and
-`--prefix-snapshots` (0 disables prefix reuse).
+Prepack calibrated 4-bit weights, then serve them:
 
-The endpoints are `/v1/models` and `/v1/chat/completions`. `"stream": true` returns SSE
-text chunks, a final usage chunk and `[DONE]`. Requests can set `temperature`, `top_k`,
-`top_p`, the penalties, `seed`, `thinking` (alias `enable_thinking`),
-`reasoning_effort` and `preserve_thinking`. Function tools use the usual
-`{type:"function",function:{...}}` envelope with automatic selection. Calls are parsed
-and returned but never executed. Only text input is accepted. Finish reasons are `stop`,
-`length` and `tool_calls`. A streaming client that stops reading is cancelled with a
-`slow_client` error.
+```sh
+hf download Qwen/Qwen3.5-0.8B --revision "$TUR_REVISION" --local-dir ~/models/qwen3.5-0.8b
+tur quantize --model ~/models/qwen3.5-0.8b --revision "$TUR_REVISION" \
+  --output ~/models/qwen3.5-0.8b-q4k --calibration calib.txt
+tur serve --model ~/models/qwen3.5-0.8b-q4k --revision q4k-v1
+```
 
-### Prepacked weights
+## Documentation
 
-`tur quantize` writes a versioned artifact that `run` and `serve` load directly. By
-default it uses Q4K with GPTQ, which needs `--calibration` text files. Use
-`--method rtn` for uncalibrated rounding. `--budget-bits 5.5` upgrades the most
-sensitive projections to `q8_0`. `--report` writes calibration and plan details as
-JSON.
+The book in [`docs/`](docs/src/SUMMARY.md) is the full documentation. Serve it with
+`just docs`.
 
-## Workspace
+- **Guide:**
+  - [Quickstart](docs/src/guide/quickstart.md)
+  - [Measured performance](docs/src/guide/performance.md)
+  - [Command line](docs/src/guide/cli.md)
+  - [HTTP API](docs/src/guide/http-api.md)
+  - [Choosing a quantization](docs/src/guide/choosing-quantization.md)
+  - [Tuning recipes](docs/src/guide/tuning.md)
+  - [Rust library](docs/src/guide/library.md)
+- **Architecture:** [Overview](docs/src/architecture/overview.md), then one chapter per
+  component: model, engine, memory, scheduling, prefix reuse, sampling, speculation,
+  kernels and serving. Each chapter ends with the decisions and measurements behind it.
+- **Design:**
+  - [Scope](docs/src/design/scope.md)
+  - [Rejected experiments](docs/src/design/rejected.md)
+  - [Open work](docs/src/design/open.md)
+
+## Development
+
+Rust 1.99+ on an Apple Silicon Mac. [`just`](https://github.com/casey/just) runs every
+task:
+
+```sh
+just ci           # fmt-check, strict clippy, checks with and without Metal, ~25 s test suite
+just bench <case> # kernels | model | serving | prefix | kv_quality | tensorops | load_weights
+```
 
 | Crate | Owns |
 | --- | --- |
 | `tur-core` | Shared errors and checked packed-execution descriptors |
-| `tur-metal` | State pools, completion fences, Metal kernels, packed weights |
-| `tur-models` | Checkpoint loading and validation, the Qwen3.5 model, templates |
-| `tur-engine` | Engine, scheduler, prefix cache, speculation, sampling, pipeline |
-| `tur` | Facade re-exports and the HTTP server library |
+| `tur-metal` | State pools, completion fences, Metal kernels, packed weights, sampler |
+| `tur-models` | Checkpoint loading and validation, the Qwen3.5 model, templates, tools |
+| `tur-engine` | Engine, scheduler, prefix cache, speculation, pipeline, memory plan |
+| `tur` | Facade and HTTP server; all integration tests and benchmarks |
 | `tur-cli` | The `tur` binary |
+
+No unsafe code, no panics, and every default backed by a measurement; see
+[Workflow and rules](docs/src/development/workflow.md) and [AGENTS.md](AGENTS.md).
 
 Licensed under Apache-2.0.

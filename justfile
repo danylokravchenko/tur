@@ -54,3 +54,11 @@ quantize dir output *args:
 # Benchmarks: `just bench kernels`, `just bench serving`; no case lists them.
 bench *args:
     cargo bench --offline -p tur --bench perf -- "$@"
+
+# Serve the book at http://localhost:3000 with live reload.
+docs:
+    mdbook serve docs --open
+
+# Build the book into docs/book.
+docs-build:
+    mdbook build docs

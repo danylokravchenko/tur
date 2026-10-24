@@ -1,9 +1,10 @@
 # AGENTS.md
 
-Guidance for AI coding agents working on Tur. Read it before changing code, and read
-[docs/decisions.md](docs/decisions.md) before changing kernels, memory, scheduling,
-speculation or weight formats: it records what was chosen, what was measured and what
-was rejected.
+Guidance for AI coding agents working on Tur. Read it before changing code. Before
+changing kernels, memory, scheduling, prefix reuse, sampling, speculation or weight
+formats, read the matching chapter of the book in [docs/src](docs/src/SUMMARY.md). Its
+"Decisions" section records what was chosen and measured, and
+[docs/src/design/rejected.md](docs/src/design/rejected.md) lists what was rejected.
 
 ## Project
 
@@ -26,7 +27,7 @@ crates/
     tests/fixtures/      pinned configs, templates, tensor headers, golden outputs
     benches/perf/        every benchmark and measurement tool, one binary
   tur-cli/     the `tur` binary: run, serve, quantize
-docs/decisions.md        design decisions, measurements, rejected experiments, open work
+docs/                    mdBook (`just docs`): guide, architecture with decisions, development, design
 scripts/                 Python generators for golden references and fixtures
 ```
 
@@ -88,7 +89,7 @@ Engineering expectations:
   clones; cloning an `Arc` is fine but should be deliberate.
 - Performance claims need measurements on the target Mac, through `just bench`.
   Default to the existing kernel unless a new one wins at its shapes beyond run-to-run
-  noise. A rejected experiment gets a row in `docs/decisions.md`.
+  noise. A rejected experiment gets a row in `docs/src/design/rejected.md`.
 - Model correctness comes from pinned external references (Transformers, MLX-LM). Do not
   mark a model supported because its config parses.
 
@@ -110,4 +111,6 @@ Engineering expectations:
 - Doc comments on public items say what the method does and any invariants it relies on.
 - Comments explain why: a measured threshold, an ordering constraint, a non-obvious
   invariant. Do not restate the code, and do not cite phase numbers or report files.
-- When a decision changes, update `docs/decisions.md`; keep it to decisions, not narrative.
+- Keep the book current. A changed default, flag, endpoint or mechanism updates its
+  chapter in `docs/src`, including the chapter's "Decisions" section. Keep decisions to
+  the choice and its evidence, not narrative. `just docs-build` must pass.
