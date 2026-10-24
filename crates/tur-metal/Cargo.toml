@@ -15,9 +15,6 @@ parking_lot.workspace = true
 candle-metal-kernels = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
 
-[dev-dependencies]
-serde_json.workspace = true
-
 [features]
 default = ["metal"]
 metal = [
@@ -26,15 +23,6 @@ metal = [
     "dep:candle-metal-kernels",
     "dep:objc2-metal",
 ]
-
-[[bench]]
-name = "kernels"
-harness = false
-required-features = ["metal"]
-
-[[example]]
-name = "tensorops_gemm"
-required-features = ["metal"]
 
 [lints]
 workspace = true

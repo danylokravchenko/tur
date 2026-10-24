@@ -909,14 +909,16 @@ fn parse_tokens(raw: &serde_json::Value, vocab: usize) -> Result<Vec<u32>> {
 mod tests {
     use super::*;
 
-    const SMALL: &str = include_str!("../../../tests/fixtures/checkpoints/small-config.json");
-    const FLAGSHIP: &str = include_str!("../../../tests/fixtures/checkpoints/qwen3.8-config.json");
+    const SMALL: &str =
+        include_str!("../../../../tur/tests/fixtures/checkpoints/small-config.json");
+    const FLAGSHIP: &str =
+        include_str!("../../../../tur/tests/fixtures/checkpoints/qwen3.8-config.json");
     const FLAGSHIP_GENERATION: &str =
-        include_str!("../../../tests/fixtures/checkpoints/qwen3.8-generation_config.json");
+        include_str!("../../../../tur/tests/fixtures/checkpoints/qwen3.8-generation_config.json");
     const FLAGSHIP_TOKENIZER_CONFIG: &str =
-        include_str!("../../../tests/fixtures/checkpoints/qwen3.8-tokenizer_config.json");
+        include_str!("../../../../tur/tests/fixtures/checkpoints/qwen3.8-tokenizer_config.json");
     const FLAGSHIP_TENSORS: &str =
-        include_str!("../../../tests/fixtures/checkpoints/qwen3.8-text-tensors.json");
+        include_str!("../../../../tur/tests/fixtures/checkpoints/qwen3.8-text-tensors.json");
 
     #[test]
     fn test_pinned_configs_parse_with_hybrid_layout() -> Result<()> {
@@ -966,7 +968,7 @@ mod tests {
 
     #[test]
     fn test_projections_cover_every_matrix_once_with_matching_shapes() -> Result<()> {
-        let moe = include_str!("../../../tests/fixtures/checkpoints/qwen3.6-config.json");
+        let moe = include_str!("../../../../tur/tests/fixtures/checkpoints/qwen3.6-config.json");
         for (json, mtp) in [(SMALL, true), (FLAGSHIP, false), (moe, false)] {
             let mut config = Config::from_json(json)?;
             if mtp && config.supports_mtp() {

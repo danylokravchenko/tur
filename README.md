@@ -24,6 +24,12 @@ cargo nextest run --workspace
 cargo build --release --bin tur
 ```
 
+Integration tests for every crate are linked into one binary,
+`crates/tur/tests/integration`, with fixtures in `crates/tur/tests/fixtures`. Test builds
+optimize dependencies, `tur-metal` and `tur-models`, because their host reference math
+dominates test time otherwise. Benchmarks and measurement tools are one binary as well:
+`cargo bench -p tur --bench perf -- <kernels|model|serving|prefix|kv_quality|tensorops|load_weights>`.
+
 The offline suite uses small tensor and tokenizer fixtures. Real-checkpoint tests are
 `#[ignore]`d and read `TUR_QWEN35_0_8B` (a local snapshot of the pinned 0.8B), plus
 `TUR_QWEN35_GOLDEN` and `TUR_QWEN35_MTP_GOLDEN`, which are written by

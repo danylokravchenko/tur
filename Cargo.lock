@@ -3394,8 +3394,11 @@ dependencies = [
  "async-stream",
  "axum",
  "candle-core",
+ "candle-metal-kernels",
  "http-body-util",
  "metal 0.33.0",
+ "objc2-metal",
+ "parking_lot",
  "serde",
  "serde_json",
  "tokenizers 0.21.4",
@@ -3441,7 +3444,6 @@ version = "0.1.0"
 dependencies = [
  "candle-core",
  "llguidance",
- "parking_lot",
  "serde_json",
  "tokenizers 0.21.4",
  "toktrie_hf_tokenizers",
@@ -3460,7 +3462,6 @@ dependencies = [
  "candle-metal-kernels",
  "objc2-metal",
  "parking_lot",
- "serde_json",
  "tur-core",
 ]
 

@@ -6,7 +6,7 @@ import struct
 import urllib.request
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1] / "crates/tur-models/tests/fixtures/checkpoints"
+ROOT = Path(__file__).resolve().parents[1] / "crates/tur/tests/fixtures/checkpoints"
 QWEN = "995ad96eacd98c81ed38be0c5b274b04031597b0"
 
 

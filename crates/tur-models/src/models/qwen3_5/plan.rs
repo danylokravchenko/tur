@@ -228,7 +228,8 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
-    const SMALL: &str = include_str!("../../../tests/fixtures/checkpoints/small-config.json");
+    const SMALL: &str =
+        include_str!("../../../../tur/tests/fixtures/checkpoints/small-config.json");
 
     #[test]
     fn test_uniform_plans_validate_and_mixed_plans_reject_unexecutable_precisions() -> Result<()> {

@@ -3,7 +3,7 @@
 Pinned environment: transformers 5.20.2, torch CPU, float32.
 
     python -I scripts/qwen3_5_reference.py --model <snapshot dir> \
-        --golden <out.safetensors> --templates crates/tur-models/tests/fixtures/qwen3_5_templates.json
+        --golden <out.safetensors> --templates crates/tur/tests/fixtures/qwen3_5_templates.json
 """
 
 import argparse
@@ -16,8 +16,8 @@ from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 
 REPO = Path(__file__).resolve().parents[1]
 TEMPLATES = {
-    "qwen3.5-0.8b": REPO / "crates/tur-models/tests/fixtures/checkpoints/small-chat_template.jinja",
-    "qwen3.8-27b": REPO / "crates/tur-models/tests/fixtures/checkpoints/qwen3.8-chat_template.jinja",
+    "qwen3.5-0.8b": REPO / "crates/tur/tests/fixtures/checkpoints/small-chat_template.jinja",
+    "qwen3.8-27b": REPO / "crates/tur/tests/fixtures/checkpoints/qwen3.8-chat_template.jinja",
 }
 
 LONG_PROMPT = (

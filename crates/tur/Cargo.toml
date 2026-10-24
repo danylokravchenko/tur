@@ -31,10 +31,20 @@ async-stream = { workspace = true }
 tokenizers.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
+parking_lot.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+candle-metal-kernels.workspace = true
+objc2-metal.workspace = true
 
 [features]
 default = ["metal"]
 metal = ["tur-engine/metal", "tur-metal/metal", "tur-models/metal", "tur-core/metal", "candle-core/metal", "dep:metal"]
+
+[[bench]]
+name = "perf"
+harness = false
+required-features = ["metal"]
 
 [lints]
 workspace = true

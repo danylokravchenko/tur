@@ -1,6 +1,6 @@
 """Regenerate the offline MoE oracle with Transformers 5.20.2 / torch 2.14.1.
 
-Weights use the same deterministic LCG and BF16 conversion as tests/common/mod.rs.
+Weights use the same deterministic LCG and BF16 conversion as crates/tur/tests/integration/model_common.rs.
 No weights or network access are needed. All layers and final logits come from the
 independent Transformers Qwen3_5MoeForCausalLM on CPU in F32.
 
@@ -15,7 +15,7 @@ from safetensors.torch import save_file
 from transformers import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextConfig
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURES = ROOT / "crates/tur-engine/tests/fixtures"
+FIXTURES = ROOT / "crates/tur/tests/fixtures"
 
 
 def values(count, seed, scale):

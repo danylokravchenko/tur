@@ -20,31 +20,9 @@ toktrie_hf_tokenizers.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 
-[dev-dependencies]
-parking_lot.workspace = true
-
 [features]
 default = ["metal"]
 metal = ["candle-core/metal", "tur-core/metal", "tur-metal/metal", "tur-models/metal"]
-
-[[bench]]
-name = "qwen3_5"
-harness = false
-required-features = ["metal"]
-
-[[bench]]
-name = "serving"
-harness = false
-required-features = ["metal"]
-
-[[bench]]
-name = "prefix"
-harness = false
-
-[[bench]]
-name = "kv_quality"
-harness = false
-required-features = ["metal"]
 
 [lints]
 workspace = true
