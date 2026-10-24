@@ -160,95 +160,15 @@ pub(super) struct MoeConfig {
 
 impl Config {
     /// Parse explicit architecture identifiers and nested text settings, never a model name.
-    #[allow(
-        clippy::float_cmp,
-        reason = "duplicate configuration fields must agree exactly"
-    )]
     pub fn from_json(json: &str) -> Result<Self> {
         let raw: serde_json::Value = serde_json::from_str(json)?;
-        let architectures = raw["architectures"].as_array();
-        let (text, prefix) = match (raw["model_type"].as_str(), architectures) {
-            (Some("qwen3_5"), Some(a))
-                if a == &[serde_json::json!("Qwen3_5ForConditionalGeneration")] =>
-            {
-                (
-                    raw.get("text_config")
-                        .ok_or_else(|| invalid("qwen3_5 requires text_config"))?,
-                    "model.language_model",
-                )
-            }
-            (Some("qwen3_5_text"), Some(a)) if a == &[serde_json::json!("Qwen3_5ForCausalLM")] => {
-                (&raw, "model")
-            }
-            (Some("qwen3_5_moe"), Some(a))
-                if a == &[serde_json::json!("Qwen3_5MoeForConditionalGeneration")] =>
-            {
-                (
-                    raw.get("text_config")
-                        .ok_or_else(|| invalid("qwen3_5_moe requires text_config"))?,
-                    "model.language_model",
-                )
-            }
-            (Some("qwen3_5_moe_text"), Some(a))
-                if a == &[serde_json::json!("Qwen3_5MoeForCausalLM")] =>
-            {
-                (&raw, "model")
-            }
-            _ => {
-                return Err(invalid(
-                    "unsupported architecture: expected Qwen3_5 dense or MoE conditional generation or text causal LM",
-                ));
-            }
-        };
+        let (text, prefix) = text_section(&raw)?;
         let is_moe = matches!(
             raw["model_type"].as_str(),
             Some("qwen3_5_moe" | "qwen3_5_moe_text")
         );
-        let moe: Option<MoeConfig> = if is_moe {
-            let moe: MoeConfig = serde_json::from_value(text.clone())?;
-            if moe.num_experts == 0
-                || moe.num_experts > 256
-                || moe.num_experts_per_tok == 0
-                || moe.num_experts_per_tok > moe.num_experts
-                || moe.moe_intermediate_size == 0
-                || moe.shared_expert_intermediate_size == 0
-            {
-                return Err(invalid("invalid Qwen3.5 MoE expert count, top-k or width"));
-            }
-            Some(moe)
-        } else {
-            None
-        };
-        for settings in [&raw, text] {
-            for key in ["quantization_config", "rope_scaling", "sliding_window"] {
-                if settings.get(key).is_some_and(|v| !v.is_null()) {
-                    return Err(invalid(format!("unsupported Qwen3.5 setting: {key}")));
-                }
-            }
-            if !is_moe
-                && [
-                    "num_experts",
-                    "moe_intermediate_size",
-                    "shared_expert_intermediate_size",
-                    "num_experts_per_tok",
-                ]
-                .iter()
-                .any(|key| settings.get(key).is_some_and(|v| !v.is_null()))
-            {
-                return Err(invalid("MoE settings require an explicit MoE architecture"));
-            }
-            if settings.get("norm_topk_prob").is_some_and(|v| v != true)
-                || settings.get("decoder_sparse_step").is_some_and(|v| v != 1)
-            {
-                return Err(invalid(
-                    "unsupported MoE routing normalization or sparse layer interval",
-                ));
-            }
-            let mlp_only = settings.get("mlp_only_layers").filter(|v| !v.is_null());
-            if mlp_only.is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty())) {
-                return Err(invalid("MLP-only layers are unsupported"));
-            }
-        }
+        let moe = moe_settings(text, is_moe)?;
+        reject_unsupported_settings(&raw, text, is_moe)?;
         let mut text: TextConfig = serde_json::from_value(text.clone())?;
         if let Some(moe) = &moe {
             text.intermediate_size = moe
@@ -316,51 +236,9 @@ impl Config {
                 "invalid Qwen3.5 dimensions, heads, layer list or normalization",
             ));
         }
-        let rope = &text.rope_parameters;
-        let rotary = text.head_dim as f64 * rope.partial_rotary_factor;
-        if rope.rope_type != "default"
-            || !rope.rope_theta.is_finite()
-            || rope.rope_theta <= 0.0
-            || !rotary.is_finite()
-            || rotary < 2.0
-            || rotary > text.head_dim as f64
-            || rotary.fract() != 0.0
-            || !(rotary as usize).is_multiple_of(2)
-            || text
-                .partial_rotary_factor
-                .is_some_and(|f| f != rope.partial_rotary_factor)
-        {
-            return Err(invalid("unsupported or invalid partial RoPE configuration"));
-        }
-        // Text-only positions are equal on all three M-RoPE axes, so interleaved sections
-        // reduce to ordinary partial rotary; any other layout would need real 3-D positions.
-        if !rope.mrope_section.is_empty() {
-            let sum = rope
-                .mrope_section
-                .iter()
-                .try_fold(0usize, |s, &n| s.checked_add(n))
-                .ok_or_else(|| invalid("mrope section overflow"))?;
-            if !rope.mrope_interleaved
-                || rope.mrope_section.len() != 3
-                || sum != rotary as usize / 2
-            {
-                return Err(invalid("unsupported M-RoPE sections"));
-            }
-        }
+        validate_rope(&text)?;
         let eos = parse_tokens(&text.eos_token_id, text.vocab_size)?;
-        let mut forbidden_tokens = Vec::new();
-        for field in [
-            "image_token_id",
-            "video_token_id",
-            "vision_start_token_id",
-            "vision_end_token_id",
-            "audio_token_id",
-        ] {
-            if let Some(id) = raw.get(field).and_then(serde_json::Value::as_u64) {
-                forbidden_tokens
-                    .push(u32::try_from(id).map_err(|_| invalid("modality token overflow"))?);
-            }
-        }
+        let forbidden_tokens = modality_tokens(&raw)?;
         let config = Self {
             text,
             moe,
@@ -877,6 +755,157 @@ impl Config {
     pub fn tied_embeddings(&self) -> bool {
         self.text.tie_word_embeddings
     }
+}
+
+/// The text settings and weight prefix of a supported architecture, chosen by its explicit
+/// identifiers.
+fn text_section(raw: &serde_json::Value) -> Result<(&serde_json::Value, &'static str)> {
+    let architectures = raw["architectures"].as_array();
+    let section = match (raw["model_type"].as_str(), architectures) {
+        (Some("qwen3_5"), Some(a))
+            if a == &[serde_json::json!("Qwen3_5ForConditionalGeneration")] =>
+        {
+            (
+                raw.get("text_config")
+                    .ok_or_else(|| invalid("qwen3_5 requires text_config"))?,
+                "model.language_model",
+            )
+        }
+        (Some("qwen3_5_text"), Some(a)) if a == &[serde_json::json!("Qwen3_5ForCausalLM")] => {
+            (raw, "model")
+        }
+        (Some("qwen3_5_moe"), Some(a))
+            if a == &[serde_json::json!("Qwen3_5MoeForConditionalGeneration")] =>
+        {
+            (
+                raw.get("text_config")
+                    .ok_or_else(|| invalid("qwen3_5_moe requires text_config"))?,
+                "model.language_model",
+            )
+        }
+        (Some("qwen3_5_moe_text"), Some(a))
+            if a == &[serde_json::json!("Qwen3_5MoeForCausalLM")] =>
+        {
+            (raw, "model")
+        }
+        _ => {
+            return Err(invalid(
+                "unsupported architecture: expected Qwen3_5 dense or MoE conditional generation or text causal LM",
+            ));
+        }
+    };
+    Ok(section)
+}
+
+fn moe_settings(text: &serde_json::Value, is_moe: bool) -> Result<Option<MoeConfig>> {
+    Ok(if is_moe {
+        let moe: MoeConfig = serde_json::from_value(text.clone())?;
+        if moe.num_experts == 0
+            || moe.num_experts > 256
+            || moe.num_experts_per_tok == 0
+            || moe.num_experts_per_tok > moe.num_experts
+            || moe.moe_intermediate_size == 0
+            || moe.shared_expert_intermediate_size == 0
+        {
+            return Err(invalid("invalid Qwen3.5 MoE expert count, top-k or width"));
+        }
+        Some(moe)
+    } else {
+        None
+    })
+}
+
+/// Reject quantization, scaling, windowing and `MoE` routing settings Tur does not implement.
+fn reject_unsupported_settings(
+    raw: &serde_json::Value,
+    text: &serde_json::Value,
+    is_moe: bool,
+) -> Result<()> {
+    for settings in [raw, text] {
+        for key in ["quantization_config", "rope_scaling", "sliding_window"] {
+            if settings.get(key).is_some_and(|v| !v.is_null()) {
+                return Err(invalid(format!("unsupported Qwen3.5 setting: {key}")));
+            }
+        }
+        if !is_moe
+            && [
+                "num_experts",
+                "moe_intermediate_size",
+                "shared_expert_intermediate_size",
+                "num_experts_per_tok",
+            ]
+            .iter()
+            .any(|key| settings.get(key).is_some_and(|v| !v.is_null()))
+        {
+            return Err(invalid("MoE settings require an explicit MoE architecture"));
+        }
+        if settings.get("norm_topk_prob").is_some_and(|v| v != true)
+            || settings.get("decoder_sparse_step").is_some_and(|v| v != 1)
+        {
+            return Err(invalid(
+                "unsupported MoE routing normalization or sparse layer interval",
+            ));
+        }
+        let mlp_only = settings.get("mlp_only_layers").filter(|v| !v.is_null());
+        if mlp_only.is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty())) {
+            return Err(invalid("MLP-only layers are unsupported"));
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::float_cmp,
+    reason = "duplicate configuration fields must agree exactly"
+)]
+fn validate_rope(text: &TextConfig) -> Result<()> {
+    let rope = &text.rope_parameters;
+    let rotary = text.head_dim as f64 * rope.partial_rotary_factor;
+    if rope.rope_type != "default"
+        || !rope.rope_theta.is_finite()
+        || rope.rope_theta <= 0.0
+        || !rotary.is_finite()
+        || rotary < 2.0
+        || rotary > text.head_dim as f64
+        || rotary.fract() != 0.0
+        || !(rotary as usize).is_multiple_of(2)
+        || text
+            .partial_rotary_factor
+            .is_some_and(|f| f != rope.partial_rotary_factor)
+    {
+        return Err(invalid("unsupported or invalid partial RoPE configuration"));
+    }
+    // Text-only positions are equal on all three M-RoPE axes, so interleaved sections
+    // reduce to ordinary partial rotary; any other layout would need real 3-D positions.
+    if !rope.mrope_section.is_empty() {
+        let sum = rope
+            .mrope_section
+            .iter()
+            .try_fold(0usize, |s, &n| s.checked_add(n))
+            .ok_or_else(|| invalid("mrope section overflow"))?;
+        if !rope.mrope_interleaved || rope.mrope_section.len() != 3 || sum != rotary as usize / 2 {
+            return Err(invalid("unsupported M-RoPE sections"));
+        }
+    }
+    Ok(())
+}
+
+/// Image, video and audio token IDs, which text-only execution must never accept.
+fn modality_tokens(raw: &serde_json::Value) -> Result<Vec<u32>> {
+    let mut forbidden_tokens = Vec::new();
+    for field in [
+        "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+        "audio_token_id",
+    ] {
+        if let Some(id) = raw.get(field).and_then(serde_json::Value::as_u64) {
+            forbidden_tokens
+                .push(u32::try_from(id).map_err(|_| invalid("modality token overflow"))?);
+        }
+    }
+    Ok(forbidden_tokens)
 }
 
 fn parse_tokens(raw: &serde_json::Value, vocab: usize) -> Result<Vec<u32>> {

@@ -192,7 +192,7 @@ fn template_error(message: impl Into<String>) -> minijinja::Error {
 
 /// Python `str` methods used by chat templates, with Python semantics.
 fn python_method(
-    _: &minijinja::State,
+    _: &minijinja::State<'_, '_>,
     value: &minijinja::Value,
     method: &str,
     args: &[minijinja::Value],

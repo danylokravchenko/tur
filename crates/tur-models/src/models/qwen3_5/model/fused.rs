@@ -17,6 +17,7 @@ use tur_core::{
 };
 use tur_metal::{
     kernels::{DeltaShape, Heads, Kernels, PagedKv, RecurrentSpan, RecurrentSpans},
+    packed::PackedLinear,
     scratch::ScratchPlan,
 };
 
@@ -92,13 +93,7 @@ impl Qwen35 {
     ) -> Result<(Tensor, Option<Tensor>)> {
         let k = &fused.kernels;
         let d = self.dims;
-        let positions = pass
-            .positions
-            .iter()
-            .map(|&p| u32::try_from(p))
-            .collect::<std::result::Result<Vec<u32>, _>>()
-            .map_err(|_| invalid("position exceeds u32"))?;
-        let positions = Tensor::new(positions.as_slice(), &self.device)?;
+        let positions = self.position_tensor(pass)?;
         let has_attention = self
             .layers
             .iter()
@@ -168,12 +163,7 @@ impl Qwen35 {
             }
         }
         let hidden = pass.hidden.then(|| h.clone());
-        if pass.rows.is_empty() {
-            let empty = Tensor::zeros((0, self.description.vocab_size), DType::F32, &self.device)?;
-            return Ok((empty, hidden));
-        }
-        let rows = Tensor::new(pass.rows.as_slice(), &self.device)?;
-        Ok((k.linear(&self.lm_head, &h.index_select(&rows, 0)?)?, hidden))
+        Ok((self.row_logits(k, &self.lm_head, &h, pass)?, hidden))
     }
 
     /// Fused draft-head pass: logits for `pass.rows`; writes the head's keys and values.
@@ -189,13 +179,7 @@ impl Qwen35 {
         let Mixer::Attention(a) = &mtp.layer.mixer else {
             return Err(invalid("draft head layer is not attention"));
         };
-        let positions = pass
-            .positions
-            .iter()
-            .map(|&p| u32::try_from(p))
-            .collect::<std::result::Result<Vec<u32>, _>>()
-            .map_err(|_| invalid("position exceeds u32"))?;
-        let positions = Tensor::new(positions.as_slice(), &self.device)?;
+        let positions = self.position_tensor(pass)?;
         let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
         let embedded = self.embedding(&ids)?;
         let joined = Tensor::cat(
@@ -216,7 +200,27 @@ impl Qwen35 {
         };
         let out = k.linear(&mlp.down, &k.swiglu(&k.linear(&mlp.gate_up, &normed)?)?)?;
         let (_, h) = k.add_rms_norm(&sum, &out, &mtp.norm, d.eps)?;
-        let head = mtp.lm_head(&self.lm_head);
+        self.row_logits(k, mtp.lm_head(&self.lm_head), &h, pass)
+    }
+
+    fn position_tensor(&self, pass: &Pass<'_, '_>) -> Result<Tensor> {
+        let positions = pass
+            .positions
+            .iter()
+            .map(|&p| u32::try_from(p))
+            .collect::<std::result::Result<Vec<u32>, _>>()
+            .map_err(|_| invalid("position exceeds u32"))?;
+        Ok(Tensor::new(positions.as_slice(), &self.device)?)
+    }
+
+    /// `head`'s logits for the rows of `h` the pass requested.
+    fn row_logits(
+        &self,
+        k: &Kernels,
+        head: &PackedLinear,
+        h: &Tensor,
+        pass: &Pass<'_, '_>,
+    ) -> Result<Tensor> {
         if pass.rows.is_empty() {
             return Ok(Tensor::zeros(
                 (0, head.out_features()),
@@ -228,7 +232,10 @@ impl Qwen35 {
         k.linear(head, &h.index_select(&rows, 0)?)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per input the attention dispatch binds"
+    )]
     fn fused_attention(
         &self,
         fused: &Fused,

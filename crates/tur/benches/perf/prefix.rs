@@ -77,7 +77,7 @@ fn time(mut f: impl FnMut()) -> f64 {
     start.elapsed().as_secs_f64() / f64::from(runs)
 }
 
-pub fn run() -> Result<()> {
+pub(crate) fn run() -> Result<()> {
     let mut rows: Vec<Value> = Vec::new();
     for entries in [8, 64] {
         let pool = pool(entries)?;

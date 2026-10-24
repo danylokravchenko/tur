@@ -13,7 +13,7 @@ use tur::{
 };
 
 #[derive(Debug, clap::Args)]
-pub struct Args {
+pub(crate) struct Args {
     /// Source `SafeTensors` checkpoint directory.
     #[arg(long)]
     model: PathBuf,
@@ -79,7 +79,7 @@ fn samples(args: &Args) -> Result<Vec<Vec<u32>>> {
     Ok(samples)
 }
 
-pub fn quantize(args: &Args) -> Result<()> {
+pub(crate) fn quantize(args: &Args) -> Result<()> {
     let config = artifact_config(&args.model)?;
     let embedding = match args.embedding.as_deref() {
         None if config.tied_embeddings() => Embedding::Head,
@@ -111,8 +111,7 @@ pub fn quantize(args: &Args) -> Result<()> {
                 execution: Execution::Fused,
                 kv: KvLayout::new(16, KvFormat::F32),
                 recurrent: DEFAULT_RECURRENT_STATE,
-                mtp: false,
-                draft_vocab: None,
+                mtp: None,
             },
         )?;
         let calibration = model.calibrate(&samples, args.method == Method::Gptq)?;

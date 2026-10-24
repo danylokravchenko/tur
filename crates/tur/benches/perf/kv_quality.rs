@@ -78,8 +78,7 @@ impl Runner {
                 execution: Execution::Fused,
                 kv: KvLayout::new(16, format),
                 recurrent,
-                mtp: false,
-                draft_vocab: None,
+                mtp: None,
             },
         )?;
         let pool = StatePool::new(
@@ -209,6 +208,10 @@ impl WeightVariant {
     }
 }
 
+fn env_usize(name: &str, default: usize) -> Result<usize> {
+    std::env::var(name).map_or(Ok(default), |v| v.parse().map_err(|_| invalid(name)))
+}
+
 fn env_list(name: &str, default: &str) -> Vec<String> {
     std::env::var(name)
         .unwrap_or_else(|_| default.into())
@@ -276,20 +279,8 @@ fn marked_spans(text: &str) -> (String, Vec<std::ops::Range<usize>>) {
     (plain, spans)
 }
 
-pub fn run() -> Result<()> {
-    let dir = env_path("TUR_QWEN35_0_8B")?;
-    let text_path = env_path("TUR_EVAL_TEXT")?;
-    let text = std::fs::read_to_string(&text_path)?;
-    let limit: usize = std::env::var("TUR_EVAL_TOKENS")
-        .unwrap_or_else(|_| "8192".into())
-        .parse()
-        .map_err(|_| invalid("TUR_EVAL_TOKENS"))?;
-    let chunk_tokens: usize = std::env::var("TUR_EVAL_CHUNK")
-        .unwrap_or_else(|_| "256".into())
-        .parse()
-        .ok()
-        .filter(|&c| c > 0)
-        .ok_or_else(|| invalid("TUR_EVAL_CHUNK"))?;
+/// The K/V formats, recurrent state dtypes and weights to compare, from the environment.
+fn variants() -> Result<Vec<Variant>> {
     let base = WeightVariant::Format(WeightFormat::Q8_0);
     let mut variants = env_list("TUR_EVAL_KV", "f16,q8,q8_64,q8_256")
         .iter()
@@ -315,7 +306,72 @@ pub fn run() -> Result<()> {
             weights: WeightVariant::parse(&weights)?,
         });
     }
-    let formats = variants;
+    Ok(variants)
+}
+
+/// Per variant, how long its greedy continuation from each snapshot matches the
+/// reference's.
+fn continuations(
+    reference: &Runner,
+    runners: &[Runner],
+    snapshots: Vec<(usize, ModelState, Vec<ModelState>)>,
+    tokens: &[u32],
+    generate: usize,
+) -> Result<Vec<Vec<Value>>> {
+    let mut continuations = vec![Vec::new(); runners.len()];
+    for (context, exact_state, states) in snapshots {
+        let next = tokens[context];
+        let expected = reference.generate(exact_state, next, generate)?;
+        for ((runner, state), out) in runners.iter().zip(states).zip(&mut continuations) {
+            let actual = runner.generate(state, next, generate)?;
+            let prefix = actual
+                .iter()
+                .zip(&expected)
+                .take_while(|(a, b)| a == b)
+                .count();
+            out.push(json!({"context": context, "matched_prefix": prefix, "tokens": generate}));
+        }
+    }
+    Ok(continuations)
+}
+
+/// One variant's results: overall, marked spans, continuations and position buckets.
+fn variant_json(
+    format: &Variant,
+    buckets: &[Bucket],
+    answers: &Bucket,
+    (weight_bytes, kv_bytes): (usize, usize),
+    continuations: &[Value],
+    evaluated: usize,
+) -> Value {
+    let total = buckets.iter().fold(Bucket::default(), |a, b| a.merge(b));
+    json!({
+        "kv_format": format.kv.to_string(),
+        "kv_token_bytes": kv_bytes,
+        "recurrent_state": format!("{:?}", format.state).to_lowercase(),
+        "weights": format.weights.name(),
+        "weight_bytes": weight_bytes,
+        "all": total.json(0, evaluated),
+        "marked": (answers.positions > 0).then(|| answers.json(0, evaluated)),
+        "continuations": continuations,
+        "buckets": buckets
+            .iter()
+            .zip(BUCKETS.windows(2))
+            .filter(|(b, _)| b.positions > 0)
+            .map(|(b, w)| b.json(w[0], w[1]))
+            .collect::<Vec<_>>(),
+    })
+}
+
+pub(crate) fn run() -> Result<()> {
+    let dir = env_path("TUR_QWEN35_0_8B")?;
+    let text_path = env_path("TUR_EVAL_TEXT")?;
+    let text = std::fs::read_to_string(&text_path)?;
+    let limit = env_usize("TUR_EVAL_TOKENS", 8192)?;
+    let chunk_tokens = Some(env_usize("TUR_EVAL_CHUNK", 256)?)
+        .filter(|&c| c > 0)
+        .ok_or_else(|| invalid("TUR_EVAL_CHUNK"))?;
+    let formats = variants()?;
     let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
         .map_err(|e| TurError::Tokenizer(e.to_string()))?;
     let (text, spans) = if std::env::var("TUR_EVAL_MARKED").is_ok_and(|v| v == "1") {
@@ -356,10 +412,7 @@ pub fn run() -> Result<()> {
         .iter()
         .map(|r| r.model.description().kv_token_bytes())
         .collect::<Result<Vec<_>>>()?;
-    let generate: usize = std::env::var("TUR_EVAL_GENERATE")
-        .unwrap_or_else(|_| "0".into())
-        .parse()
-        .map_err(|_| invalid("TUR_EVAL_GENERATE"))?;
+    let generate = env_usize("TUR_EVAL_GENERATE", 0)?;
     // (context, reference snapshot, each variant's snapshot)
     let mut snapshots: Vec<(usize, ModelState, Vec<ModelState>)> = Vec::new();
     let inputs = &tokens[..evaluated];
@@ -425,21 +478,7 @@ pub fn run() -> Result<()> {
             eprintln!("evaluated {} of {evaluated} positions", first + chunk.len());
         }
     }
-    // Per variant: (continuations, tokens matching the reference, matched prefix lengths).
-    let mut continuations = vec![Vec::new(); formats.len()];
-    for (context, exact_state, states) in snapshots {
-        let next = tokens[context];
-        let expected = reference.generate(exact_state, next, generate)?;
-        for ((runner, state), out) in runners.iter().zip(states).zip(&mut continuations) {
-            let actual = runner.generate(state, next, generate)?;
-            let prefix = actual
-                .iter()
-                .zip(&expected)
-                .take_while(|(a, b)| a == b)
-                .count();
-            out.push(json!({"context": context, "matched_prefix": prefix, "tokens": generate}));
-        }
-    }
+    let continuations = continuations(&reference, &runners, snapshots, &tokens, generate)?;
     let results: Vec<Value> = formats
         .iter()
         .zip(&buckets)
@@ -447,23 +486,14 @@ pub fn run() -> Result<()> {
         .zip(&continuations)
         .map(
             |(((format, buckets), (answers, (bytes, kv_bytes))), continuations)| {
-                let total = buckets.iter().fold(Bucket::default(), |a, b| a.merge(b));
-                json!({
-                    "kv_format": format.kv.to_string(),
-                    "kv_token_bytes": kv_bytes,
-                    "recurrent_state": format!("{:?}", format.state).to_lowercase(),
-                    "weights": format.weights.name(),
-                    "weight_bytes": bytes,
-                    "all": total.json(0, evaluated),
-                    "marked": (answers.positions > 0).then(|| answers.json(0, evaluated)),
-                    "continuations": continuations,
-                    "buckets": buckets
-                        .iter()
-                        .zip(BUCKETS.windows(2))
-                        .filter(|(b, _)| b.positions > 0)
-                        .map(|(b, w)| b.json(w[0], w[1]))
-                        .collect::<Vec<_>>(),
-                })
+                variant_json(
+                    format,
+                    buckets,
+                    answers,
+                    (*bytes, *kv_bytes),
+                    continuations,
+                    evaluated,
+                )
             },
         )
         .collect();

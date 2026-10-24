@@ -90,7 +90,7 @@ fn dispatch(
     Ok(())
 }
 
-pub fn run() -> Result<()> {
+pub(crate) fn run() -> Result<()> {
     let device = Device::new_metal(0)?;
     let Device::Metal(metal) = &device else {
         return Err(error("needs a Metal device"));

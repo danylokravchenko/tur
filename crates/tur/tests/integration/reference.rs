@@ -208,8 +208,7 @@ fn test_f32_layers_and_logits_match_transformers() -> Result<()> {
             // Exact K/V storage: the Transformers reference keeps F32 keys and values.
             kv: tur_core::execution::KvLayout::new(16, tur_core::execution::KvFormat::F32),
             recurrent: candle_core::DType::F32,
-            mtp: false,
-            draft_vocab: None,
+            mtp: None,
         },
     )?;
     let tokens = ids(get("input_ids")?)?;

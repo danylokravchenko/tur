@@ -13,8 +13,8 @@ pub use artifact::{ARTIFACT_FILE, CalibrationInfo, Manifest, Quantizer, is_artif
 pub use calibration::{Calibration, Site};
 pub use config::{Config, GenerationDefaults, Projection};
 pub use model::{
-    DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, Execution, LoadOptions, Qwen35, WeightFormat,
-    Weights, parse_recurrent_state,
+    DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, DraftHead, Execution, LoadOptions, Qwen35,
+    WeightFormat, Weights, parse_recurrent_state,
 };
 pub use plan::{Embedding, Precision, WeightPlan};
 pub use quantize::{

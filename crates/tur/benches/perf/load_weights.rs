@@ -13,7 +13,7 @@ use tur_core::{
 };
 use tur_models::models::qwen3_5::{Execution, LoadOptions, Manifest, Qwen35, Weights};
 
-pub fn run(args: &[String]) -> Result<()> {
+pub(crate) fn run(args: &[String]) -> Result<()> {
     let mut args = args.iter();
     let (Some(dir), Some(variant)) = (args.next(), args.next()) else {
         return Err(TurError::Other(
@@ -42,8 +42,7 @@ pub fn run(args: &[String]) -> Result<()> {
             execution: Execution::Fused,
             kv: KvLayout::new(16, KvFormat::F16),
             recurrent: DType::F32,
-            mtp: false,
-            draft_vocab: None,
+            mtp: None,
         },
     )?;
     device.synchronize()?;

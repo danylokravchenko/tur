@@ -120,21 +120,14 @@ fn test_grouped_expert_gemm_preserves_routing_skew_ties_and_packed_weights() -> 
             &values(experts * out * width, 42, 0.2),
             &[experts * out, width],
         )?;
-        for format in [
-            None,
-            Some(candle_core::quantized::GgmlDType::Q8_0),
-            Some(candle_core::quantized::GgmlDType::Q4K),
-        ] {
+        for format in [None, Some(GgmlDType::Q8_0), Some(GgmlDType::Q4K)] {
             let layer = match format {
                 Some(format) => PackedLinear::quantized(&weights, format, &device)?,
                 None => PackedLinear::dense(&weights, &device)?,
             };
             let dense = match format {
-                Some(format) => candle_core::quantized::QTensor::quantize(
-                    &weights.to_device(&Device::Cpu)?,
-                    format,
-                )?
-                .dequantize(&Device::Cpu)?,
+                Some(format) => QTensor::quantize(&weights.to_device(&Device::Cpu)?, format)?
+                    .dequantize(&Device::Cpu)?,
                 None => weights.to_device(&Device::Cpu)?,
             }
             .to_vec2::<f32>()?;
@@ -762,7 +755,10 @@ fn stored(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the kernel's inputs one for one"
+)]
 fn attention_reference(
     case: &AttentionCase,
     q: &[f32],

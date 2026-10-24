@@ -222,21 +222,22 @@ async fn test_http_preserves_sampling_thinking_and_tool_history() -> Result<()> 
         );
         assert_eq!(msg.request.messages[1].tool_calls[0].arguments["id"], "123");
         drop(msg.token_tx);
-        let _ = msg
-            .result_tx
-            .send(Ok(tur::backend::pipeline::GenerationStats {
-                generated_tokens: 0,
-                cached_tokens: 0,
-                prompt_tokens: 0,
-                elapsed: Duration::ZERO,
-                first_token: Duration::ZERO,
-                preemptions: 0,
-                draft_tokens: 0,
-                accepted_draft_tokens: 0,
-                generated_text: String::new(),
-                tool_calls: Vec::new(),
-                finish_reason: "stop",
-            }));
+        drop(
+            msg.result_tx
+                .send(Ok(tur::backend::pipeline::GenerationStats {
+                    generated_tokens: 0,
+                    cached_tokens: 0,
+                    prompt_tokens: 0,
+                    elapsed: Duration::ZERO,
+                    first_token: Duration::ZERO,
+                    preemptions: 0,
+                    draft_tokens: 0,
+                    accepted_draft_tokens: 0,
+                    generated_text: String::new(),
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop",
+                })),
+        );
         Ok::<(), TurError>(())
     });
     let response = build_router(state).oneshot(request(&json!({
@@ -310,7 +311,7 @@ async fn test_http_maps_admission_and_deadline_failures_and_streams_error_codes(
         let backend = tokio::spawn(async move {
             if let Some(msg) = rx.recv().await {
                 drop(msg.token_tx);
-                let _ = msg.result_tx.send(Err(error));
+                drop(msg.result_tx.send(Err(error)));
             }
         });
         let response = router
@@ -340,7 +341,7 @@ async fn test_http_maps_admission_and_deadline_failures_and_streams_error_codes(
     let backend = tokio::spawn(async move {
         if let Some(msg) = rx.recv().await {
             drop(msg.token_tx);
-            let _ = msg.result_tx.send(Err(TurError::DeadlineExceeded));
+            drop(msg.result_tx.send(Err(TurError::DeadlineExceeded)));
         }
     });
     let response = router

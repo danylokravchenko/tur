@@ -214,7 +214,7 @@ impl WeightPlan {
 }
 
 /// 64-bit FNV-1a: a stable content fingerprint for identities, not a security hash.
-pub fn fnv1a(bytes: &[u8]) -> u64 {
+pub(super) fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &b| {
         (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     })

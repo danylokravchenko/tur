@@ -52,104 +52,95 @@ candle-metal-kernels = "=0.11.0"
 objc2-metal = "=0.3.2"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"           # No unsafe Rust in workspace code
-missing_docs = "allow"           # Allow missing documentation
-unused_must_use = "deny"         # Deny ignoring Result/Option returns
+unsafe_code = "forbid"
+unused_must_use = "deny"
+missing_docs = "allow"                 # 390+ public items lack docs; enable per crate as they are written
+unreachable_pub = "warn"               # visibility states the real boundary: `pub` only if exported
+unused_qualifications = "warn"
+trivial_numeric_casts = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
-multiple_crate_versions = "allow"
-# ==============================================================================
-# RESTRICTION GROUP - Explicitly opt-in to strict checks
-# ==============================================================================
-# These lints catch patterns that should never appear in the codebase
+# Groups first; individual lints below override them.
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+multiple_crate_versions = "allow"      # transitive duplicates are outside our control
 
-# Error Handling - No panics, unwraps, or expects
+# No panics: every failure is a `TurError`.
 unwrap_used = "deny"
 expect_used = "deny"
+get_unwrap = "deny"
+unwrap_in_result = "deny"
 panic = "deny"
-unimplemented = "deny"
-todo = "warn"
-unreachable = "deny"
 panic_in_result_fn = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+todo = "deny"
+exit = "deny"
+string_slice = "deny"                  # panics off a UTF-8 boundary
 
-# Memory & Performance
-clone_on_ref_ptr = "warn"        # Cloning Arc/Rc is cheap, document it
-unnecessary_cast = "warn"
+# No silently discarded results or suppressions without a reason.
+let_underscore_must_use = "deny"
+allow_attributes_without_reason = "deny"
+try_err = "warn"
+
+# Concurrency: locks are parking_lot (clippy.toml), never held across await.
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+mutex_atomic = "warn"
+mutex_integer = "warn"
+rc_mutex = "warn"
+mem_forget = "deny"
+
+# Modular structure: small functions, one module-file style, encapsulated structs.
+too_many_lines = "warn"                # threshold in clippy.toml
+cognitive_complexity = "warn"          # threshold in clippy.toml
+self_named_module_files = "warn"       # a module with children lives in `name/mod.rs`
+partial_pub_fields = "warn"            # a struct is plain data (all pub) or encapsulated (none)
+same_name_method = "warn"
+module_name_repetitions = "allow"
+
+# Memory and numerics.
+clone_on_ref_ptr = "warn"              # make `Arc` clones explicit with `Arc::clone`
 redundant_clone = "warn"
 large_stack_arrays = "warn"
 large_types_passed_by_value = "warn"
+large_include_file = "warn"
+rc_buffer = "warn"
+lossy_float_literal = "warn"
+float_cmp_const = "warn"
+suboptimal_flops = "warn"
+imprecise_flops = "warn"
+fn_to_numeric_cast_any = "warn"
 
-# Async patterns
-await_holding_lock = "deny"      # Never hold locks across await points
-await_holding_refcell_ref = "deny"
-
-# Code Quality
-dbg_macro = "warn"               # Remove debug prints before commit
-print_stdout = "warn"            # Use proper logging instead
+# Code quality.
+dbg_macro = "deny"
+print_stdout = "warn"                  # binaries and benches opt in with a reason
 print_stderr = "warn"
-exit = "deny"                    # Don't call std::process::exit
-mem_forget = "deny"              # Don't forget to drop resources
+string_add = "warn"
+format_push_string = "warn"
+verbose_file_reads = "warn"
+infinite_loop = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+empty_structs_with_brackets = "warn"
+redundant_type_annotations = "warn"
+use_self = "warn"
+option_if_let_else = "warn"
 
-# String handling
-string_add = "warn"              # Prefer format! or push_str
-string_slice = "warn"            # Can panic on invalid UTF-8 boundaries
-
-# ==============================================================================
-# PEDANTIC GROUP - High quality code standards
-# ==============================================================================
-pedantic = { level = "warn", priority = -1 }
-
-# Selectively allow some pedantic lints that may be too strict
-module_name_repetitions = "allow"
+# Pedantic lints that cost more than they catch here.
 must_use_candidate = "allow"
-missing_errors_doc = "allow"     # Can be too noisy
-missing_panics_doc = "allow"     # We don't panic anyway
-cast_possible_truncation = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"           # nothing panics
+cast_possible_truncation = "allow"     # shape arithmetic is validated before casts
 cast_precision_loss = "allow"
 cast_sign_loss = "allow"
 cast_possible_wrap = "allow"
-similar_names = "allow"          # Sometimes similar names are fine
-too_many_lines = "allow"         # Handled by cognitive complexity
-
-# ==============================================================================
-# NURSERY GROUP - Experimental but useful lints
-# ==============================================================================
-# These are newer lints that may have false positives but catch real issues
-use_self = "warn"
-option_if_let_else = "warn"
-redundant_pub_crate = "warn"
-suboptimal_flops = "warn"
-imprecise_flops = "warn"
-
-# ==============================================================================
-# CARGO GROUP - Cargo.toml best practices
-# ==============================================================================
-cargo = { level = "warn", priority = -1 }
-
-# ==============================================================================
-# PERFORMANCE GROUP - Optimize hot paths
-# ==============================================================================
-perf = { level = "warn", priority = -1 }
-
-# ==============================================================================
-# STYLE GROUP - Consistent code style
-# ==============================================================================
-style = { level = "warn", priority = -1 }
-
-# ==============================================================================
-# COMPLEXITY GROUP - Reduce cognitive load
-# ==============================================================================
-complexity = { level = "warn", priority = -1 }
-
-# ==============================================================================
-# CORRECTNESS GROUP - Catch bugs
-# ==============================================================================
-correctness = { level = "deny", priority = -1 }
-
-# ==============================================================================
-# SUSPICIOUS GROUP - Likely bugs
-# ==============================================================================
-suspicious = { level = "warn", priority = -1 }
+similar_names = "allow"
 
 # Host reference math (Candle CPU ops, kernel references, the sampler, quantization)
 # dominates test time unoptimized: the suite takes ~22 s instead of ~140 s.

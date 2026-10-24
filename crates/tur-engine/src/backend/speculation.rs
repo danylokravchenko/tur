@@ -20,6 +20,7 @@ use std::{
     ops::RangeInclusive,
 };
 use tur_core::{Result, execution::invalid};
+use tur_models::models::qwen3_5::DraftHead;
 
 /// Prune periodically to retain at most two windows of lookup history.
 const INDEX_WINDOW: usize = 8192;
@@ -46,11 +47,7 @@ pub struct SpeculationConfig {
     /// unconstrained requests in passes of at most [`MTP_MAX_DECODES`] decodes, and each
     /// is weighed by its calibrated confidence ([`Calibration`]). Needs prefix reuse
     /// disabled.
-    pub mtp: bool,
-    /// Draft-head drafts only from token IDs below this bound, through a copy of the LM
-    /// head's leading rows, which makes the head's projection proportionally cheaper.
-    /// `None` projects onto the whole vocabulary.
-    pub mtp_vocab: Option<usize>,
+    pub mtp: Option<DraftHead>,
 }
 
 impl SpeculationConfig {
@@ -60,8 +57,7 @@ impl SpeculationConfig {
         max_pass_drafts: 0,
         min_ngram: 1,
         max_ngram: 1,
-        mtp: false,
-        mtp_vocab: None,
+        mtp: None,
     };
 
     /// Up to `max_draft` drafts per sequence and four sequences' worth per pass, from
@@ -72,8 +68,7 @@ impl SpeculationConfig {
             max_pass_drafts: max_draft.saturating_mul(4),
             min_ngram: 1,
             max_ngram: 4,
-            mtp: false,
-            mtp_vocab: None,
+            mtp: None,
         }
     }
 
@@ -81,15 +76,16 @@ impl SpeculationConfig {
     /// over the leading [`MTP_VOCAB`] token IDs.
     pub const fn with_mtp(max_draft: usize) -> Self {
         Self {
-            mtp: true,
-            mtp_vocab: Some(MTP_VOCAB),
+            mtp: Some(DraftHead {
+                vocab: Some(MTP_VOCAB),
+            }),
             ..Self::new(max_draft)
         }
     }
 
     /// Whether the multi-token prediction head drafts.
     pub fn mtp_enabled(&self) -> bool {
-        self.enabled() && self.mtp
+        self.enabled() && self.mtp.is_some()
     }
 
     /// Whether proposals and their memory reservation are enabled.

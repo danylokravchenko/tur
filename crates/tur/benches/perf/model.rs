@@ -315,7 +315,7 @@ fn measure(model: &Qwen35, prefill: &[usize], contexts: &[usize]) -> Result<Valu
     }))
 }
 
-pub fn run() -> Result<()> {
+pub(crate) fn run() -> Result<()> {
     let dir = PathBuf::from(
         std::env::var_os("TUR_QWEN35_0_8B")
             .ok_or_else(|| TurError::Other("set TUR_QWEN35_0_8B".into()))?,
@@ -354,8 +354,7 @@ pub fn run() -> Result<()> {
                             execution: Execution::Fused,
                             kv: KvLayout::new(page, kv),
                             recurrent,
-                            mtp: false,
-                            draft_vocab: None,
+                            mtp: None,
                         },
                     )?;
                     let load_seconds = load_start.elapsed().as_secs_f64();

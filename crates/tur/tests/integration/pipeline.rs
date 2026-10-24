@@ -2,10 +2,32 @@ use crate::common::Checkpoint;
 use tur::{
     InferencePipeline, Result, TurError,
     backend::{
+        memory::DeviceBudget,
         pipeline::{GenerationRequest, PipelineConfig},
         prefix::PrefixConfig,
     },
 };
+
+#[test]
+fn test_invalid_prefix_config_is_rejected_before_loading_weights() -> Result<()> {
+    let fixture = Checkpoint::new()?;
+    std::fs::write(
+        fixture.0.join("model.safetensors"),
+        b"invalid weight payload",
+    )?;
+    let budget = DeviceBudget::new(None);
+    for spacing in [0, 17] {
+        let mut config = PipelineConfig::new(1, 16);
+        config.prefix.spacing = spacing;
+        let result = InferencePipeline::with_budget(&fixture.factory(), config, &budget);
+        assert!(matches!(
+            result,
+            Err(TurError::InvalidExecution(message)) if message.starts_with("prefix spacing")
+        ));
+        assert_eq!(budget.leased(), 0);
+    }
+    Ok(())
+}
 
 #[test]
 fn test_streamed_text_matches_full_decode_and_chunked_prefill() -> Result<()> {

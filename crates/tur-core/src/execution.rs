@@ -458,7 +458,7 @@ impl PackedExecution {
         let mut requirements = ExecutionRequirements {
             packed_input_bytes: checked_elements(&[
                 self.tokens.len(),
-                std::mem::size_of::<u32>() + std::mem::size_of::<usize>(),
+                size_of::<u32>() + size_of::<usize>(),
             ])?,
             ..Default::default()
         };
@@ -606,7 +606,7 @@ mod tests {
         let requirements = validated.requirements();
         assert_eq!(
             requirements.packed_input_bytes,
-            3 * (4 + std::mem::size_of::<usize>())
+            3 * (4 + size_of::<usize>())
         );
         assert_eq!(requirements.logits_bytes, 16);
         // Positions 1..4 already own page 0 and open page 1: one 2-token page of K and V.

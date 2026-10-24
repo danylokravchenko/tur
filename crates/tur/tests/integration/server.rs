@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tower::ServiceExt;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
-type TestResult<T = ()> = std::result::Result<T, TestError>;
+type TestResult<T = ()> = Result<T, TestError>;
 
 use tur::{
     backend::{pipeline::GenerationStats, tools::ToolCall},
@@ -44,13 +44,13 @@ fn mock_worker(response_text: &'static str) -> PipelineWorker {
             // Stream words via token_tx (for SSE/streaming consumers).
             if let Some(token_tx) = &msg.token_tx {
                 for word in response_text.split_whitespace() {
-                    let _ = token_tx.send(word.to_string()).await;
-                    let _ = token_tx.send(" ".to_string()).await;
+                    drop(token_tx.send(word.to_string()).await);
+                    drop(token_tx.send(" ".to_string()).await);
                 }
             }
             drop(msg.token_tx);
             // generated_text is used by the non-streaming path in blocking_response.
-            let _ = msg.result_tx.send(Ok(GenerationStats {
+            drop(msg.result_tx.send(Ok(GenerationStats {
                 finish_reason: "stop",
                 generated_tokens: response_text.split_whitespace().count(),
                 prompt_tokens: 0,
@@ -62,7 +62,7 @@ fn mock_worker(response_text: &'static str) -> PipelineWorker {
                 accepted_draft_tokens: 0,
                 tool_calls: vec![],
                 generated_text: response_text.to_string(),
-            }));
+            })));
         }
     });
     PipelineWorker::from_sender(tx)
@@ -82,7 +82,7 @@ fn mock_tool_call_worker(
                 name: tool_name.to_string(),
                 arguments: arguments.clone(),
             };
-            let _ = msg.result_tx.send(Ok(GenerationStats {
+            drop(msg.result_tx.send(Ok(GenerationStats {
                 finish_reason: "stop",
                 generated_tokens: 1,
                 prompt_tokens: 0,
@@ -94,7 +94,7 @@ fn mock_tool_call_worker(
                 accepted_draft_tokens: 0,
                 tool_calls: vec![tc],
                 generated_text: String::new(),
-            }));
+            })));
         }
     });
     Ok(PipelineWorker::from_sender(tx))
@@ -117,7 +117,7 @@ fn json_request(uri: &str, method: &str, body: &Value) -> TestResult<Request<Bod
         .body(Body::from(body.to_string()))?)
 }
 
-async fn body_json(body: axum::body::Body) -> TestResult<Value> {
+async fn body_json(body: Body) -> TestResult<Value> {
     let bytes = body.collect().await?.to_bytes();
     Ok(serde_json::from_slice(&bytes)?)
 }

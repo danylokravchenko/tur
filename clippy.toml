@@ -1,78 +1,15 @@
-# Clippy thresholds for Tur inference, kernels and serving.
-# Lint levels live in Cargo.toml and are inherited by every workspace member.
+# Thresholds for the lints enabled in Cargo.toml `[workspace.lints]`; defaults are omitted.
 
-# ------------------------------------------------------------------------------
-# COGNITIVE COMPLEXITY
-# ------------------------------------------------------------------------------
-# Limit function complexity to maintain readability and testability
-cognitive-complexity-threshold = 15
+# Breaking changes are allowed, so lints also apply to public items.
+avoid-breaking-exported-api = false
 
-# ------------------------------------------------------------------------------
-# TYPE COMPLEXITY
-# ------------------------------------------------------------------------------
-# Warn on overly complex type signatures
-type-complexity-threshold = 250
+# Modular structure: split functions past these limits.
+too-many-lines-threshold = 150
+cognitive-complexity-threshold = 20
 
-# ------------------------------------------------------------------------------
-# DOCUMENTATION
-# ------------------------------------------------------------------------------
-# Enforce documentation for public items
-missing-docs-in-crate-items = true
-
-# ------------------------------------------------------------------------------
-# PERFORMANCE
-# ------------------------------------------------------------------------------
-# Warn on unnecessary allocations and clones
-too-many-lines-threshold = 200
-single-char-binding-names-threshold = 4
-
-# ------------------------------------------------------------------------------
-# NAMING CONVENTIONS
-# ------------------------------------------------------------------------------
-# Enforce consistent naming (snake_case, CamelCase, SCREAMING_SNAKE_CASE)
-# These are enforced by default but explicitly listed for clarity
-enum-variant-name-threshold = 3
-max-struct-bools = 3
 struct-field-name-threshold = 20
 
-# ------------------------------------------------------------------------------
-# FUNCTION PARAMETERS
-# ------------------------------------------------------------------------------
-too-many-arguments-threshold = 7
-max-fn-params-bools = 3
-
-# ------------------------------------------------------------------------------
-# ASYNC/AWAIT
-# ------------------------------------------------------------------------------
-# Ensure proper async patterns in tokio-based code
-# (Most async lints are enabled by default in pedantic/restriction groups)
-future-size-threshold = 16384
-
-# ------------------------------------------------------------------------------
-# SAFETY
-# ------------------------------------------------------------------------------
-# Maximum strictness on unsafe code (should never be used per guidelines)
-# Unsafe Rust is forbidden by the workspace Rust lints in Cargo.toml.
-
-# ------------------------------------------------------------------------------
-# VECTOR OPERATIONS
-# ------------------------------------------------------------------------------
-# Optimize vector usage patterns
-vec-box-size-threshold = 4096
-
-# ------------------------------------------------------------------------------
-# ARRAY AND STACK
-# ------------------------------------------------------------------------------
-array-size-threshold = 512000
-stack-size-threshold = 512000
-
-# ------------------------------------------------------------------------------
-# LITERAL HANDLING
-# ------------------------------------------------------------------------------
-literal-representation-threshold = 16384
-unreadable-literal-lint-fractions = true
-
-# ------------------------------------------------------------------------------
-# ERROR TYPES
-# ------------------------------------------------------------------------------
-large-error-threshold = 128
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "use parking_lot::Mutex: no poisoning, no unwrap" },
+    { path = "std::sync::RwLock", reason = "use parking_lot::RwLock: no poisoning, no unwrap" },
+]

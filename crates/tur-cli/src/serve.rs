@@ -12,7 +12,7 @@ use tur::{
 use crate::args::{ModelArgs, PipelineArgs};
 
 #[derive(Debug, clap::Args)]
-pub struct Args {
+pub(crate) struct Args {
     #[command(flatten)]
     model: ModelArgs,
     #[command(flatten)]
@@ -43,13 +43,13 @@ pub struct Args {
     prefix_snapshots: Option<usize>,
 }
 
-pub async fn serve(args: Args) -> Result<()> {
+pub(crate) async fn serve(args: Args) -> Result<()> {
     if args.served_model_name.trim().is_empty() {
         return Err(TurError::Other(
             "served model name must not be empty".into(),
         ));
     }
-    let mut pipeline = args.pipeline.config(args.max_batch_size);
+    let mut pipeline = args.pipeline.config(args.max_batch_size)?;
     if let Some(entries) = args.prefix_snapshots {
         pipeline.prefix = PrefixConfig {
             entries,

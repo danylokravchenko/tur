@@ -19,7 +19,7 @@ use tur_core::{Result, execution::invalid};
 /// File name of the weights inside an artifact directory.
 pub const ARTIFACT_FILE: &str = "tur-weights.safetensors";
 /// Layout version of [`ARTIFACT_FILE`]; readers reject any other.
-pub const FORMAT_VERSION: u32 = 1;
+pub(super) const FORMAT_VERSION: u32 = 1;
 /// Serving files copied from the source checkpoint when present.
 const COPIED: [&str; 6] = [
     "config.json",

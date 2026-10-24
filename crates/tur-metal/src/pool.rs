@@ -711,7 +711,7 @@ mod tests {
     use super::*;
     use tur_core::execution::{KvLayout, Modality, ModelIdentity};
 
-    pub fn description(page_tokens: usize, format: KvFormat) -> Arc<ModelDescription> {
+    pub(super) fn description(page_tokens: usize, format: KvFormat) -> Arc<ModelDescription> {
         Arc::new(ModelDescription {
             identity: ModelIdentity {
                 revision: "pool-fixture".into(),

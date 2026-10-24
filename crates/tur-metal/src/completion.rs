@@ -42,7 +42,7 @@ impl Fence {
                     })
                     .is_ok()
                 {
-                    Err(tur_core::TurError::Other("injected fence failure".into()))
+                    Err(TurError::Other("injected fence failure".into()))
                 } else {
                     Ok(())
                 }
@@ -109,7 +109,8 @@ impl Notifier {
             .name("tur-fence".into())
             .spawn(move || {
                 for (fence, output, reply) in rx {
-                    let _ = reply.send(complete(&fence, output));
+                    // Fails only when the requester stopped waiting; nobody needs the result.
+                    drop(reply.send(complete(&fence, output)));
                 }
             })?;
         Ok(Self { requests })
@@ -157,7 +158,9 @@ impl<T: Send + 'static> Completion<T> {
     /// Waits for a fence already handed to a notifier, which covers only earlier work.
     pub fn resources_mut(&mut self) -> Option<&mut T> {
         if let Some(event) = self.event.take() {
-            let _ = event.recv();
+            // Only orders this access after earlier work: with `completed` reset, the next
+            // `wait` checks the fence again and reports its outcome.
+            drop(event.recv());
         }
         self.completed = false;
         self.resources.as_mut()

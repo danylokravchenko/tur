@@ -9,7 +9,7 @@ use tur::{
 use crate::args::{ModelArgs, PipelineArgs};
 
 #[derive(Debug, clap::Args)]
-pub struct Args {
+pub(crate) struct Args {
     #[command(flatten)]
     model: ModelArgs,
     #[command(flatten)]
@@ -48,8 +48,8 @@ pub struct Args {
     tools: Option<PathBuf>,
 }
 
-pub fn run(args: Args) -> Result<()> {
-    let mut pipeline = InferencePipeline::new(&args.model.factory()?, args.pipeline.config(1))?;
+pub(crate) fn run(args: Args) -> Result<()> {
+    let mut pipeline = InferencePipeline::new(&args.model.factory()?, args.pipeline.config(1)?)?;
     let plan = pipeline.memory_plan();
     tracing::info!(
         resident_bytes = plan.resident(),

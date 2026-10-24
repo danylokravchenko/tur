@@ -50,8 +50,7 @@ fn options(weights: Weights, device: &Device) -> LoadOptions {
         execution: Execution::Fused,
         kv: KvLayout::new(16, KvFormat::F32),
         recurrent: DType::F32,
-        mtp: false,
-        draft_vocab: None,
+        mtp: None,
     }
 }
 
@@ -241,7 +240,7 @@ fn test_calibration_records_every_projection_input() -> Result<()> {
                     let hessian = site.hessian.as_ref().map_or(&[][..], Vec::as_slice);
                     assert_eq!(hessian.len(), p.cols * p.cols);
                     for (c, &square) in site.squares[0].iter().enumerate() {
-                        let diagonal = hessian[c * p.cols + c] as f32;
+                        let diagonal = hessian[c * p.cols + c];
                         assert!(
                             (diagonal - square).abs() <= 1e-4 * square.abs().max(1e-3),
                             "{} {c}: {diagonal} {square}",

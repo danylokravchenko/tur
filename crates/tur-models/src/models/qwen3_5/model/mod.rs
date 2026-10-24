@@ -196,11 +196,16 @@ pub struct LoadOptions {
     /// Storage of recurrent matrix state (F32, F16 or BF16); part of the state identity.
     pub recurrent: DType,
     /// Load the checkpoint's native multi-token prediction head ([`Config::with_mtp`]).
-    pub mtp: bool,
-    /// Draft only token IDs below this bound: the head projects onto a copy of the LM
-    /// head's leading rows instead of the whole vocabulary. Byte-level BPE assigns IDs in
-    /// merge order, so low IDs are the frequent tokens. `None` uses the whole LM head.
-    pub draft_vocab: Option<usize>,
+    pub mtp: Option<DraftHead>,
+}
+
+/// The checkpoint's native multi-token prediction head, loaded for drafting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftHead {
+    /// Draft only token IDs below this bound, using a copy of the LM head's leading
+    /// rows. Byte-level BPE assigns IDs in merge order, so low IDs are frequent tokens.
+    /// `None` uses the whole LM head.
+    pub vocab: Option<usize>,
 }
 
 struct Attention {
@@ -337,7 +342,7 @@ struct MtpHead {
     hidden_norm: Tensor,
     layer: Layer,
     norm: Tensor,
-    /// Leading rows of the LM head ([`LoadOptions::draft_vocab`]); `None` shares it whole.
+    /// Leading rows of the LM head ([`DraftHead::vocab`]); `None` shares it whole.
     head: Option<PackedLinear>,
 }
 
@@ -378,12 +383,12 @@ fn load_attention(tensors: &Tensors, a: &str, device: &Device) -> Result<Attenti
     })
 }
 
-/// Rows of a separate draft LM head: [`LoadOptions::draft_vocab`] when the head is loaded
+/// Rows of a separate draft LM head: [`DraftHead::vocab`] when the head is loaded
 /// and the bound excludes part of the vocabulary.
 fn draft_vocab(config: &Config, options: &LoadOptions) -> Result<Option<usize>> {
-    match options.draft_vocab {
+    match options.mtp.and_then(|head| head.vocab) {
         Some(0) => Err(invalid("draft vocabulary must not be empty")),
-        Some(rows) if options.mtp && rows < config.vocab_size() => Ok(Some(rows)),
+        Some(rows) if rows < config.vocab_size() => Ok(Some(rows)),
         _ => Ok(None),
     }
 }
@@ -546,7 +551,7 @@ impl Qwen35 {
         contexts: &[usize],
     ) -> Result<(ModelDescription, usize, usize)> {
         let with_mtp;
-        let config = if options.mtp && !config.mtp() {
+        let config = if options.mtp.is_some() && !config.mtp() {
             with_mtp = config.clone().with_mtp()?;
             &with_mtp
         } else {
@@ -604,7 +609,7 @@ impl Qwen35 {
     /// Validate config and checkpoint headers, then load the text tower onto `options.device`.
     pub fn load(dir: &Path, options: &LoadOptions) -> Result<Self> {
         let mut config = Config::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?;
-        if options.mtp {
+        if options.mtp.is_some() {
             config = config.with_mtp()?;
         }
         let (tokenizer_config, tokenizer) = (
@@ -1013,7 +1018,10 @@ impl Qwen35 {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the fused attention's inputs for differential tests"
+    )]
     fn attention(
         &self,
         a: &Attention,

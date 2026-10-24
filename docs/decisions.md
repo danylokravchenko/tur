@@ -42,6 +42,9 @@ tur-cli     the `tur` binary: run, serve, quantize
 
 Dependencies point down the list. Model-specific configuration stays with its model;
 there is no universal `Config` and one error hierarchy (`tur-core`).
+Loading and speculation share the model-owned `Option<DraftHead>`: `None` disables
+the native head, and a present head owns its optional vocabulary bound. There is no
+separate enable flag or vocabulary setting that can disagree with it.
 
 ## Execution contracts
 

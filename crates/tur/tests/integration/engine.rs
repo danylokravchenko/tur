@@ -19,7 +19,7 @@ use tur_core::{
     execution::{KvFormat, KvLayout, PackedExecution, SequenceDescriptor, StateHandle, invalid},
 };
 use tur_engine::hybrid::{HybridEngine, HybridModel, ModelState, PoolConfig, SamplingOptions};
-use tur_models::models::qwen3_5::{Execution, LoadOptions, Qwen35, WeightFormat};
+use tur_models::models::qwen3_5::{DraftHead, Execution, LoadOptions, Qwen35, WeightFormat};
 
 /// Exact K/V storage: these tests compare chunking, batching and Transformers outputs.
 const EXACT_KV: KvLayout = KvLayout {
@@ -60,8 +60,7 @@ fn load(dir: &Path, format: WeightFormat, device: Device) -> Result<Arc<Qwen35>>
             execution: Execution::Fused,
             kv: EXACT_KV,
             recurrent: candle_core::DType::F32,
-            mtp: false,
-            draft_vocab: None,
+            mtp: None,
         },
     )?))
 }
@@ -381,8 +380,7 @@ fn real(format: WeightFormat) -> Result<Real> {
             execution: Execution::Fused,
             kv: EXACT_KV,
             recurrent: candle_core::DType::F32,
-            mtp: false,
-            draft_vocab: None,
+            mtp: None,
         },
     )?);
     let generation = std::fs::read_to_string(dir.join("generation_config.json")).ok();
@@ -551,8 +549,7 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
                 execution,
                 kv: EXACT_KV,
                 recurrent: candle_core::DType::F32,
-                mtp: true,
-                draft_vocab: None,
+                mtp: Some(DraftHead { vocab: None }),
             },
         )?;
         let description = model.description();

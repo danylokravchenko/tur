@@ -208,7 +208,10 @@ struct Paged {
     slots: usize,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one argument per dimension of the benchmarked shape"
+)]
 fn paged(
     device: &Device,
     kernels: &Kernels,
@@ -831,7 +834,7 @@ fn moe_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     Ok(cases)
 }
 
-pub fn run() -> Result<()> {
+pub(crate) fn run() -> Result<()> {
     let device = Device::new_metal(0)?;
     let kernels = Kernels::new(&device)?;
     let document = json!({

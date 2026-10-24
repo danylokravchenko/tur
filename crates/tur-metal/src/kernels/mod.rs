@@ -986,7 +986,10 @@ impl Kernels {
     /// after every token, into its written slots, rounded to the pool's dtype. Returns
     /// `[rows * heads, value_dim]`. Single-token sequences take one coalesced step dispatch
     /// (unless tuning disables it) and the rest one scan dispatch.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per kernel binding; a struct would only rename them"
+    )]
     pub fn delta_scan(
         &self,
         mixed: &Tensor,
@@ -1514,7 +1517,10 @@ impl Kernels {
     }
 
     /// The tiled matrix-unit kernel over `kv`'s query tiles; same contract as `attention`.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per kernel binding; a struct would only rename them"
+    )]
     fn attention_tiles(
         &self,
         qv: &View<'_>,

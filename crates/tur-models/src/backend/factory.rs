@@ -15,8 +15,8 @@ use crate::{
     Result, TurError,
     backend::chat_template::ChatTemplate,
     models::qwen3_5::{
-        Config, Execution, GenerationDefaults, LoadOptions, Manifest, Qwen35, WeightFormat,
-        Weights, is_artifact,
+        Config, DraftHead, Execution, GenerationDefaults, LoadOptions, Manifest, Qwen35,
+        WeightFormat, Weights, is_artifact,
     },
 };
 
@@ -41,13 +41,6 @@ pub struct ModelFactory {
     pub kv: KvLayout,
     /// Recurrent matrix storage: F32, F16 or BF16.
     pub recurrent: candle_core::DType,
-}
-
-/// The checkpoint's native multi-token prediction head, loaded for drafting.
-#[derive(Clone, Copy, Debug)]
-pub struct DraftHead {
-    /// Draft from token IDs below this bound only ([`LoadOptions::draft_vocab`]).
-    pub vocab: Option<usize>,
 }
 
 fn hub_error(error: impl std::fmt::Display) -> TurError {
@@ -196,8 +189,7 @@ impl ModelFactory {
             execution: Execution::Fused,
             kv: self.kv,
             recurrent: self.recurrent,
-            mtp: draft.is_some(),
-            draft_vocab: draft.and_then(|head| head.vocab),
+            mtp: draft,
         };
         let config = if draft.is_some() {
             config.with_mtp()?

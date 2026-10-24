@@ -112,6 +112,12 @@ pub struct PipelineWorker {
 
 const MAX_ADMISSIONS_PER_PASS: usize = 32;
 
+/// Hand a request its outcome. A client that disconnected has dropped the receiver, and
+/// nobody is left to tell.
+fn reply(tx: oneshot::Sender<Result<GenerationStats>>, result: Result<GenerationStats>) {
+    drop(tx.send(result));
+}
+
 fn drain_intake<T>(rx: &mut mpsc::Receiver<T>, mut admit: impl FnMut(T)) {
     // A producer can refill a bounded channel while it is drained. Always return to
     // execution, cancellation and expiration after a bounded amount of intake work.
@@ -147,7 +153,7 @@ fn admit(
             );
         }
         Err(error) => {
-            let _ = msg.result_tx.send(Err(error));
+            reply(msg.result_tx, Err(error));
         }
     }
 }
@@ -187,10 +193,10 @@ fn deliver(
             // A remainder the channel cannot take is recovered by the adapter from the
             // final text, so completion never waits on the client.
             if let Some(stream) = &mut request.stream {
-                let _ = stream.flush(usize::MAX);
+                stream.flush(usize::MAX).ok();
             }
             drop(request.stream);
-            let _ = request.result_tx.send(result);
+            reply(request.result_tx, result);
         }
     }
     let mut cancelled = Vec::new();
@@ -207,10 +213,13 @@ fn deliver(
         pipeline.cancel(id)?;
         if let (Some(request), Some(bytes)) = (pending.remove(&id), stalled) {
             tracing::warn!(request = %id, bytes, "cancelled a stalled stream");
-            let _ = request.result_tx.send(Err(TurError::SlowClient(format!(
-                "{bytes} bytes undelivered beyond the {}-byte bound",
-                config.max_buffered_bytes
-            ))));
+            reply(
+                request.result_tx,
+                Err(TurError::SlowClient(format!(
+                    "{bytes} bytes undelivered beyond the {}-byte bound",
+                    config.max_buffered_bytes
+                ))),
+            );
         }
     }
     Ok(())
@@ -241,9 +250,7 @@ fn serve(
             Ok(step) => step,
             Err(error) => {
                 for (_, request) in pending.drain() {
-                    let _ = request
-                        .result_tx
-                        .send(Err(TurError::Other(error.to_string())));
+                    reply(request.result_tx, Err(TurError::Other(error.to_string())));
                 }
                 return Err(error);
             }
@@ -285,7 +292,8 @@ impl PipelineWorker {
                         }
                     }
                     Err(error) => {
-                        let _ = ready_tx.send(Err(error));
+                        // The caller waits on this channel until the worker reports.
+                        drop(ready_tx.send(Err(error)));
                     }
                 }
             })?;

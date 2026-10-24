@@ -11,6 +11,7 @@ use tur::{
     },
     core::execution::invalid,
     hybrid::SamplingOptions,
+    models::qwen3_5::DraftHead,
 };
 
 fn config(drafts: usize, batch: usize) -> PipelineConfig {
@@ -331,7 +332,7 @@ fn mtp_config(drafts: usize, batch: usize) -> PipelineConfig {
 fn assert_mtp_preserves_outputs(factory: &tur::ModelFactory) -> Result<()> {
     for vocab in [None, Some(40)] {
         let mut config = mtp_config(4, 1);
-        config.speculation.mtp_vocab = vocab;
+        config.speculation.mtp = Some(DraftHead { vocab });
         assert_mtp_preserves_outputs_with(factory, config)?;
     }
     Ok(())
@@ -418,14 +419,14 @@ fn test_mtp_needs_a_head_and_disables_prefix_reuse() -> Result<()> {
     // A reduced draft vocabulary is a copy of that many F32 LM-head rows of 64 values; the
     // pipeline checks the plan against the loaded weights.
     let mut reduced = mtp_config(4, 1);
-    reduced.speculation.mtp_vocab = Some(40);
+    reduced.speculation.mtp = Some(DraftHead { vocab: Some(40) });
     let reduced = InferencePipeline::new(&with_head.factory(), reduced)?;
     assert_eq!(
         reduced.memory_plan().weights - drafted.memory_plan().weights,
         40 * 64 * 4
     );
     let mut empty = mtp_config(4, 1);
-    empty.speculation.mtp_vocab = Some(0);
+    empty.speculation.mtp = Some(DraftHead { vocab: Some(0) });
     assert!(InferencePipeline::new(&with_head.factory(), empty).is_err());
     Ok(())
 }

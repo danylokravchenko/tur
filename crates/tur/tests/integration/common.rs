@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, reason = "some fixtures serve only Metal-gated tests")]
 use candle_core::{DType, Device, Tensor};
 use std::{collections::HashMap, path::PathBuf};
 use tokenizers::{Tokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};
@@ -20,10 +20,10 @@ const TINY: &str = r#"{
   "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.25}
 }"#;
 
-pub struct Checkpoint(pub PathBuf);
+pub(crate) struct Checkpoint(pub PathBuf);
 impl Drop for Checkpoint {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        drop(std::fs::remove_dir_all(&self.0));
     }
 }
 
@@ -42,7 +42,7 @@ fn values(count: usize, seed: u64, scale: f32) -> Vec<f32> {
 
 impl Checkpoint {
     /// With zero decoder updates and tied embeddings, token 5 is the unique greedy winner.
-    pub fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Self::write(TINY, |name, count, _| {
             let mut values = vec![0f32; count];
             if name.ends_with("embed_tokens.weight") {
@@ -58,14 +58,14 @@ impl Checkpoint {
     /// Random weights without modality placeholders: every output depends on the whole
     /// context and on the request's own recurrent and attention state, so leaked or
     /// misplaced state changes generated text.
-    pub fn random() -> Result<Self> {
+    pub(crate) fn random() -> Result<Self> {
         let config = TINY.replace(r#", "image_token_id": 94"#, "");
         Self::random_config(&config)
     }
 
     /// Random fixture using head sizes supported by the fused Metal kernels.
     #[cfg(feature = "metal")]
-    pub fn fused() -> Result<Self> {
+    pub(crate) fn fused() -> Result<Self> {
         let mut config: serde_json::Value = serde_json::from_str(TINY)?;
         for (name, value) in [
             ("hidden_size", 256),
@@ -83,7 +83,7 @@ impl Checkpoint {
     }
 
     /// [`Self::random`] with a random native multi-token prediction head.
-    pub fn random_mtp() -> Result<Self> {
+    pub(crate) fn random_mtp() -> Result<Self> {
         let config = TINY.replace(r#", "image_token_id": 94"#, "").replace(
             r#""num_hidden_layers": 4,"#,
             r#""num_hidden_layers": 4, "mtp_num_hidden_layers": 1,"#,
@@ -93,7 +93,7 @@ impl Checkpoint {
 
     /// [`Self::fused`] with a random native multi-token prediction head.
     #[cfg(feature = "metal")]
-    pub fn fused_mtp() -> Result<Self> {
+    pub(crate) fn fused_mtp() -> Result<Self> {
         let fixture = Self::fused()?;
         let path = fixture.0.join("config.json");
         let mut config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
@@ -153,7 +153,7 @@ impl Checkpoint {
         Ok(fixture)
     }
 
-    pub fn factory(&self) -> ModelFactory {
+    pub(crate) fn factory(&self) -> ModelFactory {
         ModelFactory {
             source: ModelSource::LocalPath(self.0.clone()),
             revision: "tiny-adapter-fixture-v1".into(),

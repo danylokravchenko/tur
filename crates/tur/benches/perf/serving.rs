@@ -33,7 +33,7 @@ use tur_engine::{
     hybrid::SamplingOptions,
 };
 use tur_models::models::qwen3_5::{
-    DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, WeightFormat, parse_recurrent_state,
+    DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, DraftHead, WeightFormat, parse_recurrent_state,
 };
 
 const CHUNK: usize = 256;
@@ -425,59 +425,13 @@ fn mean_at(values: &Value, indices: impl Iterator<Item = usize>) -> f64 {
 /// Prefix-scheduling workloads on the default pipeline configuration: a cold shared
 /// system prompt reached by a burst, queue contention between warm and cold prompts, an
 /// agent loop, a change of hot prefix under churn, and traffic with little or no reuse.
-fn reuse_runs(
+/// Four agents share a 1K-token tool manual; each step appends the reply and a
+/// 128-token tool result.
+fn agent_run(
     factory: &ModelFactory,
     tokenizer: &Tokenizer,
     options: SamplingOptions,
-) -> Result<Vec<Value>> {
-    let mut runs = Vec::new();
-    let record =
-        |runs: &mut Vec<Value>, name: &str, pipeline: &InferencePipeline, result: Value| {
-            report(name, &result);
-            let prefix = pipeline.prefix_stats();
-            eprintln!("  {prefix:?}, {} retained", pipeline.memory_plan().retained);
-            runs.push(json!({"workload": name, "prefix": format!("{prefix:?}"),
-            "retained_entries": pipeline.memory_plan().retained, "result": result}));
-        };
-
-    // Eight users reach one cold 1.5K-token system prompt together.
-    let mut pipeline = reuse_pipeline(factory, tokenizer, 8, options)?;
-    let system = prompt(tokenizer, 1536, 17)?;
-    let users = (0..8)
-        .map(|u| turn(tokenizer, Some(&system), 48, 4000 + u, 32, options))
-        .collect::<Result<Vec<_>>>()?;
-    let result = run_requests(&mut pipeline, &users)?;
-    record(&mut runs, "cold_shared", &pipeline, result);
-
-    // Four running slots, sixteen requests at once: even ones share a warmed 1K-token
-    // system prompt, odd ones are cold 1K-token prompts.
-    drop(pipeline);
-    let mut pipeline = reuse_pipeline(factory, tokenizer, 4, options)?;
-    let system = prompt(tokenizer, 1024, 18)?;
-    run_requests(
-        &mut pipeline,
-        &[turn(tokenizer, Some(&system), 32, 4100, 8, options)?],
-    )?;
-    let requests = (0..16)
-        .map(|i| {
-            if i % 2 == 0 {
-                turn(tokenizer, Some(&system), 32, 4200 + i, 32, options)
-            } else {
-                turn(tokenizer, None, 1056, 4200 + i, 32, options)
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let result = run_requests(&mut pipeline, &requests)?;
-    eprintln!(
-        "contention TTFT mean: warm {:.0} ms, cold {:.0} ms",
-        mean_at(&result["ttft_each"], (0..16).step_by(2)) * 1e3,
-        mean_at(&result["ttft_each"], (1..16).step_by(2)) * 1e3
-    );
-    record(&mut runs, "contention", &pipeline, result);
-
-    // Four agents share a 1K-token tool manual; each step appends the reply and a
-    // 128-token tool result.
-    drop(pipeline);
+) -> Result<Value> {
     let mut pipeline = reuse_pipeline(factory, tokenizer, 8, options)?;
     let manual = prompt(tokenizer, 1024, 19)?;
     let mut agents: Vec<Vec<ChatMessage>> = (0..4)
@@ -542,14 +496,19 @@ fn reuse_runs(
     eprintln!(
         "agent: {cached_total} of {prompt_total} prompt tokens cached, {wall:.2} s; {prefix:?}"
     );
-    runs.push(
+    Ok(
         json!({"workload": "agent", "steps": steps, "prefix": format!("{prefix:?}"),
         "retained_entries": pipeline.memory_plan().retained}),
-    );
+    )
+}
 
-    // One hot 1K-token prefix per phase beside three cold 1K-token prompts per wave; the
-    // hot prefix changes after five waves.
-    drop(pipeline);
+/// One hot 1K-token prefix per phase beside three cold 1K-token prompts per wave; the
+/// hot prefix changes after five waves.
+fn churn_run(
+    factory: &ModelFactory,
+    tokenizer: &Tokenizer,
+    options: SamplingOptions,
+) -> Result<Value> {
     let mut pipeline = reuse_pipeline(factory, tokenizer, 4, options)?;
     let mut phases = Vec::new();
     for phase in 0..2 {
@@ -592,14 +551,69 @@ fn reuse_runs(
         "  churn {prefix:?}, {} retained",
         pipeline.memory_plan().retained
     );
-    runs.push(
+    Ok(
         json!({"workload": "churn", "phases": phases, "prefix": format!("{prefix:?}"),
         "retained_entries": pipeline.memory_plan().retained}),
+    )
+}
+
+fn reuse_runs(
+    factory: &ModelFactory,
+    tokenizer: &Tokenizer,
+    options: SamplingOptions,
+) -> Result<Vec<Value>> {
+    let mut runs = Vec::new();
+    let record =
+        |runs: &mut Vec<Value>, name: &str, pipeline: &InferencePipeline, result: Value| {
+            report(name, &result);
+            let prefix = pipeline.prefix_stats();
+            eprintln!("  {prefix:?}, {} retained", pipeline.memory_plan().retained);
+            runs.push(json!({"workload": name, "prefix": format!("{prefix:?}"),
+            "retained_entries": pipeline.memory_plan().retained, "result": result}));
+        };
+
+    // Eight users reach one cold 1.5K-token system prompt together.
+    let mut pipeline = reuse_pipeline(factory, tokenizer, 8, options)?;
+    let system = prompt(tokenizer, 1536, 17)?;
+    let users = (0..8)
+        .map(|u| turn(tokenizer, Some(&system), 48, 4000 + u, 32, options))
+        .collect::<Result<Vec<_>>>()?;
+    let result = run_requests(&mut pipeline, &users)?;
+    record(&mut runs, "cold_shared", &pipeline, result);
+
+    // Four running slots, sixteen requests at once: even ones share a warmed 1K-token
+    // system prompt, odd ones are cold 1K-token prompts.
+    drop(pipeline);
+    let mut pipeline = reuse_pipeline(factory, tokenizer, 4, options)?;
+    let system = prompt(tokenizer, 1024, 18)?;
+    run_requests(
+        &mut pipeline,
+        &[turn(tokenizer, Some(&system), 32, 4100, 8, options)?],
+    )?;
+    let requests = (0..16)
+        .map(|i| {
+            if i % 2 == 0 {
+                turn(tokenizer, Some(&system), 32, 4200 + i, 32, options)
+            } else {
+                turn(tokenizer, None, 1056, 4200 + i, 32, options)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let result = run_requests(&mut pipeline, &requests)?;
+    eprintln!(
+        "contention TTFT mean: warm {:.0} ms, cold {:.0} ms",
+        mean_at(&result["ttft_each"], (0..16).step_by(2)) * 1e3,
+        mean_at(&result["ttft_each"], (1..16).step_by(2)) * 1e3
     );
+    record(&mut runs, "contention", &pipeline, result);
+
+    drop(pipeline);
+    runs.push(agent_run(factory, tokenizer, options)?);
+
+    runs.push(churn_run(factory, tokenizer, options)?);
 
     // Sixteen distinct 512-token prompts at eight running: only the template header is
     // shared.
-    drop(pipeline);
     let mut pipeline = reuse_pipeline(factory, tokenizer, 8, options)?;
     let requests = (0..16)
         .map(|i| turn(tokenizer, None, 512, 4700 + i, 32, options))
@@ -724,7 +738,233 @@ fn arrivals(
     }))
 }
 
-pub fn run() -> Result<()> {
+/// What every workload shares: the checkpoint, sampling and the configured sizes.
+struct Bench<'a> {
+    factory: &'a ModelFactory,
+    tokenizer: &'a Tokenizer,
+    options: SamplingOptions,
+    concurrency: Vec<usize>,
+    max: usize,
+    output: usize,
+    device_sampling: bool,
+}
+
+/// Closed-loop bursts on one warmed pipeline: short prompts at each concurrency, then
+/// short and 2K-token prompts arriving together.
+fn burst_runs(bench: &Bench<'_>, decode: bool, mixed: bool) -> Result<Vec<Value>> {
+    let mut runs = Vec::new();
+    let Bench {
+        factory,
+        tokenizer,
+        options,
+        max,
+        output,
+        device_sampling,
+        ..
+    } = *bench;
+    let concurrency = bench.concurrency.clone();
+    let mut config = PipelineConfig::new(max, CHUNK);
+    config.device_sampling = device_sampling;
+    let mut pipeline = InferencePipeline::new(factory, config)?;
+    // Warm pipelines and kernels.
+    let warm = Burst {
+        prompts: vec![prompt(tokenizer, 64, 99)?],
+        output: 8,
+    };
+    burst(&mut pipeline, &warm, options)?;
+    if decode {
+        for &requests in &concurrency {
+            // Distinct prompts per burst, so no burst restores another's snapshots.
+            let short = Burst {
+                prompts: (0..requests)
+                    .map(|i| prompt(tokenizer, 128, requests * 100 + i))
+                    .collect::<Result<_>>()?,
+                output,
+            };
+            let result = burst(&mut pipeline, &short, options)?;
+            report(&format!("decode-heavy c={requests}"), &result);
+            runs.push(json!({"workload": "decode_heavy", "prompt": 128, "concurrency": requests, "result": result}));
+        }
+    }
+    if mixed {
+        // Mixed: half the requests carry 2K-token prompts, arriving with short ones.
+        let mixed = Burst {
+            prompts: (0..max)
+                .map(|i| prompt(tokenizer, if i % 2 == 0 { 128 } else { 2048 }, 10_000 + i))
+                .collect::<Result<_>>()?,
+            output,
+        };
+        let result = burst(&mut pipeline, &mixed, options)?;
+        report(&format!("mixed c={max}"), &result);
+        runs.push(
+            json!({"workload": "mixed", "prompt": [128, 2048], "concurrency": max, "result": result}),
+        );
+    }
+    Ok(runs)
+}
+
+/// Grammar-constrained requests, where every token is masked.
+fn grammar_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
+    let mut runs = Vec::new();
+    let Bench {
+        factory,
+        options,
+        max,
+        output,
+        device_sampling,
+        ..
+    } = *bench;
+    let concurrency = bench.concurrency.clone();
+    // JSON-like lists that the grammar terminates; every token is masked.
+    let grammar =
+        TopLevelGrammar::from_regex(r#"\{"items": \[("[a-z]{2,10}", ){3,6}"[a-z]{2,10}"\]\}"#);
+    let mut config = PipelineConfig::new(max, CHUNK);
+    config.device_sampling = device_sampling;
+    // Repeated prompts would otherwise restore from prompt-end snapshots.
+    config.prefix = PrefixConfig::DISABLED;
+    let mut pipeline = InferencePipeline::new(factory, config)?;
+    for &concurrency in &concurrency {
+        let requests: Vec<GenerationRequest> = (0..concurrency)
+            .map(|i| {
+                let mut request = GenerationRequest::new(
+                    format!("Request {i}. List a few animals as JSON."),
+                    output,
+                );
+                request.seed = i as u64;
+                request.sampling = options;
+                request.render.enable_thinking = Some(false);
+                request.grammar = Some(grammar.clone());
+                request
+            })
+            .collect();
+        // The first run builds the parser factory over the tokenizer; time the second.
+        run_requests(&mut pipeline, &requests)?;
+        let result = run_requests(&mut pipeline, &requests)?;
+        report(&format!("grammar c={concurrency}"), &result);
+        runs.push(json!({"workload": "grammar", "concurrency": concurrency, "result": result}));
+    }
+    Ok(runs)
+}
+
+/// Open-loop arrivals, serial and overlapped intake, at each configured rate.
+fn arrival_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
+    let mut runs = Vec::new();
+    let Bench {
+        factory,
+        tokenizer,
+        options,
+        ..
+    } = *bench;
+    let count = env_sizes("TUR_BENCH_REQUESTS", "48")?
+        .first()
+        .copied()
+        .unwrap_or(48);
+    for rate in env_sizes("TUR_BENCH_RATE", "2,4")? {
+        for overlapped in [false, true] {
+            let result = arrivals(factory, tokenizer, rate as f64, count, overlapped, options)?;
+            eprintln!(
+                "arrivals {rate}/s, {}: {:.1} out tok/s, TTFT p50/p95 {:.0}/{:.0} ms, ITL p50/p95/p99 {:.1}/{:.1}/{:.1} ms, intake p50 {:.2} ms (sum {:.0} ms), idle {:.2}%",
+                if overlapped { "overlapped" } else { "serial" },
+                result["output_tokens_per_second"].as_f64().unwrap_or(0.0),
+                result["ttft_seconds"]["p50"].as_f64().unwrap_or(0.0) * 1e3,
+                result["ttft_seconds"]["p95"].as_f64().unwrap_or(0.0) * 1e3,
+                result["itl_seconds"]["p50"].as_f64().unwrap_or(0.0) * 1e3,
+                result["itl_seconds"]["p95"].as_f64().unwrap_or(0.0) * 1e3,
+                result["itl_seconds"]["p99"].as_f64().unwrap_or(0.0) * 1e3,
+                result["intake_seconds"]["p50"].as_f64().unwrap_or(0.0) * 1e3,
+                result["intake_seconds"]["sum"].as_f64().unwrap_or(0.0) * 1e3,
+                result["device_idle_fraction_lower_bound"]
+                    .as_f64()
+                    .unwrap_or(0.0)
+                    * 100.0,
+            );
+            runs.push(json!({"workload": "arrivals", "result": result}));
+        }
+    }
+    Ok(runs)
+}
+
+/// Prompt lookup and draft-head speculation over repetitive, code and novel prompts.
+fn speculation_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
+    let mut runs = Vec::new();
+    let Bench {
+        factory,
+        options,
+        output,
+        device_sampling,
+        ..
+    } = *bench;
+    let concurrency = bench.concurrency.clone();
+    let repeats = env_sizes("TUR_BENCH_REPEATS", "3")?
+        .first()
+        .copied()
+        .unwrap_or(3);
+    let heads = env_sizes("TUR_BENCH_MTP", "0")?;
+    let prompts = std::env::var("TUR_BENCH_SPECULATION").unwrap_or_else(|_| "repeat,novel".into());
+    let configs = env_sizes("TUR_BENCH_DRAFT", "0,4")?
+        .into_iter()
+        .flat_map(|draft| {
+            let heads = if draft == 0 { vec![0] } else { heads.clone() };
+            heads.into_iter().map(move |mtp| (draft, mtp == 1))
+        });
+    for (draft, with_mtp) in configs {
+        for &count in &concurrency {
+            let mut config = PipelineConfig::new(count, CHUNK);
+            config.prefix = PrefixConfig::DISABLED;
+            config.device_sampling = device_sampling;
+            config.speculation = if with_mtp {
+                SpeculationConfig {
+                    mtp: Some(DraftHead {
+                        vocab: env_sizes("TUR_BENCH_MTP_VOCAB", "32768")?
+                            .first()
+                            .copied()
+                            .filter(|&rows| rows > 0),
+                    }),
+                    ..SpeculationConfig::with_mtp(draft)
+                }
+            } else {
+                SpeculationConfig::new(draft)
+            };
+            let mut pipeline = InferencePipeline::new(factory, config)?;
+            for workload in prompts.split(',') {
+                let requests: Vec<_> = (0..count).map(|i| {
+                    let text = match workload {
+                        "repeat" => format!("Request {i}. Continue this pattern exactly for 200 words, without an introduction:\n{}", "red green blue yellow orange purple ".repeat(12)),
+                        "code" => format!("Request {i}. Write a Rust function that parses an INI file into a map of sections to key-value pairs, with error handling for malformed lines. Only output code."),
+                        _ => format!("Request {i}. Explain how a database recovers from a power failure during a transaction. Be specific about write-ahead logs, checkpoints and isolation."),
+                    };
+                    let mut request = GenerationRequest::new(text, output);
+                    request.seed = i as u64;
+                    request.render.enable_thinking = Some(false);
+                    request.sampling = options;
+                    request
+                }).collect();
+                // Warm execution separately; adaptive draft selection remains active.
+                run_requests(&mut pipeline, &requests)?;
+                for repeat in 0..repeats {
+                    let result = run_requests(&mut pipeline, &requests)?;
+                    report(
+                        &format!(
+                            "speculation {workload} c={count} draft={draft}{}",
+                            if with_mtp { "+mtp" } else { "" }
+                        ),
+                        &result,
+                    );
+                    let memory = pipeline.memory_plan();
+                    let stats = pipeline.speculation_stats();
+                    runs.push(json!({"workload": workload, "concurrency": count, "draft": draft, "repeat": repeat,
+                        "mtp": with_mtp, "speculation_totals": format!("{stats:?}"),
+                        "resident_bytes": memory.resident(), "state_pool_bytes": memory.state_pool, "draft_slots": memory.draft_slots,
+                        "cost_fit_seconds": pipeline.draft_costs().line(count),
+                        "result": result}));
+                }
+            }
+        }
+    }
+    Ok(runs)
+}
+
+pub(crate) fn run() -> Result<()> {
     let dir = std::env::var("TUR_QWEN35_0_8B")
         .map(PathBuf::from)
         .map_err(|_| invalid("set TUR_QWEN35_0_8B to a Qwen3.5-0.8B snapshot"))?;
@@ -748,111 +988,28 @@ pub fn run() -> Result<()> {
             .map_or(Ok(DEFAULT_RECURRENT_STATE), |s| parse_recurrent_state(&s))
             .map_err(TurError::Other)?,
     };
-    let max = concurrency.iter().copied().max().unwrap_or(1);
+    let bench = Bench {
+        factory: &factory,
+        tokenizer: &tokenizer,
+        options,
+        max: concurrency.iter().copied().max().unwrap_or(1),
+        concurrency,
+        output,
+        device_sampling,
+    };
     let mut runs = Vec::new();
     if workloads.contains("decode") || workloads.contains("mixed") {
-        let mut config = PipelineConfig::new(max, CHUNK);
-        config.device_sampling = device_sampling;
-        let mut pipeline = InferencePipeline::new(&factory, config)?;
-        // Warm pipelines and kernels.
-        let warm = Burst {
-            prompts: vec![prompt(&tokenizer, 64, 99)?],
-            output: 8,
-        };
-        burst(&mut pipeline, &warm, options)?;
-        if workloads.contains("decode") {
-            for &requests in &concurrency {
-                // Distinct prompts per burst, so no burst restores another's snapshots.
-                let short = Burst {
-                    prompts: (0..requests)
-                        .map(|i| prompt(&tokenizer, 128, requests * 100 + i))
-                        .collect::<Result<_>>()?,
-                    output,
-                };
-                let result = burst(&mut pipeline, &short, options)?;
-                report(&format!("decode-heavy c={requests}"), &result);
-                runs.push(json!({"workload": "decode_heavy", "prompt": 128, "concurrency": requests, "result": result}));
-            }
-        }
-        if workloads.contains("mixed") {
-            // Mixed: half the requests carry 2K-token prompts, arriving with short ones.
-            let mixed = Burst {
-                prompts: (0..max)
-                    .map(|i| prompt(&tokenizer, if i % 2 == 0 { 128 } else { 2048 }, 10_000 + i))
-                    .collect::<Result<_>>()?,
-                output,
-            };
-            let result = burst(&mut pipeline, &mixed, options)?;
-            report(&format!("mixed c={max}"), &result);
-            runs.push(
-                json!({"workload": "mixed", "prompt": [128, 2048], "concurrency": max, "result": result}),
-            );
-        }
+        runs.extend(burst_runs(
+            &bench,
+            workloads.contains("decode"),
+            workloads.contains("mixed"),
+        )?);
     }
     if workloads.contains("grammar") {
-        // JSON-like lists that the grammar terminates; every token is masked.
-        let grammar =
-            TopLevelGrammar::from_regex(r#"\{"items": \[("[a-z]{2,10}", ){3,6}"[a-z]{2,10}"\]\}"#);
-        let mut config = PipelineConfig::new(max, CHUNK);
-        config.device_sampling = device_sampling;
-        // Repeated prompts would otherwise restore from prompt-end snapshots.
-        config.prefix = PrefixConfig::DISABLED;
-        let mut pipeline = InferencePipeline::new(&factory, config)?;
-        for &concurrency in &concurrency {
-            let requests: Vec<GenerationRequest> = (0..concurrency)
-                .map(|i| {
-                    let mut request = GenerationRequest::new(
-                        format!("Request {i}. List a few animals as JSON."),
-                        output,
-                    );
-                    request.seed = i as u64;
-                    request.sampling = options;
-                    request.render.enable_thinking = Some(false);
-                    request.grammar = Some(grammar.clone());
-                    request
-                })
-                .collect();
-            // The first run builds the parser factory over the tokenizer; time the second.
-            run_requests(&mut pipeline, &requests)?;
-            let result = run_requests(&mut pipeline, &requests)?;
-            report(&format!("grammar c={concurrency}"), &result);
-            runs.push(json!({"workload": "grammar", "concurrency": concurrency, "result": result}));
-        }
+        runs.extend(grammar_runs(&bench)?);
     }
     if workloads.contains("arrivals") {
-        let count = env_sizes("TUR_BENCH_REQUESTS", "48")?
-            .first()
-            .copied()
-            .unwrap_or(48);
-        for rate in env_sizes("TUR_BENCH_RATE", "2,4")? {
-            for overlapped in [false, true] {
-                let result = arrivals(
-                    &factory,
-                    &tokenizer,
-                    rate as f64,
-                    count,
-                    overlapped,
-                    options,
-                )?;
-                eprintln!(
-                    "arrivals {rate}/s, {}: {:.1} out tok/s, TTFT p50/p95 {:.0}/{:.0} ms, ITL p50/p95/p99 {:.1}/{:.1}/{:.1} ms, intake p50 {:.2} ms (sum {:.0} ms), idle {:.2}%",
-                    if overlapped { "overlapped" } else { "serial" },
-                    result["output_tokens_per_second"].as_f64().unwrap_or(0.0),
-                    result["ttft_seconds"]["p50"].as_f64().unwrap_or(0.0) * 1e3,
-                    result["ttft_seconds"]["p95"].as_f64().unwrap_or(0.0) * 1e3,
-                    result["itl_seconds"]["p50"].as_f64().unwrap_or(0.0) * 1e3,
-                    result["itl_seconds"]["p95"].as_f64().unwrap_or(0.0) * 1e3,
-                    result["itl_seconds"]["p99"].as_f64().unwrap_or(0.0) * 1e3,
-                    result["intake_seconds"]["p50"].as_f64().unwrap_or(0.0) * 1e3,
-                    result["intake_seconds"]["sum"].as_f64().unwrap_or(0.0) * 1e3,
-                    result["device_idle_fraction_lower_bound"]
-                        .as_f64()
-                        .unwrap_or(0.0)
-                        * 100.0,
-                );
-                runs.push(json!({"workload": "arrivals", "result": result}));
-            }
-        }
+        runs.extend(arrival_runs(&bench)?);
     }
     if workloads.contains("prefix") {
         for spacing in env_sizes("TUR_BENCH_SPACING", "0,64,128,256,512")? {
@@ -863,71 +1020,7 @@ pub fn run() -> Result<()> {
         runs.extend(reuse_runs(&factory, &tokenizer, options)?);
     }
     if workloads.contains("speculation") {
-        let repeats = env_sizes("TUR_BENCH_REPEATS", "3")?
-            .first()
-            .copied()
-            .unwrap_or(3);
-        let heads = env_sizes("TUR_BENCH_MTP", "0")?;
-        let prompts =
-            std::env::var("TUR_BENCH_SPECULATION").unwrap_or_else(|_| "repeat,novel".into());
-        let configs = env_sizes("TUR_BENCH_DRAFT", "0,4")?
-            .into_iter()
-            .flat_map(|draft| {
-                let heads = if draft == 0 { vec![0] } else { heads.clone() };
-                heads.into_iter().map(move |mtp| (draft, mtp == 1))
-            });
-        for (draft, with_mtp) in configs {
-            for &count in &concurrency {
-                let mut config = PipelineConfig::new(count, CHUNK);
-                config.prefix = PrefixConfig::DISABLED;
-                config.device_sampling = device_sampling;
-                config.speculation = if with_mtp {
-                    SpeculationConfig {
-                        mtp_vocab: env_sizes("TUR_BENCH_MTP_VOCAB", "32768")?
-                            .first()
-                            .copied()
-                            .filter(|&rows| rows > 0),
-                        ..SpeculationConfig::with_mtp(draft)
-                    }
-                } else {
-                    SpeculationConfig::new(draft)
-                };
-                let mut pipeline = InferencePipeline::new(&factory, config)?;
-                for workload in prompts.split(',') {
-                    let requests: Vec<_> = (0..count).map(|i| {
-                        let text = match workload {
-                            "repeat" => format!("Request {i}. Continue this pattern exactly for 200 words, without an introduction:\n{}", "red green blue yellow orange purple ".repeat(12)),
-                            "code" => format!("Request {i}. Write a Rust function that parses an INI file into a map of sections to key-value pairs, with error handling for malformed lines. Only output code."),
-                            _ => format!("Request {i}. Explain how a database recovers from a power failure during a transaction. Be specific about write-ahead logs, checkpoints and isolation."),
-                        };
-                        let mut request = GenerationRequest::new(text, output);
-                        request.seed = i as u64;
-                        request.render.enable_thinking = Some(false);
-                        request.sampling = options;
-                        request
-                    }).collect();
-                    // Warm execution separately; adaptive draft selection remains active.
-                    run_requests(&mut pipeline, &requests)?;
-                    for repeat in 0..repeats {
-                        let result = run_requests(&mut pipeline, &requests)?;
-                        report(
-                            &format!(
-                                "speculation {workload} c={count} draft={draft}{}",
-                                if with_mtp { "+mtp" } else { "" }
-                            ),
-                            &result,
-                        );
-                        let memory = pipeline.memory_plan();
-                        let stats = pipeline.speculation_stats();
-                        runs.push(json!({"workload": workload, "concurrency": count, "draft": draft, "repeat": repeat,
-                            "mtp": with_mtp, "speculation_totals": format!("{stats:?}"),
-                            "resident_bytes": memory.resident(), "state_pool_bytes": memory.state_pool, "draft_slots": memory.draft_slots,
-                            "cost_fit_seconds": pipeline.draft_costs().line(count),
-                            "result": result}));
-                    }
-                }
-            }
-        }
+        runs.extend(speculation_runs(&bench)?);
     }
     println!(
         "{}",
