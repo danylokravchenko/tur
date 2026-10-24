@@ -500,7 +500,7 @@ fn main() -> Result<()> {
     let factory = ModelFactory {
         source: ModelSource::LocalPath(dir.clone()),
         revision: "bench".into(),
-        format: WeightFormat::Q8_0,
+        format: Some(WeightFormat::Q8_0),
         device: candle_core::Device::new_metal(0)?,
         kv: DEFAULT_KV_LAYOUT,
         recurrent: std::env::var("TUR_BENCH_STATE")

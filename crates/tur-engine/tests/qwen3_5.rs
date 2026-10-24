@@ -60,7 +60,7 @@ fn load(dir: &Path, format: WeightFormat, device: Device) -> Result<Arc<Qwen35>>
         dir,
         &LoadOptions {
             revision: "tiny-fixture".into(),
-            format,
+            weights: format.into(),
             device,
             execution: Execution::Fused,
             kv: EXACT_KV,
@@ -380,7 +380,7 @@ fn real(format: WeightFormat) -> Result<Real> {
         &dir,
         &LoadOptions {
             revision: "Qwen/Qwen3.5-0.8B@2fc06364".into(),
-            format,
+            weights: format.into(),
             device: device()?,
             execution: Execution::Fused,
             kv: EXACT_KV,
@@ -549,7 +549,7 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
             &dir,
             &LoadOptions {
                 revision: "Qwen/Qwen3.5-0.8B@2fc06364".into(),
-                format: WeightFormat::F32,
+                weights: WeightFormat::F32.into(),
                 device: device()?,
                 execution,
                 kv: EXACT_KV,

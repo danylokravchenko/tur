@@ -410,7 +410,7 @@ mod tests {
             factory: ModelFactory {
                 source: ModelSource::LocalPath("/missing/tur-checkpoint".into()),
                 revision: "fixture".into(),
-                format: WeightFormat::F32,
+                format: Some(WeightFormat::F32),
                 device: Device::Cpu,
                 kv: DEFAULT_KV_LAYOUT,
                 recurrent: DEFAULT_RECURRENT_STATE,

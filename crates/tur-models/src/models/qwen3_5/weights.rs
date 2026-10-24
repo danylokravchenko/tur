@@ -3,7 +3,7 @@
 use super::config::Config;
 use candle_core::{DType, Device, Tensor};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
 };
@@ -12,21 +12,38 @@ use tur_core::{Result, execution::invalid};
 /// Headers larger than this are rejected before allocation.
 const MAX_HEADER_BYTES: u64 = 256 << 20;
 
-struct Entry {
+/// One tensor's location and declared layout.
+#[derive(Clone)]
+pub(super) struct Entry {
     file: usize,
-    shape: Vec<usize>,
-    dtype: DType,
+    pub(super) shape: Vec<usize>,
+    pub(super) dtype: safetensors::Dtype,
     offset: u64,
-    bytes: usize,
+    pub(super) bytes: usize,
 }
 
-/// A validated set of text-tower tensors spread over one or more `SafeTensors` files.
+impl Entry {
+    /// Candle element type of a readable tensor.
+    pub(super) fn candle_dtype(&self, name: &str) -> Result<DType> {
+        match self.dtype {
+            safetensors::Dtype::BF16 => Ok(DType::BF16),
+            safetensors::Dtype::F16 => Ok(DType::F16),
+            safetensors::Dtype::F32 => Ok(DType::F32),
+            safetensors::Dtype::U8 => Ok(DType::U8),
+            dtype => Err(invalid(format!("unsupported dtype {dtype:?} for {name}"))),
+        }
+    }
+}
+
+/// Validated tensors spread over one or more `SafeTensors` files, read on demand.
 pub(super) struct Checkpoint {
     files: Vec<PathBuf>,
     entries: BTreeMap<String, Entry>,
 }
 
-fn header(path: &Path) -> Result<(safetensors::tensor::Metadata, u64)> {
+/// Parse and check one file's header: tensor table, `__metadata__` strings and the offset
+/// of its payload, which must end exactly at the end of the file.
+fn header(path: &Path) -> Result<(safetensors::tensor::Metadata, HashMap<String, String>, u64)> {
     let mut file = std::fs::File::open(path)?;
     let mut length = [0u8; 8];
     file.read_exact(&mut length)?;
@@ -36,10 +53,14 @@ fn header(path: &Path) -> Result<(safetensors::tensor::Metadata, u64)> {
     }
     let mut bytes = vec![0u8; usize::try_from(length).map_err(|_| invalid("header size"))?];
     file.read_exact(&mut bytes)?;
-    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)?;
+    let mut map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)?;
+    let strings = map
+        .remove("__metadata__")
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
     let mut tensors: Vec<(String, safetensors::tensor::TensorInfo)> = map
         .into_iter()
-        .filter(|(name, _)| name != "__metadata__")
         .map(|(name, info)| Ok((name, serde_json::from_value(info)?)))
         .collect::<Result<_>>()?;
     tensors.sort_unstable_by_key(|(_, info)| info.data_offsets);
@@ -51,7 +72,7 @@ fn header(path: &Path) -> Result<(safetensors::tensor::Metadata, u64)> {
     if start.checked_add(metadata.data_len() as u64) != Some(file.metadata()?.len()) {
         return Err(invalid("safetensors file length disagrees with its header"));
     }
-    Ok((metadata, start))
+    Ok((metadata, strings, start))
 }
 
 fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -88,122 +109,143 @@ fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 impl Checkpoint {
-    /// Match every header against the config before any payload is read. Tensors outside
-    /// the text tower (vision, MTP) are ignored; unexpected text tensors are rejected.
-    pub(super) fn open(dir: &Path, config: &Config) -> Result<Self> {
-        let expected = config.weight_shapes()?;
-        let prefix = format!("{}.", config.text_prefix());
-        let files = weight_files(dir)?;
+    /// Every tensor of `files` with each file's metadata strings; no payload is read.
+    pub(super) fn scan(files: Vec<PathBuf>) -> Result<(Self, Vec<HashMap<String, String>>)> {
         let mut entries = BTreeMap::new();
+        let mut metadata = Vec::with_capacity(files.len());
         for (index, path) in files.iter().enumerate() {
-            let (metadata, start) = header(path)?;
-            for (name, info) in metadata.tensors() {
-                let text = name.starts_with(&prefix) || name == "lm_head.weight";
-                let Some(shape) = expected.get(&name) else {
-                    if text && !(name == "lm_head.weight" && config.tied_embeddings()) {
-                        return Err(invalid(format!("unexpected text tensor {name}")));
-                    }
-                    continue;
+            let (header, strings, start) = header(path)?;
+            metadata.push(strings);
+            for (name, info) in header.tensors() {
+                let entry = Entry {
+                    file: index,
+                    shape: info.shape.clone(),
+                    dtype: info.dtype,
+                    offset: start
+                        .checked_add(info.data_offsets.0 as u64)
+                        .ok_or_else(|| invalid("weight offset overflow"))?,
+                    bytes: info.data_offsets.1 - info.data_offsets.0,
                 };
-                let dtype = match info.dtype {
-                    safetensors::Dtype::BF16 => DType::BF16,
-                    safetensors::Dtype::F16 => DType::F16,
-                    safetensors::Dtype::F32 => DType::F32,
-                    dtype => {
-                        return Err(invalid(format!("unsupported dtype {dtype:?} for {name}")));
-                    }
-                };
-                let actual = &info.shape;
-                if actual != shape {
-                    return Err(invalid(format!(
-                        "{name} has shape {actual:?}, expected {shape:?}"
-                    )));
-                }
-                if entries
-                    .insert(
-                        name.clone(),
-                        Entry {
-                            file: index,
-                            shape: actual.clone(),
-                            dtype,
-                            offset: start
-                                .checked_add(info.data_offsets.0 as u64)
-                                .ok_or_else(|| invalid("weight offset overflow"))?,
-                            bytes: info.data_offsets.1 - info.data_offsets.0,
-                        },
-                    )
-                    .is_some()
-                {
+                if entries.insert(name.clone(), entry).is_some() {
                     return Err(invalid(format!("duplicate tensor {name}")));
                 }
             }
         }
+        Ok((Self { files, entries }, metadata))
+    }
+
+    /// Match every header of a source checkpoint against the config before any payload
+    /// is read. Tensors outside the text tower (vision, an unloaded MTP head) are dropped;
+    /// unexpected text tensors are rejected.
+    pub(super) fn open(dir: &Path, config: &Config) -> Result<Self> {
+        let expected = config.weight_shapes()?;
+        let prefix = format!("{}.", config.text_prefix());
+        let (mut checkpoint, _) = Self::scan(weight_files(dir)?)?;
+        let mut entries = BTreeMap::new();
+        for (name, entry) in std::mem::take(&mut checkpoint.entries) {
+            let text = name.starts_with(&prefix) || name == "lm_head.weight";
+            let Some(shape) = expected.get(&name) else {
+                if text && !(name == "lm_head.weight" && config.tied_embeddings()) {
+                    return Err(invalid(format!("unexpected text tensor {name}")));
+                }
+                continue;
+            };
+            if entry.dtype == safetensors::Dtype::U8 {
+                return Err(invalid(format!("unsupported dtype U8 for {name}")));
+            }
+            entry.candle_dtype(&name)?;
+            if &entry.shape != shape {
+                return Err(invalid(format!(
+                    "{name} has shape {:?}, expected {shape:?}",
+                    entry.shape
+                )));
+            }
+            entries.insert(name, entry);
+        }
         if let Some(missing) = expected.keys().find(|name| !entries.contains_key(*name)) {
             return Err(invalid(format!("missing tensor {missing}")));
         }
-        Ok(Self { files, entries })
+        checkpoint.entries = entries;
+        Ok(checkpoint)
     }
 
-    /// Read just this tensor, after every header has passed validation. Packing a layer
-    /// can now release its host payload before the next layer is read: `MoE` checkpoints
-    /// never require all unquantized experts or a complete shard in host memory.
-    pub(super) fn take(&mut self, name: &str) -> Result<Tensor> {
+    pub(super) fn entries(&self) -> &BTreeMap<String, Entry> {
+        &self.entries
+    }
+
+    fn locate(&self, name: &str) -> Result<(Entry, std::fs::File)> {
         let entry = self
             .entries
-            .remove(name)
-            .ok_or_else(|| invalid(format!("missing tensor {name}")))?;
+            .get(name)
+            .ok_or_else(|| invalid(format!("missing tensor {name}")))?
+            .clone();
         let mut file = std::fs::File::open(&self.files[entry.file])?;
         file.seek(SeekFrom::Start(entry.offset))?;
+        Ok((entry, file))
+    }
+
+    /// Read just this tensor's payload, after every header has passed validation.
+    pub(super) fn take_raw(&self, name: &str) -> Result<(Entry, Vec<u8>)> {
+        let (entry, mut file) = self.locate(name)?;
         let mut bytes = vec![0u8; entry.bytes];
         file.read_exact(&mut bytes)?;
+        Ok((entry, bytes))
+    }
+
+    /// Read this tensor onto the host in its stored element type.
+    pub(super) fn take(&self, name: &str) -> Result<Tensor> {
+        let (entry, bytes) = self.take_raw(name)?;
         Ok(Tensor::from_raw_buffer(
             &bytes,
-            entry.dtype,
+            entry.candle_dtype(name)?,
             &entry.shape,
             &Device::Cpu,
         )?)
     }
 
-    /// Read a rank-three tensor one leading index at a time, as `[dims[1], dims[2]]`
-    /// matrices: an expert bank streams one expert's payload instead of the whole bank.
-    pub(super) fn take_split(&mut self, name: &str) -> Result<Split> {
-        let entry = self
-            .entries
-            .remove(name)
-            .ok_or_else(|| invalid(format!("missing tensor {name}")))?;
-        let &[count, rows, cols] = entry.shape.as_slice() else {
-            return Err(invalid(format!("{name} is not a stack of matrices")));
+    /// Read a matrix, or a stack of matrices as one `[Σ rows, cols]` matrix, `chunk`
+    /// rows at a time: packing can release each chunk before the next is read, so no
+    /// projection needs its full-precision payload in host memory at once.
+    pub(super) fn take_rows(&self, name: &str, chunk: usize) -> Result<Rows> {
+        let (entry, file) = self.locate(name)?;
+        let dtype = entry.candle_dtype(name)?;
+        let (rows, cols) = match entry.shape.as_slice() {
+            [rows, cols] => (*rows, *cols),
+            [count, rows, cols] => (count * rows, *cols),
+            _ => return Err(invalid(format!("{name} is not a matrix"))),
         };
-        let mut file = std::fs::File::open(&self.files[entry.file])?;
-        file.seek(SeekFrom::Start(entry.offset))?;
-        Ok(Split {
+        if chunk == 0 || rows * cols * dtype.size_in_bytes() != entry.bytes {
+            return Err(invalid(format!("{name} cannot be read in row chunks")));
+        }
+        Ok(Rows {
             file,
-            dtype: entry.dtype,
-            shape: [rows, cols],
-            bytes: entry.bytes.checked_div(count).unwrap_or(0),
-            remaining: count,
+            dtype,
+            cols,
+            chunk,
+            remaining: rows,
         })
     }
 }
 
-/// Matrices of one stacked checkpoint tensor, read in order on demand.
-pub(super) struct Split {
+/// Row chunks of one checkpoint matrix, read in order on demand.
+pub(super) struct Rows {
     file: std::fs::File,
     dtype: DType,
-    shape: [usize; 2],
-    bytes: usize,
+    cols: usize,
+    chunk: usize,
     remaining: usize,
 }
 
-impl Iterator for Split {
+impl Iterator for Rows {
     type Item = Result<Tensor>;
 
     fn next(&mut self) -> Option<Result<Tensor>> {
         if self.remaining == 0 {
             return None;
         }
-        self.remaining -= 1;
-        let mut bytes = vec![0u8; self.bytes];
+        let rows = self.chunk.min(self.remaining);
+        self.remaining -= rows;
+        let mut bytes = vec![0u8; rows * self.cols * self.dtype.size_in_bytes()];
         Some(
             self.file
                 .read_exact(&mut bytes)
@@ -212,7 +254,7 @@ impl Iterator for Split {
                     Ok(Tensor::from_raw_buffer(
                         &bytes,
                         self.dtype,
-                        &self.shape,
+                        &[rows, self.cols],
                         &Device::Cpu,
                     )?)
                 }),

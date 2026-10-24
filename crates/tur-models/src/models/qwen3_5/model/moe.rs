@@ -1,52 +1,38 @@
 //! Qwen3.5 `MoE` feed-forward block: normalized top-k and sigmoid-gated shared expert.
 
-use super::{DenseMlp, Tensors, WeightFormat, f32_on};
-use crate::models::qwen3_5::config::MoeConfig;
-use candle_core::{Device, Tensor, quantized::GgmlDType};
+use super::{DenseMlp, Tensors, f32_on};
+use crate::models::qwen3_5::{calibration::Recorder, config::MoeConfig};
+use candle_core::{Device, Tensor};
 use tur_core::{Result, execution::invalid};
 use tur_metal::packed::PackedLinear;
 
 pub(super) struct Moe {
     router: Tensor,
     shared_gate: Tensor,
-    shared: DenseMlp,
-    gate_up: PackedLinear,
-    down: PackedLinear,
+    pub(super) shared: DenseMlp,
+    pub(super) gate_up: PackedLinear,
+    pub(super) down: PackedLinear,
     settings: MoeConfig,
 }
 
 impl Moe {
+    /// Expert banks are packed one expert at a time: the host never holds a
+    /// full-precision bank.
     pub(super) fn load(
-        tensors: &mut Tensors,
+        tensors: &Tensors,
         prefix: &str,
         settings: MoeConfig,
-        format: WeightFormat,
         device: &Device,
     ) -> Result<Self> {
-        let packed = match format {
-            WeightFormat::F32 => None,
-            WeightFormat::Q8_0 => Some(GgmlDType::Q8_0),
-            WeightFormat::Q4K => Some(GgmlDType::Q4K),
-        };
-        // Experts stream from the checkpoint and pack one at a time: the host never holds
-        // a full-precision bank.
-        let mut bank = |name: &str| {
-            PackedLinear::stacked(
-                tensors.split(&format!("{prefix}.experts.{name}"))?,
-                packed,
-                device,
-            )
-        };
-        let (gate_up, down) = (bank("gate_up_proj")?, bank("down_proj")?);
         Ok(Self {
+            gate_up: tensors.projection(&format!("{prefix}.experts.gate_up_proj"))?,
+            down: tensors.projection(&format!("{prefix}.experts.down_proj"))?,
             router: f32_on(&tensors.take(&format!("{prefix}.gate.weight"))?, device)?,
             shared_gate: f32_on(
                 &tensors.take(&format!("{prefix}.shared_expert_gate.weight"))?,
                 device,
             )?,
-            shared: DenseMlp::load(tensors, &format!("{prefix}.shared_expert"), format, device)?,
-            gate_up,
-            down,
+            shared: DenseMlp::load(tensors, &format!("{prefix}.shared_expert"))?,
             settings,
         })
     }
@@ -63,7 +49,7 @@ impl Moe {
     /// projects all of its tokens at once through only its own rows, in the declared
     /// storage format, and outputs accumulate in expert-ID order. Fused Metal dispatch
     /// never uses this path.
-    pub(super) fn reference(&self, h: &Tensor) -> Result<Tensor> {
+    pub(super) fn reference(&self, h: &Tensor, recorder: Option<&Recorder>) -> Result<Tensor> {
         let logits = h.matmul(&self.router.t()?)?.to_vec2::<f32>()?;
         let width = h.dim(1)?;
         let inner = self.settings.moe_intermediate_size;
@@ -87,11 +73,18 @@ impl Moe {
             let count = tokens.len();
             let ids = Tensor::from_vec(tokens, count, h.device())?;
             let rows = h.index_select(&ids, 0)?;
+            let experts = self.settings.num_experts;
+            if let Some(recorder) = recorder {
+                recorder.record_expert(&self.gate_up, expert, experts, &rows)?;
+            }
             let gate_up = self
                 .gate_up
                 .forward_rows(&rows, expert * 2 * inner, 2 * inner)?;
             let act = (candle_nn::ops::silu(&gate_up.narrow(1, 0, inner)?)?
                 * gate_up.narrow(1, inner, inner)?)?;
+            if let Some(recorder) = recorder {
+                recorder.record_expert(&self.down, expert, experts, &act)?;
+            }
             let scales = Tensor::from_vec(scales, (count, 1), h.device())?;
             let routed = self
                 .down
@@ -99,7 +92,7 @@ impl Moe {
                 .broadcast_mul(&scales)?;
             output = output.index_add(&ids, &routed, 0)?;
         }
-        let shared = self.shared.forward(h)?;
+        let shared = self.shared.forward(h, recorder)?;
         let gate = candle_nn::ops::sigmoid(&h.matmul(&self.shared_gate.t()?)?)?;
         Ok((output + shared.broadcast_mul(&gate)?)?)
     }

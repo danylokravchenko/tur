@@ -86,7 +86,7 @@ fn load_state(
         dir,
         &LoadOptions {
             revision: "small-fixture".into(),
-            format,
+            weights: format.into(),
             device: device.clone(),
             execution,
             kv,
@@ -484,7 +484,7 @@ fn test_execution_selection_and_declared_workspace() -> Result<()> {
         model.config(),
         &LoadOptions {
             revision: "preflight".into(),
-            format: WeightFormat::F32,
+            weights: WeightFormat::F32.into(),
             device: device.clone(),
             execution: Execution::Fused,
             kv: F32_KV,
@@ -529,7 +529,7 @@ fn test_preload_weight_plans_match_every_format_and_tied_embedding_layout() -> R
         for format in [WeightFormat::F32, WeightFormat::Q8_0, WeightFormat::Q4K] {
             let options = LoadOptions {
                 revision: "preflight".into(),
-                format,
+                weights: format.into(),
                 device: Device::Cpu,
                 execution: Execution::Fused,
                 kv: F32_KV,
@@ -859,7 +859,7 @@ fn real(format: WeightFormat, execution: Execution, kv: KvLayout) -> Result<Qwen
         &env_path("TUR_QWEN35_0_8B")?,
         &LoadOptions {
             revision: "Qwen/Qwen3.5-0.8B@2fc06364".into(),
-            format,
+            weights: format.into(),
             device: metal()?,
             execution,
             kv,

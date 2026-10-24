@@ -158,7 +158,7 @@ impl Checkpoint {
         ModelFactory {
             source: ModelSource::LocalPath(self.0.clone()),
             revision: "tiny-adapter-fixture-v1".into(),
-            format: WeightFormat::F32,
+            format: Some(WeightFormat::F32),
             device: Device::Cpu,
             // 16-dimension heads take unscaled formats only.
             kv: KvLayout::new(16, KvFormat::F32),

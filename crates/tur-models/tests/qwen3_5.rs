@@ -207,7 +207,7 @@ fn test_f32_layers_and_logits_match_transformers() -> Result<()> {
         &env_path("TUR_QWEN35_0_8B")?,
         &LoadOptions {
             revision: "Qwen/Qwen3.5-0.8B@2fc06364".into(),
-            format: WeightFormat::F32,
+            weights: WeightFormat::F32.into(),
             device: device()?,
             execution: Execution::Fused,
             // Exact K/V storage: the Transformers reference keeps F32 keys and values.

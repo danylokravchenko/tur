@@ -5,16 +5,20 @@
 //! Packed Qwen3.5/3.8 text execution over explicit hybrid state.
 
 use super::{
-    config::{Config, LayerKind},
+    artifact::{self, Manifest},
+    calibration::{Calibration, Recorder},
+    config::{Config, LayerKind, Projection},
     math::{self, DeltaInputs},
-    weights::{Checkpoint, Split},
+    plan::{self, Embedding, Precision, WeightPlan},
+    quantize::{Packer, STAGING_BYTES},
+    weights::Checkpoint,
 };
 use crate::hybrid::{
     Addresses, Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward,
     SequenceForward, SequenceStep, StatePool,
 };
-use candle_core::{DType, Device, Tensor, quantized::GgmlDType};
-use std::{path::Path, sync::Arc};
+use candle_core::{DType, Device, Tensor};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 use tur_core::{
     Result,
     execution::{KvFormat, KvLayout, ModelDescription, checked_elements, invalid},
@@ -24,6 +28,51 @@ use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
 #[cfg(feature = "metal")]
 mod fused;
 mod moe;
+
+/// Every projection of a model in [`Config::projections`] order, borrowed shared or (with
+/// `mut`) mutably: one traversal serves both.
+macro_rules! projections {
+    ($model:expr $(, $m:tt)?) => {{
+        let model = $model;
+        let mut out = Vec::new();
+        let head = & $($m)? model.lm_head;
+        for layer in & $($m)? model.layers {
+            projections!(@layer out, layer $(, $m)?);
+        }
+        if let Some(mtp) = & $($m)? model.mtp {
+            out.push(& $($m)? mtp.fc);
+            projections!(@layer out, & $($m)? mtp.layer $(, $m)?);
+        }
+        out.push(head);
+        out
+    }};
+    (@layer $out:ident, $layer:expr $(, $m:tt)?) => {{
+        let layer = $layer;
+        match & $($m)? layer.mixer {
+            Mixer::Attention(a) => {
+                $out.push(& $($m)? a.q);
+                $out.push(& $($m)? a.kv);
+                $out.push(& $($m)? a.o);
+            }
+            Mixer::Delta(net) => {
+                $out.push(& $($m)? net.proj);
+                $out.push(& $($m)? net.out);
+            }
+        }
+        match & $($m)? layer.mlp {
+            Mlp::Dense(mlp) => {
+                $out.push(& $($m)? mlp.gate_up);
+                $out.push(& $($m)? mlp.down);
+            }
+            Mlp::Moe(moe) => {
+                $out.push(& $($m)? moe.gate_up);
+                $out.push(& $($m)? moe.down);
+                $out.push(& $($m)? moe.shared.gate_up);
+                $out.push(& $($m)? moe.shared.down);
+            }
+        }
+    }};
+}
 
 /// Storage for projection matrices. Norms, gates, convolution and state stay F32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +104,44 @@ impl WeightFormat {
             Self::F32 => "f32",
             Self::Q8_0 => "q8_0",
             Self::Q4K => "q4k",
+        }
+    }
+}
+
+/// Where projection weights come from and how they are stored.
+#[derive(Clone, Debug)]
+pub enum Weights {
+    /// Convert `SafeTensors` at load time, every projection in one format.
+    Uniform(WeightFormat),
+    /// Convert `SafeTensors` at load time by an explicit plan, rounding to nearest.
+    Plan(Arc<WeightPlan>),
+    /// Upload the directory's prepacked artifact as stored. The manifest, read when the
+    /// load was planned, must still describe the artifact.
+    Prepacked(Arc<Manifest>),
+}
+
+impl From<WeightFormat> for Weights {
+    fn from(format: WeightFormat) -> Self {
+        Self::Uniform(format)
+    }
+}
+
+impl Weights {
+    /// Storage precision of every projection and the embedding.
+    pub fn plan(&self, config: &Config) -> Result<WeightPlan> {
+        match self {
+            Self::Uniform(format) => WeightPlan::uniform(config, *format),
+            Self::Plan(plan) => Ok(plan.as_ref().clone()),
+            Self::Prepacked(manifest) => Ok(manifest.plan.clone()),
+        }
+    }
+
+    /// Weight identity appended to the checkpoint revision.
+    fn tag(&self) -> String {
+        match self {
+            Self::Uniform(format) => format.tag().to_owned(),
+            Self::Plan(plan) => plan.tag(),
+            Self::Prepacked(manifest) => manifest.identity(),
         }
     }
 }
@@ -99,9 +186,9 @@ pub fn parse_recurrent_state(name: &str) -> std::result::Result<DType, String> {
 /// How to place a checkpoint.
 #[derive(Clone, Debug)]
 pub struct LoadOptions {
-    /// Exact checkpoint identity (repository and commit). The weight format is appended.
+    /// Exact checkpoint identity (repository and commit). The weight identity is appended.
     pub revision: String,
-    pub format: WeightFormat,
+    pub weights: Weights,
     pub device: Device,
     pub execution: Execution,
     /// Paged K/V page size and storage format; part of the state identity.
@@ -154,21 +241,10 @@ enum Mlp {
 }
 
 impl DenseMlp {
-    fn load(
-        tensors: &mut Tensors,
-        prefix: &str,
-        format: WeightFormat,
-        device: &Device,
-    ) -> Result<Self> {
-        let gate = tensors.take(&format!("{prefix}.gate_proj.weight"))?;
-        let up = tensors.take(&format!("{prefix}.up_proj.weight"))?;
+    fn load(tensors: &Tensors, prefix: &str) -> Result<Self> {
         Ok(Self {
-            gate_up: linear(&Tensor::cat(&[gate, up], 0)?, format, device)?,
-            down: linear(
-                &tensors.take(&format!("{prefix}.down_proj.weight"))?,
-                format,
-                device,
-            )?,
+            gate_up: tensors.projection(&format!("{prefix}.gate_up_proj"))?,
+            down: tensors.projection(&format!("{prefix}.down_proj"))?,
         })
     }
 
@@ -176,10 +252,16 @@ impl DenseMlp {
         self.gate_up.resident_bytes() + self.down.resident_bytes()
     }
 
-    fn forward(&self, h: &Tensor) -> Result<Tensor> {
+    fn forward(&self, h: &Tensor, recorder: Option<&Recorder>) -> Result<Tensor> {
         let i = self.down.in_features();
+        if let Some(recorder) = recorder {
+            recorder.record(&self.gate_up, h)?;
+        }
         let gate_up = self.gate_up.forward(h)?;
         let act = (candle_nn::ops::silu(&gate_up.narrow(1, 0, i)?)? * gate_up.narrow(1, i, i)?)?;
+        if let Some(recorder) = recorder {
+            recorder.record(&self.down, &act)?;
+        }
         self.down.forward(&act)
     }
 }
@@ -232,10 +314,8 @@ pub struct Qwen35 {
     description: ModelDescription,
     device: Device,
     dims: Dims,
-    embed: Tensor,
+    embed: Embeddings,
     lm_head: PackedLinear,
-    /// The head is the embedding itself (tied F32 weights), not a second copy.
-    shares_embedding: bool,
     norm: Tensor,
     layers: Vec<Layer>,
     mtp: Option<MtpHead>,
@@ -255,6 +335,16 @@ struct MtpHead {
     norm: Tensor,
 }
 
+/// Input embedding storage.
+enum Embeddings {
+    /// A dense F32 or BF16 table.
+    Table(Tensor),
+    /// A packed table, dequantized one gathered row at a time.
+    Packed(PackedLinear),
+    /// Rows of the tied LM head: no second table.
+    Head,
+}
+
 /// One live sequence's rows within the packed hidden states and its resolved state.
 struct Span<'a> {
     start: usize,
@@ -266,34 +356,11 @@ struct Span<'a> {
     sequence: &'a SequenceForward<'a>,
 }
 
-fn linear(weight: &Tensor, format: WeightFormat, device: &Device) -> Result<PackedLinear> {
-    match format {
-        WeightFormat::F32 => PackedLinear::dense(weight, device),
-        WeightFormat::Q8_0 => PackedLinear::quantized(weight, GgmlDType::Q8_0, device),
-        WeightFormat::Q4K => PackedLinear::quantized(weight, GgmlDType::Q4K, device),
-    }
-}
-
-fn load_attention(
-    tensors: &mut Tensors,
-    a: &str,
-    format: WeightFormat,
-    device: &Device,
-) -> Result<Attention> {
-    let k = tensors.take(&format!("{a}.k_proj.weight"))?;
-    let v = tensors.take(&format!("{a}.v_proj.weight"))?;
+fn load_attention(tensors: &Tensors, a: &str, device: &Device) -> Result<Attention> {
     Ok(Attention {
-        q: linear(
-            &tensors.take(&format!("{a}.q_proj.weight"))?,
-            format,
-            device,
-        )?,
-        kv: linear(&Tensor::cat(&[k, v], 0)?, format, device)?,
-        o: linear(
-            &tensors.take(&format!("{a}.o_proj.weight"))?,
-            format,
-            device,
-        )?,
+        q: tensors.projection(&format!("{a}.q_proj"))?,
+        kv: tensors.projection(&format!("{a}.kv_proj"))?,
+        o: tensors.projection(&format!("{a}.o_proj"))?,
         q_norm: centred(&tensors.take(&format!("{a}.q_norm.weight"))?, device)?,
         k_norm: centred(&tensors.take(&format!("{a}.k_norm.weight"))?, device)?,
     })
@@ -308,15 +375,141 @@ fn centred(tensor: &Tensor, device: &Device) -> Result<Tensor> {
     Ok((tensor.to_dtype(DType::F32)? + 1.0)?.to_device(device)?)
 }
 
-struct Tensors(Checkpoint);
+/// Validated weight source of one load: a `SafeTensors` checkpoint converted by a plan,
+/// or a prepacked artifact uploaded as stored.
+struct Tensors {
+    checkpoint: Checkpoint,
+    prepacked: bool,
+    plan: WeightPlan,
+    projections: BTreeMap<String, Projection>,
+    device: Device,
+}
 
 impl Tensors {
-    fn take(&mut self, name: &str) -> Result<Tensor> {
-        self.0.take(name)
+    fn open(dir: &Path, config: &Config, weights: &Weights, device: &Device) -> Result<Self> {
+        let (checkpoint, plan, prepacked) = match weights {
+            Weights::Prepacked(manifest) => {
+                let (checkpoint, found) = artifact::open_for(dir, config)?;
+                if found != **manifest {
+                    return Err(invalid(
+                        "prepacked artifact changed after its load was planned",
+                    ));
+                }
+                (checkpoint, found.plan, true)
+            }
+            weights => {
+                if artifact::is_artifact(dir) {
+                    return Err(invalid(
+                        "directory holds a prepacked artifact; load it as Weights::Prepacked",
+                    ));
+                }
+                let plan = weights.plan(config)?;
+                plan.validate(config)?;
+                (Checkpoint::open(dir, config)?, plan, false)
+            }
+        };
+        Ok(Self {
+            checkpoint,
+            prepacked,
+            plan,
+            projections: config
+                .projections()?
+                .into_iter()
+                .map(|p| (p.name.clone(), p))
+                .collect(),
+            device: device.clone(),
+        })
     }
 
-    fn split(&mut self, name: &str) -> Result<Split> {
-        self.0.take_split(name)
+    /// A small tensor (norm, gate, convolution) on the host in its stored dtype.
+    fn take(&self, name: &str) -> Result<Tensor> {
+        self.checkpoint.take(name)
+    }
+
+    /// Projection `name` on the device in its planned precision.
+    fn projection(&self, name: &str) -> Result<PackedLinear> {
+        let projection = self
+            .projections
+            .get(name)
+            .ok_or_else(|| invalid(format!("model has no projection {name}")))?;
+        let precision = self.plan.precision(name)?;
+        let shape = (projection.rows, projection.cols);
+        if self.prepacked {
+            return self.stored(name, precision, shape);
+        }
+        Packer::RTN
+            .pack(&self.checkpoint, projection, precision)?
+            .upload(precision, shape, &self.device)
+    }
+
+    /// An artifact matrix uploaded exactly as stored; its layout was validated on open.
+    fn stored(
+        &self,
+        name: &str,
+        precision: Precision,
+        shape: (usize, usize),
+    ) -> Result<PackedLinear> {
+        let (entry, bytes) = self.checkpoint.take_raw(name)?;
+        match precision.ggml() {
+            Some(format) => PackedLinear::from_blocks(&bytes, format, shape, &self.device),
+            None => PackedLinear::dense(
+                &Tensor::from_raw_buffer(
+                    &bytes,
+                    entry.candle_dtype(name)?,
+                    &entry.shape,
+                    &Device::Cpu,
+                )?,
+                &self.device,
+            ),
+        }
+    }
+
+    /// The input embedding in its planned storage. Dense tables are filled on the device
+    /// a staging chunk at a time, so the host never holds the whole table.
+    fn embedding(&self, config: &Config) -> Result<Embeddings> {
+        let name = config.embedding_name();
+        let (rows, cols) = (config.vocab_size(), config.hidden_size());
+        let precision = match self.plan.embedding {
+            Embedding::Head => return Ok(Embeddings::Head),
+            Embedding::Table(precision) => precision,
+        };
+        let dtype = match precision {
+            Precision::F32 => DType::F32,
+            Precision::Bf16 => DType::BF16,
+            _ if self.prepacked => {
+                return Ok(Embeddings::Packed(self.stored(
+                    &name,
+                    precision,
+                    (rows, cols),
+                )?));
+            }
+            _ => {
+                let table = Projection {
+                    name: name.clone(),
+                    parts: vec![(name, rows)],
+                    rows,
+                    cols,
+                    experts: 1,
+                };
+                return Ok(Embeddings::Packed(
+                    Packer::RTN
+                        .pack(&self.checkpoint, &table, precision)?
+                        .upload(precision, (rows, cols), &self.device)?,
+                ));
+            }
+        };
+        let table = Tensor::zeros((rows, cols), dtype, &self.device)?;
+        let mut row = 0;
+        for chunk in self
+            .checkpoint
+            .take_rows(&name, (STAGING_BYTES / (cols * 4)).max(1))?
+        {
+            let chunk = chunk?.to_dtype(dtype)?.to_device(&self.device)?;
+            let count = chunk.dim(0)?;
+            table.slice_set(&chunk, 0, row)?;
+            row += count;
+        }
+        Ok(Embeddings::Table(table))
     }
 }
 
@@ -338,61 +531,28 @@ impl Qwen35 {
             config
         };
         let description = config.description(
-            format!("{}#{}", options.revision, options.format.tag()),
+            format!("{}#{}", options.revision, options.weights.tag()),
             options.kv,
             options.recurrent,
         )?;
         description.validate()?;
-        let quant = match options.format {
-            WeightFormat::F32 => None,
-            WeightFormat::Q8_0 => Some(GgmlDType::Q8_0),
-            WeightFormat::Q4K => Some(GgmlDType::Q4K),
-        };
-        let projection_bytes = |shape: &[usize]| -> Result<usize> {
-            let elements = checked_elements(shape)?;
-            if let Some(format) = quant {
-                if shape
-                    .last()
-                    .is_none_or(|width| !width.is_multiple_of(format.block_size()))
-                {
-                    return Err(invalid(
-                        "projection width does not fit its quantization block",
-                    ));
-                }
-                (elements / format.block_size()).checked_mul(format.type_size())
-            } else {
-                elements.checked_mul(4)
-            }
-            .ok_or_else(|| invalid("weight size overflow"))
-        };
-        let mut weights = 0usize;
+        let plan = options.weights.plan(config)?;
+        plan.validate(config)?;
+        let mut weights = plan.bytes(config)?;
+        let mut stacked: std::collections::BTreeSet<String> = config
+            .projections()?
+            .into_iter()
+            .flat_map(|p| p.parts.into_iter().map(|(name, _)| name))
+            .collect();
+        stacked.insert(config.embedding_name());
+        // Every other tensor (norms, convolution, decay, expert routers) stays F32.
         for (name, shape) in config.weight_shapes()? {
-            let embedding = name.ends_with("embed_tokens.weight");
-            // Every other rank-two checkpoint tensor is a projection, including the
-            // in_proj_qkv/z/a/b matrices that are concatenated by the loader.
-            let router = name.ends_with("mlp.gate.weight")
-                || name.ends_with("mlp.shared_expert_gate.weight");
-            let expert = name.ends_with("mlp.experts.gate_up_proj")
-                || name.ends_with("mlp.experts.down_proj");
-            let bytes = if (shape.len() == 2 || expert) && !embedding && !router {
-                projection_bytes(&shape)?
-            } else {
-                let element_bytes = if embedding && quant.is_some() { 2 } else { 4 };
-                checked_elements(&shape)?
-                    .checked_mul(element_bytes)
-                    .ok_or_else(|| invalid("weight size overflow"))?
-            };
-            weights = weights
-                .checked_add(bytes)
-                .ok_or_else(|| invalid("weight total overflow"))?;
-        }
-        if config.tied_embeddings() && quant.is_some() {
-            weights = weights
-                .checked_add(projection_bytes(&[
-                    config.text.vocab_size,
-                    config.text.hidden_size,
-                ])?)
-                .ok_or_else(|| invalid("tied head size overflow"))?;
+            if !stacked.contains(&name) {
+                weights = checked_elements(&shape)?
+                    .checked_mul(4)
+                    .and_then(|bytes| weights.checked_add(bytes))
+                    .ok_or_else(|| invalid("weight total overflow"))?;
+            }
         }
         let scratch = {
             #[cfg(feature = "metal")]
@@ -427,58 +587,39 @@ impl Qwen35 {
                 &std::fs::read_to_string(tokenizer)?,
             )?;
         }
-        let checkpoint = Checkpoint::open(dir, &config)?;
-        let mut tensors = Tensors(checkpoint);
         let device = &options.device;
-        let format = options.format;
+        let tensors = Tensors::open(dir, &config, &options.weights, device)?;
         let dims = Dims::new(&config)?;
         let prefix = config.text_prefix().to_string();
         let mut layers = Vec::with_capacity(config.layer_kinds().len());
         for (i, kind) in config.layer_kinds().iter().enumerate() {
             let p = format!("{prefix}.layers.{i}");
             let mixer = match kind {
-                LayerKind::FullAttention => Mixer::Attention(load_attention(
-                    &mut tensors,
-                    &format!("{p}.self_attn"),
-                    format,
-                    device,
-                )?),
+                LayerKind::FullAttention => {
+                    Mixer::Attention(load_attention(&tensors, &format!("{p}.self_attn"), device)?)
+                }
                 LayerKind::LinearAttention => {
                     let l = format!("{p}.linear_attn");
-                    let parts = ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"]
-                        .iter()
-                        .map(|n| tensors.take(&format!("{l}.{n}.weight")))
-                        .collect::<Result<Vec<_>>>()?;
                     let conv = tensors.take(&format!("{l}.conv1d.weight"))?;
                     let a_log = tensors.take(&format!("{l}.A_log"))?.to_dtype(DType::F32)?;
                     Mixer::Delta(DeltaNet {
-                        proj: linear(&Tensor::cat(&parts, 0)?, format, device)?,
+                        proj: tensors.projection(&format!("{l}.in_proj"))?,
                         conv: f32_on(&conv.squeeze(1)?, device)?,
                         neg_a: a_log.exp()?.neg()?.to_device(device)?,
                         dt_bias: f32_on(&tensors.take(&format!("{l}.dt_bias"))?, device)?,
                         norm: f32_on(&tensors.take(&format!("{l}.norm.weight"))?, device)?,
-                        out: linear(
-                            &tensors.take(&format!("{l}.out_proj.weight"))?,
-                            format,
-                            device,
-                        )?,
+                        out: tensors.projection(&format!("{l}.out_proj"))?,
                     })
                 }
             };
             let mlp = match config.moe {
                 Some(settings) => Mlp::Moe(Box::new(moe::Moe::load(
-                    &mut tensors,
+                    &tensors,
                     &format!("{p}.mlp"),
                     settings,
-                    format,
                     device,
                 )?)),
-                None => Mlp::Dense(DenseMlp::load(
-                    &mut tensors,
-                    &format!("{p}.mlp"),
-                    format,
-                    device,
-                )?),
+                None => Mlp::Dense(DenseMlp::load(&tensors, &format!("{p}.mlp"))?),
             };
             layers.push(Layer {
                 input_norm: centred(
@@ -496,7 +637,7 @@ impl Qwen35 {
         let mtp = if config.mtp() {
             let p = "mtp.layers.0";
             Some(MtpHead {
-                fc: linear(&tensors.take("mtp.fc.weight")?, format, device)?,
+                fc: tensors.projection("mtp.fc")?,
                 embedding_norm: centred(
                     &tensors.take("mtp.pre_fc_norm_embedding.weight")?,
                     device,
@@ -512,37 +653,21 @@ impl Qwen35 {
                         device,
                     )?,
                     mixer: Mixer::Attention(load_attention(
-                        &mut tensors,
+                        &tensors,
                         &format!("{p}.self_attn"),
-                        format,
                         device,
                     )?),
-                    mlp: Mlp::Dense(DenseMlp::load(
-                        &mut tensors,
-                        &format!("{p}.mlp"),
-                        format,
-                        device,
-                    )?),
+                    mlp: Mlp::Dense(DenseMlp::load(&tensors, &format!("{p}.mlp"))?),
                 },
                 norm: centred(&tensors.take("mtp.norm.weight")?, device)?,
             })
         } else {
             None
         };
-        let embed_source = tensors.take(&format!("{prefix}.embed_tokens.weight"))?;
-        // Quantized formats keep the lookup table in BF16; only selected rows become F32.
-        let embed = match format {
-            WeightFormat::F32 => f32_on(&embed_source, device)?,
-            _ => embed_source.to_dtype(DType::BF16)?.to_device(device)?,
-        };
-        let shares_embedding = config.tied_embeddings() && format == WeightFormat::F32;
-        let lm_head = match (config.tied_embeddings(), format) {
-            (true, WeightFormat::F32) => PackedLinear::dense(&embed, device)?,
-            (true, _) => linear(&embed_source, format, device)?,
-            (false, _) => linear(&tensors.take("lm_head.weight")?, format, device)?,
-        };
+        let lm_head = tensors.projection("lm_head")?;
+        let embed = tensors.embedding(&config)?;
         let norm = centred(&tensors.take(&format!("{prefix}.norm.weight"))?, device)?;
-        let revision = format!("{}#{}", options.revision, format.tag());
+        let revision = format!("{}#{}", options.revision, options.weights.tag());
         Self {
             description: config.description(revision, options.kv, options.recurrent)?,
             config,
@@ -550,7 +675,6 @@ impl Qwen35 {
             dims,
             embed,
             lm_head,
-            shares_embedding,
             norm,
             layers,
             mtp,
@@ -588,13 +712,16 @@ impl Qwen35 {
     }
 
     /// Device bytes of every weight: packed projections plus embeddings, norms,
-    /// convolution and gate parameters. A tied F32 head shares the embedding's storage.
+    /// convolution and gate parameters. An embedding gathered from the head adds none.
     pub fn weight_bytes(&self) -> usize {
         let bytes = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
-        let mut total = self.projection_bytes() + bytes(&self.norm);
-        if !self.shares_embedding {
-            total += bytes(&self.embed);
-        }
+        let mut total = self.projection_bytes()
+            + bytes(&self.norm)
+            + match &self.embed {
+                Embeddings::Table(table) => bytes(table),
+                Embeddings::Packed(table) => table.resident_bytes(),
+                Embeddings::Head => 0,
+            };
         if let Some(mtp) = &self.mtp {
             total += bytes(&mtp.embedding_norm) + bytes(&mtp.hidden_norm) + bytes(&mtp.norm);
         }
@@ -658,6 +785,19 @@ impl Qwen35 {
     /// layer (`[tokens, hidden]` each, before the final norm) plus logits for `rows`.
     /// For validation against reference implementations.
     pub fn trace(&self, tokens: &[u32], rows: &[usize]) -> Result<(Vec<Tensor>, Tensor)> {
+        let mut layers = Vec::with_capacity(self.layers.len());
+        let logits = self.single(tokens, rows, Some(&mut layers), None)?;
+        Ok((layers, logits))
+    }
+
+    /// One pass over `tokens` from an empty state in a private pool.
+    fn single(
+        &self,
+        tokens: &[u32],
+        rows: &[usize],
+        trace: Option<&mut Vec<Tensor>>,
+        recorder: Option<&Recorder>,
+    ) -> Result<Tensor> {
         let pool = StatePool::new(
             Arc::new(self.description.clone()),
             &self.device,
@@ -683,13 +823,94 @@ impl Qwen35 {
             pool: &pool,
         };
         let span = self.check(&batch, &sequences[0], 0)?;
-        let mut layers = Vec::with_capacity(self.layers.len());
-        let mut steps = self.run(&batch, &[span], Some(&mut layers))?;
-        let logits = steps
+        let mut steps = self.run(&batch, &[span], trace, recorder)?;
+        steps
             .pop()
             .map(|s| s.logits)
-            .ok_or_else(|| invalid("trace produced no output"))?;
-        Ok((layers, logits))
+            .ok_or_else(|| invalid("pass produced no output"))
+    }
+
+    /// Record every projection's input statistics over `samples`, each run from an empty
+    /// state through the F32 reference operations, with second moments when `hessians`.
+    /// Use F32 weights: statistics describe the unquantized model. The MTP head is not
+    /// run and gets none.
+    pub fn calibrate(&self, samples: &[Vec<u32>], hessians: bool) -> Result<Calibration> {
+        let recorder = Recorder::new(hessians);
+        let mut ids = Vec::new();
+        for sample in samples {
+            self.single(sample, &[], None, Some(&recorder))?;
+            self.device.synchronize()?;
+            ids.extend(sample.iter().flat_map(|t| t.to_le_bytes()));
+        }
+        let names: Vec<String> = self
+            .config
+            .projections()?
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        let named: Vec<(String, &PackedLinear)> =
+            names.into_iter().zip(self.projection_refs()).collect();
+        recorder.finish(
+            &named,
+            samples.len(),
+            samples.iter().map(Vec::len).sum(),
+            plan::fnv1a(&ids),
+        )
+    }
+
+    /// Projection `name`.
+    pub fn projection(&self, name: &str) -> Result<&PackedLinear> {
+        let index = self.projection_index(name)?;
+        self.projection_refs()
+            .into_iter()
+            .nth(index)
+            .ok_or_else(|| invalid("projection list is shorter than the config's"))
+    }
+
+    /// Replace projection `name` with same-shaped `weights`, returning the previous ones;
+    /// e.g. to measure one projection's quantization sensitivity without reloading.
+    pub fn replace_projection(
+        &mut self,
+        name: &str,
+        weights: PackedLinear,
+    ) -> Result<PackedLinear> {
+        let index = self.projection_index(name)?;
+        let slot = self
+            .projection_refs_mut()
+            .into_iter()
+            .nth(index)
+            .ok_or_else(|| invalid("projection list is shorter than the config's"))?;
+        if (slot.out_features(), slot.in_features())
+            != (weights.out_features(), weights.in_features())
+        {
+            return Err(invalid(format!("replacement for {name} has another shape")));
+        }
+        Ok(std::mem::replace(slot, weights))
+    }
+
+    fn projection_index(&self, name: &str) -> Result<usize> {
+        self.config
+            .projections()?
+            .iter()
+            .position(|p| p.name == name)
+            .ok_or_else(|| invalid(format!("model has no projection {name}")))
+    }
+
+    fn projection_refs(&self) -> Vec<&PackedLinear> {
+        projections!(self)
+    }
+
+    fn projection_refs_mut(&mut self) -> Vec<&mut PackedLinear> {
+        projections!(self, mut)
+    }
+
+    /// F32 input embeddings of `ids`.
+    fn embedding(&self, ids: &Tensor) -> Result<Tensor> {
+        Ok(match &self.embed {
+            Embeddings::Table(table) => table.index_select(ids, 0)?.to_dtype(DType::F32)?,
+            Embeddings::Packed(table) => table.rows(ids)?,
+            Embeddings::Head => self.lm_head.rows(ids)?,
+        })
     }
 
     /// Device holding the weights; an engine executing this model must use the same handle.
@@ -752,6 +973,7 @@ impl Qwen35 {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
         a: &Attention,
@@ -760,9 +982,14 @@ impl Qwen35 {
         pool: &StatePool,
         layer: usize,
         spans: &[Span<'_>],
+        recorder: Option<&Recorder>,
     ) -> Result<Tensor> {
         let d = self.dims;
         let n = h.dim(0)?;
+        if let Some(recorder) = recorder {
+            recorder.record(&a.q, h)?;
+            recorder.record(&a.kv, h)?;
+        }
         let q_gate = a.q.forward(h)?.reshape((n, d.heads, 2 * d.head_dim))?;
         let q = q_gate.narrow(2, 0, d.head_dim)?.contiguous()?;
         let gate = q_gate
@@ -802,7 +1029,11 @@ impl Qwen35 {
             )?);
         }
         let attended = Tensor::cat(&outputs, 0)?.reshape((n, d.heads * d.head_dim))?;
-        a.o.forward(&(attended * candle_nn::ops::sigmoid(&gate)?)?)
+        let gated = (attended * candle_nn::ops::sigmoid(&gate)?)?;
+        if let Some(recorder) = recorder {
+            recorder.record(&a.o, &gated)?;
+        }
+        a.o.forward(&gated)
     }
 
     fn delta(
@@ -812,9 +1043,13 @@ impl Qwen35 {
         pool: &StatePool,
         layer: usize,
         spans: &[Span<'_>],
+        recorder: Option<&Recorder>,
     ) -> Result<Tensor> {
         let d = self.dims;
         let n = h.dim(0)?;
+        if let Some(recorder) = recorder {
+            recorder.record(&net.proj, h)?;
+        }
         let proj = net.proj.forward(h)?;
         let qkv = proj.narrow(1, 0, d.channels)?;
         let z = proj.narrow(1, d.channels, d.value_width)?.contiguous()?;
@@ -870,22 +1105,28 @@ impl Qwen35 {
         }
         let rows = n * d.value_heads;
         let core = Tensor::cat(&outputs, 0)?.reshape((rows, d.value_dim))?;
-        let gated = math::gated_rms(&core, &z.reshape((rows, d.value_dim))?, &net.norm, d.eps)?;
-        net.out.forward(&gated.reshape((n, d.value_width))?)
+        let gated = math::gated_rms(&core, &z.reshape((rows, d.value_dim))?, &net.norm, d.eps)?
+            .reshape((n, d.value_width))?;
+        if let Some(recorder) = recorder {
+            recorder.record(&net.out, &gated)?;
+        }
+        net.out.forward(&gated)
     }
 
-    fn mlp(layer: &Layer, h: &Tensor) -> Result<Tensor> {
+    fn mlp(layer: &Layer, h: &Tensor, recorder: Option<&Recorder>) -> Result<Tensor> {
         match &layer.mlp {
-            Mlp::Dense(mlp) => mlp.forward(h),
-            Mlp::Moe(moe) => moe.reference(h),
+            Mlp::Dense(mlp) => mlp.forward(h, recorder),
+            Mlp::Moe(moe) => moe.reference(h, recorder),
         }
     }
 
+    /// Execute live spans. Recording calibration statistics always uses the reference.
     fn run(
         &self,
         batch: &PackedForward<'_>,
         spans: &[Span<'_>],
         trace: Option<&mut Vec<Tensor>>,
+        recorder: Option<&Recorder>,
     ) -> Result<Vec<SequenceStep>> {
         let mut ids = Vec::new();
         let mut positions = Vec::new();
@@ -923,11 +1164,11 @@ impl Qwen35 {
         };
         #[cfg(feature = "metal")]
         let (logits, hidden) = match &self.fused {
-            Some(fused) => self.run_fused(fused, &pass, trace)?,
-            None => self.run_reference(&pass, trace)?,
+            Some(fused) if recorder.is_none() => self.run_fused(fused, &pass, trace)?,
+            _ => self.run_reference(&pass, trace, recorder)?,
         };
         #[cfg(not(feature = "metal"))]
-        let (logits, hidden) = self.run_reference(&pass, trace)?;
+        let (logits, hidden) = self.run_reference(&pass, trace, recorder)?;
         let mut offset = 0;
         let mut steps = Vec::with_capacity(spans.len());
         for span in spans {
@@ -950,24 +1191,30 @@ impl Qwen35 {
         &self,
         pass: &Pass<'_, '_>,
         mut trace: Option<&mut Vec<Tensor>>,
+        recorder: Option<&Recorder>,
     ) -> Result<(Tensor, Option<Tensor>)> {
         let d = self.dims;
         let spans = pass.spans;
         let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
-        let mut x = self.embed.index_select(&ids, 0)?.to_dtype(DType::F32)?;
+        let mut x = self.embedding(&ids)?;
         let rotary = math::rotary_tables(&pass.positions, d.rotary_dim, d.theta, &self.device)?;
         for (index, layer) in self.layers.iter().enumerate() {
             let h = math::rms(&x, &layer.input_norm, d.eps)?;
             let mixed = match &layer.mixer {
-                Mixer::Attention(a) => self.attention(a, &h, &rotary, pass.pool, index, spans)?,
-                Mixer::Delta(net) => self.delta(net, &h, pass.pool, index, spans)?,
+                Mixer::Attention(a) => {
+                    self.attention(a, &h, &rotary, pass.pool, index, spans, recorder)?
+                }
+                Mixer::Delta(net) => self.delta(net, &h, pass.pool, index, spans, recorder)?,
             };
             x = (x + mixed)?;
             let h = math::rms(&x, &layer.post_norm, d.eps)?;
-            x = (&x + Self::mlp(layer, &h)?)?;
+            x = (&x + Self::mlp(layer, &h, recorder)?)?;
             if let Some(trace) = trace.as_mut() {
                 trace.push(x.clone());
             }
+        }
+        if let Some(recorder) = recorder {
+            recorder.record(&self.lm_head, &math::rms(&x, &self.norm, d.eps)?)?;
         }
         let hidden = pass
             .hidden
@@ -1032,7 +1279,7 @@ impl Qwen35 {
     ) -> Result<Tensor> {
         let d = self.dims;
         let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
-        let embedded = self.embed.index_select(&ids, 0)?.to_dtype(DType::F32)?;
+        let embedded = self.embedding(&ids)?;
         let joined = Tensor::cat(
             &[
                 math::rms(&embedded, &mtp.embedding_norm, d.eps)?,
@@ -1046,9 +1293,17 @@ impl Qwen35 {
         };
         let rotary = math::rotary_tables(&pass.positions, d.rotary_dim, d.theta, &self.device)?;
         let h = math::rms(&x, &mtp.layer.input_norm, d.eps)?;
-        x = (x + self.attention(a, &h, &rotary, pass.pool, self.layers.len(), pass.spans)?)?;
+        x = (x + self.attention(
+            a,
+            &h,
+            &rotary,
+            pass.pool,
+            self.layers.len(),
+            pass.spans,
+            None,
+        )?)?;
         let h = math::rms(&x, &mtp.layer.post_norm, d.eps)?;
-        x = (&x + Self::mlp(&mtp.layer, &h)?)?;
+        x = (&x + Self::mlp(&mtp.layer, &h, None)?)?;
         let index = Tensor::new(pass.rows.as_slice(), &self.device)?;
         self.lm_head
             .forward(&math::rms(&x.index_select(&index, 0)?, &mtp.norm, d.eps)?)
@@ -1113,7 +1368,7 @@ impl HybridModel for Qwen35 {
             }
         }
         if !spans.is_empty() {
-            for (index, step) in live.into_iter().zip(self.run(batch, &spans, None)?) {
+            for (index, step) in live.into_iter().zip(self.run(batch, &spans, None, None)?) {
                 results[index] = Some(Ok(step));
             }
         }

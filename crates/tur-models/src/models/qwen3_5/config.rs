@@ -11,6 +11,44 @@ use tur_core::{
     },
 };
 
+/// One loaded projection: checkpoint matrices stacked along output rows into the matrix
+/// the model multiplies by. Names are stable keys for weight plans, calibration
+/// statistics and prepacked artifacts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Projection {
+    /// Checkpoint module path of the loaded matrix, e.g. `….layers.0.self_attn.kv_proj`.
+    pub name: String,
+    /// Checkpoint tensors in stacking order, with the output rows each contributes.
+    pub parts: Vec<(String, usize)>,
+    pub rows: usize,
+    pub cols: usize,
+    /// Experts of a stacked expert bank, each owning `rows / experts` rows; 1 otherwise.
+    pub experts: usize,
+}
+
+impl Projection {
+    fn new(name: String, parts: Vec<(String, usize)>, cols: usize) -> Self {
+        let rows = parts.iter().map(|(_, rows)| rows).sum();
+        Self {
+            name,
+            parts,
+            rows,
+            cols,
+            experts: 1,
+        }
+    }
+
+    fn bank(name: String, experts: usize, rows: usize, cols: usize) -> Self {
+        Self {
+            parts: vec![(name.clone(), experts * rows)],
+            name,
+            rows: experts * rows,
+            cols,
+            experts,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum LayerKind {
@@ -346,6 +384,11 @@ impl Config {
     /// Exclusive text positional limit.
     pub fn max_position(&self) -> usize {
         self.text.max_position_embeddings
+    }
+
+    /// Residual stream width.
+    pub fn hidden_size(&self) -> usize {
+        self.text.hidden_size
     }
 
     /// Padded projection vocabulary size (may exceed tokenizer vocabulary).
@@ -700,12 +743,138 @@ impl Config {
         Ok(shapes)
     }
 
+    /// Every projection the model multiplies by, in load order: each layer's mixer then
+    /// feed-forward projections, the MTP head's when loaded, then the LM head (stacked
+    /// from the embedding when tied).
+    pub fn projections(&self) -> Result<Vec<Projection>> {
+        let t = &self.text;
+        let hidden = t.hidden_size;
+        let query = checked_elements(&[t.num_attention_heads, t.head_dim])?;
+        let kv = checked_elements(&[t.num_key_value_heads, t.head_dim])?;
+        let part = |name: String, rows: usize| (format!("{name}.weight"), rows);
+        let attention = |prefix: &str| {
+            let a = format!("{prefix}.self_attn");
+            vec![
+                Projection::new(
+                    format!("{a}.q_proj"),
+                    vec![part(format!("{a}.q_proj"), 2 * query)],
+                    hidden,
+                ),
+                Projection::new(
+                    format!("{a}.kv_proj"),
+                    vec![
+                        part(format!("{a}.k_proj"), kv),
+                        part(format!("{a}.v_proj"), kv),
+                    ],
+                    hidden,
+                ),
+                Projection::new(
+                    format!("{a}.o_proj"),
+                    vec![part(format!("{a}.o_proj"), hidden)],
+                    query,
+                ),
+            ]
+        };
+        let dense = |m: String, inner: usize| {
+            vec![
+                Projection::new(
+                    format!("{m}.gate_up_proj"),
+                    vec![
+                        part(format!("{m}.gate_proj"), inner),
+                        part(format!("{m}.up_proj"), inner),
+                    ],
+                    hidden,
+                ),
+                Projection::new(
+                    format!("{m}.down_proj"),
+                    vec![part(format!("{m}.down_proj"), hidden)],
+                    inner,
+                ),
+            ]
+        };
+        let mut projections = Vec::new();
+        for (i, kind) in t.layer_types.iter().enumerate() {
+            let layer = format!("{}.layers.{i}", self.prefix);
+            match kind {
+                LayerKind::FullAttention => projections.extend(attention(&layer)),
+                LayerKind::LinearAttention => {
+                    let l = format!("{layer}.linear_attn");
+                    let heads = t.linear_num_value_heads;
+                    projections.push(Projection::new(
+                        format!("{l}.in_proj"),
+                        vec![
+                            part(format!("{l}.in_proj_qkv"), self.conv_channels()?),
+                            part(format!("{l}.in_proj_z"), self.value_width()?),
+                            part(format!("{l}.in_proj_b"), heads),
+                            part(format!("{l}.in_proj_a"), heads),
+                        ],
+                        hidden,
+                    ));
+                    projections.push(Projection::new(
+                        format!("{l}.out_proj"),
+                        vec![part(format!("{l}.out_proj"), hidden)],
+                        self.value_width()?,
+                    ));
+                }
+            }
+            match &self.moe {
+                Some(moe) => {
+                    let e = format!("{layer}.mlp.experts");
+                    let inner = moe.moe_intermediate_size;
+                    projections.push(Projection::bank(
+                        format!("{e}.gate_up_proj"),
+                        moe.num_experts,
+                        checked_elements(&[2, inner])?,
+                        hidden,
+                    ));
+                    projections.push(Projection::bank(
+                        format!("{e}.down_proj"),
+                        moe.num_experts,
+                        hidden,
+                        inner,
+                    ));
+                    projections.extend(dense(
+                        format!("{layer}.mlp.shared_expert"),
+                        moe.shared_expert_intermediate_size,
+                    ));
+                }
+                None => projections.extend(dense(format!("{layer}.mlp"), t.intermediate_size)),
+            }
+        }
+        if self.mtp {
+            projections.push(Projection::new(
+                "mtp.fc".into(),
+                vec![part("mtp.fc".into(), hidden)],
+                checked_elements(&[2, hidden])?,
+            ));
+            projections.extend(attention("mtp.layers.0"));
+            projections.extend(dense("mtp.layers.0.mlp".into(), t.intermediate_size));
+        }
+        let head = if t.tie_word_embeddings {
+            self.embedding_name()
+        } else {
+            "lm_head.weight".into()
+        };
+        projections.push(Projection::new(
+            "lm_head".into(),
+            vec![(head, t.vocab_size)],
+            hidden,
+        ));
+        Ok(projections)
+    }
+
+    /// Checkpoint name of the input embedding table.
+    pub fn embedding_name(&self) -> String {
+        format!("{}.embed_tokens.weight", self.prefix)
+    }
+
     /// Checkpoint name prefix owned by the text tower; other prefixes are ignored.
     pub(super) fn text_prefix(&self) -> &str {
         &self.prefix
     }
 
-    pub(super) fn tied_embeddings(&self) -> bool {
+    /// Whether the LM head reuses the input embedding matrix.
+    pub fn tied_embeddings(&self) -> bool {
         self.text.tie_word_embeddings
     }
 }
@@ -791,6 +960,49 @@ mod tests {
                 .ok_or_else(|| invalid(format!("missing {name}")))?;
             let actual: Vec<usize> = serde_json::from_value(header["shape"].clone())?;
             assert_eq!(&actual, shape, "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_projections_cover_every_matrix_once_with_matching_shapes() -> Result<()> {
+        let moe = include_str!("../../../../../docs/references/p8/qwen3.6-config.json");
+        for (json, mtp) in [(SMALL, true), (FLAGSHIP, false), (moe, false)] {
+            let mut config = Config::from_json(json)?;
+            if mtp && config.supports_mtp() {
+                config = config.with_mtp()?;
+            }
+            let shapes = config.weight_shapes()?;
+            let mut seen = std::collections::BTreeSet::new();
+            for projection in config.projections()? {
+                let mut rows = 0;
+                for (name, part_rows) in &projection.parts {
+                    let shape = shapes
+                        .get(name)
+                        .ok_or_else(|| invalid(format!("{name} is not a checkpoint tensor")))?;
+                    let (part, cols) = match shape.as_slice() {
+                        [r, c] => (*r, *c),
+                        [e, r, c] => (e * r, *c),
+                        _ => return Err(invalid(format!("{name} is not a matrix"))),
+                    };
+                    assert_eq!((part, cols), (*part_rows, projection.cols), "{name}");
+                    rows += part;
+                    assert!(seen.insert(name.clone()) || config.tied_embeddings());
+                }
+                assert_eq!(rows, projection.rows);
+                assert!(projection.rows.is_multiple_of(projection.experts));
+            }
+            // Everything else is a vector, a convolution, a router or the embedding.
+            for (name, shape) in &shapes {
+                if !seen.contains(name) {
+                    assert!(
+                        shape.len() != 2
+                            || name.ends_with("embed_tokens.weight")
+                            || name.ends_with("gate.weight"),
+                        "{name} {shape:?}"
+                    );
+                }
+            }
         }
         Ok(())
     }

@@ -28,7 +28,7 @@ fn load(path: &Path, device: &Device, format: WeightFormat) -> Result<Qwen35> {
         path,
         &LoadOptions {
             revision: "moe-fixture-v1".into(),
-            format,
+            weights: format.into(),
             device: device.clone(),
             execution: Execution::Fused,
             kv: KvLayout::new(16, KvFormat::F32),
@@ -164,7 +164,7 @@ fn test_moe_fused_packed_prefill_decode_and_rollback_match_reference() -> Result
             fused.config(),
             &LoadOptions {
                 revision: "plan".into(),
-                format,
+                weights: format.into(),
                 device: Device::Cpu,
                 execution: Execution::Reference,
                 kv: KvLayout::new(16, KvFormat::F32),

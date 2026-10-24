@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 //! Revision-pinned checkpoint loading for the hybrid text model.
 
-use std::path::{Component, Path, PathBuf};
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 use candle_core::Device;
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
@@ -11,7 +14,10 @@ use tur_core::execution::KvLayout;
 use crate::{
     Result, TurError,
     backend::chat_template::ChatTemplate,
-    models::qwen3_5::{Config, Execution, GenerationDefaults, LoadOptions, Qwen35, WeightFormat},
+    models::qwen3_5::{
+        Config, Execution, GenerationDefaults, LoadOptions, Manifest, Qwen35, WeightFormat,
+        Weights, is_artifact,
+    },
 };
 
 /// A local `SafeTensors` directory or a fully qualified Hugging Face repository.
@@ -27,7 +33,9 @@ pub struct ModelFactory {
     pub source: ModelSource,
     /// Immutable commit for remote sources; a caller-provided identity for local weights.
     pub revision: String,
-    pub format: WeightFormat,
+    /// Convert `SafeTensors` projections into this format. `None` loads the checkpoint's
+    /// prepacked artifact when it has one and converts to `Q8_0` otherwise.
+    pub format: Option<WeightFormat>,
     pub device: Device,
     /// Paged K/V page size and storage format.
     pub kv: KvLayout,
@@ -109,7 +117,8 @@ impl ModelFactory {
 
     /// Load the text model and serving metadata. Missing or invalid templates are errors.
     /// `Q8_0/Q4K` explicitly convert `SafeTensors` matrices into packed resident weights;
-    /// legacy ordinary-attention GGUF checkpoints are unsupported.
+    /// a prepacked artifact is uploaded as stored. Legacy ordinary-attention GGUF
+    /// checkpoints are unsupported.
     pub fn create_model(&self) -> Result<(Qwen35, Tokenizer, ChatTemplate, GenerationDefaults)> {
         let (model, tokenizer, template, defaults, ()) = self.create_model_with(|_, _| Ok(()))?;
         Ok((model, tokenizer, template, defaults))
@@ -159,6 +168,16 @@ impl ModelFactory {
             }
         }
         let template = ChatTemplate::from_model_dir(&dir)?;
+        let weights = match (self.format, is_artifact(&dir)) {
+            (None, true) => Weights::Prepacked(Arc::new(Manifest::read(&dir)?)),
+            (None, false) => WeightFormat::Q8_0.into(),
+            (Some(_), true) => {
+                return Err(TurError::Other(
+                    "checkpoint is a prepacked artifact; omit the weight format".into(),
+                ));
+            }
+            (Some(format), false) => format.into(),
+        };
         let options = LoadOptions {
             revision: match &self.source {
                 ModelSource::HuggingFace(id) => format!("{id}@{}", self.revision),
@@ -166,7 +185,7 @@ impl ModelFactory {
                     format!("{}@{}", path.canonicalize()?.display(), self.revision)
                 }
             },
-            format: self.format,
+            weights,
             device: self.device.clone(),
             execution: Execution::Fused,
             kv: self.kv,
@@ -202,7 +221,7 @@ mod tests {
         let factory = ModelFactory {
             source: ModelSource::HuggingFace("Qwen/Qwen3.5-0.8B".into()),
             revision: "main".into(),
-            format: WeightFormat::F32,
+            format: Some(WeightFormat::F32),
             device: Device::Cpu,
             kv: crate::models::qwen3_5::DEFAULT_KV_LAYOUT,
             recurrent: crate::models::qwen3_5::DEFAULT_RECURRENT_STATE,

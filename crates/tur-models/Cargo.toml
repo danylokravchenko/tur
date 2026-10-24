@@ -20,6 +20,10 @@ minijinja.workspace = true
 hf-hub.workspace = true
 safetensors.workspace = true
 
+[[example]]
+name = "load_weights"
+required-features = ["metal"]
+
 [features]
 default = ["metal"]
 metal = ["candle-core/metal", "candle-nn/metal", "tur-core/metal", "tur-metal/metal"]

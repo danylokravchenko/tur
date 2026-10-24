@@ -39,8 +39,10 @@ struct Args {
     #[arg(long)]
     revision: String,
     /// Explicit `SafeTensors` conversion to f32, `q8_0` or q4k resident projections.
-    #[arg(long, default_value = "q8_0")]
-    weight_format: WeightFormat,
+    /// Omitted, a prepacked artifact (`tur-quantize`) loads as stored and any other
+    /// checkpoint converts to `q8_0`.
+    #[arg(long)]
+    weight_format: Option<WeightFormat>,
     /// Model ID accepted by /v1/chat/completions and listed by /v1/models.
     #[arg(long, default_value = "qwen-hybrid")]
     served_model_name: String,

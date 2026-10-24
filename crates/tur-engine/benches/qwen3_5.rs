@@ -10,13 +10,17 @@
 //! device completion.
 //!
 //! `TUR_QWEN35_0_8B=<snapshot> cargo bench --offline -p tur-engine --bench qwen3_5 > out.json`
-//! narrows with `TUR_BENCH_FORMATS=q8_0,q4k`, `TUR_BENCH_KV=f32,q8`, `TUR_BENCH_PAGES=16,64`,
+//! narrows with `TUR_BENCH_FORMATS=q8_0,q4k` (entries may also be prepacked artifact directories), `TUR_BENCH_KV=f32,q8`, `TUR_BENCH_PAGES=16,64`,
 //! `TUR_BENCH_PREFILL=128,2048` and `TUR_BENCH_CONTEXTS=2048,8192`. `TUR_BENCH_REFERENCE=1`
 //! adds the F32 reference execution with F32 K/V.
 
 use candle_core::Device;
 use serde_json::{Value, json};
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 use tur_core::{
     Result, TurError,
     execution::{KvFormat, KvLayout, PackedExecution, SequenceDescriptor, invalid},
@@ -26,7 +30,8 @@ use tur_engine::hybrid::{
     SamplingOptions, SequenceForward, StatePool,
 };
 use tur_models::models::qwen3_5::{
-    Execution, LoadOptions, Qwen35, WeightFormat, parse_recurrent_state,
+    Execution, LoadOptions, Manifest, Qwen35, WeightFormat, Weights, is_artifact,
+    parse_recurrent_state,
 };
 
 const SHORT_CONTEXT: usize = 128;
@@ -284,7 +289,14 @@ fn main() -> Result<()> {
     let reference = std::env::var("TUR_BENCH_REFERENCE").is_ok_and(|v| v == "1");
     let mut runs = Vec::new();
     for name in env_list("TUR_BENCH_FORMATS", "q8_0,q4k") {
-        let format: WeightFormat = name.parse().map_err(TurError::Other)?;
+        let (source, weights) = if is_artifact(Path::new(&name)) {
+            let source = PathBuf::from(&name);
+            let manifest = Manifest::read(&source)?;
+            (source, Weights::Prepacked(Arc::new(manifest)))
+        } else {
+            let format: WeightFormat = name.parse().map_err(TurError::Other)?;
+            (dir.clone(), format.into())
+        };
         for kv in env_list("TUR_BENCH_KV", "f32,f16,q8") {
             let kv: KvFormat = kv.parse().map_err(TurError::Other)?;
             for state in env_list("TUR_BENCH_STATE", "f32") {
@@ -292,10 +304,10 @@ fn main() -> Result<()> {
                 for &page in &pages {
                     let load_start = Instant::now();
                     let model = Qwen35::load(
-                        &dir,
+                        &source,
                         &LoadOptions {
                             revision: "Qwen/Qwen3.5-0.8B@2fc06364".into(),
-                            format,
+                            weights: weights.clone(),
                             device: device.clone(),
                             execution: Execution::Fused,
                             kv: KvLayout::new(page, kv),

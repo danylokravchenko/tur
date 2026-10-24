@@ -129,7 +129,7 @@ impl Qwen35 {
             None
         };
         let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
-        let mut x = self.embed.index_select(&ids, 0)?.to_dtype(DType::F32)?;
+        let mut x = self.embedding(&ids)?;
         let first = self
             .layers
             .first()
@@ -197,7 +197,7 @@ impl Qwen35 {
             .map_err(|_| invalid("position exceeds u32"))?;
         let positions = Tensor::new(positions.as_slice(), &self.device)?;
         let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
-        let embedded = self.embed.index_select(&ids, 0)?.to_dtype(DType::F32)?;
+        let embedded = self.embedding(&ids)?;
         let joined = Tensor::cat(
             &[
                 k.rms_norm(&embedded, &mtp.embedding_norm, d.eps)?,

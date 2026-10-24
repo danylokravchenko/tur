@@ -32,8 +32,10 @@ struct Args {
     #[arg(long)]
     revision: String,
     /// Convert `SafeTensors` projections into this resident format: f32, `q8_0`, q4k.
-    #[arg(long, default_value = "q8_0")]
-    weight_format: WeightFormat,
+    /// Omitted, a prepacked artifact (`tur-quantize`) loads as stored and any other
+    /// checkpoint converts to `q8_0`.
+    #[arg(long)]
+    weight_format: Option<WeightFormat>,
     #[arg(long, default_value = "Who are you?")]
     prompt: String,
     #[arg(short = 'n', long, default_value_t = 128)]

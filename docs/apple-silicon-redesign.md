@@ -30,6 +30,17 @@ its scratch by 98% with no model-level speed change. TensorOps run on the M1 wit
 unsafe bindings but only match Candle's F32 GEMM. MoE and F16/BF16 items are deferred.
 See the [P10 report](apple-silicon-p10-kernels.md).
 
+P11 ran on 2026-10-24, on the M1 and the 0.8B checkpoint only. A new offline tool,
+`tur-quantize`, writes versioned prepacked artifacts that load byte-identical to load-time
+conversion, validated before any payload is read: Q4K loads in 0.2 s instead of 9 s with
+half the peak RSS. Gathering a tied checkpoint's embedding from the packed head cuts Q4K
+resident weights from 933 to 425 MB at unchanged quality. At equal bytes, GPTQ cuts Q4K's
+KL from F32 by 49–59% on held-out prose, code and retrieval text and 12% on tool/JSON
+text; a 5.5-bit mixed Q4K/`Q8_0` plan halves it again for +23% bytes. Speed is unchanged
+at equal formats. Q5K/Q6K lack small-batch kernels and stay out of projections, and
+calibration does not yet scale to the flagship on these Macs. See the
+[P11 report](apple-silicon-p11-weights.md).
+
 Post-P8 roadmap added on 2026-10-23: P9 establishes a fresh comparative baseline;
 P10–P15 evaluate kernel, quantization, execution, speculation and prefix-scheduling
 improvements; production release moves from P9 to P16. These packages are planned,
@@ -528,6 +539,9 @@ capability/dispatch table and rejected variants. References:
 
 ### P11 — Calibrated weights and bounded loading
 
+Measured on the M1 and 0.8B checkpoint (2026-10-24); results, rejected options and the
+remaining flagship limits are in the [P11 report](apple-silicon-p11-weights.md).
+
 Depends on P9; coordinate execution formats with P10. Extend existing checkpoint and
 packed-weight machinery rather than introducing a competing loader or weight hierarchy.
 
@@ -693,7 +707,7 @@ and ordinary decoding separately. No improvement remains a possible experiment o
 | P10–P13 combined, ordinary M1 decode | Aim for 1.05–1.15× tokens/s in selected beneficial regimes | Engineering target; weight/state bandwidth and already-small host scheduling costs limit general gains. Batch-1 improvement may be negligible |
 | P12 low-bit KV versus Q8 group 32 | Roughly 1.7–2.4× smaller **KV storage**, subject to measured metadata/padding | Q8 uses 8.5 bits/value including one F16 scale per 32 values. Illustrative 5–3.5 effective-bit candidates give this range; formats and quality still need validation |
 | P12 F16 recurrent matrices versus F32 | 2× smaller matrix payload; less than 2× smaller total recurrent state | Already available in P6, not a new gain. Historical serving throughput improved only 4–5% at concurrency 8–16; long-context quality and speculative compatibility remain constraints |
-| P11 calibrated weights | Better quality at equal bytes, or fewer bytes at equal quality; no fixed speedup forecast | Same-bit calibration may change no runtime cost. Lower precision helps only if corresponding kernels win and sensitive tensors retain adequate precision |
+| P11 calibrated weights | Better quality at equal bytes, or fewer bytes at equal quality; no fixed speedup forecast | Same-bit calibration may change no runtime cost. Lower precision helps only if corresponding kernels win and sensitive tensors retain adequate precision. **Measured 2026-10-24 (0.8B, M1): GPTQ halved Q4K's KL at equal bytes with unchanged speed; the tied-head embedding cut Q4K weights 2.2× at equal quality** |
 | P14 learned/confidence speculation, novel text at low concurrency | Exploratory goal: 1.20–1.50× tokens/s over the best applicable P8 policy | Low confidence until a compatible drafter and total cost are measured. At high concurrency the desired result may simply be neutral fallback |
 | P15 prefix-aware scheduling | Lower TTFT and fewer recomputed tokens on reuse-heavy traffic; no universal multiplier | P7 already captures large prefix wins. Additional benefit depends on hit rate, queue contention and snapshot memory; no gain is expected with no reuse |
 | Metal TensorOps on newer Macs; full flagship MoE | No numerical forecast yet | Requires same-device before/after measurements and real checkpoint execution. Changing hardware is not a software speedup |

@@ -11,6 +11,8 @@
 //! `cargo bench --offline -p tur-metal --bench kernels > out.json`
 //! `TUR_BENCH_ONLY=delta|linear|paged|tiled|sample|moe` restricts the run to one group;
 //! `TUR_BENCH_MOE=q8_0,q4k,f32` selects expert weight formats.
+//! `TUR_BENCH_LINEAR=q8_0,q4k,q5k,q6k` selects projection formats (default `q8_0,q4k`);
+//! Q5K and Q6K have no Tur kernels and measure Candle's only.
 //! `TUR_BENCH_SHAPE=<substring>` selects tiled attention shapes for focused tuning.
 
 use candle_core::{D, DType, Device, Tensor, quantized::GgmlDType};
@@ -148,29 +150,45 @@ fn gemv_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
         qmm_q4k_rows: (1, 16),
         ..kernels.tuning()
     })?;
+    let formats = std::env::var("TUR_BENCH_LINEAR")
+        .unwrap_or_else(|_| "q8_0,q4k".into())
+        .split(',')
+        .map(|name| match name {
+            "q8_0" => Ok(GgmlDType::Q8_0),
+            "q4k" => Ok(GgmlDType::Q4K),
+            "q5k" => Ok(GgmlDType::Q5K),
+            "q6k" => Ok(GgmlDType::Q6K),
+            _ => Err(tur_core::execution::invalid(format!(
+                "unknown format {name}"
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut cases = Vec::new();
     for (label, n, k) in shapes {
         let weight = random(&Device::Cpu, &[n, k], 1, 0.05)?;
-        for format in [GgmlDType::Q8_0, GgmlDType::Q4K] {
+        for &format in &formats {
             let layer = PackedLinear::quantized(&weight, format, device)?;
+            let tur = matches!(format, GgmlDType::Q8_0 | GgmlDType::Q4K);
             for rows in [1usize, 2, 3, 4, 5, 6, 7, 8, 16, 128] {
                 let x = random(device, &[rows, k], 2, 1.0)?;
                 let existing = time(device, || layer.forward(&x))?;
+                let seconds = existing["median_seconds"].as_f64().unwrap_or(f64::INFINITY);
                 let mut case = json!({
                     "operation": "packed_linear", "shape": label, "out": n, "in": k,
                     "format": format!("{format:?}"), "rows": rows,
                     "weight_bytes": layer.resident_bytes(),
                     "candle": existing,
+                    "candle_weight_gb_per_s": layer.resident_bytes() as f64 / seconds / 1e9,
                     "candle_kernel": if rows == 1 { "mul_mv" } else { "mul_mm (F16 tiles)" },
                 });
-                if rows <= 16 {
+                if tur && rows <= 16 {
                     let custom = time(device, || qmm.linear(&layer, &x))?;
                     let seconds = custom["median_seconds"].as_f64().unwrap_or(f64::INFINITY);
                     case["tur_qmm"] = custom;
                     case["tur_qmm_weight_gb_per_s"] =
                         json!(layer.resident_bytes() as f64 / seconds / 1e9);
                 }
-                if rows <= 8 {
+                if tur && rows <= 8 {
                     // Force the GEMV for every measured row count, whatever the dispatch range.
                     let custom = time(device, || gemv.linear(&layer, &x))?;
                     let seconds = custom["median_seconds"].as_f64().unwrap_or(f64::INFINITY);

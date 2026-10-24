@@ -1,0 +1,333 @@
+{
+  "schema_version": 2,
+  "checkpoint": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
+  "weights": "q8_0 unless a result names other weights",
+  "reference_weights": "f32",
+  "reference_weight_bytes": 3009572096,
+  "reference_kv": "f32",
+  "reference_state": "f32",
+  "page_tokens": 16,
+  "text": "heldout-prose.txt",
+  "text_bytes": 96386,
+  "evaluated_positions": 8192,
+  "chunk": 256,
+  "metric": "teacher-forced next-token distributions; KL(F32 reference || variant) in nats",
+  "results": [
+    {
+      "kv_format": "f32",
+      "recurrent_state": "f32",
+      "weights": "/private/tmp/claude-501/-Users-danylokravchenko-Projects-tur/1ff0edc8-0135-409d-9275-c78d20170531/scratchpad/art/q4k-rtn",
+      "weight_bytes": 424934656,
+      "all": {
+        "positions": [
+          0,
+          8192
+        ],
+        "count": 8192,
+        "mean_kl": 0.14130944047856386,
+        "max_kl": 2.18497896194458,
+        "top1_agreement": 0.7972412109375,
+        "top1_accuracy": 0.3699951171875,
+        "reference_top1_accuracy": 0.380859375,
+        "mean_nll": 3.852240247899365,
+        "reference_mean_nll": 3.700017763126204
+      },
+      "marked": null,
+      "buckets": [
+        {
+          "positions": [
+            0,
+            1024
+          ],
+          "count": 1024,
+          "mean_kl": 0.1276044135135237,
+          "max_kl": 1.8962860107421875,
+          "top1_agreement": 0.80078125,
+          "top1_accuracy": 0.3173828125,
+          "reference_top1_accuracy": 0.328125,
+          "mean_nll": 4.086386220853427,
+          "reference_mean_nll": 3.9329031059246944
+        },
+        {
+          "positions": [
+            1024,
+            2048
+          ],
+          "count": 1024,
+          "mean_kl": 0.1300852185990493,
+          "max_kl": 2.18497896194458,
+          "top1_agreement": 0.8115234375,
+          "top1_accuracy": 0.39453125,
+          "reference_top1_accuracy": 0.404296875,
+          "mean_nll": 3.7229944592035267,
+          "reference_mean_nll": 3.582168259352777
+        },
+        {
+          "positions": [
+            2048,
+            4096
+          ],
+          "count": 2048,
+          "mean_kl": 0.12678650836128258,
+          "max_kl": 1.6979752779006958,
+          "top1_agreement": 0.80419921875,
+          "top1_accuracy": 0.3740234375,
+          "reference_top1_accuracy": 0.39013671875,
+          "mean_nll": 3.8184003149575627,
+          "reference_mean_nll": 3.675077715260363
+        },
+        {
+          "positions": [
+            4096,
+            8192
+          ],
+          "count": 4096,
+          "mean_kl": 0.15480321874834319,
+          "max_kl": 1.1088292598724365,
+          "top1_agreement": 0.789306640625,
+          "top1_accuracy": 0.375,
+          "reference_top1_accuracy": 0.383544921875,
+          "mean_nll": 3.8429351683057105,
+          "reference_mean_nll": 3.683728827302859
+        }
+      ]
+    },
+    {
+      "kv_format": "f32",
+      "recurrent_state": "f32",
+      "weights": "/private/tmp/claude-501/-Users-danylokravchenko-Projects-tur/1ff0edc8-0135-409d-9275-c78d20170531/scratchpad/art/q4k-imatrix",
+      "weight_bytes": 424934656,
+      "all": {
+        "positions": [
+          0,
+          8192
+        ],
+        "count": 8192,
+        "mean_kl": 0.09408844132668887,
+        "max_kl": 2.0597705841064453,
+        "top1_agreement": 0.8333740234375,
+        "top1_accuracy": 0.374267578125,
+        "reference_top1_accuracy": 0.380859375,
+        "mean_nll": 3.8146182505650623,
+        "reference_mean_nll": 3.700017763126204
+      },
+      "marked": null,
+      "buckets": [
+        {
+          "positions": [
+            0,
+            1024
+          ],
+          "count": 1024,
+          "mean_kl": 0.08305676948387486,
+          "max_kl": 1.3542693853378296,
+          "top1_agreement": 0.8427734375,
+          "top1_accuracy": 0.318359375,
+          "reference_top1_accuracy": 0.328125,
+          "mean_nll": 4.04623211228526,
+          "reference_mean_nll": 3.9329031059246944
+        },
+        {
+          "positions": [
+            1024,
+            2048
+          ],
+          "count": 1024,
+          "mean_kl": 0.08411778545786941,
+          "max_kl": 0.8699837327003479,
+          "top1_agreement": 0.8408203125,
+          "top1_accuracy": 0.3935546875,
+          "reference_top1_accuracy": 0.404296875,
+          "mean_nll": 3.6946222499483383,
+          "reference_mean_nll": 3.582168259352777
+        },
+        {
+          "positions": [
+            2048,
+            4096
+          ],
+          "count": 2048,
+          "mean_kl": 0.0910276653586033,
+          "max_kl": 1.2495471239089966,
+          "top1_agreement": 0.837890625,
+          "top1_accuracy": 0.38916015625,
+          "reference_top1_accuracy": 0.39013671875,
+          "mean_nll": 3.798028931566719,
+          "reference_mean_nll": 3.675077715260363
+        },
+        {
+          "positions": [
+            4096,
+            8192
+          ],
+          "count": 4096,
+          "mean_kl": 0.10086941123864002,
+          "max_kl": 2.0597705841064453,
+          "top1_agreement": 0.826904296875,
+          "top1_accuracy": 0.3759765625,
+          "reference_top1_accuracy": 0.383544921875,
+          "mean_nll": 3.795008444788365,
+          "reference_mean_nll": 3.683728827302859
+        }
+      ]
+    },
+    {
+      "kv_format": "f32",
+      "recurrent_state": "f32",
+      "weights": "/private/tmp/claude-501/-Users-danylokravchenko-Projects-tur/1ff0edc8-0135-409d-9275-c78d20170531/scratchpad/art/q4k-gptq",
+      "weight_bytes": 424934656,
+      "all": {
+        "positions": [
+          0,
+          8192
+        ],
+        "count": 8192,
+        "mean_kl": 0.07043701143430342,
+        "max_kl": 1.8104009628295898,
+        "top1_agreement": 0.84423828125,
+        "top1_accuracy": 0.3763427734375,
+        "reference_top1_accuracy": 0.380859375,
+        "mean_nll": 3.770824357020917,
+        "reference_mean_nll": 3.700017763126204
+      },
+      "marked": null,
+      "buckets": [
+        {
+          "positions": [
+            0,
+            1024
+          ],
+          "count": 1024,
+          "mean_kl": 0.06254681838147569,
+          "max_kl": 1.2153315544128418,
+          "top1_agreement": 0.8642578125,
+          "top1_accuracy": 0.322265625,
+          "reference_top1_accuracy": 0.328125,
+          "mean_nll": 4.037933553190804,
+          "reference_mean_nll": 3.9329031059246944
+        },
+        {
+          "positions": [
+            1024,
+            2048
+          ],
+          "count": 1024,
+          "mean_kl": 0.06367666909285141,
+          "max_kl": 0.720307469367981,
+          "top1_agreement": 0.8486328125,
+          "top1_accuracy": 0.3896484375,
+          "reference_top1_accuracy": 0.404296875,
+          "mean_nll": 3.648191958902867,
+          "reference_mean_nll": 3.582168259352777
+        },
+        {
+          "positions": [
+            2048,
+            4096
+          ],
+          "count": 2048,
+          "mean_kl": 0.06476616558341919,
+          "max_kl": 1.5040113925933838,
+          "top1_agreement": 0.84814453125,
+          "top1_accuracy": 0.38232421875,
+          "reference_top1_accuracy": 0.39013671875,
+          "mean_nll": 3.756814106047269,
+          "reference_mean_nll": 3.675077715260363
+        },
+        {
+          "positions": [
+            4096,
+            8192
+          ],
+          "count": 4096,
+          "mean_kl": 0.07693506820831546,
+          "max_kl": 1.8104009628295898,
+          "top1_agreement": 0.836181640625,
+          "top1_accuracy": 0.383544921875,
+          "reference_top1_accuracy": 0.383544921875,
+          "mean_nll": 3.7417102829947817,
+          "reference_mean_nll": 3.683728827302859
+        }
+      ]
+    },
+    {
+      "kv_format": "f32",
+      "recurrent_state": "f32",
+      "weights": "/private/tmp/claude-501/-Users-danylokravchenko-Projects-tur/1ff0edc8-0135-409d-9275-c78d20170531/scratchpad/art/q8-rtn",
+      "weight_bytes": 800881920,
+      "all": {
+        "positions": [
+          0,
+          8192
+        ],
+        "count": 8192,
+        "mean_kl": 0.0007599293615040414,
+        "max_kl": 0.03606262803077698,
+        "top1_agreement": 0.9835205078125,
+        "top1_accuracy": 0.3812255859375,
+        "reference_top1_accuracy": 0.380859375,
+        "mean_nll": 3.6995877896681164,
+        "reference_mean_nll": 3.700017763126204
+      },
+      "marked": null,
+      "buckets": [
+        {
+          "positions": [
+            0,
+            1024
+          ],
+          "count": 1024,
+          "mean_kl": 0.0006885047439090242,
+          "max_kl": 0.03606262803077698,
+          "top1_agreement": 0.9892578125,
+          "top1_accuracy": 0.330078125,
+          "reference_top1_accuracy": 0.328125,
+          "mean_nll": 3.933401782414254,
+          "reference_mean_nll": 3.9329031059246944
+        },
+        {
+          "positions": [
+            1024,
+            2048
+          ],
+          "count": 1024,
+          "mean_kl": 0.0006709004371411864,
+          "max_kl": 0.016647018492221832,
+          "top1_agreement": 0.9814453125,
+          "top1_accuracy": 0.4013671875,
+          "reference_top1_accuracy": 0.404296875,
+          "mean_nll": 3.5800767214843745,
+          "reference_mean_nll": 3.582168259352777
+        },
+        {
+          "positions": [
+            2048,
+            4096
+          ],
+          "count": 2048,
+          "mean_kl": 0.0007167148660343209,
+          "max_kl": 0.008448688313364983,
+          "top1_agreement": 0.98046875,
+          "top1_accuracy": 0.390625,
+          "reference_top1_accuracy": 0.39013671875,
+          "mean_nll": 3.6765991672399796,
+          "reference_mean_nll": 3.675077715260363
+        },
+        {
+          "positions": [
+            4096,
+            8192
+          ],
+          "count": 4096,
+          "mean_kl": 0.0008216499947283698,
+          "max_kl": 0.007631134241819382,
+          "top1_agreement": 0.984130859375,
+          "top1_accuracy": 0.38427734375,
+          "reference_top1_accuracy": 0.383544921875,
+          "mean_nll": 3.682506369741586,
+          "reference_mean_nll": 3.683728827302859
+        }
+      ]
+    }
+  ]
+}
