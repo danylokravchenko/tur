@@ -13,7 +13,7 @@
 //! packed weight and K/V formats, page sizes, exact prefix forks and restores, memory
 //! pressure, workspace and allocation bounds. Needs host GPU access and fails, rather
 //! than skips, without it. Real-checkpoint tests are `#[ignore]` and need
-//! `TUR_QWEN35_0_8B`; the reference itself is validated against Transformers in P3.
+//! `TUR_QWEN35_0_8B`; the reference itself is validated against Transformers.
 
 mod common;
 
@@ -912,7 +912,7 @@ fn test_real_checkpoint_fused_matches_reference() -> Result<()> {
     let _gpu = GPU.lock();
     let tokens = real_prompt()?;
     let all: Vec<usize> = (0..tokens.len()).collect();
-    // F32: every layer and all logits within the P3 reference gate.
+    // F32: every layer and all logits within the reference gate.
     let fused = real(WeightFormat::F32, Execution::Fused, F32_KV)?;
     let (fused_layers, fused_logits) = fused.trace(&tokens, &all)?;
     let reference = fused.with_execution(Execution::Reference)?;

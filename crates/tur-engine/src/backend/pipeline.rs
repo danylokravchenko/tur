@@ -12,7 +12,7 @@ use tur_core::execution::{PackedExecution, SequenceDescriptor, StateHandle, inva
 use tur_models::{
     backend::{
         chat_template::{ChatMessage, ChatTemplate, RenderOptions, Role},
-        factory::ModelFactory,
+        factory::{DraftHead, ModelFactory},
         tools::{ToolCall, ToolDefinition},
     },
     models::qwen3_5::{GenerationDefaults, Qwen35},
@@ -364,21 +364,20 @@ impl InferencePipeline {
             },
             ..config
         };
-        if config.speculation.mtp_enabled() && config.prefix.enabled() {
-            // A snapshot at boundary B cannot hold the head's entry for B - 1: it depends on
-            // the token sampled after B, which differs between requests sharing the snapshot.
-            return Err(invalid(
-                "native MTP drafts need prefix reuse disabled (PrefixConfig::DISABLED)",
-            ));
-        }
-        let factory = &ModelFactory {
-            mtp: config.speculation.mtp_enabled(),
-            draft_vocab: config
-                .speculation
-                .mtp_vocab
-                .filter(|_| config.speculation.mtp_enabled()),
-            ..factory.clone()
+        // A snapshot at boundary B cannot hold the head's entry for B - 1: it depends on
+        // the token sampled after B, which differs between requests sharing the snapshot.
+        let config = if config.speculation.mtp_enabled() && config.prefix.enabled() {
+            tracing::info!("native MTP drafts disable prefix reuse");
+            PipelineConfig {
+                prefix: PrefixConfig::DISABLED,
+                ..config
+            }
+        } else {
+            config
         };
+        let draft = config.speculation.mtp_enabled().then_some(DraftHead {
+            vocab: config.speculation.mtp_vocab,
+        });
         let limits = config.scheduler;
         let draft_rows = config
             .speculation
@@ -392,7 +391,7 @@ impl InferencePipeline {
             .min(limits.max_batch_tokens.saturating_sub(1));
         let draft_slots = draft_rows;
         let (model, tokenizer, template, defaults, (plan, pool, lease)) = factory
-            .create_model_with(|architecture, options| {
+            .create_model_with(draft, |architecture, options| {
                 let tokens = limits.max_batch_tokens;
                 let sequences = limits.max_running.min(tokens);
                 let (description, weights, scratch_peak) = Qwen35::memory_requirements(
@@ -1537,7 +1536,7 @@ impl InferencePipeline {
                     // expected acceptance of its drafts. Its verification outcomes also count
                     // the unlikely drafts planning chose to verify, whose rejections stopped
                     // the head computing its likely ones; greedy requests, whose drafts are
-                    // rarely unlikely, did better on verification outcomes (P14 report).
+                    // rarely unlikely, did better on verification outcomes.
                     if let Some(draft) = draft.filter(|_| !pending.greedy) {
                         let expected = self.calibration[0].acceptance(draft.confidence).rate();
                         pending.mtp_acceptance.expect(expected);

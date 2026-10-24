@@ -1,4 +1,4 @@
-"""Regenerate the offline P8 MoE oracle with Transformers 5.20.2 / torch 2.14.1.
+"""Regenerate the offline MoE oracle with Transformers 5.20.2 / torch 2.14.1.
 
 Weights use the same deterministic LCG and BF16 conversion as tests/common/mod.rs.
 No weights or network access are needed. All layers and final logits come from the

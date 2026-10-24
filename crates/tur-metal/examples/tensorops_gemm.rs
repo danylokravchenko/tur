@@ -4,7 +4,7 @@
 )]
 #![forbid(unsafe_code)]
 //! Metal 4 `TensorOps` capability and F32 GEMM throughput against Candle's F32 GEMM on the
-//! same device (P10). Kernels build `tensor_inline` views over existing buffers in the
+//! same device. Kernels build `tensor_inline` views over existing buffers in the
 //! shader, so the host needs no `MTLTensor` objects, whose buffer-backed constructor is
 //! unsafe in objc2-metal. Prints one JSON line per measurement.
 //!

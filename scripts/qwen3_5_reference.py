@@ -1,7 +1,6 @@
 """Golden references for tur's Qwen3.5/3.8 text implementation.
 
-Pinned environment: transformers 5.20.2 (its modeling_qwen3_5.py differs from
-docs/references/p3/modeling_qwen3_5.py only in cache plumbing), torch CPU, float32.
+Pinned environment: transformers 5.20.2, torch CPU, float32.
 
     python -I scripts/qwen3_5_reference.py --model <snapshot dir> \
         --golden <out.safetensors> --templates crates/tur-models/tests/fixtures/qwen3_5_templates.json
@@ -17,8 +16,8 @@ from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 
 REPO = Path(__file__).resolve().parents[1]
 TEMPLATES = {
-    "qwen3.5-0.8b": REPO / "docs/references/p3/small-chat_template.jinja",
-    "qwen3.8-27b": REPO / "docs/references/p3/qwen3.8-chat_template.jinja",
+    "qwen3.5-0.8b": REPO / "crates/tur-models/tests/fixtures/checkpoints/small-chat_template.jinja",
+    "qwen3.8-27b": REPO / "crates/tur-models/tests/fixtures/checkpoints/qwen3.8-chat_template.jinja",
 }
 
 LONG_PROMPT = (

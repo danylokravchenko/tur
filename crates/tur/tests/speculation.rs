@@ -406,16 +406,21 @@ fn test_fused_mtp_drafts_preserve_target_sampling() -> Result<()> {
 }
 
 #[test]
-fn test_mtp_needs_a_head_and_no_prefix_reuse() -> Result<()> {
+fn test_mtp_needs_a_head_and_disables_prefix_reuse() -> Result<()> {
     let with_head = Checkpoint::random_mtp()?;
-    let mut prefix = mtp_config(4, 1);
-    prefix.prefix = PipelineConfig::new(1, 16).prefix;
-    assert!(InferencePipeline::new(&with_head.factory(), prefix).is_err());
     let without_head = Checkpoint::random()?;
     assert!(InferencePipeline::new(&without_head.factory(), mtp_config(4, 1)).is_err());
     // The head's keys and values are one more state layer of the plan.
     let plain = InferencePipeline::new(&with_head.factory(), config(4, 1))?;
     let drafted = InferencePipeline::new(&with_head.factory(), mtp_config(4, 1))?;
+    // Requested prefix reuse is dropped, retaining no snapshots or their logit rows.
+    let mut prefix = mtp_config(4, 1);
+    prefix.prefix = PipelineConfig::new(1, 16).prefix;
+    let prefix = InferencePipeline::new(&with_head.factory(), prefix)?;
+    assert_eq!(
+        prefix.memory_plan().resident(),
+        drafted.memory_plan().resident()
+    );
     assert!(drafted.memory_plan().weights > plain.memory_plan().weights);
     // A reduced draft vocabulary is a copy of that many F32 LM-head rows of 64 values; the
     // pipeline checks the plan against the loaded weights.

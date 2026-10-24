@@ -428,7 +428,7 @@ fn mean_at(values: &Value, indices: impl Iterator<Item = usize>) -> f64 {
     picked.iter().sum::<f64>() / picked.len().max(1) as f64
 }
 
-/// Prefix-scheduling workloads on the default pipeline configuration (P15): a cold shared
+/// Prefix-scheduling workloads on the default pipeline configuration: a cold shared
 /// system prompt reached by a burst, queue contention between warm and cold prompts, an
 /// agent loop, a change of hot prefix under churn, and traffic with little or no reuse.
 fn reuse_runs(
@@ -753,8 +753,6 @@ fn main() -> Result<()> {
         recurrent: std::env::var("TUR_BENCH_STATE")
             .map_or(Ok(DEFAULT_RECURRENT_STATE), |s| parse_recurrent_state(&s))
             .map_err(TurError::Other)?,
-        mtp: false,
-        draft_vocab: None,
     };
     let max = concurrency.iter().copied().max().unwrap_or(1);
     let mut runs = Vec::new();

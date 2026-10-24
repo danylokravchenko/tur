@@ -33,7 +33,7 @@ fn templates(name: &str) -> Result<ChatTemplate> {
         _ => return Err(invalid(format!("unknown template {name}"))),
     };
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/references/p3")
+        .join("tests/fixtures/checkpoints")
         .join(file);
     ChatTemplate::from_template(std::fs::read_to_string(path)?)
 }

@@ -19,7 +19,7 @@ pub enum Precision {
     Bf16,
     Q8_0,
     /// Embedding tables only: Candle's 2–16-row kernels for Q6K/Q5K are 2.5–3.5× slower
-    /// than Tur's `Q8_0`/Q4K ones on the M1 (P11 kernel artifact), so projections exclude them.
+    /// than Tur's `Q8_0`/Q4K ones on the M1, so projections exclude them.
     Q6k,
     Q5k,
     Q4k,
@@ -228,7 +228,7 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
-    const SMALL: &str = include_str!("../../../../../docs/references/p3/small-config.json");
+    const SMALL: &str = include_str!("../../../tests/fixtures/checkpoints/small-config.json");
 
     #[test]
     fn test_uniform_plans_validate_and_mixed_plans_reject_unexecutable_precisions() -> Result<()> {

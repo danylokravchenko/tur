@@ -1,8 +1,0 @@
-MoE 1 tokens, skew false: grouped 0.584 ms, individual 0.360 ms
-MoE 1 tokens, skew true: grouped 0.597 ms, individual 0.373 ms
-MoE 8 tokens, skew false: grouped 2.828 ms, individual 2.784 ms
-MoE 8 tokens, skew true: grouped 0.988 ms, individual 0.438 ms
-MoE 32 tokens, skew false: grouped 7.237 ms, individual 7.245 ms
-MoE 32 tokens, skew true: grouped 1.826 ms, individual 0.776 ms
-MoE 128 tokens, skew false: grouped 17.235 ms, individual 12.617 ms
-MoE 128 tokens, skew true: grouped 6.234 ms, individual 2.488 ms

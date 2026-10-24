@@ -41,12 +41,13 @@ pub struct ModelFactory {
     pub kv: KvLayout,
     /// Recurrent matrix storage: F32, F16 or BF16.
     pub recurrent: candle_core::DType,
-    /// Load the checkpoint's native multi-token prediction head. The inference pipeline
-    /// sets it from its speculation config.
-    pub mtp: bool,
-    /// Draft from token IDs below this bound only ([`LoadOptions::draft_vocab`]). The
-    /// inference pipeline sets it from its speculation config.
-    pub draft_vocab: Option<usize>,
+}
+
+/// The checkpoint's native multi-token prediction head, loaded for drafting.
+#[derive(Clone, Copy, Debug)]
+pub struct DraftHead {
+    /// Draft from token IDs below this bound only ([`LoadOptions::draft_vocab`]).
+    pub vocab: Option<usize>,
 }
 
 fn hub_error(error: impl std::fmt::Display) -> TurError {
@@ -123,15 +124,17 @@ impl ModelFactory {
     /// a prepacked artifact is uploaded as stored. Legacy ordinary-attention GGUF
     /// checkpoints are unsupported.
     pub fn create_model(&self) -> Result<(Qwen35, Tokenizer, ChatTemplate, GenerationDefaults)> {
-        let (model, tokenizer, template, defaults, ()) = self.create_model_with(|_, _| Ok(()))?;
+        let (model, tokenizer, template, defaults, ()) =
+            self.create_model_with(None, |_, _| Ok(()))?;
         Ok((model, tokenizer, template, defaults))
     }
 
     /// Validate serving metadata, then reserve resources before loading any weight
     /// payload or uploading tensors. The reservation is returned with the model and is
-    /// dropped automatically on a loading failure.
+    /// dropped automatically on a loading failure. `draft` also loads the MTP head.
     pub fn create_model_with<R>(
         &self,
+        draft: Option<DraftHead>,
         reserve: impl FnOnce(&Config, &LoadOptions) -> Result<R>,
     ) -> Result<(Qwen35, Tokenizer, ChatTemplate, GenerationDefaults, R)> {
         let dir = self.resolve()?;
@@ -193,10 +196,14 @@ impl ModelFactory {
             execution: Execution::Fused,
             kv: self.kv,
             recurrent: self.recurrent,
-            mtp: self.mtp,
-            draft_vocab: self.draft_vocab,
+            mtp: draft.is_some(),
+            draft_vocab: draft.and_then(|head| head.vocab),
         };
-        let config = if self.mtp { config.with_mtp()? } else { config };
+        let config = if draft.is_some() {
+            config.with_mtp()?
+        } else {
+            config
+        };
         let reservation = reserve(&config, &options)?;
         let model = Qwen35::load(&dir, &options)?;
         Ok((model, tokenizer, template, defaults, reservation))
@@ -229,8 +236,6 @@ mod tests {
             device: Device::Cpu,
             kv: crate::models::qwen3_5::DEFAULT_KV_LAYOUT,
             recurrent: crate::models::qwen3_5::DEFAULT_RECURRENT_STATE,
-            mtp: false,
-            draft_vocab: None,
         };
         assert!(factory.resolve().is_err());
     }

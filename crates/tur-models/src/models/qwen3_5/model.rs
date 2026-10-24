@@ -158,7 +158,7 @@ pub enum Execution {
     Reference,
 }
 
-/// K/V storage chosen from the P5 measurements on the M1 (see the P5 report): F16 was the
+/// K/V storage chosen from M1 measurements (`docs/decisions.md`): F16 was the
 /// fastest format end to end and indistinguishable from F32 in quality; page sizes of
 /// 16–128 tokens performed alike, and 16 wastes the least tail memory. Q8 halves K/V
 /// memory again for capacity-bound deployments.
@@ -1345,8 +1345,11 @@ impl Qwen35 {
         let h = math::rms(&x, &mtp.layer.post_norm, d.eps)?;
         x = (&x + Self::mlp(&mtp.layer, &h, None)?)?;
         let index = Tensor::new(pass.rows.as_slice(), &self.device)?;
-        mtp.lm_head(&self.lm_head)
-            .forward(&math::rms(&x.index_select(&index, 0)?, &mtp.norm, d.eps)?)
+        mtp.lm_head(&self.lm_head).forward(&math::rms(
+            &x.index_select(&index, 0)?,
+            &mtp.norm,
+            d.eps,
+        )?)
     }
 }
 

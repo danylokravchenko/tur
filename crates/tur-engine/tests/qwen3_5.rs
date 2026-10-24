@@ -479,7 +479,7 @@ fn test_quantized_generation_is_coherent() -> Result<()> {
     let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
         .map_err(|e| TurError::Tokenizer(e.to_string()))?;
     // Q8_0 has a predeclared 0.95 top-1 floor. Q4K has no quality budget yet (measured
-    // 0.821 on 2026-10-22); P3 requires only coherent, terminating generation from it.
+    // 0.821 on 2026-10-22); this requires only coherent, terminating generation from it.
     for (format, floor) in [(WeightFormat::Q8_0, Some(0.95)), (WeightFormat::Q4K, None)] {
         let Real {
             model,

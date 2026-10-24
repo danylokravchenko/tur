@@ -509,7 +509,7 @@ pub fn allocate(
 mod tests {
     use super::*;
 
-    const SMALL: &str = include_str!("../../../../../docs/references/p3/small-config.json");
+    const SMALL: &str = include_str!("../../../tests/fixtures/checkpoints/small-config.json");
 
     #[test]
     fn test_allocation_upgrades_the_best_divergence_per_byte_within_budget() -> Result<()> {

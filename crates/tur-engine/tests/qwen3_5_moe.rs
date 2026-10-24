@@ -83,11 +83,11 @@ fn test_moe_reference_matches_independent_transformers_layers_and_logits() -> Re
 #[test]
 fn test_moe_config_and_weight_mapping_match_the_pinned_checkpoint() -> Result<()> {
     let config = Config::from_json(include_str!(
-        "../../../docs/references/p8/qwen3.6-config.json"
+        "../../tur-models/tests/fixtures/checkpoints/qwen3.6-config.json"
     ))?;
     let expected = config.weight_shapes()?;
     let index: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../docs/references/p8/qwen3.6-model.safetensors.index.json"
+        "../../tur-models/tests/fixtures/checkpoints/qwen3.6-model.safetensors.index.json"
     ))?;
     let names = index["weight_map"]
         .as_object()
@@ -96,7 +96,7 @@ fn test_moe_config_and_weight_mapping_match_the_pinned_checkpoint() -> Result<()
         assert!(names.contains_key(name), "missing {name}");
     }
     let headers: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../docs/references/p8/qwen3.6-text-tensors.json"
+        "../../tur-models/tests/fixtures/checkpoints/qwen3.6-text-tensors.json"
     ))?;
     for (name, shape) in &expected {
         assert_eq!(

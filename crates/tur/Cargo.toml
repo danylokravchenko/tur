@@ -27,18 +27,10 @@ tokio = { workspace = true }
 tower-http = { workspace = true }
 async-stream = { workspace = true }
 
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator.workspace = true
-
 [dev-dependencies]
 tokenizers.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
-
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-candle-metal-kernels.workspace = true
-objc2-metal.workspace = true
-objc2-foundation.workspace = true
 
 [features]
 default = ["metal"]

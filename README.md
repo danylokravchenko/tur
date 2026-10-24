@@ -1,153 +1,118 @@
 # Tur
 
-Tur is a Rust inference engine being redesigned for Apple Silicon. It runs the
-Qwen3.5/3.8 dense hybrid text model through the packed `HybridEngine`: fused Metal
-kernels (P4) over persistent, paged and optionally quantized K/V and recurrent state
-pools (P5). The CLI and HTTP worker use this path. Ordinary Qwen3, Granite 4.1 and
-their legacy engine, cache, tests and benchmark have been removed.
+Tur is a Rust inference engine for Apple Silicon. It runs Qwen3.5/3.8 dense hybrid
+text models (Gated DeltaNet plus gated attention) on fused Metal kernels, over paged
+and optionally quantized K/V and recurrent state. It also does packed continuous
+batching, prefix reuse, device sampling and exact speculative decoding.
 
-An experimental Qwen3.5 MoE text path also implements Qwen3.6-35B-A3B's expert layout.
-Small-model conformance and pinned checkpoint headers pass; full 35B execution,
-expert-kernel performance and quality gates remain open. See the
-[P8 report](docs/apple-silicon-p8-speculation-moe.md).
-
-The real Qwen3.5-0.8B checkpoint was validated against Transformers on CPU and Metal.
-Qwen3.8-27B shares the implementation and has pinned config, tensor-header and
-template validation; it has **not been executed** on the development Mac. Measurements
-come from one M1; production serving hardening, quality budgets and release gates are
-later stages. See the [redesign plan](docs/apple-silicon-redesign.md), the
-[P3](docs/apple-silicon-p3-qwen.md), [P4](docs/apple-silicon-p4-metal.md) and
-[P5](docs/apple-silicon-p5-memory.md) reports.
+The Qwen3.5-0.8B checkpoint is validated against Transformers on CPU and Metal.
+Qwen3.8-27B shares the code path but has not been executed. The Qwen3.6 MoE path is
+experimental. Every measurement so far comes from one M1. See
+[design decisions](docs/decisions.md) for what was chosen, what was rejected and what
+is still open.
 
 ## Build and test
 
-Rust 1.99 or later is required. Metal is enabled by default on macOS.
+Rust 1.99 or later. Metal is enabled by default; `--no-default-features` builds the
+CPU reference only.
 
 ```sh
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo nextest run --workspace
-cargo build --bin tur --bin server
+cargo build --release --bin tur
 ```
 
-The offline suite uses small tensor and tokenizer fixtures. Real checkpoint tests
-are explicitly ignored and require the environment variables documented in the
-[P3 report](docs/apple-silicon-p3-qwen.md). `--cpu-reference` on either binary selects
-the CPU numerical reference for development checks.
+The offline suite uses small tensor and tokenizer fixtures. Real-checkpoint tests are
+`#[ignore]`d and read `TUR_QWEN35_0_8B` (a local snapshot of the pinned 0.8B), plus
+`TUR_QWEN35_GOLDEN` and `TUR_QWEN35_MTP_GOLDEN`, which are written by
+`scripts/qwen3_5_reference.py` and `scripts/qwen3_5_mtp_reference.py`.
 
-Every workspace member inherits the shared Rust and Clippy lints, including forbidden
-unsafe Rust and denied unwrap/expect, explicit panic and lock-across-await paths.
-Fallible tests allow assertions while propagating setup and task errors with `?`.
-`--no-default-features` builds the CPU reference; obsolete CUDA features are removed.
+## Usage
 
-## CLI
-
-Use a fully qualified Hugging Face repository and an immutable commit. Checkpoint
-architecture fields determine support; model names do not select an architecture.
-The loader rejects ordinary Qwen3, Granite and unsupported architectures or tensor
-layouts. Qwen3.5 MoE is experimental; its 35B Q4K text weights alone exceed the
-development Mac's 16 GB memory. Native MTP and Gemma 4 execution are disabled.
+One binary, three commands:
 
 ```sh
-cargo run --bin tur -- \
-  --model-id Qwen/Qwen3.5-0.8B \
-  --revision 2fc06364715b967f1860aea9cf38778875588b17 \
-  --weight-format q8_0 --prompt 'Write one sentence about the Moon.' \
-  --temperature 0 --max-tokens 64
+tur run      --model <dir|org/name> --revision <rev> [--prompt ...]   # one completion to stdout
+tur serve    --model <dir|org/name> --revision <rev> [--listen ...]   # OpenAI-style HTTP API
+tur quantize --model <dir> --revision <rev> --output <dir>            # prepack weights offline
 ```
 
-For a local SafeTensors checkpoint, replace `--model-id` with
-`--weight-path /path/to/checkpoint` and provide its identity with `--revision`.
-The directory must contain `config.json`, `tokenizer.json`, `tokenizer_config.json`,
-and `model.safetensors` or `model.safetensors.index.json` plus its shards.
-`chat_template.jinja` takes precedence over the tokenizer config's template.
-`generation_config.json` is optional. Invalid metadata or templates fail loading.
-Remote sources need Hugging Face access; use a local directory for offline loading.
-
-`--weight-format f32|q8_0|q4k` explicitly converts the SafeTensors projection matrices
-into the selected resident storage. Q8_0 is the adapter default. These are not GGUF
-imports, and `q4k` does not promise a Q4_K_M quality recipe. Packed storage and
-quantization limitations are documented in the P3 report.
-
-Sampling controls (`--temperature`, `--top-k`, `--top-p`) inherit checkpoint defaults
-when omitted. `--temperature 0` selects greedy generation. Thinking controls are
-passed to the checkpoint template: `--thinking true|false`,
-`--reasoning-effort low|medium|xhigh`, and `--preserve-thinking true|false`.
-Omitting them preserves the template's defaults. No `/think` suffix is injected.
-`--tools /path/to/tools.json` accepts an array of `{name, description, parameters}`
-function definitions. `--prefill-chunk-size` defaults to 256.
-
-`--speculative-draft 4` enables adaptive prompt-lookup speculation on either binary.
-It is disabled by default. This throughput mode can accelerate repetitive output but
-delivers tokens in bursts with longer pauses, uses extra state memory, and automatically
-falls back to ordinary decoding with F16/BF16 recurrent state. Measurements and exact
-verification semantics are in the [P8 report](docs/apple-silicon-p8-speculation-moe.md).
-
-K/V state is paged: `--kv-format f32|f16|q8|q8_<group>` (default `f16`) selects storage
-and `--kv-page-tokens` (default 16) the page size. `q8` halves K/V memory relative to
-`f16` with a small, measured quality cost. `--state-memory-mb` sets the memory for K/V
-pages and recurrent state; by default each concurrent request gets room for an 8K-token
-context within the device's working set, and a budget beyond the working set is
-rejected. The budget includes the permanent zero recurrent slot, two usable recurrent
-slots per concurrent request, retained snapshots, speculative checkpoints when enabled,
-and whole K/V pages; page rounding stays within the requested bytes.
-
-## HTTP server
-
-The binary loads one resident hybrid model before opening the listener. Model load
-or template failures are startup errors. Choose an API ID with `--served-model-name`.
+`--model` is a local checkpoint directory or a fully qualified Hugging Face repository.
+A remote `--revision` must be a 40-character commit. For a local directory it is the
+identity you assign. A directory needs `config.json`, `tokenizer.json`,
+`tokenizer_config.json` and SafeTensors weights. `chat_template.jinja` and
+`generation_config.json` are optional. `TUR_MODEL` and `TUR_REVISION` set both flags
+from the environment.
 
 ```sh
-cargo run --bin server -- \
-  --weight-path /path/to/checkpoint --revision my-pinned-checkpoint \
-  --weight-format q8_0 --served-model-name qwen-hybrid \
-  --max-batch-size 4 --prefill-chunk-size 256 --port 8080
+cargo run --release --bin tur -- run \
+  --model Qwen/Qwen3.5-0.8B --revision 2fc06364715b967f1860aea9cf38778875588b17 \
+  --prompt 'Write one sentence about the Moon.' --temperature 0 --max-tokens 64
 ```
 
-Remote loading uses the same `--model-id` and `--revision` flags as the CLI.
+### Shared by `run` and `serve`
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--weight-format f32\|q8_0\|q4k` | `q8_0` | Convert SafeTensors projections at load time. Omit it for a prepacked artifact |
+| `--kv-format f32\|f16\|q8\|q8_<group>` | `f16` | K/V storage; `q8` halves memory at a small measured quality cost |
+| `--kv-page-tokens` | 16 | Tokens per K/V page |
+| `--recurrent-state f32\|f16` | `f32` | F16 halves recurrent memory; its error grows with decode length |
+| `--state-memory-mb` | derived | K/V and recurrent memory; default fits an 8K context per concurrent request |
+| `--prefill-chunk-size` | 256 | Largest prefill chunk of one request per pass |
+| `--speculative-draft N` | 0 | Prompt-lookup drafts per decode. Throughput mode: tokens arrive in bursts |
+| `--mtp` | off | Also draft with the checkpoint's MTP head; disables prefix reuse |
+| `--cpu-reference` | off | Run the CPU numerical reference |
+
+`run` also takes the sampling flags `--temperature`, `--top-k` and `--top-p`, the
+penalty flags, and `--seed`. Sampling flags you omit inherit the checkpoint's defaults;
+`--temperature 0` is greedy. It also takes `--thinking`, `--reasoning-effort` and
+`--preserve-thinking`, which are passed to the checkpoint template, and `--tools` with
+a JSON array of `{name, description, parameters}`.
+
+### Serving
 
 ```sh
-curl http://127.0.0.1:8080/v1/models
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"qwen-hybrid","messages":[{"role":"user","content":"Hello"}],"max_tokens":64,"temperature":0,"thinking":false}'
+cargo run --release --bin tur -- serve \
+  --model /path/to/checkpoint --revision my-checkpoint --served-model-name qwen-hybrid \
+  --max-batch-size 8 --listen 127.0.0.1:8080
+
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen-hybrid","messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
 
-Set `"stream":true` for SSE text chunks, a final usage/finish chunk and `[DONE]`.
-Omitting `model` selects the configured model. Request-level `temperature`, `top_k`,
-`top_p`, `seed`, `thinking` (alias `enable_thinking`), `reasoning_effort` and
-`preserve_thinking` are honored. Conversation turns preserve `reasoning_content`
-and assistant function calls; tool response turns are rendered by the checkpoint.
-Function tools use the usual `{type:"function",function:{name,description,parameters}}`
-envelope. Only automatic tool selection is supported. Complete Qwen hybrid XML calls
-are parsed with schema-aware argument types; the server returns function calls but
-does not execute tools.
+The model loads and validates before the listener binds. `serve` also takes
+`--max-batch-tokens`, `--max-waiting`, `--request-timeout-secs` and
+`--prefix-snapshots` (0 disables prefix reuse).
 
-Only text input is supported. Image, video and audio content parts and placeholder
-tokens are rejected. Positive generation limits must fit the model context. Usage
-counts prompt tokens and sampled completion tokens, including EOS. Finish reasons
-are `stop`, `length`, or `tool_calls`.
+The endpoints are `/v1/models` and `/v1/chat/completions`. `"stream": true` returns SSE
+text chunks, a final usage chunk and `[DONE]`. Requests can set `temperature`, `top_k`,
+`top_p`, the penalties, `seed`, `thinking` (alias `enable_thinking`),
+`reasoning_effort` and `preserve_thinking`. Function tools use the usual
+`{type:"function",function:{...}}` envelope with automatic selection. Calls are parsed
+and returned but never executed. Only text input is accepted. Finish reasons are `stop`,
+`length` and `tool_calls`. A streaming client that stops reading is cancelled with a
+`slow_client` error.
 
-The worker bounds intake and live request counts, packs one prefill chunk or decode
-token per sequence, isolates per-request failures, and releases state on completion
-or client cancellation. The server takes the same K/V and state-memory flags as the
-CLI. Requests that can never fit the state pool are rejected. Memory pressure can evict
-prefix snapshots and preempt running state for recomputation. Packed scheduling, prefix
-reuse, device sampling and bounded streaming are implemented; see the
-[P6](docs/apple-silicon-p6-scheduling.md) and [P7](docs/apple-silicon-p7-serving.md) reports.
-Production hardening and release gates remain open; measurements are development evidence.
+### Prepacked weights
+
+`tur quantize` writes a versioned artifact that `run` and `serve` load directly. By
+default it uses Q4K with GPTQ, which needs `--calibration` text files. Use
+`--method rtn` for uncalibrated rounding. `--budget-bits 5.5` upgrades the most
+sensitive projections to `q8_0`. `--report` writes calibration and plan details as
+JSON.
 
 ## Workspace
 
-`tur-core` owns checked descriptors and shared errors; `tur-metal` owns state pools,
-completion and Metal kernels; `tur-models` owns the hybrid decoder and checkpoint metadata;
-`tur-engine` owns execution and the text pipeline. `tur` provides facade exports and
-the HTTP library; `tur-cli` and `tur-server` provide the binaries. Breaking Rust and
-CLI changes are deliberate; legacy compatibility aliases and flags are removed.
-
-[P0 baseline artifacts](docs/apple-silicon-baseline.md) remain as historical
-measurement evidence. Their ordinary-model runners were retired with the legacy
-implementation. The synthetic Metal probe remains available.
+| Crate | Owns |
+| --- | --- |
+| `tur-core` | Shared errors and checked packed-execution descriptors |
+| `tur-metal` | State pools, completion fences, Metal kernels, packed weights |
+| `tur-models` | Checkpoint loading and validation, the Qwen3.5 model, templates |
+| `tur-engine` | Engine, scheduler, prefix cache, speculation, sampling, pipeline |
+| `tur` | Facade re-exports and the HTTP server library |
+| `tur-cli` | The `tur` binary |
 
 Licensed under Apache-2.0.

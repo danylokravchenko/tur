@@ -147,14 +147,10 @@ negative results if selection collapses quality or SSD transfers dominate latenc
 
 ## Fit with existing Tur work
 
-- [P8 MoE report](apple-silicon-p8-speculation-moe.md): packed experts, routing,
-  grouped Metal dispatch and independent fixtures; full 35B quality gates remain open.
-- [P11 weights report](apple-silicon-p11-weights.md): calibrated quantization,
-  sensitivity allocation, prepacked artifacts and bounded loading; several quality
-  domains and real-model mixed-precision measurements remain pending.
-- [P5 memory report](apple-silicon-p5-memory.md): shared memory accounting and state
-  pools. Extend accounting to resident/offloaded weights and staging rather than
-  creating a competing budget system.
+- [Design decisions](decisions.md): packed experts and grouped Metal dispatch (full 35B
+  quality gates remain open), calibrated quantization, sensitivity allocation and
+  prepacked artifacts, and the single memory budget. Extend that accounting to
+  resident/offloaded weights and staging rather than creating a competing budget system.
 - Existing implementation starting points:
   `crates/tur-models/src/models/qwen3_5/{calibration.rs,plan.rs,artifact.rs,weights.rs}`,
   `crates/tur-models/src/models/qwen3_5/model/moe.rs`,

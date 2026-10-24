@@ -91,7 +91,7 @@ fn candle_rms(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
     Ok(x.broadcast_mul(&inv)?.broadcast_mul(w)?)
 }
 
-/// The P3 reference attention for one sequence: repeated K/V heads, a masked score
+/// The reference attention for one sequence: repeated K/V heads, a masked score
 /// block and softmax through Candle matmuls.
 fn candle_attention(q: &Tensor, k: &Tensor, v: &Tensor, past: usize) -> Result<Tensor> {
     let (n, heads, dim) = q.dims3()?;
@@ -654,7 +654,7 @@ fn norm_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
 }
 
 /// Sampling a Qwen3.5 vocabulary row: device penalties, argmax and rejection sampling
-/// against copying rows to the host and sampling there (the P6 path for sampled requests).
+/// against copying rows to the host and sampling there (the host sampling path).
 fn sample_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     let vocab = 248_320;
     let mut cases = Vec::new();

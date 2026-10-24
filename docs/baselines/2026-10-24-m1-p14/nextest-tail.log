@@ -1,3 +1,0 @@
-        PASS [   0.046s] (255/255) tur-models::qwen3_5 test_templates_render_exactly_like_transformers
-────────────
-     Summary [ 295.327s] 255 tests run: 255 passed, 8 skipped

@@ -3394,14 +3394,10 @@ dependencies = [
  "async-stream",
  "axum",
  "candle-core",
- "candle-metal-kernels",
  "http-body-util",
  "metal 0.33.0",
- "objc2-foundation",
- "objc2-metal",
  "serde",
  "serde_json",
- "tikv-jemallocator",
  "tokenizers 0.21.4",
  "tokio",
  "tower",
@@ -3419,9 +3415,12 @@ dependencies = [
 name = "tur-cli"
 version = "0.1.0"
 dependencies = [
+ "candle-core",
  "clap",
  "serde_json",
+ "tikv-jemallocator",
  "tokenizers 0.21.4",
+ "tokio",
  "tracing",
  "tur",
 ]
@@ -3479,15 +3478,6 @@ dependencies = [
  "tokenizers 0.21.4",
  "tur-core",
  "tur-metal",
-]
-
-[[package]]
-name = "tur-server"
-version = "0.1.0"
-dependencies = [
- "clap",
- "tokio",
- "tur",
 ]
 
 [[package]]

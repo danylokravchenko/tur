@@ -30,7 +30,7 @@ from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
 
 REPO = Path(__file__).resolve().parents[1]
-TEMPLATE = REPO / "docs/references/p3/small-chat_template.jinja"
+TEMPLATE = REPO / "crates/tur-models/tests/fixtures/checkpoints/small-chat_template.jinja"
 PROMPTS = [
     "Explain how a write-ahead log lets a database recover after a crash. Be specific.",
     "Write a short Python function that merges two sorted lists, then explain it.",

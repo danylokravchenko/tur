@@ -151,12 +151,7 @@ impl PackedLinear {
                 let prefix = data
                     .get(..bytes)
                     .ok_or_else(|| invalid("packed rows outside weights"))?;
-                Self::from_blocks(
-                    prefix,
-                    *format,
-                    (rows, self.in_features),
-                    &packed.device(),
-                )
+                Self::from_blocks(prefix, *format, (rows, self.in_features), &packed.device())
             }
             Weights::Packed { .. } => Err(invalid("packed weights lost their blocks")),
         }

@@ -27,7 +27,7 @@ const INDEX_WINDOW: usize = 8192;
 /// Token IDs the draft head drafts from by default. Byte-level BPE numbers tokens in merge
 /// order, so these are the most frequent: on Qwen3.5-0.8B they kept the head's acceptance
 /// on prose and code at a seventh of its projection cost; 16K lost prose drafts and 64K
-/// added cost (P14 report).
+/// added cost.
 pub const MTP_VOCAB: usize = 32_768;
 
 /// Speculative decoding limits.
@@ -276,7 +276,7 @@ pub const MTP_MIN_RATE: f64 = 0.3;
 /// Most decoding sequences of a pass for which draft-head drafts are computed. On the M1
 /// with Qwen3.5-0.8B they paid at one to four sequences and did not at eight, where a
 /// verified draft costs about three quarters of a decode token's share of the pass even
-/// with a reduced draft vocabulary (P8 and P14 reports).
+/// with a reduced draft vocabulary.
 pub const MTP_MAX_DECODES: usize = 4;
 /// Decode counts above this share one fit.
 const COST_BUCKETS: usize = 64;

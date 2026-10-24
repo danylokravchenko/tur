@@ -16,7 +16,7 @@ use std::{collections::HashMap, sync::Arc, sync::RwLockReadGuard};
 use tur_core::{Result, TurError, execution::invalid};
 
 /// Version of the buffer layouts the kernels assume. Bump when any binding layout changes.
-/// 2: paged K/V pools in F32/F16/Q8 and slot-addressed recurrent state (P5).
+/// 2: paged K/V pools in F32/F16/Q8 and slot-addressed recurrent state.
 /// 3: tiled prefill attention over query tiles.
 pub const LAYOUT_VERSION: u32 = 3;
 
@@ -253,14 +253,14 @@ impl Tuning {
         Self {
             row_threads: limit.min(256),
             simdgroups: (limit / SIMD_WIDTH).clamp(1, 4),
-            // The M1 sweep (P4 kernel artifact) is flat within ~5%; 2 was best most often.
+            // The M1 sweep is flat within ~5%; 2 was best most often.
             scan_simdgroups: (limit / SIMD_WIDTH).clamp(1, 2),
             elementwise_threads: limit.min(256),
             attention_parallelism: 1024,
             min_split_keys: 64,
             // The M1 attention sweep crosses over at 64 queries × 8 heads (16 tiles).
             attention_tiled_groups: 16,
-            // Measured crossovers on M1 (P4 and P6 kernel artifacts): Candle's one-row GEMV
+            // Measured crossovers on M1: Candle's one-row GEMV
             // wins at one row. For Q8_0 the custom GEMV wins at 2–3 rows and the
             // matrix-unit kernel from 4 (1.3–2.6× at 5–8 rows, F32 parity with Candle's
             // F16-tile GEMM at 16). Q4K uses its matrix-unit kernel at 2–16 rows: it beats
@@ -272,7 +272,7 @@ impl Tuning {
             gemv_q4k_rows: (2, 2),
             qmm_q8_0_rows: (4, 16),
             qmm_q4k_rows: (2, 16),
-            // M1 decode sweep (P10 kernel artifact): two heads per simdgroup are 1.06–1.25×
+            // M1 decode sweep: two heads per simdgroup are 1.06–1.25×
             // faster over Q8 pools and lose or tie over F32 and F16; four lose everywhere.
             attention_head_group: 1,
             attention_q8_head_group: 2,

@@ -1,8 +1,6 @@
-#![forbid(unsafe_code)]
 //! Offline weight preparation: calibrate on text, optionally allocate per-projection
 //! precision under a byte budget from measured sensitivities, and write a prepacked
-//! artifact that `tur` and `server` load as stored.
-use clap::Parser;
+//! artifact that `run` and `serve` load as stored.
 use std::{io::Write, path::PathBuf, time::Instant};
 use tur::{
     Result, TurError,
@@ -14,16 +12,11 @@ use tur::{
     },
 };
 
-#[derive(Debug, Parser)]
-#[command(
-    author,
-    version,
-    about = "Prepack Tur weights from a SafeTensors checkpoint"
-)]
-struct Args {
+#[derive(Debug, clap::Args)]
+pub struct Args {
     /// Source `SafeTensors` checkpoint directory.
     #[arg(long)]
-    weight_path: PathBuf,
+    model: PathBuf,
     /// Exact identity of the source checkpoint, recorded in the artifact.
     #[arg(long)]
     revision: String,
@@ -35,9 +28,10 @@ struct Args {
     method: Method,
     /// Every projection's precision, or the narrowest one when `--budget-bits` allocates.
     #[arg(long, default_value = "q4k")]
-    format: WeightFormat,
+    weight_format: WeightFormat,
     /// Average bits per projection weight (embedding table excluded): measure each
-    /// projection's sensitivity and upgrade the most sensitive from `--format` to `q8_0`.
+    /// projection's sensitivity and upgrade the most sensitive from `--weight-format` to
+    /// `q8_0`.
     #[arg(long)]
     budget_bits: Option<f64>,
     /// Embedding storage: head (tied checkpoints: gather rows of the packed LM head),
@@ -64,7 +58,7 @@ struct Args {
 }
 
 fn samples(args: &Args) -> Result<Vec<Vec<u32>>> {
-    let tokenizer = tokenizers::Tokenizer::from_file(args.weight_path.join("tokenizer.json"))
+    let tokenizer = tokenizers::Tokenizer::from_file(args.model.join("tokenizer.json"))
         .map_err(|e| TurError::Tokenizer(e.to_string()))?;
     let mut samples = Vec::new();
     let mut budget = args.calibration_tokens;
@@ -85,10 +79,8 @@ fn samples(args: &Args) -> Result<Vec<Vec<u32>>> {
     Ok(samples)
 }
 
-fn main() -> Result<()> {
-    tur::shared::init_tracing()?;
-    let args = Args::parse();
-    let config = artifact_config(&args.weight_path)?;
+pub fn quantize(args: &Args) -> Result<()> {
+    let config = artifact_config(&args.model)?;
     let embedding = match args.embedding.as_deref() {
         None if config.tied_embeddings() => Embedding::Head,
         None => Embedding::Table(Precision::Bf16),
@@ -97,13 +89,13 @@ fn main() -> Result<()> {
     };
     let base = WeightPlan {
         embedding,
-        ..WeightPlan::uniform(&config, args.format)?
+        ..WeightPlan::uniform(&config, args.weight_format)?
     };
     let calibrated = args.method != Method::Rtn || args.budget_bits.is_some();
     let mut report = serde_json::json!({ "source": args.revision, "method": args.method });
     let started = Instant::now();
     let (calibration, plan) = if calibrated {
-        let samples = samples(&args)?;
+        let samples = samples(args)?;
         if samples.is_empty() {
             return Err(TurError::Other(
                 "calibration needs --calibration text".into(),
@@ -111,7 +103,7 @@ fn main() -> Result<()> {
         }
         let device = tur::shared::inference_device(false)?;
         let mut model = Qwen35::load(
-            &args.weight_path,
+            &args.model,
             &LoadOptions {
                 revision: args.revision.clone(),
                 weights: WeightFormat::F32.into(),
@@ -148,7 +140,7 @@ fn main() -> Result<()> {
                 let measured = sensitivities(
                     &mut model,
                     &reference,
-                    &[Precision::from(args.format), Precision::Q8_0],
+                    &[Precision::from(args.weight_format), Precision::Q8_0],
                     &packer,
                     |s| {
                         tracing::info!(
@@ -173,7 +165,7 @@ fn main() -> Result<()> {
                     &config,
                     &measured,
                     budget,
-                    Precision::from(args.format),
+                    Precision::from(args.weight_format),
                     embedding,
                 )?;
                 report["sensitivities"] = serde_json::to_value(&measured)?;
@@ -193,7 +185,7 @@ fn main() -> Result<()> {
     let packing = Instant::now();
     let manifest = write_artifact(
         &Conversion {
-            source: &args.weight_path,
+            source: &args.model,
             identity: &args.revision,
             output: &args.output,
             calibration: &args

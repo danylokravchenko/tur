@@ -163,8 +163,6 @@ impl Checkpoint {
             // 16-dimension heads take unscaled formats only.
             kv: KvLayout::new(16, KvFormat::F32),
             recurrent: DType::F32,
-            mtp: false,
-            draft_vocab: None,
         }
     }
 }

@@ -1,6 +1,0 @@
-    Finished `bench` profile [optimized] target(s) in 0.48s
-     Running benches/serving.rs (target/release/deps/serving-e1a1e5fe3c552d2f)
-arrivals 2/s, serial: 83.0 out tok/s, TTFT p50/p95 4618/10661 ms, ITL p50/p95/p99 61.1/289.9/340.2 ms, intake p50 0.00 ms (sum 1789 ms), idle 9.38%
-arrivals 2/s, overlapped: 85.9 out tok/s, TTFT p50/p95 3964/9319 ms, ITL p50/p95/p99 60.3/268.3/290.1 ms, intake p50 0.00 ms (sum 1734 ms), idle 4.81%
-arrivals 4/s, serial: 89.2 out tok/s, TTFT p50/p95 10481/19130 ms, ITL p50/p95/p99 52.7/296.2/378.5 ms, intake p50 0.00 ms (sum 1772 ms), idle 9.64%
-arrivals 4/s, overlapped: 93.2 out tok/s, TTFT p50/p95 9132/17699 ms, ITL p50/p95/p99 52.5/290.5/345.6 ms, intake p50 0.00 ms (sum 1645 ms), idle 5.16%

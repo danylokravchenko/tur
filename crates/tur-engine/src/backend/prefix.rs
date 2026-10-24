@@ -53,7 +53,7 @@ pub struct PrefixConfig {
 }
 
 impl PrefixConfig {
-    /// Default snapshot spacing in tokens; see the P7 report for the measurement.
+    /// Default snapshot spacing in tokens, the best of a 64–512 sweep on shared-prompt traffic.
     pub const DEFAULT_SPACING: usize = 256;
 
     /// Disabled: no snapshots and no chunk alignment.
