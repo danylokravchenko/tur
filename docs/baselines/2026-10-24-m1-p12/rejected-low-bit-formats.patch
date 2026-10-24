@@ -1,0 +1,3800 @@
+diff --git a/crates/tur-cli/src/main.rs b/crates/tur-cli/src/main.rs
+index 42d2cb3..d917ea4 100644
+--- a/crates/tur-cli/src/main.rs
++++ b/crates/tur-cli/src/main.rs
+@@ -80,8 +80,9 @@ struct Args {
+     /// reuse. Requires F32 recurrent state.
+     #[arg(long)]
+     mtp: bool,
+-    /// K/V storage: f32, f16, q8 (one scale per 32 dimensions, half of F16's memory) or
+-    /// q8_<group>.
++    /// K/V storage: f32, f16, q8 (one scale per 32 dimensions, half of F16's memory),
++    /// q8_<group>, or the P12 low-bit experiments q6, tq6, tq5, q4, q4a, tq4, tq4p and the
++    /// key:value pairs tq6:q8 and q6:q8 (quality costs in docs/apple-silicon-p12-kv.md).
+     #[arg(long, default_value_t = DEFAULT_KV_LAYOUT.format)]
+     kv_format: KvFormat,
+     /// Tokens per K/V page.
+diff --git a/crates/tur-core/src/execution.rs b/crates/tur-core/src/execution.rs
+index 83c3214..c46adc4 100644
+--- a/crates/tur-core/src/execution.rs
++++ b/crates/tur-core/src/execution.rs
+@@ -49,9 +49,20 @@ pub enum LayerStateKind {
+ 
+ /// Version of the paged K/V memory layout. Bump when page, scale or code layouts change, so
+ /// checkpoints and persisted prefixes from another layout are rejected rather than misread.
+-pub const KV_LAYOUT_VERSION: u32 = 1;
++/// Version 2 adds the 4-bit formats; their rotation signs and codebooks are part of it.
++pub const KV_LAYOUT_VERSION: u32 = 2;
+ 
+-/// Storage format of attention keys and values.
++/// Whether stored rows are attention keys or values; a format may encode them differently.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub enum KvRole {
++    Key,
++    Value,
++}
++
++/// Storage format of attention keys and values. Every 4-bit format packs two codes per
++/// byte, dimension `2i` in the low nibble of byte `i`. 5- and 6-bit formats store those
++/// low nibbles, then a plane of the remaining high bits (`8 / (bits - 4)` codes per byte,
++/// lowest dimension in the lowest bits).
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+ pub enum KvFormat {
+     F32,
+@@ -62,51 +73,231 @@ pub enum KvFormat {
+     Q8 {
+         group: usize,
+     },
++    /// Symmetric 4-bit codes `c` in `1..=15` decoding to `scale · (c - 8)`, with one F16
++    /// scale `max |x| / 7` per `group` dimensions.
++    Q4 {
++        group: usize,
++    },
++    /// Asymmetric 4-bit codes `c` in `0..=15` decoding to `min + scale · c`, with an F16
++    /// `(scale, min)` pair per `group` dimensions (KIVI's per-token value quantizer).
++    Q4A {
++        group: usize,
++    },
++    /// TurboQuant-MSE at 4 bits for keys and values: a randomized Hadamard rotation, then
++    /// one F16 scale `‖x‖ / √dim` per row and 16-level Lloyd–Max Gaussian codes.
++    Tq4,
++    /// TurboQuant-prod keys (3-bit Lloyd–Max codes plus a 1-bit QJL sign of the residual,
++    /// two F16 scales per row) with [`Self::Tq4`] values.
++    Tq4P,
++    /// Symmetric 6-bit codes `c` in `1..=63` decoding to `scale · (c - 32)`, with one F16
++    /// scale `max |x| / 31` per `group` dimensions.
++    Q6 {
++        group: usize,
++    },
++    /// TurboQuant-MSE at 5 or 6 bits: [`Self::Tq4`] with 32- or 64-level codebooks.
++    Tq5,
++    Tq6,
++    /// Keys and values in different codecs (KIVI-style asymmetric precision). Kernels
++    /// exist only for the instantiated pairs; the reference path runs any.
++    Split {
++        key: KvCodec,
++        value: KvCodec,
++    },
+ }
+ 
+-impl KvFormat {
+-    /// Default Q8 group: one scale per 32 dimensions.
+-    pub const Q8: Self = Self::Q8 { group: 32 };
++/// How one role (keys or values) of a [`KvFormat`] stores a row of head dimensions.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub enum KvCodec {
++    F32,
++    F16,
++    Q8 {
++        group: usize,
++    },
++    Q4 {
++        group: usize,
++    },
++    Q4A {
++        group: usize,
++    },
++    /// Rotated row, F16 scale and 4-bit Lloyd–Max codes.
++    Tq4,
++    /// Rotated row, F16 scale and QJL residual scale, 3-bit codes plus a residual sign.
++    Tq3Qjl,
++    Q6 {
++        group: usize,
++    },
++    /// Rotated row, F16 scale and 5- or 6-bit Lloyd–Max codes.
++    Tq5,
++    Tq6,
++}
+ 
++impl KvCodec {
+     /// Dtype of the stored codes or values.
+     pub fn data_dtype(self) -> DType {
+         match self {
+             Self::F32 => DType::F32,
+             Self::F16 => DType::F16,
+-            Self::Q8 { .. } => DType::U8,
++            _ => DType::U8,
++        }
++    }
++
++    /// Bits of one stored code; 16 or 32 for unquantized values.
++    pub fn bits(self) -> usize {
++        match self {
++            Self::F32 => 32,
++            Self::F16 => 16,
++            Self::Q8 { .. } => 8,
++            Self::Q6 { .. } | Self::Tq6 => 6,
++            Self::Tq5 => 5,
++            Self::Q4 { .. } | Self::Q4A { .. } | Self::Tq4 | Self::Tq3Qjl => 4,
++        }
++    }
++
++    /// Stored elements per row of `head_dim` dimensions: bytes for packed codes.
++    pub fn row_elements(self, head_dim: usize) -> usize {
++        match self {
++            Self::F32 | Self::F16 | Self::Q8 { .. } => head_dim,
++            _ => head_dim * self.bits() / 8,
+         }
+     }
+ 
+-    /// Head dimensions sharing one scale, or `None` for unscaled formats.
+-    pub fn group(self) -> Option<usize> {
++    /// F16 scale parameters per row of `head_dim` dimensions.
++    pub fn row_scales(self, head_dim: usize) -> usize {
++        match self {
++            Self::F32 | Self::F16 => 0,
++            Self::Q8 { group } | Self::Q4 { group } | Self::Q6 { group } => head_dim / group.max(1),
++            Self::Q4A { group } => 2 * (head_dim / group.max(1)),
++            Self::Tq4 | Self::Tq5 | Self::Tq6 => 1,
++            Self::Tq3Qjl => 2,
++        }
++    }
++
++    /// Dimensions sharing one scale (or scale pair); the whole row for rotated codecs.
++    pub fn group(self, head_dim: usize) -> Option<usize> {
+         match self {
+-            Self::Q8 { group } => Some(group),
+             Self::F32 | Self::F16 => None,
++            Self::Q8 { group } | Self::Q4 { group } | Self::Q4A { group } | Self::Q6 { group } => {
++                Some(group)
++            }
++            Self::Tq4 | Self::Tq3Qjl | Self::Tq5 | Self::Tq6 => Some(head_dim),
++        }
++    }
++
++    /// Whether rows are stored in the randomized Hadamard basis.
++    pub fn rotated(self) -> bool {
++        matches!(self, Self::Tq4 | Self::Tq3Qjl | Self::Tq5 | Self::Tq6)
++    }
++
++    /// Bytes of one stored row: codes plus F16 scales.
++    pub fn row_bytes(self, head_dim: usize) -> Result<usize> {
++        let data = checked_elements(&[self.row_elements(head_dim)])?
++            .checked_mul(self.data_dtype().size_in_bytes())
++            .ok_or_else(|| invalid("K/V row size overflow"))?;
++        data.checked_add(2 * self.row_scales(head_dim))
++            .ok_or_else(|| invalid("K/V row size overflow"))
++    }
++}
++
++impl KvFormat {
++    /// Default Q8 group: one scale per 32 dimensions.
++    pub const Q8: Self = Self::Q8 { group: 32 };
++    /// Default Q4 group: one scale per 32 dimensions.
++    pub const Q4: Self = Self::Q4 { group: 32 };
++
++    /// Codec storing `role` rows.
++    pub fn codec(self, role: KvRole) -> KvCodec {
++        match (self, role) {
++            (Self::F32, _) => KvCodec::F32,
++            (Self::F16, _) => KvCodec::F16,
++            (Self::Q8 { group }, _) => KvCodec::Q8 { group },
++            (Self::Q4 { group }, _) => KvCodec::Q4 { group },
++            (Self::Q4A { group }, _) => KvCodec::Q4A { group },
++            (Self::Q6 { group }, _) => KvCodec::Q6 { group },
++            (Self::Tq5, _) => KvCodec::Tq5,
++            (Self::Tq6, _) => KvCodec::Tq6,
++            (Self::Tq4, _) | (Self::Tq4P, KvRole::Value) => KvCodec::Tq4,
++            (Self::Tq4P, KvRole::Key) => KvCodec::Tq3Qjl,
++            (Self::Split { key, .. }, KvRole::Key) => key,
++            (Self::Split { value, .. }, KvRole::Value) => value,
+         }
+     }
+ 
+-    /// Reject groups that do not tile `head_dim` in whole 32-lane SIMD rows.
++    /// Codec of stored keys.
++    pub fn key(self) -> KvCodec {
++        self.codec(KvRole::Key)
++    }
++
++    /// Codec of stored values.
++    pub fn value(self) -> KvCodec {
++        self.codec(KvRole::Value)
++    }
++
++    /// Reject groups that do not tile `head_dim` in whole 32-lane SIMD rows, and rotated
++    /// formats whose head dimension is not a power of two the kernels support.
+     pub fn validate(self, head_dim: usize) -> Result<()> {
+-        if let Some(group) = self.group()
+-            && (group == 0 || !group.is_multiple_of(32) || !head_dim.is_multiple_of(group))
+-        {
+-            return Err(invalid(format!(
+-                "K/V group {group} must be a multiple of 32 dividing head dim {head_dim}"
+-            )));
++        match self {
++            Self::F32 | Self::F16 => Ok(()),
++            Self::Split { key, value } => {
++                Self::single(key).validate(head_dim)?;
++                Self::single(value).validate(head_dim)
++            }
++            Self::Q8 { group } | Self::Q4 { group } | Self::Q4A { group } | Self::Q6 { group } => {
++                if group == 0 || !group.is_multiple_of(32) || !head_dim.is_multiple_of(group) {
++                    return Err(invalid(format!(
++                        "K/V group {group} must be a multiple of 32 dividing head dim {head_dim}"
++                    )));
++                }
++                Ok(())
++            }
++            Self::Tq4 | Self::Tq4P | Self::Tq5 | Self::Tq6 => {
++                if !matches!(head_dim, 64 | 128 | 256) {
++                    return Err(invalid(format!(
++                        "rotated K/V formats need head dim 64, 128 or 256, not {head_dim}"
++                    )));
++                }
++                Ok(())
++            }
+         }
+-        Ok(())
+     }
+ 
+-    /// Bytes of one token's keys (or values): codes plus F16 scales.
++    /// The single-codec format storing keys and values with `codec`.
++    fn single(codec: KvCodec) -> Self {
++        match codec {
++            KvCodec::F32 => Self::F32,
++            KvCodec::F16 => Self::F16,
++            KvCodec::Q8 { group } => Self::Q8 { group },
++            KvCodec::Q4 { group } => Self::Q4 { group },
++            KvCodec::Q4A { group } => Self::Q4A { group },
++            KvCodec::Tq4 => Self::Tq4,
++            KvCodec::Tq3Qjl => Self::Tq4P,
++            KvCodec::Q6 { group } => Self::Q6 { group },
++            KvCodec::Tq5 => Self::Tq5,
++            KvCodec::Tq6 => Self::Tq6,
++        }
++    }
++
++    /// Bytes of one token's keys plus values of `kv_heads` heads: codes plus F16 scales.
+     pub fn token_bytes(self, kv_heads: usize, head_dim: usize) -> Result<usize> {
+-        let data = checked_elements(&[kv_heads, head_dim, self.data_dtype().size_in_bytes()])?;
+-        let scales = match self.group() {
+-            Some(group) if group > 0 => checked_elements(&[kv_heads, head_dim / group, 2])?,
+-            Some(_) => return Err(invalid("zero K/V group")),
+-            None => 0,
+-        };
+-        data.checked_add(scales)
+-            .ok_or_else(|| invalid("K/V token size overflow"))
++        if self.key().group(head_dim) == Some(0) || self.value().group(head_dim) == Some(0) {
++            return Err(invalid("zero K/V group"));
++        }
++        let rows = self
++            .key()
++            .row_bytes(head_dim)?
++            .checked_add(self.value().row_bytes(head_dim)?)
++            .ok_or_else(|| invalid("K/V token size overflow"))?;
++        checked_elements(&[kv_heads, rows])
++    }
++}
++
++impl KvFormat {
++    /// The codec of a format that stores keys and values alike.
++    fn single_codec(self) -> std::result::Result<KvCodec, String> {
++        if self.key() == self.value() {
++            Ok(self.key())
++        } else {
++            Err(format!("{self} stores keys and values differently"))
++        }
+     }
+ }
+ 
+@@ -116,6 +307,20 @@ impl std::fmt::Display for KvFormat {
+             Self::F32 => f.write_str("f32"),
+             Self::F16 => f.write_str("f16"),
+             Self::Q8 { group } => write!(f, "q8_{group}"),
++            Self::Q4 { group } => write!(f, "q4_{group}"),
++            Self::Q4A { group } => write!(f, "q4a_{group}"),
++            Self::Tq4 => f.write_str("tq4"),
++            Self::Tq4P => f.write_str("tq4p"),
++            Self::Q6 { group } => write!(f, "q6_{group}"),
++            Self::Tq5 => f.write_str("tq5"),
++            Self::Tq6 => f.write_str("tq6"),
++            Self::Split { key, value } => {
++                let value = Self::single(*value);
++                match key {
++                    KvCodec::Tq3Qjl => write!(f, "tq3qjl:{value}"),
++                    _ => write!(f, "{}:{value}", Self::single(*key)),
++                }
++            }
+         }
+     }
+ }
+@@ -123,18 +328,43 @@ impl std::fmt::Display for KvFormat {
+ impl std::str::FromStr for KvFormat {
+     type Err = String;
+ 
+-    /// `f32`, `f16`, `q8` (group 32) or `q8_<group>`.
++    /// `f32`, `f16`, `tq4`, `tq4p`, `tq5`, `tq6`, or `q8`, `q6`, `q4`, `q4a` with an
++    /// optional `_<group>` (default 32); or `<key>:<value>` with one of those per role, where the key may also
++    /// be `tq3qjl` (TurboQuant-prod keys).
+     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+         let value = value.to_ascii_lowercase();
++        if let Some((key, value)) = value.split_once(':') {
++            let key = if key == "tq3qjl" {
++                KvCodec::Tq3Qjl
++            } else {
++                key.parse::<Self>()?.single_codec()?
++            };
++            let value = value.parse::<Self>()?.single_codec()?;
++            return Ok(Self::Split { key, value });
++        }
++        let grouped = |name: &str| -> Option<usize> {
++            match value.strip_prefix(name)? {
++                "" => Some(32),
++                rest => rest.strip_prefix('_')?.parse().ok(),
++            }
++        };
+         match value.as_str() {
+             "f32" => Ok(Self::F32),
+             "f16" => Ok(Self::F16),
+-            "q8" => Ok(Self::Q8),
+-            _ => value
+-                .strip_prefix("q8_")
+-                .and_then(|group| group.parse().ok())
++            "tq4" => Ok(Self::Tq4),
++            "tq4p" => Ok(Self::Tq4P),
++            "tq5" => Ok(Self::Tq5),
++            "tq6" => Ok(Self::Tq6),
++            _ => grouped("q8")
+                 .map(|group| Self::Q8 { group })
+-                .ok_or_else(|| "K/V format must be f32, f16, q8 or q8_<group>".into()),
++                .or_else(|| grouped("q6").map(|group| Self::Q6 { group }))
++                .or_else(|| grouped("q4a").map(|group| Self::Q4A { group }))
++                .or_else(|| grouped("q4").map(|group| Self::Q4 { group }))
++                .ok_or_else(|| {
++                    "K/V format must be f32, f16, tq4, tq4p, tq5, tq6, or q8, q6, q4, q4a with \
++                     an optional _<group>"
++                        .into()
++                }),
+         }
+     }
+ }
+@@ -198,10 +428,7 @@ impl LayerStateKind {
+     /// K plus V bytes for one token in `format`, including scales; zero for recurrent layers.
+     pub fn attention_token_bytes(&self, format: KvFormat) -> Result<usize> {
+         match *self {
+-            Self::Attention { kv_heads, head_dim } => format
+-                .token_bytes(kv_heads, head_dim)?
+-                .checked_mul(2)
+-                .ok_or_else(|| invalid("K/V token size overflow")),
++            Self::Attention { kv_heads, head_dim } => format.token_bytes(kv_heads, head_dim),
+             Self::Recurrent { .. } => Ok(0),
+         }
+     }
+@@ -630,6 +857,18 @@ mod tests {
+         // 512 one-byte codes plus 2 heads × 8 groups of F16 scales, for K and V.
+         assert_eq!(bytes(KvFormat::Q8)?, 6 * 2 * (512 + 32));
+         assert_eq!(bytes(KvFormat::Q8 { group: 128 })?, 6 * 2 * (512 + 8));
++        // 4-bit: 256 codes per head row plus scales; asymmetric groups carry two.
++        assert_eq!(bytes(KvFormat::Q4)?, 6 * 2 * (256 + 32));
++        assert_eq!(bytes(KvFormat::Q4A { group: 64 })?, 6 * 2 * (256 + 32));
++        // Split formats count each role's codec.
++        let split = KvFormat::Split {
++            key: KvCodec::Q8 { group: 32 },
++            value: KvCodec::Q4 { group: 32 },
++        };
++        assert_eq!(bytes(split)?, 6 * 2 * (256 + 16 + 128 + 16));
++        // One scale per row; TurboQuant-prod keys add the residual scale.
++        assert_eq!(bytes(KvFormat::Tq4)?, 6 * 2 * (256 + 4));
++        assert_eq!(bytes(KvFormat::Tq4P)?, 6 * 2 * (256 + 6));
+         let model = description(layers, KvFormat::Q8);
+         assert_eq!(model.page_bytes()?, 2 * 6 * 2 * 544);
+         assert_eq!(model.recurrent_slot_bytes()?, 18 * 12);
+@@ -668,12 +907,29 @@ mod tests {
+                 .is_ok()
+         );
+         for group in [0, 16, 48, 128] {
+-            assert!(
+-                description(vec![attention(1, 64)], KvFormat::Q8 { group })
+-                    .validate()
+-                    .is_err(),
+-                "group {group}"
+-            );
++            for format in [
++                KvFormat::Q8 { group },
++                KvFormat::Q4 { group },
++                KvFormat::Q4A { group },
++            ] {
++                assert!(
++                    description(vec![attention(1, 64)], format)
++                        .validate()
++                        .is_err(),
++                    "{format}"
++                );
++            }
++        }
++        for (dim, valid) in [(64, true), (256, true), (32, false), (96, false)] {
++            for format in [KvFormat::Tq4, KvFormat::Tq4P] {
++                assert_eq!(
++                    description(vec![attention(1, dim)], format)
++                        .validate()
++                        .is_ok(),
++                    valid,
++                    "{format} dim {dim}"
++                );
++            }
+         }
+         let mut model = description(vec![attention(1, 64)], KvFormat::F16);
+         model.kv.page_tokens = 0;
+@@ -703,12 +959,37 @@ mod tests {
+             KvFormat::F16,
+             KvFormat::Q8,
+             KvFormat::Q8 { group: 64 },
++            KvFormat::Q4 { group: 64 },
++            KvFormat::Q4A { group: 32 },
++            KvFormat::Tq4,
++            KvFormat::Tq4P,
+         ] {
+             assert_eq!(format.to_string().parse::<KvFormat>(), Ok(format));
+         }
+         assert_eq!("q8".parse::<KvFormat>(), Ok(KvFormat::Q8 { group: 32 }));
+-        assert!("q4".parse::<KvFormat>().is_err());
+-        assert!("q8_x".parse::<KvFormat>().is_err());
++        assert_eq!("Q4".parse::<KvFormat>(), Ok(KvFormat::Q4 { group: 32 }));
++        assert_eq!("q4a".parse::<KvFormat>(), Ok(KvFormat::Q4A { group: 32 }));
++        for bad in ["q2", "q8_x", "q4_", "q4b", "tq3"] {
++            assert!(bad.parse::<KvFormat>().is_err(), "{bad}");
++        }
++        assert_eq!(KvFormat::Tq4P.key(), KvCodec::Tq3Qjl);
++        let split = "q8:q4_64".parse::<KvFormat>();
++        assert_eq!(
++            split,
++            Ok(KvFormat::Split {
++                key: KvCodec::Q8 { group: 32 },
++                value: KvCodec::Q4 { group: 64 },
++            })
++        );
++        for name in ["q8_32:q4_64", "f16:tq4", "tq3qjl:tq4"] {
++            assert_eq!(
++                name.parse::<KvFormat>().map(|f| f.to_string()),
++                Ok(name.into())
++            );
++        }
++        assert!("tq4p:f16".parse::<KvFormat>().is_err());
++        assert!("q8:".parse::<KvFormat>().is_err());
++        assert_eq!(KvFormat::Tq4P.value(), KvCodec::Tq4);
+     }
+ 
+     #[test]
+diff --git a/crates/tur-engine/Cargo.toml b/crates/tur-engine/Cargo.toml
+index 7f1447c..07b722d 100644
+--- a/crates/tur-engine/Cargo.toml
++++ b/crates/tur-engine/Cargo.toml
+@@ -42,5 +42,9 @@ name = "kv_quality"
+ harness = false
+ required-features = ["metal"]
+ 
++[[example]]
++name = "kv_stats"
++required-features = ["metal"]
++
+ [lints]
+ workspace = true
+diff --git a/crates/tur-engine/benches/kv_quality.rs b/crates/tur-engine/benches/kv_quality.rs
+index d8a6b67..7876a6c 100644
+--- a/crates/tur-engine/benches/kv_quality.rs
++++ b/crates/tur-engine/benches/kv_quality.rs
+@@ -21,6 +21,12 @@
+ //! weights; `TUR_EVAL_WEIGHTS` (default none) adds variants with F32 K/V and state, each
+ //! `f32`, `q8_0`, `q4k` or a prepacked artifact directory. With `TUR_EVAL_MARKED=1`, text
+ //! between `⟦` and `⟧` (markers removed) is also scored separately, e.g. retrieval answers.
++//! `TUR_EVAL_EXECUTION=reference` runs every model through the reference operations, so K/V
++//! formats can be screened before their kernels exist. `TUR_EVAL_GENERATE=<n>` also keeps
++//! each model's state at 1K, 2K, 4K and 8K tokens and, after the teacher-forced pass, forks
++//! those snapshots (a second turn reusing the first turn's cached state) to feed the text's
++//! next token and decode `n` greedy tokens, reporting how long each variant's continuation
++//! matches the reference's.
+ 
+ use candle_core::{D, DType, Device, Tensor};
+ use serde_json::{Value, json};
+@@ -41,6 +47,8 @@ use tur_models::models::qwen3_5::{
+ };
+ 
+ const BUCKETS: [usize; 5] = [0, 1024, 2048, 4096, 8192];
++/// Contexts whose states seed generated continuations.
++const SNAPSHOTS: [usize; 4] = [1024, 2048, 4096, 8192];
+ 
+ fn env_path(name: &str) -> Result<PathBuf> {
+     std::env::var_os(name)
+@@ -62,7 +70,13 @@ struct Runner {
+ }
+ 
+ impl Runner {
+-    fn new(dir: &Path, device: &Device, variant: Variant, tokens: usize) -> Result<Self> {
++    fn new(
++        dir: &Path,
++        device: &Device,
++        variant: Variant,
++        tokens: usize,
++        execution: Execution,
++    ) -> Result<Self> {
+         let Variant {
+             kv: format,
+             state: recurrent,
+@@ -75,7 +89,7 @@ impl Runner {
+                 revision: "Qwen/Qwen3.5-0.8B@2fc06364".into(),
+                 weights,
+                 device: device.clone(),
+-                execution: Execution::Fused,
++                execution,
+                 kv: KvLayout::new(16, format),
+                 recurrent,
+                 mtp: false,
+@@ -84,9 +98,10 @@ impl Runner {
+         let pool = StatePool::new(
+             Arc::new(model.description()),
+             device,
++            // Room for the snapshots and one continuation forked from each.
+             PoolConfig {
+-                pages: model.description().pages_for(tokens) + 1,
+-                recurrent_slots: 2,
++                pages: model.description().pages_for(tokens) + 1 + SNAPSHOTS.len() * 16,
++                recurrent_slots: 4 + 2 * SNAPSHOTS.len(),
+             },
+         )?;
+         let state = ModelState::new(&pool);
+@@ -123,6 +138,43 @@ impl Runner {
+         self.pool.reclaim();
+         Ok(log_probs)
+     }
++
++    /// Greedy continuation of `steps` tokens from `state` after feeding `first`.
++    fn generate(&self, mut state: ModelState, first: u32, steps: usize) -> Result<Vec<u32>> {
++        let mut out = Vec::with_capacity(steps);
++        let mut next = first;
++        while out.len() < steps {
++            let mut reservation = state.reserve(1, Boundaries::Final)?;
++            reservation.prepare()?;
++            let binding = reservation.binding();
++            let step = self
++                .model
++                .forward(&PackedForward {
++                    tokens: &[next],
++                    positions: &[state.position()],
++                    sequences: &[SequenceForward {
++                        tokens: 0..1,
++                        state: &binding,
++                        logits: &[0],
++                        hidden: false,
++                    }],
++                    pool: &self.pool,
++                })?
++                .pop()
++                .ok_or_else(|| invalid("missing step"))??;
++            next = step
++                .logits
++                .argmax(D::Minus1)?
++                .flatten_all()?
++                .to_vec1::<u32>()?[0];
++            out.push(next);
++            state = reservation.commit(1)?;
++            drop(reservation);
++            self.model.device().synchronize()?;
++            self.pool.reclaim();
++        }
++        Ok(out)
++    }
+ }
+ 
+ /// K/V format, recurrent state dtype and weights of one evaluated model.
+@@ -294,6 +346,11 @@ fn main() -> Result<()> {
+     tokens.truncate(limit + 1);
+     let evaluated = tokens.len() - 1;
+     let device = Device::new_metal(0)?;
++    let execution = match std::env::var("TUR_EVAL_EXECUTION").as_deref() {
++        Ok("reference") => Execution::Reference,
++        Ok("fused") | Err(_) => Execution::Fused,
++        Ok(other) => return Err(TurError::Other(format!("unknown execution {other}"))),
++    };
+     let reference_weights = WeightVariant::parse(
+         &std::env::var("TUR_EVAL_REFERENCE").unwrap_or_else(|_| "q8_0".into()),
+     )?;
+@@ -302,14 +359,24 @@ fn main() -> Result<()> {
+         state: DType::F32,
+         weights: reference_weights.clone(),
+     };
+-    let mut reference = Runner::new(&dir, &device, exact, evaluated)?;
++    let mut reference = Runner::new(&dir, &device, exact, evaluated, execution)?;
+     let mut runners = formats
+         .iter()
+-        .map(|format| Runner::new(&dir, &device, format.clone(), evaluated))
++        .map(|format| Runner::new(&dir, &device, format.clone(), evaluated, execution))
+         .collect::<Result<Vec<_>>>()?;
+     let mut buckets = vec![vec![Bucket::default(); BUCKETS.len() - 1]; formats.len()];
+     let mut answers = vec![Bucket::default(); formats.len()];
+     let weight_bytes: Vec<usize> = runners.iter().map(|r| r.model.weight_bytes()).collect();
++    let kv_bytes = runners
++        .iter()
++        .map(|r| r.model.description().kv_token_bytes())
++        .collect::<Result<Vec<_>>>()?;
++    let generate: usize = std::env::var("TUR_EVAL_GENERATE")
++        .unwrap_or_else(|_| "0".into())
++        .parse()
++        .map_err(|_| invalid("TUR_EVAL_GENERATE"))?;
++    // (context, reference snapshot, each variant's snapshot)
++    let mut snapshots: Vec<(usize, ModelState, Vec<ModelState>)> = Vec::new();
+     let inputs = &tokens[..evaluated];
+     for (index, chunk) in inputs.chunks(chunk_tokens).enumerate() {
+         let first = index * chunk_tokens;
+@@ -361,31 +428,59 @@ fn main() -> Result<()> {
+                 }
+             }
+         }
++        let end = first + chunk.len();
++        if generate > 0 && SNAPSHOTS.contains(&end) && end < tokens.len() {
++            snapshots.push((
++                end,
++                reference.state.clone(),
++                runners.iter().map(|r| r.state.clone()).collect(),
++            ));
++        }
+         if (first + chunk.len()).is_multiple_of(512) || first + chunk.len() == evaluated {
+             eprintln!("evaluated {} of {evaluated} positions", first + chunk.len());
+         }
+     }
++    // Per variant: (continuations, tokens matching the reference, matched prefix lengths).
++    let mut continuations = vec![Vec::new(); formats.len()];
++    for (context, exact_state, states) in snapshots {
++        let next = tokens[context];
++        let expected = reference.generate(exact_state, next, generate)?;
++        for ((runner, state), out) in runners.iter().zip(states).zip(&mut continuations) {
++            let actual = runner.generate(state, next, generate)?;
++            let prefix = actual
++                .iter()
++                .zip(&expected)
++                .take_while(|(a, b)| a == b)
++                .count();
++            out.push(json!({"context": context, "matched_prefix": prefix, "tokens": generate}));
++        }
++    }
+     let results: Vec<Value> = formats
+         .iter()
+         .zip(&buckets)
+-        .zip(answers.iter().zip(&weight_bytes))
+-        .map(|((format, buckets), (answers, bytes))| {
+-            let total = buckets.iter().fold(Bucket::default(), |a, b| a.merge(b));
+-            json!({
+-                "kv_format": format.kv.to_string(),
+-                "recurrent_state": format!("{:?}", format.state).to_lowercase(),
+-                "weights": format.weights.name(),
+-                "weight_bytes": bytes,
+-                "all": total.json(0, evaluated),
+-                "marked": (answers.positions > 0).then(|| answers.json(0, evaluated)),
+-                "buckets": buckets
+-                    .iter()
+-                    .zip(BUCKETS.windows(2))
+-                    .filter(|(b, _)| b.positions > 0)
+-                    .map(|(b, w)| b.json(w[0], w[1]))
+-                    .collect::<Vec<_>>(),
+-            })
+-        })
++        .zip(answers.iter().zip(weight_bytes.iter().zip(&kv_bytes)))
++        .zip(&continuations)
++        .map(
++            |(((format, buckets), (answers, (bytes, kv_bytes))), continuations)| {
++                let total = buckets.iter().fold(Bucket::default(), |a, b| a.merge(b));
++                json!({
++                    "kv_format": format.kv.to_string(),
++                    "kv_token_bytes": kv_bytes,
++                    "recurrent_state": format!("{:?}", format.state).to_lowercase(),
++                    "weights": format.weights.name(),
++                    "weight_bytes": bytes,
++                    "all": total.json(0, evaluated),
++                    "marked": (answers.positions > 0).then(|| answers.json(0, evaluated)),
++                    "continuations": continuations,
++                    "buckets": buckets
++                        .iter()
++                        .zip(BUCKETS.windows(2))
++                        .filter(|(b, _)| b.positions > 0)
++                        .map(|(b, w)| b.json(w[0], w[1]))
++                        .collect::<Vec<_>>(),
++                })
++            },
++        )
+         .collect();
+     let document = json!({
+         "schema_version": 2,
+@@ -393,6 +488,7 @@ fn main() -> Result<()> {
+         "weights": "q8_0 unless a result names other weights",
+         "reference_weights": reference_weights.name(), "reference_weight_bytes": reference.model.weight_bytes(),
+         "reference_kv": "f32", "reference_state": "f32", "page_tokens": 16,
++        "execution": format!("{execution:?}").to_lowercase(),
+         "text": text_path.file_name().map(|n| n.to_string_lossy().into_owned()),
+         "text_bytes": text.len(), "evaluated_positions": evaluated, "chunk": chunk_tokens,
+         "metric": "teacher-forced next-token distributions; KL(F32 reference || variant) in nats",
+diff --git a/crates/tur-engine/examples/kv_stats.rs b/crates/tur-engine/examples/kv_stats.rs
+new file mode 100644
+index 0000000..634450e
+--- /dev/null
++++ b/crates/tur-engine/examples/kv_stats.rs
+@@ -0,0 +1,219 @@
++#![allow(clippy::print_stdout, reason = "diagnostic tool prints a JSON report")]
++#![forbid(unsafe_code)]
++//! K/V statistics on a real checkpoint: runs held-out text through the model with F32 K/V,
++//! reads every attention layer's keys and values back, and reports per K/V head the static
++//! per-channel share of the energy, peak-to-RMS ratios, the largest channel offsets, and the
++//! relative squared error of each 4-bit codec on raw and channel-centered rows.
++//!
++//! `TUR_QWEN35_0_8B=<snapshot> TUR_EVAL_TEXT=<file> cargo run --release --offline -p tur-engine
++//! --example kv_stats > stats.json`; `TUR_EVAL_TOKENS` (default 4096) bounds the context.
++
++use candle_core::{DType, Device, Tensor};
++use serde_json::{Value, json};
++use std::{path::PathBuf, sync::Arc};
++use tur_core::{
++    Result, TurError,
++    execution::{KvCodec, KvFormat, KvLayout, invalid},
++};
++use tur_engine::hybrid::{
++    Boundaries, HybridModel, ModelState, PackedForward, PoolConfig, SequenceForward, StatePool,
++};
++use tur_metal::{
++    pool::{dequantize, quantize},
++    state::LayerSnapshot,
++};
++use tur_models::models::qwen3_5::{Execution, LoadOptions, Qwen35, WeightFormat};
++
++const CODECS: [KvCodec; 5] = [
++    KvCodec::Q8 { group: 32 },
++    KvCodec::Q4 { group: 32 },
++    KvCodec::Q4A { group: 32 },
++    KvCodec::Tq4,
++    KvCodec::Tq3Qjl,
++];
++
++/// Relative squared error of `codec` on `[n, dim]` rows.
++fn codec_error(codec: KvCodec, rows: &[f32], dim: usize) -> Result<f64> {
++    let n = rows.len() / dim;
++    let x = Tensor::from_slice(rows, (n, 1, dim), &Device::Cpu)?;
++    let (data, scales) = quantize(codec, &x)?;
++    let y = dequantize(codec, &data, scales.as_ref())?
++        .flatten_all()?
++        .to_vec1::<f32>()?;
++    let (mut error, mut power) = (0f64, 0f64);
++    for (a, b) in rows.iter().zip(&y) {
++        error += f64::from(a - b).powi(2);
++        power += f64::from(*a).powi(2);
++    }
++    Ok(error / power.max(f64::MIN_POSITIVE))
++}
++
++/// Statistics of one head's `[n, dim]` rows; `rotary` leading dimensions are rotated.
++fn head_stats(rows: &[f32], dim: usize, rotary: usize) -> Result<Value> {
++    let n = rows.len() / dim;
++    let mut mean = vec![0f64; dim];
++    let mut square = vec![0f64; dim];
++    for row in rows.chunks(dim) {
++        for (c, v) in row.iter().enumerate() {
++            mean[c] += f64::from(*v);
++            square[c] += f64::from(*v).powi(2);
++        }
++    }
++    for (m, s) in mean.iter_mut().zip(&mut square) {
++        *m /= n as f64;
++        *s /= n as f64;
++    }
++    let share = |range: std::ops::Range<usize>| {
++        let static_energy: f64 = range.clone().map(|c| mean[c].powi(2)).sum();
++        let total: f64 = range.map(|c| square[c]).sum();
++        static_energy / total.max(f64::MIN_POSITIVE)
++    };
++    let peak = rows
++        .chunks(dim)
++        .map(|row| {
++            let rms = (row.iter().map(|v| v * v).sum::<f32>() / dim as f32).sqrt();
++            row.iter().fold(0f32, |m, v| m.max(v.abs())) / rms.max(f32::MIN_POSITIVE)
++        })
++        .sum::<f32>()
++        / n as f32;
++    let mut channels: Vec<usize> = (0..dim).collect();
++    channels.sort_by(|a, b| mean[*b].abs().total_cmp(&mean[*a].abs()));
++    let top: Vec<Value> = channels
++        .iter()
++        .take(4)
++        .map(|&c| {
++            let std = mean[c].mul_add(-mean[c], square[c]).max(0.0).sqrt();
++            json!({"channel": c, "mean": mean[c], "std": std})
++        })
++        .collect();
++    let centered: Vec<f32> = rows
++        .chunks(dim)
++        .flat_map(|row| row.iter().zip(&mean).map(|(v, m)| v - *m as f32))
++        .collect();
++    let mut errors = serde_json::Map::new();
++    for codec in CODECS {
++        let name = format!("{codec:?}").to_lowercase();
++        errors.insert(
++            name,
++            json!({
++                "raw": codec_error(codec, rows, dim)?,
++                "centered": codec_error(codec, &centered, dim)?,
++            }),
++        );
++    }
++    Ok(json!({
++        "rms": (square.iter().sum::<f64>() / dim as f64).sqrt(),
++        "static_share": share(0..dim),
++        "static_share_rotary": share(0..rotary),
++        "static_share_fixed": share(rotary..dim),
++        "peak_to_rms": peak,
++        "largest_offsets": top,
++        "relative_squared_error": errors,
++    }))
++}
++
++fn main() -> Result<()> {
++    let var = |name: &str| {
++        std::env::var_os(name)
++            .map(PathBuf::from)
++            .ok_or_else(|| TurError::Other(format!("set {name}")))
++    };
++    let dir = var("TUR_QWEN35_0_8B")?;
++    let text = std::fs::read_to_string(var("TUR_EVAL_TEXT")?)?;
++    let limit: usize = std::env::var("TUR_EVAL_TOKENS")
++        .unwrap_or_else(|_| "4096".into())
++        .parse()
++        .map_err(|_| invalid("TUR_EVAL_TOKENS"))?;
++    let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
++        .map_err(|e| TurError::Tokenizer(e.to_string()))?;
++    let mut tokens = tokenizer
++        .encode(text.as_str(), false)
++        .map_err(|e| TurError::Tokenizer(e.to_string()))?
++        .get_ids()
++        .to_vec();
++    tokens.truncate(limit);
++    let device = Device::new_metal(0)?;
++    let model = Qwen35::load(
++        &dir,
++        &LoadOptions {
++            revision: "Qwen/Qwen3.5-0.8B@2fc06364".into(),
++            weights: WeightFormat::Q8_0.into(),
++            device: device.clone(),
++            execution: Execution::Fused,
++            kv: KvLayout::new(16, KvFormat::F32),
++            recurrent: DType::F32,
++            mtp: false,
++        },
++    )?;
++    let description = model.description();
++    let pool = StatePool::new(
++        Arc::new(description.clone()),
++        &device,
++        PoolConfig {
++            pages: description.pages_for(tokens.len()) + 1,
++            recurrent_slots: 2,
++        },
++    )?;
++    let mut state = ModelState::new(&pool);
++    for chunk in tokens.chunks(256) {
++        let mut reservation = state.reserve(chunk.len(), Boundaries::Final)?;
++        reservation.prepare()?;
++        let binding = reservation.binding();
++        let start = state.position();
++        let positions: Vec<usize> = (start..start + chunk.len()).collect();
++        model.forward(&PackedForward {
++            tokens: chunk,
++            positions: &positions,
++            sequences: &[SequenceForward {
++                tokens: 0..chunk.len(),
++                state: &binding,
++                logits: &[],
++                hidden: false,
++            }],
++            pool: &pool,
++        })?;
++        state = reservation.commit(chunk.len())?;
++        drop(reservation);
++        device.synchronize()?;
++        pool.reclaim();
++    }
++    // Rotated leading dimensions per head, from the checkpoint's own configuration.
++    let config: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
++    let text_config = &config["text_config"];
++    let rotary = (text_config["head_dim"].as_f64().unwrap_or(0.0)
++        * text_config["rope_parameters"]["partial_rotary_factor"]
++            .as_f64()
++            .unwrap_or(1.0)) as usize;
++    let mut layers = Vec::new();
++    for (index, layer) in state.read_layers()?.into_iter().enumerate() {
++        let LayerSnapshot::Attention { key, value } = layer else {
++            continue;
++        };
++        let (_, heads, dim) = key.dims3()?;
++        let mut per_head = Vec::new();
++        for h in 0..heads {
++            let rows = |t: &Tensor| -> Result<Vec<f32>> {
++                Ok(t.narrow(1, h, 1)?
++                    .to_device(&Device::Cpu)?
++                    .flatten_all()?
++                    .to_vec1::<f32>()?)
++            };
++            per_head.push(json!({
++                "head": h,
++                "key": head_stats(&rows(&key)?, dim, rotary)?,
++                "value": head_stats(&rows(&value)?, dim, rotary)?,
++            }));
++        }
++        layers.push(json!({"layer": index, "heads": per_head}));
++    }
++    let report = json!({
++        "checkpoint": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
++        "tokens": tokens.len(),
++        "rotary_dims": rotary,
++        "static_share": "sum of squared per-channel means over the mean squared value",
++        "layers": layers,
++    });
++    let output = serde_json::to_string_pretty(&report)?;
++    std::io::Write::write_all(&mut std::io::stdout(), output.as_bytes())?;
++    Ok(())
++}
+diff --git a/crates/tur-engine/tests/qwen3_5_fused.rs b/crates/tur-engine/tests/qwen3_5_fused.rs
+index 94a5fe8..5c24621 100644
+--- a/crates/tur-engine/tests/qwen3_5_fused.rs
++++ b/crates/tur-engine/tests/qwen3_5_fused.rs
+@@ -386,6 +386,10 @@ fn test_kv_formats_and_page_sizes_on_the_fused_path() -> Result<()> {
+         (KvFormat::F16, 1e-3),
+         (KvFormat::Q8, 2e-2),
+         (KvFormat::Q8 { group: 64 }, 2e-2),
++        (KvFormat::Q4, 0.3),
++        (KvFormat::Q4A { group: 32 }, 0.3),
++        (KvFormat::Tq4, 0.3),
++        (KvFormat::Tq4P, 0.3),
+     ] {
+         let kv = KvLayout { format, ..F32_KV };
+         let fused = run(Execution::Fused, kv)?;
+@@ -708,17 +712,33 @@ fn continue_greedy(
+     Ok(out)
+ }
+ 
++/// Formats with kernels whose lifecycle the engine tests cover.
++const LIFECYCLE_FORMATS: [KvFormat; 5] = [
++    KvFormat::Q8,
++    KvFormat::Q4,
++    KvFormat::Q4A { group: 32 },
++    KvFormat::Tq4,
++    KvFormat::Tq4P,
++];
++
+ #[test]
+ fn test_full_and_partial_prefix_forks_and_restores_continue_exactly() -> Result<()> {
+     let _gpu = GPU.lock();
+     let checkpoint = small()?;
++    for format in LIFECYCLE_FORMATS {
++        prefix_forks_and_restores(&checkpoint.0, format)?;
++    }
++    Ok(())
++}
++
++fn prefix_forks_and_restores(dir: &Path, format: KvFormat) -> Result<()> {
+     let device = metal()?;
+     let model = Arc::new(load_kv(
+-        &checkpoint.0,
++        dir,
+         WeightFormat::F32,
+         &device,
+         Execution::Fused,
+-        KvLayout::new(16, KvFormat::Q8),
++        KvLayout::new(16, format),
+     )?);
+     let config = PoolConfig {
+         pages: 64,
+@@ -740,13 +760,14 @@ fn test_full_and_partial_prefix_forks_and_restores_continue_exactly() -> Result<
+         // Fresh requests computing the same full sequences without any sharing.
+         let fresh = greedy(&mut engine)?;
+         let fresh_first = feed(&mut engine, fresh, prefix)?;
+-        assert_eq!(fresh_first, first);
++        assert_eq!(fresh_first, first, "{format}");
+         assert_eq!(
+             continue_greedy(&mut engine, fresh, fresh_first, 6)?,
+-            expected
++            expected,
++            "{format}"
+         );
+         let fresh_b = greedy(&mut engine)?;
+-        assert_eq!(feed(&mut engine, fresh_b, &tokens)?, fork_next);
++        assert_eq!(feed(&mut engine, fresh_b, &tokens)?, fork_next, "{format}");
+         // The checkpoint never changed, and restoring it replays exactly.
+         assert_eq!(snapshot(saved.model_state())?, saved_state);
+         let a = engine.restore(engine.metadata(a.request)?.handle, &saved)?;
+@@ -773,9 +794,9 @@ fn test_full_and_partial_prefix_forks_and_restores_continue_exactly() -> Result<
+             .pop()
+             .ok_or_else(|| invalid("missing result"))?
+             .outcome?;
+-        assert_eq!(commit.accepted_tokens, 3);
++        assert_eq!(commit.accepted_tokens, 3, "{format}");
+         let outputs: Vec<u32> = commit.outputs.iter().map(|o| o.token).collect();
+-        assert_eq!(outputs, expected[1..4]);
++        assert_eq!(outputs, expected[1..4], "{format}");
+         let next = *outputs.last().ok_or_else(|| invalid("no output"))?;
+         assert_eq!(continue_greedy(&mut engine, c, next, 3)?, expected[3..6]);
+         for handle in [a, b, c, fresh, fresh_b] {
+@@ -791,13 +812,20 @@ fn test_full_and_partial_prefix_forks_and_restores_continue_exactly() -> Result<
+ fn test_memory_pressure_fails_new_work_without_corrupting_live_requests() -> Result<()> {
+     let _gpu = GPU.lock();
+     let checkpoint = small()?;
++    for format in LIFECYCLE_FORMATS {
++        memory_pressure(&checkpoint.0, format)?;
++    }
++    Ok(())
++}
++
++fn memory_pressure(dir: &Path, format: KvFormat) -> Result<()> {
+     let device = metal()?;
+     let model = Arc::new(load_kv(
+-        &checkpoint.0,
++        dir,
+         WeightFormat::Q8_0,
+         &device,
+         Execution::Fused,
+-        KvLayout::new(16, KvFormat::Q8),
++        KvLayout::new(16, format),
+     )?);
+     let tokens = prompt(60, 25);
+     let mut control = HybridEngine::new(
+@@ -836,7 +864,7 @@ fn test_memory_pressure_fails_new_work_without_corrupting_live_requests() -> Res
+         let last = *out.last().ok_or_else(|| invalid("empty"))?;
+         out.push(feed(&mut engine, a, &[last])?);
+     }
+-    assert_eq!(out, expected);
++    assert_eq!(out, expected, "{format}");
+     assert!(rejected > 0);
+     assert_eq!(engine.metadata(b.request)?.position, 0);
+     // Releasing a admits b; the pool never grew.
+diff --git a/crates/tur-metal/benches/kernels.rs b/crates/tur-metal/benches/kernels.rs
+index d920514..015664b 100644
+--- a/crates/tur-metal/benches/kernels.rs
++++ b/crates/tur-metal/benches/kernels.rs
+@@ -14,11 +14,16 @@
+ //! `TUR_BENCH_LINEAR=q8_0,q4k,q5k,q6k` selects projection formats (default `q8_0,q4k`);
+ //! Q5K and Q6K have no Tur kernels and measure Candle's only.
+ //! `TUR_BENCH_SHAPE=<substring>` selects tiled attention shapes for focused tuning.
++//! `TUR_BENCH_KV=f16,q8,q4,tq4` selects the K/V formats of the paged and tiled groups
++//! (default every format with kernels).
+ 
+ use candle_core::{D, DType, Device, Tensor, quantized::GgmlDType};
+ use serde_json::{Value, json};
+ use std::time::Instant;
+-use tur_core::{Result, execution::KvFormat};
++use tur_core::{
++    Result, TurError,
++    execution::{KvCodec, KvFormat},
++};
+ use tur_metal::{
+     kernels::{DeltaShape, Heads, Kernels, PagedKv, RecurrentSpan, Tuning},
+     packed::PackedLinear,
+@@ -229,18 +234,22 @@ fn paged(
+     let length = past + new;
+     let pages = length.div_ceil(page);
+     let slots = pages * page * sequences;
+-    let store = || -> Result<KvPool> {
++    let store = |codec: KvCodec| -> Result<KvPool> {
++        let scales = codec.row_scales(dim);
+         Ok(KvPool {
+-            data: Tensor::zeros((slots, kv_heads, dim), format.data_dtype(), device)?,
+-            scales: format
+-                .group()
+-                .map(|g| Tensor::zeros((slots, kv_heads, dim / g), DType::F16, device))
++            data: Tensor::zeros(
++                (slots, kv_heads, codec.row_elements(dim)),
++                codec.data_dtype(),
++                device,
++            )?,
++            scales: (scales > 0)
++                .then(|| Tensor::zeros((slots, kv_heads, scales), DType::F16, device))
+                 .transpose()?,
+         })
+     };
+     let pool = AttentionPool {
+-        key: store()?,
+-        value: store()?,
++        key: store(format.key())?,
++        value: store(format.value())?,
+         format,
+         page_tokens: page,
+         kv_heads,
+@@ -352,16 +361,22 @@ fn attention_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+     Ok(cases)
+ }
+ 
++/// `TUR_BENCH_KV`'s formats, or `default`.
++fn kv_formats(default: &[&str]) -> Result<Vec<KvFormat>> {
++    let names = std::env::var("TUR_BENCH_KV").unwrap_or_else(|_| default.join(","));
++    names
++        .split(',')
++        .filter(|name| !name.is_empty())
++        .map(|name| name.parse().map_err(TurError::Other))
++        .collect()
++}
++
+ /// K/V format × page size sweep at Qwen3.5-0.8B attention shapes: attention over pages
+ /// in place, and the quantize-on-write cost of the pass's new rows.
+ fn paged_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+-    let formats = [
+-        KvFormat::F32,
+-        KvFormat::F16,
+-        KvFormat::Q8,
+-        KvFormat::Q8 { group: 64 },
+-        KvFormat::Q8 { group: 256 },
+-    ];
++    let formats = kv_formats(&[
++        "f32", "f16", "q8", "q8_64", "q8_256", "q4", "q4a", "tq4", "tq4p",
++    ])?;
+     // (label, past, new tokens per sequence, sequences)
+     let shapes = [
+         ("decode ctx 2048", 2047usize, 1usize, 1usize),
+@@ -382,7 +397,7 @@ fn paged_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+             head_stride: HEAD_DIM,
+             col_offset: 0,
+         };
+-        for format in formats {
++        for &format in &formats {
+             for page in [16usize, 32, 64, 128] {
+                 let paged = paged(
+                     device, kernels, format, page, KV_HEADS, HEAD_DIM, past, new, sequences,
+@@ -394,7 +409,7 @@ fn paged_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+                     kernels.kv_write(&rows, heads, &rows, heads, &paged.pool, &paged.kv)?;
+                     Ok(rows.clone())
+                 })?;
+-                let bytes = format.token_bytes(KV_HEADS, HEAD_DIM)? * 2 * paged.slots;
++                let bytes = format.token_bytes(KV_HEADS, HEAD_DIM)? * paged.slots;
+                 // One or two query heads per simdgroup share each loaded K/V row.
+                 let mut head_groups = Vec::new();
+                 if page == 16 && new == 1 {
+@@ -450,6 +465,7 @@ fn tiled_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+         ("chunk 32 x4 after 1024", 1024, 32, 4),
+         ("decode ctx 2048 x8", 2047, 1, 8),
+     ];
++    let formats = kv_formats(&["f32", "f16", "q8", "q4", "q4a", "tq4", "tq4p"])?;
+     let mut cases = Vec::new();
+     let shape_filter = std::env::var("TUR_BENCH_SHAPE").ok();
+     for (label, past, new, sequences) in shapes {
+@@ -462,7 +478,7 @@ fn tiled_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+         let tokens = new * sequences;
+         let q = random(device, &[tokens, HEADS, HEAD_DIM], 5, 1.0)?;
+         let gate = random(device, &[tokens, HEADS * 2 * HEAD_DIM], 6, 1.0)?;
+-        for format in [KvFormat::F32, KvFormat::F16, KvFormat::Q8] {
++        for &format in &formats {
+             let paged = paged(
+                 device, kernels, format, 16, KV_HEADS, HEAD_DIM, past, new, sequences,
+             )?;
+diff --git a/crates/tur-metal/src/codec.rs b/crates/tur-metal/src/codec.rs
+new file mode 100644
+index 0000000..a0c9e1c
+--- /dev/null
++++ b/crates/tur-metal/src/codec.rs
+@@ -0,0 +1,578 @@
++#![forbid(unsafe_code)]
++//! Host reference of the 4- to 6-bit K/V codecs: symmetric and asymmetric groupwise codes
++//! and the `TurboQuant` rotations, codebooks and QJL residual signs. The kernels apply the same
++//! arithmetic in the same order, so their codes match these except where float division
++//! rounding moves a value across a decision boundary.
++//!
++//! Rotated codecs store `y = H·D·x / √d`, with `H` the Sylvester Hadamard matrix and `D`
++//! a diagonal of pseudo-random signs fixed by [`ROTATION_SEED`]. The QJL projection is
++//! `S = H·D₂` (rows of norm `√d`, like an i.i.d. Gaussian sketch) with signs from
++//! [`QJL_SEED`]. Both seeds are part of [`tur_core::execution::KV_LAYOUT_VERSION`].
++
++use candle_core::{DType, Device, Tensor};
++use tur_core::{
++    Result,
++    execution::{KvCodec, invalid},
++};
++
++/// Seed of the rotation signs `D`.
++pub const ROTATION_SEED: u32 = 0x5EED_0001;
++/// Seed of the QJL projection signs `D₂`.
++pub const QJL_SEED: u32 = 0x5EED_0002;
++
++/// Lloyd–Max reconstruction levels of a unit Gaussian at 16 levels (Max, 1960).
++pub const LLOYD_MAX_16: [f32; 16] = [
++    -2.732_589_6,
++    -2.069_017_2,
++    -1.618_046_4,
++    -1.256_231_2,
++    -0.942_340_5,
++    -0.656_759_1,
++    -0.388_048_3,
++    -0.128_395,
++    0.128_395,
++    0.388_048_3,
++    0.656_759_1,
++    0.942_340_5,
++    1.256_231_2,
++    1.618_046_4,
++    2.069_017_2,
++    2.732_589_6,
++];
++
++/// Lloyd–Max reconstruction levels of a unit Gaussian at 8 levels.
++pub const LLOYD_MAX_8: [f32; 8] = [
++    -2.151_945_7,
++    -1.343_909_3,
++    -0.756_005_3,
++    -0.245_094_2,
++    0.245_094_2,
++    0.756_005_3,
++    1.343_909_3,
++    2.151_945_7,
++];
++
++/// Positive half of the 32-level Lloyd–Max codebook of a unit Gaussian; the negative half
++/// mirrors it.
++const LLOYD_MAX_32_HALF: [f32; 16] = [
++    0.065_889_7,
++    0.198_051_8,
++    0.331_378_3,
++    0.466_699_5,
++    0.604_933_6,
++    0.747_135_7,
++    0.894_565_1,
++    1.048_783_3,
++    1.211_804_4,
++    1.386_340_3,
++    1.576_228_1,
++    1.787_233_2,
++    2.028_728_4,
++    2.317_739_4,
++    2.691_119_6,
++    3.260_732_5,
++];
++
++/// Positive half of the 64-level Lloyd–Max codebook of a unit Gaussian.
++const LLOYD_MAX_64_HALF: [f32; 32] = [
++    0.033_409_5,
++    0.100_278_3,
++    0.167_296_9,
++    0.234_567,
++    0.302_192_8,
++    0.370_282_6,
++    0.438_949_7,
++    0.508_313_8,
++    0.578_503,
++    0.649_655_6,
++    0.721_921_9,
++    0.795_467_7,
++    0.870_476_6,
++    0.947_154_9,
++    1.025_736_3,
++    1.106_488_2,
++    1.189_720_1,
++    1.275_794_5,
++    1.365_141,
++    1.458_276_4,
++    1.555_831_2,
++    1.658_588_9,
++    1.767_541_9,
++    1.883_977_2,
++    2.009_611,
++    2.146_810_2,
++    2.298_981_2,
++    2.471_305,
++    2.672_273_8,
++    2.917_406_8,
++    3.240_437,
++    3.744_101_3,
++];
++
++/// A symmetric codebook from its positive half, in increasing order.
++fn mirrored(half: &[f32]) -> Vec<f32> {
++    half.iter()
++        .rev()
++        .map(|v| -v)
++        .chain(half.iter().copied())
++        .collect()
++}
++
++/// The Lloyd–Max codebook of a rotated codec.
++fn codebook(codec: KvCodec) -> Vec<f32> {
++    match codec {
++        KvCodec::Tq5 => mirrored(&LLOYD_MAX_32_HALF),
++        KvCodec::Tq6 => mirrored(&LLOYD_MAX_64_HALF),
++        KvCodec::Tq3Qjl => LLOYD_MAX_8.to_vec(),
++        _ => LLOYD_MAX_16.to_vec(),
++    }
++}
++
++/// Pack `bits`-bit codes of rows of `dim`: per row, the low nibbles two per byte, then the
++/// remaining high bits `8 / (bits - 4)` per byte, lowest dimension in the lowest bits.
++fn pack(codes: &[u8], dim: usize, bits: usize) -> Vec<u8> {
++    let high = bits - 4;
++    let mut out = Vec::with_capacity(codes.len() * bits / 8);
++    for row in codes.chunks(dim) {
++        out.extend(row.chunks(2).map(|p| (p[0] & 15) | ((p[1] & 15) << 4)));
++        if let Some(per) = 8usize.checked_div(high) {
++            out.extend(row.chunks(per).map(|group| {
++                group
++                    .iter()
++                    .enumerate()
++                    .fold(0u8, |byte, (i, c)| byte | ((c >> 4) << (i * high)))
++            }));
++        }
++    }
++    out
++}
++
++/// Inverse of [`pack`].
++fn unpack(bytes: &[u8], dim: usize, bits: usize) -> Vec<u8> {
++    let high = bits - 4;
++    let mask = (1u8 << high) - 1;
++    let mut codes = Vec::with_capacity(bytes.len() * 8 / bits);
++    for row in bytes.chunks(dim * bits / 8) {
++        let (low, upper) = row.split_at(dim / 2);
++        let start = codes.len();
++        codes.extend(low.iter().flat_map(|b| [b & 15, b >> 4]));
++        if let Some(per) = 8usize.checked_div(high) {
++            for (i, code) in codes[start..].iter_mut().enumerate() {
++                *code |= ((upper[i / per] >> ((i % per) * high)) & mask) << 4;
++            }
++        }
++    }
++    codes
++}
++
++/// `lowbias32` integer hash; the kernels use the same function.
++fn hash(mut x: u32) -> u32 {
++    x ^= x >> 16;
++    x = x.wrapping_mul(0x7feb_352d);
++    x ^= x >> 15;
++    x = x.wrapping_mul(0x846c_a68b);
++    x ^ (x >> 16)
++}
++
++/// Sign `±1` of dimension `i` under `seed`.
++pub fn sign(seed: u32, i: usize) -> f32 {
++    if hash(seed ^ i as u32) & 1 == 0 {
++        1.0
++    } else {
++        -1.0
++    }
++}
++
++/// Unnormalised in-place Walsh–Hadamard transform, strides in increasing order: the
++/// kernels' butterfly order, so both round identically.
++fn hadamard(x: &mut [f32]) {
++    let n = x.len();
++    let mut stride = 1;
++    while stride < n {
++        for base in (0..n).step_by(2 * stride) {
++            for i in base..base + stride {
++                let (a, b) = (x[i], x[i + stride]);
++                x[i] = a + b;
++                x[i + stride] = a - b;
++            }
++        }
++        stride *= 2;
++    }
++}
++
++/// `H·D·x / √d`.
++pub fn rotate(x: &mut [f32]) {
++    for (i, v) in x.iter_mut().enumerate() {
++        *v *= sign(ROTATION_SEED, i);
++    }
++    hadamard(x);
++    let norm = (x.len() as f32).sqrt().recip();
++    for v in x.iter_mut() {
++        *v *= norm;
++    }
++}
++
++/// Inverse of [`rotate`]: `D·H·y / √d`.
++pub fn unrotate(y: &mut [f32]) {
++    hadamard(y);
++    let norm = (y.len() as f32).sqrt().recip();
++    for (i, v) in y.iter_mut().enumerate() {
++        *v *= norm * sign(ROTATION_SEED, i);
++    }
++}
++
++/// QJL projection `H·D₂·x` (unnormalised).
++pub fn project(x: &mut [f32]) {
++    for (i, v) in x.iter_mut().enumerate() {
++        *v *= sign(QJL_SEED, i);
++    }
++    hadamard(x);
++}
++
++/// Index of the nearest level: the number of midpoints strictly below `u`. Midpoints are
++/// `0.5 · (a + b)` in F32, exactly as the kernels compute them (`f32::midpoint` rounds
++/// once in F64 and can differ in the last bit).
++#[allow(clippy::manual_midpoint, reason = "must round like the kernels")]
++fn nearest(levels: &[f32], u: f32) -> u8 {
++    levels
++        .windows(2)
++        .filter(|w| 0.5 * (w[0] + w[1]) < u)
++        .count() as u8
++}
++
++/// Round every value to F16 and back, as the kernels store scales.
++fn round_f16(values: Vec<f32>) -> Result<Vec<f32>> {
++    let n = values.len();
++    Ok(Tensor::from_vec(values, n, &Device::Cpu)?
++        .to_dtype(DType::F16)?
++        .to_dtype(DType::F32)?
++        .to_vec1::<f32>()?)
++}
++
++/// Encode `[n, heads, dim]` rows with a 4-bit `codec`: U8 `[n, heads, dim / 2]` nibbles
++/// and F16 `[n, heads, codec.row_scales(dim)]` scales, on the input's device.
++pub fn encode(codec: KvCodec, x: &Tensor) -> Result<(Tensor, Tensor)> {
++    let (n, heads, dim) = x.dims3()?;
++    let rows = n * heads;
++    let values = x
++        .to_dtype(DType::F32)?
++        .to_device(&Device::Cpu)?
++        .flatten_all()?
++        .to_vec1::<f32>()?;
++    let per = codec.row_scales(dim);
++    let mut codes = vec![0u8; rows * dim];
++    let mut scales = vec![0f32; rows * per];
++    let divisor = |s: f32| s.max(f32::MIN_POSITIVE);
++    match codec {
++        KvCodec::Q4 { group } | KvCodec::Q6 { group } => {
++            let limit = if codec.bits() == 4 { 7.0f32 } else { 31.0 };
++            let raw = values
++                .chunks(group)
++                .map(|g| g.iter().fold(0f32, |m, v| m.max(v.abs())) * (1.0 / limit))
++                .collect();
++            scales = round_f16(raw)?;
++            for (i, v) in values.iter().enumerate() {
++                let q = (v / divisor(scales[i / group]))
++                    .round()
++                    .clamp(-limit, limit);
++                codes[i] = (q as i32 + limit as i32 + 1) as u8;
++            }
++        }
++        KvCodec::Q4A { group } => {
++            let mins = round_f16(
++                values
++                    .chunks(group)
++                    .map(|g| g.iter().fold(f32::INFINITY, |m, v| m.min(*v)))
++                    .collect(),
++            )?;
++            let raw = values
++                .chunks(group)
++                .zip(&mins)
++                .map(|(g, min)| (g.iter().fold(f32::NEG_INFINITY, |m, v| m.max(*v)) - min) / 15.0)
++                .collect();
++            let steps = round_f16(raw)?;
++            for (i, v) in values.iter().enumerate() {
++                let g = i / group;
++                codes[i] = ((v - mins[g]) / divisor(steps[g])).round().clamp(0.0, 15.0) as u8;
++            }
++            for (g, (step, min)) in steps.iter().zip(&mins).enumerate() {
++                scales[2 * g] = *step;
++                scales[2 * g + 1] = *min;
++            }
++        }
++        KvCodec::Tq4 | KvCodec::Tq5 | KvCodec::Tq6 | KvCodec::Tq3Qjl => {
++            let mut rotated = values;
++            let root = (dim as f32).sqrt().recip();
++            let raw = rotated
++                .chunks_mut(dim)
++                .map(|row| {
++                    rotate(row);
++                    row.iter().map(|v| v * v).sum::<f32>().sqrt() * root
++                })
++                .collect();
++            let row_scales = round_f16(raw)?;
++            if codec == KvCodec::Tq3Qjl {
++                let mut residual_scales = Vec::with_capacity(rows);
++                let qjl = (std::f32::consts::FRAC_PI_2).sqrt() / dim as f32;
++                for (r, row) in rotated.chunks(dim).enumerate() {
++                    let s = row_scales[r];
++                    let mut residual: Vec<f32> = row
++                        .iter()
++                        .enumerate()
++                        .map(|(i, v)| {
++                            let c = nearest(&LLOYD_MAX_8, v / divisor(s));
++                            codes[r * dim + i] = c;
++                            v / divisor(s) - LLOYD_MAX_8[c as usize]
++                        })
++                        .collect();
++                    let norm = residual.iter().map(|e| e * e).sum::<f32>().sqrt();
++                    residual_scales.push(s * qjl * norm);
++                    project(&mut residual);
++                    for (i, z) in residual.iter().enumerate() {
++                        if *z < 0.0 {
++                            codes[r * dim + i] |= 8;
++                        }
++                    }
++                }
++                let residual_scales = round_f16(residual_scales)?;
++                for r in 0..rows {
++                    scales[2 * r] = row_scales[r];
++                    scales[2 * r + 1] = residual_scales[r];
++                }
++            } else {
++                let levels = codebook(codec);
++                for (i, v) in rotated.iter().enumerate() {
++                    codes[i] = nearest(&levels, v / divisor(row_scales[i / dim]));
++                }
++                scales = row_scales;
++            }
++        }
++        _ => return Err(invalid(format!("{codec:?} is not a packed codec"))),
++    }
++    let packed = pack(&codes, dim, codec.bits());
++    let device = x.device();
++    Ok((
++        Tensor::from_vec(packed, (n, heads, codec.row_elements(dim)), &Device::Cpu)?
++            .to_device(device)?,
++        Tensor::from_vec(scales, (n, heads, per), &Device::Cpu)?
++            .to_dtype(DType::F16)?
++            .to_device(device)?,
++    ))
++}
++
++/// Inverse of [`encode`]: F32 `[n, heads, dim]` in the original basis. Rotated keys of
++/// [`KvCodec::Tq3Qjl`] decode to the QJL inner-product estimator
++/// `s·c + r·Sᵀρ` rotated back, so `q · k̂` equals the kernels' two-term score.
++pub fn decode(codec: KvCodec, data: &Tensor, scales: &Tensor) -> Result<Tensor> {
++    let (n, heads, bytes) = data.dims3()?;
++    let dim = bytes * 8 / codec.bits();
++    let per = codec.row_scales(dim);
++    if scales.dims() != [n, heads, per] {
++        return Err(invalid("K/V scales do not match the codec"));
++    }
++    let bytes = data
++        .to_device(&Device::Cpu)?
++        .flatten_all()?
++        .to_vec1::<u8>()?;
++    let scales = scales
++        .to_dtype(DType::F32)?
++        .to_device(&Device::Cpu)?
++        .flatten_all()?
++        .to_vec1::<f32>()?;
++    let codes = unpack(&bytes, dim, codec.bits());
++    let mut out = vec![0f32; codes.len()];
++    match codec {
++        KvCodec::Q4 { group } | KvCodec::Q6 { group } => {
++            let zero = if codec.bits() == 4 { 8.0 } else { 32.0 };
++            for (i, c) in codes.iter().enumerate() {
++                out[i] = scales[i / group] * (f32::from(*c) - zero);
++            }
++        }
++        KvCodec::Q4A { group } => {
++            for (i, c) in codes.iter().enumerate() {
++                let g = i / group;
++                out[i] = scales[2 * g].mul_add(f32::from(*c), scales[2 * g + 1]);
++            }
++        }
++        KvCodec::Tq4 | KvCodec::Tq5 | KvCodec::Tq6 => {
++            let levels = codebook(codec);
++            for (r, row) in out.chunks_mut(dim).enumerate() {
++                for (i, v) in row.iter_mut().enumerate() {
++                    *v = scales[r] * levels[codes[r * dim + i] as usize];
++                }
++                unrotate(row);
++            }
++        }
++        KvCodec::Tq3Qjl => {
++            for (r, row) in out.chunks_mut(dim).enumerate() {
++                let (s, residual) = (scales[2 * r], scales[2 * r + 1]);
++                // Sᵀρ = D₂·H·ρ.
++                let mut signs: Vec<f32> = codes[r * dim..(r + 1) * dim]
++                    .iter()
++                    .map(|c| if c & 8 == 0 { 1.0 } else { -1.0 })
++                    .collect();
++                hadamard(&mut signs);
++                for (i, v) in row.iter_mut().enumerate() {
++                    let c = codes[r * dim + i] & 7;
++                    *v = (residual * sign(QJL_SEED, i))
++                        .mul_add(signs[i], s * LLOYD_MAX_8[c as usize]);
++                }
++                unrotate(row);
++            }
++        }
++        _ => return Err(invalid(format!("{codec:?} is not a packed codec"))),
++    }
++    Ok(Tensor::from_vec(out, (n, heads, dim), &Device::Cpu)?.to_device(data.device())?)
++}
++
++#[cfg(test)]
++#[allow(
++    clippy::panic_in_result_fn,
++    reason = "tests assert outcomes after fallible setup"
++)]
++mod tests {
++    use super::*;
++
++    fn rows(n: usize, dim: usize, seed: u32) -> Vec<f32> {
++        (0..n * dim)
++            .map(|i| {
++                let u = hash(seed.wrapping_mul(0x9e37_79b9) ^ i as u32) as f32 / u32::MAX as f32;
++                // A few large outlier channels, as real keys have.
++                let outlier = if i % dim == 3 { 12.0 } else { 1.0 };
++                u.mul_add(2.0, -1.0) * outlier
++            })
++            .collect()
++    }
++
++    fn mse(a: &[f32], b: &[f32]) -> f32 {
++        a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>() / a.len() as f32
++    }
++
++    #[test]
++    fn test_rotation_is_orthonormal_and_inverts() {
++        for dim in [64usize, 128, 256] {
++            let x = rows(1, dim, 1);
++            let mut y = x.clone();
++            rotate(&mut y);
++            let norm = |v: &[f32]| v.iter().map(|a| a * a).sum::<f32>().sqrt();
++            assert!((norm(&x) - norm(&y)).abs() < 1e-4 * norm(&x));
++            unrotate(&mut y);
++            assert!(mse(&x, &y) < 1e-12);
++        }
++        // Signs are balanced and differ between the two seeds.
++        let plus = (0..256).filter(|&i| sign(ROTATION_SEED, i) > 0.0).count();
++        assert!((96..160).contains(&plus));
++        assert!((0..256).any(|i| (sign(ROTATION_SEED, i) > 0.0) != (sign(QJL_SEED, i) > 0.0)));
++    }
++
++    #[test]
++    fn test_codebooks_are_symmetric_and_sorted() {
++        let wide = [codebook(KvCodec::Tq5), codebook(KvCodec::Tq6)];
++        assert_eq!((wide[0].len(), wide[1].len()), (32, 64));
++        for levels in [&LLOYD_MAX_16[..], &LLOYD_MAX_8[..], &wide[0], &wide[1]] {
++            assert!(levels.windows(2).all(|w| w[0] < w[1]));
++            for (a, b) in levels.iter().zip(levels.iter().rev()) {
++                assert_eq!(*a, -*b);
++            }
++        }
++        assert_eq!(nearest(&LLOYD_MAX_16, 0.0), 7);
++        assert_eq!(nearest(&LLOYD_MAX_16, 1e-6), 8);
++        assert_eq!(nearest(&LLOYD_MAX_16, 99.0), 15);
++        assert_eq!(nearest(&LLOYD_MAX_8, -99.0), 0);
++    }
++
++    #[test]
++    fn test_low_bit_codecs_round_trip_within_their_error_bounds() -> Result<()> {
++        let (n, heads, dim) = (6, 2, 256);
++        let x = rows(n * heads, dim, 2);
++        let tensor = Tensor::from_slice(&x, (n, heads, dim), &Device::Cpu)?;
++        let power = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
++        for (codec, bound) in [
++            (KvCodec::Q4 { group: 32 }, 0.05),
++            (KvCodec::Q4 { group: 64 }, 0.05),
++            (KvCodec::Q4A { group: 32 }, 0.05),
++            (KvCodec::Tq4, 0.02),
++            (KvCodec::Q6 { group: 32 }, 0.003),
++            (KvCodec::Tq5, 0.006),
++            (KvCodec::Tq6, 0.0015),
++        ] {
++            let (data, scales) = encode(codec, &tensor)?;
++            assert_eq!(data.dims(), [n, heads, dim * codec.bits() / 8]);
++            assert_eq!(scales.dims(), [n, heads, codec.row_scales(dim)]);
++            let restored = decode(codec, &data, &scales)?
++                .flatten_all()?
++                .to_vec1::<f32>()?;
++            let error = mse(&x, &restored) / power;
++            assert!(error < bound, "{codec:?}: {error}");
++            // Re-encoding decoded rows is stable for unrotated codes.
++            if !codec.rotated() {
++                let again = Tensor::from_slice(&restored, (n, heads, dim), &Device::Cpu)?;
++                let (codes, _) = encode(codec, &again)?;
++                assert_eq!(
++                    codes.flatten_all()?.to_vec1::<u8>()?,
++                    data.flatten_all()?.to_vec1::<u8>()?,
++                    "{codec:?}"
++                );
++            }
++        }
++        // Symmetric groups bound each element by half a step; outliers inflate the step
++        // only in their own group.
++        let (data, scales) = encode(KvCodec::Q4 { group: 32 }, &tensor)?;
++        let steps = scales
++            .to_dtype(DType::F32)?
++            .flatten_all()?
++            .to_vec1::<f32>()?;
++        let restored = decode(KvCodec::Q4 { group: 32 }, &data, &scales)?
++            .flatten_all()?
++            .to_vec1::<f32>()?;
++        for (i, (a, b)) in x.iter().zip(&restored).enumerate() {
++            assert!((a - b).abs() <= 0.5 * steps[i / 32] * 1.001, "element {i}");
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn test_bit_planes_round_trip_every_code() {
++        for bits in [4usize, 5, 6] {
++            let dim = 64;
++            let codes: Vec<u8> = (0..2 * dim).map(|i| (i * 37 % (1 << bits)) as u8).collect();
++            let packed = pack(&codes, dim, bits);
++            assert_eq!(packed.len(), 2 * dim * bits / 8);
++            assert_eq!(unpack(&packed, dim, bits), codes, "{bits} bits");
++        }
++    }
++
++    #[test]
++    fn test_qjl_keys_estimate_inner_products_without_bias() -> Result<()> {
++        // Over many keys, the TurboQuant-prod estimate of q·k has a mean error far below
++        // its spread, and a smaller mean bias than the 3-bit codes alone.
++        let dim = 128;
++        let keys = 512;
++        let x = rows(keys, dim, 3);
++        let q = rows(1, dim, 4);
++        let tensor = Tensor::from_slice(&x, (keys, 1, dim), &Device::Cpu)?;
++        let (data, scales) = encode(KvCodec::Tq3Qjl, &tensor)?;
++        let restored = decode(KvCodec::Tq3Qjl, &data, &scales)?
++            .flatten_all()?
++            .to_vec1::<f32>()?;
++        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
++        let errors: Vec<f32> = x
++            .chunks(dim)
++            .zip(restored.chunks(dim))
++            .map(|(k, e)| dot(&q, e) - dot(&q, k))
++            .collect();
++        let mean = errors.iter().sum::<f32>() / keys as f32;
++        let spread = (errors.iter().map(|e| (e - mean).powi(2)).sum::<f32>() / keys as f32).sqrt();
++        assert!(mean.abs() < 0.2 * spread, "mean {mean}, spread {spread}");
++        // Zero rows encode to zero scales and decode to zeros, not NaN.
++        let zeros = Tensor::zeros((1, 1, dim), DType::F32, &Device::Cpu)?;
++        for codec in [KvCodec::Tq4, KvCodec::Tq3Qjl, KvCodec::Q4A { group: 32 }] {
++            let (data, scales) = encode(codec, &zeros)?;
++            let restored = decode(codec, &data, &scales)?
++                .flatten_all()?
++                .to_vec1::<f32>()?;
++            assert!(restored.iter().all(|v| *v == 0.0), "{codec:?}");
++        }
++        Ok(())
++    }
++}
+diff --git a/crates/tur-metal/src/kernels/attention.metal b/crates/tur-metal/src/kernels/attention.metal
+index e1686e2..b6aa71a 100644
+--- a/crates/tur-metal/src/kernels/attention.metal
++++ b/crates/tur-metal/src/kernels/attention.metal
+@@ -1,10 +1,151 @@
+ // ---------------------------------------------------------------------------------------
+ // Paged K/V: quantize-on-write of new rows and attention reading pages in place.
+-// Storage formats: F32 and F16 values, or Q8 two's-complement codes with one F16 scale
+-// per `group` head dimensions. Q8 groups are multiples of 32, so a group never splits a
+-// 32-dimension run of one register (writes) or a lane's 4-dimension vector (reads).
++// Codecs (one per role; a format may store keys and values differently):
++//   KV_PLAIN  F32 or F16 values.
++//   KV_Q8     two's-complement codes with one F16 scale per `group` dimensions.
++//   KV_Q4     4-bit codes c in 1..15 decoding to scale * (c - 8), one scale per group.
++//   KV_Q4A    4-bit codes c in 0..15 decoding to min + step * c, a (step, min) pair per group.
++//   KV_TQ4    TurboQuant-MSE: rows in the randomized Hadamard basis, one F16 scale per row
++//             and 16-level Lloyd-Max codes.
++//   KV_TQ3QJL TurboQuant-prod keys: 3-bit Lloyd-Max codes plus the sign of the QJL-projected
++//             residual in bit 3, and per row (scale, residual scale).
++//   KV_Q6     6-bit codes c in 1..63 decoding to scale * (c - 32), one scale per group.
++//   KV_TQ5/6  KV_TQ4 with 32- or 64-level codebooks.
++// Packed codes store dimension 2i's low nibble in the low nibble of byte i; 5- and 6-bit
++// codes then store their high bits in a plane after the nibbles, 8 / (bits - 4) per byte. Groups are multiples of 32,
++// so a group never splits a 32-dimension run of one register (writes) or a lane's vector
++// (reads). The host reference (`codec.rs`) defines the same arithmetic.
+ // ---------------------------------------------------------------------------------------
+ 
++#define KV_PLAIN 0
++#define KV_Q8 1
++#define KV_Q4 2
++#define KV_Q4A 3
++#define KV_TQ4 4
++#define KV_TQ3QJL 5
++#define KV_Q6 6
++#define KV_TQ5 7
++#define KV_TQ6 8
++
++#define KV_ROTATION_SEED 0x5EED0001u
++#define KV_QJL_SEED 0x5EED0002u
++
++constant float LLOYD_MAX_16[16] = {
++    -2.7325896f, -2.0690172f, -1.6180464f, -1.2562312f, -0.9423405f, -0.6567591f,
++    -0.3880483f, -0.128395f, 0.128395f, 0.3880483f, 0.6567591f, 0.9423405f,
++    1.2562312f, 1.6180464f, 2.0690172f, 2.7325896f};
++constant float LLOYD_MAX_8[8] = {
++    -2.1519457f, -1.3439093f, -0.7560053f, -0.2450942f, 0.2450942f, 0.7560053f,
++    1.3439093f, 2.1519457f};
++
++static inline uint kv_hash(uint x) {
++    x ^= x >> 16;
++    x *= 0x7feb352du;
++    x ^= x >> 15;
++    x *= 0x846ca68bu;
++    return x ^ (x >> 16);
++}
++
++static inline float kv_sign(uint seed, uint i) {
++    return (kv_hash(seed ^ i) & 1u) == 0 ? 1.0f : -1.0f;
++}
++
++constant float LLOYD_MAX_32[32] = {
++    -3.2607325f, -2.6911196f, -2.3177394f, -2.0287284f, -1.7872332f, -1.5762281f,
++    -1.3863403f, -1.2118044f, -1.0487833f, -0.8945651f, -0.7471357f, -0.6049336f,
++    -0.4666995f, -0.3313783f, -0.1980518f, -0.0658897f, 0.0658897f, 0.1980518f,
++    0.3313783f, 0.4666995f, 0.6049336f, 0.7471357f, 0.8945651f, 1.0487833f,
++    1.2118044f, 1.3863403f, 1.5762281f, 1.7872332f, 2.0287284f, 2.3177394f,
++    2.6911196f, 3.2607325f};
++constant float LLOYD_MAX_64[64] = {
++    -3.7441013f, -3.2404371f, -2.9174068f, -2.6722738f, -2.4713048f, -2.2989812f,
++    -2.1468102f, -2.009611f, -1.8839772f, -1.7675419f, -1.6585889f, -1.5558312f,
++    -1.4582764f, -1.365141f, -1.2757945f, -1.1897201f, -1.1064882f, -1.0257363f,
++    -0.9471549f, -0.8704766f, -0.7954677f, -0.7219219f, -0.6496556f, -0.578503f,
++    -0.5083138f, -0.4389497f, -0.3702826f, -0.3021928f, -0.234567f, -0.1672969f,
++    -0.1002783f, -0.0334095f, 0.0334095f, 0.1002783f, 0.1672969f, 0.234567f,
++    0.3021928f, 0.3702826f, 0.4389497f, 0.5083138f, 0.578503f, 0.6496556f,
++    0.7219219f, 0.7954677f, 0.8704766f, 0.9471549f, 1.0257363f, 1.1064882f,
++    1.1897201f, 1.2757945f, 1.365141f, 1.4582764f, 1.5558312f, 1.6585889f,
++    1.7675419f, 1.8839772f, 2.009611f, 2.1468102f, 2.2989812f, 2.4713048f,
++    2.6722738f, 2.9174068f, 3.2404371f, 3.7441013f};
++
++// Bit-packed codes (4 to 6 bits), and of those the rotated TurboQuant codecs.
++static constexpr bool kv_packed(uint q) { return q >= KV_Q4; }
++static constexpr bool kv_rotated(uint q) { return q == KV_TQ4 || q == KV_TQ3QJL || q == KV_TQ5 || q == KV_TQ6; }
++static constexpr uint kv_bits(uint q) { return q == KV_Q6 || q == KV_TQ6 ? 6 : q == KV_TQ5 ? 5 : 4; }
++
++// F16 parameters per stored row.
++template <uint Q>
++static inline uint kv_scale_count(uint dim, uint group) {
++    return Q == KV_PLAIN ? 0
++        : Q == KV_Q8 || Q == KV_Q4 || Q == KV_Q6 ? dim / group
++        : Q == KV_Q4A ? 2 * dim / group
++        : Q == KV_TQ3QJL ? 2
++        : 1;
++}
++
++// Reconstruction level of a rotated codec's code.
++template <uint Q>
++static inline float kv_level(uint c) {
++    return Q == KV_TQ6 ? LLOYD_MAX_64[c & 63u] : Q == KV_TQ5 ? LLOYD_MAX_32[c & 31u] : LLOYD_MAX_16[c & 15u];
++}
++
++// Index of the nearest Lloyd-Max level: the number of midpoints strictly below u.
++template <uint L>
++static inline uint kv_nearest(constant float *levels, float u) {
++    uint c = 0;
++    for (uint j = 0; j + 1 < L; ++j) {
++        c += 0.5f * (levels[j] + levels[j + 1]) < u ? 1u : 0u;
++    }
++    return c;
++}
++
++// Unnormalised Walsh-Hadamard transform of a row held as x[r] at dimension lane + 32 r:
++// strides 1..16 across lanes, then across registers, in increasing order like the host.
++template <uint R>
++static inline void kv_hadamard(thread float (&x)[R], uint lane) {
++    for (uint m = 1; m < SIMD; m <<= 1) {
++        for (uint r = 0; r < R; ++r) {
++            float other = simd_shuffle_xor(x[r], m);
++            x[r] = (lane & m) != 0 ? other - x[r] : x[r] + other;
++        }
++    }
++    for (uint m = 1; m < R; m <<= 1) {
++        for (uint r = 0; r < R; ++r) {
++            if ((r & m) == 0) {
++                float a = x[r];
++                float b = x[r + m];
++                x[r] = a + b;
++                x[r + m] = a - b;
++            }
++        }
++    }
++}
++
++// Store register r's packed codes of a `dim`-dimension row: even lanes write the nibble
++// byte shared with the next lane; above 4 bits, the first lane of each run of 8 / (bits - 4)
++// lanes also writes their high bits into the plane after the nibbles.
++template <uint BITS>
++static inline void kv_store_codes(device uchar *dst, uint code, uint lane, uint r, uint dim) {
++    uint i = lane + SIMD * r;
++    uint high = simd_shuffle_down(code, 1);
++    if ((lane & 1) == 0) {
++        dst[i / 2] = uchar((code & 15u) | ((high & 15u) << 4));
++    }
++    if (BITS > 4) {
++        constexpr uint HB = BITS > 4 ? BITS - 4 : 1;
++        constexpr uint PER = 8 / HB;
++        uint bits = (code >> 4) << ((lane % PER) * HB);
++        for (uint s = 1; s < PER; s <<= 1) {
++            bits |= simd_shuffle_xor(bits, s);
++        }
++        if (lane % PER == 0) {
++            dst[dim / 2 + i / PER] = uchar(bits);
++        }
++    }
++}
++
+ struct KvWriteParams {
+     uint tokens;
+     uint kv_heads;
+@@ -18,21 +159,135 @@ struct KvWriteParams {
+     uint v_col;
+     uint v_head_stride;
+     float inv_127;
++    float inv_sqrt_dim;
++    float qjl;
+ };
+ 
++// Encode one row (x[r] at dimension lane + 32 r) of pool row `row` with codec Q.
++template <uint R, typename T, uint Q>
++static inline void kv_encode(thread float (&x)[R], device T *data, device half *scales_base, ulong row, uint lane, constant KvWriteParams &p) {
++    if (Q == KV_PLAIN) {
++        device T *dst = data + row * p.dim;
++        for (uint r = 0; r < R; ++r) {
++            dst[lane + SIMD * r] = T(x[r]);
++        }
++        return;
++    }
++    device half *scales = scales_base + row * kv_scale_count<Q>(p.dim, p.group);
++    uint per = p.group / SIMD;
++    if (Q == KV_Q8) {
++        device T *dst = data + row * p.dim;
++        for (uint g = 0; g * per < R; ++g) {
++            float amax = 0.0f;
++            for (uint r = g * per; r < (g + 1) * per; ++r) {
++                amax = max(amax, simd_max(fabs(x[r])));
++            }
++            half scale = half(amax * p.inv_127);
++            float divisor = max(float(scale), FLT_MIN);
++            for (uint r = g * per; r < (g + 1) * per; ++r) {
++                dst[lane + SIMD * r] = T(int(clamp(round(x[r] / divisor), -127.0f, 127.0f)));
++            }
++            if (lane == 0) {
++                scales[g] = scale;
++            }
++        }
++        return;
++    }
++    constexpr uint BITS = kv_bits(Q);
++    device uchar *dst = (device uchar *)data + row * (p.dim * BITS / 8);
++    if (Q == KV_Q4 || Q == KV_Q4A || Q == KV_Q6) {
++        const float limit = Q == KV_Q6 ? 31.0f : 7.0f;
++        for (uint g = 0; g * per < R; ++g) {
++            float lo = FLT_MAX, hi = -FLT_MAX, amax = 0.0f;
++            for (uint r = g * per; r < (g + 1) * per; ++r) {
++                lo = min(lo, simd_min(x[r]));
++                hi = max(hi, simd_max(x[r]));
++                amax = max(amax, simd_max(fabs(x[r])));
++            }
++            half step = Q == KV_Q4A ? half(0.0f) : Q == KV_Q6 ? half(amax * (1.0f / 31.0f)) : half(amax * (1.0f / 7.0f));
++            half lowest = half(lo);
++            if (Q == KV_Q4A) {
++                step = half((hi - float(lowest)) / 15.0f);
++            }
++            float divisor = max(float(step), FLT_MIN);
++            for (uint r = g * per; r < (g + 1) * per; ++r) {
++                uint code = Q == KV_Q4A
++                    ? uint(clamp(round((x[r] - float(lowest)) / divisor), 0.0f, 15.0f))
++                    : uint(int(clamp(round(x[r] / divisor), -limit, limit)) + int(limit) + 1);
++                kv_store_codes<BITS>(dst, code, lane, r, p.dim);
++            }
++            if (lane == 0) {
++                if (Q != KV_Q4A) {
++                    scales[g] = step;
++                } else {
++                    scales[2 * g] = step;
++                    scales[2 * g + 1] = lowest;
++                }
++            }
++        }
++        return;
++    }
++    // Rotated codecs: y = H D x / sqrt(dim), then one scale ||y|| / sqrt(dim) per row.
++    for (uint r = 0; r < R; ++r) {
++        x[r] *= kv_sign(KV_ROTATION_SEED, lane + SIMD * r);
++    }
++    kv_hadamard<R>(x, lane);
++    float squares = 0.0f;
++    for (uint r = 0; r < R; ++r) {
++        x[r] *= p.inv_sqrt_dim;
++        squares += x[r] * x[r];
++    }
++    half scale = half(sqrt(simd_sum(squares)) * p.inv_sqrt_dim);
++    float divisor = max(float(scale), FLT_MIN);
++    if (Q != KV_TQ3QJL) {
++        for (uint r = 0; r < R; ++r) {
++            float u = x[r] / divisor;
++            uint code = Q == KV_TQ6 ? kv_nearest<64>(LLOYD_MAX_64, u)
++                : Q == KV_TQ5 ? kv_nearest<32>(LLOYD_MAX_32, u)
++                : kv_nearest<16>(LLOYD_MAX_16, u);
++            kv_store_codes<BITS>(dst, code, lane, r, p.dim);
++        }
++        if (lane == 0) {
++            scales[0] = scale;
++        }
++        return;
++    }
++    // TurboQuant-prod: 3-bit codes, then the sign of S e for the residual e = u - c,
++    // S = H D2, with the residual scale s * sqrt(pi/2) / dim * ||e||.
++    uint codes[R];
++    float residual = 0.0f;
++    for (uint r = 0; r < R; ++r) {
++        float u = x[r] / divisor;
++        codes[r] = kv_nearest<8>(LLOYD_MAX_8, u);
++        x[r] = u - LLOYD_MAX_8[codes[r]];
++        residual += x[r] * x[r];
++    }
++    half residual_scale = half(float(scale) * p.qjl * sqrt(simd_sum(residual)));
++    for (uint r = 0; r < R; ++r) {
++        x[r] *= kv_sign(KV_QJL_SEED, lane + SIMD * r);
++    }
++    kv_hadamard<R>(x, lane);
++    for (uint r = 0; r < R; ++r) {
++        kv_store_codes<4>(dst, codes[r] | (x[r] < 0.0f ? 8u : 0u), lane, r, p.dim);
++    }
++    if (lane == 0) {
++        scales[0] = scale;
++        scales[1] = residual_scale;
++    }
++}
++
+ // Store new keys and values. One simdgroup per (K or V, token, head). Token t's row goes
+-// to logical position visible[t] - 1 of its page table. Q8 codes match the host
+-// reference: scale = half(max|x| * (1/127)), code = clamp(round(x / scale), +-127).
+-template <uint R, typename T, uint QUANT>
++// to logical position visible[t] - 1 of its page table, encoded with the role's codec.
++template <uint R, typename KT, uint KQ, typename VT, uint VQ>
+ kernel void kv_write(
+     device const float *k_src [[buffer(0)]],
+     device const float *v_src [[buffer(1)]],
+     device const uint *table [[buffer(2)]],
+     device const uint *first_block [[buffer(3)]],
+     device const uint *visible [[buffer(4)]],
+-    device T *k_data [[buffer(5)]],
++    device KT *k_data [[buffer(5)]],
+     device half *k_scales [[buffer(6)]],
+-    device T *v_data [[buffer(7)]],
++    device VT *v_data [[buffer(7)]],
+     device half *v_scales [[buffer(8)]],
+     constant KvWriteParams &p [[buffer(9)]],
+     uint tg [[threadgroup_position_in_grid]],
+@@ -56,27 +311,77 @@ kernel void kv_write(
+     for (uint r = 0; r < R; ++r) {
+         x[r] = src[lane + SIMD * r];
+     }
+-    device T *dst = (value ? v_data : k_data) + (slot * p.kv_heads + h) * p.dim;
+-    if (QUANT == 0) {
++    ulong row = slot * p.kv_heads + h;
++    if (value) {
++        kv_encode<R, VT, VQ>(x, v_data, v_scales, row, lane, p);
++    } else {
++        kv_encode<R, KT, KQ>(x, k_data, k_scales, row, lane, p);
++    }
++}
++
++struct RotateParams {
++    uint rows;
++    uint heads;
++    uint dim;
++    uint src_stride;
++    uint src_col;
++    uint src_head_stride;
++    uint gate_stride;
++    uint gate_col;
++    uint gate_head_stride;
++    float inv_sqrt_dim;
++};
++
++// One simdgroup per (token, head) row. MODE 0 rotates queries into the stored basis,
++// MODE 1 also writes their QJL projection H D2 q to `out2`, and MODE 2 rotates attention
++// outputs back (D H y / sqrt(dim)) and applies the sigmoid output gate.
++template <uint R, uint MODE>
++kernel void kv_rotate(
++    device const float *src [[buffer(0)]],
++    device float *out [[buffer(1)]],
++    device float *out2 [[buffer(2)]],
++    device const float *gate [[buffer(3)]],
++    constant RotateParams &p [[buffer(4)]],
++    uint tg [[threadgroup_position_in_grid]],
++    uint sg [[simdgroup_index_in_threadgroup]],
++    uint lane [[thread_index_in_simdgroup]],
++    uint sgs [[simdgroups_per_threadgroup]]) {
++    uint item = tg * sgs + sg;
++    if (item >= p.rows) {
++        return;
++    }
++    uint t = item / p.heads;
++    uint h = item % p.heads;
++    device const float *row = src + ulong(t) * p.src_stride + p.src_col + ulong(h) * p.src_head_stride;
++    float x[R];
++    for (uint r = 0; r < R; ++r) {
++        x[r] = row[lane + SIMD * r];
++        if (MODE != 2) {
++            x[r] *= kv_sign(KV_ROTATION_SEED, lane + SIMD * r);
++        }
++    }
++    kv_hadamard<R>(x, lane);
++    device float *o = out + ulong(item) * p.dim;
++    if (MODE == 2) {
++        device const float *gr = gate + ulong(t) * p.gate_stride + p.gate_col + ulong(h) * p.gate_head_stride;
+         for (uint r = 0; r < R; ++r) {
+-            dst[lane + SIMD * r] = T(x[r]);
++            uint i = lane + SIMD * r;
++            o[i] = x[r] * (p.inv_sqrt_dim * kv_sign(KV_ROTATION_SEED, i)) * sigmoid(gr[i]);
+         }
+         return;
+     }
+-    uint per = p.group / SIMD;
+-    device half *scales = (value ? v_scales : k_scales) + (slot * p.kv_heads + h) * (p.dim / p.group);
+-    for (uint g = 0; g * per < R; ++g) {
+-        float amax = 0.0f;
+-        for (uint r = g * per; r < (g + 1) * per; ++r) {
+-            amax = max(amax, simd_max(fabs(x[r])));
+-        }
+-        half scale = half(amax * p.inv_127);
+-        float divisor = max(float(scale), FLT_MIN);
+-        for (uint r = g * per; r < (g + 1) * per; ++r) {
+-            dst[lane + SIMD * r] = T(int(clamp(round(x[r] / divisor), -127.0f, 127.0f)));
++    for (uint r = 0; r < R; ++r) {
++        x[r] *= p.inv_sqrt_dim;
++        o[lane + SIMD * r] = x[r];
++    }
++    if (MODE == 1) {
++        for (uint r = 0; r < R; ++r) {
++            x[r] *= kv_sign(KV_QJL_SEED, lane + SIMD * r);
+         }
+-        if (lane == 0) {
+-            scales[g] = scale;
++        kv_hadamard<R>(x, lane);
++        device float *o2 = out2 + ulong(item) * p.dim;
++        for (uint r = 0; r < R; ++r) {
++            o2[lane + SIMD * r] = x[r];
+         }
+     }
+ }
+@@ -154,20 +459,71 @@ static inline void kv_dims(device const char *src, thread float (&x)[R]) {
+     }
+ }
+ 
++// Unsigned bytes; only instantiated, never read: 4-bit rows load through kv_load.
++template <uint R>
++static inline void kv_dims(device const uchar *src, thread float (&x)[R]) {
++    for (uint i = 0; i < R; ++i) {
++        x[i] = float(src[i]);
++    }
++}
++
++// High bits (above the nibble) of N consecutive codes from dimension d of a packed row.
++template <uint BITS, uint N>
++static inline uint kv_high_bits(device const uchar *row, uint dim, uint d) {
++    if (BITS <= 4) {
++        return 0;
++    }
++    constexpr uint HB = BITS > 4 ? BITS - 4 : 1;
++    uint bit = d * HB;
++    device const uchar *plane = row + dim / 2 + bit / 8;
++    uint word = plane[0];
++    if (bit % 8 + N * HB > 8) {
++        word |= uint(plane[1]) << 8;
++    }
++    return word >> (bit % 8);
++}
++
++// V stored dimensions starting at d of pool row `row`, as F32 values (F32/F16), signed
++// Q8 codes, or packed codes. A packed row holds dim * bits / 8 bytes; V nibbles are one
++// aligned load of V / 2 bytes, and their high bits at most two byte loads.
++template <uint V, typename T, uint Q>
++static inline void kv_load(device const T *data, ulong row, uint dim, uint d, thread float (&x)[V]) {
++    if (!kv_packed(Q)) {
++        kv_dims<V>(data + row * dim + d, x);
++        return;
++    }
++    constexpr uint BITS = kv_bits(Q);
++    device const uchar *base = (device const uchar *)data + row * (dim * BITS / 8);
++    device const uchar *src = base + d / 2;
++    uint word = V == 8 ? *(device const uint *)src
++        : V == 4 ? uint(*(device const ushort *)src)
++        : uint(*src);
++    uint high = kv_high_bits<BITS, V>(base, dim, d);
++    for (uint i = 0; i < V; ++i) {
++        uint code = (word >> (4 * i)) & 15u;
++        if (BITS > 4) {
++            code |= ((high >> (i * (BITS - 4))) & ((1u << (BITS - 4)) - 1u)) << 4;
++        }
++        x[i] = float(code);
++    }
++}
++
+ // One simdgroup per (HG consecutive heads of one K/V head, split, token). Lane l reads
+ // each key and value row as C vectors of V = min(R, 16 / sizeof(T)) values, vector c at
+ // dimensions V*l + 32*V*c, so every load instruction covers one contiguous segment of the
+-// row: one 16-byte load per row for F16 or Q8 at head dimension 256, and for Q8 one scale
+-// per vector (a vector never straddles a 32-multiple group). Each loaded K and V vector
+-// serves all HG query heads. Keys are taken ATTENTION_KEYS at a time, so their loads are
+-// outstanding together. Online softmax keeps the running max/sum in F32. With one split
+-// the gated output is written directly; otherwise unnormalised partial sums and
+-// (max, sum) statistics go to scratch.
+-template <uint R, typename T, uint QUANT, uint HG>
++// row: one 16-byte load per row for F16 or Q8 at head dimension 256 (4 bytes for 4-bit
++// codes), and one scale per vector (a vector never straddles a 32-multiple group). Each
++// loaded K and V vector serves all HG query heads. Keys are taken ATTENTION_KEYS at a
++// time, so their loads are outstanding together. Online softmax keeps the running
++// max/sum in F32. With one split the output is written directly, gated unless values are
++// rotated (kv_rotate then rotates back and gates); otherwise unnormalised partial sums and
++// (max, sum) statistics go to scratch. Rotated keys expect rotated queries, and QJL keys
++// also their projections in q2.
++template <uint R, typename KT, uint KQ, typename VT, uint VQ, uint HG>
+ kernel void attention_kv(
+     device const float *q [[buffer(0)]],
+-    device const T *k [[buffer(1)]],
+-    device const T *v [[buffer(2)]],
++    device const KT *k [[buffer(1)]],
++    device const VT *v [[buffer(2)]],
+     device const uint *table [[buffer(3)]],
+     device const uint *first_block [[buffer(4)]],
+     device const uint *visible [[buffer(5)]],
+@@ -178,13 +534,15 @@ kernel void attention_kv(
+     constant AttentionParams &p [[buffer(10)]],
+     device const half *k_scales [[buffer(11)]],
+     device const half *v_scales [[buffer(12)]],
++    device const float *q2 [[buffer(13)]],
+     uint tg [[threadgroup_position_in_grid]],
+     uint sg [[simdgroup_index_in_threadgroup]],
+     uint lane [[thread_index_in_simdgroup]],
+     uint sgs [[simdgroups_per_threadgroup]]) {
+     constexpr uint U = ATTENTION_KEYS;
+-    constexpr uint V = R * sizeof(T) <= 16 ? R : 16 / sizeof(T);
++    constexpr uint V = R * sizeof(KT) <= 16 ? R : 16 / sizeof(KT);
+     constexpr uint C = R / V;
++    constexpr bool QJL = KQ == KV_TQ3QJL;
+     uint head_groups = p.heads / HG;
+     uint item = tg * sgs + sg;
+     if (item >= p.tokens * head_groups * p.splits) {
+@@ -199,20 +557,27 @@ kernel void attention_kv(
+     uint begin = split * p.split_keys;
+     uint end = min(keys, begin + p.split_keys);
+     uint base = first_block[t];
+-    uint groups = QUANT == 0 ? 0 : p.dim / p.group;
++    uint k_count = kv_scale_count<KQ>(p.dim, p.group);
++    uint v_count = kv_scale_count<VQ>(p.dim, p.group);
+     uint dims[C], sidx[C];
+-    float qv[HG][C][V], acc[HG][C][V];
++    // Q4A keys add min * (sum of the lane's query dimensions) per group.
++    float qv[HG][C][V], qs[HG][C], q2v[QJL ? HG : 1][C][V], acc[HG][C][V];
+     for (uint c = 0; c < C; ++c) {
+         dims[c] = V * lane + SIMD * V * c;
+-        sidx[c] = QUANT == 0 ? 0 : dims[c] / p.group;
++        sidx[c] = KQ == KV_PLAIN || kv_rotated(KQ) ? 0 : dims[c] / p.group;
+     }
+     for (uint x = 0; x < HG; ++x) {
+         device const float *qr = q + (ulong(t) * p.heads + h0 + x) * p.dim;
+         for (uint c = 0; c < C; ++c) {
+             kv_dims<V>(qr + dims[c], qv[x][c]);
++            qs[x][c] = 0.0f;
+             for (uint i = 0; i < V; ++i) {
++                qs[x][c] += qv[x][c][i];
+                 acc[x][c][i] = 0.0f;
+             }
++            if (QJL) {
++                kv_dims<V>(q2 + (ulong(t) * p.heads + h0 + x) * p.dim + dims[c], q2v[QJL ? x : 0][c]);
++            }
+         }
+     }
+     float m[HG], l[HG];
+@@ -238,20 +603,51 @@ kernel void attention_kv(
+         }
+         float score[HG][U];
+         for (uint u = 0; u < U; ++u) {
+-            device const T *kr = k + ulong(rows[u]) * p.dim;
+             for (uint x = 0; x < HG; ++x) {
+                 score[x][u] = 0.0f;
+             }
++            device const half *ks = k_scales + ulong(rows[u]) * k_count;
+             for (uint c = 0; c < C; ++c) {
+                 float kd[V];
+-                kv_dims<V>(kr + dims[c], kd);
+-                float ks = QUANT == 0 ? 1.0f : float(k_scales[ulong(rows[u]) * groups + sidx[c]]);
++                kv_load<V, KT, KQ>(k, rows[u], p.dim, dims[c], kd);
++                float scale = 1.0f, offset = 0.0f, residual = 0.0f;
++                if (KQ == KV_Q8 || KQ == KV_Q4 || KQ == KV_Q6 || (kv_rotated(KQ) && !QJL)) {
++                    scale = float(ks[sidx[c]]);
++                } else if (KQ == KV_Q4A) {
++                    scale = float(ks[2 * sidx[c]]);
++                    offset = float(ks[2 * sidx[c] + 1]);
++                } else if (QJL) {
++                    scale = float(ks[0]);
++                    residual = float(ks[1]);
++                }
++                float signs[V];
++                for (uint i = 0; i < V; ++i) {
++                    uint code = kv_packed(KQ) ? uint(kd[i]) : 0u;
++                    signs[i] = (code & 8u) != 0 ? -1.0f : 1.0f;
++                    kd[i] = KQ == KV_Q4 ? kd[i] - 8.0f
++                        : KQ == KV_Q6 ? kd[i] - 32.0f
++                        : QJL ? LLOYD_MAX_8[code & 7u]
++                        : kv_rotated(KQ) ? kv_level<KQ>(code)
++                        : kd[i];
++                }
+                 for (uint x = 0; x < HG; ++x) {
+                     float d = 0.0f;
+                     for (uint i = 0; i < V; ++i) {
+                         d = fma(qv[x][c][i], kd[i], d);
+                     }
+-                    score[x][u] += QUANT == 0 ? d : d * ks;
++                    if (KQ == KV_PLAIN) {
++                        score[x][u] += d;
++                    } else if (KQ == KV_Q4A) {
++                        score[x][u] += d * scale + offset * qs[x][c];
++                    } else if (QJL) {
++                        float e = 0.0f;
++                        for (uint i = 0; i < V; ++i) {
++                            e = fma(q2v[QJL ? x : 0][c][i], signs[i], e);
++                        }
++                        score[x][u] += d * scale + e * residual;
++                    } else {
++                        score[x][u] += d * scale;
++                    }
+                 }
+             }
+         }
+@@ -277,15 +673,29 @@ kernel void attention_kv(
+             m[x] = m_new;
+         }
+         for (uint u = 0; u < U; ++u) {
+-            device const T *vr = v + ulong(rows[u]) * p.dim;
++            device const half *vs = v_scales + ulong(rows[u]) * v_count;
+             for (uint c = 0; c < C; ++c) {
+                 float vd[V];
+-                kv_dims<V>(vr + dims[c], vd);
+-                float vs = QUANT == 0 ? 1.0f : float(v_scales[ulong(rows[u]) * groups + sidx[c]]);
++                kv_load<V, VT, VQ>(v, rows[u], p.dim, dims[c], vd);
++                uint vg = VQ == KV_PLAIN || kv_rotated(VQ) ? 0 : dims[c] / p.group;
++                float scale = 1.0f, offset = 0.0f;
++                if (VQ == KV_Q4A) {
++                    scale = float(vs[2 * vg]);
++                    offset = float(vs[2 * vg + 1]);
++                } else if (VQ != KV_PLAIN) {
++                    scale = float(vs[vg]);
++                }
++                for (uint i = 0; i < V; ++i) {
++                    vd[i] = VQ == KV_Q4 ? vd[i] - 8.0f
++                        : VQ == KV_Q6 ? vd[i] - 32.0f
++                        : kv_rotated(VQ) ? kv_level<VQ>(uint(vd[i]))
++                        : vd[i];
++                }
+                 for (uint x = 0; x < HG; ++x) {
+-                    float w = QUANT == 0 ? weight[x][u] : weight[x][u] * vs;
++                    float w = VQ == KV_PLAIN ? weight[x][u] : weight[x][u] * scale;
++                    float b = weight[x][u] * offset;
+                     for (uint i = 0; i < V; ++i) {
+-                        acc[x][c][i] = fma(w, vd[i], acc[x][c][i]);
++                        acc[x][c][i] = VQ == KV_Q4A ? fma(w, vd[i], acc[x][c][i] + b) : fma(w, vd[i], acc[x][c][i]);
+                     }
+                 }
+             }
+@@ -299,7 +709,8 @@ kernel void attention_kv(
+             float inv = l[x] > 0.0f ? 1.0f / l[x] : 0.0f;
+             for (uint c = 0; c < C; ++c) {
+                 for (uint i = 0; i < V; ++i) {
+-                    o[dims[c] + i] = acc[x][c][i] * inv * sigmoid(gr[dims[c] + i]);
++                    float y = acc[x][c][i] * inv;
++                    o[dims[c] + i] = kv_rotated(VQ) ? y : y * sigmoid(gr[dims[c] + i]);
+                 }
+             }
+             continue;
+@@ -359,18 +770,48 @@ static inline float row_sum(float x) {
+     return x + simd_shuffle_xor(x, 8);
+ }
+ 
+-// Four dequantized dimensions d..d+4 of one stored row; groups are multiples of 32.
+-template <typename T, uint QUANT>
+-static inline float4 kv_vector(device const T *data, device const half *scales, ulong head, uint dim, uint d, uint group) {
+-    float4 x = float4(*(device const vec<T, 4> *)(data + head * dim + d));
+-    return QUANT == 0 ? x : x * float(scales[head * (dim / group) + d / group]);
++// Four dequantized dimensions d..d+4 of stored row `head`; groups are multiples of 32.
++// QJL keys have two parts: the scaled 3-bit codes (part 0) and the scaled residual signs
++// (part 1), which multiply the queries and their projections respectively.
++template <typename T, uint Q>
++static inline float4 kv_vector(device const T *data, device const half *scales, ulong head, uint dim, uint d, uint group, uint part) {
++    if (!kv_packed(Q)) {
++        float4 x = float4(*(device const vec<T, 4> *)(data + head * dim + d));
++        return Q == KV_PLAIN ? x : x * float(scales[head * (dim / group) + d / group]);
++    }
++    constexpr uint BITS = kv_bits(Q);
++    device const uchar *row = (device const uchar *)data + head * (dim * BITS / 8);
++    uint word = *(device const ushort *)(row + d / 2);
++    uint high = kv_high_bits<BITS, 4>(row, dim, d);
++    device const half *s = scales + head * kv_scale_count<Q>(dim, group);
++    float4 x;
++    for (uint i = 0; i < 4; ++i) {
++        uint c = (word >> (4 * i)) & 15u;
++        if (BITS > 4) {
++            c |= ((high >> (i * (BITS - 4))) & ((1u << (BITS - 4)) - 1u)) << 4;
++        }
++        x[i] = Q == KV_Q4 ? float(c) - 8.0f
++            : Q == KV_Q6 ? float(c) - 32.0f
++            : Q == KV_Q4A ? float(c)
++            : Q == KV_TQ3QJL ? (part == 0 ? LLOYD_MAX_8[c & 7u] : (c & 8u) != 0 ? -1.0f : 1.0f)
++            : kv_level<Q>(c);
++    }
++    if (Q == KV_Q4 || Q == KV_Q6) {
++        return x * float(s[d / group]);
++    }
++    if (Q == KV_Q4A) {
++        return x * float(s[2 * (d / group)]) + float(s[2 * (d / group) + 1]);
++    }
++    return x * float(s[Q == KV_TQ3QJL ? part : 0]);
+ }
+ 
+-template <uint CHUNKS, typename T, uint QUANT>
++// Rotated values leave the output ungated in the stored basis for kv_rotate. QJL keys
++// sweep twice the dimensions: [q | q2] against [scaled codes | scaled residual signs].
++template <uint CHUNKS, typename KT, uint KQ, typename VT, uint VQ>
+ kernel void attention_tiled(
+     device const float *q [[buffer(0)]],
+-    device const T *k [[buffer(1)]],
+-    device const T *v [[buffer(2)]],
++    device const KT *k [[buffer(1)]],
++    device const VT *v [[buffer(2)]],
+     device const uint *table [[buffer(3)]],
+     device const uint *first_block [[buffer(4)]],
+     device const uint *visible [[buffer(5)]],
+@@ -380,6 +821,7 @@ kernel void attention_tiled(
+     constant TiledParams &p [[buffer(9)]],
+     device const half *k_scales [[buffer(10)]],
+     device const half *v_scales [[buffer(11)]],
++    device const float *q2 [[buffer(12)]],
+     threadgroup float *shared [[threadgroup(0)]],
+     uint tg [[threadgroup_position_in_grid]],
+     uint tid [[thread_index_in_threadgroup]],
+@@ -387,6 +829,7 @@ kernel void attention_tiled(
+     uint sg [[simdgroup_index_in_threadgroup]],
+     uint lane [[thread_index_in_simdgroup]]) {
+     const uint D = TD * CHUNKS;
++    constexpr uint KCHUNKS = KQ == KV_TQ3QJL ? 2 * CHUNKS : CHUNKS;
+     uint h = tg % p.heads;
+     uint tile = tg / p.heads;
+     if (tile >= p.tiles) {
+@@ -409,6 +852,7 @@ kernel void attention_tiled(
+ 
+     simdgroup_float8x8 o[8 * CHUNKS];
+     device const float *qr = q + (ulong(token) * p.heads + h) * D;
++    device const float *q2r = q2 + (ulong(token) * p.heads + h) * D;
+     // Every matrix-array index must become constant: dynamic indexing spills the
+     // fragments to thread memory, including inside the dimension-chunk loops.
+     #pragma clang loop unroll(full)
+@@ -429,14 +873,16 @@ kernel void attention_tiled(
+             s[kt] = simdgroup_float8x8(0.0f);
+         }
+         #pragma clang loop unroll(full)
+-        for (uint c = 0; c < CHUNKS; ++c) {
++        for (uint kc = 0; kc < KCHUNKS; ++kc) {
++            uint c = kc % CHUNKS;
++            uint part = kc / CHUNKS;
+             threadgroup_barrier(mem_flags::mem_threadgroup);
+             for (uint i = tid; i < TK * TD / 4; i += threads) {
+                 uint key = i / (TD / 4);
+                 uint d = 4 * (i % (TD / 4));
+                 ulong head = ulong(slots[key]) * p.kv_heads + g;
+                 *(threadgroup float4 *)(stage + key * TD + d) = kb + key < keys
+-                    ? kv_vector<T, QUANT>(k, k_scales, head, D, c * TD + d, p.group)
++                    ? kv_vector<KT, KQ>(k, k_scales, head, D, c * TD + d, p.group, part)
+                     : float4(0.0f);
+             }
+             threadgroup_barrier(mem_flags::mem_threadgroup);
+@@ -444,7 +890,7 @@ kernel void attention_tiled(
+             for (uint x = 0; x < TD / 8; ++x) {
+                 simdgroup_float8x8 a;
+                 // The clamped token also keeps partial query tiles inside the allocation.
+-                float2 pair = *(device const float2 *)(qr + c * TD + 8 * x + fc.y);
++                float2 pair = *(device const float2 *)((part == 0 ? qr : q2r) + c * TD + 8 * x + fc.y);
+                 a.thread_elements()[0] = pair[0] * p.scale;
+                 a.thread_elements()[1] = pair[1] * p.scale;
+                 #pragma clang loop unroll(full)
+@@ -494,7 +940,7 @@ kernel void attention_tiled(
+                 uint d = 4 * (i % (TD / 4));
+                 ulong head = ulong(slots[key]) * p.kv_heads + g;
+                 *(threadgroup float4 *)(stage + key * TD + d) = kb + key < keys
+-                    ? kv_vector<T, QUANT>(v, v_scales, head, D, c * TD + d, p.group)
++                    ? kv_vector<VT, VQ>(v, v_scales, head, D, c * TD + d, p.group, 0)
+                     : float4(0.0f);
+             }
+             threadgroup_barrier(mem_flags::mem_threadgroup);
+@@ -520,13 +966,15 @@ kernel void attention_tiled(
+         #pragma clang loop unroll(full)
+         for (uint e = 0; e < 2; ++e) {
+             uint col = 8 * x + fc.y + e;
+-            orow[col] = o[x].thread_elements()[e] * inv * sigmoid(gr[col]);
++            float y = o[x].thread_elements()[e] * inv;
++            orow[col] = kv_rotated(VQ) ? y : y * sigmoid(gr[col]);
+         }
+     }
+ }
+ 
+-// Combine split partials of one (token, head) and apply the sigmoid output gate.
+-template <uint R>
++// Combine split partials of one (token, head) and apply the sigmoid output gate, or leave
++// the output ungated for kv_rotate when GATE is false (rotated values).
++template <uint R, bool GATE>
+ kernel void attention_reduce_f32(
+     device const float *partial [[buffer(0)]],
+     device const float *stats [[buffer(1)]],
+@@ -571,39 +1019,57 @@ kernel void attention_reduce_f32(
+     float inv = l > 0.0f ? 1.0f / l : 0.0f;
+     for (uint r = 0; r < R; ++r) {
+         uint i = lane + SIMD * r;
+-        o[i] = acc[r] * inv * sigmoid(gr[i]);
++        o[i] = GATE ? acc[r] * inv * sigmoid(gr[i]) : acc[r] * inv;
+     }
+ }
+ 
+-#define TILED(R, NAME, T, QUANT) \
+-    template [[host_name("attention_tiled_r" #R "_" #NAME)]] kernel void attention_tiled<R / 2, T, QUANT>( \
+-        device const float *, device const T *, device const T *, device const uint *, \
++#define TILED(R, NAME, KT, KQ, VT, VQ) \
++    template [[host_name("attention_tiled_r" #R "_" #NAME)]] kernel void attention_tiled<R / 2, KT, KQ, VT, VQ>( \
++        device const float *, device const KT *, device const VT *, device const uint *, \
+         device const uint *, device const uint *, device const float *, device float *, \
+         device const uint *, constant TiledParams &, device const half *, device const half *, \
+-        threadgroup float *, uint, uint, uint, uint, uint);
+-#define ATTENTION_KV(R, NAME, T, QUANT, HG, PREFIX) \
+-    template [[host_name(PREFIX #R "_" #NAME)]] kernel void attention_kv<R, T, QUANT, HG>( \
+-        device const float *, device const T *, device const T *, device const uint *, \
++        device const float *, threadgroup float *, uint, uint, uint, uint, uint);
++#define ATTENTION_KV(R, NAME, KT, KQ, VT, VQ, HG, PREFIX) \
++    template [[host_name(PREFIX #R "_" #NAME)]] kernel void attention_kv<R, KT, KQ, VT, VQ, HG>( \
++        device const float *, device const KT *, device const VT *, device const uint *, \
+         device const uint *, device const uint *, device const float *, device float *, \
+         device float *, device float *, constant AttentionParams &, device const half *, \
+-        device const half *, uint, uint, uint, uint);
+-#define KV_FORMAT(R, NAME, T, QUANT) \
+-    TILED(R, NAME, T, QUANT) \
+-    template [[host_name("kv_write_r" #R "_" #NAME)]] kernel void kv_write<R, T, QUANT>( \
++        device const half *, device const float *, uint, uint, uint, uint);
++#define KV_FORMAT(R, NAME, KT, KQ, VT, VQ) \
++    TILED(R, NAME, KT, KQ, VT, VQ) \
++    template [[host_name("kv_write_r" #R "_" #NAME)]] kernel void kv_write<R, KT, KQ, VT, VQ>( \
+         device const float *, device const float *, device const uint *, device const uint *, \
+-        device const uint *, device T *, device half *, device T *, device half *, \
++        device const uint *, device KT *, device half *, device VT *, device half *, \
+         constant KvWriteParams &, uint, uint, uint, uint); \
+-    ATTENTION_KV(R, NAME, T, QUANT, 1, "attention_r") \
+-    ATTENTION_KV(R, NAME, T, QUANT, 2, "attention_h2_r")
+-// R registers per lane: head dimension 64, 128 or 256 over 32 lanes.
+-#define ATTENTION(R) \
+-    KV_FORMAT(R, f32, float, 0) \
+-    KV_FORMAT(R, f16, half, 0) \
+-    KV_FORMAT(R, q8, char, 1) \
+-    template [[host_name("attention_reduce_r" #R "_f32")]] kernel void attention_reduce_f32<R>( \
++    ATTENTION_KV(R, NAME, KT, KQ, VT, VQ, 1, "attention_r") \
++    ATTENTION_KV(R, NAME, KT, KQ, VT, VQ, 2, "attention_h2_r")
++#define ROTATE(R, MODE) \
++    template [[host_name("kv_rotate_r" #R "_m" #MODE)]] kernel void kv_rotate<R, MODE>( \
++        device const float *, device float *, device float *, device const float *, \
++        constant RotateParams &, uint, uint, uint, uint);
++#define REDUCE(R, NAME, GATE) \
++    template [[host_name("attention_reduce_r" #R "_" #NAME)]] kernel void attention_reduce_f32<R, GATE>( \
+         device const float *, device const float *, device const float *, device float *, \
+         constant AttentionParams &, uint, uint, uint, uint);
++// R registers per lane: head dimension 64, 128 or 256 over 32 lanes.
++#define ATTENTION(R) \
++    KV_FORMAT(R, f32, float, KV_PLAIN, float, KV_PLAIN) \
++    KV_FORMAT(R, f16, half, KV_PLAIN, half, KV_PLAIN) \
++    KV_FORMAT(R, q8, char, KV_Q8, char, KV_Q8) \
++    KV_FORMAT(R, q4, uchar, KV_Q4, uchar, KV_Q4) \
++    KV_FORMAT(R, q4a, uchar, KV_Q4A, uchar, KV_Q4A) \
++    KV_FORMAT(R, tq4, uchar, KV_TQ4, uchar, KV_TQ4) \
++    KV_FORMAT(R, tq4p, uchar, KV_TQ3QJL, uchar, KV_TQ4) \
++    KV_FORMAT(R, q6, uchar, KV_Q6, uchar, KV_Q6) \
++    KV_FORMAT(R, tq5, uchar, KV_TQ5, uchar, KV_TQ5) \
++    KV_FORMAT(R, tq6, uchar, KV_TQ6, uchar, KV_TQ6) \
++    KV_FORMAT(R, tq6_q8, uchar, KV_TQ6, char, KV_Q8) \
++    KV_FORMAT(R, q6_q8, uchar, KV_Q6, char, KV_Q8) \
++    REDUCE(R, f32, true) \
++    REDUCE(R, ungated, false) \
++    ROTATE(R, 0) \
++    ROTATE(R, 1) \
++    ROTATE(R, 2)
+ ATTENTION(2)
+ ATTENTION(4)
+ ATTENTION(8)
+-
+diff --git a/crates/tur-metal/src/kernels/mod.rs b/crates/tur-metal/src/kernels/mod.rs
+index a33d266..df3420c 100644
+--- a/crates/tur-metal/src/kernels/mod.rs
++++ b/crates/tur-metal/src/kernels/mod.rs
+@@ -20,7 +20,7 @@ use runtime::{Pipeline, Runtime, View, to_u32};
+ use std::sync::Arc;
+ use tur_core::{
+     Result,
+-    execution::{KvFormat, invalid},
++    execution::{KvCodec, KvFormat, invalid},
+ };
+ 
+ /// Key rows owned by one delta-step simdgroup, in order of preference: 16 is fastest on M1
+@@ -147,6 +147,33 @@ struct KvWriteParams {
+     v_col: u32,
+     v_head_stride: u32,
+     inv_127: f32,
++    inv_sqrt_dim: f32,
++    qjl: f32,
++}
++
++#[repr(C)]
++struct RotateParams {
++    rows: u32,
++    heads: u32,
++    dim: u32,
++    src_stride: u32,
++    src_col: u32,
++    src_head_stride: u32,
++    gate_stride: u32,
++    gate_col: u32,
++    gate_head_stride: u32,
++    inv_sqrt_dim: f32,
++}
++
++/// What `kv_rotate` does to each row (`MODE` in the MSL).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Rotation {
++    /// Into the stored basis.
++    Forward = 0,
++    /// Into the stored basis, plus the QJL projection.
++    ForwardProjected = 1,
++    /// Back from the stored basis, then the sigmoid output gate.
++    InverseGated = 2,
+ }
+ 
+ #[repr(C)]
+@@ -1241,8 +1268,8 @@ impl Kernels {
+     pub fn attention_head_group(&self, heads: usize, kv_heads: usize, format: KvFormat) -> usize {
+         let group = heads.checked_div(kv_heads).unwrap_or(1);
+         let tuned = match format {
+-            KvFormat::Q8 { .. } => self.tuning.attention_q8_head_group,
+             KvFormat::F32 | KvFormat::F16 => self.tuning.attention_head_group,
++            _ => self.tuning.attention_q8_head_group,
+         };
+         if group.is_multiple_of(tuned) {
+             tuned
+@@ -1251,8 +1278,9 @@ impl Kernels {
+         }
+     }
+ 
+-    /// Scratch bytes of one attention dispatch over a `format` pool (split partials and
+-    /// statistics).
++    /// Scratch bytes of one attention dispatch over a `format` pool: split partials and
++    /// statistics, plus rotated queries (and QJL projections) and the attended rows in
++    /// the stored basis for rotated formats.
+     pub fn attention_scratch_bytes(
+         &self,
+         tokens: usize,
+@@ -1264,34 +1292,38 @@ impl Kernels {
+     ) -> usize {
+         let hg = self.attention_head_group(heads, kv_heads, format);
+         let split = self.attention_split(tokens, heads / hg, max_visible);
+-        if split.splits == 1 {
+-            return 0;
+-        }
+-        tokens
+-            .saturating_mul(heads)
+-            .saturating_mul(split.splits)
+-            .saturating_mul(dim + 2)
+-            .saturating_mul(4)
++        let rows = tokens.saturating_mul(heads);
++        let partials = if split.splits == 1 {
++            0
++        } else {
++            rows.saturating_mul(split.splits)
++                .saturating_mul(dim + 2)
++                .saturating_mul(4)
++        };
++        let rotated = usize::from(format.key().rotated())
++            + usize::from(format.key() == KvCodec::Tq3Qjl)
++            + usize::from(format.value().rotated());
++        partials.saturating_add(rows.saturating_mul(dim).saturating_mul(4 * rotated))
+     }
+ 
+-    /// Validate a K/V pool in `format` against `slots` rows of `kv_heads × dim`.
++    /// Validate a K/V pool stored with `codec` against `slots` rows of `kv_heads × dim`.
+     fn kv_views<'a>(
+         &self,
+         pool: &'a KvPool,
+-        format: KvFormat,
++        codec: KvCodec,
+         slots: usize,
+         kv_heads: usize,
+         dim: usize,
+     ) -> Result<(View<'a>, Option<View<'a>>)> {
+-        if pool.data.dims() != [slots, kv_heads, dim] {
++        if pool.data.dims() != [slots, kv_heads, codec.row_elements(dim)] {
+             return Err(invalid("K/V pool does not match its page addressing"));
+         }
+-        let data = self.runtime.view(&pool.data, format.data_dtype())?;
++        let data = self.runtime.view(&pool.data, codec.data_dtype())?;
+         data.contiguous("K/V pool")?;
+-        let scales = match (format.group(), &pool.scales) {
+-            (None, None) => None,
+-            (Some(group), Some(scales)) => {
+-                if scales.dims() != [slots, kv_heads, dim / group] {
++        let scales = match (codec.row_scales(dim), &pool.scales) {
++            (0, None) => None,
++            (count, Some(scales)) if count > 0 => {
++                if scales.dims() != [slots, kv_heads, count] {
+                     return Err(invalid("K/V scales do not match the pool"));
+                 }
+                 let view = self.runtime.view(scales, DType::F16)?;
+@@ -1314,10 +1346,46 @@ impl Kernels {
+             KvFormat::F32 => "f32",
+             KvFormat::F16 => "f16",
+             KvFormat::Q8 { .. } => "q8",
++            KvFormat::Q4 { .. } => "q4",
++            KvFormat::Q4A { .. } => "q4a",
++            KvFormat::Tq4 => "tq4",
++            KvFormat::Tq4P => "tq4p",
++            KvFormat::Q6 { .. } => "q6",
++            KvFormat::Tq5 => "tq5",
++            KvFormat::Tq6 => "tq6",
++            KvFormat::Split {
++                key: KvCodec::Tq6,
++                value: KvCodec::Q8 { .. },
++            } => "tq6_q8",
++            KvFormat::Split {
++                key: KvCodec::Q6 { .. },
++                value: KvCodec::Q8 { .. },
++            } => "q6_q8",
++            KvFormat::Split { .. } => {
++                return Err(invalid(format!(
++                    "no {prefix} kernel for K/V format {format}"
++                )));
++            }
+         };
+         Ok(format!("{prefix}_r{registers}_{suffix}"))
+     }
+ 
++    /// The scale group the kernels index grouped codecs by: keys and values must agree when
++    /// both are grouped; rotated and unquantized codecs have none (32 is passed unused).
++    fn kv_group(format: KvFormat, dim: usize) -> Result<u32> {
++        let grouped = |codec: KvCodec| (!codec.rotated()).then(|| codec.group(dim)).flatten();
++        let group = match (grouped(format.key()), grouped(format.value())) {
++            (Some(k), Some(v)) if k != v => {
++                return Err(invalid(format!(
++                    "{format}: kernels need one K/V scale group"
++                )));
++            }
++            (Some(group), _) | (None, Some(group)) => group,
++            (None, None) => 32,
++        };
++        to_u32(group, "group")
++    }
++
+     /// Store new keys and values into `pool`, quantizing to its format. Token `t` of the
+     /// pass writes logical position `visible[t] - 1` of its page table in `kv`. Key head
+     /// `h` of token `t` is read at column `key_heads.col_offset + h * head_stride` of `key`
+@@ -1350,9 +1418,10 @@ impl Kernels {
+         if kv.page != pool.page_tokens {
+             return Err(invalid("page addressing does not match the pool"));
+         }
+-        let (k_data, k_scales) = self.kv_views(&pool.key, pool.format, kv.slots, kv_heads, dim)?;
++        let (k_data, k_scales) =
++            self.kv_views(&pool.key, pool.format.key(), kv.slots, kv_heads, dim)?;
+         let (v_data, v_scales) =
+-            self.kv_views(&pool.value, pool.format, kv.slots, kv_heads, dim)?;
++            self.kv_views(&pool.value, pool.format.value(), kv.slots, kv_heads, dim)?;
+         let table = self.runtime.view(&kv.table, DType::U32)?;
+         let first = self.runtime.view(&kv.first_block, DType::U32)?;
+         let visible = self.runtime.view(&kv.visible, DType::U32)?;
+@@ -1361,7 +1430,7 @@ impl Kernels {
+             kv_heads: to_u32(kv_heads, "kv heads")?,
+             dim: to_u32(dim, "head dim")?,
+             page: to_u32(kv.page, "page")?,
+-            group: to_u32(pool.format.group().unwrap_or(32), "group")?,
++            group: Self::kv_group(pool.format, dim)?,
+             k_stride: to_u32(kv_view.row_stride, "key stride")?,
+             k_col: to_u32(key_heads.col_offset, "key column")?,
+             k_head_stride: to_u32(key_heads.head_stride, "key head stride")?,
+@@ -1369,6 +1438,8 @@ impl Kernels {
+             v_col: to_u32(value_heads.col_offset, "value column")?,
+             v_head_stride: to_u32(value_heads.head_stride, "value head stride")?,
+             inv_127: (1.0f64 / 127.0) as f32,
++            inv_sqrt_dim: (dim as f32).sqrt().recip(),
++            qjl: std::f32::consts::FRAC_PI_2.sqrt() / dim as f32,
+         };
+         let pipeline = self.pipeline(&Self::kv_kernel("kv_write", dim, pool.format)?)?;
+         let (groups, threads) = self.simdgroup_launch(pipeline, 2 * kv.tokens * kv_heads);
+@@ -1393,6 +1464,10 @@ impl Kernels {
+     /// format, gated by `sigmoid(gate)`. `q` is `[tokens, heads, dim]`. Gate head `h` of
+     /// token `t` is at column `gate.col_offset + h * gate.head_stride` of `gate_source`
+     /// row `t`. Returns `[tokens, heads * dim]`.
++    ///
++    /// Rotated keys are scored against queries rotated into their basis (QJL keys also
++    /// against the queries' projections); rotated values leave the attended rows in the
++    /// stored basis, so one more dispatch rotates them back and applies the gate.
+     pub fn attention(
+         &self,
+         q: &Tensor,
+@@ -1400,6 +1475,129 @@ impl Kernels {
+         kv: &PagedKv,
+         gate_source: &Tensor,
+         gate: Heads,
++    ) -> Result<Tensor> {
++        let (_, heads, dim) = q.dims3()?;
++        let (key, value) = (pool.format.key(), pool.format.value());
++        let rows = Heads {
++            count: heads,
++            dim,
++            head_stride: dim,
++            col_offset: 0,
++        };
++        let prepared = if key.rotated() {
++            let mode = if key == KvCodec::Tq3Qjl {
++                Rotation::ForwardProjected
++            } else {
++                Rotation::Forward
++            };
++            Some(self.rotate(q, rows, mode, None)?)
++        } else {
++            None
++        };
++        let (q, projected) = match &prepared {
++            Some((rotated, projected)) => (rotated, projected.as_ref()),
++            None => (q, None),
++        };
++        let attended = self.attention_core(q, projected, pool, kv, gate_source, gate)?;
++        if !value.rotated() {
++            return Ok(attended);
++        }
++        let (gated, _) = self.rotate(
++            &attended,
++            rows,
++            Rotation::InverseGated,
++            Some((gate_source, gate)),
++        )?;
++        Ok(gated)
++    }
++
++    /// Rotate `[tokens, heads × dim]` rows (`heads` within each row) for rotated K/V codecs.
++    /// Returns `[tokens, heads, dim]` (forward) or `[tokens, heads × dim]` (inverse, gated),
++    /// and the QJL projections when requested.
++    fn rotate(
++        &self,
++        src: &Tensor,
++        heads: Heads,
++        mode: Rotation,
++        gate: Option<(&Tensor, Heads)>,
++    ) -> Result<(Tensor, Option<Tensor>)> {
++        let sv = self.view(src)?;
++        let (count, dim) = (heads.count, heads.dim);
++        if count == 0 || heads.col_offset + (count - 1) * heads.head_stride + dim > sv.cols {
++            return Err(invalid("rotated rows exceed their source"));
++        }
++        let gv = gate.map(|(source, _)| self.view(source)).transpose()?;
++        let gate_heads = match (&gv, gate) {
++            (Some(view), Some((_, g))) => {
++                if view.rows != sv.rows
++                    || g.count != count
++                    || g.dim != dim
++                    || g.col_offset + (count - 1) * g.head_stride + dim > view.cols
++                {
++                    return Err(invalid("rotation gate exceeds its projection"));
++                }
++                Some(g)
++            }
++            _ if mode == Rotation::InverseGated => {
++                return Err(invalid("inverse rotation needs the output gate"));
++            }
++            _ => None,
++        };
++        let items = sv
++            .rows
++            .checked_mul(count)
++            .ok_or_else(|| invalid("rotated row count overflow"))?;
++        let params = RotateParams {
++            rows: to_u32(items, "rotated rows")?,
++            heads: to_u32(count, "heads")?,
++            dim: to_u32(dim, "head dim")?,
++            src_stride: to_u32(sv.row_stride, "source stride")?,
++            src_col: to_u32(heads.col_offset, "source column")?,
++            src_head_stride: to_u32(heads.head_stride, "source head stride")?,
++            gate_stride: to_u32(gv.as_ref().map_or(0, |g| g.row_stride), "gate stride")?,
++            gate_col: to_u32(gate_heads.map_or(0, |g| g.col_offset), "gate column")?,
++            gate_head_stride: to_u32(gate_heads.map_or(0, |g| g.head_stride), "gate head stride")?,
++            inv_sqrt_dim: (dim as f32).sqrt().recip(),
++        };
++        let out = self.output(items, dim)?;
++        let projected = if mode == Rotation::ForwardProjected {
++            Some(self.output(items, dim)?)
++        } else {
++            None
++        };
++        let name = Self::kv_kernel("kv_rotate", dim, KvFormat::F32)?
++            .replace("_f32", &format!("_m{}", mode as u32));
++        let pipeline = self.pipeline(&name)?;
++        let (groups, threads) = self.simdgroup_launch(pipeline, items);
++        self.runtime
++            .dispatch(pipeline, "tur_kv_rotate", groups, threads, |e| {
++                sv.bind(e, 0)?;
++                out.bind(e, 1);
++                // Unused buffers alias bound ones; every declared buffer must be bound.
++                projected.as_ref().unwrap_or(&out).bind(e, 2);
++                gv.as_ref().unwrap_or(&sv).bind(e, 3)?;
++                e.set_bytes(4, &params);
++                Ok(())
++            })?;
++        let shape: (usize, usize, usize) = (sv.rows, count, dim);
++        let projected = projected.map(|p| self.finish(p, shape)).transpose()?;
++        let out = if mode == Rotation::InverseGated {
++            self.finish(out, (sv.rows, count * dim))?
++        } else {
++            self.finish(out, shape)?
++        };
++        Ok((out, projected))
++    }
++
++    /// Attention kernels over (possibly rotated) queries; ungated when values are rotated.
++    fn attention_core(
++        &self,
++        q: &Tensor,
++        projected: Option<&Tensor>,
++        pool: &AttentionPool,
++        kv: &PagedKv,
++        gate_source: &Tensor,
++        gate: Heads,
+     ) -> Result<Tensor> {
+         let (tokens, heads, dim) = q.dims3()?;
+         let kv_heads = pool.kv_heads;
+@@ -1420,18 +1618,32 @@ impl Kernels {
+             Self::kv_kernel(&format!("attention_h{hg}"), dim, pool.format)?
+         };
+         let reduce = Self::kv_kernel("attention_reduce", dim, KvFormat::F32)?;
+-        let (k_data, k_scales) = self.kv_views(&pool.key, pool.format, kv.slots, kv_heads, dim)?;
++        let reduce = if pool.format.value().rotated() {
++            reduce.replace("_f32", "_ungated")
++        } else {
++            reduce
++        };
++        let (k_data, k_scales) =
++            self.kv_views(&pool.key, pool.format.key(), kv.slots, kv_heads, dim)?;
+         let (v_data, v_scales) =
+-            self.kv_views(&pool.value, pool.format, kv.slots, kv_heads, dim)?;
++            self.kv_views(&pool.value, pool.format.value(), kv.slots, kv_heads, dim)?;
+         let qv = self.view(q)?;
+         let gv = self.view(gate_source)?;
+         qv.contiguous("queries")?;
++        let pv = projected.map(|p| self.view(p)).transpose()?;
++        if let Some(pv) = &pv {
++            pv.contiguous("query projections")?;
++            pv.expect(qv.rows, qv.cols, "query projections")?;
++        } else if pool.format.key() == KvCodec::Tq3Qjl {
++            return Err(invalid("QJL keys need query projections"));
++        }
+         if gv.rows != tokens || gate.col_offset + (heads - 1) * gate.head_stride + dim > gv.cols {
+             return Err(invalid("attention gate exceeds its projection"));
+         }
+         if self.attention_tiled(kv, heads, dim) {
+             return self.attention_tiles(
+                 &qv,
++                pv.as_ref().unwrap_or(&qv),
+                 pool,
+                 kv,
+                 &gv,
+@@ -1463,7 +1675,7 @@ impl Kernels {
+             gate_stride: to_u32(gv.row_stride, "gate stride")?,
+             gate_col: to_u32(gate.col_offset, "gate column")?,
+             gate_head_stride: to_u32(gate.head_stride, "gate head stride")?,
+-            group: to_u32(pool.format.group().unwrap_or(32), "group")?,
++            group: Self::kv_group(pool.format, dim)?,
+             scale: (dim as f64).sqrt().recip() as f32,
+         };
+         let items = tokens * heads;
+@@ -1495,6 +1707,7 @@ impl Kernels {
+                 e.set_bytes(10, &params);
+                 k_scales.as_ref().unwrap_or(&k_data).bind(e, 11)?;
+                 v_scales.as_ref().unwrap_or(&v_data).bind(e, 12)?;
++                pv.as_ref().unwrap_or(&qv).bind(e, 13)?;
+                 Ok(())
+             })?;
+         if let Some((partial, stats)) = &scratch {
+@@ -1518,6 +1731,7 @@ impl Kernels {
+     fn attention_tiles(
+         &self,
+         qv: &View<'_>,
++        pv: &View<'_>,
+         pool: &AttentionPool,
+         kv: &PagedKv,
+         gv: &View<'_>,
+@@ -1535,7 +1749,7 @@ impl Kernels {
+             heads: to_u32(heads, "heads")?,
+             kv_heads: to_u32(pool.kv_heads, "kv heads")?,
+             page: to_u32(kv.page, "page")?,
+-            group: to_u32(pool.format.group().unwrap_or(32), "group")?,
++            group: Self::kv_group(pool.format, dim)?,
+             gate_stride: to_u32(gv.row_stride, "gate stride")?,
+             gate_col: to_u32(gate.col_offset, "gate column")?,
+             gate_head_stride: to_u32(gate.head_stride, "gate head stride")?,
+@@ -1569,6 +1783,7 @@ impl Kernels {
+                 e.set_bytes(9, &params);
+                 k_scales.as_ref().unwrap_or(&k_data).bind(e, 10)?;
+                 v_scales.as_ref().unwrap_or(&v_data).bind(e, 11)?;
++                pv.bind(e, 12)?;
+                 e.set_threadgroup_memory_length(0, Self::tiled_memory_bytes());
+                 Ok(())
+             })?;
+diff --git a/crates/tur-metal/src/kernels/runtime.rs b/crates/tur-metal/src/kernels/runtime.rs
+index 821e686..ffdf2ef 100644
+--- a/crates/tur-metal/src/kernels/runtime.rs
++++ b/crates/tur-metal/src/kernels/runtime.rs
+@@ -18,7 +18,8 @@ use tur_core::{Result, TurError, execution::invalid};
+ /// Version of the buffer layouts the kernels assume. Bump when any binding layout changes.
+ /// 2: paged K/V pools in F32/F16/Q8 and slot-addressed recurrent state (P5).
+ /// 3: tiled prefill attention over query tiles.
+-pub const LAYOUT_VERSION: u32 = 3;
++/// 4: 4-bit and rotated K/V codecs, separate key and value codecs, query projections.
++pub const LAYOUT_VERSION: u32 = 4;
+ 
+ // Runtime Metal compilation has no local include search path, so embed the families as
+ // one source string with shared helpers first.
+@@ -67,42 +68,162 @@ const FUNCTIONS: &[&str] = &[
+     "kv_write_r2_f32",
+     "kv_write_r2_f16",
+     "kv_write_r2_q8",
++    "kv_write_r2_q4",
++    "kv_write_r2_q4a",
++    "kv_write_r2_tq4",
++    "kv_write_r2_tq4p",
++    "kv_write_r2_q6_q8",
++    "kv_write_r2_tq6_q8",
++    "kv_write_r2_tq6",
++    "kv_write_r2_tq5",
++    "kv_write_r2_q6",
+     "kv_write_r4_f32",
+     "kv_write_r4_f16",
+     "kv_write_r4_q8",
++    "kv_write_r4_q4",
++    "kv_write_r4_q4a",
++    "kv_write_r4_tq4",
++    "kv_write_r4_tq4p",
++    "kv_write_r4_q6_q8",
++    "kv_write_r4_tq6_q8",
++    "kv_write_r4_tq6",
++    "kv_write_r4_tq5",
++    "kv_write_r4_q6",
+     "kv_write_r8_f32",
+     "kv_write_r8_f16",
+     "kv_write_r8_q8",
++    "kv_write_r8_q4",
++    "kv_write_r8_q4a",
++    "kv_write_r8_tq4",
++    "kv_write_r8_tq4p",
++    "kv_write_r8_q6_q8",
++    "kv_write_r8_tq6_q8",
++    "kv_write_r8_tq6",
++    "kv_write_r8_tq5",
++    "kv_write_r8_q6",
+     "attention_r2_f32",
+     "attention_r2_f16",
+     "attention_r2_q8",
++    "attention_r2_q4",
++    "attention_r2_q4a",
++    "attention_r2_tq4",
++    "attention_r2_tq4p",
++    "attention_r2_q6_q8",
++    "attention_r2_tq6_q8",
++    "attention_r2_tq6",
++    "attention_r2_tq5",
++    "attention_r2_q6",
+     "attention_r4_f32",
+     "attention_r4_f16",
+     "attention_r4_q8",
++    "attention_r4_q4",
++    "attention_r4_q4a",
++    "attention_r4_tq4",
++    "attention_r4_tq4p",
++    "attention_r4_q6_q8",
++    "attention_r4_tq6_q8",
++    "attention_r4_tq6",
++    "attention_r4_tq5",
++    "attention_r4_q6",
+     "attention_r8_f32",
+     "attention_r8_f16",
+     "attention_r8_q8",
++    "attention_r8_q4",
++    "attention_r8_q4a",
++    "attention_r8_tq4",
++    "attention_r8_tq4p",
++    "attention_r8_q6_q8",
++    "attention_r8_tq6_q8",
++    "attention_r8_tq6",
++    "attention_r8_tq5",
++    "attention_r8_q6",
+     "attention_h2_r2_f32",
+     "attention_h2_r2_f16",
+     "attention_h2_r2_q8",
++    "attention_h2_r2_q4",
++    "attention_h2_r2_q4a",
++    "attention_h2_r2_tq4",
++    "attention_h2_r2_tq4p",
++    "attention_h2_r2_q6_q8",
++    "attention_h2_r2_tq6_q8",
++    "attention_h2_r2_tq6",
++    "attention_h2_r2_tq5",
++    "attention_h2_r2_q6",
+     "attention_h2_r4_f32",
+     "attention_h2_r4_f16",
+     "attention_h2_r4_q8",
++    "attention_h2_r4_q4",
++    "attention_h2_r4_q4a",
++    "attention_h2_r4_tq4",
++    "attention_h2_r4_tq4p",
++    "attention_h2_r4_q6_q8",
++    "attention_h2_r4_tq6_q8",
++    "attention_h2_r4_tq6",
++    "attention_h2_r4_tq5",
++    "attention_h2_r4_q6",
+     "attention_h2_r8_f32",
+     "attention_h2_r8_f16",
+     "attention_h2_r8_q8",
++    "attention_h2_r8_q4",
++    "attention_h2_r8_q4a",
++    "attention_h2_r8_tq4",
++    "attention_h2_r8_tq4p",
++    "attention_h2_r8_q6_q8",
++    "attention_h2_r8_tq6_q8",
++    "attention_h2_r8_tq6",
++    "attention_h2_r8_tq5",
++    "attention_h2_r8_q6",
+     "attention_tiled_r2_f32",
+     "attention_tiled_r2_f16",
+     "attention_tiled_r2_q8",
++    "attention_tiled_r2_q4",
++    "attention_tiled_r2_q4a",
++    "attention_tiled_r2_tq4",
++    "attention_tiled_r2_tq4p",
++    "attention_tiled_r2_q6_q8",
++    "attention_tiled_r2_tq6_q8",
++    "attention_tiled_r2_tq6",
++    "attention_tiled_r2_tq5",
++    "attention_tiled_r2_q6",
+     "attention_tiled_r4_f32",
+     "attention_tiled_r4_f16",
+     "attention_tiled_r4_q8",
++    "attention_tiled_r4_q4",
++    "attention_tiled_r4_q4a",
++    "attention_tiled_r4_tq4",
++    "attention_tiled_r4_tq4p",
++    "attention_tiled_r4_q6_q8",
++    "attention_tiled_r4_tq6_q8",
++    "attention_tiled_r4_tq6",
++    "attention_tiled_r4_tq5",
++    "attention_tiled_r4_q6",
+     "attention_tiled_r8_f32",
+     "attention_tiled_r8_f16",
+     "attention_tiled_r8_q8",
++    "attention_tiled_r8_q4",
++    "attention_tiled_r8_q4a",
++    "attention_tiled_r8_tq4",
++    "attention_tiled_r8_tq4p",
++    "attention_tiled_r8_q6_q8",
++    "attention_tiled_r8_tq6_q8",
++    "attention_tiled_r8_tq6",
++    "attention_tiled_r8_tq5",
++    "attention_tiled_r8_q6",
+     "attention_reduce_r2_f32",
++    "attention_reduce_r2_ungated",
+     "attention_reduce_r4_f32",
++    "attention_reduce_r4_ungated",
+     "attention_reduce_r8_f32",
++    "attention_reduce_r8_ungated",
++    "kv_rotate_r2_m0",
++    "kv_rotate_r2_m1",
++    "kv_rotate_r2_m2",
++    "kv_rotate_r4_m0",
++    "kv_rotate_r4_m1",
++    "kv_rotate_r4_m2",
++    "kv_rotate_r8_m0",
++    "kv_rotate_r8_m1",
++    "kv_rotate_r8_m2",
+     "qmv_q8_0_b1_f32",
+     "qmv_q8_0_b2_f32",
+     "qmv_q8_0_b3_f32",
+diff --git a/crates/tur-metal/src/lib.rs b/crates/tur-metal/src/lib.rs
+index b3ebea8..d54768e 100644
+--- a/crates/tur-metal/src/lib.rs
++++ b/crates/tur-metal/src/lib.rs
+@@ -1,4 +1,5 @@
+ //! Device resource ownership, paged state pools, packed weights and Metal kernels.
++pub mod codec;
+ pub mod completion;
+ #[cfg(feature = "metal")]
+ pub mod kernels;
+diff --git a/crates/tur-metal/src/pool.rs b/crates/tur-metal/src/pool.rs
+index d06a1fc..440f0bd 100644
+--- a/crates/tur-metal/src/pool.rs
++++ b/crates/tur-metal/src/pool.rs
+@@ -19,7 +19,7 @@ use std::sync::{
+ };
+ use tur_core::{
+     Result, TurError,
+-    execution::{KvFormat, LayerStateKind, ModelDescription, invalid},
++    execution::{KvCodec, KvFormat, LayerStateKind, ModelDescription, invalid},
+ };
+ 
+ /// Pool capacities: K/V pages and usable recurrent slots (the zero slot is extra).
+@@ -284,8 +284,8 @@ impl Drop for Lease {
+     }
+ }
+ 
+-/// Stored keys or values of one attention layer: `[slots, kv_heads, head_dim]` codes and,
+-/// for quantized formats, `[slots, kv_heads, head_dim / group]` F16 scales.
++/// Stored keys or values of one attention layer: `[slots, kv_heads, codec.row_elements]`
++/// codes and, for quantized codecs, `[slots, kv_heads, codec.row_scales]` F16 scales.
+ pub struct KvPool {
+     pub data: Tensor,
+     pub scales: Option<Tensor>,
+@@ -363,29 +363,24 @@ impl StatePool {
+         for kind in &description.layers {
+             layers.push(match *kind {
+                 LayerStateKind::Attention { kv_heads, head_dim } => {
+-                    let store = || -> Result<KvPool> {
++                    let store = |codec: KvCodec| -> Result<KvPool> {
++                        let scales = codec.row_scales(head_dim);
+                         Ok(KvPool {
+                             data: Tensor::zeros(
+-                                (slots, kv_heads, head_dim),
+-                                kv.format.data_dtype(),
++                                (slots, kv_heads, codec.row_elements(head_dim)),
++                                codec.data_dtype(),
+                                 device,
+                             )?,
+-                            scales: kv
+-                                .format
+-                                .group()
+-                                .map(|g| {
+-                                    Tensor::zeros(
+-                                        (slots, kv_heads, head_dim / g),
+-                                        DType::F16,
+-                                        device,
+-                                    )
++                            scales: (scales > 0)
++                                .then(|| {
++                                    Tensor::zeros((slots, kv_heads, scales), DType::F16, device)
+                                 })
+                                 .transpose()?,
+                         })
+                     };
+                     LayerPool::Attention(AttentionPool {
+-                        key: store()?,
+-                        value: store()?,
++                        key: store(kv.format.key())?,
++                        value: store(kv.format.value())?,
+                         format: kv.format,
+                         page_tokens: kv.page_tokens,
+                         kv_heads,
+@@ -533,17 +528,18 @@ fn resolve(allocator: &Mutex<Allocator>, ids: &[Id]) -> Result<Vec<u32>> {
+ }
+ 
+ /// Reference quantizer for `[tokens, kv_heads, head_dim]` F32 rows: stored codes and, for
+-/// Q8, F16 scales `[tokens, kv_heads, head_dim / group]`. The kernels apply the same
+-/// arithmetic: `scale = f16(max|x| · (1/127))`, `code = clamp(round(x / scale), ±127)`,
+-/// stored as a two's-complement byte in U8 (Candle has no signed 8-bit dtype).
+-pub fn quantize(format: KvFormat, x: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
++/// quantized codecs, F16 scales `[tokens, kv_heads, codec.row_scales]`. The kernels apply
++/// the same arithmetic. Q8: `scale = f16(max|x| · (1/127))`, `code = clamp(round(x / scale),
++/// ±127)`, stored as a two's-complement byte in U8 (Candle has no signed 8-bit dtype).
++/// 4-bit codecs are defined in [`crate::codec`].
++pub fn quantize(codec: KvCodec, x: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
+     let x = x.to_dtype(DType::F32)?.contiguous()?;
+-    match format {
+-        KvFormat::F32 => Ok((x, None)),
+-        KvFormat::F16 => Ok((x.to_dtype(DType::F16)?, None)),
+-        KvFormat::Q8 { group } => {
++    match codec {
++        KvCodec::F32 => Ok((x, None)),
++        KvCodec::F16 => Ok((x.to_dtype(DType::F16)?, None)),
++        KvCodec::Q8 { group } => {
+             let (n, heads, dim) = x.dims3()?;
+-            format.validate(dim)?;
++            KvFormat::Q8 { group }.validate(dim)?;
+             let grouped = x.reshape((n, heads, dim / group, group))?;
+             let scales = (grouped.abs()?.max_keepdim(3)? / 127.0)?.to_dtype(DType::F16)?;
+             // A scale that rounds to zero stores zero codes: the group is below F16 range.
+@@ -559,15 +555,19 @@ pub fn quantize(format: KvFormat, x: &Tensor) -> Result<(Tensor, Option<Tensor>)
+                 .reshape((n, heads, dim))?;
+             Ok((codes, Some(scales.reshape((n, heads, dim / group))?)))
+         }
++        _ => {
++            let (codes, scales) = crate::codec::encode(codec, &x)?;
++            Ok((codes, Some(scales)))
++        }
+     }
+ }
+ 
+-/// Inverse of [`quantize`]: F32 `[tokens, kv_heads, head_dim]`.
+-pub fn dequantize(format: KvFormat, data: &Tensor, scales: Option<&Tensor>) -> Result<Tensor> {
+-    match (format, scales) {
+-        (KvFormat::F32, None) => Ok(data.clone()),
+-        (KvFormat::F16, None) => Ok(data.to_dtype(DType::F32)?),
+-        (KvFormat::Q8 { group }, Some(scales)) => {
++/// Inverse of [`quantize`]: F32 `[tokens, kv_heads, head_dim]` in the original basis.
++pub fn dequantize(codec: KvCodec, data: &Tensor, scales: Option<&Tensor>) -> Result<Tensor> {
++    match (codec, scales) {
++        (KvCodec::F32, None) => Ok(data.clone()),
++        (KvCodec::F16, None) => Ok(data.to_dtype(DType::F32)?),
++        (KvCodec::Q8 { group }, Some(scales)) => {
+             let (n, heads, dim) = data.dims3()?;
+             let unsigned = data.to_dtype(DType::F32)?;
+             let codes = unsigned
+@@ -578,7 +578,11 @@ pub fn dequantize(format: KvFormat, data: &Tensor, scales: Option<&Tensor>) -> R
+                 .broadcast_mul(&scales.to_dtype(DType::F32)?.unsqueeze(3)?)?
+                 .reshape((n, heads, dim))?)
+         }
+-        _ => Err(invalid("K/V scales do not match the format")),
++        (KvCodec::F32 | KvCodec::F16 | KvCodec::Q8 { .. }, _) => {
++            Err(invalid("K/V scales do not match the format"))
++        }
++        (codec, Some(scales)) => crate::codec::decode(codec, data, scales),
++        (_, None) => Err(invalid("K/V scales do not match the format")),
+     }
+ }
+ 
+@@ -656,11 +660,14 @@ impl AttentionPool {
+             return Ok((empty()?, empty()?));
+         }
+         let runs = runs(pages, self.page_tokens, 0, count)?;
+-        let read = |pool: &KvPool| -> Result<Tensor> {
++        let read = |pool: &KvPool, codec| -> Result<Tensor> {
+             let (data, scales) = pool.gather(&runs)?;
+-            dequantize(self.format, &data, scales.as_ref())
++            dequantize(codec, &data, scales.as_ref())
+         };
+-        Ok((read(&self.key)?, read(&self.value)?))
++        Ok((
++            read(&self.key, self.format.key())?,
++            read(&self.value, self.format.value())?,
++        ))
+     }
+ 
+     /// Reference write: quantize `[n, kv_heads, head_dim]` keys and values and store them as
+@@ -673,9 +680,9 @@ impl AttentionPool {
+         }
+         let runs = runs(pages, self.page_tokens, start, start + n)?;
+         self.key
+-            .scatter(&runs, start, &quantize(self.format, key)?)?;
++            .scatter(&runs, start, &quantize(self.format.key(), key)?)?;
+         self.value
+-            .scatter(&runs, start, &quantize(self.format, value)?)
++            .scatter(&runs, start, &quantize(self.format.value(), value)?)
+     }
+ }
+ 
+@@ -860,7 +867,7 @@ mod tests {
+         let x = rows(5, 1)?;
+         let values = x.flatten_all()?.to_vec1::<f32>()?;
+         for group in [32, 64] {
+-            let format = KvFormat::Q8 { group };
++            let format = KvCodec::Q8 { group };
+             let (codes, scales) = quantize(format, &x)?;
+             let scales = scales.ok_or_else(|| invalid("missing scales"))?;
+             assert_eq!(codes.dtype(), DType::U8);
+@@ -880,9 +887,9 @@ mod tests {
+                 );
+             }
+         }
+-        let (half, _) = quantize(KvFormat::F16, &x)?;
++        let (half, _) = quantize(KvCodec::F16, &x)?;
+         assert_eq!(half.dtype(), DType::F16);
+-        let restored = dequantize(KvFormat::F16, &half, None)?
++        let restored = dequantize(KvCodec::F16, &half, None)?
+             .flatten_all()?
+             .to_vec1::<f32>()?;
+         for (a, b) in values.iter().zip(&restored) {
+@@ -890,8 +897,8 @@ mod tests {
+         }
+         // A zero group stores zero codes and a zero scale rather than NaN.
+         let zeros = Tensor::zeros((1, 2, 64), DType::F32, &Device::Cpu)?;
+-        let (codes, scales) = quantize(KvFormat::Q8, &zeros)?;
+-        let restored = dequantize(KvFormat::Q8, &codes, scales.as_ref())?;
++        let (codes, scales) = quantize(KvFormat::Q8.key(), &zeros)?;
++        let restored = dequantize(KvFormat::Q8.key(), &codes, scales.as_ref())?;
+         assert!(
+             restored
+                 .flatten_all()?
+@@ -904,7 +911,15 @@ mod tests {
+ 
+     #[test]
+     fn test_scatter_and_gather_follow_the_page_table_for_every_format() -> Result<()> {
+-        for format in [KvFormat::F32, KvFormat::F16, KvFormat::Q8] {
++        for format in [
++            KvFormat::F32,
++            KvFormat::F16,
++            KvFormat::Q8,
++            KvFormat::Q4,
++            KvFormat::Q4A { group: 64 },
++            KvFormat::Tq4,
++            KvFormat::Tq4P,
++        ] {
+             let pool = StatePool::new(
+                 description(4, format),
+                 &Device::Cpu,
+@@ -920,15 +935,16 @@ mod tests {
+             attention.scatter(&pages, 0, &k.narrow(0, 0, 3)?, &v.narrow(0, 0, 3)?)?;
+             attention.scatter(&pages, 3, &k.narrow(0, 3, 6)?, &v.narrow(0, 3, 6)?)?;
+             let (gk, gv) = attention.gather(&pages, 9)?;
+-            let (qk, sk) = quantize(format, &k)?;
+-            let (qv, sv) = quantize(format, &v)?;
+-            let expect_k = dequantize(format, &qk, sk.as_ref())?;
+-            let expect_v = dequantize(format, &qv, sv.as_ref())?;
++            let (qk, sk) = quantize(format.key(), &k)?;
++            let (qv, sv) = quantize(format.value(), &v)?;
++            let expect_k = dequantize(format.key(), &qk, sk.as_ref())?;
++            let expect_v = dequantize(format.value(), &qv, sv.as_ref())?;
+             let flat = |t: &Tensor| t.flatten_all().and_then(|t| t.to_vec1::<f32>());
+             assert_eq!(flat(&gk)?, flat(&expect_k)?, "{format}");
+             assert_eq!(flat(&gv)?, flat(&expect_v)?, "{format}");
+             // Token 4 lives in physical page 1, slot 1 * 4 + 0.
+             let raw = attention.key.data.get(4)?.to_dtype(DType::F32)?;
++            assert_eq!(raw.dim(1)?, format.key().row_elements(64));
+             assert_eq!(flat(&raw)?, flat(&qk.get(4)?.to_dtype(DType::F32)?)?);
+             assert!(attention.gather(&pages, 13).is_err());
+         }
+diff --git a/crates/tur-metal/src/state.rs b/crates/tur-metal/src/state.rs
+index 001c89f..49d8793 100644
+--- a/crates/tur-metal/src/state.rs
++++ b/crates/tur-metal/src/state.rs
+@@ -459,6 +459,15 @@ mod tests {
+     };
+ 
+     fn pool(pages: usize, slots: usize) -> Result<StatePool> {
++        pool_with(KvFormat::Q8, 32, pages, slots)
++    }
++
++    fn pool_with(
++        format: KvFormat,
++        head_dim: usize,
++        pages: usize,
++        slots: usize,
++    ) -> Result<StatePool> {
+         StatePool::new(
+             Arc::new(ModelDescription {
+                 identity: ModelIdentity {
+@@ -468,7 +477,7 @@ mod tests {
+                 layers: vec![
+                     LayerStateKind::Attention {
+                         kv_heads: 1,
+-                        head_dim: 32,
++                        head_dim,
+                     },
+                     LayerStateKind::Recurrent {
+                         conv_channels: 1,
+@@ -479,7 +488,7 @@ mod tests {
+                         dtype: DType::F32,
+                     },
+                 ],
+-                kv: KvLayout::new(2, KvFormat::Q8),
++                kv: KvLayout::new(2, format),
+                 modalities: vec![Modality::Text],
+                 vocab_size: 8,
+                 max_position: 16,
+@@ -503,8 +512,7 @@ mod tests {
+         reservation.prepare()?;
+         let addresses = reservation.binding().resolve(state.pool())?;
+         let n = values.len();
+-        let rows: Vec<f32> = values.iter().flat_map(|v| [*v; 32]).collect();
+-        let rows = Tensor::from_vec(rows, (n, 1, 32), &Device::Cpu)?;
++        let rows = rows(state.pool(), values)?;
+         state.pool().attention(0)?.scatter(
+             &addresses.pages,
+             state.position(),
+@@ -524,6 +532,30 @@ mod tests {
+         reservation.commit(accepted)
+     }
+ 
++    /// Key rows of `values`: a ramp around each value, so rotated codecs see varied rows.
++    fn rows(pool: &StatePool, values: &[f32]) -> Result<Tensor> {
++        let dim = pool.attention(0)?.head_dim;
++        let rows: Vec<f32> = values
++            .iter()
++            .flat_map(|v| (0..dim).map(move |i| v + (i as f32 / dim as f32 - 0.5) * 0.25))
++            .collect();
++        Ok(Tensor::from_vec(
++            rows,
++            (values.len(), 1, dim),
++            &Device::Cpu,
++        )?)
++    }
++
++    /// Mean stored key per token, as the pool's key codec stores `values`.
++    fn stored_keys(pool: &StatePool, values: &[f32]) -> Result<Vec<f32>> {
++        let codec = pool.description().kv.format.key();
++        let (data, scales) = crate::pool::quantize(codec, &rows(pool, values)?)?;
++        Ok(crate::pool::dequantize(codec, &data, scales.as_ref())?
++            .mean(2)?
++            .flatten_all()?
++            .to_vec1::<f32>()?)
++    }
++
+     fn keys(state: &ModelState) -> Result<(Vec<f32>, f32)> {
+         let mut keys = Vec::new();
+         let mut recurrent = f32::NAN;
+@@ -594,6 +626,41 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn test_every_format_copies_shared_tails_and_publishes_exact_partial_accepts() -> Result<()> {
++        for format in [
++            KvFormat::F16,
++            KvFormat::Q8,
++            KvFormat::Q4,
++            KvFormat::Q4A { group: 32 },
++            KvFormat::Tq4,
++            KvFormat::Tq4P,
++            KvFormat::Q6 { group: 32 },
++            KvFormat::Tq6,
++        ] {
++            let pool = pool_with(format, 64, 8, 6)?;
++            let saved = pass(
++                &ModelState::new(&pool),
++                &[1.0, 2.0, 3.0],
++                Boundaries::Final,
++                3,
++            )?;
++            let a = pass(&saved.clone(), &[4.0], Boundaries::Final, 1)?;
++            let b = pass(&saved, &[9.0, 8.0, 7.0], Boundaries::EveryToken, 2)?;
++            // Every branch reads exactly the codes written for its own tokens.
++            let expect = |values: &[f32]| stored_keys(&pool, values);
++            assert_eq!(keys(&saved)?.0, expect(&[1.0, 2.0, 3.0])?, "{format}");
++            assert_eq!(keys(&a)?.0, expect(&[1.0, 2.0, 3.0, 4.0])?, "{format}");
++            assert_eq!(keys(&b)?.0, expect(&[1.0, 2.0, 3.0, 9.0, 8.0])?, "{format}");
++            assert_eq!((keys(&b)?.1, b.position()), (8.0, 5), "{format}");
++            drop((saved, a, b));
++            let usage = pool.usage()?;
++            assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0), "{format}");
++            pool.reclaim();
++        }
++        Ok(())
++    }
++
+     #[test]
+     fn test_partial_accept_selects_the_exact_boundary_and_releases_the_rest() -> Result<()> {
+         let pool = pool(4, 4)?;
+diff --git a/crates/tur-metal/tests/kernels.rs b/crates/tur-metal/tests/kernels.rs
+index 842e6f8..17b0113 100644
+--- a/crates/tur-metal/tests/kernels.rs
++++ b/crates/tur-metal/tests/kernels.rs
+@@ -16,7 +16,10 @@ use candle_core::{
+     DType, Device, Tensor,
+     quantized::{GgmlDType, QTensor},
+ };
+-use tur_core::{Result, execution::KvFormat};
++use tur_core::{
++    Result,
++    execution::{KvCodec, KvFormat},
++};
+ use tur_metal::{
+     completion::{Completion, Quarantine},
+     kernels::{DeltaShape, Heads, Kernels, RecurrentSpan, Tuning},
+@@ -728,7 +731,34 @@ fn paged_pool(case: &AttentionCase, seed: u64) -> Pool {
+     (k, v, slots, table, first, visible)
+ }
+ 
+-/// Store F32 pool rows in `format`. Quantized pools keep NaN poison in the scales of
++/// Every K/V format, with the groups the tests sweep.
++const FORMATS: [KvFormat; 17] = [
++    KvFormat::F32,
++    KvFormat::F16,
++    KvFormat::Q8,
++    KvFormat::Q8 { group: 64 },
++    KvFormat::Q8 { group: 128 },
++    KvFormat::Q8 { group: 256 },
++    KvFormat::Q4,
++    KvFormat::Q4 { group: 128 },
++    KvFormat::Q4A { group: 32 },
++    KvFormat::Q4A { group: 64 },
++    KvFormat::Tq4,
++    KvFormat::Tq4P,
++    KvFormat::Q6 { group: 32 },
++    KvFormat::Tq5,
++    KvFormat::Tq6,
++    KvFormat::Split {
++        key: KvCodec::Tq6,
++        value: KvCodec::Q8 { group: 32 },
++    },
++    KvFormat::Split {
++        key: KvCodec::Q6 { group: 64 },
++        value: KvCodec::Q8 { group: 64 },
++    },
++];
++
++/// Store F32 pool rows with `codec`. Quantized pools keep NaN poison in the scales of
+ /// unused slots (codes cannot hold NaN); returns the device pool and its exact dequantized
+ /// host values, which are what a correct kernel reads.
+ fn stored(
+@@ -737,7 +767,7 @@ fn stored(
+     slots: usize,
+     kv_heads: usize,
+     dim: usize,
+-    format: KvFormat,
++    format: KvCodec,
+ ) -> Result<(KvPool, Vec<f32>)> {
+     let host = Tensor::from_slice(rows, (slots, kv_heads, dim), &Device::Cpu)?;
+     let (data, scales) = quantize(format, &host)?;
+@@ -840,8 +870,8 @@ fn run_attention(
+     let tokens = visible.len();
+     let q = values(tokens * case.heads * case.dim, 20, 1.0);
+     let gate = values(tokens * case.heads * 2 * case.dim, 21, 2.0);
+-    let (key, k_exact) = stored(device, &k, slots, case.kv_heads, case.dim, format)?;
+-    let (value, v_exact) = stored(device, &v, slots, case.kv_heads, case.dim, format)?;
++    let (key, k_exact) = stored(device, &k, slots, case.kv_heads, case.dim, format.key())?;
++    let (value, v_exact) = stored(device, &v, slots, case.kv_heads, case.dim, format.value())?;
+     let pool = AttentionPool {
+         key,
+         value,
+@@ -865,15 +895,8 @@ fn run_attention(
+ }
+ 
+ fn check_attention(kernels: &Kernels, device: &Device, case: &AttentionCase) -> Result<()> {
+-    for format in [
+-        KvFormat::F32,
+-        KvFormat::F16,
+-        KvFormat::Q8,
+-        KvFormat::Q8 { group: 64 },
+-        KvFormat::Q8 { group: 128 },
+-        KvFormat::Q8 { group: 256 },
+-    ] {
+-        if format.group().is_some_and(|group| group > case.dim) {
++    for format in FORMATS {
++        if format.validate(case.dim).is_err() {
+             continue;
+         }
+         let (actual, expected) = run_attention(kernels, device, case, format)?;
+@@ -1064,6 +1087,12 @@ fn test_quantized_kv_attention_stays_close_to_f32_attention() -> Result<()> {
+         (KvFormat::F16, 2e-3),
+         (KvFormat::Q8, 2e-2),
+         (KvFormat::Q8 { group: 256 }, 3e-2),
++        // Uniform synthetic rows: per-row TurboQuant scales fit them worse than group
++        // maxima; real keys with outlier channels behave differently (see the P12 report).
++        (KvFormat::Q4, 0.1),
++        (KvFormat::Q4A { group: 32 }, 0.1),
++        (KvFormat::Tq4, 0.15),
++        (KvFormat::Tq4P, 0.15),
+     ] {
+         let (actual, _) = run_attention(&kernels, &device, &case, format)?;
+         let error = relative_error(&actual, &exact);
+@@ -1092,18 +1121,30 @@ fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<
+         .flat_map(|t| projection[t * (2 * width + 5) + width..][..width].to_vec())
+         .collect();
+     let paged = kernels.paged_kv(case.page, slots, &table, &first, &visible)?;
+-    for format in [
+-        KvFormat::F32,
+-        KvFormat::F16,
+-        KvFormat::Q8,
+-        KvFormat::Q8 { group: 128 },
+-    ] {
++    for format in FORMATS {
++        if format.validate(case.dim).is_err() {
++            continue;
++        }
+         let poison = vec![f32::NAN; slots * width];
+-        let (key_pool, _) = stored(&device, &poison, slots, case.kv_heads, case.dim, format)?;
+-        let (value_pool, _) = stored(&device, &poison, slots, case.kv_heads, case.dim, format)?;
+         let pool = AttentionPool {
+-            key: key_pool,
+-            value: value_pool,
++            key: stored(
++                &device,
++                &poison,
++                slots,
++                case.kv_heads,
++                case.dim,
++                format.key(),
++            )?
++            .0,
++            value: stored(
++                &device,
++                &poison,
++                slots,
++                case.kv_heads,
++                case.dim,
++                format.value(),
++            )?
++            .0,
+             format,
+             page_tokens: case.page,
+             kv_heads: case.kv_heads,
+@@ -1127,17 +1168,20 @@ fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<
+             &pool,
+             &paged,
+         )?;
+-        for (rows, kv) in [(&key, &pool.key), (&value, &pool.value)] {
++        for (rows, kv, codec) in [
++            (&key, &pool.key, format.key()),
++            (&value, &pool.value, format.value()),
++        ] {
+             let host = Tensor::from_slice(
+                 rows.as_slice(),
+                 (tokens, case.kv_heads, case.dim),
+                 &Device::Cpu,
+             )?;
+-            let (codes, scales) = quantize(format, &host)?;
+-            let expected = read(&dequantize(format, &codes, scales.as_ref())?)?;
++            let (codes, scales) = quantize(codec, &host)?;
++            let expected = read(&dequantize(codec, &codes, scales.as_ref())?)?;
+             let step = scales.map(|s| read(&s.to_dtype(DType::F32)?)).transpose()?;
+             let stored_rows = read(&dequantize(
+-                format,
++                codec,
+                 &kv.data.to_device(&Device::Cpu)?,
+                 kv.scales
+                     .as_ref()
+@@ -1147,6 +1191,7 @@ fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<
+             )?)?;
+             let mut written = vec![false; slots];
+             let mut flips = 0;
++            let (mut error, mut power) = (0f64, 0f64);
+             for t in 0..tokens {
+                 let j = visible[t] as usize - 1;
+                 let slot =
+@@ -1154,10 +1199,17 @@ fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<
+                 written[slot] = true;
+                 for i in 0..width {
+                     let (a, b) = (stored_rows[slot * width + i], expected[t * width + i]);
+-                    if a != b {
+-                        // Division rounding may move a Q8 code across a .5 tie by one step.
+-                        let group = format.group().unwrap_or(case.dim);
+-                        let s = step.as_ref().map_or(0.0, |s| s[(t * width + i) / group]);
++                    error += f64::from(a - b).powi(2);
++                    power += f64::from(b).powi(2);
++                    if a != b && !codec.rotated() {
++                        // Division rounding may move a code across a .5 tie by one step;
++                        // an asymmetric step is the first of each group's scale pair.
++                        let group = codec.group(case.dim).unwrap_or(case.dim);
++                        let pair = 1 + usize::from(matches!(codec, KvCodec::Q4A { .. }));
++                        let row = (t * width + i) / case.dim;
++                        let index =
++                            row * codec.row_scales(case.dim) + pair * (i % case.dim / group);
++                        let s = step.as_ref().map_or(0.0, |s| s[index]);
+                         assert!(
+                             (a - b).abs() <= s * 1.0001,
+                             "{format} token {t} element {i}"
+@@ -1170,6 +1222,12 @@ fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<
+                 flips * 1000 <= tokens * width,
+                 "{format}: {flips} code flips"
+             );
++            // Rotated rows mix every code of the row, so they are compared in aggregate.
++            assert!(
++                !codec.rotated() || error <= 1e-6 * power,
++                "{format}: relative squared error {}",
++                error / power
++            );
+             // Unwritten slots keep their poison: nothing outside the target slots changed.
+             for (slot, done) in written.iter().enumerate() {
+                 if !done {
+@@ -1694,8 +1752,8 @@ fn test_repeated_passes_reach_a_stable_allocation_bound() -> Result<()> {
+         sequences: vec![(100, 1), (3, 1)],
+     };
+     let (keys, vals, slots, table, first, visible) = paged_pool(&case, 40);
+-    let (key, _) = stored(&device, &keys, slots, 2, 128, KvFormat::Q8)?;
+-    let (value, _) = stored(&device, &vals, slots, 2, 128, KvFormat::Q8)?;
++    let (key, _) = stored(&device, &keys, slots, 2, 128, KvFormat::Q8.key())?;
++    let (value, _) = stored(&device, &vals, slots, 2, 128, KvFormat::Q8.value())?;
+     let pool = AttentionPool {
+         key,
+         value,
+diff --git a/crates/tur-server/src/main.rs b/crates/tur-server/src/main.rs
+index e45c926..3306f4e 100644
+--- a/crates/tur-server/src/main.rs
++++ b/crates/tur-server/src/main.rs
+@@ -78,8 +78,9 @@ struct Args {
+     /// Fail requests not finished this many seconds after arrival.
+     #[arg(long)]
+     request_timeout_secs: Option<u64>,
+-    /// K/V storage: f32, f16, q8 (one scale per 32 dimensions, half of F16's memory) or
+-    /// q8_<group>.
++    /// K/V storage: f32, f16, q8 (one scale per 32 dimensions, half of F16's memory),
++    /// q8_<group>, or the P12 low-bit experiments q6, tq6, tq5, q4, q4a, tq4, tq4p and the
++    /// key:value pairs tq6:q8 and q6:q8 (quality costs in docs/apple-silicon-p12-kv.md).
+     #[arg(long, default_value_t = DEFAULT_KV_LAYOUT.format)]
+     kv_format: KvFormat,
+     /// Tokens per K/V page.

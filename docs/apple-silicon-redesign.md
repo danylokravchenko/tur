@@ -41,6 +41,16 @@ at equal formats. Q5K/Q6K lack small-batch kernels and stay out of projections, 
 calibration does not yet scale to the flagship on these Macs. See the
 [P11 report](apple-silicon-p11-weights.md).
 
+P12 ran on 2026-10-24, on the M1 and the 0.8B checkpoint only, and closed with a
+measured rejection. Groupwise Q4, KIVI-style asymmetric Q4, `TurboQuant` (randomized
+Hadamard rotation, Lloyd–Max codes) with and without its QJL residual, and 5/6-bit
+variants were built with fused page-native kernels and lifecycle tests. Every 4-bit
+format missed the quality budget (mean KL ≤ 1e-3, top-1 ≥ 98% per domain) by 10–30×.
+Values dominate the error, and each extra bit cuts KL about 4×. The only passing format,
+6-bit `TurboQuant` keys with Q8 values, saves just 1.17× over Q8 and decodes 2–7% slower,
+so Tur keeps F32/F16/Q8 K/V. The implementation is preserved as a patch; see the
+[P12 report](apple-silicon-p12-kv.md).
+
 Post-P8 roadmap added on 2026-10-23: P9 establishes a fresh comparative baseline;
 P10–P15 evaluate kernel, quantization, execution, speculation and prefix-scheduling
 improvements; production release moves from P9 to P16. These packages are planned,
@@ -567,6 +577,10 @@ alone is not a speedup claim. Reference:
 
 ### P12 — Low-bit KV and hybrid-state memory
 
+Measured on the M1 and 0.8B checkpoint (2026-10-24) and closed with a documented
+rejection; results, kernels kept as a patch, and limits are in the
+[P12 report](apple-silicon-p12-kv.md).
+
 Depends on P9 and stable P10 attention interfaces. TurboQuant is an experiment in this
 package, not a predetermined replacement for Q8.
 
@@ -705,7 +719,7 @@ and ordinary decoding separately. No improvement remains a possible experiment o
 | P10 chunked DeltaNet, long prefill | About 1.06–1.10× whole-model throughput **if** the chunked kernel is 2–4× faster than the current scan | Revised after the 2026-10-23 kernel pass: the rewritten token-serial scan is about 12% of 2K prefill (18 × 10.4 ms of ~1.6 s), down from about 21%; removing it entirely would give at most about 1.14×. **Measured 2026-10-24: the chunked kernel was 0.41–0.66× the scan on M1; rejected** |
 | P10–P13 combined, M1 prefill | Aim for 1.10–1.30× prompt tokens/s at unchanged quality | Engineering target; projections already ran near the measured M1 F32 ceiling in P4, limiting gains without changing precision or workload |
 | P10–P13 combined, ordinary M1 decode | Aim for 1.05–1.15× tokens/s in selected beneficial regimes | Engineering target; weight/state bandwidth and already-small host scheduling costs limit general gains. Batch-1 improvement may be negligible |
-| P12 low-bit KV versus Q8 group 32 | Roughly 1.7–2.4× smaller **KV storage**, subject to measured metadata/padding | Q8 uses 8.5 bits/value including one F16 scale per 32 values. Illustrative 5–3.5 effective-bit candidates give this range; formats and quality still need validation |
+| P12 low-bit KV versus Q8 group 32 | Roughly 1.7–2.4× smaller **KV storage**, subject to measured metadata/padding | Q8 uses 8.5 bits/value including one F16 scale per 32 values. Illustrative 5–3.5 effective-bit candidates give this range; formats and quality still need validation. **Measured 2026-10-24 (0.8B, M1): 4-bit formats were 10–30× over the quality budget; the best passing format saved 1.17× and decoded 2–7% slower; rejected** |
 | P12 F16 recurrent matrices versus F32 | 2× smaller matrix payload; less than 2× smaller total recurrent state | Already available in P6, not a new gain. Historical serving throughput improved only 4–5% at concurrency 8–16; long-context quality and speculative compatibility remain constraints |
 | P11 calibrated weights | Better quality at equal bytes, or fewer bytes at equal quality; no fixed speedup forecast | Same-bit calibration may change no runtime cost. Lower precision helps only if corresponding kernels win and sensitive tensors retain adequate precision. **Measured 2026-10-24 (0.8B, M1): GPTQ halved Q4K's KL at equal bytes with unchanged speed; the tied-head embedding cut Q4K weights 2.2× at equal quality** |
 | P14 learned/confidence speculation, novel text at low concurrency | Exploratory goal: 1.20–1.50× tokens/s over the best applicable P8 policy | Low confidence until a compatible drafter and total cost are measured. At high concurrency the desired result may simply be neutral fallback |

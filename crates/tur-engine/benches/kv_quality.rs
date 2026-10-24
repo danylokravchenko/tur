@@ -21,6 +21,10 @@
 //! weights; `TUR_EVAL_WEIGHTS` (default none) adds variants with F32 K/V and state, each
 //! `f32`, `q8_0`, `q4k` or a prepacked artifact directory. With `TUR_EVAL_MARKED=1`, text
 //! between `⟦` and `⟧` (markers removed) is also scored separately, e.g. retrieval answers.
+//! `TUR_EVAL_GENERATE=<n>` also keeps each model's state at 1K, 2K, 4K and 8K tokens and,
+//! after the teacher-forced pass, forks those snapshots (a second turn reusing the first
+//! turn's cached state) to feed the text's next token and decode `n` greedy tokens,
+//! reporting how long each variant's continuation matches the reference's.
 
 use candle_core::{D, DType, Device, Tensor};
 use serde_json::{Value, json};
@@ -41,6 +45,8 @@ use tur_models::models::qwen3_5::{
 };
 
 const BUCKETS: [usize; 5] = [0, 1024, 2048, 4096, 8192];
+/// Contexts whose states seed generated continuations.
+const SNAPSHOTS: [usize; 4] = [1024, 2048, 4096, 8192];
 
 fn env_path(name: &str) -> Result<PathBuf> {
     std::env::var_os(name)
@@ -84,9 +90,10 @@ impl Runner {
         let pool = StatePool::new(
             Arc::new(model.description()),
             device,
+            // Room for the snapshots and one continuation forked from each.
             PoolConfig {
-                pages: model.description().pages_for(tokens) + 1,
-                recurrent_slots: 2,
+                pages: model.description().pages_for(tokens) + 1 + SNAPSHOTS.len() * 16,
+                recurrent_slots: 4 + 2 * SNAPSHOTS.len(),
             },
         )?;
         let state = ModelState::new(&pool);
@@ -122,6 +129,46 @@ impl Runner {
         self.model.device().synchronize()?;
         self.pool.reclaim();
         Ok(log_probs)
+    }
+
+    /// Greedy continuation of `steps` tokens from `state` after feeding `first`.
+    fn generate(&self, mut state: ModelState, first: u32, steps: usize) -> Result<Vec<u32>> {
+        let mut out = Vec::with_capacity(steps);
+        let mut next = first;
+        while out.len() < steps {
+            let mut reservation = state.reserve(1, Boundaries::Final)?;
+            reservation.prepare()?;
+            let binding = reservation.binding();
+            let step = self
+                .model
+                .forward(&PackedForward {
+                    tokens: &[next],
+                    positions: &[state.position()],
+                    sequences: &[SequenceForward {
+                        tokens: 0..1,
+                        state: &binding,
+                        logits: &[0],
+                        hidden: false,
+                    }],
+                    pool: &self.pool,
+                })?
+                .pop()
+                .ok_or_else(|| invalid("missing step"))??;
+            next = step
+                .logits
+                .argmax(D::Minus1)?
+                .flatten_all()?
+                .to_vec1::<u32>()?
+                .first()
+                .copied()
+                .ok_or_else(|| invalid("empty logits"))?;
+            out.push(next);
+            state = reservation.commit(1)?;
+            drop(reservation);
+            self.model.device().synchronize()?;
+            self.pool.reclaim();
+        }
+        Ok(out)
     }
 }
 
@@ -310,6 +357,16 @@ fn main() -> Result<()> {
     let mut buckets = vec![vec![Bucket::default(); BUCKETS.len() - 1]; formats.len()];
     let mut answers = vec![Bucket::default(); formats.len()];
     let weight_bytes: Vec<usize> = runners.iter().map(|r| r.model.weight_bytes()).collect();
+    let kv_bytes = runners
+        .iter()
+        .map(|r| r.model.description().kv_token_bytes())
+        .collect::<Result<Vec<_>>>()?;
+    let generate: usize = std::env::var("TUR_EVAL_GENERATE")
+        .unwrap_or_else(|_| "0".into())
+        .parse()
+        .map_err(|_| invalid("TUR_EVAL_GENERATE"))?;
+    // (context, reference snapshot, each variant's snapshot)
+    let mut snapshots: Vec<(usize, ModelState, Vec<ModelState>)> = Vec::new();
     let inputs = &tokens[..evaluated];
     for (index, chunk) in inputs.chunks(chunk_tokens).enumerate() {
         let first = index * chunk_tokens;
@@ -361,31 +418,59 @@ fn main() -> Result<()> {
                 }
             }
         }
+        let end = first + chunk.len();
+        if generate > 0 && SNAPSHOTS.contains(&end) && end < tokens.len() {
+            snapshots.push((
+                end,
+                reference.state.clone(),
+                runners.iter().map(|r| r.state.clone()).collect(),
+            ));
+        }
         if (first + chunk.len()).is_multiple_of(512) || first + chunk.len() == evaluated {
             eprintln!("evaluated {} of {evaluated} positions", first + chunk.len());
+        }
+    }
+    // Per variant: (continuations, tokens matching the reference, matched prefix lengths).
+    let mut continuations = vec![Vec::new(); formats.len()];
+    for (context, exact_state, states) in snapshots {
+        let next = tokens[context];
+        let expected = reference.generate(exact_state, next, generate)?;
+        for ((runner, state), out) in runners.iter().zip(states).zip(&mut continuations) {
+            let actual = runner.generate(state, next, generate)?;
+            let prefix = actual
+                .iter()
+                .zip(&expected)
+                .take_while(|(a, b)| a == b)
+                .count();
+            out.push(json!({"context": context, "matched_prefix": prefix, "tokens": generate}));
         }
     }
     let results: Vec<Value> = formats
         .iter()
         .zip(&buckets)
-        .zip(answers.iter().zip(&weight_bytes))
-        .map(|((format, buckets), (answers, bytes))| {
-            let total = buckets.iter().fold(Bucket::default(), |a, b| a.merge(b));
-            json!({
-                "kv_format": format.kv.to_string(),
-                "recurrent_state": format!("{:?}", format.state).to_lowercase(),
-                "weights": format.weights.name(),
-                "weight_bytes": bytes,
-                "all": total.json(0, evaluated),
-                "marked": (answers.positions > 0).then(|| answers.json(0, evaluated)),
-                "buckets": buckets
-                    .iter()
-                    .zip(BUCKETS.windows(2))
-                    .filter(|(b, _)| b.positions > 0)
-                    .map(|(b, w)| b.json(w[0], w[1]))
-                    .collect::<Vec<_>>(),
-            })
-        })
+        .zip(answers.iter().zip(weight_bytes.iter().zip(&kv_bytes)))
+        .zip(&continuations)
+        .map(
+            |(((format, buckets), (answers, (bytes, kv_bytes))), continuations)| {
+                let total = buckets.iter().fold(Bucket::default(), |a, b| a.merge(b));
+                json!({
+                    "kv_format": format.kv.to_string(),
+                    "kv_token_bytes": kv_bytes,
+                    "recurrent_state": format!("{:?}", format.state).to_lowercase(),
+                    "weights": format.weights.name(),
+                    "weight_bytes": bytes,
+                    "all": total.json(0, evaluated),
+                    "marked": (answers.positions > 0).then(|| answers.json(0, evaluated)),
+                    "continuations": continuations,
+                    "buckets": buckets
+                        .iter()
+                        .zip(BUCKETS.windows(2))
+                        .filter(|(b, _)| b.positions > 0)
+                        .map(|(b, w)| b.json(w[0], w[1]))
+                        .collect::<Vec<_>>(),
+                })
+            },
+        )
         .collect();
     let document = json!({
         "schema_version": 2,

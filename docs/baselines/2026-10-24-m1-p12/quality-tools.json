@@ -1,0 +1,323 @@
+{
+  "schema_version": 2,
+  "checkpoint": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
+  "weights": "q8_0 unless a result names other weights",
+  "reference_weights": "q8_0",
+  "reference_weight_bytes": 1309441280,
+  "reference_kv": "f32",
+  "reference_state": "f32",
+  "page_tokens": 16,
+  "text": "heldout-tools.txt",
+  "text_bytes": 72322,
+  "evaluated_positions": 8192,
+  "chunk": 256,
+  "metric": "teacher-forced next-token distributions; KL(F32 reference || variant) in nats",
+  "results": [
+    {
+      "kv_format": "q8_32",
+      "kv_token_bytes": 6528,
+      "recurrent_state": "f32",
+      "weights": "q8_0",
+      "weight_bytes": 1309441280,
+      "all": {
+        "positions": [
+          0,
+          8192
+        ],
+        "count": 8192,
+        "mean_kl": 0.00009100602148113598,
+        "max_kl": 0.034159764647483826,
+        "top1_agreement": 0.998291015625,
+        "top1_accuracy": 0.845458984375,
+        "reference_top1_accuracy": 0.845458984375,
+        "mean_nll": 0.7265920890217746,
+        "reference_mean_nll": 0.7267405127560355
+      },
+      "marked": null,
+      "continuations": [
+        {
+          "context": 1024,
+          "matched_prefix": 64,
+          "tokens": 64
+        },
+        {
+          "context": 2048,
+          "matched_prefix": 64,
+          "tokens": 64
+        },
+        {
+          "context": 4096,
+          "matched_prefix": 63,
+          "tokens": 64
+        },
+        {
+          "context": 8192,
+          "matched_prefix": 64,
+          "tokens": 64
+        }
+      ],
+      "buckets": [
+        {
+          "positions": [
+            0,
+            1024
+          ],
+          "count": 1024,
+          "mean_kl": 0.0005274599778247436,
+          "max_kl": 0.034159764647483826,
+          "top1_agreement": 0.994140625,
+          "top1_accuracy": 0.787109375,
+          "reference_top1_accuracy": 0.7880859375,
+          "mean_nll": 1.2178051828807235,
+          "reference_mean_nll": 1.218743733198256
+        },
+        {
+          "positions": [
+            1024,
+            2048
+          ],
+          "count": 1024,
+          "mean_kl": 0.000048989960044751096,
+          "max_kl": 0.0037724636495113373,
+          "top1_agreement": 0.9990234375,
+          "top1_accuracy": 0.81640625,
+          "reference_top1_accuracy": 0.81640625,
+          "mean_nll": 0.8752638830836375,
+          "reference_mean_nll": 0.8756569863849845
+        },
+        {
+          "positions": [
+            2048,
+            4096
+          ],
+          "count": 2048,
+          "mean_kl": 0.000025556304930336133,
+          "max_kl": 0.0006611226126551628,
+          "top1_agreement": 0.9990234375,
+          "top1_accuracy": 0.857421875,
+          "reference_top1_accuracy": 0.85791015625,
+          "mean_nll": 0.6712637697622087,
+          "reference_mean_nll": 0.6713920091467342
+        },
+        {
+          "positions": [
+            4096,
+            8192
+          ],
+          "count": 4096,
+          "mean_kl": 0.00002512140602973023,
+          "max_kl": 0.0016747228801250458,
+          "top1_agreement": 0.998779296875,
+          "top1_accuracy": 0.861328125,
+          "reference_top1_accuracy": 0.86083984375,
+          "mean_nll": 0.5942850266713546,
+          "reference_mean_nll": 0.5941848410428937
+        }
+      ]
+    },
+    {
+      "kv_format": "tq6",
+      "kv_token_bytes": 4656,
+      "recurrent_state": "f32",
+      "weights": "q8_0",
+      "weight_bytes": 1309441280,
+      "all": {
+        "positions": [
+          0,
+          8192
+        ],
+        "count": 8192,
+        "mean_kl": 0.0011616719671766335,
+        "max_kl": 1.3771170377731323,
+        "top1_agreement": 0.9937744140625,
+        "top1_accuracy": 0.8455810546875,
+        "reference_top1_accuracy": 0.845458984375,
+        "mean_nll": 0.7275336814138018,
+        "reference_mean_nll": 0.7267405127560355
+      },
+      "marked": null,
+      "continuations": [
+        {
+          "context": 1024,
+          "matched_prefix": 13,
+          "tokens": 64
+        },
+        {
+          "context": 2048,
+          "matched_prefix": 64,
+          "tokens": 64
+        },
+        {
+          "context": 4096,
+          "matched_prefix": 63,
+          "tokens": 64
+        },
+        {
+          "context": 8192,
+          "matched_prefix": 64,
+          "tokens": 64
+        }
+      ],
+      "buckets": [
+        {
+          "positions": [
+            0,
+            1024
+          ],
+          "count": 1024,
+          "mean_kl": 0.006569332794264391,
+          "max_kl": 1.3771170377731323,
+          "top1_agreement": 0.9833984375,
+          "top1_accuracy": 0.7880859375,
+          "reference_top1_accuracy": 0.7880859375,
+          "mean_nll": 1.2218434051494138,
+          "reference_mean_nll": 1.218743733198256
+        },
+        {
+          "positions": [
+            1024,
+            2048
+          ],
+          "count": 1024,
+          "mean_kl": 0.0006572013050553963,
+          "max_kl": 0.0501977801322937,
+          "top1_agreement": 0.9951171875,
+          "top1_accuracy": 0.8154296875,
+          "reference_top1_accuracy": 0.81640625,
+          "mean_nll": 0.8755589350648254,
+          "reference_mean_nll": 0.8756569863849845
+        },
+        {
+          "positions": [
+            2048,
+            4096
+          ],
+          "count": 2048,
+          "mean_kl": 0.0003475718127968553,
+          "max_kl": 0.020509958267211914,
+          "top1_agreement": 0.99609375,
+          "top1_accuracy": 0.857421875,
+          "reference_top1_accuracy": 0.85791015625,
+          "mean_nll": 0.6718177454199754,
+          "reference_mean_nll": 0.6713920091467342
+        },
+        {
+          "positions": [
+            4096,
+            8192
+          ],
+          "count": 4096,
+          "mean_kl": 0.0003429245031248926,
+          "max_kl": 0.016794562339782715,
+          "top1_agreement": 0.994873046875,
+          "top1_accuracy": 0.861572265625,
+          "reference_top1_accuracy": 0.86083984375,
+          "mean_nll": 0.5948079050640562,
+          "reference_mean_nll": 0.5941848410428937
+        }
+      ]
+    },
+    {
+      "kv_format": "tq6_q8_32",
+      "kv_token_bytes": 5592,
+      "recurrent_state": "f32",
+      "weights": "q8_0",
+      "weight_bytes": 1309441280,
+      "all": {
+        "positions": [
+          0,
+          8192
+        ],
+        "count": 8192,
+        "mean_kl": 0.0005532270595359344,
+        "max_kl": 0.22000302374362946,
+        "top1_agreement": 0.9945068359375,
+        "top1_accuracy": 0.8450927734375,
+        "reference_top1_accuracy": 0.845458984375,
+        "mean_nll": 0.726677246014825,
+        "reference_mean_nll": 0.7267405127560355
+      },
+      "marked": null,
+      "continuations": [
+        {
+          "context": 1024,
+          "matched_prefix": 14,
+          "tokens": 64
+        },
+        {
+          "context": 2048,
+          "matched_prefix": 64,
+          "tokens": 64
+        },
+        {
+          "context": 4096,
+          "matched_prefix": 64,
+          "tokens": 64
+        },
+        {
+          "context": 8192,
+          "matched_prefix": 64,
+          "tokens": 64
+        }
+      ],
+      "buckets": [
+        {
+          "positions": [
+            0,
+            1024
+          ],
+          "count": 1024,
+          "mean_kl": 0.0031122473996862575,
+          "max_kl": 0.22000302374362946,
+          "top1_agreement": 0.984375,
+          "top1_accuracy": 0.787109375,
+          "reference_top1_accuracy": 0.7880859375,
+          "mean_nll": 1.216475510259666,
+          "reference_mean_nll": 1.218743733198256
+        },
+        {
+          "positions": [
+            1024,
+            2048
+          ],
+          "count": 1024,
+          "mean_kl": 0.0002714337496703542,
+          "max_kl": 0.009560571983456612,
+          "top1_agreement": 0.99609375,
+          "top1_accuracy": 0.814453125,
+          "reference_top1_accuracy": 0.81640625,
+          "mean_nll": 0.8739537328807985,
+          "reference_mean_nll": 0.8756569863849845
+        },
+        {
+          "positions": [
+            2048,
+            4096
+          ],
+          "count": 2048,
+          "mean_kl": 0.0001655723563489137,
+          "max_kl": 0.009779734537005424,
+          "top1_agreement": 0.99560546875,
+          "top1_accuracy": 0.8564453125,
+          "reference_top1_accuracy": 0.85791015625,
+          "mean_nll": 0.6726037998118641,
+          "reference_mean_nll": 0.6713920091467342
+        },
+        {
+          "positions": [
+            4096,
+            8192
+          ],
+          "count": 4096,
+          "mean_kl": 0.0001777476535582592,
+          "max_kl": 0.013752905651926994,
+          "top1_agreement": 0.99609375,
+          "top1_accuracy": 0.861572265625,
+          "reference_top1_accuracy": 0.86083984375,
+          "mean_nll": 0.5944452813386017,
+          "reference_mean_nll": 0.5941848410428937
+        }
+      ]
+    }
+  ]
+}
