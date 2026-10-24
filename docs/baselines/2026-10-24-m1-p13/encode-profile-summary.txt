@@ -1,0 +1,41 @@
+total self samples under 6submit 1072
+   225  21.0%  AGX dispatch/bind encoding
+   165  15.4%  malloc/free
+   134  12.5%  candle hazard maps (hash)
+   111  10.4%  buffer create (newBuffer/IOGPU) (via caller)
+    90   8.4%  buffer create (newBuffer/IOGPU)
+    54   5.0%  objc runtime
+    33   3.1%  AGX dispatch/bind encoding (via caller)
+    24   2.2%  command encoder lock/fences (via caller)
+    21   2.0%  debug labels (CFString) (via caller)
+    17   1.6%  other: kevent_id
+    17   1.6%  debug labels (CFString)
+    16   1.5%  other: _RNvMs1_NtNtCsfPTNDopPFdY_9tur_metal7kernels7runtimeNtB5_7Ru
+    15   1.4%  command encoder lock/fences
+    12   1.1%  other: _RNvMs0_NtNtCs384e0p2ICvy_20candle_metal_kernels5metal7encod
+     9   0.8%  candle hazard maps (hash) (via caller)
+     8   0.7%  other: <deduplicated_symbol>
+     6   0.6%  other: _RNvMsn_NtCs6zY7rJBZy9D_5alloc4syncINtB5_3ArcNtNtCsh4yIoUxvk
+     5   0.5%  other: _RNvMs1_NtCsfPTNDopPFdY_9tur_metal7kernelsNtB5_7Kernels10del
+     5   0.5%  other: _RINvMs3_NtNtCsfPTNDopPFdY_9tur_metal7kernels7runtimeNtB6_6O
+     4   0.4%  other: _RINvMNtCsh4yIoUxvkOH_11candle_core9custom_opNtNtB5_6tensor6
+     4   0.4%  other: _RNvMs1_NtCsh4yIoUxvkOH_11candle_core6tensorNtB5_6Tensor18st
+     4   0.4%  other: _RINvMs1_NtNtCsfPTNDopPFdY_9tur_metal7kernels7runtimeNtB6_7R
+     4   0.4%  residency set commit
+     4   0.4%  other: _RINvNtCsjIpoRzUjyHQ_4core3ptr9drop_glueNtNtNtCsh4yIoUxvkOH_
+     3   0.3%  other: _RNvMNtCsh4yIoUxvkOH_11candle_core6layoutNtB2_6Layout13is_co
+     3   0.3%  other: _RINvNtCsh4yIoUxvkOH_11candle_core6tensor12from_storageNtNtB
+     3   0.3%  other: _RNvMNtNtCsh4yIoUxvkOH_11candle_core9quantized5metalNtB2_13Q
+     3   0.3%  other: _RNvNvNtCs6zY7rJBZy9D_5alloc3fmt6format12format_inner
+     3   0.3%  other: _RNvXNtNtCs6zY7rJBZy9D_5alloc3vec21spec_from_iter_nestedINtB
+     3   0.3%  other: _RNvMs1_NtCsfPTNDopPFdY_9tur_metal7kernelsNtB5_7Kernels9atte
+     3   0.3%  other: _RNvMs5_NtCsYWnQtZMkG7_10tur_engine6hybridINtB5_12HybridEngi
+     2   0.2%  other: _RNvMs9_NtCsh4yIoUxvkOH_11candle_core6deviceNtB5_6Device11sa
+     2   0.2%  other: _RNCNvMs1_NtCsfPTNDopPFdY_9tur_metal7kernelsNtB7_7Kernels10d
+     2   0.2%  other: _RNvXs5_NtCsh4yIoUxvkOH_11candle_core9quantizedNtB5_7QTensor
+     2   0.2%  other: _dispatch_kq_poll
+     2   0.2%  other: _RNvMs2_NtNtCsfPTNDopPFdY_9tur_metal7kernels7runtimeNtB5_4Vi
+     2   0.2%  other: _RNvMs1_NtCsfPTNDopPFdY_9tur_metal7kernelsNtB5_7Kernels8kv_v
+     2   0.2%  other: _RNvNtNtCsfPTNDopPFdY_9tur_metal7kernels7runtime6to_u32
+     2   0.2%  other: _RNvMNtCsh4yIoUxvkOH_11candle_core7storageNtB2_7Storage6devi
+     2   0.2%  other: _RNvMNtCsh4yIoUxvkOH_11candle_core7storageNtB2_7Storage5dtyp

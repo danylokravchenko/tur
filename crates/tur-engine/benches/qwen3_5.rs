@@ -12,7 +12,8 @@
 //! `TUR_QWEN35_0_8B=<snapshot> cargo bench --offline -p tur-engine --bench qwen3_5 > out.json`
 //! narrows with `TUR_BENCH_FORMATS=q8_0,q4k` (entries may also be prepacked artifact directories), `TUR_BENCH_KV=f32,q8`, `TUR_BENCH_PAGES=16,64`,
 //! `TUR_BENCH_PREFILL=128,2048` and `TUR_BENCH_CONTEXTS=2048,8192`. `TUR_BENCH_REFERENCE=1`
-//! adds the F32 reference execution with F32 K/V.
+//! adds the F32 reference execution with F32 K/V. `TUR_BENCH_ONLY=prefill,decode,engine`
+//! selects cases and `TUR_BENCH_ENGINE_TOKENS=32` sets the engine case's length.
 
 use candle_core::Device;
 use serde_json::{Value, json};
@@ -82,9 +83,24 @@ fn pool(model: &Qwen35, contexts: &[usize], extra: usize) -> Result<StatePool> {
     )
 }
 
+/// Host time to encode a pass and time until the device completed it, from a synchronized
+/// device.
+#[derive(Clone, Copy)]
+struct Timed {
+    encode: f64,
+    total: f64,
+}
+
+fn medians(samples: &[Timed]) -> (f64, f64) {
+    (
+        median(samples.iter().map(|s| s.total).collect()),
+        median(samples.iter().map(|s| s.encode).collect()),
+    )
+}
+
 /// One forward pass of `sequences` with the last row of each as logits: reserve pages and
 /// slots, encode, wait. Nothing is committed, so the pass can repeat on the same states.
-fn pass(model: &Qwen35, pool: &StatePool, sequences: &[(&ModelState, &[u32])]) -> Result<f64> {
+fn pass(model: &Qwen35, pool: &StatePool, sequences: &[(&ModelState, &[u32])]) -> Result<Timed> {
     let mut packed = Vec::new();
     let mut positions = Vec::new();
     let mut ranges = Vec::new();
@@ -124,11 +140,12 @@ fn pass(model: &Qwen35, pool: &StatePool, sequences: &[(&ModelState, &[u32])]) -
     })? {
         result?;
     }
+    let encode = start.elapsed().as_secs_f64();
     model.device().synchronize()?;
-    let seconds = start.elapsed().as_secs_f64();
+    let total = start.elapsed().as_secs_f64();
     drop(reservations);
     pool.reclaim();
-    Ok(seconds)
+    Ok(Timed { encode, total })
 }
 
 /// Committed state after prefilling `prompt` in chunks of 2048 tokens.
@@ -172,10 +189,12 @@ fn prefill_case(model: &Qwen35, length: usize) -> Result<Value> {
     let samples = (0..iterations)
         .map(|_| pass(model, &pool, &[(&empty, &prompt)]))
         .collect::<Result<Vec<_>>>()?;
-    let seconds = median(samples.clone());
+    let (seconds, encode) = medians(&samples);
     Ok(json!({
         "prompt_tokens": length, "median_seconds": seconds,
-        "tokens_per_second": length as f64 / seconds, "samples_seconds": samples,
+        "median_encode_seconds": encode,
+        "tokens_per_second": length as f64 / seconds,
+        "samples_seconds": samples.iter().map(|s| s.total).collect::<Vec<_>>(),
     }))
 }
 
@@ -196,11 +215,13 @@ fn decode_case(model: &Qwen35, batch: usize, context: usize) -> Result<Value> {
     let samples = (0..DECODE_STEPS)
         .map(|_| pass(model, &pool, &sequences))
         .collect::<Result<Vec<_>>>()?;
-    let seconds = median(samples.clone());
+    let (seconds, encode) = medians(&samples);
     let usage = pool.usage()?;
     Ok(json!({
         "sequences": batch, "context": context, "median_step_seconds": seconds,
-        "tokens_per_second": batch as f64 / seconds, "samples_seconds": samples,
+        "median_encode_seconds": encode,
+        "tokens_per_second": batch as f64 / seconds,
+        "samples_seconds": samples.iter().map(|s| s.total).collect::<Vec<_>>(),
         "state_leased_bytes": usage.leased_bytes(),
     }))
 }
@@ -217,10 +238,14 @@ fn engine_case(model: Arc<Qwen35>, generated: usize) -> Result<Value> {
     let handle = engine.allocate(0, SamplingOptions::default(), None)?;
     let mut next = tokens(SHORT_CONTEXT, 99);
     let mut samples = Vec::new();
+    let (mut submits, mut posts, mut gaps) = (Vec::new(), Vec::new(), Vec::new());
+    let mut completed: Option<Instant> = None;
     for step in 0..=generated {
         let meta = engine.metadata(handle.request)?;
         let n = next.len();
         let start = Instant::now();
+        // The device has no work queued from the previous completion until this submission.
+        let gap = completed.map(|at| start.saturating_duration_since(at).as_secs_f64());
         engine.submit(PackedExecution {
             positions: (meta.position..meta.position + n).collect(),
             tokens: std::mem::take(&mut next),
@@ -231,6 +256,7 @@ fn engine_case(model: Arc<Qwen35>, generated: usize) -> Result<Value> {
                 speculative: false,
             }],
         })?;
+        let submitted = start.elapsed().as_secs_f64();
         let token = engine
             .finish()?
             .pop()
@@ -240,31 +266,49 @@ fn engine_case(model: Arc<Qwen35>, generated: usize) -> Result<Value> {
             .first()
             .map(|o| o.token)
             .ok_or_else(|| invalid("no output"))?;
+        let finished = Instant::now();
+        completed = engine.completed_at();
         // The first step is the prompt prefill.
         if step > 0 {
-            samples.push(start.elapsed().as_secs_f64());
+            samples.push(finished.duration_since(start).as_secs_f64());
+            submits.push(submitted);
+            posts.push(completed.map_or(0.0, |at| {
+                finished.saturating_duration_since(at).as_secs_f64()
+            }));
+            gaps.extend(gap);
         }
         next = vec![token];
     }
     let seconds = median(samples.clone());
     Ok(json!({
         "generated_tokens": generated, "median_token_seconds": seconds,
+        "median_submit_seconds": median(submits),
+        "median_after_completion_seconds": median(posts),
+        "median_idle_seconds": median(gaps),
         "tokens_per_second": 1.0 / seconds, "samples_seconds": samples,
     }))
 }
 
+/// Whether `TUR_BENCH_ONLY` (comma-separated `prefill`, `decode`, `engine`) selects `case`.
+fn selected(case: &str) -> bool {
+    std::env::var("TUR_BENCH_ONLY").map_or(true, |only| only.split(',').any(|c| c == case))
+}
+
 fn run(model: &Qwen35, prefill: &[usize], contexts: &[usize]) -> Result<Value> {
+    let prefill = if selected("prefill") { prefill } else { &[] };
     let prefill = prefill
         .iter()
         .map(|&length| prefill_case(model, length))
         .collect::<Result<Vec<_>>>()?;
-    let mut decode = [1, 2, 4, 8, 16]
-        .into_iter()
-        .map(|batch| decode_case(model, batch, SHORT_CONTEXT))
-        .collect::<Result<Vec<_>>>()?;
-    for &context in contexts {
-        for batch in [1, 4] {
-            decode.push(decode_case(model, batch, context)?);
+    let mut decode = Vec::new();
+    if selected("decode") {
+        for batch in [1, 2, 4, 8, 16] {
+            decode.push(decode_case(model, batch, SHORT_CONTEXT)?);
+        }
+        for &context in contexts {
+            for batch in [1, 4] {
+                decode.push(decode_case(model, batch, context)?);
+            }
         }
     }
     let description = model.description();
@@ -287,6 +331,10 @@ fn main() -> Result<()> {
     let contexts = env_sizes("TUR_BENCH_CONTEXTS", "2048,8192")?;
     let pages = env_sizes("TUR_BENCH_PAGES", "16")?;
     let reference = std::env::var("TUR_BENCH_REFERENCE").is_ok_and(|v| v == "1");
+    let engine_tokens = env_sizes("TUR_BENCH_ENGINE_TOKENS", "32")?
+        .first()
+        .copied()
+        .ok_or_else(|| invalid("TUR_BENCH_ENGINE_TOKENS"))?;
     let mut runs = Vec::new();
     for name in env_list("TUR_BENCH_FORMATS", "q8_0,q4k") {
         let (source, weights) = if is_artifact(Path::new(&name)) {
@@ -329,14 +377,17 @@ fn main() -> Result<()> {
                         result["execution"] = json!("Reference");
                         runs.push(result);
                         let model = Arc::new(model.with_execution(Execution::Fused)?);
+                        if selected("engine") {
+                            runs.push(json!({
+                                "format": name, "execution": "Fused", "kv_format": kv.to_string(),
+                                "page_tokens": page, "engine": engine_case(model, engine_tokens)?,
+                            }));
+                        }
+                    } else if selected("engine") {
                         runs.push(json!({
                             "format": name, "execution": "Fused", "kv_format": kv.to_string(),
-                            "page_tokens": page, "engine": engine_case(model, 32)?,
-                        }));
-                    } else {
-                        runs.push(json!({
-                            "format": name, "execution": "Fused", "kv_format": kv.to_string(),
-                            "page_tokens": page, "engine": engine_case(Arc::new(model), 32)?,
+                            "page_tokens": page,
+                            "engine": engine_case(Arc::new(model), engine_tokens)?,
                         }));
                     }
                 }
@@ -344,7 +395,7 @@ fn main() -> Result<()> {
         }
     }
     let document = json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "checkpoint": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
         "workload": "synthetic token ids; one prefill pass per prompt length; decode steps re-run one token over committed context without publishing",
         "short_context": SHORT_CONTEXT, "warmup": WARMUP, "decode_steps": DECODE_STEPS,

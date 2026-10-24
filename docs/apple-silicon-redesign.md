@@ -51,6 +51,16 @@ Values dominate the error, and each extra bit cuts KL about 4×. The only passin
 so Tur keeps F32/F16/Q8 K/V. The implementation is preserved as a patch; see the
 [P12 report](apple-silicon-p12-kv.md).
 
+P13 ran on 2026-10-24, on the M1 and the 0.8B checkpoint only, and found no speed gain.
+Host encoding is 13–25% of a pass but overlaps GPU execution: committing work to the GPU
+earlier or later changes nothing beyond noise. The device idles 28–38 µs between passes,
+so overlap or a second in-flight pass cannot exceed about 1.003×; neither was built. A
+batch-invariant execution mode was built and was bit-identical across batch size, order
+and chunking (default kernels differed in 11 of 15 comparisons). It cost 0.52–0.60× prefill
+and 0.59–0.87× single-sequence decode, so it is preserved as a patch, not kept. The model
+benchmark now reports encode, submit, post-completion and idle time. See the
+[P13 report](apple-silicon-p13-execution.md).
+
 Post-P8 roadmap added on 2026-10-23: P9 establishes a fresh comparative baseline;
 P10–P15 evaluate kernel, quantization, execution, speculation and prefix-scheduling
 improvements; production release moves from P9 to P16. These packages are planned,
@@ -613,6 +623,12 @@ speedups use a dequantize-then-attend baseline; Tur already reads packed pages d
 
 ### P13 — Reusable execution plans, overlap and batch invariance
 
+Measured on the M1 and 0.8B checkpoint (2026-10-24) and closed without a speed change:
+encoding is off the critical path and inter-pass idle bounds overlap at about 1.003×.
+Batch invariance was built and rejected on cost. Results are in the
+[P13 report](apple-silicon-p13-execution.md); re-run its commit-granularity sweep on
+hardware with a faster GPU relative to its CPU before revisiting items 1–3.
+
 Depends on P9; specialize plans for validated P10/P12 variants. Build on current
 completion ownership, scratch planning and device sampling.
 
@@ -718,7 +734,7 @@ and ordinary decoding separately. No improvement remains a possible experiment o
 | --- | --- | --- |
 | P10 chunked DeltaNet, long prefill | About 1.06–1.10× whole-model throughput **if** the chunked kernel is 2–4× faster than the current scan | Revised after the 2026-10-23 kernel pass: the rewritten token-serial scan is about 12% of 2K prefill (18 × 10.4 ms of ~1.6 s), down from about 21%; removing it entirely would give at most about 1.14×. **Measured 2026-10-24: the chunked kernel was 0.41–0.66× the scan on M1; rejected** |
 | P10–P13 combined, M1 prefill | Aim for 1.10–1.30× prompt tokens/s at unchanged quality | Engineering target; projections already ran near the measured M1 F32 ceiling in P4, limiting gains without changing precision or workload |
-| P10–P13 combined, ordinary M1 decode | Aim for 1.05–1.15× tokens/s in selected beneficial regimes | Engineering target; weight/state bandwidth and already-small host scheduling costs limit general gains. Batch-1 improvement may be negligible |
+| P10–P13 combined, ordinary M1 decode | Aim for 1.05–1.15× tokens/s in selected beneficial regimes | Engineering target; weight/state bandwidth and already-small host scheduling costs limit general gains. Batch-1 improvement may be negligible. **Measured 2026-10-24 (0.8B, M1): P13's host-side work cannot exceed about 1.003×; encoding overlaps the GPU and inter-pass idle is 28–38 µs** |
 | P12 low-bit KV versus Q8 group 32 | Roughly 1.7–2.4× smaller **KV storage**, subject to measured metadata/padding | Q8 uses 8.5 bits/value including one F16 scale per 32 values. Illustrative 5–3.5 effective-bit candidates give this range; formats and quality still need validation. **Measured 2026-10-24 (0.8B, M1): 4-bit formats were 10–30× over the quality budget; the best passing format saved 1.17× and decoded 2–7% slower; rejected** |
 | P12 F16 recurrent matrices versus F32 | 2× smaller matrix payload; less than 2× smaller total recurrent state | Already available in P6, not a new gain. Historical serving throughput improved only 4–5% at concurrency 8–16; long-context quality and speculative compatibility remain constraints |
 | P11 calibrated weights | Better quality at equal bytes, or fewer bytes at equal quality; no fixed speedup forecast | Same-bit calibration may change no runtime cost. Lower precision helps only if corresponding kernels win and sensitive tensors retain adequate precision. **Measured 2026-10-24 (0.8B, M1): GPTQ halved Q4K's KL at equal bytes with unchanged speed; the tied-head embedding cut Q4K weights 2.2× at equal quality** |
