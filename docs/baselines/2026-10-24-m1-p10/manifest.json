@@ -1,0 +1,56 @@
+{
+  "date": "2026-10-24",
+  "hardware": {
+    "model": "MacBookPro17,1",
+    "chip": "Apple M1",
+    "gpu_cores": 8,
+    "unified_memory_gb": 16
+  },
+  "os": "26.6.2",
+  "source_base_commit": "165e9b8",
+  "source_state": "uncommitted P10 changes on top of the base commit (files below). 'before' artifacts ran the base commit unchanged in a separate worktree with its own target directory; 'after' artifacts ran this state.",
+  "source_sha256": {
+    "crates/tur-metal/src/kernels/attention.metal": "4839567f23de57ec1872c51f26ab4648c713f6e54db66d19a47cadcaea10014f",
+    "crates/tur-metal/src/kernels/delta.metal": "25084d09e03ac1e1f3f53a039d3556ca3bb5c625226a2e25230084e4476a5ca7",
+    "crates/tur-metal/src/kernels/mod.rs": "dbd6ff14d368c86cd7910f8a5b7c9d3774e377ad398e87faa1c2b5c522940eca",
+    "crates/tur-metal/src/kernels/runtime.rs": "514be1547d6991f8988b6a790bc83d4de739be55505cd65a98fb4aa9b6d3e851",
+    "crates/tur-models/src/models/qwen3_5/model/fused.rs": "00bb6f7d00c048b0c87d9c1aa9341fdfd9ad4fa4e33294a3fddad5c8e8be7734",
+    "crates/tur-models/src/models/qwen3_5/model.rs": "d5b513224600ec1ebd873ef1345d06379b931fd350a36b75db3556636ce1dee3",
+    "crates/tur-metal/benches/kernels.rs": "11f98c4da66351e7eb347d7c8dff36c5b208752e33607fa30aba0b634977686f",
+    "crates/tur-metal/examples/tensorops_gemm.rs": "b83f915691b8f0468cc074a0d140ba0d648bdcd0a4711c0d79324eb8fbe4fb86",
+    "crates/tur-metal/tests/kernels.rs": "b98ec3160b526619b0ba8975ede2b9acb9f9a4e49a6baa31035d2709a26a728b"
+  },
+  "compiler": [
+    "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "host: aarch64-apple-darwin",
+    "LLVM version: 23.1.1"
+  ],
+  "profile": "pre-release (release without LTO); the TensorOps example runs in release",
+  "checkpoint": {
+    "model": "Qwen/Qwen3.5-0.8B",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17"
+  },
+  "golden_sha256": {
+    "TUR_QWEN35_GOLDEN": "daab283e17fdb60f12682ad505b3bde381d6e719b413555918b6282f804bbd57",
+    "TUR_QWEN35_MTP_GOLDEN": "6f426c999009b01e922529fc4012fdf1f7e801097933b6fca6788b03d7c823d2"
+  },
+  "commands": {
+    "delta": "TUR_BENCH_ONLY=delta cargo bench --offline -p tur-metal --bench kernels --profile pre-release",
+    "paged": "TUR_BENCH_ONLY=paged cargo bench --offline -p tur-metal --bench kernels --profile pre-release",
+    "tensorops": "cargo run --offline --release -p tur-metal --example tensorops_gemm",
+    "model": "TUR_QWEN35_0_8B=<snapshot> TUR_BENCH_FORMATS=q8_0,q4k TUR_BENCH_KV=f16,q8 TUR_BENCH_PAGES=16 TUR_BENCH_PREFILL=2048 TUR_BENCH_CONTEXTS=8192 cargo bench --offline -p tur-engine --bench qwen3_5 --profile pre-release",
+    "prefill": "TUR_QWEN35_0_8B=<snapshot> TUR_BENCH_FORMATS=q8_0 TUR_BENCH_KV=f16 TUR_BENCH_PAGES=16 TUR_BENCH_PREFILL=2048,8192 TUR_BENCH_CONTEXTS=2048 cargo bench --offline -p tur-engine --bench qwen3_5 --profile pre-release",
+    "tests": "cargo nextest run --offline --cargo-profile pre-release --workspace --test-threads 1",
+    "checkpoint_tests": "TUR_QWEN35_0_8B=<snapshot> TUR_QWEN35_GOLDEN=<golden> TUR_QWEN35_MTP_GOLDEN=<mtp golden> cargo nextest run --offline --cargo-profile pre-release --workspace --run-ignored ignored-only --test-threads 1",
+    "shader_validation": "MTL_SHADER_VALIDATION=1 MTL_DEBUG_LAYER=1 cargo nextest run --offline --cargo-profile pre-release -p tur-metal -p tur-engine --test-threads 1 --no-fail-fast"
+  },
+  "notes": [
+    "delta-before/after-1..3 and model-before/after-1..2, prefill-before/after-1..3 are interleaved runs (before, after, before, ...); the report gives the best median per cell.",
+    "The base worktree's delta benchmark had its token list widened to 1/16/32/64/128/512/2048/8192 to match; nothing else changed.",
+    "paged-head-groups.json predates removing the four-heads-per-simdgroup kernel; its head_groups entries include 4 for that reason.",
+    "rejected-chunked-*.json and rejected-scan-scaled-vectors.json ran intermediate source states in this tree only. rejected-chunked-delta.json (final chunked kernels) and rejected-chunked-unstaged.json (first version) time the full chunked path; the ablation, tile-occupancy and split-accumulator files skipped the chunk-prepare kernel and time the shared prepare pass plus the sequential kernel.",
+    "rejected-chunked-delta.patch is the complete working tree including the chunked kernels, relative to the base commit.",
+    "An earlier A/B attempt shared CARGO_TARGET_DIR between the two trees, so Cargo ran one tree's binaries for both; those results were discarded and are not in this directory.",
+    "Golden files came from earlier sessions' reference-script outputs; the base commit passes all 8 checkpoint tests with them."
+  ]
+}

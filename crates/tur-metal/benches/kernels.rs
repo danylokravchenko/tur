@@ -377,12 +377,29 @@ fn paged_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
                     Ok(rows.clone())
                 })?;
                 let bytes = format.token_bytes(KV_HEADS, HEAD_DIM)? * 2 * paged.slots;
+                // One or two query heads per simdgroup share each loaded K/V row.
+                let mut head_groups = Vec::new();
+                if page == 16 && new == 1 {
+                    for head_group in [1usize, 2] {
+                        let tuned = kernels.clone().with_tuning(Tuning {
+                            attention_head_group: head_group,
+                            attention_q8_head_group: head_group,
+                            ..kernels.tuning()
+                        })?;
+                        let timing = time(device, || {
+                            tuned.attention(&q, &paged.pool, &paged.kv, &gate, gate_heads())
+                        })?;
+                        head_groups.push(json!({
+                            "heads_per_simdgroup": head_group, "attention": timing,
+                        }));
+                    }
+                }
                 cases.push(json!({
                     "operation": "paged_attention", "shape": label, "kv_format": format.to_string(),
                     "page": page, "context": past + new, "sequences": sequences,
                     "pool_bytes": bytes, "fill_tokens": paged.fill.tokens(),
                     "split": format!("{:?}", kernels.attention_split(tokens, HEADS, past + new)),
-                    "attention": attention, "kv_write": write,
+                    "attention": attention, "kv_write": write, "head_groups": head_groups,
                 }));
             }
         }
@@ -472,7 +489,7 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
             a_col: value_heads,
         };
         let channels = shape.channels();
-        for tokens in [1usize, 128, 2048] {
+        for tokens in [1usize, 16, 32, 64, 128, 512, 2048, 8192] {
             let mixed = random(device, &[tokens, channels], 7, 1.0)?;
             let proj = random(device, &[tokens, 2 * value_heads], 8, 1.0)?;
             // Pools of two slots: the committed state in slot 0, the new one in slot 1.
@@ -496,7 +513,10 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
             let per_token = scan["median_seconds"].as_f64().unwrap_or(0.0) / tokens as f64;
             // Threadgroup shape sweep: the staged state tile trades coalescing for occupancy.
             let mut sweep = Vec::new();
-            for scan_simdgroups in [1usize, 2, 4, 8] {
+            for scan_simdgroups in [1usize, 2, 4, 8]
+                .into_iter()
+                .filter(|_| matches!(tokens, 128 | 2048))
+            {
                 let tuned = kernels.clone().with_tuning(Tuning {
                     scan_simdgroups,
                     ..kernels.tuning()

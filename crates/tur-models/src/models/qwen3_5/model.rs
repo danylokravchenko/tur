@@ -398,7 +398,7 @@ impl Qwen35 {
             #[cfg(feature = "metal")]
             if options.execution == Execution::Fused && matches!(options.device, Device::Metal(_)) {
                 let kernels = tur_metal::kernels::Kernels::new(&options.device)?;
-                fused::workspace(config, &kernels, options.kv.page_tokens, tokens, contexts)?
+                fused::workspace(config, &kernels, &options.kv, tokens, contexts)?
             } else {
                 0
             }

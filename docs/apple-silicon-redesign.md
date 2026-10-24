@@ -21,6 +21,15 @@ checkpoint, 2K prefill is 1.13–1.14× faster and Q4K batched decode 1.11–1.3
 decode gains 0–9%. Chunked DeltaNet prefill and the MoE wide-tier gap remain open. See
 the [kernel performance report](apple-silicon-kernel-performance.md).
 
+P10 ran on 2026-10-24, ahead of P9 and measured against the kernel-pass commit on the
+M1 only. Chunked DeltaNet prefill was implemented and verified but ran at 0.41–0.66× the
+token scan at every shape, so it was removed (preserved as a patch). Decode attention now
+pairs query heads over Q8 K/V: 1.06–1.25× attention and up to 1.09× model decode at 8K
+context. The recurrent prepare pass writes scales instead of normalised copies, cutting
+its scratch by 98% with no model-level speed change. TensorOps run on the M1 without
+unsafe bindings but only match Candle's F32 GEMM. MoE and F16/BF16 items are deferred.
+See the [P10 report](apple-silicon-p10-kernels.md).
+
 Post-P8 roadmap added on 2026-10-23: P9 establishes a fresh comparative baseline;
 P10–P15 evaluate kernel, quantization, execution, speculation and prefix-scheduling
 improvements; production release moves from P9 to P16. These packages are planned,
@@ -480,6 +489,11 @@ until that checkpoint runs. Sources: [MLX-LM](https://github.com/ml-explore/mlx-
 
 ### P10 — Finish parallel prefill and tune native Metal math
 
+Measured on the M1 (2026-10-24) without a P9 baseline; results, rejected variants and
+deferrals are in the [P10 report](apple-silicon-p10-kernels.md). Chunked prefill is a
+measured rejection on this device, not an open implementation item; retry it on hardware
+with faster matrix units or through TensorOps.
+
 Depends on P9. Work in `tur-metal` kernels and `tur-models`' fused Qwen path, using
 the existing `math::delta_chunked` reference and state contracts.
 
@@ -674,7 +688,7 @@ and ordinary decoding separately. No improvement remains a possible experiment o
 
 | Work and regime | Working target or bound | Basis and limitation |
 | --- | --- | --- |
-| P10 chunked DeltaNet, long prefill | About 1.06–1.10× whole-model throughput **if** the chunked kernel is 2–4× faster than the current scan | Revised after the 2026-10-23 kernel pass: the rewritten token-serial scan is about 12% of 2K prefill (18 × 10.4 ms of ~1.6 s), down from about 21%; removing it entirely would give at most about 1.14× |
+| P10 chunked DeltaNet, long prefill | About 1.06–1.10× whole-model throughput **if** the chunked kernel is 2–4× faster than the current scan | Revised after the 2026-10-23 kernel pass: the rewritten token-serial scan is about 12% of 2K prefill (18 × 10.4 ms of ~1.6 s), down from about 21%; removing it entirely would give at most about 1.14×. **Measured 2026-10-24: the chunked kernel was 0.41–0.66× the scan on M1; rejected** |
 | P10–P13 combined, M1 prefill | Aim for 1.10–1.30× prompt tokens/s at unchanged quality | Engineering target; projections already ran near the measured M1 F32 ceiling in P4, limiting gains without changing precision or workload |
 | P10–P13 combined, ordinary M1 decode | Aim for 1.05–1.15× tokens/s in selected beneficial regimes | Engineering target; weight/state bandwidth and already-small host scheduling costs limit general gains. Batch-1 improvement may be negligible |
 | P12 low-bit KV versus Q8 group 32 | Roughly 1.7–2.4× smaller **KV storage**, subject to measured metadata/padding | Q8 uses 8.5 bits/value including one F16 scale per 32 values. Illustrative 5–3.5 effective-bit candidates give this range; formats and quality still need validation |

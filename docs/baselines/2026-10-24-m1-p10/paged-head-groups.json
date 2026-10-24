@@ -1,0 +1,2898 @@
+{
+  "schema_version": 3,
+  "workload": "synthetic kernel shapes from Qwen3.5-0.8B and Qwen3.8-27B; not model or serving throughput",
+  "dtype": "f32",
+  "capabilities": "Capabilities { name: \"Apple M1\", architecture: \"applegpu_g13g\", apple_family: 7, metal3: true, metal4: true, unified_memory: true, max_threads_per_threadgroup: 1024, threadgroup_memory_bytes: 32768, max_buffer_bytes: 9534832640, recommended_working_set_bytes: 12713115648 }",
+  "tuning": "Tuning { row_threads: 256, simdgroups: 4, scan_simdgroups: 2, elementwise_threads: 256, attention_parallelism: 1024, min_split_keys: 64, attention_tiled_groups: 16, gemv_q8_0_rows: (2, 3), gemv_q4k_rows: (2, 2), qmm_q8_0_rows: (4, 16), qmm_q4k_rows: (2, 16), attention_head_group: 1, delta_step: true, delta_chunk: 0, delta_chunk_tokens: 64, delta_chunk_simdgroups: 4 }",
+  "layout_version": 3,
+  "warmup": 3,
+  "samples": 15,
+  "timing": "host wall time per operation over an adaptive batch of reps ending at Device::synchronize; outputs are recycled through the pool between reps",
+  "cases": {
+    "norm": [],
+    "delta_net": [],
+    "attention": [
+      {
+        "operation": "attention",
+        "shape": "prefill 128",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 128,
+        "sequences": 1,
+        "page": 16,
+        "kv_format": "f32",
+        "split": "AttentionSplit { splits: 1, split_keys: 128 }",
+        "tur": {
+          "median_seconds": 0.00019358647311827957,
+          "p90_seconds": 0.0001980004516129032,
+          "reps_per_sample": 93
+        },
+        "candle_reference": {
+          "median_seconds": 0.004021367363636364,
+          "p90_seconds": 0.004083352272727273,
+          "reps_per_sample": 11
+        },
+        "speedup": 20.77297705185912
+      },
+      {
+        "operation": "attention",
+        "shape": "prefill 2048",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2048,
+        "sequences": 1,
+        "page": 16,
+        "kv_format": "f32",
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "tur": {
+          "median_seconds": 0.0263643955,
+          "p90_seconds": 0.028861625,
+          "reps_per_sample": 2
+        },
+        "candle_reference": {
+          "median_seconds": 0.311881,
+          "p90_seconds": 0.31835075,
+          "reps_per_sample": 1
+        },
+        "speedup": 11.829628333408973
+      },
+      {
+        "operation": "attention",
+        "shape": "decode ctx 2048",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2048,
+        "sequences": 1,
+        "page": 16,
+        "kv_format": "f32",
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "tur": {
+          "median_seconds": 0.00016842441860465119,
+          "p90_seconds": 0.00017936627906976743,
+          "reps_per_sample": 86
+        },
+        "candle_reference": {
+          "median_seconds": 0.0460089375,
+          "p90_seconds": 0.046471792,
+          "reps_per_sample": 2
+        },
+        "speedup": 273.17260692464356
+      },
+      {
+        "operation": "attention",
+        "shape": "decode ctx 8192",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 8192,
+        "sequences": 1,
+        "page": 16,
+        "kv_format": "f32",
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "tur": {
+          "median_seconds": 0.000688625,
+          "p90_seconds": 0.0007068771842105264,
+          "reps_per_sample": 38
+        },
+        "candle_reference": {
+          "median_seconds": 0.206486042,
+          "p90_seconds": 0.207028542,
+          "reps_per_sample": 1
+        },
+        "speedup": 299.852665819568
+      },
+      {
+        "operation": "attention",
+        "shape": "decode ctx 2048 x8",
+        "heads": 8,
+        "kv_heads": 2,
+        "head_dim": 256,
+        "context": 2048,
+        "sequences": 8,
+        "page": 16,
+        "kv_format": "f32",
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "tur": {
+          "median_seconds": 0.001280856193548387,
+          "p90_seconds": 0.0013310201612903227,
+          "reps_per_sample": 31
+        },
+        "candle_reference": {
+          "median_seconds": 0.345934542,
+          "p90_seconds": 0.349144292,
+          "reps_per_sample": 1
+        },
+        "speedup": 270.0807036281326
+      }
+    ],
+    "paged_attention": [
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "f32",
+        "page": 16,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 8388608,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00016847861842105263,
+          "p90_seconds": 0.00017648575,
+          "reps_per_sample": 76
+        },
+        "kv_write": {
+          "median_seconds": 6.3416684210526316e-6,
+          "p90_seconds": 8.946931578947369e-6,
+          "reps_per_sample": 190
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.0001648328470588235,
+              "p90_seconds": 0.00017380784705882353,
+              "reps_per_sample": 85
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.00022768601785714285,
+              "p90_seconds": 0.00023171651785714286,
+              "reps_per_sample": 56
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.00020336945,
+              "p90_seconds": 0.00020690486666666668,
+              "reps_per_sample": 60
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "f32",
+        "page": 32,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 8388608,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00016709145454545454,
+          "p90_seconds": 0.0001726461038961039,
+          "reps_per_sample": 77
+        },
+        "kv_write": {
+          "median_seconds": 9.155844155844155e-6,
+          "p90_seconds": 0.000010541935064935064,
+          "reps_per_sample": 154
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "f32",
+        "page": 64,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 8388608,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0001702195512820513,
+          "p90_seconds": 0.00018520620512820513,
+          "reps_per_sample": 78
+        },
+        "kv_write": {
+          "median_seconds": 4.4693587443946185e-6,
+          "p90_seconds": 4.652466367713005e-6,
+          "reps_per_sample": 223
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "f32",
+        "page": 128,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 8388608,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00016553596842105263,
+          "p90_seconds": 0.00017155526315789475,
+          "reps_per_sample": 95
+        },
+        "kv_write": {
+          "median_seconds": 8.00349677419355e-6,
+          "p90_seconds": 9.061832258064516e-6,
+          "reps_per_sample": 155
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "f16",
+        "page": 16,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 4194304,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0000808011037735849,
+          "p90_seconds": 0.00008418789622641509,
+          "reps_per_sample": 106
+        },
+        "kv_write": {
+          "median_seconds": 5.994877005347594e-6,
+          "p90_seconds": 6.6114064171122994e-6,
+          "reps_per_sample": 187
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.00007796716101694916,
+              "p90_seconds": 0.0000806334745762712,
+              "reps_per_sample": 118
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.0000707390350877193,
+              "p90_seconds": 0.00007317287719298246,
+              "reps_per_sample": 114
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.00009539805319148936,
+              "p90_seconds": 0.00009756870212765957,
+              "reps_per_sample": 94
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "f16",
+        "page": 32,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 4194304,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00008040745263157895,
+          "p90_seconds": 0.00008618815789473684,
+          "reps_per_sample": 95
+        },
+        "kv_write": {
+          "median_seconds": 6.093046632124352e-6,
+          "p90_seconds": 6.342186528497409e-6,
+          "reps_per_sample": 193
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "f16",
+        "page": 64,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 4194304,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00007809769827586207,
+          "p90_seconds": 0.00008171731034482759,
+          "reps_per_sample": 116
+        },
+        "kv_write": {
+          "median_seconds": 7.325270967741935e-6,
+          "p90_seconds": 8.702954838709677e-6,
+          "reps_per_sample": 155
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "f16",
+        "page": 128,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 4194304,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00008081525471698113,
+          "p90_seconds": 0.0000840868679245283,
+          "reps_per_sample": 106
+        },
+        "kv_write": {
+          "median_seconds": 6.540386503067485e-6,
+          "p90_seconds": 8.951944785276073e-6,
+          "reps_per_sample": 163
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "q8_32",
+        "page": 16,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2228224,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00011132852884615386,
+          "p90_seconds": 0.00011471795192307692,
+          "reps_per_sample": 104
+        },
+        "kv_write": {
+          "median_seconds": 7.530150753768844e-6,
+          "p90_seconds": 8.719643216080402e-6,
+          "reps_per_sample": 199
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.0001115217889908257,
+              "p90_seconds": 0.00011345374311926606,
+              "reps_per_sample": 109
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.0000969678795180723,
+              "p90_seconds": 0.00010087398795180723,
+              "reps_per_sample": 83
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.00013094914705882353,
+              "p90_seconds": 0.00013214951470588235,
+              "reps_per_sample": 68
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "q8_32",
+        "page": 32,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2228224,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00011111468817204301,
+          "p90_seconds": 0.00011347221505376345,
+          "reps_per_sample": 93
+        },
+        "kv_write": {
+          "median_seconds": 8.521432692307692e-6,
+          "p90_seconds": 8.80008173076923e-6,
+          "reps_per_sample": 208
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "q8_32",
+        "page": 64,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2228224,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00011161155913978495,
+          "p90_seconds": 0.000114691311827957,
+          "reps_per_sample": 93
+        },
+        "kv_write": {
+          "median_seconds": 7.79033155080214e-6,
+          "p90_seconds": 9.071524064171123e-6,
+          "reps_per_sample": 187
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "q8_32",
+        "page": 128,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2228224,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00011183416,
+          "p90_seconds": 0.00011454208000000001,
+          "reps_per_sample": 100
+        },
+        "kv_write": {
+          "median_seconds": 0.0000113891768707483,
+          "p90_seconds": 0.000011923469387755102,
+          "reps_per_sample": 147
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "q8_64",
+        "page": 16,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2162688,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00011260619512195122,
+          "p90_seconds": 0.00011633028048780488,
+          "reps_per_sample": 82
+        },
+        "kv_write": {
+          "median_seconds": 6.271028037383178e-6,
+          "p90_seconds": 6.367990654205608e-6,
+          "reps_per_sample": 214
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.00010873857522123894,
+              "p90_seconds": 0.0001104576017699115,
+              "reps_per_sample": 113
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.00009813185074626865,
+              "p90_seconds": 0.00010119589552238805,
+              "reps_per_sample": 67
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.000126830223880597,
+              "p90_seconds": 0.00013077674626865672,
+              "reps_per_sample": 67
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "q8_64",
+        "page": 32,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2162688,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00011458333720930233,
+          "p90_seconds": 0.00011654069767441861,
+          "reps_per_sample": 86
+        },
+        "kv_write": {
+          "median_seconds": 0.000010561449494949496,
+          "p90_seconds": 0.000010887419191919193,
+          "reps_per_sample": 198
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "q8_64",
+        "page": 64,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2162688,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00011167658095238095,
+          "p90_seconds": 0.00011323968571428572,
+          "reps_per_sample": 105
+        },
+        "kv_write": {
+          "median_seconds": 9.807218309859154e-6,
+          "p90_seconds": 0.000011827169014084507,
+          "reps_per_sample": 142
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "q8_64",
+        "page": 128,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2162688,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00011192908653846154,
+          "p90_seconds": 0.00011303485576923078,
+          "reps_per_sample": 104
+        },
+        "kv_write": {
+          "median_seconds": 7.949664429530202e-6,
+          "p90_seconds": 9.45861744966443e-6,
+          "reps_per_sample": 149
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "q8_256",
+        "page": 16,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2113536,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00010980818918918919,
+          "p90_seconds": 0.00011331531531531532,
+          "reps_per_sample": 111
+        },
+        "kv_write": {
+          "median_seconds": 0.000010763358974358975,
+          "p90_seconds": 0.000013827192307692308,
+          "reps_per_sample": 156
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.00011681538888888888,
+              "p90_seconds": 0.00011929225,
+              "reps_per_sample": 72
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.00011041783333333333,
+              "p90_seconds": 0.00012006016666666666,
+              "reps_per_sample": 36
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.0001295725806451613,
+              "p90_seconds": 0.00013535820967741934,
+              "reps_per_sample": 62
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "q8_256",
+        "page": 32,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2113536,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00011427243589743588,
+          "p90_seconds": 0.00011771314102564104,
+          "reps_per_sample": 78
+        },
+        "kv_write": {
+          "median_seconds": 8.441801587301587e-6,
+          "p90_seconds": 0.000010550595238095239,
+          "reps_per_sample": 126
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "q8_256",
+        "page": 64,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2113536,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00011027655882352942,
+          "p90_seconds": 0.00011222058823529411,
+          "reps_per_sample": 102
+        },
+        "kv_write": {
+          "median_seconds": 6.984543010752688e-6,
+          "p90_seconds": 9.252467741935484e-6,
+          "reps_per_sample": 186
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048",
+        "kv_format": "q8_256",
+        "page": 128,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2113536,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 32, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00010903318584070796,
+          "p90_seconds": 0.00011038642477876106,
+          "reps_per_sample": 113
+        },
+        "kv_write": {
+          "median_seconds": 5.528487179487179e-6,
+          "p90_seconds": 5.6552692307692316e-6,
+          "reps_per_sample": 234
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "f32",
+        "page": 16,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 33554432,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0006878679148936171,
+          "p90_seconds": 0.0007036613617021277,
+          "reps_per_sample": 47
+        },
+        "kv_write": {
+          "median_seconds": 6.089063492063492e-6,
+          "p90_seconds": 7.5368148148148145e-6,
+          "reps_per_sample": 189
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.0006927694444444444,
+              "p90_seconds": 0.0007154953777777778,
+              "reps_per_sample": 45
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.0007000797428571428,
+              "p90_seconds": 0.0007299976,
+              "reps_per_sample": 35
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.000825578125,
+              "p90_seconds": 0.000828953125,
+              "reps_per_sample": 32
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "f32",
+        "page": 32,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 33554432,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0006858247954545455,
+          "p90_seconds": 0.000708143,
+          "reps_per_sample": 44
+        },
+        "kv_write": {
+          "median_seconds": 6.096004608294931e-6,
+          "p90_seconds": 6.923769585253456e-6,
+          "reps_per_sample": 217
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "f32",
+        "page": 64,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 33554432,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0006859030652173914,
+          "p90_seconds": 0.000699721,
+          "reps_per_sample": 46
+        },
+        "kv_write": {
+          "median_seconds": 6.000573394495413e-6,
+          "p90_seconds": 7.336967889908257e-6,
+          "reps_per_sample": 218
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "f32",
+        "page": 128,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 33554432,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0006838740869565217,
+          "p90_seconds": 0.0006968034347826086,
+          "reps_per_sample": 46
+        },
+        "kv_write": {
+          "median_seconds": 8.097517730496453e-6,
+          "p90_seconds": 0.00001012558865248227,
+          "reps_per_sample": 141
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "f16",
+        "page": 16,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 16777216,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00041922341379310344,
+          "p90_seconds": 0.0004230423965517241,
+          "reps_per_sample": 58
+        },
+        "kv_write": {
+          "median_seconds": 9.675531914893618e-6,
+          "p90_seconds": 0.000010026595744680852,
+          "reps_per_sample": 141
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.0004240744680851064,
+              "p90_seconds": 0.0004283235744680851,
+              "reps_per_sample": 47
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.0004367093095238095,
+              "p90_seconds": 0.0004472073333333333,
+              "reps_per_sample": 42
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.00042626806666666665,
+              "p90_seconds": 0.0004311770833333334,
+              "reps_per_sample": 60
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "f16",
+        "page": 32,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 16777216,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0004198940677966102,
+          "p90_seconds": 0.00042565677966101696,
+          "reps_per_sample": 59
+        },
+        "kv_write": {
+          "median_seconds": 8.332006369426753e-6,
+          "p90_seconds": 9.741509554140128e-6,
+          "reps_per_sample": 157
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "f16",
+        "page": 64,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 16777216,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00042357415254237285,
+          "p90_seconds": 0.00042718925423728814,
+          "reps_per_sample": 59
+        },
+        "kv_write": {
+          "median_seconds": 6.778906250000001e-6,
+          "p90_seconds": 0.000012165625000000001,
+          "reps_per_sample": 160
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "f16",
+        "page": 128,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 16777216,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0004195861166666666,
+          "p90_seconds": 0.00042945903333333336,
+          "reps_per_sample": 60
+        },
+        "kv_write": {
+          "median_seconds": 5.812765957446809e-6,
+          "p90_seconds": 6.572514893617021e-6,
+          "reps_per_sample": 235
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "q8_32",
+        "page": 16,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 8912896,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00041751136363636366,
+          "p90_seconds": 0.00042259848484848487,
+          "reps_per_sample": 66
+        },
+        "kv_write": {
+          "median_seconds": 7.760132596685083e-6,
+          "p90_seconds": 9.815839779005526e-6,
+          "reps_per_sample": 181
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.00041829791666666666,
+              "p90_seconds": 0.0004235680666666667,
+              "reps_per_sample": 60
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.0003497364418604651,
+              "p90_seconds": 0.0003574873953488372,
+              "reps_per_sample": 43
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.000445690625,
+              "p90_seconds": 0.00044762707499999995,
+              "reps_per_sample": 40
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "q8_32",
+        "page": 32,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 8912896,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0004219949655172414,
+          "p90_seconds": 0.00042578305172413794,
+          "reps_per_sample": 58
+        },
+        "kv_write": {
+          "median_seconds": 7.74585635359116e-6,
+          "p90_seconds": 0.000010049955801104973,
+          "reps_per_sample": 181
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "q8_32",
+        "page": 64,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 8912896,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00042400278333333335,
+          "p90_seconds": 0.0004259666666666667,
+          "reps_per_sample": 60
+        },
+        "kv_write": {
+          "median_seconds": 0.0000111125625,
+          "p90_seconds": 0.000011865166666666666,
+          "reps_per_sample": 144
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "q8_32",
+        "page": 128,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 8912896,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00042156920338983053,
+          "p90_seconds": 0.0004274067796610169,
+          "reps_per_sample": 59
+        },
+        "kv_write": {
+          "median_seconds": 9.757258064516129e-6,
+          "p90_seconds": 0.000012285483870967742,
+          "reps_per_sample": 155
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "q8_64",
+        "page": 16,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 8650752,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0004196328125,
+          "p90_seconds": 0.000422289703125,
+          "reps_per_sample": 64
+        },
+        "kv_write": {
+          "median_seconds": 9.369755244755244e-6,
+          "p90_seconds": 0.00001433479020979021,
+          "reps_per_sample": 143
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.00042576121153846153,
+              "p90_seconds": 0.00043069632692307693,
+              "reps_per_sample": 52
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.000347491,
+              "p90_seconds": 0.0003521584901960785,
+              "reps_per_sample": 51
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.0004433377368421053,
+              "p90_seconds": 0.00044657455263157894,
+              "reps_per_sample": 38
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "q8_64",
+        "page": 32,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 8650752,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.00041348391228070174,
+          "p90_seconds": 0.00041931359649122804,
+          "reps_per_sample": 57
+        },
+        "kv_write": {
+          "median_seconds": 7.487113402061855e-6,
+          "p90_seconds": 8.361252577319587e-6,
+          "reps_per_sample": 194
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "q8_64",
+        "page": 64,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 8650752,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0004137473064516129,
+          "p90_seconds": 0.00043950672580645166,
+          "reps_per_sample": 62
+        },
+        "kv_write": {
+          "median_seconds": 7.0091762114537445e-6,
+          "p90_seconds": 8.152718061674009e-6,
+          "reps_per_sample": 227
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "q8_64",
+        "page": 128,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 8650752,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0004118194444444444,
+          "p90_seconds": 0.00041422287301587303,
+          "reps_per_sample": 63
+        },
+        "kv_write": {
+          "median_seconds": 7.5560865384615386e-6,
+          "p90_seconds": 8.558091346153847e-6,
+          "reps_per_sample": 208
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "q8_256",
+        "page": 16,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 8454144,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0004139223220338983,
+          "p90_seconds": 0.00041732627118644064,
+          "reps_per_sample": 59
+        },
+        "kv_write": {
+          "median_seconds": 6.93093607305936e-6,
+          "p90_seconds": 7.162287671232876e-6,
+          "reps_per_sample": 219
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.00041239266101694916,
+              "p90_seconds": 0.0004143898305084745,
+              "reps_per_sample": 59
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.000335061775862069,
+              "p90_seconds": 0.00033747844827586207,
+              "reps_per_sample": 58
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.000421354568627451,
+              "p90_seconds": 0.00042613560784313727,
+              "reps_per_sample": 51
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "q8_256",
+        "page": 32,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 8454144,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0004123347457627118,
+          "p90_seconds": 0.00041470974576271187,
+          "reps_per_sample": 59
+        },
+        "kv_write": {
+          "median_seconds": 6.843365740740741e-6,
+          "p90_seconds": 6.984763888888889e-6,
+          "reps_per_sample": 216
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "q8_256",
+        "page": 64,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 8454144,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0004105770151515151,
+          "p90_seconds": 0.00041384784848484847,
+          "reps_per_sample": 66
+        },
+        "kv_write": {
+          "median_seconds": 6.847533632286995e-6,
+          "p90_seconds": 8.207026905829596e-6,
+          "reps_per_sample": 223
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 8192",
+        "kv_format": "q8_256",
+        "page": 128,
+        "context": 8192,
+        "sequences": 1,
+        "pool_bytes": 8454144,
+        "fill_tokens": 8192,
+        "split": "AttentionSplit { splits: 128, split_keys: 64 }",
+        "attention": {
+          "median_seconds": 0.0004117251451612903,
+          "p90_seconds": 0.00041321908064516133,
+          "reps_per_sample": 62
+        },
+        "kv_write": {
+          "median_seconds": 7.4097222222222215e-6,
+          "p90_seconds": 8.67950505050505e-6,
+          "reps_per_sample": 198
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "f32",
+        "page": 16,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 134217728,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.0025680046666666668,
+          "p90_seconds": 0.002622701388888889,
+          "reps_per_sample": 18
+        },
+        "kv_write": {
+          "median_seconds": 6.5022561576354675e-6,
+          "p90_seconds": 6.969827586206896e-6,
+          "reps_per_sample": 203
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.00258278125,
+              "p90_seconds": 0.002664846375,
+              "reps_per_sample": 16
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 256 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.0025626110666666663,
+              "p90_seconds": 0.002662455533333333,
+              "reps_per_sample": 15
+            },
+            "split": "AttentionSplit { splits: 256, split_keys: 128 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.0032439965,
+              "p90_seconds": 0.00334672575,
+              "reps_per_sample": 12
+            },
+            "split": "AttentionSplit { splits: 512, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "f32",
+        "page": 32,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 134217728,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.0025535538823529412,
+          "p90_seconds": 0.002590502470588235,
+          "reps_per_sample": 17
+        },
+        "kv_write": {
+          "median_seconds": 4.418187214611873e-6,
+          "p90_seconds": 4.8808995433789954e-6,
+          "reps_per_sample": 219
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "f32",
+        "page": 64,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 134217728,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.0025614953888888885,
+          "p90_seconds": 0.002620715277777778,
+          "reps_per_sample": 18
+        },
+        "kv_write": {
+          "median_seconds": 6.879658385093168e-6,
+          "p90_seconds": 9.536751552795032e-6,
+          "reps_per_sample": 161
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "f32",
+        "page": 128,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 134217728,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.002537058823529412,
+          "p90_seconds": 0.002579171588235294,
+          "reps_per_sample": 17
+        },
+        "kv_write": {
+          "median_seconds": 6.9578125000000006e-6,
+          "p90_seconds": 9.078125e-6,
+          "reps_per_sample": 160
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "f16",
+        "page": 16,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 67108864,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.0012973224347826086,
+          "p90_seconds": 0.0013099402173913043,
+          "reps_per_sample": 23
+        },
+        "kv_write": {
+          "median_seconds": 6.463768115942029e-6,
+          "p90_seconds": 7.677333333333334e-6,
+          "reps_per_sample": 207
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.0012738936896551723,
+              "p90_seconds": 0.0013012313103448277,
+              "reps_per_sample": 29
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 256 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.0014009474782608695,
+              "p90_seconds": 0.0014231558260869566,
+              "reps_per_sample": 23
+            },
+            "split": "AttentionSplit { splits: 256, split_keys: 128 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.001666134222222222,
+              "p90_seconds": 0.0017059676111111112,
+              "reps_per_sample": 18
+            },
+            "split": "AttentionSplit { splits: 512, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "f16",
+        "page": 32,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 67108864,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.0012892270344827587,
+          "p90_seconds": 0.0013607887931034483,
+          "reps_per_sample": 29
+        },
+        "kv_write": {
+          "median_seconds": 6.22097191011236e-6,
+          "p90_seconds": 7.936331460674158e-6,
+          "reps_per_sample": 178
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "f16",
+        "page": 64,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 67108864,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.001276858870967742,
+          "p90_seconds": 0.0012993252580645162,
+          "reps_per_sample": 31
+        },
+        "kv_write": {
+          "median_seconds": 5.818915611814345e-6,
+          "p90_seconds": 7.210088607594937e-6,
+          "reps_per_sample": 237
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "f16",
+        "page": 128,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 67108864,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.0012802137096774194,
+          "p90_seconds": 0.0012888723225806453,
+          "reps_per_sample": 31
+        },
+        "kv_write": {
+          "median_seconds": 6.694897196261682e-6,
+          "p90_seconds": 7.3481308411214946e-6,
+          "reps_per_sample": 214
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "q8_32",
+        "page": 16,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 35651584,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.0013211830357142858,
+          "p90_seconds": 0.0013289836071428572,
+          "reps_per_sample": 28
+        },
+        "kv_write": {
+          "median_seconds": 7.254955947136563e-6,
+          "p90_seconds": 7.933555066079295e-6,
+          "reps_per_sample": 227
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.0013236266153846153,
+              "p90_seconds": 0.0013436570384615385,
+              "reps_per_sample": 26
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 256 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.0011066197916666666,
+              "p90_seconds": 0.0011140104166666666,
+              "reps_per_sample": 24
+            },
+            "split": "AttentionSplit { splits: 256, split_keys: 128 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.001629745388888889,
+              "p90_seconds": 0.0016346990555555557,
+              "reps_per_sample": 18
+            },
+            "split": "AttentionSplit { splits: 512, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "q8_32",
+        "page": 32,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 35651584,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.00134273332,
+          "p90_seconds": 0.0013559199999999998,
+          "reps_per_sample": 25
+        },
+        "kv_write": {
+          "median_seconds": 9.87293388429752e-6,
+          "p90_seconds": 0.000012158057851239669,
+          "reps_per_sample": 121
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "q8_32",
+        "page": 64,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 35651584,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.001333234,
+          "p90_seconds": 0.0013773045,
+          "reps_per_sample": 26
+        },
+        "kv_write": {
+          "median_seconds": 8.019994219653178e-6,
+          "p90_seconds": 9.30635838150289e-6,
+          "reps_per_sample": 173
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "q8_32",
+        "page": 128,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 35651584,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.0013267847333333332,
+          "p90_seconds": 0.0013467097,
+          "reps_per_sample": 30
+        },
+        "kv_write": {
+          "median_seconds": 0.000011331093959731543,
+          "p90_seconds": 0.000014016778523489934,
+          "reps_per_sample": 149
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "q8_64",
+        "page": 16,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 34603008,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.0013449409583333332,
+          "p90_seconds": 0.001354892375,
+          "reps_per_sample": 24
+        },
+        "kv_write": {
+          "median_seconds": 0.000011052466666666666,
+          "p90_seconds": 0.000012763274074074074,
+          "reps_per_sample": 135
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.001346929037037037,
+              "p90_seconds": 0.0013514305555555554,
+              "reps_per_sample": 27
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 256 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.0011021100000000001,
+              "p90_seconds": 0.00111315332,
+              "reps_per_sample": 25
+            },
+            "split": "AttentionSplit { splits: 256, split_keys: 128 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.0016185647777777778,
+              "p90_seconds": 0.0016298055555555556,
+              "reps_per_sample": 18
+            },
+            "split": "AttentionSplit { splits: 512, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "q8_64",
+        "page": 32,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 34603008,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.0013341333333333333,
+          "p90_seconds": 0.0013486389,
+          "reps_per_sample": 30
+        },
+        "kv_write": {
+          "median_seconds": 0.000011035791946308725,
+          "p90_seconds": 0.000011529637583892618,
+          "reps_per_sample": 149
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "q8_64",
+        "page": 64,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 34603008,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.0013380902666666667,
+          "p90_seconds": 0.0013466430666666668,
+          "reps_per_sample": 30
+        },
+        "kv_write": {
+          "median_seconds": 6.352625e-6,
+          "p90_seconds": 6.545523148148148e-6,
+          "reps_per_sample": 216
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "q8_64",
+        "page": 128,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 34603008,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.0013283817096774193,
+          "p90_seconds": 0.001345799741935484,
+          "reps_per_sample": 31
+        },
+        "kv_write": {
+          "median_seconds": 7.1310781249999995e-6,
+          "p90_seconds": 8.244354166666666e-6,
+          "reps_per_sample": 192
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "q8_256",
+        "page": 16,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 33816576,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.0013330550967741936,
+          "p90_seconds": 0.0013472594193548388,
+          "reps_per_sample": 31
+        },
+        "kv_write": {
+          "median_seconds": 9.654726666666667e-6,
+          "p90_seconds": 0.000012533053333333333,
+          "reps_per_sample": 150
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.0013405312500000001,
+              "p90_seconds": 0.0013470297857142855,
+              "reps_per_sample": 28
+            },
+            "split": "AttentionSplit { splits: 128, split_keys: 256 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.0011004618333333334,
+              "p90_seconds": 0.0011068194166666667,
+              "reps_per_sample": 24
+            },
+            "split": "AttentionSplit { splits: 256, split_keys: 128 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.0016776209,
+              "p90_seconds": 0.0016866791999999998,
+              "reps_per_sample": 10
+            },
+            "split": "AttentionSplit { splits: 512, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "q8_256",
+        "page": 32,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 33816576,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.001329887652173913,
+          "p90_seconds": 0.0013821485652173913,
+          "reps_per_sample": 23
+        },
+        "kv_write": {
+          "median_seconds": 8.627245098039216e-6,
+          "p90_seconds": 0.000010198529411764705,
+          "reps_per_sample": 204
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "q8_256",
+        "page": 64,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 33816576,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.001331253111111111,
+          "p90_seconds": 0.0013496651481481482,
+          "reps_per_sample": 27
+        },
+        "kv_write": {
+          "median_seconds": 9.23758865248227e-6,
+          "p90_seconds": 0.000011070035460992907,
+          "reps_per_sample": 141
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 32768",
+        "kv_format": "q8_256",
+        "page": 128,
+        "context": 32768,
+        "sequences": 1,
+        "pool_bytes": 33816576,
+        "fill_tokens": 32768,
+        "split": "AttentionSplit { splits: 128, split_keys: 256 }",
+        "attention": {
+          "median_seconds": 0.001324805,
+          "p90_seconds": 0.0013524833599999999,
+          "reps_per_sample": 25
+        },
+        "kv_write": {
+          "median_seconds": 6.482941520467837e-6,
+          "p90_seconds": 9.972707602339182e-6,
+          "reps_per_sample": 171
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "f32",
+        "page": 16,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 67108864,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0012795282258064517,
+          "p90_seconds": 0.0013228171935483872,
+          "reps_per_sample": 31
+        },
+        "kv_write": {
+          "median_seconds": 5.824316017316017e-6,
+          "p90_seconds": 6.954186147186147e-6,
+          "reps_per_sample": 231
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.001285472724137931,
+              "p90_seconds": 0.001329675275862069,
+              "reps_per_sample": 29
+            },
+            "split": "AttentionSplit { splits: 16, split_keys: 128 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.0012930560769230767,
+              "p90_seconds": 0.0014061490384615384,
+              "reps_per_sample": 26
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.0015243049090909093,
+              "p90_seconds": 0.0015892215909090908,
+              "reps_per_sample": 22
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "f32",
+        "page": 32,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 67108864,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0012705014137931036,
+          "p90_seconds": 0.0012989956896551724,
+          "reps_per_sample": 29
+        },
+        "kv_write": {
+          "median_seconds": 6.370544186046512e-6,
+          "p90_seconds": 7.511627906976744e-6,
+          "reps_per_sample": 215
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "f32",
+        "page": 64,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 67108864,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.001258926064516129,
+          "p90_seconds": 0.0012776021612903225,
+          "reps_per_sample": 31
+        },
+        "kv_write": {
+          "median_seconds": 5.904411764705882e-6,
+          "p90_seconds": 6.681561085972851e-6,
+          "reps_per_sample": 221
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "f32",
+        "page": 128,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 67108864,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0012567070000000001,
+          "p90_seconds": 0.0012840201612903228,
+          "reps_per_sample": 31
+        },
+        "kv_write": {
+          "median_seconds": 6.080568720379147e-6,
+          "p90_seconds": 6.245260663507109e-6,
+          "reps_per_sample": 211
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "f16",
+        "page": 16,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 33554432,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0006399748333333334,
+          "p90_seconds": 0.0006489236041666667,
+          "reps_per_sample": 48
+        },
+        "kv_write": {
+          "median_seconds": 6.584383838383838e-6,
+          "p90_seconds": 6.839858585858586e-6,
+          "reps_per_sample": 198
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.000647673619047619,
+              "p90_seconds": 0.000665046619047619,
+              "reps_per_sample": 42
+            },
+            "split": "AttentionSplit { splits: 16, split_keys: 128 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.000710056,
+              "p90_seconds": 0.00072415234375,
+              "reps_per_sample": 32
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.0007450889,
+              "p90_seconds": 0.0007546889,
+              "reps_per_sample": 30
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "f16",
+        "page": 32,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 33554432,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0006541518666666667,
+          "p90_seconds": 0.0006852490666666666,
+          "reps_per_sample": 45
+        },
+        "kv_write": {
+          "median_seconds": 4.458900000000001e-6,
+          "p90_seconds": 4.671213636363636e-6,
+          "reps_per_sample": 220
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "f16",
+        "page": 64,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 33554432,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0006483602499999999,
+          "p90_seconds": 0.0006736640625,
+          "reps_per_sample": 48
+        },
+        "kv_write": {
+          "median_seconds": 6.998394230769231e-6,
+          "p90_seconds": 7.676278846153847e-6,
+          "reps_per_sample": 208
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "f16",
+        "page": 128,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 33554432,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0006529175531914893,
+          "p90_seconds": 0.0006985673829787235,
+          "reps_per_sample": 47
+        },
+        "kv_write": {
+          "median_seconds": 8.658870967741936e-6,
+          "p90_seconds": 9.708870967741935e-6,
+          "reps_per_sample": 155
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "q8_32",
+        "page": 16,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 17825792,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.000668328125,
+          "p90_seconds": 0.00067182725,
+          "reps_per_sample": 48
+        },
+        "kv_write": {
+          "median_seconds": 9.303207692307692e-6,
+          "p90_seconds": 0.00001506890769230769,
+          "reps_per_sample": 130
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.0006618829285714285,
+              "p90_seconds": 0.0006664761904761904,
+              "reps_per_sample": 42
+            },
+            "split": "AttentionSplit { splits: 16, split_keys: 128 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.0005298892045454545,
+              "p90_seconds": 0.0005381931818181818,
+              "reps_per_sample": 44
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.0007035117435897436,
+              "p90_seconds": 0.0007137820512820514,
+              "reps_per_sample": 39
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "q8_32",
+        "page": 32,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 17825792,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0006556143617021277,
+          "p90_seconds": 0.0006629760638297873,
+          "reps_per_sample": 47
+        },
+        "kv_write": {
+          "median_seconds": 7.625852040816327e-6,
+          "p90_seconds": 7.973423469387755e-6,
+          "reps_per_sample": 196
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "q8_32",
+        "page": 64,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 17825792,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0006553625957446808,
+          "p90_seconds": 0.0006601764042553192,
+          "reps_per_sample": 47
+        },
+        "kv_write": {
+          "median_seconds": 7.590025906735751e-6,
+          "p90_seconds": 8.216751295336787e-6,
+          "reps_per_sample": 193
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "q8_32",
+        "page": 128,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 17825792,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0006547491063829787,
+          "p90_seconds": 0.0006574166595744681,
+          "reps_per_sample": 47
+        },
+        "kv_write": {
+          "median_seconds": 7.775295918367346e-6,
+          "p90_seconds": 8.46747448979592e-6,
+          "reps_per_sample": 196
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "q8_64",
+        "page": 16,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 17301504,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0006560746458333333,
+          "p90_seconds": 0.0006869392291666667,
+          "reps_per_sample": 48
+        },
+        "kv_write": {
+          "median_seconds": 7.695289719626169e-6,
+          "p90_seconds": 8.683411214953271e-6,
+          "reps_per_sample": 214
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.000659414847826087,
+              "p90_seconds": 0.0006875353260869565,
+              "reps_per_sample": 46
+            },
+            "split": "AttentionSplit { splits: 16, split_keys: 128 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.0005259201458333334,
+              "p90_seconds": 0.0005357821041666667,
+              "reps_per_sample": 48
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.0006975543888888889,
+              "p90_seconds": 0.0007038738333333333,
+              "reps_per_sample": 36
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "q8_64",
+        "page": 32,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 17301504,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0006533333265306122,
+          "p90_seconds": 0.0006706649591836735,
+          "reps_per_sample": 49
+        },
+        "kv_write": {
+          "median_seconds": 7.570574162679426e-6,
+          "p90_seconds": 9.148325358851675e-6,
+          "reps_per_sample": 209
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "q8_64",
+        "page": 64,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 17301504,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0006539319591836734,
+          "p90_seconds": 0.0006575221020408163,
+          "reps_per_sample": 49
+        },
+        "kv_write": {
+          "median_seconds": 7.3468899521531096e-6,
+          "p90_seconds": 7.596291866028708e-6,
+          "reps_per_sample": 209
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "q8_64",
+        "page": 128,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 17301504,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.000654117914893617,
+          "p90_seconds": 0.000658009744680851,
+          "reps_per_sample": 47
+        },
+        "kv_write": {
+          "median_seconds": 7.2159770642201835e-6,
+          "p90_seconds": 8.388761467889909e-6,
+          "reps_per_sample": 218
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "q8_256",
+        "page": 16,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 16908288,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0006554270833333334,
+          "p90_seconds": 0.0006599826458333334,
+          "reps_per_sample": 48
+        },
+        "kv_write": {
+          "median_seconds": 7.2655245098039215e-6,
+          "p90_seconds": 7.91196568627451e-6,
+          "reps_per_sample": 204
+        },
+        "head_groups": [
+          {
+            "heads_per_simdgroup": 1,
+            "attention": {
+              "median_seconds": 0.0006589817073170732,
+              "p90_seconds": 0.0006745365853658537,
+              "reps_per_sample": 41
+            },
+            "split": "AttentionSplit { splits: 16, split_keys: 128 }"
+          },
+          {
+            "heads_per_simdgroup": 2,
+            "attention": {
+              "median_seconds": 0.0005281513157894737,
+              "p90_seconds": 0.0005301162368421052,
+              "reps_per_sample": 38
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          },
+          {
+            "heads_per_simdgroup": 4,
+            "attention": {
+              "median_seconds": 0.0006955032051282051,
+              "p90_seconds": 0.0007007019230769231,
+              "reps_per_sample": 39
+            },
+            "split": "AttentionSplit { splits: 32, split_keys: 64 }"
+          }
+        ]
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "q8_256",
+        "page": 32,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 16908288,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0006549540816326531,
+          "p90_seconds": 0.0006626462448979593,
+          "reps_per_sample": 49
+        },
+        "kv_write": {
+          "median_seconds": 6.645565957446809e-6,
+          "p90_seconds": 8.13280425531915e-6,
+          "reps_per_sample": 235
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "q8_256",
+        "page": 64,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 16908288,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0006558641599999999,
+          "p90_seconds": 0.00066538416,
+          "reps_per_sample": 50
+        },
+        "kv_write": {
+          "median_seconds": 7.689429268292684e-6,
+          "p90_seconds": 9.226424390243902e-6,
+          "reps_per_sample": 205
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "decode ctx 2048 x8",
+        "kv_format": "q8_256",
+        "page": 128,
+        "context": 2048,
+        "sequences": 8,
+        "pool_bytes": 16908288,
+        "fill_tokens": 16384,
+        "split": "AttentionSplit { splits: 16, split_keys: 128 }",
+        "attention": {
+          "median_seconds": 0.0006553605510204081,
+          "p90_seconds": 0.0006584566326530612,
+          "reps_per_sample": 49
+        },
+        "kv_write": {
+          "median_seconds": 7.443627450980393e-6,
+          "p90_seconds": 7.797588235294118e-6,
+          "reps_per_sample": 204
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "f32",
+        "page": 16,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 8388608,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.026225271,
+          "p90_seconds": 0.0264873125,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.00019211885227272727,
+          "p90_seconds": 0.00019831629545454544,
+          "reps_per_sample": 88
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "f32",
+        "page": 32,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 8388608,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.026302854,
+          "p90_seconds": 0.0266605,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.00019478213253012048,
+          "p90_seconds": 0.00020140963855421685,
+          "reps_per_sample": 83
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "f32",
+        "page": 64,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 8388608,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.026243167,
+          "p90_seconds": 0.0265139375,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.0001963701627906977,
+          "p90_seconds": 0.00020394622093023254,
+          "reps_per_sample": 86
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "f32",
+        "page": 128,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 8388608,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.0261041665,
+          "p90_seconds": 0.026656625,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.00019099433980582526,
+          "p90_seconds": 0.00019903964077669904,
+          "reps_per_sample": 103
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "f16",
+        "page": 16,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 4194304,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.025320604,
+          "p90_seconds": 0.0255563125,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.0001117978515625,
+          "p90_seconds": 0.00012329134375,
+          "reps_per_sample": 128
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "f16",
+        "page": 32,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 4194304,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.025298479,
+          "p90_seconds": 0.02565525,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.00010946593650793652,
+          "p90_seconds": 0.00011209623015873016,
+          "reps_per_sample": 126
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "f16",
+        "page": 64,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 4194304,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.025332,
+          "p90_seconds": 0.0255910835,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.000110472672,
+          "p90_seconds": 0.000113199664,
+          "reps_per_sample": 125
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "f16",
+        "page": 128,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 4194304,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.0258030625,
+          "p90_seconds": 0.0263769165,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.0001103298872180451,
+          "p90_seconds": 0.00011219298496240602,
+          "reps_per_sample": 133
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "q8_32",
+        "page": 16,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2228224,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.0288585205,
+          "p90_seconds": 0.0293695205,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.0003015259565217391,
+          "p90_seconds": 0.0003024794782608696,
+          "reps_per_sample": 69
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "q8_32",
+        "page": 32,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2228224,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.0288514375,
+          "p90_seconds": 0.029170979,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.00030135855263157895,
+          "p90_seconds": 0.00030354878947368424,
+          "reps_per_sample": 76
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "q8_32",
+        "page": 64,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2228224,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.0286513335,
+          "p90_seconds": 0.029094417,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.0003010005394736842,
+          "p90_seconds": 0.00030297697368421056,
+          "reps_per_sample": 76
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "q8_32",
+        "page": 128,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2228224,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.028841604,
+          "p90_seconds": 0.0290731045,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.000300603125,
+          "p90_seconds": 0.000315368225,
+          "reps_per_sample": 80
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "q8_64",
+        "page": 16,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2162688,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.0287421875,
+          "p90_seconds": 0.0290516665,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.00026727277333333334,
+          "p90_seconds": 0.0002680916666666667,
+          "reps_per_sample": 75
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "q8_64",
+        "page": 32,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2162688,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.02878125,
+          "p90_seconds": 0.029079,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.0002652885802469136,
+          "p90_seconds": 0.0002670833333333333,
+          "reps_per_sample": 81
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "q8_64",
+        "page": 64,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2162688,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.0286980415,
+          "p90_seconds": 0.0291420835,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.00026591614814814815,
+          "p90_seconds": 0.00026656892592592595,
+          "reps_per_sample": 81
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "q8_64",
+        "page": 128,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2162688,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.028926479,
+          "p90_seconds": 0.029237646,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.00026526005747126437,
+          "p90_seconds": 0.0002703912873563218,
+          "reps_per_sample": 87
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "q8_256",
+        "page": 16,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2113536,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.028876396,
+          "p90_seconds": 0.029227833,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.00024011796103896104,
+          "p90_seconds": 0.00024110606493506494,
+          "reps_per_sample": 77
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "q8_256",
+        "page": 32,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2113536,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.0287534585,
+          "p90_seconds": 0.029397021,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.00023260849504950492,
+          "p90_seconds": 0.00023417863366336636,
+          "reps_per_sample": 101
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "q8_256",
+        "page": 64,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2113536,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.0283469585,
+          "p90_seconds": 0.028548146,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.000232805,
+          "p90_seconds": 0.00023485375,
+          "reps_per_sample": 100
+        },
+        "head_groups": []
+      },
+      {
+        "operation": "paged_attention",
+        "shape": "prefill 2048",
+        "kv_format": "q8_256",
+        "page": 128,
+        "context": 2048,
+        "sequences": 1,
+        "pool_bytes": 2113536,
+        "fill_tokens": 2048,
+        "split": "AttentionSplit { splits: 1, split_keys: 2048 }",
+        "attention": {
+          "median_seconds": 0.0285324375,
+          "p90_seconds": 0.028791042,
+          "reps_per_sample": 2
+        },
+        "kv_write": {
+          "median_seconds": 0.0002333031914893617,
+          "p90_seconds": 0.0002351258936170213,
+          "reps_per_sample": 94
+        },
+        "head_groups": []
+      }
+    ],
+    "tiled_attention": [],
+    "packed_linear": [],
+    "sampling": [],
+    "moe": []
+  }
+}

@@ -167,9 +167,11 @@ struct ScanParams {
 };
 
 // Per-token inputs of the scan, computed once per token instead of once per state column:
-// row r of `prep` holds L2-normalised q (also scaled by 1/sqrt(key_dim)) and k per key
-// head, then q·k per key head, then (decay, beta) per value head. One simdgroup per
-// (row, key head); the gate columns of its value heads go to its first lanes.
+// row r of `prep` holds, per key head, the scales that L2-normalise q (also by
+// 1/sqrt(key_dim)) and k, then q·k of the normalised vectors per key head, then
+// (decay, beta) per value head. Consumers read q and k from `mixed` and apply the scales,
+// so no normalised copy is written. One simdgroup per (row, key head); the gate columns
+// of its value heads go to its first lanes.
 kernel void delta_prepare_f32(
     device const float *mixed [[buffer(0)]],
     device const float *proj [[buffer(1)]],
@@ -202,19 +204,18 @@ kernel void delta_prepare_f32(
     device float *out = prep + ulong(row) * p.prep_stride;
     float qk = 0.0f;
     for (uint i = lane; i < dk; i += SIMD) {
-        float qn = q[i] * q_scale, kn = k[i] * k_scale;
-        out[kh * dk + i] = qn;
-        out[p.key_width + kh * dk + i] = kn;
-        qk += qn * kn;
+        qk += (q[i] * q_scale) * (k[i] * k_scale);
     }
     qk = simd_sum(qk);
     if (lane == 0) {
-        out[2 * p.key_width + kh] = qk;
+        out[kh] = q_scale;
+        out[key_heads + kh] = k_scale;
+        out[2 * key_heads + kh] = qk;
     }
     device const float *gates = proj + ulong(row) * p.proj_stride;
     for (uint g = lane; g < p.groups; g += SIMD) {
         uint h = kh * p.groups + g;
-        device float *db = out + 2 * p.key_width + key_heads + 2 * h;
+        device float *db = out + 3 * key_heads + 2 * h;
         db[0] = exp(softplus(gates[p.a_col + h] + dt_bias[h]) * neg_a[h]);
         db[1] = sigmoid(gates[p.b_col + h]);
     }
@@ -225,7 +226,7 @@ kernel void delta_prepare_f32(
 // rows: P = key_dim / ROWS lanes share a column, so a simdgroup covers 32 / P columns of
 // one head. 32 rows measured fastest on M1 (64 doubles live registers and halves the
 // simdgroups; 16 adds a shuffle step per reduction).
-// Per token, with S the column's decayed-before state and q, k from `prep`,
+// Per token, with S the column's decayed-before state and q, k normalised by `prep`,
 //   a = k·S, b = q·S, pred = decay·a, corr = beta·(v - pred),
 //   out = q·S' = decay·b + (q·k)·corr,  S' = decay·S + k·corr,
 // so both dot products are lane-local over the lane's rows and combine across the P lanes
@@ -233,8 +234,9 @@ kernel void delta_prepare_f32(
 // memory or barrier is needed. State loads and stores are row segments across a
 // simdgroup's columns. Every loop over the state is fully unrolled: a dynamic index
 // would spill the state registers to thread memory. State is stored as T (float,
-// half or bfloat) and updated in F32.
-template <uint ROWS, typename T>
+// half or bfloat) and updated in F32. V is float4 when every row of `mixed` is 16-byte
+// aligned, else packed_float4.
+template <uint ROWS, typename T, typename V>
 kernel void delta_scan(
     device const float *mixed [[buffer(0)]],
     device const float *prep [[buffer(1)]],
@@ -278,36 +280,39 @@ kernel void delta_scan(
     }
     uint q_col = kh * dk + r0;
     uint k_col = p.key_width + kh * dk + r0;
-    uint qk_col = 2 * p.key_width + kh;
-    uint gate_col = 2 * p.key_width + key_heads + 2 * h;
+    uint gate_col = 3 * key_heads + 2 * h;
     uint v_col = 2 * p.key_width + h * dv + column;
     for (uint t = 0; t < s.tokens; ++t) {
         uint row = s.row + t;
         device const float *pr = prep + ulong(row) * p.prep_stride;
-        device const float4 *qv = (device const float4 *)(pr + q_col);
-        device const float4 *kv = (device const float4 *)(pr + k_col);
-        float decay = pr[gate_col], beta = pr[gate_col + 1], qk = pr[qk_col];
-        float v = mixed[ulong(row) * p.mixed_stride + v_col];
+        device const float *mr = mixed + ulong(row) * p.mixed_stride;
+        device const V *qv = (device const V *)(mr + q_col);
+        device const V *kv = (device const V *)(mr + k_col);
+        float q_scale = pr[kh], k_scale = pr[key_heads + kh], qk = pr[2 * key_heads + kh];
+        float decay = pr[gate_col], beta = pr[gate_col + 1];
+        float v = mr[v_col];
         float4 a4 = 0.0f, b4 = 0.0f;
         #pragma clang loop unroll(full)
         for (uint i = 0; i < ROWS / 4; ++i) {
             float4 st = float4(state[4 * i], state[4 * i + 1], state[4 * i + 2], state[4 * i + 3]);
-            a4 = fma(kv[i], st, a4);
-            b4 = fma(qv[i], st, b4);
+            a4 = fma(float4(kv[i]), st, a4);
+            b4 = fma(float4(qv[i]), st, b4);
         }
+        // The normalising scales apply to the raw dot products and to the correction.
         float a = (a4.x + a4.y) + (a4.z + a4.w);
         float b = (b4.x + b4.y) + (b4.z + b4.w);
         for (uint offset = columns; offset < SIMD; offset *= 2) {
             a += simd_shuffle_xor(a, ushort(offset));
             b += simd_shuffle_xor(b, ushort(offset));
         }
-        float correction = (v - decay * a) * beta;
+        float correction = (v - decay * a * k_scale) * beta;
         if (r0 == 0 && active) {
-            out[(ulong(row) * p.heads + h) * dv + col] = decay * b + qk * correction;
+            out[(ulong(row) * p.heads + h) * dv + col] = decay * b * q_scale + qk * correction;
         }
+        float scaled = correction * k_scale;
         #pragma clang loop unroll(full)
         for (uint i = 0; i < ROWS / 4; ++i) {
-            float4 kc = kv[i] * correction;
+            float4 kc = float4(kv[i]) * scaled;
             state[4 * i] = fma(state[4 * i], decay, kc.x);
             state[4 * i + 1] = fma(state[4 * i + 1], decay, kc.y);
             state[4 * i + 2] = fma(state[4 * i + 2], decay, kc.z);
@@ -337,14 +342,17 @@ kernel void delta_scan(
 // Key rows per delta-scan lane (`DELTA_SCAN_ROWS` on the host); key_dim / SCAN_ROWS lanes share
 // a value column.
 #define SCAN_ROWS 32
-#define SCAN(T, NAME) \
-    template [[host_name("delta_scan_" #NAME)]] kernel void delta_scan<SCAN_ROWS, T>( \
+#define SCAN(T, V, NAME) \
+    template [[host_name("delta_scan_" #NAME)]] kernel void delta_scan<SCAN_ROWS, T, V>( \
         device const float *, device const float *, device T *, device float *, \
         constant ScanParams &, device const RecurrentSpan *, device const uint *, \
         device const uint *, uint, uint, uint, uint);
-SCAN(float, f32)
-SCAN(half, f16)
-SCAN(bfloat, bf16)
+SCAN(float, float4, f32)
+SCAN(half, float4, f16)
+SCAN(bfloat, float4, bf16)
+SCAN(float, packed_float4, unaligned_f32)
+SCAN(half, packed_float4, unaligned_f16)
+SCAN(bfloat, packed_float4, unaligned_bf16)
 
 // One gated delta step for each single-token sequence `order` lists. A threadgroup covers
 // (sequence, head, 64 value columns) with DK / ROWS simdgroups: lane l owns value columns

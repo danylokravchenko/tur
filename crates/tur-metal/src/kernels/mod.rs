@@ -238,6 +238,12 @@ impl DeltaShape {
     pub fn channels(&self) -> usize {
         2 * self.key_width() + self.value_width()
     }
+
+    /// Floats per row of the recurrent prefill's prepared inputs: q and k scales and q·k
+    /// per key head, then (decay, beta) per value head, rounded to whole float4s.
+    pub fn prepared_width(&self) -> usize {
+        (3 * self.key_heads + 2 * self.value_heads).next_multiple_of(4)
+    }
 }
 
 /// Validated paged K/V addressing for a packed batch. Key `j` of query token `t` lives in
@@ -392,6 +398,9 @@ impl Kernels {
             || tuning.scan_simdgroups == 0
             || tuning.elementwise_threads == 0
             || tuning.attention_parallelism == 0
+            || [tuning.attention_head_group, tuning.attention_q8_head_group]
+                .iter()
+                .any(|hg| ![1, 2].contains(hg))
             || tuning.min_split_keys == 0
             || [tuning.gemv_q8_0_rows, tuning.gemv_q4k_rows]
                 .iter()
@@ -1007,10 +1016,14 @@ impl Kernels {
         if !matches!(dk, 64 | 128 | 256) {
             return Err(invalid(format!("no delta scan kernel for key dim {dk}")));
         }
-        let name = format!("delta_scan_{storage}");
-        // Prepared row: normalised q and k, q·k per key head, (decay, beta) per value head;
-        // rounded to whole float4s so the scan's vector reads stay aligned.
-        let prep_stride = (2 * shape.key_width() + shape.key_heads + 2 * heads).next_multiple_of(4);
+        // The scan reads q and k rows of `mixed` as float4s, aligned when every row is.
+        let aligned = mv.row_stride.is_multiple_of(4) && mv.offset().is_multiple_of(16);
+        let name = if aligned {
+            format!("delta_scan_{storage}")
+        } else {
+            format!("delta_scan_unaligned_{storage}")
+        };
+        let prep_stride = shape.prepared_width();
         bv.expect(1, heads, "dt bias")?;
         av.expect(1, heads, "decay rate")?;
         if pool.dims().get(1..) != Some(&[heads, dk, dv][..]) {
@@ -1223,15 +1236,34 @@ impl Kernels {
         })
     }
 
-    /// Scratch bytes of one attention dispatch (split partials and statistics).
+    /// Query heads that one per-query attention simdgroup serves over a `format` pool: the
+    /// tuned count when it divides the query heads per K/V head, else 1.
+    pub fn attention_head_group(&self, heads: usize, kv_heads: usize, format: KvFormat) -> usize {
+        let group = heads.checked_div(kv_heads).unwrap_or(1);
+        let tuned = match format {
+            KvFormat::Q8 { .. } => self.tuning.attention_q8_head_group,
+            KvFormat::F32 | KvFormat::F16 => self.tuning.attention_head_group,
+        };
+        if group.is_multiple_of(tuned) {
+            tuned
+        } else {
+            1
+        }
+    }
+
+    /// Scratch bytes of one attention dispatch over a `format` pool (split partials and
+    /// statistics).
     pub fn attention_scratch_bytes(
         &self,
         tokens: usize,
         heads: usize,
+        kv_heads: usize,
         dim: usize,
         max_visible: usize,
+        format: KvFormat,
     ) -> usize {
-        let split = self.attention_split(tokens, heads, max_visible);
+        let hg = self.attention_head_group(heads, kv_heads, format);
+        let split = self.attention_split(tokens, heads / hg, max_visible);
         if split.splits == 1 {
             return 0;
         }
@@ -1381,7 +1413,12 @@ impl Kernels {
         {
             return Err(invalid("attention shapes do not match"));
         }
-        let name = Self::kv_kernel("attention", dim, pool.format)?;
+        let hg = self.attention_head_group(heads, kv_heads, pool.format);
+        let name = if hg == 1 {
+            Self::kv_kernel("attention", dim, pool.format)?
+        } else {
+            Self::kv_kernel(&format!("attention_h{hg}"), dim, pool.format)?
+        };
         let reduce = Self::kv_kernel("attention_reduce", dim, KvFormat::F32)?;
         let (k_data, k_scales) = self.kv_views(&pool.key, pool.format, kv.slots, kv_heads, dim)?;
         let (v_data, v_scales) =
@@ -1413,7 +1450,8 @@ impl Kernels {
         let table = self.runtime.view(&kv.table, DType::U32)?;
         let first = self.runtime.view(&kv.first_block, DType::U32)?;
         let visible = self.runtime.view(&kv.visible, DType::U32)?;
-        let split = self.attention_split(tokens, heads, kv.max_visible);
+        // Splits fill the GPU with simdgroups, each serving `hg` heads.
+        let split = self.attention_split(tokens, heads / hg, kv.max_visible);
         let params = AttentionParams {
             tokens: to_u32(tokens, "tokens")?,
             heads: to_u32(heads, "heads")?,
@@ -1439,7 +1477,7 @@ impl Kernels {
             None
         };
         let pipeline = self.pipeline(&name)?;
-        let (groups, threads) = self.simdgroup_launch(pipeline, items * split.splits);
+        let (groups, threads) = self.simdgroup_launch(pipeline, items / hg * split.splits);
         self.runtime
             .dispatch(pipeline, "tur_attention", groups, threads, |e| {
                 qv.bind(e, 0)?;

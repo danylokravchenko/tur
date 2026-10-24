@@ -1,0 +1,867 @@
+{
+  "schema_version": 3,
+  "workload": "synthetic kernel shapes from Qwen3.5-0.8B and Qwen3.8-27B; not model or serving throughput",
+  "dtype": "f32",
+  "capabilities": "Capabilities { name: \"Apple M1\", architecture: \"applegpu_g13g\", apple_family: 7, metal3: true, metal4: true, unified_memory: true, max_threads_per_threadgroup: 1024, threadgroup_memory_bytes: 32768, max_buffer_bytes: 9534832640, recommended_working_set_bytes: 12713115648 }",
+  "tuning": "Tuning { row_threads: 256, simdgroups: 4, scan_simdgroups: 2, elementwise_threads: 256, attention_parallelism: 1024, min_split_keys: 64, attention_tiled_groups: 16, gemv_q8_0_rows: (2, 3), gemv_q4k_rows: (2, 2), qmm_q8_0_rows: (4, 16), qmm_q4k_rows: (2, 16), attention_head_group: 1, attention_q8_head_group: 2, delta_step: true }",
+  "layout_version": 3,
+  "warmup": 3,
+  "samples": 15,
+  "timing": "host wall time per operation over an adaptive batch of reps ending at Device::synchronize; outputs are recycled through the pool between reps",
+  "cases": {
+    "norm": [
+      {
+        "operation": "add_rms_norm",
+        "hidden": 1024,
+        "rows": 1,
+        "tur": {
+          "median_seconds": 6.780126923076923e-6,
+          "p90_seconds": 6.990223076923077e-6,
+          "reps_per_sample": 260
+        },
+        "candle_ops": {
+          "median_seconds": 0.00003386929411764706,
+          "p90_seconds": 0.000034885607843137256,
+          "reps_per_sample": 51
+        },
+        "speedup": 4.995377594240767
+      },
+      {
+        "operation": "swiglu",
+        "hidden": 1024,
+        "rows": 1,
+        "tur": {
+          "median_seconds": 3.842626923076923e-6,
+          "p90_seconds": 4.2328500000000005e-6,
+          "reps_per_sample": 260
+        },
+        "candle_ops": {
+          "median_seconds": 0.000012977930693069307,
+          "p90_seconds": 0.000017475455445544554,
+          "reps_per_sample": 202
+        },
+        "speedup": 3.377359018417909
+      },
+      {
+        "operation": "add_rms_norm",
+        "hidden": 1024,
+        "rows": 2048,
+        "tur": {
+          "median_seconds": 0.00063277734375,
+          "p90_seconds": 0.0006679140625,
+          "reps_per_sample": 32
+        },
+        "candle_ops": {
+          "median_seconds": 0.0055368265000000005,
+          "p90_seconds": 0.0056275833333333325,
+          "reps_per_sample": 6
+        },
+        "speedup": 8.750039100937707
+      },
+      {
+        "operation": "swiglu",
+        "hidden": 1024,
+        "rows": 2048,
+        "tur": {
+          "median_seconds": 0.0004925833235294118,
+          "p90_seconds": 0.0005190919117647059,
+          "reps_per_sample": 34
+        },
+        "candle_ops": {
+          "median_seconds": 0.007451819333333334,
+          "p90_seconds": 0.007699791666666666,
+          "reps_per_sample": 6
+        },
+        "speedup": 15.128038196543597
+      },
+      {
+        "operation": "add_rms_norm",
+        "hidden": 5120,
+        "rows": 8,
+        "tur": {
+          "median_seconds": 0.0000167815,
+          "p90_seconds": 0.00001956588372093023,
+          "reps_per_sample": 86
+        },
+        "candle_ops": {
+          "median_seconds": 0.0000675613103448276,
+          "p90_seconds": 0.00006830124137931035,
+          "reps_per_sample": 87
+        },
+        "speedup": 4.0259398948143845
+      },
+      {
+        "operation": "swiglu",
+        "hidden": 5120,
+        "rows": 8,
+        "tur": {
+          "median_seconds": 8.545302325581394e-6,
+          "p90_seconds": 8.648982558139535e-6,
+          "reps_per_sample": 172
+        },
+        "candle_ops": {
+          "median_seconds": 0.00007898333000000001,
+          "p90_seconds": 0.00008109999999999999,
+          "reps_per_sample": 100
+        },
+        "speedup": 9.242894749733297
+      }
+    ],
+    "delta_net": [
+      {
+        "operation": "delta_net",
+        "shape": "0.8b",
+        "tokens": 1,
+        "key_heads": 16,
+        "value_heads": 16,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 7.005710659898478e-6,
+          "p90_seconds": 7.171741116751269e-6,
+          "reps_per_sample": 197
+        },
+        "scan": {
+          "median_seconds": 0.00003080035,
+          "p90_seconds": 0.00003104444166666667,
+          "reps_per_sample": 120
+        },
+        "scan_seconds_per_token": 0.00003080035,
+        "scan_simdgroup_sweep": []
+      },
+      {
+        "operation": "delta_net",
+        "shape": "0.8b",
+        "tokens": 16,
+        "key_heads": 16,
+        "value_heads": 16,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 0.000024745915032679738,
+          "p90_seconds": 0.000025391888888888888,
+          "reps_per_sample": 153
+        },
+        "scan": {
+          "median_seconds": 0.00012471315384615384,
+          "p90_seconds": 0.00012778203846153846,
+          "reps_per_sample": 26
+        },
+        "scan_seconds_per_token": 7.794572115384615e-6,
+        "scan_simdgroup_sweep": []
+      },
+      {
+        "operation": "delta_net",
+        "shape": "0.8b",
+        "tokens": 32,
+        "key_heads": 16,
+        "value_heads": 16,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 0.00004298949593495935,
+          "p90_seconds": 0.00004841938211382114,
+          "reps_per_sample": 123
+        },
+        "scan": {
+          "median_seconds": 0.00015868529411764706,
+          "p90_seconds": 0.00016118529411764706,
+          "reps_per_sample": 85
+        },
+        "scan_seconds_per_token": 4.9589154411764705e-6,
+        "scan_simdgroup_sweep": []
+      },
+      {
+        "operation": "delta_net",
+        "shape": "0.8b",
+        "tokens": 64,
+        "key_heads": 16,
+        "value_heads": 16,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 0.00008381808536585366,
+          "p90_seconds": 0.00008494410975609755,
+          "reps_per_sample": 82
+        },
+        "scan": {
+          "median_seconds": 0.00027484533898305085,
+          "p90_seconds": 0.000284259186440678,
+          "reps_per_sample": 59
+        },
+        "scan_seconds_per_token": 4.2944584216101695e-6,
+        "scan_simdgroup_sweep": []
+      },
+      {
+        "operation": "delta_net",
+        "shape": "0.8b",
+        "tokens": 128,
+        "key_heads": 16,
+        "value_heads": 16,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 0.0001551086956521739,
+          "p90_seconds": 0.0001570948115942029,
+          "reps_per_sample": 69
+        },
+        "scan": {
+          "median_seconds": 0.0005071775714285714,
+          "p90_seconds": 0.0005122122857142857,
+          "reps_per_sample": 42
+        },
+        "scan_seconds_per_token": 3.962324776785714e-6,
+        "scan_simdgroup_sweep": [
+          {
+            "scan_simdgroups": 1,
+            "scan": {
+              "median_seconds": 0.0005118891914893617,
+              "p90_seconds": 0.000548345744680851,
+              "reps_per_sample": 47
+            }
+          },
+          {
+            "scan_simdgroups": 2,
+            "scan": {
+              "median_seconds": 0.00050132166,
+              "p90_seconds": 0.0005308833400000001,
+              "reps_per_sample": 50
+            }
+          },
+          {
+            "scan_simdgroups": 4,
+            "scan": {
+              "median_seconds": 0.0005206325818181818,
+              "p90_seconds": 0.0005430825818181818,
+              "reps_per_sample": 55
+            }
+          },
+          {
+            "scan_simdgroups": 8,
+            "scan": {
+              "median_seconds": 0.0005337380952380953,
+              "p90_seconds": 0.0005615704285714286,
+              "reps_per_sample": 42
+            }
+          }
+        ]
+      },
+      {
+        "operation": "delta_net",
+        "shape": "0.8b",
+        "tokens": 512,
+        "key_heads": 16,
+        "value_heads": 16,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 0.0006121652413793103,
+          "p90_seconds": 0.0006371666896551724,
+          "reps_per_sample": 29
+        },
+        "scan": {
+          "median_seconds": 0.0022178125,
+          "p90_seconds": 0.00227508075,
+          "reps_per_sample": 16
+        },
+        "scan_seconds_per_token": 4.3316650390625e-6,
+        "scan_simdgroup_sweep": []
+      },
+      {
+        "operation": "delta_net",
+        "shape": "0.8b",
+        "tokens": 2048,
+        "key_heads": 16,
+        "value_heads": 16,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 0.0025996875,
+          "p90_seconds": 0.0026831791,
+          "reps_per_sample": 10
+        },
+        "scan": {
+          "median_seconds": 0.0090799918,
+          "p90_seconds": 0.0092266916,
+          "reps_per_sample": 5
+        },
+        "scan_seconds_per_token": 4.43358974609375e-6,
+        "scan_simdgroup_sweep": [
+          {
+            "scan_simdgroups": 1,
+            "scan": {
+              "median_seconds": 0.0091069332,
+              "p90_seconds": 0.009654675,
+              "reps_per_sample": 5
+            }
+          },
+          {
+            "scan_simdgroups": 2,
+            "scan": {
+              "median_seconds": 0.0090893416,
+              "p90_seconds": 0.0091558334,
+              "reps_per_sample": 5
+            }
+          },
+          {
+            "scan_simdgroups": 4,
+            "scan": {
+              "median_seconds": 0.0092842918,
+              "p90_seconds": 0.0095052166,
+              "reps_per_sample": 5
+            }
+          },
+          {
+            "scan_simdgroups": 8,
+            "scan": {
+              "median_seconds": 0.0094858084,
+              "p90_seconds": 0.0097088416,
+              "reps_per_sample": 5
+            }
+          }
+        ]
+      },
+      {
+        "operation": "delta_net",
+        "shape": "0.8b",
+        "tokens": 8192,
+        "key_heads": 16,
+        "value_heads": 16,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 0.013092972333333334,
+          "p90_seconds": 0.013384541666666666,
+          "reps_per_sample": 3
+        },
+        "scan": {
+          "median_seconds": 0.0371344165,
+          "p90_seconds": 0.037985625,
+          "reps_per_sample": 2
+        },
+        "scan_seconds_per_token": 4.533009826660157e-6,
+        "scan_simdgroup_sweep": []
+      },
+      {
+        "operation": "delta_net_decode",
+        "shape": "0.8b",
+        "sequences": 1,
+        "state_bytes_moved": 2097152,
+        "step": {
+          "median_seconds": 0.000032573328,
+          "p90_seconds": 0.000034212664,
+          "reps_per_sample": 125
+        },
+        "ragged_scan": {
+          "median_seconds": 0.00005578622608695652,
+          "p90_seconds": 0.00005684855652173913,
+          "reps_per_sample": 115
+        },
+        "per_sequence": {
+          "median_seconds": 0.00005662975438596491,
+          "p90_seconds": 0.000057165938596491225,
+          "reps_per_sample": 114
+        },
+        "conv": {
+          "median_seconds": 9.014307228915664e-6,
+          "p90_seconds": 9.09162048192771e-6,
+          "reps_per_sample": 166
+        },
+        "speedup_vs_scan": 1.712635137771508,
+        "speedup": 1.7385314262627667
+      },
+      {
+        "operation": "delta_net_decode",
+        "shape": "0.8b",
+        "sequences": 2,
+        "state_bytes_moved": 4194304,
+        "step": {
+          "median_seconds": 0.00005997480620155038,
+          "p90_seconds": 0.00006463986046511628,
+          "reps_per_sample": 129
+        },
+        "ragged_scan": {
+          "median_seconds": 0.00010777631578947368,
+          "p90_seconds": 0.00010961973684210526,
+          "reps_per_sample": 95
+        },
+        "per_sequence": {
+          "median_seconds": 0.0001145364105263158,
+          "p90_seconds": 0.00011619649473684211,
+          "reps_per_sample": 95
+        },
+        "conv": {
+          "median_seconds": 0.000010241523255813953,
+          "p90_seconds": 0.000010331633720930233,
+          "reps_per_sample": 172
+        },
+        "speedup_vs_scan": 1.7970264952133785,
+        "speedup": 1.9097420697185175
+      },
+      {
+        "operation": "delta_net_decode",
+        "shape": "0.8b",
+        "sequences": 4,
+        "state_bytes_moved": 8388608,
+        "step": {
+          "median_seconds": 0.00014420908108108107,
+          "p90_seconds": 0.00014997936036036035,
+          "reps_per_sample": 111
+        },
+        "ragged_scan": {
+          "median_seconds": 0.00021132222666666667,
+          "p90_seconds": 0.0002133983333333333,
+          "reps_per_sample": 75
+        },
+        "per_sequence": {
+          "median_seconds": 0.00026186380597014927,
+          "p90_seconds": 0.0002743053432835821,
+          "reps_per_sample": 67
+        },
+        "conv": {
+          "median_seconds": 0.000012348507142857143,
+          "p90_seconds": 0.000012536314285714287,
+          "reps_per_sample": 140
+        },
+        "speedup_vs_scan": 1.4653877903004697,
+        "speedup": 1.8158621080382396
+      },
+      {
+        "operation": "delta_net_decode",
+        "shape": "0.8b",
+        "sequences": 8,
+        "state_bytes_moved": 16777216,
+        "step": {
+          "median_seconds": 0.00035596009859154926,
+          "p90_seconds": 0.0003720152535211268,
+          "reps_per_sample": 71
+        },
+        "ragged_scan": {
+          "median_seconds": 0.0004365328947368421,
+          "p90_seconds": 0.00045476828070175436,
+          "reps_per_sample": 57
+        },
+        "per_sequence": {
+          "median_seconds": 0.0005775777777777777,
+          "p90_seconds": 0.0005932777777777777,
+          "reps_per_sample": 45
+        },
+        "conv": {
+          "median_seconds": 0.000018994555555555554,
+          "p90_seconds": 0.000019304738562091503,
+          "reps_per_sample": 153
+        },
+        "speedup_vs_scan": 1.2263534493447454,
+        "speedup": 1.622591352410334
+      },
+      {
+        "operation": "delta_net_decode",
+        "shape": "0.8b",
+        "sequences": 16,
+        "state_bytes_moved": 33554432,
+        "step": {
+          "median_seconds": 0.0006715912978723404,
+          "p90_seconds": 0.0006883537234042554,
+          "reps_per_sample": 47
+        },
+        "ragged_scan": {
+          "median_seconds": 0.0008508940571428572,
+          "p90_seconds": 0.0008847904571428572,
+          "reps_per_sample": 35
+        },
+        "per_sequence": {
+          "median_seconds": 0.0011641898148148147,
+          "p90_seconds": 0.0011812592592592593,
+          "reps_per_sample": 27
+        },
+        "conv": {
+          "median_seconds": 0.00003520787777777778,
+          "p90_seconds": 0.000038693055555555555,
+          "reps_per_sample": 90
+        },
+        "speedup_vs_scan": 1.2669819573877201,
+        "speedup": 1.7334796006188127
+      },
+      {
+        "operation": "delta_net",
+        "shape": "27b",
+        "tokens": 1,
+        "key_heads": 16,
+        "value_heads": 48,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 9.829327683615819e-6,
+          "p90_seconds": 9.994819209039549e-6,
+          "reps_per_sample": 177
+        },
+        "scan": {
+          "median_seconds": 0.0000818889921875,
+          "p90_seconds": 0.0000837395859375,
+          "reps_per_sample": 128
+        },
+        "scan_seconds_per_token": 0.0000818889921875,
+        "scan_simdgroup_sweep": []
+      },
+      {
+        "operation": "delta_net",
+        "shape": "27b",
+        "tokens": 16,
+        "key_heads": 16,
+        "value_heads": 48,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 0.00003885933027522936,
+          "p90_seconds": 0.00004064678899082569,
+          "reps_per_sample": 109
+        },
+        "scan": {
+          "median_seconds": 0.00027747702564102564,
+          "p90_seconds": 0.0002953905,
+          "reps_per_sample": 78
+        },
+        "scan_seconds_per_token": 0.000017342314102564102,
+        "scan_simdgroup_sweep": []
+      },
+      {
+        "operation": "delta_net",
+        "shape": "27b",
+        "tokens": 32,
+        "key_heads": 16,
+        "value_heads": 48,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 0.00006924166666666666,
+          "p90_seconds": 0.00007343055555555556,
+          "reps_per_sample": 90
+        },
+        "scan": {
+          "median_seconds": 0.00043513455737704914,
+          "p90_seconds": 0.0004456878524590164,
+          "reps_per_sample": 61
+        },
+        "scan_seconds_per_token": 0.000013597954918032785,
+        "scan_simdgroup_sweep": []
+      },
+      {
+        "operation": "delta_net",
+        "shape": "27b",
+        "tokens": 64,
+        "key_heads": 16,
+        "value_heads": 48,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 0.00013158631428571429,
+          "p90_seconds": 0.00013650892857142857,
+          "reps_per_sample": 70
+        },
+        "scan": {
+          "median_seconds": 0.0008136445882352941,
+          "p90_seconds": 0.0008268676470588235,
+          "reps_per_sample": 17
+        },
+        "scan_seconds_per_token": 0.00001271319669117647,
+        "scan_simdgroup_sweep": []
+      },
+      {
+        "operation": "delta_net",
+        "shape": "27b",
+        "tokens": 128,
+        "key_heads": 16,
+        "value_heads": 48,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 0.0002487898936170213,
+          "p90_seconds": 0.0002651897234042553,
+          "reps_per_sample": 47
+        },
+        "scan": {
+          "median_seconds": 0.001469096,
+          "p90_seconds": 0.0014917645217391304,
+          "reps_per_sample": 23
+        },
+        "scan_seconds_per_token": 0.0000114773125,
+        "scan_simdgroup_sweep": [
+          {
+            "scan_simdgroups": 1,
+            "scan": {
+              "median_seconds": 0.0014915613684210525,
+              "p90_seconds": 0.0016106863684210526,
+              "reps_per_sample": 19
+            }
+          },
+          {
+            "scan_simdgroups": 2,
+            "scan": {
+              "median_seconds": 0.0014358385416666666,
+              "p90_seconds": 0.0015168784999999999,
+              "reps_per_sample": 24
+            }
+          },
+          {
+            "scan_simdgroups": 4,
+            "scan": {
+              "median_seconds": 0.00144796045,
+              "p90_seconds": 0.00146883335,
+              "reps_per_sample": 20
+            }
+          },
+          {
+            "scan_simdgroups": 8,
+            "scan": {
+              "median_seconds": 0.0013988087272727274,
+              "p90_seconds": 0.0014191742727272727,
+              "reps_per_sample": 22
+            }
+          }
+        ]
+      },
+      {
+        "operation": "delta_net",
+        "shape": "27b",
+        "tokens": 512,
+        "key_heads": 16,
+        "value_heads": 48,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 0.0010866620555555556,
+          "p90_seconds": 0.001128625,
+          "reps_per_sample": 18
+        },
+        "scan": {
+          "median_seconds": 0.006358,
+          "p90_seconds": 0.006448257,
+          "reps_per_sample": 6
+        },
+        "scan_seconds_per_token": 0.00001241796875,
+        "scan_simdgroup_sweep": []
+      },
+      {
+        "operation": "delta_net",
+        "shape": "27b",
+        "tokens": 2048,
+        "key_heads": 16,
+        "value_heads": 48,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 0.0051309584,
+          "p90_seconds": 0.00526935,
+          "reps_per_sample": 5
+        },
+        "scan": {
+          "median_seconds": 0.026841646,
+          "p90_seconds": 0.0273754165,
+          "reps_per_sample": 2
+        },
+        "scan_seconds_per_token": 0.0000131062724609375,
+        "scan_simdgroup_sweep": [
+          {
+            "scan_simdgroups": 1,
+            "scan": {
+              "median_seconds": 0.028921229,
+              "p90_seconds": 0.029152,
+              "reps_per_sample": 2
+            }
+          },
+          {
+            "scan_simdgroups": 2,
+            "scan": {
+              "median_seconds": 0.0262876455,
+              "p90_seconds": 0.027475208,
+              "reps_per_sample": 2
+            }
+          },
+          {
+            "scan_simdgroups": 4,
+            "scan": {
+              "median_seconds": 0.0269438125,
+              "p90_seconds": 0.027429625,
+              "reps_per_sample": 2
+            }
+          },
+          {
+            "scan_simdgroups": 8,
+            "scan": {
+              "median_seconds": 0.026787125,
+              "p90_seconds": 0.0272965,
+              "reps_per_sample": 2
+            }
+          }
+        ]
+      },
+      {
+        "operation": "delta_net",
+        "shape": "27b",
+        "tokens": 8192,
+        "key_heads": 16,
+        "value_heads": 48,
+        "key_dim": 128,
+        "value_dim": 128,
+        "conv": {
+          "median_seconds": 0.0275189375,
+          "p90_seconds": 0.028670771,
+          "reps_per_sample": 2
+        },
+        "scan": {
+          "median_seconds": 0.120692208,
+          "p90_seconds": 0.125265417,
+          "reps_per_sample": 1
+        },
+        "scan_seconds_per_token": 0.000014732935546875,
+        "scan_simdgroup_sweep": []
+      },
+      {
+        "operation": "delta_net_decode",
+        "shape": "27b",
+        "sequences": 1,
+        "state_bytes_moved": 6291456,
+        "step": {
+          "median_seconds": 0.00009817587012987012,
+          "p90_seconds": 0.00011565801298701299,
+          "reps_per_sample": 77
+        },
+        "ragged_scan": {
+          "median_seconds": 0.00014625,
+          "p90_seconds": 0.00019786281132075473,
+          "reps_per_sample": 106
+        },
+        "per_sequence": {
+          "median_seconds": 0.00013613721551724138,
+          "p90_seconds": 0.0001419084051724138,
+          "reps_per_sample": 116
+        },
+        "conv": {
+          "median_seconds": 8.449095022624434e-6,
+          "p90_seconds": 8.793366515837103e-6,
+          "reps_per_sample": 221
+        },
+        "speedup_vs_scan": 1.4896735807539665,
+        "speedup": 1.3866667576987584
+      },
+      {
+        "operation": "delta_net_decode",
+        "shape": "27b",
+        "sequences": 2,
+        "state_bytes_moved": 12582912,
+        "step": {
+          "median_seconds": 0.00024205038372093022,
+          "p90_seconds": 0.00024635708139534885,
+          "reps_per_sample": 86
+        },
+        "ragged_scan": {
+          "median_seconds": 0.0003146048125,
+          "p90_seconds": 0.000350042328125,
+          "reps_per_sample": 64
+        },
+        "per_sequence": {
+          "median_seconds": 0.0003214498072289157,
+          "p90_seconds": 0.00033216816867469876,
+          "reps_per_sample": 83
+        },
+        "conv": {
+          "median_seconds": 0.000010022259803921569,
+          "p90_seconds": 0.000010276960784313724,
+          "reps_per_sample": 204
+        },
+        "speedup_vs_scan": 1.2997492822102723,
+        "speedup": 1.328028496742762
+      },
+      {
+        "operation": "delta_net_decode",
+        "shape": "27b",
+        "sequences": 4,
+        "state_bytes_moved": 25165824,
+        "step": {
+          "median_seconds": 0.0004983763833333333,
+          "p90_seconds": 0.0005071805500000001,
+          "reps_per_sample": 60
+        },
+        "ragged_scan": {
+          "median_seconds": 0.0006098662790697674,
+          "p90_seconds": 0.0006198817674418605,
+          "reps_per_sample": 43
+        },
+        "per_sequence": {
+          "median_seconds": 0.0006596677,
+          "p90_seconds": 0.000677953125,
+          "reps_per_sample": 40
+        },
+        "conv": {
+          "median_seconds": 0.000016540572368421052,
+          "p90_seconds": 0.00001710417105263158,
+          "reps_per_sample": 152
+        },
+        "speedup_vs_scan": 1.2237062177600526,
+        "speedup": 1.323633546974855
+      },
+      {
+        "operation": "delta_net_decode",
+        "shape": "27b",
+        "sequences": 8,
+        "state_bytes_moved": 50331648,
+        "step": {
+          "median_seconds": 0.0009717489230769231,
+          "p90_seconds": 0.0009967681538461538,
+          "reps_per_sample": 39
+        },
+        "ragged_scan": {
+          "median_seconds": 0.0011720287241379311,
+          "p90_seconds": 0.001189919551724138,
+          "reps_per_sample": 29
+        },
+        "per_sequence": {
+          "median_seconds": 0.0013211902666666667,
+          "p90_seconds": 0.0013854583333333332,
+          "reps_per_sample": 30
+        },
+        "conv": {
+          "median_seconds": 0.000025482876712328766,
+          "p90_seconds": 0.000029860445205479452,
+          "reps_per_sample": 146
+        },
+        "speedup_vs_scan": 1.2061024162772898,
+        "speedup": 1.3596004433771645
+      },
+      {
+        "operation": "delta_net_decode",
+        "shape": "27b",
+        "sequences": 16,
+        "state_bytes_moved": 100663296,
+        "step": {
+          "median_seconds": 0.0018692029130434782,
+          "p90_seconds": 0.0018996431304347827,
+          "reps_per_sample": 23
+        },
+        "ragged_scan": {
+          "median_seconds": 0.0021592083333333333,
+          "p90_seconds": 0.0022472384444444443,
+          "reps_per_sample": 18
+        },
+        "per_sequence": {
+          "median_seconds": 0.0026508916666666666,
+          "p90_seconds": 0.0027113333333333334,
+          "reps_per_sample": 15
+        },
+        "conv": {
+          "median_seconds": 0.000049355603448275864,
+          "p90_seconds": 0.000054260413793103446,
+          "reps_per_sample": 116
+        },
+        "speedup_vs_scan": 1.1551492447749623,
+        "speedup": 1.4181936311828367
+      }
+    ],
+    "attention": [],
+    "paged_attention": [],
+    "tiled_attention": [],
+    "packed_linear": [],
+    "sampling": [],
+    "moe": []
+  }
+}

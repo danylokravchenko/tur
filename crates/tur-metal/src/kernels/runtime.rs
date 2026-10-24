@@ -82,6 +82,15 @@ const FUNCTIONS: &[&str] = &[
     "attention_r8_f32",
     "attention_r8_f16",
     "attention_r8_q8",
+    "attention_h2_r2_f32",
+    "attention_h2_r2_f16",
+    "attention_h2_r2_q8",
+    "attention_h2_r4_f32",
+    "attention_h2_r4_f16",
+    "attention_h2_r4_q8",
+    "attention_h2_r8_f32",
+    "attention_h2_r8_f16",
+    "attention_h2_r8_q8",
     "attention_tiled_r2_f32",
     "attention_tiled_r2_f16",
     "attention_tiled_r2_q8",
@@ -110,6 +119,9 @@ const FUNCTIONS: &[&str] = &[
     "delta_scan_f32",
     "delta_scan_f16",
     "delta_scan_bf16",
+    "delta_scan_unaligned_f32",
+    "delta_scan_unaligned_f16",
+    "delta_scan_unaligned_bf16",
     "delta_step_d64_r16_f32",
     "delta_step_d64_r32_f32",
     "delta_step_d64_r16_f16",
@@ -225,6 +237,11 @@ pub struct Tuning {
     /// precedence over the GEMV ranges; at most 16.
     pub qmm_q8_0_rows: (usize, usize),
     pub qmm_q4k_rows: (usize, usize),
+    /// Query heads of one K/V head that a per-query attention simdgroup serves (1 or 2)
+    /// over F32 or F16 pools, and over Q8 pools; each loaded key and value row then
+    /// serves that many heads.
+    pub attention_head_group: usize,
+    pub attention_q8_head_group: usize,
     /// Single-token recurrent sequences use the coalesced step kernel instead of the scan.
     pub delta_step: bool,
 }
@@ -255,6 +272,10 @@ impl Tuning {
             gemv_q4k_rows: (2, 2),
             qmm_q8_0_rows: (4, 16),
             qmm_q4k_rows: (2, 16),
+            // M1 decode sweep (P10 kernel artifact): two heads per simdgroup are 1.06–1.25×
+            // faster over Q8 pools and lose or tie over F32 and F16; four lose everywhere.
+            attention_head_group: 1,
+            attention_q8_head_group: 2,
             delta_step: true,
         }
     }

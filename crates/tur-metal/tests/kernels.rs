@@ -579,11 +579,18 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
     let (device, kernels, _gpu) = setup()?;
     // Single-token sequences take the step kernel, or the scan when tuning disables it.
     // Narrow storage rounds each stored state once; a pass accumulates in F32, so outputs
-    // match a reference started from the rounded committed state.
-    for (dk, delta_step, dtype) in [64usize, 128, 256].into_iter().flat_map(|dk| {
+    // match a reference started from the rounded committed state. Rows of `mixed` padded
+    // by 3 or 4 columns take the unaligned or the aligned scan.
+    for (dk, delta_step, dtype, pad) in [64usize, 128, 256].into_iter().flat_map(|dk| {
         [DType::F32, DType::F16, DType::BF16]
             .into_iter()
-            .flat_map(move |dtype| [(dk, true, dtype), (dk, false, dtype)])
+            .flat_map(move |dtype| {
+                [
+                    (dk, true, dtype, 3),
+                    (dk, false, dtype, 3),
+                    (dk, false, dtype, 4),
+                ]
+            })
     }) {
         let stored = match dtype {
             DType::F32 => 1e-5,
@@ -604,7 +611,7 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
         };
         let case = ScanCase {
             shape,
-            mixed_cols: shape.channels() + 3,
+            mixed_cols: shape.channels() + pad,
             proj_cols: 12,
         };
         // A long prefill, decodes forked from one slot, a speculative sequence and a
@@ -897,9 +904,44 @@ fn test_attention_paged_gqa_matches_reference_for_every_format_and_split() -> Re
         };
         assert_eq!(kernels.attention_split(24, 8, 40).splits, 1);
         assert!(split.attention_split(24, 8, 40).splits > 1);
-        check_attention(&kernels, &device, &case)?;
-        check_attention(&split, &device, &case)?;
+        // One or two query heads per simdgroup for every format, with and without splits.
+        for head_group in [1usize, 2] {
+            for tuned in [&kernels, &split] {
+                let tuned = tuned.clone().with_tuning(Tuning {
+                    attention_head_group: head_group,
+                    attention_q8_head_group: head_group,
+                    ..tuned.tuning()
+                })?;
+                assert_eq!(tuned.attention_head_group(8, 2, KvFormat::Q8), head_group);
+                check_attention(&tuned, &device, &case)?;
+            }
+        }
     }
+    let grouped = kernels.clone().with_tuning(Tuning {
+        attention_head_group: 2,
+        attention_q8_head_group: 2,
+        ..kernels.tuning()
+    })?;
+    assert!(
+        kernels
+            .clone()
+            .with_tuning(Tuning {
+                attention_q8_head_group: 4,
+                ..kernels.tuning()
+            })
+            .is_err()
+    );
+    // Three query heads per K/V head admit no grouping; six admit pairs.
+    assert_eq!(grouped.attention_head_group(6, 2, KvFormat::F16), 1);
+    assert_eq!(grouped.attention_head_group(12, 2, KvFormat::F16), 2);
+    let case = AttentionCase {
+        heads: 6,
+        kv_heads: 2,
+        dim: 128,
+        page: 16,
+        sequences: vec![(40, 1), (7, 2)],
+    };
+    check_attention(&grouped, &device, &case)?;
     // Long-context decode: default tuning splits 1000 keys across threadgroups.
     let case = AttentionCase {
         heads: 4,
@@ -909,7 +951,8 @@ fn test_attention_paged_gqa_matches_reference_for_every_format_and_split() -> Re
         sequences: vec![(999, 1)],
     };
     assert!(kernels.attention_split(1, 4, 1000).splits > 1);
-    check_attention(&kernels, &device, &case)
+    check_attention(&kernels, &device, &case)?;
+    check_attention(&grouped, &device, &case)
 }
 
 #[test]

@@ -1,0 +1,2276 @@
+diff --git a/crates/tur-metal/Cargo.toml b/crates/tur-metal/Cargo.toml
+index b45f1bd..339eabb 100644
+--- a/crates/tur-metal/Cargo.toml
++++ b/crates/tur-metal/Cargo.toml
+@@ -32,5 +32,9 @@ name = "kernels"
+ harness = false
+ required-features = ["metal"]
+ 
++[[example]]
++name = "tensorops_gemm"
++required-features = ["metal"]
++
+ [lints]
+ workspace = true
+diff --git a/crates/tur-metal/benches/kernels.rs b/crates/tur-metal/benches/kernels.rs
+index 8cb16fb..cd5e822 100644
+--- a/crates/tur-metal/benches/kernels.rs
++++ b/crates/tur-metal/benches/kernels.rs
+@@ -377,12 +377,31 @@ fn paged_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+                     Ok(rows.clone())
+                 })?;
+                 let bytes = format.token_bytes(KV_HEADS, HEAD_DIM)? * 2 * paged.slots;
++                // Several query heads per simdgroup share each loaded K/V row.
++                let mut head_groups = Vec::new();
++                if page == 16 && new == 1 {
++                    for attention_head_group in [1usize, 2] {
++                        let tuned = kernels.clone().with_tuning(Tuning {
++                            attention_head_group,
++                            attention_q8_head_group: attention_head_group,
++                            ..kernels.tuning()
++                        })?;
++                        let timing = time(device, || {
++                            tuned.attention(&q, &paged.pool, &paged.kv, &gate, gate_heads())
++                        })?;
++                        head_groups.push(json!({
++                            "heads_per_simdgroup": attention_head_group, "attention": timing,
++                            "split": format!("{:?}", tuned.attention_split(
++                                tokens, HEADS / attention_head_group, past + new)),
++                        }));
++                    }
++                }
+                 cases.push(json!({
+                     "operation": "paged_attention", "shape": label, "kv_format": format.to_string(),
+                     "page": page, "context": past + new, "sequences": sequences,
+                     "pool_bytes": bytes, "fill_tokens": paged.fill.tokens(),
+                     "split": format!("{:?}", kernels.attention_split(tokens, HEADS, past + new)),
+-                    "attention": attention, "kv_write": write,
++                    "attention": attention, "kv_write": write, "head_groups": head_groups,
+                 }));
+             }
+         }
+@@ -472,7 +491,24 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+             a_col: value_heads,
+         };
+         let channels = shape.channels();
+-        for tokens in [1usize, 128, 2048] {
++        let scan_only = kernels.clone().with_tuning(Tuning {
++            delta_chunk: 0,
++            ..kernels.tuning()
++        })?;
++        let chunked: Vec<(usize, Kernels)> = [32usize, 64]
++            .into_iter()
++            .map(|chunk| -> Result<_> {
++                Ok((
++                    chunk,
++                    kernels.clone().with_tuning(Tuning {
++                        delta_chunk: chunk,
++                        delta_chunk_tokens: 2,
++                        ..kernels.tuning()
++                    })?,
++                ))
++            })
++            .collect::<Result<_>>()?;
++        for tokens in [1usize, 16, 32, 64, 128, 512, 2048, 8192] {
+             let mixed = random(device, &[tokens, channels], 7, 1.0)?;
+             let proj = random(device, &[tokens, 2 * value_heads], 8, 1.0)?;
+             // Pools of two slots: the committed state in slot 0, the new one in slot 1.
+@@ -481,43 +517,134 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+             let dt_bias = random(device, &[value_heads], 11, 1.0)?;
+             let neg_a = (random(device, &[value_heads], 12, 1.0)?.abs()? * -1.0)?;
+             let state = random(device, &[2, value_heads, 128, 128], 13, 0.1)?;
+-            let writes = kernels.recurrent_spans(&[RecurrentSpan {
++            let span = [RecurrentSpan {
+                 tokens,
+                 position: 0,
+                 read: 0,
+                 writes: &[1],
+-            }])?;
++            }];
++            let writes = scan_only.recurrent_spans(&span)?;
+             let conv = time(device, || {
+                 kernels.delta_conv(&mixed, &writes, &history, &conv_w)
+             })?;
+             let scan = time(device, || {
+-                kernels.delta_scan(&mixed, &proj, &writes, &shape, &dt_bias, &neg_a, &state)
++                scan_only.delta_scan(&mixed, &proj, &writes, &shape, &dt_bias, &neg_a, &state)
+             })?;
+             let per_token = scan["median_seconds"].as_f64().unwrap_or(0.0) / tokens as f64;
+-            // Threadgroup shape sweep: the staged state tile trades coalescing for occupancy.
+-            let mut sweep = Vec::new();
+-            for scan_simdgroups in [1usize, 2, 4, 8] {
+-                let tuned = kernels.clone().with_tuning(Tuning {
+-                    scan_simdgroups,
+-                    ..kernels.tuning()
+-                })?;
++            let mut chunks = Vec::new();
++            for (chunk, tuned) in &chunked {
++                let spans = tuned.recurrent_spans(&span)?;
+                 let timing = time(device, || {
+-                    tuned.delta_scan(&mixed, &proj, &writes, &shape, &dt_bias, &neg_a, &state)
++                    tuned.delta_scan(&mixed, &proj, &spans, &shape, &dt_bias, &neg_a, &state)
+                 })?;
+-                sweep.push(json!({"scan_simdgroups": scan_simdgroups, "scan": timing}));
++                chunks.push(json!({
++                    "chunk": chunk, "chunked": spans.chunked() > 0, "scan": timing,
++                    "speedup": speedup(&timing, &scan),
++                }));
++            }
++            // Chunked threadgroup widths: wider groups share each staged tile among more
++            // value columns but leave fewer threadgroups.
++            let mut chunk_sweep = Vec::new();
++            if matches!(tokens, 128 | 2048) {
++                for (chunk, tuned) in &chunked {
++                    for delta_chunk_simdgroups in [1usize, 2, 4, 8, 16] {
++                        let tuned = tuned.clone().with_tuning(Tuning {
++                            delta_chunk_simdgroups,
++                            ..tuned.tuning()
++                        })?;
++                        let spans = tuned.recurrent_spans(&span)?;
++                        let timing = time(device, || {
++                            tuned
++                                .delta_scan(&mixed, &proj, &spans, &shape, &dt_bias, &neg_a, &state)
++                        })?;
++                        chunk_sweep.push(json!({
++                            "chunk": chunk, "simdgroups": delta_chunk_simdgroups, "scan": timing,
++                        }));
++                    }
++                }
++            }
++            // Threadgroup shape sweep: the staged state tile trades coalescing for occupancy.
++            let mut sweep = Vec::new();
++            if matches!(tokens, 128 | 2048) {
++                for scan_simdgroups in [1usize, 2, 4, 8] {
++                    let tuned = scan_only.clone().with_tuning(Tuning {
++                        scan_simdgroups,
++                        ..scan_only.tuning()
++                    })?;
++                    let timing = time(device, || {
++                        tuned.delta_scan(&mixed, &proj, &writes, &shape, &dt_bias, &neg_a, &state)
++                    })?;
++                    sweep.push(json!({"scan_simdgroups": scan_simdgroups, "scan": timing}));
++                }
+             }
+             cases.push(json!({
+                 "operation": "delta_net", "shape": label, "tokens": tokens,
+                 "key_heads": key_heads, "value_heads": value_heads, "key_dim": 128, "value_dim": 128,
+                 "conv": conv, "scan": scan, "scan_seconds_per_token": per_token,
++                "chunked": chunks, "chunk_simdgroup_sweep": chunk_sweep,
+                 "scan_simdgroup_sweep": sweep,
+             }));
+         }
++        cases.extend(delta_batched_prefill_cases(
++            device, &scan_only, &chunked, label, shape,
++        )?);
+         cases.extend(delta_decode_cases(device, kernels, label, shape)?);
+     }
+     Ok(cases)
+ }
+ 
++/// Several prompts prefilled in one pass: the token scan against each chunk length.
++fn delta_batched_prefill_cases(
++    device: &Device,
++    scan_only: &Kernels,
++    chunked: &[(usize, Kernels)],
++    label: &str,
++    shape: DeltaShape,
++) -> Result<Vec<Value>> {
++    let mut cases = Vec::new();
++    let heads = shape.value_heads;
++    for (sequences, tokens) in [(4usize, 128usize), (8, 256), (16, 128)] {
++        let rows = sequences * tokens;
++        let mixed = random(device, &[rows, shape.channels()], 7, 1.0)?;
++        let proj = random(device, &[rows, 2 * heads], 8, 1.0)?;
++        let dt_bias = random(device, &[heads], 11, 1.0)?;
++        let neg_a = (random(device, &[heads], 12, 1.0)?.abs()? * -1.0)?;
++        let state = random(device, &[2 * sequences, heads, 128, 128], 13, 0.1)?;
++        let writes: Vec<[u32; 1]> = (0..sequences)
++            .map(|i| [u32::try_from(sequences + i).unwrap_or(0)])
++            .collect();
++        let spans: Vec<RecurrentSpan<'_>> = writes
++            .iter()
++            .enumerate()
++            .map(|(i, write)| RecurrentSpan {
++                tokens,
++                position: 0,
++                read: u32::try_from(i).unwrap_or(0),
++                writes: write,
++            })
++            .collect();
++        let ragged = scan_only.recurrent_spans(&spans)?;
++        let scan = time(device, || {
++            scan_only.delta_scan(&mixed, &proj, &ragged, &shape, &dt_bias, &neg_a, &state)
++        })?;
++        let mut chunks = Vec::new();
++        for (chunk, tuned) in chunked {
++            let ragged = tuned.recurrent_spans(&spans)?;
++            let timing = time(device, || {
++                tuned.delta_scan(&mixed, &proj, &ragged, &shape, &dt_bias, &neg_a, &state)
++            })?;
++            chunks.push(json!({
++                "chunk": chunk, "scan": timing, "speedup": speedup(&timing, &scan),
++            }));
++        }
++        cases.push(json!({
++            "operation": "delta_net_batched_prefill", "shape": label,
++            "sequences": sequences, "tokens": tokens, "scan": scan, "chunked": chunks,
++        }));
++    }
++    Ok(cases)
++}
++
+ /// Batched decode: the ragged convolution and coalesced step kernel, against the ragged
+ /// scan and one scan dispatch per sequence.
+ fn delta_decode_cases(
+diff --git a/crates/tur-metal/examples/tensorops_gemm.rs b/crates/tur-metal/examples/tensorops_gemm.rs
+new file mode 100644
+index 0000000..b0e1ad7
+--- /dev/null
++++ b/crates/tur-metal/examples/tensorops_gemm.rs
+@@ -0,0 +1,157 @@
++#![allow(
++    clippy::print_stdout,
++    reason = "this probe emits its JSON lines on stdout"
++)]
++#![forbid(unsafe_code)]
++//! Metal 4 `TensorOps` capability and F32 GEMM throughput against Candle's F32 GEMM on the
++//! same device (P10). Kernels build `tensor_inline` views over existing buffers in the
++//! shader, so the host needs no `MTLTensor` objects, whose buffer-backed constructor is
++//! unsafe in objc2-metal. Prints one JSON line per measurement.
++//!
++//! `cargo run --release -p tur-metal --example tensorops_gemm`
++
++use candle_core::{DType, Device, Storage, Tensor};
++use candle_metal_kernels::metal::{ComputeCommandEncoder, ComputePipeline};
++use objc2_metal::{MTLCompileOptions, MTLLanguageVersion, MTLSize};
++use serde_json::json;
++use std::time::Instant;
++use tur_core::{Result, TurError};
++
++const REPS: usize = 10;
++
++/// `C[m×n] = A[m×k] · B[k×n]`, row-major, one `tm × tn` output tile per threadgroup.
++fn source(m: usize, n: usize, k: usize, tm: usize, tn: usize, simdgroups: usize) -> String {
++    format!(
++        r"
++#include <metal_stdlib>
++#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
++using namespace metal;
++using namespace mpp::tensor_ops;
++
++kernel void gemm(device float *a [[buffer(0)]], device float *b [[buffer(1)]],
++                 device float *c [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]]) {{
++    auto A = tensor<device float, dextents<int32_t, 2>, tensor_inline>(a, dextents<int32_t, 2>({k}, {m}));
++    auto B = tensor<device float, dextents<int32_t, 2>, tensor_inline>(b, dextents<int32_t, 2>({n}, {k}));
++    auto C = tensor<device float, dextents<int32_t, 2>, tensor_inline>(c, dextents<int32_t, 2>({n}, {m}));
++    constexpr auto desc = matmul2d_descriptor({tm}, {tn}, dynamic_length_v<int>, false, false, false,
++                                              matmul2d_descriptor::mode::multiply);
++    matmul2d<desc, execution_simdgroups<{simdgroups}>> op;
++    op.run(A.slice(0, tg.y * {tm}), B.slice(tg.x * {tn}, 0), C.slice(tg.x * {tn}, tg.y * {tm}));
++}}
++"
++    )
++}
++
++fn error(e: impl std::fmt::Display) -> TurError {
++    TurError::Other(format!("TensorOps: {e}"))
++}
++
++fn seconds(device: &Device, mut op: impl FnMut() -> Result<()>) -> Result<f64> {
++    op()?;
++    device.synchronize()?;
++    let start = Instant::now();
++    for _ in 0..REPS {
++        op()?;
++    }
++    device.synchronize()?;
++    Ok(start.elapsed().as_secs_f64() / REPS as f64)
++}
++
++fn dispatch(
++    device: &Device,
++    pipeline: &ComputePipeline,
++    tensors: [&Tensor; 3],
++    groups: (usize, usize),
++    threads: usize,
++) -> Result<()> {
++    let Device::Metal(metal) = device else {
++        return Err(error("needs a Metal device"));
++    };
++    let [a, b, c] = tensors.map(Tensor::storage_and_layout);
++    let (Storage::Metal(a), Storage::Metal(b), Storage::Metal(c)) = (&*a.0, &*b.0, &*c.0) else {
++        return Err(error("inputs are not Metal storage"));
++    };
++    let guard = metal.command_encoder()?;
++    guard.set_compute_pipeline_state(pipeline);
++    let encoder: &ComputeCommandEncoder = guard.as_ref();
++    encoder.set_input_buffer(0, Some(a.buffer()), 0);
++    encoder.set_input_buffer(1, Some(b.buffer()), 0);
++    encoder.set_output_buffer(2, Some(c.buffer()), 0);
++    encoder.dispatch_thread_groups(
++        MTLSize {
++            width: groups.0,
++            height: groups.1,
++            depth: 1,
++        },
++        MTLSize {
++            width: threads,
++            height: 1,
++            depth: 1,
++        },
++    );
++    Ok(())
++}
++
++fn main() -> Result<()> {
++    let device = Device::new_metal(0)?;
++    let Device::Metal(metal) = &device else {
++        return Err(error("needs a Metal device"));
++    };
++    let raw = metal.metal_device();
++    // Prefill projections of the 0.8B checkpoint: in_proj-like, a short chunk, down.
++    for (m, n, k) in [
++        (2048usize, 8192usize, 1024usize),
++        (128, 8192, 1024),
++        (2048, 1024, 3584),
++    ] {
++        let a = Tensor::randn(0f32, 1.0, (m, k), &device)?;
++        let b = Tensor::randn(0f32, 1.0, (k, n), &device)?;
++        let reference = a.matmul(&b)?;
++        let flops = 2.0 * (m * n * k) as f64;
++        let candle = seconds(&device, || {
++            a.matmul(&b)?;
++            Ok(())
++        })?;
++        println!(
++            "{}",
++            json!({"m": m, "n": n, "k": k, "kernel": "candle_f32", "seconds": candle,
++                   "tflops": flops / candle / 1e12})
++        );
++        for (tm, tn, simdgroups) in [
++            (32usize, 32usize, 4usize),
++            (64, 32, 4),
++            (64, 64, 4),
++            (128, 64, 8),
++        ] {
++            let options = MTLCompileOptions::new();
++            options.setLanguageVersion(MTLLanguageVersion::Version4_0);
++            let library = raw
++                .new_library_with_source(&source(m, n, k, tm, tn, simdgroups), Some(&options))
++                .map_err(error)?;
++            let function = library.get_function("gemm", None).map_err(error)?;
++            let pipeline = raw
++                .new_compute_pipeline_state_with_function(&function)
++                .map_err(error)?;
++            let c = Tensor::zeros((m, n), DType::F32, &device)?;
++            let run = || {
++                dispatch(
++                    &device,
++                    &pipeline,
++                    [&a, &b, &c],
++                    (n / tn, m / tm),
++                    32 * simdgroups,
++                )
++            };
++            let tensorops = seconds(&device, run)?;
++            let max_error = (&c - &reference)?.abs()?.max_all()?.to_scalar::<f32>()?;
++            println!(
++                "{}",
++                json!({"m": m, "n": n, "k": k, "kernel": "tensorops_matmul2d_f32",
++                       "tile": [tm, tn], "simdgroups": simdgroups, "seconds": tensorops,
++                       "tflops": flops / tensorops / 1e12, "speedup_vs_candle": candle / tensorops,
++                       "max_abs_error_vs_candle": max_error})
++            );
++        }
++    }
++    Ok(())
++}
+diff --git a/crates/tur-metal/src/kernels/attention.metal b/crates/tur-metal/src/kernels/attention.metal
+index b8840af..bf7f557 100644
+--- a/crates/tur-metal/src/kernels/attention.metal
++++ b/crates/tur-metal/src/kernels/attention.metal
+@@ -154,15 +154,16 @@ static inline void kv_dims(device const char *src, thread float (&x)[R]) {
+     }
+ }
+ 
+-// One simdgroup per (head, split, token). Lane l reads each key and value row as C
+-// vectors of V = min(R, 16 / sizeof(T)) values, vector c at dimensions V*l + 32*V*c, so
+-// every load instruction covers one contiguous segment of the row: one 16-byte load per
+-// row for F16 or Q8 at head dimension 256, and for Q8 one scale per vector (a vector never
+-// straddles a 32-multiple group). Keys are taken ATTENTION_KEYS at a time, so their loads
+-// are outstanding together. Online softmax keeps the running max/sum in F32. With one
+-// split the gated output is written directly; otherwise unnormalised partial sums and
++// One simdgroup per (HG consecutive heads of one K/V head, split, token). Lane l reads
++// each key and value row as C vectors of V = min(R, 16 / sizeof(T)) values, vector c at
++// dimensions V*l + 32*V*c, so every load instruction covers one contiguous segment of the
++// row: one 16-byte load per row for F16 or Q8 at head dimension 256, and for Q8 one scale
++// per vector (a vector never straddles a 32-multiple group). Each loaded K and V vector
++// serves all HG query heads. Keys are taken ATTENTION_KEYS at a time, so their loads are
++// outstanding together. Online softmax keeps the running max/sum in F32. With one split
++// the gated output is written directly; otherwise unnormalised partial sums and
+ // (max, sum) statistics go to scratch.
+-template <uint R, typename T, uint QUANT>
++template <uint R, typename T, uint QUANT, uint HG>
+ kernel void attention_kv(
+     device const float *q [[buffer(0)]],
+     device const T *k [[buffer(1)]],
+@@ -184,33 +185,41 @@ kernel void attention_kv(
+     constexpr uint U = ATTENTION_KEYS;
+     constexpr uint V = R * sizeof(T) <= 16 ? R : 16 / sizeof(T);
+     constexpr uint C = R / V;
++    uint head_groups = p.heads / HG;
+     uint item = tg * sgs + sg;
+-    if (item >= p.tokens * p.heads * p.splits) {
++    if (item >= p.tokens * head_groups * p.splits) {
+         return;
+     }
+-    uint h = item % p.heads;
+-    uint rest = item / p.heads;
++    uint h0 = (item % head_groups) * HG;
++    uint rest = item / head_groups;
+     uint split = rest % p.splits;
+     uint t = rest / p.splits;
+-    uint g = h / (p.heads / p.kv_heads);
++    uint g = h0 / (p.heads / p.kv_heads);
+     uint keys = visible[t];
+     uint begin = split * p.split_keys;
+     uint end = min(keys, begin + p.split_keys);
+     uint base = first_block[t];
+     uint groups = QUANT == 0 ? 0 : p.dim / p.group;
+     uint dims[C], sidx[C];
+-    float qv[C][V], acc[C][V];
+-    device const float *qr = q + (ulong(t) * p.heads + h) * p.dim;
++    float qv[HG][C][V], acc[HG][C][V];
+     for (uint c = 0; c < C; ++c) {
+         dims[c] = V * lane + SIMD * V * c;
+         sidx[c] = QUANT == 0 ? 0 : dims[c] / p.group;
+-        kv_dims<V>(qr + dims[c], qv[c]);
+-        for (uint i = 0; i < V; ++i) {
+-            acc[c][i] = 0.0f;
++    }
++    for (uint x = 0; x < HG; ++x) {
++        device const float *qr = q + (ulong(t) * p.heads + h0 + x) * p.dim;
++        for (uint c = 0; c < C; ++c) {
++            kv_dims<V>(qr + dims[c], qv[x][c]);
++            for (uint i = 0; i < V; ++i) {
++                acc[x][c][i] = 0.0f;
++            }
+         }
+     }
+-    float m = -FLT_MAX;
+-    float l = 0.0f;
++    float m[HG], l[HG];
++    for (uint x = 0; x < HG; ++x) {
++        m[x] = -FLT_MAX;
++        l[x] = 0.0f;
++    }
+     for (uint j0 = begin; j0 < end; j0 += U) {
+         // Pool rows (slot * kv_heads + g; the host bounds them by 2^32) of this step's keys.
+         // Keys past the range repeat the last one and get zero weight. A step inside one
+@@ -227,74 +236,86 @@ kernel void attention_kv(
+                 rows[u] = (table[base + j / p.page] * p.page + j % p.page) * p.kv_heads + g;
+             }
+         }
+-        float score[U];
++        float score[HG][U];
+         for (uint u = 0; u < U; ++u) {
+             device const T *kr = k + ulong(rows[u]) * p.dim;
+-            float partial_dot = 0.0f;
++            for (uint x = 0; x < HG; ++x) {
++                score[x][u] = 0.0f;
++            }
+             for (uint c = 0; c < C; ++c) {
+                 float kd[V];
+                 kv_dims<V>(kr + dims[c], kd);
+-                float d = 0.0f;
+-                for (uint i = 0; i < V; ++i) {
+-                    d = fma(qv[c][i], kd[i], d);
++                float ks = QUANT == 0 ? 1.0f : float(k_scales[ulong(rows[u]) * groups + sidx[c]]);
++                for (uint x = 0; x < HG; ++x) {
++                    float d = 0.0f;
++                    for (uint i = 0; i < V; ++i) {
++                        d = fma(qv[x][c][i], kd[i], d);
++                    }
++                    score[x][u] += QUANT == 0 ? d : d * ks;
+                 }
+-                partial_dot += QUANT == 0 ? d : d * float(k_scales[ulong(rows[u]) * groups + sidx[c]]);
+             }
+-            score[u] = partial_dot;
+         }
+-        float m_new = m;
+-        for (uint u = 0; u < U; ++u) {
+-            score[u] = simd_sum(score[u]) * p.scale;
+-            m_new = j0 + u < end ? max(m_new, score[u]) : m_new;
+-        }
+-        float correction = exp(m - m_new);
+-        float weight[U];
+-        float total = 0.0f;
+-        for (uint u = 0; u < U; ++u) {
+-            weight[u] = j0 + u < end ? exp(score[u] - m_new) : 0.0f;
+-            total += weight[u];
+-        }
+-        l = l * correction + total;
+-        for (uint c = 0; c < C; ++c) {
+-            for (uint i = 0; i < V; ++i) {
+-                acc[c][i] *= correction;
++        float weight[HG][U];
++        for (uint x = 0; x < HG; ++x) {
++            float m_new = m[x];
++            for (uint u = 0; u < U; ++u) {
++                score[x][u] = simd_sum(score[x][u]) * p.scale;
++                m_new = j0 + u < end ? max(m_new, score[x][u]) : m_new;
++            }
++            float correction = exp(m[x] - m_new);
++            float total = 0.0f;
++            for (uint u = 0; u < U; ++u) {
++                weight[x][u] = j0 + u < end ? exp(score[x][u] - m_new) : 0.0f;
++                total += weight[x][u];
+             }
++            l[x] = l[x] * correction + total;
++            for (uint c = 0; c < C; ++c) {
++                for (uint i = 0; i < V; ++i) {
++                    acc[x][c][i] *= correction;
++                }
++            }
++            m[x] = m_new;
+         }
+         for (uint u = 0; u < U; ++u) {
+             device const T *vr = v + ulong(rows[u]) * p.dim;
+             for (uint c = 0; c < C; ++c) {
+                 float vd[V];
+                 kv_dims<V>(vr + dims[c], vd);
+-                float w = QUANT == 0 ? weight[u] : weight[u] * float(v_scales[ulong(rows[u]) * groups + sidx[c]]);
+-                for (uint i = 0; i < V; ++i) {
+-                    acc[c][i] = fma(w, vd[i], acc[c][i]);
++                float vs = QUANT == 0 ? 1.0f : float(v_scales[ulong(rows[u]) * groups + sidx[c]]);
++                for (uint x = 0; x < HG; ++x) {
++                    float w = QUANT == 0 ? weight[x][u] : weight[x][u] * vs;
++                    for (uint i = 0; i < V; ++i) {
++                        acc[x][c][i] = fma(w, vd[i], acc[x][c][i]);
++                    }
+                 }
+             }
+         }
+-        m = m_new;
+     }
+-    if (p.splits == 1) {
+-        device const float *gr = gate + ulong(t) * p.gate_stride + p.gate_col + ulong(h) * p.gate_head_stride;
+-        device float *o = out + (ulong(t) * p.heads + h) * p.dim;
+-        float inv = l > 0.0f ? 1.0f / l : 0.0f;
++    for (uint x = 0; x < HG; ++x) {
++        uint h = h0 + x;
++        if (p.splits == 1) {
++            device const float *gr = gate + ulong(t) * p.gate_stride + p.gate_col + ulong(h) * p.gate_head_stride;
++            device float *o = out + (ulong(t) * p.heads + h) * p.dim;
++            float inv = l[x] > 0.0f ? 1.0f / l[x] : 0.0f;
++            for (uint c = 0; c < C; ++c) {
++                for (uint i = 0; i < V; ++i) {
++                    o[dims[c] + i] = acc[x][c][i] * inv * sigmoid(gr[dims[c] + i]);
++                }
++            }
++            continue;
++        }
++        ulong slot = (ulong(t) * p.heads + h) * p.splits + split;
++        device float *pp = partial + slot * p.dim;
+         for (uint c = 0; c < C; ++c) {
+             for (uint i = 0; i < V; ++i) {
+-                o[dims[c] + i] = acc[c][i] * inv * sigmoid(gr[dims[c] + i]);
++                pp[dims[c] + i] = acc[x][c][i];
+             }
+         }
+-        return;
+-    }
+-    ulong slot = (ulong(t) * p.heads + h) * p.splits + split;
+-    device float *pp = partial + slot * p.dim;
+-    for (uint c = 0; c < C; ++c) {
+-        for (uint i = 0; i < V; ++i) {
+-            pp[dims[c] + i] = acc[c][i];
++        if (lane == 0) {
++            stats[2 * slot] = m[x];
++            stats[2 * slot + 1] = l[x];
+         }
+     }
+-    if (lane == 0) {
+-        stats[2 * slot] = m;
+-        stats[2 * slot + 1] = l;
+-    }
+ }
+ 
+ // Tiled prefill attention on the matrix units. A threadgroup of 4 simdgroups takes up to
+@@ -321,13 +342,6 @@ struct TiledParams {
+     float scale;
+ };
+ 
+-// Row and first column of the two elements a lane holds in an 8x8 simdgroup matrix. Lanes
+-// sharing a row differ only in lane bits 0 and 3.
+-static inline ushort2 fragment_coord(ushort lane) {
+-    ushort quad = lane / 4;
+-    return ushort2((quad & 4) + (lane / 2) % 4, (quad & 2) * 2 + (lane % 2) * 2);
+-}
+-
+ static inline float row_max(float x) {
+     x = max(x, simd_shuffle_xor(x, 1));
+     return max(x, simd_shuffle_xor(x, 8));
+@@ -560,17 +574,20 @@ kernel void attention_reduce_f32(
+         device const uint *, device const uint *, device const float *, device float *, \
+         device const uint *, constant TiledParams &, device const half *, device const half *, \
+         threadgroup float *, uint, uint, uint, uint, uint);
++#define ATTENTION_KV(R, NAME, T, QUANT, HG, PREFIX) \
++    template [[host_name(PREFIX #R "_" #NAME)]] kernel void attention_kv<R, T, QUANT, HG>( \
++        device const float *, device const T *, device const T *, device const uint *, \
++        device const uint *, device const uint *, device const float *, device float *, \
++        device float *, device float *, constant AttentionParams &, device const half *, \
++        device const half *, uint, uint, uint, uint);
+ #define KV_FORMAT(R, NAME, T, QUANT) \
+     TILED(R, NAME, T, QUANT) \
+     template [[host_name("kv_write_r" #R "_" #NAME)]] kernel void kv_write<R, T, QUANT>( \
+         device const float *, device const float *, device const uint *, device const uint *, \
+         device const uint *, device T *, device half *, device T *, device half *, \
+         constant KvWriteParams &, uint, uint, uint, uint); \
+-    template [[host_name("attention_r" #R "_" #NAME)]] kernel void attention_kv<R, T, QUANT>( \
+-        device const float *, device const T *, device const T *, device const uint *, \
+-        device const uint *, device const uint *, device const float *, device float *, \
+-        device float *, device float *, constant AttentionParams &, device const half *, \
+-        device const half *, uint, uint, uint, uint);
++    ATTENTION_KV(R, NAME, T, QUANT, 1, "attention_r") \
++    ATTENTION_KV(R, NAME, T, QUANT, 2, "attention_h2_r")
+ // R registers per lane: head dimension 64, 128 or 256 over 32 lanes.
+ #define ATTENTION(R) \
+     KV_FORMAT(R, f32, float, 0) \
+diff --git a/crates/tur-metal/src/kernels/common.metal b/crates/tur-metal/src/kernels/common.metal
+index 6ba0006..02a1cf9 100644
+--- a/crates/tur-metal/src/kernels/common.metal
++++ b/crates/tur-metal/src/kernels/common.metal
+@@ -10,6 +10,13 @@ static inline float silu(float x) { return x / (1.0f + exp(-x)); }
+ static inline float sigmoid(float x) { return 1.0f / (1.0f + exp(-x)); }
+ static inline float softplus(float x) { return max(x, 0.0f) + log(1.0f + exp(-fabs(x))); }
+ 
++// Row and first column of the two elements a lane holds in an 8x8 simdgroup matrix. Lanes
++// sharing a row differ only in lane bits 0 and 3.
++static inline ushort2 fragment_coord(ushort lane) {
++    ushort quad = lane / 4;
++    return ushort2((quad & 4) + (lane / 2) % 4, (quad & 2) * 2 + (lane % 2) * 2);
++}
++
+ // Sum over the whole threadgroup. Every thread must call it; `scratch` holds >= 32 floats.
+ static inline float threadgroup_sum(float v, threadgroup float *scratch, uint sg, uint lane, uint sgs) {
+     v = simd_sum(v);
+diff --git a/crates/tur-metal/src/kernels/delta.metal b/crates/tur-metal/src/kernels/delta.metal
+index 1b98f22..fe17a48 100644
+--- a/crates/tur-metal/src/kernels/delta.metal
++++ b/crates/tur-metal/src/kernels/delta.metal
+@@ -164,12 +164,15 @@ struct ScanParams {
+     uint b_col;
+     uint a_col;
+     uint prep_stride;
++    uint chunk_stride;
+ };
+ 
+ // Per-token inputs of the scan, computed once per token instead of once per state column:
+-// row r of `prep` holds L2-normalised q (also scaled by 1/sqrt(key_dim)) and k per key
+-// head, then q·k per key head, then (decay, beta) per value head. One simdgroup per
+-// (row, key head); the gate columns of its value heads go to its first lanes.
++// row r of `prep` holds, per key head, the scales that L2-normalise q (also by
++// 1/sqrt(key_dim)) and k, then q·k of the normalised vectors per key head, then
++// (decay, beta) per value head. Consumers read q and k from `mixed` and apply the scales,
++// so no normalised copy is written. One simdgroup per (row, key head); the gate columns
++// of its value heads go to its first lanes.
+ kernel void delta_prepare_f32(
+     device const float *mixed [[buffer(0)]],
+     device const float *proj [[buffer(1)]],
+@@ -202,19 +205,18 @@ kernel void delta_prepare_f32(
+     device float *out = prep + ulong(row) * p.prep_stride;
+     float qk = 0.0f;
+     for (uint i = lane; i < dk; i += SIMD) {
+-        float qn = q[i] * q_scale, kn = k[i] * k_scale;
+-        out[kh * dk + i] = qn;
+-        out[p.key_width + kh * dk + i] = kn;
+-        qk += qn * kn;
++        qk += (q[i] * q_scale) * (k[i] * k_scale);
+     }
+     qk = simd_sum(qk);
+     if (lane == 0) {
+-        out[2 * p.key_width + kh] = qk;
++        out[kh] = q_scale;
++        out[key_heads + kh] = k_scale;
++        out[2 * key_heads + kh] = qk;
+     }
+     device const float *gates = proj + ulong(row) * p.proj_stride;
+     for (uint g = lane; g < p.groups; g += SIMD) {
+         uint h = kh * p.groups + g;
+-        device float *db = out + 2 * p.key_width + key_heads + 2 * h;
++        device float *db = out + 3 * key_heads + 2 * h;
+         db[0] = exp(softplus(gates[p.a_col + h] + dt_bias[h]) * neg_a[h]);
+         db[1] = sigmoid(gates[p.b_col + h]);
+     }
+@@ -225,7 +227,7 @@ kernel void delta_prepare_f32(
+ // rows: P = key_dim / ROWS lanes share a column, so a simdgroup covers 32 / P columns of
+ // one head. 32 rows measured fastest on M1 (64 doubles live registers and halves the
+ // simdgroups; 16 adds a shuffle step per reduction).
+-// Per token, with S the column's decayed-before state and q, k from `prep`,
++// Per token, with S the column's decayed-before state and q, k normalised by `prep`,
+ //   a = k·S, b = q·S, pred = decay·a, corr = beta·(v - pred),
+ //   out = q·S' = decay·b + (q·k)·corr,  S' = decay·S + k·corr,
+ // so both dot products are lane-local over the lane's rows and combine across the P lanes
+@@ -233,8 +235,9 @@ kernel void delta_prepare_f32(
+ // memory or barrier is needed. State loads and stores are row segments across a
+ // simdgroup's columns. Every loop over the state is fully unrolled: a dynamic index
+ // would spill the state registers to thread memory. State is stored as T (float,
+-// half or bfloat) and updated in F32.
+-template <uint ROWS, typename T>
++// half or bfloat) and updated in F32. V is float4 when every row of `mixed` is 16-byte
++// aligned, else packed_float4.
++template <uint ROWS, typename T, typename V>
+ kernel void delta_scan(
+     device const float *mixed [[buffer(0)]],
+     device const float *prep [[buffer(1)]],
+@@ -278,36 +281,39 @@ kernel void delta_scan(
+     }
+     uint q_col = kh * dk + r0;
+     uint k_col = p.key_width + kh * dk + r0;
+-    uint qk_col = 2 * p.key_width + kh;
+-    uint gate_col = 2 * p.key_width + key_heads + 2 * h;
++    uint gate_col = 3 * key_heads + 2 * h;
+     uint v_col = 2 * p.key_width + h * dv + column;
+     for (uint t = 0; t < s.tokens; ++t) {
+         uint row = s.row + t;
+         device const float *pr = prep + ulong(row) * p.prep_stride;
+-        device const float4 *qv = (device const float4 *)(pr + q_col);
+-        device const float4 *kv = (device const float4 *)(pr + k_col);
+-        float decay = pr[gate_col], beta = pr[gate_col + 1], qk = pr[qk_col];
+-        float v = mixed[ulong(row) * p.mixed_stride + v_col];
++        device const float *mr = mixed + ulong(row) * p.mixed_stride;
++        device const V *qv = (device const V *)(mr + q_col);
++        device const V *kv = (device const V *)(mr + k_col);
++        float q_scale = pr[kh], k_scale = pr[key_heads + kh], qk = pr[2 * key_heads + kh];
++        float decay = pr[gate_col], beta = pr[gate_col + 1];
++        float v = mr[v_col];
+         float4 a4 = 0.0f, b4 = 0.0f;
+         #pragma clang loop unroll(full)
+         for (uint i = 0; i < ROWS / 4; ++i) {
+             float4 st = float4(state[4 * i], state[4 * i + 1], state[4 * i + 2], state[4 * i + 3]);
+-            a4 = fma(kv[i], st, a4);
+-            b4 = fma(qv[i], st, b4);
++            a4 = fma(float4(kv[i]), st, a4);
++            b4 = fma(float4(qv[i]), st, b4);
+         }
++        // The normalising scales apply to the raw dot products and to the correction.
+         float a = (a4.x + a4.y) + (a4.z + a4.w);
+         float b = (b4.x + b4.y) + (b4.z + b4.w);
+         for (uint offset = columns; offset < SIMD; offset *= 2) {
+             a += simd_shuffle_xor(a, ushort(offset));
+             b += simd_shuffle_xor(b, ushort(offset));
+         }
+-        float correction = (v - decay * a) * beta;
++        float correction = (v - decay * a * k_scale) * beta;
+         if (r0 == 0 && active) {
+-            out[(ulong(row) * p.heads + h) * dv + col] = decay * b + qk * correction;
++            out[(ulong(row) * p.heads + h) * dv + col] = decay * b * q_scale + qk * correction;
+         }
++        float scaled = correction * k_scale;
+         #pragma clang loop unroll(full)
+         for (uint i = 0; i < ROWS / 4; ++i) {
+-            float4 kc = kv[i] * correction;
++            float4 kc = float4(kv[i]) * scaled;
+             state[4 * i] = fma(state[4 * i], decay, kc.x);
+             state[4 * i + 1] = fma(state[4 * i + 1], decay, kc.y);
+             state[4 * i + 2] = fma(state[4 * i + 2], decay, kc.z);
+@@ -337,14 +343,17 @@ kernel void delta_scan(
+ // Key rows per delta-scan lane (`DELTA_SCAN_ROWS` on the host); key_dim / SCAN_ROWS lanes share
+ // a value column.
+ #define SCAN_ROWS 32
+-#define SCAN(T, NAME) \
+-    template [[host_name("delta_scan_" #NAME)]] kernel void delta_scan<SCAN_ROWS, T>( \
++#define SCAN(T, V, NAME) \
++    template [[host_name("delta_scan_" #NAME)]] kernel void delta_scan<SCAN_ROWS, T, V>( \
+         device const float *, device const float *, device T *, device float *, \
+         constant ScanParams &, device const RecurrentSpan *, device const uint *, \
+         device const uint *, uint, uint, uint, uint);
+-SCAN(float, f32)
+-SCAN(half, f16)
+-SCAN(bfloat, bf16)
++SCAN(float, float4, f32)
++SCAN(half, float4, f16)
++SCAN(bfloat, float4, bf16)
++SCAN(float, packed_float4, unaligned_f32)
++SCAN(half, packed_float4, unaligned_f16)
++SCAN(bfloat, packed_float4, unaligned_bf16)
+ 
+ // One gated delta step for each single-token sequence `order` lists. A threadgroup covers
+ // (sequence, head, 64 value columns) with DK / ROWS simdgroups: lane l owns value columns
+@@ -454,3 +463,480 @@ STEPS(float, f32)
+ STEPS(half, f16)
+ STEPS(bfloat, bf16)
+ 
++
++// ---------------------------------------------------------------------------------------
++// Chunked gated DeltaNet prefill (UT transform)
++// ---------------------------------------------------------------------------------------
++//
++// Within a chunk of L <= C tokens with cumulative log decay γ_i (γ_i - γ_j <= 0 for j <= i,
++// so no exponent is ever positive) and initial state S:
++//   A = strict_lower(β_i k_i·k_j e^{γ_i-γ_j}),  T = (I + A)^-1,
++//   U = T diag(β) V,  W = T diag(β e^γ) K,  P = lower(q_i·k_j e^{γ_i-γ_j}),
++//   V' = U - W S,  O = diag(e^γ) Q S + P V',  S' = e^{γ_L} S + Kᵀ diag(e^{γ_L-γ}) V'.
++// `delta_chunk_prepare` computes P, U, W and γ for every chunk in parallel;
++// `delta_chunk_scan` walks a sequence's chunks with its state in matrix registers. This
++// equals the token recurrence up to summation order; accumulation stays in F32.
++
++// 8x8 block at `p` with row stride `stride`: element (r, c) is p[r * stride + c] * scale
++// when r < rows and c < cols, else 0, with `scale` the lane's row scale. Masked elements
++// are never read.
++static inline simdgroup_float8x8 frag_load(
++    device const float *p, ulong stride, uint rows, uint cols, ushort2 rc, float scale = 1.0f) {
++    simdgroup_float8x8 m;
++    thread auto &e = m.thread_elements();
++    device const float *at = p + ulong(rc.x) * stride + rc.y;
++    bool row = rc.x < rows;
++    e[0] = row && rc.y < cols ? at[0] * scale : 0.0f;
++    e[1] = row && rc.y + 1 < cols ? at[1] * scale : 0.0f;
++    return m;
++}
++
++// Transposed block: element (r, c) is p[c * stride + r] when c < rows, else 0, scaled by
++// `scale[c]` (one value per stored row).
++static inline simdgroup_float8x8 frag_load_t(
++    device const float *p, ulong stride, uint rows, float2 scale, ushort2 rc) {
++    simdgroup_float8x8 m;
++    thread auto &e = m.thread_elements();
++    e[0] = rc.y < rows ? p[ulong(rc.y) * stride + rc.x] * scale.x : 0.0f;
++    e[1] = rc.y + 1 < rows ? p[ulong(rc.y + 1) * stride + rc.x] * scale.y : 0.0f;
++    return m;
++}
++
++// Per-(row, value head) scratch entry of the chunked path: W (dk), P (C), U (dv), γ.
++// W leads so that staged W rows stay 16-byte aligned.
++struct ChunkLayout {
++    uint stride;
++    uint p;
++    uint u;
++    uint gamma;
++};
++
++static inline ChunkLayout chunk_layout(uint chunk, constant ScanParams &p) {
++    ChunkLayout l;
++    l.p = p.key_dim;
++    l.u = p.key_dim + chunk;
++    l.gamma = l.u + p.value_dim;
++    l.stride = p.chunk_stride;
++    return l;
++}
++
++// One threadgroup per (chunk, value head). `chunks` holds (first packed row, tokens) per
++// chunk; chunks never cross sequences. The solve of T keeps A in the strict lower
++// triangle of `m` and T's strict lower part transposed in the upper triangle, so thread
++// j derives column j of T alone, without barriers.
++template <uint C>
++kernel void delta_chunk_prepare(
++    device const float *mixed [[buffer(0)]],
++    device const float *proj [[buffer(1)]],
++    device const float *dt_bias [[buffer(2)]],
++    device const float *neg_a [[buffer(3)]],
++    device const float *prep [[buffer(4)]],
++    device float *scratch [[buffer(5)]],
++    constant ScanParams &p [[buffer(6)]],
++    device const uint2 *chunks [[buffer(7)]],
++    uint tg [[threadgroup_position_in_grid]],
++    uint tid [[thread_index_in_threadgroup]],
++    uint threads [[threads_per_threadgroup]],
++    uint sg [[simdgroup_index_in_threadgroup]],
++    uint lane [[thread_index_in_simdgroup]],
++    uint sgs [[simdgroups_per_threadgroup]]) {
++    constexpr uint LD = C + 1;
++    constexpr uint B = C / 8;
++    threadgroup float m[C * LD];
++    threadgroup float gamma[C];
++    threadgroup float beta[C];
++    threadgroup float q_scale[C];
++    threadgroup float k_scale[C];
++    uint h = tg % p.heads;
++    uint2 chunk = chunks[tg / p.heads];
++    uint row0 = chunk.x, len = chunk.y;
++    uint kh = h / p.groups;
++    uint key_heads = p.heads / p.groups;
++    uint dk = p.key_dim, dv = p.value_dim;
++    ChunkLayout l = chunk_layout(C, p);
++    ulong srow = ulong(p.heads) * l.stride;
++    device float *sc = scratch + (ulong(row0) * p.heads + h) * l.stride;
++
++    if (sg == 0) {
++        float carry = 0.0f;
++        for (uint base = 0; base < C; base += SIMD) {
++            uint t = base + lane;
++            float g = 0.0f, b = 0.0f;
++            if (t < len) {
++                device const float *gates = proj + ulong(row0 + t) * p.proj_stride;
++                g = softplus(gates[p.a_col + h] + dt_bias[h]) * neg_a[h];
++                b = sigmoid(gates[p.b_col + h]);
++            }
++            float sum = simd_prefix_inclusive_sum(g) + carry;
++            gamma[t] = sum;
++            beta[t] = b;
++            device const float *pr = prep + ulong(row0 + min(t, len - 1)) * p.prep_stride;
++            q_scale[t] = pr[kh];
++            k_scale[t] = pr[key_heads + kh];
++            carry = simd_broadcast(sum, ushort(SIMD - 1));
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    ushort2 rc = fragment_coord(ushort(lane));
++    device const float *qp = mixed + ulong(row0) * p.mixed_stride + kh * dk;
++    device const float *kp = qp + p.key_width;
++    for (uint blk = sg; blk < B * (B + 1) / 2; blk += sgs) {
++        uint bi = 0;
++        while ((bi + 1) * (bi + 2) / 2 <= blk) {
++            ++bi;
++        }
++        uint bj = blk - bi * (bi + 1) / 2;
++        uint ri = bi * 8 < len ? len - bi * 8 : 0;
++        uint rj = bj * 8 < len ? len - bj * 8 : 0;
++        simdgroup_float8x8 kk = simdgroup_float8x8(0.0f), qk = simdgroup_float8x8(0.0f);
++        device const float *qi = qp + ulong(bi * 8) * p.mixed_stride;
++        device const float *ki = kp + ulong(bi * 8) * p.mixed_stride;
++        device const float *kj = kp + ulong(bj * 8) * p.mixed_stride;
++        uint jc = bj * 8 + rc.y;
++        float2 kj_scale = float2(k_scale[jc], k_scale[jc + 1]);
++        float qi_scale = q_scale[bi * 8 + rc.x], ki_scale = k_scale[bi * 8 + rc.x];
++        for (uint d = 0; d < dk; d += 8) {
++            simdgroup_float8x8 kt = frag_load_t(kj + d, p.mixed_stride, rj, kj_scale, rc);
++            simdgroup_multiply_accumulate(kk, frag_load(ki + d, p.mixed_stride, ri, 8, rc, ki_scale), kt, kk);
++            simdgroup_multiply_accumulate(qk, frag_load(qi + d, p.mixed_stride, ri, 8, rc, qi_scale), kt, qk);
++        }
++        thread auto &ek = kk.thread_elements();
++        thread auto &eq = qk.thread_elements();
++        uint i = bi * 8 + rc.x;
++        for (uint x = 0; x < 2; ++x) {
++            uint j = bj * 8 + rc.y + x;
++            bool valid = i < len && j < len && j <= i;
++            float decay = valid ? exp(gamma[i] - gamma[j]) : 0.0f;
++            if (j < i) {
++                m[i * LD + j] = valid ? beta[i] * ek[x] * decay : 0.0f;
++            }
++            if (i < len) {
++                sc[ulong(i) * srow + l.p + j] = valid ? eq[x] * decay : 0.0f;
++            }
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    for (uint j = tid; j < C; j += threads) {
++        for (uint i = j + 1; i < C; ++i) {
++            float t = -m[i * LD + j];
++            for (uint q = j + 1; q < i; ++q) {
++                t = fma(-m[i * LD + q], m[j * LD + q], t);
++            }
++            m[j * LD + i] = t;
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    // U and W: T's columns scaled by β (for V) or β e^γ (for K), lower blocks only.
++    uint vb = (dv + 7) / 8, kb = dk / 8;
++    device const float *vp = mixed + ulong(row0) * p.mixed_stride + 2 * p.key_width + h * dv;
++    for (uint blk = sg; blk < B * (vb + kb); blk += sgs) {
++        uint bi = blk / (vb + kb);
++        uint bc = blk % (vb + kb);
++        if (bi * 8 >= len) {
++            continue;
++        }
++        bool is_v = bc < vb;
++        uint col = is_v ? bc * 8 : (bc - vb) * 8;
++        uint cols = is_v ? dv - col : 8;
++        simdgroup_float8x8 acc = simdgroup_float8x8(0.0f);
++        for (uint bj = 0; bj <= bi; ++bj) {
++            if (bj * 8 >= len) {
++                break;
++            }
++            simdgroup_float8x8 t;
++            thread auto &et = t.thread_elements();
++            uint i = bi * 8 + rc.x;
++            for (uint x = 0; x < 2; ++x) {
++                uint j = bj * 8 + rc.y + x;
++                float v = i > j ? m[j * LD + i] : (i == j ? 1.0f : 0.0f);
++                float s = is_v ? beta[j] : beta[j] * exp(gamma[j]);
++                et[x] = v * s;
++            }
++            simdgroup_float8x8 b = is_v
++                ? frag_load(vp + ulong(bj * 8) * p.mixed_stride + col, p.mixed_stride, len - bj * 8, cols, rc)
++                : frag_load(kp + ulong(bj * 8) * p.mixed_stride + col, p.mixed_stride, len - bj * 8, 8, rc,
++                            k_scale[bj * 8 + rc.x]);
++            simdgroup_multiply_accumulate(acc, t, b, acc);
++        }
++        thread auto &e = acc.thread_elements();
++        uint i = bi * 8 + rc.x;
++        if (i < len) {
++            device float *dst = sc + ulong(i) * srow + (is_v ? l.u : 0) + col;
++            for (uint x = 0; x < 2; ++x) {
++                if (rc.y + x < cols) {
++                    dst[rc.y + x] = e[x];
++                }
++            }
++        }
++    }
++    for (uint t = tid; t < len; t += threads) {
++        sc[ulong(t) * srow + l.gamma] = gamma[t];
++    }
++}
++
++// Stage `C` rows of KT columns at `src` (row stride `stride`, 4-byte aligned) into
++// `tile`, each row scaled by `scale[r]` (zero at or past the chunk's length). Transposed
++// staging writes column c of the rows as tile row c (stride C + 4).
++template <uint C, uint KT, bool TRANSPOSE>
++static inline void stage_rows(
++    threadgroup float *tile, device const float *src, ulong stride, uint len,
++    threadgroup const float *scale, uint tid, uint threads) {
++    constexpr uint LT = KT + 4;
++    constexpr uint LC = C + 4;
++    constexpr uint Q = KT / 4;
++    for (uint e = tid; e < C * Q; e += threads) {
++        uint r = TRANSPOSE ? e % C : e / Q;
++        uint c = 4 * (TRANSPOSE ? e / C : e % Q);
++        float4 v = 0.0f;
++        if (r < len) {
++            v = float4(*(device const packed_float4 *)(src + ulong(r) * stride + c)) * scale[r];
++        }
++        if (TRANSPOSE) {
++            tile[c * LC + r] = v.x;
++            tile[(c + 1) * LC + r] = v.y;
++            tile[(c + 2) * LC + r] = v.z;
++            tile[(c + 3) * LC + r] = v.w;
++        } else {
++            *(threadgroup float4 *)(tile + r * LT + c) = v;
++        }
++    }
++}
++
++// One threadgroup per (sequence, value head, sgs x 8 value columns); simdgroup g owns
++// 8 value columns, with the state's DK x 8 slice in DK / 8 matrix registers. Per chunk
++// the threadgroup stages P, then W, e^γ Q and (e^{γ_L-γ} K)ᵀ (q and k normalised by
++// their `prep` scales) in KT-column tiles that
++// every simdgroup multiplies with its own slice; nothing a product waits on is read from
++// device memory element by element. The state is loaded from the committed slot and
++// stored once, rounded like the token scan's final state.
++template <uint C, uint DK, typename T>
++kernel void delta_chunk_scan(
++    device const float *prep [[buffer(0)]],
++    device const float *scratch [[buffer(1)]],
++    device T *pool [[buffer(2)]],
++    device float *out [[buffer(3)]],
++    constant ScanParams &p [[buffer(4)]],
++    device const RecurrentSpan *spans [[buffer(5)]],
++    device const uint *slots [[buffer(6)]],
++    device const uint *order [[buffer(7)]],
++    device const float *mixed [[buffer(8)]],
++    uint tg [[threadgroup_position_in_grid]],
++    uint tid [[thread_index_in_threadgroup]],
++    uint threads [[threads_per_threadgroup]],
++    uint sg [[simdgroup_index_in_threadgroup]],
++    uint lane [[thread_index_in_simdgroup]],
++    uint sgs [[simdgroups_per_threadgroup]]) {
++    constexpr uint KB = DK / 8;
++    constexpr uint B = C / 8;
++    constexpr uint KT = DK < 2048 / C ? DK : 2048 / C;
++    constexpr uint LT = KT + 4;
++    constexpr uint LC = C + 4;
++    constexpr uint TILES = DK / KT;
++    constexpr uint TB = KT / 8;
++    constexpr uint TILE = C * LT > KT * LC ? C * LT : KT * LC;
++    threadgroup float tile[TILE];
++    threadgroup float pt[C * LC];
++    // Per-row staging scales: 1 for W, e^γ times the q scale, e^{γ_L-γ} times the k scale.
++    threadgroup float ones[C];
++    threadgroup float q_factor[C];
++    threadgroup float k_factor[C];
++    uint dv = p.value_dim;
++    uint blocks = (dv + 7) / 8;
++    uint groups = (blocks + sgs - 1) / sgs;
++    uint per_sequence = p.heads * groups;
++    uint index = tg / per_sequence;
++    if (index >= p.sequences) {
++        return;
++    }
++    RecurrentSpan s = spans[order[index]];
++    uint h = (tg % per_sequence) / groups;
++    uint block = (tg % groups) * sgs + sg;
++    // Simdgroups past the last block stage tiles but load and store nothing.
++    uint c0 = min(block, blocks - 1) * 8;
++    uint cols = block < blocks ? min(8u, dv - c0) : 0;
++    uint kh = h / p.groups;
++    uint key_heads = p.heads / p.groups;
++    ChunkLayout l = chunk_layout(C, p);
++    ulong srow = ulong(p.heads) * l.stride;
++    ushort2 rc = fragment_coord(ushort(lane));
++    ulong state_size = ulong(p.heads) * DK * dv;
++    ulong head_state = ulong(h) * DK * dv + c0;
++
++    simdgroup_float8x8 st[KB];
++    device const T *state_in = pool + ulong(s.read) * state_size + head_state;
++    #pragma clang loop unroll(full)
++    for (uint d = 0; d < KB; ++d) {
++        thread auto &e = st[d].thread_elements();
++        device const T *at = state_in + ulong(d * 8 + rc.x) * dv + rc.y;
++        e[0] = rc.y < cols ? float(at[0]) : 0.0f;
++        e[1] = rc.y + 1 < cols ? float(at[1]) : 0.0f;
++    }
++    for (uint t0 = 0; t0 < s.tokens; t0 += C) {
++        uint len = min(C, s.tokens - t0);
++        uint row0 = s.row + t0;
++        device const float *sc = scratch + (ulong(row0) * p.heads + h) * l.stride;
++        device const float *qp = mixed + ulong(row0) * p.mixed_stride + kh * DK;
++        device const float *kp = qp + p.key_width;
++        // U loads are issued first; W S hides their latency.
++        simdgroup_float8x8 vn[B];
++        #pragma clang loop unroll(full)
++        for (uint bi = 0; bi < B; ++bi) {
++            uint rows = bi * 8 < len ? len - bi * 8 : 0;
++            vn[bi] = frag_load(sc + ulong(bi * 8) * srow + l.u + c0, srow, rows, cols, rc);
++        }
++        float last = sc[ulong(len - 1) * srow + l.gamma];
++        for (uint t = tid; t < C; t += threads) {
++            bool valid = t < len;
++            float g = valid ? sc[ulong(t) * srow + l.gamma] : 0.0f;
++            device const float *pr = prep + ulong(row0 + (valid ? t : 0)) * p.prep_stride;
++            ones[t] = 1.0f;
++            q_factor[t] = valid ? exp(g) * pr[kh] : 0.0f;
++            k_factor[t] = valid ? exp(last - g) * pr[key_heads + kh] : 0.0f;
++        }
++        // P's lower blocks; the upper ones are never written by the prepare kernel.
++        for (uint e = tid; e < C * C; e += threads) {
++            uint i = e / C, j = e % C;
++            pt[i * LC + j] = i < len && j / 8 <= i / 8 ? sc[ulong(i) * srow + l.p + j] : 0.0f;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        // V' = U - W S
++        simdgroup_float8x8 ws[B];
++        #pragma clang loop unroll(full)
++        for (uint bi = 0; bi < B; ++bi) {
++            ws[bi] = simdgroup_float8x8(0.0f);
++        }
++        #pragma clang loop unroll(full)
++        for (uint kt = 0; kt < TILES; ++kt) {
++            stage_rows<C, KT, false>(tile, sc + kt * KT, srow, len, ones, tid, threads);
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++            #pragma clang loop unroll(full)
++            for (uint bi = 0; bi < B; ++bi) {
++                if (bi * 8 < len) {
++                    #pragma clang loop unroll(full)
++                    for (uint d = 0; d < TB; ++d) {
++                        simdgroup_float8x8 a;
++                        simdgroup_load(a, tile + bi * 8 * LT + d * 8, LT);
++                        simdgroup_multiply_accumulate(ws[bi], a, st[kt * TB + d], ws[bi]);
++                    }
++                }
++            }
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++        }
++        #pragma clang loop unroll(full)
++        for (uint bi = 0; bi < B; ++bi) {
++            thread auto &e = vn[bi].thread_elements();
++            thread auto &f = ws[bi].thread_elements();
++            e[0] -= f[0];
++            e[1] -= f[1];
++        }
++
++        // O = (e^γ Q) S + P V'
++        simdgroup_float8x8 o[B];
++        #pragma clang loop unroll(full)
++        for (uint bi = 0; bi < B; ++bi) {
++            o[bi] = simdgroup_float8x8(0.0f);
++            #pragma clang loop unroll(full)
++            for (uint bj = 0; bj <= bi; ++bj) {
++                simdgroup_float8x8 a;
++                simdgroup_load(a, pt + bi * 8 * LC + bj * 8, LC);
++                simdgroup_multiply_accumulate(o[bi], a, vn[bj], o[bi]);
++            }
++        }
++        #pragma clang loop unroll(full)
++        for (uint kt = 0; kt < TILES; ++kt) {
++            stage_rows<C, KT, false>(tile, qp + kt * KT, p.mixed_stride, len, q_factor, tid, threads);
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++            #pragma clang loop unroll(full)
++            for (uint bi = 0; bi < B; ++bi) {
++                if (bi * 8 < len) {
++                    #pragma clang loop unroll(full)
++                    for (uint d = 0; d < TB; ++d) {
++                        simdgroup_float8x8 a;
++                        simdgroup_load(a, tile + bi * 8 * LT + d * 8, LT);
++                        simdgroup_multiply_accumulate(o[bi], a, st[kt * TB + d], o[bi]);
++                    }
++                }
++            }
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++        }
++        #pragma clang loop unroll(full)
++        for (uint bi = 0; bi < B; ++bi) {
++            thread auto &e = o[bi].thread_elements();
++            uint i = bi * 8 + rc.x;
++            if (i < len) {
++                device float *dst = out + (ulong(row0 + i) * p.heads + h) * dv + c0;
++                if (rc.y < cols) {
++                    dst[rc.y] = e[0];
++                }
++                if (rc.y + 1 < cols) {
++                    dst[rc.y + 1] = e[1];
++                }
++            }
++        }
++
++        // S' = e^{γ_L} S + (e^{γ_L-γ} K)ᵀ V'
++        float decay = exp(last);
++        #pragma clang loop unroll(full)
++        for (uint d = 0; d < KB; ++d) {
++            thread auto &e = st[d].thread_elements();
++            e[0] *= decay;
++            e[1] *= decay;
++        }
++        #pragma clang loop unroll(full)
++        for (uint kt = 0; kt < TILES; ++kt) {
++            stage_rows<C, KT, true>(tile, kp + kt * KT, p.mixed_stride, len, k_factor, tid, threads);
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++            #pragma clang loop unroll(full)
++            for (uint d = 0; d < TB; ++d) {
++                #pragma clang loop unroll(full)
++                for (uint bj = 0; bj < B; ++bj) {
++                    if (bj * 8 < len) {
++                        simdgroup_float8x8 a;
++                        simdgroup_load(a, tile + d * 8 * LC + bj * 8, LC);
++                        simdgroup_multiply_accumulate(st[kt * TB + d], a, vn[bj], st[kt * TB + d]);
++                    }
++                }
++            }
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++        }
++    }
++    device T *final_state = pool + ulong(slots[s.writes]) * state_size + head_state;
++    uint position = s.position + s.tokens - 1;
++    #pragma clang loop unroll(full)
++    for (uint d = 0; d < KB; ++d) {
++        thread auto &e = st[d].thread_elements();
++        ulong at = ulong(d * 8 + rc.x) * dv + rc.y;
++        uint element = uint(head_state + at);
++        if (rc.y < cols) {
++            final_state[at] = store_state<T>(e[0], position, element);
++        }
++        if (rc.y + 1 < cols) {
++            final_state[at + 1] = store_state<T>(e[1], position, element + 1);
++        }
++    }
++}
++
++#define CHUNK_PREPARE(C) \
++    template [[host_name("delta_chunk_prepare_c" #C)]] kernel void delta_chunk_prepare<C>( \
++        device const float *, device const float *, device const float *, device const float *, \
++        device const float *, device float *, constant ScanParams &, device const uint2 *, \
++        uint, uint, uint, uint, uint, uint);
++CHUNK_PREPARE(32)
++CHUNK_PREPARE(64)
++
++#define CHUNK_SCAN(C, DK, T, NAME) \
++    template [[host_name("delta_chunk_scan_c" #C "_d" #DK "_" #NAME)]] kernel void delta_chunk_scan<C, DK, T>( \
++        device const float *, device const float *, device T *, device float *, \
++        constant ScanParams &, device const RecurrentSpan *, device const uint *, \
++        device const uint *, device const float *, uint, uint, uint, uint, uint, uint);
++#define CHUNK_SCANS(C, T, NAME) CHUNK_SCAN(C, 64, T, NAME) CHUNK_SCAN(C, 128, T, NAME) CHUNK_SCAN(C, 256, T, NAME)
++CHUNK_SCANS(32, float, f32)
++CHUNK_SCANS(32, half, f16)
++CHUNK_SCANS(32, bfloat, bf16)
++CHUNK_SCANS(64, float, f32)
++CHUNK_SCANS(64, half, f16)
++CHUNK_SCANS(64, bfloat, bf16)
+diff --git a/crates/tur-metal/src/kernels/mod.rs b/crates/tur-metal/src/kernels/mod.rs
+index 783a007..b3e6cf9 100644
+--- a/crates/tur-metal/src/kernels/mod.rs
++++ b/crates/tur-metal/src/kernels/mod.rs
+@@ -28,6 +28,9 @@ use tur_core::{
+ const DELTA_STEP_ROWS: [usize; 2] = [16, 32];
+ /// Key rows held by one delta-scan lane (`SCAN_ROWS` in the MSL).
+ const DELTA_SCAN_ROWS: usize = 32;
++/// Chunk lengths with compiled chunk-parallel recurrent kernels. 128 would need a
++/// 66 KB triangular solve, beyond the 32 KB of threadgroup memory Apple GPUs guarantee.
++const DELTA_CHUNKS: [usize; 2] = [32, 64];
+ /// Output rows per GEMV simdgroup (`NR` in the MSL `QMV` instantiations).
+ fn gemv_rows(format: GgmlDType, batch: usize) -> usize {
+     match format {
+@@ -94,6 +97,7 @@ struct ScanParams {
+     b_col: u32,
+     a_col: u32,
+     prep_stride: u32,
++    chunk_stride: u32,
+ }
+ 
+ #[repr(C)]
+@@ -238,6 +242,12 @@ impl DeltaShape {
+     pub fn channels(&self) -> usize {
+         2 * self.key_width() + self.value_width()
+     }
++
++    /// Floats per row of the recurrent prefill's prepared inputs: q and k scales and q·k
++    /// per key head, then (decay, beta) per value head, rounded to whole float4s.
++    pub fn prepared_width(&self) -> usize {
++        (3 * self.key_heads + 2 * self.value_heads).next_multiple_of(4)
++    }
+ }
+ 
+ /// Validated paged K/V addressing for a packed batch. Key `j` of query token `t` lives in
+@@ -319,11 +329,17 @@ pub struct RecurrentSpans {
+     /// Sequence of each packed row.
+     rows: Tensor,
+     slots: Tensor,
+-    /// Sequence orders with their counts: single-token sequences (the decode step), the
+-    /// rest (the scan), and all of them (the scan alone). Each may be empty.
++    /// Sequence orders with their counts: single-token sequences (the decode step),
++    /// chunked prefills, the remaining multi-token sequences (the scan), and every
++    /// unchunked sequence (the scan alone). Each may be empty.
+     single: (Tensor, usize),
++    chunked: (Tensor, usize),
+     multi: (Tensor, usize),
+-    all: (Tensor, usize),
++    unchunked: (Tensor, usize),
++    /// `(first packed row, tokens)` of every chunk of the chunked sequences.
++    chunks: (Tensor, usize),
++    /// Chunk length chosen when the spans were built, or 0.
++    chunk: usize,
+     sequences: usize,
+     tokens: usize,
+     /// Highest slot read or written, checked against each pool.
+@@ -339,6 +355,11 @@ impl RecurrentSpans {
+         self.tokens
+     }
+ 
++    /// Sequences taking the chunk-parallel prefill.
++    pub fn chunked(&self) -> usize {
++        self.chunked.1
++    }
++
+     fn check(&self, capacity: usize, rows: usize) -> Result<()> {
+         if self.max_slot as usize >= capacity || rows != self.tokens {
+             return Err(invalid(
+@@ -392,7 +413,12 @@ impl Kernels {
+             || tuning.scan_simdgroups == 0
+             || tuning.elementwise_threads == 0
+             || tuning.attention_parallelism == 0
++            || [tuning.attention_head_group, tuning.attention_q8_head_group]
++                .iter()
++                .any(|hg| ![1, 2].contains(hg))
+             || tuning.min_split_keys == 0
++            || tuning.delta_chunk_simdgroups == 0
++            || (tuning.delta_chunk != 0 && !DELTA_CHUNKS.contains(&tuning.delta_chunk))
+             || [tuning.gemv_q8_0_rows, tuning.gemv_q4k_rows]
+                 .iter()
+                 .any(|&(min, max)| min == 0 || max > 8)
+@@ -864,11 +890,47 @@ impl Kernels {
+             .chain(written.last().copied())
+             .max()
+             .unwrap_or(0);
+-        let all: Vec<u32> = (0..to_u32(spans.len(), "sequences")?).collect();
+-        let (single, multi): (Vec<u32>, Vec<u32>) = all
+-            .iter()
+-            .partition(|&&i| spans.get(i as usize).is_some_and(|span| span.tokens == 1));
+-        let counts = [single.len(), multi.len(), all.len()];
++        let chunk = self.tuning.delta_chunk;
++        let chunked_span = |span: &RecurrentSpan<'_>| {
++            chunk != 0
++                && span.tokens > 1
++                && span.tokens >= self.tuning.delta_chunk_tokens
++                && span.writes.len() == 1
++        };
++        let mut single = Vec::new();
++        let mut chunked = Vec::new();
++        let mut multi = Vec::new();
++        let mut unchunked = Vec::new();
++        let mut chunks = Vec::new();
++        let mut first = 0;
++        for (index, span) in spans.iter().enumerate() {
++            let index = to_u32(index, "sequence")?;
++            first += span.tokens;
++            if chunked_span(span) {
++                chunked.push(index);
++                let row = first - span.tokens;
++                for start in (0..span.tokens).step_by(chunk) {
++                    chunks.extend([
++                        to_u32(row + start, "chunk row")?,
++                        to_u32((span.tokens - start).min(chunk), "chunk tokens")?,
++                    ]);
++                }
++                continue;
++            }
++            unchunked.push(index);
++            if span.tokens == 1 {
++                single.push(index);
++            } else {
++                multi.push(index);
++            }
++        }
++        let counts = [
++            single.len(),
++            chunked.len(),
++            multi.len(),
++            unchunked.len(),
++            chunks.len() / 2,
++        ];
+         // Uploads are never empty; an unused order list is a placeholder of one entry.
+         let placeholder = |ids: &[u32]| {
+             if ids.is_empty() {
+@@ -877,23 +939,36 @@ impl Kernels {
+                 ids.to_vec()
+             }
+         };
+-        let [table_view, rows_view, slots_view, single, multi, all] =
+-            self.runtime.indices_packed([
+-                &table,
+-                &rows,
+-                &slots,
+-                &placeholder(&single),
+-                &placeholder(&multi),
+-                &placeholder(&all),
+-            ])?;
++        let [
++            table_view,
++            rows_view,
++            slots_view,
++            single,
++            chunked,
++            multi,
++            unchunked,
++            chunks,
++        ] = self.runtime.indices_packed([
++            &table,
++            &rows,
++            &slots,
++            &placeholder(&single),
++            &placeholder(&chunked),
++            &placeholder(&multi),
++            &placeholder(&unchunked),
++            &placeholder(&chunks),
++        ])?;
+         Ok(RecurrentSpans {
+             spans: table_view,
+             tokens: rows.len(),
+             rows: rows_view,
+             slots: slots_view,
+             single: (single, counts[0]),
+-            multi: (multi, counts[1]),
+-            all: (all, counts[2]),
++            chunked: (chunked, counts[1]),
++            multi: (multi, counts[2]),
++            unchunked: (unchunked, counts[3]),
++            chunks: (chunks, counts[4]),
++            chunk,
+             sequences: spans.len(),
+             max_slot,
+         })
+@@ -976,7 +1051,8 @@ impl Kernels {
+     /// BF16; updates accumulate in F32) and writes its state after the last token, or
+     /// after every token, into its written slots, rounded to the pool's dtype. Returns
+     /// `[rows * heads, value_dim]`. Single-token sequences take one coalesced step dispatch
+-    /// (unless tuning disables it) and the rest one scan dispatch.
++    /// (unless tuning disables it), prefills chosen by [`Kernels::recurrent_spans`] the
++    /// chunk-parallel kernels, and the rest one scan dispatch.
+     #[allow(clippy::too_many_arguments)]
+     pub fn delta_scan(
+         &self,
+@@ -1007,10 +1083,14 @@ impl Kernels {
+         if !matches!(dk, 64 | 128 | 256) {
+             return Err(invalid(format!("no delta scan kernel for key dim {dk}")));
+         }
+-        let name = format!("delta_scan_{storage}");
+-        // Prepared row: normalised q and k, q·k per key head, (decay, beta) per value head;
+-        // rounded to whole float4s so the scan's vector reads stay aligned.
+-        let prep_stride = (2 * shape.key_width() + shape.key_heads + 2 * heads).next_multiple_of(4);
++        // The scan reads q and k rows of `mixed` as float4s, aligned when every row is.
++        let aligned = mv.row_stride.is_multiple_of(4) && mv.offset().is_multiple_of(16);
++        let name = if aligned {
++            format!("delta_scan_{storage}")
++        } else {
++            format!("delta_scan_unaligned_{storage}")
++        };
++        let prep_stride = shape.prepared_width();
+         bv.expect(1, heads, "dt bias")?;
+         av.expect(1, heads, "decay rate")?;
+         if pool.dims().get(1..) != Some(&[heads, dk, dv][..]) {
+@@ -1025,12 +1105,13 @@ impl Kernels {
+         {
+             return Err(invalid("delta scan inputs do not match the delta geometry"));
+         }
+-        // Without the step kernel every sequence goes through the scan.
++        // Without the step kernel every unchunked sequence goes through the scan.
+         let (stepped, scanned) = if self.tuning.delta_step {
+             (&spans.single, &spans.multi)
+         } else {
+-            (&spans.single, &spans.all)
++            (&spans.single, &spans.unchunked)
+         };
++        let chunk_stride = Self::delta_chunk_stride(spans.chunk, shape);
+         let stepped_count = if self.tuning.delta_step { stepped.1 } else { 0 };
+         let params = |sequences: usize| -> Result<ScanParams> {
+             Ok(ScanParams {
+@@ -1045,6 +1126,7 @@ impl Kernels {
+                 b_col: to_u32(shape.b_col, "b column")?,
+                 a_col: to_u32(shape.a_col, "a column")?,
+                 prep_stride: to_u32(prep_stride, "prepared stride")?,
++                chunk_stride: to_u32(chunk_stride, "chunk stride")?,
+             })
+         };
+         let table = self.runtime.view(&spans.spans, DType::U32)?;
+@@ -1094,23 +1176,83 @@ impl Kernels {
+                     Ok(())
+                 })?;
+         }
+-        if scanned.1 > 0 {
+-            let params = params(scanned.1)?;
+-            let rows = to_u32(mv.rows, "rows")?;
+-            let prep = self.output(mv.rows, prep_stride)?;
+-            let pipeline = self.pipeline("delta_prepare_f32")?;
+-            let (groups, threads) = self.simdgroup_launch(pipeline, mv.rows * shape.key_heads);
++        if scanned.1 == 0 && spans.chunked.1 == 0 {
++            return self.finish(out, (mv.rows * heads, dv));
++        }
++        let rows = to_u32(mv.rows, "rows")?;
++        let prep = self.output(mv.rows, prep_stride)?;
++        let pipeline = self.pipeline("delta_prepare_f32")?;
++        let (groups, threads) = self.simdgroup_launch(pipeline, mv.rows * shape.key_heads);
++        let prep_params = params(0)?;
++        self.runtime
++            .dispatch(pipeline, "tur_delta_prepare", groups, threads, |e| {
++                mv.bind(e, 0)?;
++                pv.bind(e, 1)?;
++                bv.bind(e, 2)?;
++                av.bind(e, 3)?;
++                prep.bind(e, 4);
++                e.set_bytes(5, &prep_params);
++                e.set_bytes(6, &rows);
++                Ok(())
++            })?;
++        if spans.chunked.1 > 0 {
++            let chunk = spans.chunk;
++            let params = params(spans.chunked.1)?;
++            let scratch = self.output(mv.rows * heads, chunk_stride)?;
++            let pipeline = self.pipeline(&format!("delta_chunk_prepare_c{chunk}"))?;
++            let chunks = self.runtime.view(&spans.chunks.0, DType::U32)?;
++            let groups = spans
++                .chunks
++                .1
++                .checked_mul(heads)
++                .ok_or_else(|| invalid("chunk prepare grid overflow"))?;
++            to_u32(groups, "chunk prepare threadgroups")?;
++            let threads = pipeline.threads((self.tuning.simdgroups * 32).max(chunk));
+             self.runtime
+-                .dispatch(pipeline, "tur_delta_prepare", groups, threads, |e| {
++                .dispatch(pipeline, "tur_delta_chunk_prepare", groups, threads, |e| {
+                     mv.bind(e, 0)?;
+                     pv.bind(e, 1)?;
+                     bv.bind(e, 2)?;
+                     av.bind(e, 3)?;
+-                    prep.bind(e, 4);
+-                    e.set_bytes(5, &params);
+-                    e.set_bytes(6, &rows);
++                    e.set_input_buffer(4, Some(prep.buffer()), 0);
++                    scratch.bind(e, 5);
++                    e.set_bytes(6, &params);
++                    chunks.bind(e, 7)?;
+                     Ok(())
+                 })?;
++            let pipeline = self.pipeline(&format!("delta_chunk_scan_c{chunk}_d{dk}_{storage}"))?;
++            // A threadgroup's simdgroups each own 8 value columns of one head.
++            let simdgroups = pipeline
++                .simdgroups(self.tuning.delta_chunk_simdgroups)
++                .max(1);
++            let groups = spans
++                .chunked
++                .1
++                .checked_mul(heads * dv.div_ceil(8).div_ceil(simdgroups))
++                .ok_or_else(|| invalid("chunk scan grid overflow"))?;
++            to_u32(groups, "chunk scan threadgroups")?;
++            let order = self.runtime.view(&spans.chunked.0, DType::U32)?;
++            self.runtime.dispatch(
++                pipeline,
++                "tur_delta_chunk_scan",
++                groups,
++                simdgroups * 32,
++                |e| {
++                    e.set_input_buffer(0, Some(prep.buffer()), 0);
++                    e.set_input_buffer(1, Some(scratch.buffer()), 0);
++                    sv.bind_mut(e, 2)?;
++                    out.bind(e, 3);
++                    e.set_bytes(4, &params);
++                    table.bind(e, 5)?;
++                    slots.bind(e, 6)?;
++                    order.bind(e, 7)?;
++                    mv.bind(e, 8)?;
++                    Ok(())
++                },
++            )?;
++        }
++        if scanned.1 > 0 {
++            let params = params(scanned.1)?;
+             let pipeline = self.pipeline(&name)?;
+             // dk / DELTA_SCAN_ROWS lanes share a value column.
+             let columns = 32 * DELTA_SCAN_ROWS / dk;
+@@ -1138,6 +1280,26 @@ impl Kernels {
+         self.finish(out, (mv.rows * heads, dv))
+     }
+ 
++    /// Floats per (row, value head) of the chunked prefill's scratch: P, U, W and γ.
++    fn delta_chunk_stride(chunk: usize, shape: &DeltaShape) -> usize {
++        if chunk == 0 {
++            return 0;
++        }
++        (chunk + shape.value_dim + shape.key_dim + 1).next_multiple_of(4)
++    }
++
++    /// Scratch bytes of the chunked recurrent prefill in a pass of `tokens` packed rows:
++    /// 0 when no sequence of the pass can be long enough to be chunked.
++    pub fn delta_chunk_scratch_bytes(&self, tokens: usize, shape: &DeltaShape) -> usize {
++        if self.tuning.delta_chunk == 0 || tokens < self.tuning.delta_chunk_tokens.max(2) {
++            return 0;
++        }
++        tokens
++            .saturating_mul(shape.value_heads)
++            .saturating_mul(Self::delta_chunk_stride(self.tuning.delta_chunk, shape))
++            .saturating_mul(4)
++    }
++
+     /// Validate and upload paged addressing for `slots` pool rows of `page` tokens.
+     /// Every table entry must address a whole page inside the pool, and every token's
+     /// visible keys must be covered by table entries.
+@@ -1223,15 +1385,34 @@ impl Kernels {
+         })
+     }
+ 
+-    /// Scratch bytes of one attention dispatch (split partials and statistics).
++    /// Query heads that one per-query attention simdgroup serves over a `format` pool: the
++    /// tuned count when it divides the query heads per K/V head, else 1.
++    pub fn attention_head_group(&self, heads: usize, kv_heads: usize, format: KvFormat) -> usize {
++        let group = heads.checked_div(kv_heads).unwrap_or(1);
++        let tuned = match format {
++            KvFormat::Q8 { .. } => self.tuning.attention_q8_head_group,
++            KvFormat::F32 | KvFormat::F16 => self.tuning.attention_head_group,
++        };
++        if group.is_multiple_of(tuned) {
++            tuned
++        } else {
++            1
++        }
++    }
++
++    /// Scratch bytes of one attention dispatch over a `format` pool (split partials and
++    /// statistics).
+     pub fn attention_scratch_bytes(
+         &self,
+         tokens: usize,
+         heads: usize,
++        kv_heads: usize,
+         dim: usize,
+         max_visible: usize,
++        format: KvFormat,
+     ) -> usize {
+-        let split = self.attention_split(tokens, heads, max_visible);
++        let hg = self.attention_head_group(heads, kv_heads, format);
++        let split = self.attention_split(tokens, heads / hg, max_visible);
+         if split.splits == 1 {
+             return 0;
+         }
+@@ -1381,7 +1562,12 @@ impl Kernels {
+         {
+             return Err(invalid("attention shapes do not match"));
+         }
+-        let name = Self::kv_kernel("attention", dim, pool.format)?;
++        let hg = self.attention_head_group(heads, kv_heads, pool.format);
++        let name = if hg == 1 {
++            Self::kv_kernel("attention", dim, pool.format)?
++        } else {
++            Self::kv_kernel(&format!("attention_h{hg}"), dim, pool.format)?
++        };
+         let reduce = Self::kv_kernel("attention_reduce", dim, KvFormat::F32)?;
+         let (k_data, k_scales) = self.kv_views(&pool.key, pool.format, kv.slots, kv_heads, dim)?;
+         let (v_data, v_scales) =
+@@ -1413,7 +1599,8 @@ impl Kernels {
+         let table = self.runtime.view(&kv.table, DType::U32)?;
+         let first = self.runtime.view(&kv.first_block, DType::U32)?;
+         let visible = self.runtime.view(&kv.visible, DType::U32)?;
+-        let split = self.attention_split(tokens, heads, kv.max_visible);
++        // Splits fill the GPU with simdgroups, each serving `hg` heads.
++        let split = self.attention_split(tokens, heads / hg, kv.max_visible);
+         let params = AttentionParams {
+             tokens: to_u32(tokens, "tokens")?,
+             heads: to_u32(heads, "heads")?,
+@@ -1439,7 +1626,7 @@ impl Kernels {
+             None
+         };
+         let pipeline = self.pipeline(&name)?;
+-        let (groups, threads) = self.simdgroup_launch(pipeline, items * split.splits);
++        let (groups, threads) = self.simdgroup_launch(pipeline, items / hg * split.splits);
+         self.runtime
+             .dispatch(pipeline, "tur_attention", groups, threads, |e| {
+                 qv.bind(e, 0)?;
+diff --git a/crates/tur-metal/src/kernels/runtime.rs b/crates/tur-metal/src/kernels/runtime.rs
+index 0d5ce18..aaf9869 100644
+--- a/crates/tur-metal/src/kernels/runtime.rs
++++ b/crates/tur-metal/src/kernels/runtime.rs
+@@ -82,6 +82,15 @@ const FUNCTIONS: &[&str] = &[
+     "attention_r8_f32",
+     "attention_r8_f16",
+     "attention_r8_q8",
++    "attention_h2_r2_f32",
++    "attention_h2_r2_f16",
++    "attention_h2_r2_q8",
++    "attention_h2_r4_f32",
++    "attention_h2_r4_f16",
++    "attention_h2_r4_q8",
++    "attention_h2_r8_f32",
++    "attention_h2_r8_f16",
++    "attention_h2_r8_q8",
+     "attention_tiled_r2_f32",
+     "attention_tiled_r2_f16",
+     "attention_tiled_r2_q8",
+@@ -110,6 +119,29 @@ const FUNCTIONS: &[&str] = &[
+     "delta_scan_f32",
+     "delta_scan_f16",
+     "delta_scan_bf16",
++    "delta_scan_unaligned_f32",
++    "delta_scan_unaligned_f16",
++    "delta_scan_unaligned_bf16",
++    "delta_chunk_prepare_c32",
++    "delta_chunk_prepare_c64",
++    "delta_chunk_scan_c32_d64_f32",
++    "delta_chunk_scan_c32_d64_f16",
++    "delta_chunk_scan_c32_d64_bf16",
++    "delta_chunk_scan_c32_d128_f32",
++    "delta_chunk_scan_c32_d128_f16",
++    "delta_chunk_scan_c32_d128_bf16",
++    "delta_chunk_scan_c32_d256_f32",
++    "delta_chunk_scan_c32_d256_f16",
++    "delta_chunk_scan_c32_d256_bf16",
++    "delta_chunk_scan_c64_d64_f32",
++    "delta_chunk_scan_c64_d64_f16",
++    "delta_chunk_scan_c64_d64_bf16",
++    "delta_chunk_scan_c64_d128_f32",
++    "delta_chunk_scan_c64_d128_f16",
++    "delta_chunk_scan_c64_d128_bf16",
++    "delta_chunk_scan_c64_d256_f32",
++    "delta_chunk_scan_c64_d256_f16",
++    "delta_chunk_scan_c64_d256_bf16",
+     "delta_step_d64_r16_f32",
+     "delta_step_d64_r32_f32",
+     "delta_step_d64_r16_f16",
+@@ -225,8 +257,22 @@ pub struct Tuning {
+     /// precedence over the GEMV ranges; at most 16.
+     pub qmm_q8_0_rows: (usize, usize),
+     pub qmm_q4k_rows: (usize, usize),
++    /// Query heads of one K/V head that a per-query attention simdgroup serves (1 or 2)
++    /// over F32 or F16 pools, and over Q8 pools; each loaded key and value row then
++    /// serves that many heads.
++    pub attention_head_group: usize,
++    pub attention_q8_head_group: usize,
+     /// Single-token recurrent sequences use the coalesced step kernel instead of the scan.
+     pub delta_step: bool,
++    /// Chunk length (32 or 64) of the chunk-parallel recurrent prefill, or 0 to scan
++    /// every multi-token sequence token by token.
++    pub delta_chunk: usize,
++    /// Fewest tokens of a sequence that takes the chunked prefill. Sequences that write a
++    /// state after every token (speculative verification) always scan.
++    pub delta_chunk_tokens: usize,
++    /// Simdgroups per chunked-scan threadgroup, each owning 8 value columns of one head;
++    /// more share each staged tile among more columns.
++    pub delta_chunk_simdgroups: usize,
+ }
+ 
+ impl Tuning {
+@@ -255,7 +301,14 @@ impl Tuning {
+             gemv_q4k_rows: (2, 2),
+             qmm_q8_0_rows: (4, 16),
+             qmm_q4k_rows: (2, 16),
++            // M1 decode sweep (P10 kernel artifact): two heads per simdgroup are 1.06–1.25×
++            // faster over Q8 pools and lose or tie over F32 and F16; four lose everywhere.
++            attention_head_group: 1,
++            attention_q8_head_group: 2,
+             delta_step: true,
++            delta_chunk: 0,
++            delta_chunk_tokens: 64,
++            delta_chunk_simdgroups: (limit / SIMD_WIDTH).clamp(1, 4),
+         }
+     }
+ }
+diff --git a/crates/tur-metal/tests/kernels.rs b/crates/tur-metal/tests/kernels.rs
+index 6f2a5a3..838a316 100644
+--- a/crates/tur-metal/tests/kernels.rs
++++ b/crates/tur-metal/tests/kernels.rs
+@@ -579,11 +579,18 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
+     let (device, kernels, _gpu) = setup()?;
+     // Single-token sequences take the step kernel, or the scan when tuning disables it.
+     // Narrow storage rounds each stored state once; a pass accumulates in F32, so outputs
+-    // match a reference started from the rounded committed state.
+-    for (dk, delta_step, dtype) in [64usize, 128, 256].into_iter().flat_map(|dk| {
++    // match a reference started from the rounded committed state. Rows of `mixed` padded
++    // by 3 or 4 columns take the unaligned or the aligned scan.
++    for (dk, delta_step, dtype, pad) in [64usize, 128, 256].into_iter().flat_map(|dk| {
+         [DType::F32, DType::F16, DType::BF16]
+             .into_iter()
+-            .flat_map(move |dtype| [(dk, true, dtype), (dk, false, dtype)])
++            .flat_map(move |dtype| {
++                [
++                    (dk, true, dtype, 3),
++                    (dk, false, dtype, 3),
++                    (dk, false, dtype, 4),
++                ]
++            })
+     }) {
+         let stored = match dtype {
+             DType::F32 => 1e-5,
+@@ -592,6 +599,7 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
+         };
+         let kernels = kernels.clone().with_tuning(Tuning {
+             delta_step,
++            delta_chunk: 0,
+             ..kernels.tuning()
+         })?;
+         let shape = DeltaShape {
+@@ -604,7 +612,7 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
+         };
+         let case = ScanCase {
+             shape,
+-            mixed_cols: shape.channels() + 3,
++            mixed_cols: shape.channels() + pad,
+             proj_cols: 12,
+         };
+         // A long prefill, decodes forked from one slot, a speculative sequence and a
+@@ -673,6 +681,256 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
+     Ok(())
+ }
+ 
++/// Inputs of one recurrent test pass.
++struct ScanInputs {
++    mixed: Vec<f32>,
++    proj: Vec<f32>,
++    dt_bias: Vec<f32>,
++    neg_a: Vec<f32>,
++}
++
++impl ScanInputs {
++    fn new(case: &ScanCase, rows: usize, seed: u64) -> Self {
++        let heads = case.shape.value_heads;
++        Self {
++            mixed: values(rows * case.mixed_cols, seed, 1.0),
++            proj: values(rows * case.proj_cols, seed + 1, 3.0),
++            dt_bias: values(heads, seed + 2, 1.0),
++            neg_a: values(heads, seed + 3, 1.0)
++                .iter()
++                .map(|v| -v.abs() - 0.1)
++                .collect(),
++        }
++    }
++
++    /// Set the decay gate of every head on `rows`: large values forget the state almost
++    /// completely each token, very negative ones keep it almost unchanged.
++    fn set_decay_gate(&mut self, case: &ScanCase, rows: std::ops::Range<usize>, gate: f32) {
++        for row in rows {
++            for h in 0..case.shape.value_heads {
++                self.proj[row * case.proj_cols + case.shape.a_col + h] = gate;
++            }
++        }
++    }
++
++    fn run(
++        &self,
++        kernels: &Kernels,
++        device: &Device,
++        case: &ScanCase,
++        spans: &tur_metal::kernels::RecurrentSpans,
++        pool: &Tensor,
++    ) -> Result<Tensor> {
++        let rows = spans.tokens();
++        let heads = case.shape.value_heads;
++        kernels.delta_scan(
++            &upload(device, &self.mixed, &[rows, case.mixed_cols])?,
++            &upload(device, &self.proj, &[rows, case.proj_cols])?,
++            spans,
++            &case.shape,
++            &upload(device, &self.dt_bias, &[heads])?,
++            &upload(device, &self.neg_a, &[heads])?,
++            pool,
++        )
++    }
++}
++
++fn scan_case(key_heads: usize, value_heads: usize, key_dim: usize, value_dim: usize) -> ScanCase {
++    let shape = DeltaShape {
++        key_heads,
++        value_heads,
++        key_dim,
++        value_dim,
++        b_col: 1,
++        a_col: 1 + value_heads,
++    };
++    ScanCase {
++        shape,
++        mixed_cols: shape.channels() + 5,
++        proj_cols: 2 * value_heads + 3,
++    }
++}
++
++fn stored_tolerance(dtype: DType) -> f64 {
++    match dtype {
++        DType::F32 => 1e-5,
++        DType::F16 => 1e-3,
++        _ => 8e-3,
++    }
++}
++
++#[test]
++fn test_chunked_delta_prefill_matches_recurrence_across_chunk_boundaries() -> Result<()> {
++    let (device, kernels, _gpu) = setup()?;
++    assert!(
++        kernels
++            .clone()
++            .with_tuning(Tuning {
++                delta_chunk: 128,
++                ..kernels.tuning()
++            })
++            .is_err()
++    );
++    for chunk in [32usize, 64] {
++        let kernels = kernels.clone().with_tuning(Tuning {
++            delta_chunk: chunk,
++            delta_chunk_tokens: 2,
++            ..kernels.tuning()
++        })?;
++        // Grouped heads with partial value blocks, one key head shared by three value
++        // heads at the model's head size, and the widest key dim.
++        for (key_heads, value_heads, dk, dv) in [(2, 4, 64, 22), (1, 3, 128, 128), (1, 1, 256, 16)]
++        {
++            let case = scan_case(key_heads, value_heads, dk, dv);
++            // Partial, exact and spilling chunks, a long prefill, a decode and a
++            // speculative window in one pass; two prefills fork from committed slot 0.
++            let ragged: Vec<(usize, u32, Vec<u32>)> = vec![
++                (2, 0, vec![1]),
++                (chunk - 1, 0, vec![2]),
++                (chunk, 3, vec![4]),
++                (chunk + 1, 5, vec![6]),
++                (2 * chunk + 5, 7, vec![8]),
++                (600, 9, vec![10]),
++                (1, 11, vec![12]),
++                (4, 13, vec![14, 15, 16, 17]),
++            ];
++            let rows: usize = ragged.iter().map(|(tokens, _, _)| tokens).sum();
++            let mut inputs = ScanInputs::new(&case, rows, 30 + dk as u64);
++            // Near-total forgetting in the third sequence, near-perfect memory in the fifth.
++            let starts: Vec<usize> = ragged
++                .iter()
++                .scan(0, |row, (tokens, _, _)| {
++                    let start = *row;
++                    *row += tokens;
++                    Some(start)
++                })
++                .collect();
++            inputs.set_decay_gate(&case, starts[2]..starts[2] + chunk, 40.0);
++            inputs.set_decay_gate(&case, starts[4]..starts[4] + 2 * chunk + 5, -40.0);
++            for dtype in [DType::F32, DType::F16, DType::BF16] {
++                let (pool, _) = committed_pool(&device, 18, &[value_heads, dk, dv], &ragged, 0.1)?;
++                let pool = pool.to_dtype(dtype)?;
++                let widen = |slot: usize| -> Result<Vec<f32>> {
++                    read(&pool.get(slot)?.to_dtype(DType::F32)?)
++                };
++                let initial: Vec<Vec<f32>> = (0..18).map(widen).collect::<Result<_>>()?;
++                let addressing = kernels.recurrent_spans(&spans(&ragged))?;
++                assert_eq!(addressing.chunked(), 6);
++                let out = inputs.run(&kernels, &device, &case, &addressing, &pool)?;
++                for ((tokens, slot, writes), start) in ragged.iter().zip(&starts) {
++                    let (expected_out, expected_states) = scan_reference(
++                        &case,
++                        &inputs.mixed,
++                        &inputs.proj,
++                        *start..start + tokens,
++                        &inputs.dt_bias,
++                        &inputs.neg_a,
++                        &initial[*slot as usize],
++                    );
++                    let what = format!("chunk {chunk} dk {dk} {dtype:?} tokens {tokens}");
++                    let actual =
++                        read(&out.narrow(0, start * value_heads, tokens * value_heads)?)?;
++                    let error = relative_error(&actual, &expected_out);
++                    assert!(error < 2e-5, "{what}: output {error}");
++                    let boundaries: Vec<&Vec<f64>> = if writes.len() > 1 {
++                        expected_states.iter().collect()
++                    } else {
++                        expected_states.last().into_iter().collect()
++                    };
++                    for (&written, expected) in writes.iter().zip(boundaries) {
++                        let error = relative_error(&widen(written as usize)?, expected);
++                        assert!(error < stored_tolerance(dtype), "{what}: state {error}");
++                    }
++                    assert_eq!(widen(*slot as usize)?, initial[*slot as usize]);
++                }
++            }
++        }
++    }
++    Ok(())
++}
++
++#[test]
++fn test_chunked_prefill_split_at_a_snapshot_boundary_then_verified_matches_one_pass() -> Result<()>
++{
++    let (device, kernels, _gpu) = setup()?;
++    // Chunk 32 splits the passes at whole chunks and a partial one, 64 only partially.
++    for chunk in [32usize, 64] {
++        let kernels = kernels.clone().with_tuning(Tuning {
++            delta_chunk: chunk,
++            delta_chunk_tokens: 2,
++            ..kernels.tuning()
++        })?;
++        let case = scan_case(2, 4, 128, 128);
++        let heads = case.shape.value_heads;
++        let (first, second, window) = (96usize, 40usize, 4usize);
++        let total = first + second + window;
++        let inputs = ScanInputs::new(&case, total, 61);
++        let part = |rows: std::ops::Range<usize>| ScanInputs {
++            mixed: inputs.mixed[rows.start * case.mixed_cols..rows.end * case.mixed_cols].to_vec(),
++            proj: inputs.proj[rows.start * case.proj_cols..rows.end * case.proj_cols].to_vec(),
++            dt_bias: inputs.dt_bias.clone(),
++            neg_a: inputs.neg_a.clone(),
++        };
++        let committed = [(1, 0, vec![])];
++        let (pool, initial) = committed_pool(&device, 12, &[heads, 128, 128], &committed, 0.1)?;
++        let (expected_out, expected_states) = scan_reference(
++            &case,
++            &inputs.mixed,
++            &inputs.proj,
++            0..total,
++            &inputs.dt_bias,
++            &inputs.neg_a,
++            &initial[0],
++        );
++        let state_size = heads * 128 * 128;
++        let check = |actual: &[f32], tokens: std::ops::Range<usize>, what: &str| {
++            let expected =
++                &expected_out[tokens.start * state_size / 128..tokens.end * state_size / 128];
++            let error = relative_error(actual, expected);
++            assert!(error < 2e-5, "{what}: output {error}");
++        };
++        // The prompt in two passes, the second starting from the first's snapshot, then a
++        // speculative window storing every token's state.
++        let passes: [(std::ops::Range<usize>, u32, Vec<u32>); 3] = [
++            (0..first, 0, vec![1]),
++            (first..first + second, 1, vec![2]),
++            (first + second..total, 2, vec![3, 4, 5, 6]),
++        ];
++        for (rows, read_slot, writes) in &passes {
++            let ragged = [(rows.len(), *read_slot, writes.clone())];
++            let addressing = kernels.recurrent_spans(&spans(&ragged))?;
++            assert_eq!(addressing.chunked(), usize::from(writes.len() == 1));
++            let out = part(rows.clone()).run(&kernels, &device, &case, &addressing, &pool)?;
++            check(&read(&out)?, rows.clone(), "split pass");
++            let boundaries: Vec<usize> = if writes.len() > 1 {
++                rows.clone().collect()
++            } else {
++                vec![rows.end - 1]
++            };
++            for (&slot, t) in writes.iter().zip(boundaries) {
++                let error = relative_error(&read(&pool.get(slot as usize)?)?, &expected_states[t]);
++                assert!(error < 1e-5, "state after token {t}: {error}");
++            }
++        }
++        // Rejecting the window restores the snapshot, which the window never touched; a replay
++        // from the first snapshot reproduces it exactly.
++        let snapshot = read(&pool.get(2)?)?;
++        let replay = [(second, 1, vec![7])];
++        let addressing = kernels.recurrent_spans(&spans(&replay))?;
++        part(first..first + second).run(&kernels, &device, &case, &addressing, &pool)?;
++        assert_eq!(read(&pool.get(7)?)?, snapshot);
++        // The whole sequence in one chunked pass.
++        let whole = [(total, 0, vec![8])];
++        let addressing = kernels.recurrent_spans(&spans(&whole))?;
++        let out = inputs.run(&kernels, &device, &case, &addressing, &pool)?;
++        check(&read(&out)?, 0..total, "one pass");
++        let error = relative_error(&read(&pool.get(8)?)?, &expected_states[total - 1]);
++        assert!(error < 1e-5, "one-pass state: {error}");
++        assert_eq!(read(&pool.get(0)?)?, initial[0]);
++    }
++    Ok(())
++}
++
+ struct AttentionCase {
+     heads: usize,
+     kv_heads: usize,
+@@ -897,9 +1155,44 @@ fn test_attention_paged_gqa_matches_reference_for_every_format_and_split() -> Re
+         };
+         assert_eq!(kernels.attention_split(24, 8, 40).splits, 1);
+         assert!(split.attention_split(24, 8, 40).splits > 1);
+-        check_attention(&kernels, &device, &case)?;
+-        check_attention(&split, &device, &case)?;
++        // One or two query heads per simdgroup for every format, with and without splits.
++        for head_group in [1usize, 2] {
++            for tuned in [&kernels, &split] {
++                let tuned = tuned.clone().with_tuning(Tuning {
++                    attention_head_group: head_group,
++                    attention_q8_head_group: head_group,
++                    ..tuned.tuning()
++                })?;
++                assert_eq!(tuned.attention_head_group(8, 2, KvFormat::Q8), head_group);
++                check_attention(&tuned, &device, &case)?;
++            }
++        }
+     }
++    let grouped = kernels.clone().with_tuning(Tuning {
++        attention_head_group: 2,
++        attention_q8_head_group: 2,
++        ..kernels.tuning()
++    })?;
++    assert!(
++        kernels
++            .clone()
++            .with_tuning(Tuning {
++                attention_q8_head_group: 4,
++                ..kernels.tuning()
++            })
++            .is_err()
++    );
++    // Three query heads per K/V head admit no grouping; six admit pairs.
++    assert_eq!(grouped.attention_head_group(6, 2, KvFormat::F16), 1);
++    assert_eq!(grouped.attention_head_group(12, 2, KvFormat::F16), 2);
++    let case = AttentionCase {
++        heads: 6,
++        kv_heads: 2,
++        dim: 128,
++        page: 16,
++        sequences: vec![(40, 1), (7, 2)],
++    };
++    check_attention(&grouped, &device, &case)?;
+     // Long-context decode: default tuning splits 1000 keys across threadgroups.
+     let case = AttentionCase {
+         heads: 4,
+@@ -909,7 +1202,8 @@ fn test_attention_paged_gqa_matches_reference_for_every_format_and_split() -> Re
+         sequences: vec![(999, 1)],
+     };
+     assert!(kernels.attention_split(1, 4, 1000).splits > 1);
+-    check_attention(&kernels, &device, &case)
++    check_attention(&kernels, &device, &case)?;
++    check_attention(&grouped, &device, &case)
+ }
+ 
+ #[test]
+diff --git a/crates/tur-models/src/models/qwen3_5/model.rs b/crates/tur-models/src/models/qwen3_5/model.rs
+index 4583fdd..8e62ecf 100644
+--- a/crates/tur-models/src/models/qwen3_5/model.rs
++++ b/crates/tur-models/src/models/qwen3_5/model.rs
+@@ -398,7 +398,7 @@ impl Qwen35 {
+             #[cfg(feature = "metal")]
+             if options.execution == Execution::Fused && matches!(options.device, Device::Metal(_)) {
+                 let kernels = tur_metal::kernels::Kernels::new(&options.device)?;
+-                fused::workspace(config, &kernels, options.kv.page_tokens, tokens, contexts)?
++                fused::workspace(config, &kernels, &options.kv, tokens, contexts)?
+             } else {
+                 0
+             }
+diff --git a/crates/tur-models/src/models/qwen3_5/model/fused.rs b/crates/tur-models/src/models/qwen3_5/model/fused.rs
+index f448a47..a95cfea 100644
+--- a/crates/tur-models/src/models/qwen3_5/model/fused.rs
++++ b/crates/tur-models/src/models/qwen3_5/model/fused.rs
+@@ -13,7 +13,7 @@ use crate::hybrid::PackedForward;
+ use candle_core::{DType, Tensor};
+ use tur_core::{
+     Result,
+-    execution::{checked_elements, invalid},
++    execution::{KvLayout, checked_elements, invalid},
+ };
+ use tur_metal::{
+     kernels::{DeltaShape, Heads, Kernels, PagedKv, RecurrentSpan, RecurrentSpans},
+@@ -40,14 +40,7 @@ impl Fused {
+         Ok(Self {
+             inv_freq: kernels.rotary_frequencies(d.rotary_dim, d.theta)?,
+             page,
+-            delta: DeltaShape {
+-                key_heads: d.key_heads,
+-                value_heads: d.value_heads,
+-                key_dim: d.key_dim,
+-                value_dim: d.value_dim,
+-                b_col: d.channels + d.value_width,
+-                a_col: d.channels + d.value_width + d.value_heads,
+-            },
++            delta: delta_shape(&d),
+             kernels,
+         })
+     }
+@@ -347,7 +340,25 @@ impl Qwen35 {
+         n: usize,
+         contexts: &[usize],
+     ) -> Result<usize> {
+-        workspace(&self.config, &fused.kernels, fused.page, n, contexts)
++        workspace(
++            &self.config,
++            &fused.kernels,
++            &self.description.kv,
++            n,
++            contexts,
++        )
++    }
++}
++
++/// Recurrent geometry of the fused kernels: the projection row is `q | k | v | z | b | a`.
++fn delta_shape(d: &Dims) -> DeltaShape {
++    DeltaShape {
++        key_heads: d.key_heads,
++        value_heads: d.value_heads,
++        key_dim: d.key_dim,
++        value_dim: d.value_dim,
++        b_col: d.channels + d.value_width,
++        a_col: d.channels + d.value_width + d.value_heads,
+     }
+ }
+ 
+@@ -355,10 +366,11 @@ impl Qwen35 {
+ pub(super) fn workspace(
+     config: &Config,
+     kernels: &Kernels,
+-    page: usize,
++    kv: &KvLayout,
+     n: usize,
+     contexts: &[usize],
+ ) -> Result<usize> {
++    let (page, kv_format) = (kv.page_tokens, kv.format);
+     let d = Dims::new(config)?;
+     let f = DType::F32;
+     let hidden = config.text.hidden_size;
+@@ -418,7 +430,14 @@ pub(super) fn workspace(
+                 )?;
+                 let q = plan.reserve(elements(q_width)?, f)?;
+                 let key = plan.reserve(elements(kv_width)?, f)?;
+-                let split = kernels.attention_scratch_bytes(n, d.heads, d.head_dim, max_visible);
++                let split = kernels.attention_scratch_bytes(
++                    n,
++                    d.heads,
++                    d.kv_heads,
++                    d.head_dim,
++                    max_visible,
++                    kv_format,
++                );
+                 plan.transient(split, DType::U8)?;
+                 let attended = plan.reserve(elements(q_width)?, f)?;
+                 for region in [q, key, kv, q_gate] {
+@@ -431,18 +450,14 @@ pub(super) fn workspace(
+                 kinds.1 = true;
+                 let proj = plan.reserve(elements(projection_width)?, f)?;
+                 let mixed = plan.reserve(elements(d.channels)?, f)?;
+-                // The scan's prepared rows (normalised q|k, q·k and gates) live beside
+-                // its output.
+-                let prepared = d
+-                    .key_heads
+-                    .checked_mul(d.key_dim)
+-                    .and_then(|key_width| key_width.checked_mul(2))
+-                    .and_then(|width| width.checked_add(d.key_heads))
+-                    .and_then(|width| width.checked_add(d.value_heads.checked_mul(2)?))
+-                    .map(|width| width.next_multiple_of(4))
+-                    .ok_or_else(|| invalid("recurrent scan scratch overflow"))?;
+-                let prepared = plan.reserve(elements(prepared)?, f)?;
++                // The scan's prepared rows (q and k scales, q·k and gates) and the
++                // chunked prefill's scratch live beside its output.
++                let shape = delta_shape(&d);
++                let prepared = plan.reserve(elements(shape.prepared_width())?, f)?;
++                let chunked =
++                    plan.reserve(kernels.delta_chunk_scratch_bytes(n, &shape), DType::U8)?;
+                 let core = plan.reserve(elements(d.value_width)?, f)?;
++                plan.release(chunked);
+                 plan.release(prepared);
+                 let gated = plan.reserve(elements(d.value_width)?, f)?;
+                 for region in [mixed, core, proj] {

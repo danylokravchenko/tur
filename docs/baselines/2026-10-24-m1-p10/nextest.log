@@ -1,0 +1,249 @@
+   Compiling tur-metal v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-metal)
+   Compiling tur-models v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-models)
+   Compiling tur-engine v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-engine)
+   Compiling tur v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur)
+   Compiling tur-cli v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-cli)
+   Compiling tur-server v0.1.0 (/Users/danylokravchenko/Projects/tur/crates/tur-server)
+    Finished `pre-release` profile [optimized] target(s) in 49.28s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+────────────
+ Nextest run ID 4cedd498-b287-4952-8818-8ebb87bc55d9 with nextest profile: default
+    Starting 235 tests across 21 binaries (8 tests skipped)
+        PASS [   0.011s] (  1/235) tur server::worker::tests::test_intake_rejects_overload_and_records_arrival_before_queueing
+        PASS [   0.011s] (  2/235) tur server::worker::tests::test_refilled_intake_returns_to_execution_within_its_limit
+        PASS [   0.011s] (  3/235) tur server::worker::tests::test_startup_failure_is_returned_before_worker_is_ready
+        PASS [   0.011s] (  4/235) tur shared::tests::test_cpu_reference_selection
+        PASS [   0.013s] (  5/235) tur::hybrid_serving test_http_maps_admission_and_deadline_failures_and_streams_error_codes
+        PASS [   0.011s] (  6/235) tur::hybrid_serving test_http_preserves_sampling_thinking_and_tool_history
+        PASS [   0.010s] (  7/235) tur::hybrid_serving test_http_rejects_unsupported_media_and_invalid_controls
+        PASS [   0.022s] (  8/235) tur::hybrid_serving test_real_stream_stops_at_tokenizer_eos_and_reports_usage
+        PASS [   0.019s] (  9/235) tur::hybrid_serving test_real_worker_serves_concurrent_requests_with_queued_admission
+        PASS [   0.017s] ( 10/235) tur::hybrid_serving test_stalled_stream_is_cancelled_with_bounded_buffering
+        PASS [   0.015s] ( 11/235) tur::hybrid_serving test_worker_reclaims_cancelled_request_before_admitting_next
+        PASS [   0.017s] ( 12/235) tur::pipeline_integration test_admission_validates_sampling_context_and_limits_without_leaking_slots
+        PASS [   0.018s] ( 13/235) tur::pipeline_integration test_checkpoint_template_controls_thinking_without_prompt_heuristics
+        PASS [   0.035s] ( 14/235) tur::pipeline_integration test_exhausted_pool_preempts_the_newest_request_and_both_finish
+        PASS [   0.012s] ( 15/235) tur::pipeline_integration test_factory_rejects_legacy_architectures_and_invalid_templates
+        PASS [   0.016s] ( 16/235) tur::pipeline_integration test_generation_config_eos_stops_and_is_not_streamed
+        PASS [   0.018s] ( 17/235) tur::pipeline_integration test_packed_requests_can_join_cancel_and_fail_independently
+        PASS [   0.021s] ( 18/235) tur::pipeline_integration test_requests_beyond_the_state_pool_are_rejected_at_admission
+        PASS [   0.026s] ( 19/235) tur::pipeline_integration test_requests_wait_for_pages_and_complete_in_turn
+        PASS [   0.023s] ( 20/235) tur::pipeline_integration test_streamed_text_matches_full_decode_and_chunked_prefill
+        PASS [   0.034s] ( 21/235) tur::prefix_reuse test_a_next_turn_resumes_after_the_previous_reply
+        PASS [   0.039s] ( 22/235) tur::prefix_reuse test_cache_salts_isolate_namespaces
+        PASS [   0.131s] ( 23/235) tur::prefix_reuse test_snapshots_yield_memory_and_concurrent_reuse_matches_cold_runs
+        PASS [   0.048s] ( 24/235) tur::prefix_reuse test_warmed_prefixes_continue_like_cold_runs_and_skip_their_prefill
+        PASS [   0.247s] ( 25/235) tur::scheduling test_cancellation_while_a_pass_is_in_flight_releases_state_and_spares_survivors
+        PASS [   0.023s] ( 26/235) tur::scheduling test_deadlines_include_intake_and_never_publish_a_late_completion
+        PASS [   0.091s] ( 27/235) tur::scheduling test_decode_gaps_and_prefill_progress_are_bounded
+        PASS [   0.121s] ( 28/235) tur::scheduling test_f16_recompute_under_pressure_preserves_sampled_continuations
+        PASS [   0.063s] ( 29/235) tur::scheduling test_grammar_requests_terminate_with_the_grammar_and_batch_independently
+        PASS [   0.017s] ( 30/235) tur::scheduling test_loaded_models_share_a_budget_and_failed_loads_return_reservations
+        PASS [   0.261s] ( 31/235) tur::scheduling test_preemption_and_cancellation_under_pool_pressure_preserve_survivors
+        PASS [   0.016s] ( 32/235) tur::scheduling test_presence_penalty_steers_greedy_decoding_away_from_sampled_tokens
+        PASS [   0.200s] ( 33/235) tur::scheduling test_queue_limits_and_deadlines_fail_requests_and_release_state
+        PASS [   0.032s] ( 34/235) tur::scheduling test_sample_timestamps_include_tokens_that_text_decoding_buffers
+        PASS [   0.497s] ( 35/235) tur::scheduling test_staggered_and_reshuffled_mixed_requests_match_solo_runs
+        PASS [   0.583s] ( 36/235) tur::scheduling_metal test_batched_runs_repeat_exactly_and_reproducible_mode_ignores_other_traffic
+        PASS [   0.234s] ( 37/235) tur::scheduling_metal test_device_sampling_with_penalties_is_independent_of_batch_order_on_metal
+        PASS [   0.292s] ( 38/235) tur::scheduling_metal test_f16_packed_recompute_and_loaded_model_budget_on_metal
+        PASS [   0.211s] ( 39/235) tur::scheduling_metal test_grammar_requests_are_sampled_on_the_device_and_batch_independently
+        PASS [   0.012s] ( 40/235) tur::server_integration test_chat_empty_messages_returns_400
+        PASS [   0.009s] ( 41/235) tur::server_integration test_chat_max_tokens_field_accepted
+        PASS [   0.009s] ( 42/235) tur::server_integration test_chat_multi_turn_conversation_accepted
+        PASS [   0.009s] ( 43/235) tur::server_integration test_chat_non_streaming_returns_assistant_message
+        PASS [   0.009s] ( 44/235) tur::server_integration test_chat_non_streaming_usage_reflects_token_count
+        PASS [   0.010s] ( 45/235) tur::server_integration test_chat_streaming_body_contains_done_sentinel
+        PASS [   0.009s] ( 46/235) tur::server_integration test_chat_streaming_first_chunk_has_role
+        PASS [   0.009s] ( 47/235) tur::server_integration test_chat_streaming_returns_sse_content_type
+        PASS [   0.009s] ( 48/235) tur::server_integration test_concurrent_non_streaming_requests_all_complete
+        PASS [   0.009s] ( 49/235) tur::server_integration test_concurrent_streaming_requests_all_complete
+        PASS [   0.009s] ( 50/235) tur::server_integration test_large_burst_of_requests_does_not_return_503
+        PASS [   0.008s] ( 51/235) tur::server_integration test_mixed_streaming_and_non_streaming_concurrent
+        PASS [   0.008s] ( 52/235) tur::server_integration test_models_returns_configured_model_id
+        PASS [   0.008s] ( 53/235) tur::server_integration test_tool_call_response_has_correct_structure
+        PASS [   0.022s] ( 54/235) tur::speculation test_batch_drafts_share_a_bound_and_cancel_without_leaks
+        PASS [   0.022s] ( 55/235) tur::speculation test_constraints_and_eos_do_not_publish_extra_draft_outputs
+        PASS [   5.023s] ( 56/235) tur::speculation test_deadline_expiring_during_a_drafted_pass_fails_only_that_request
+        PASS [   0.091s] ( 57/235) tur::speculation test_decodes_draft_beside_a_prefill_and_match_plain_decoding
+        PASS [   0.020s] ( 58/235) tur::speculation test_draft_reservation_does_not_overcommit_an_explicit_state_budget
+        PASS [   0.199s] ( 59/235) tur::speculation test_fused_mtp_drafts_preserve_target_sampling
+        PASS [   0.074s] ( 60/235) tur::speculation test_lookup_verification_matches_target_sampling_and_request_limits
+        PASS [   0.103s] ( 61/235) tur::speculation test_mtp_drafts_preserve_target_sampling_and_release_state
+        PASS [   0.017s] ( 62/235) tur::speculation test_mtp_needs_a_head_and_no_prefix_reuse
+        PASS [   0.018s] ( 63/235) tur::speculation test_narrow_recurrent_state_automatically_disables_speculation
+        PASS [   0.035s] ( 64/235) tur::speculation test_preempted_drafting_requests_rebuild_their_lookup_and_match_plain_decoding
+        PASS [   0.041s] ( 65/235) tur::speculation test_preempted_mtp_requests_recompute_the_head_and_match_plain_decoding
+        PASS [   0.023s] ( 66/235) tur::speculation test_prefix_snapshots_remain_at_the_accepted_boundary
+        PASS [   0.275s] ( 67/235) tur::speculation test_speculative_device_sampling_preserves_seeded_penalties_and_outputs
+        PASS [   0.014s] ( 68/235) tur-core execution::tests::test_checked_state_dimensions
+        PASS [   0.011s] ( 69/235) tur-core execution::tests::test_execution_payload_requirements_and_aggregate_overflow
+        PASS [   0.009s] ( 70/235) tur-core execution::tests::test_kv_format_names_round_trip
+        PASS [   0.009s] ( 71/235) tur-core execution::tests::test_kv_formats_count_codes_and_scales_per_attention_layer
+        PASS [   0.008s] ( 72/235) tur-core execution::tests::test_kv_layout_groups_pages_versions_and_modalities_are_validated
+        PASS [   0.008s] ( 73/235) tur-core execution::tests::test_recurrent_dtype_sizes_the_matrix_and_keeps_the_history_f32
+        PASS [   0.008s] ( 74/235) tur-core execution::tests::test_speculative_recurrent_boundaries_are_charged_per_token
+        PASS [   0.008s] ( 75/235) tur-engine backend::memory::tests::test_budget_boundaries_fit_without_overallocating_the_zero_slot
+        PASS [   0.008s] ( 76/235) tur-engine backend::memory::tests::test_concurrent_leases_never_exceed_the_limit
+        PASS [   0.008s] ( 77/235) tur-engine backend::memory::tests::test_default_budget_sizes_contexts_and_fits_the_device_limit
+        PASS [   0.008s] ( 78/235) tur-engine backend::memory::tests::test_explicit_budget_beyond_the_device_limit_is_rejected
+        PASS [   0.008s] ( 79/235) tur-engine backend::memory::tests::test_models_sharing_a_device_budget_cannot_overcommit
+        PASS [   0.008s] ( 80/235) tur-engine backend::pipeline::tests::test_sampling_uses_checkpoint_defaults_and_explicit_greedy
+        PASS [   0.008s] ( 81/235) tur-engine backend::prefix::tests::test_a_whole_prompt_hit_needs_the_snapshot_logits
+        PASS [   0.008s] ( 82/235) tur-engine backend::prefix::tests::test_disabled_cache_never_aligns_or_stores
+        PASS [   0.008s] ( 83/235) tur-engine backend::prefix::tests::test_eviction_prefers_unused_entries_and_releases_leases
+        PASS [   0.008s] ( 84/235) tur-engine backend::prefix::tests::test_hash_matches_are_verified_against_tokens
+        PASS [   0.008s] ( 85/235) tur-engine backend::prefix::tests::test_lookup_returns_the_deepest_verified_admissible_prefix
+        PASS [   0.008s] ( 86/235) tur-engine backend::scheduler::tests::test_aged_prefill_reclaims_younger_state_and_running_slots
+        PASS [   0.008s] ( 87/235) tur-engine backend::scheduler::tests::test_config_validation_rejects_passes_without_decode_room
+        PASS [   0.008s] ( 88/235) tur-engine backend::scheduler::tests::test_cost_samples_are_normalized_for_ragged_token_counts
+        PASS [   0.008s] ( 89/235) tur-engine backend::scheduler::tests::test_decodes_run_first_and_prefill_keeps_its_minimum
+        PASS [   0.008s] ( 90/235) tur-engine backend::scheduler::tests::test_measured_costs_shrink_prefill_by_bounded_steps
+        PASS [   0.008s] ( 91/235) tur-engine backend::scheduler::tests::test_memory_shortage_preempts_the_newest_running_request
+        PASS [   0.008s] ( 92/235) tur-engine backend::scheduler::tests::test_replay_chunks_remain_indivisible_under_cost_and_token_pressure
+        PASS [   0.008s] ( 93/235) tur-engine backend::scheduler::tests::test_skipped_decodes_rotate_to_the_front
+        PASS [   0.008s] ( 94/235) tur-engine backend::scheduler::tests::test_waiting_queue_limits_requests_and_tokens
+        PASS [   0.008s] ( 95/235) tur-engine backend::speculation::tests::test_acceptance_rises_with_accepted_drafts_and_recovers_towards_the_prior
+        PASS [   0.008s] ( 96/235) tur-engine backend::speculation::tests::test_config_validation
+        PASS [   0.009s] ( 97/235) tur-engine backend::speculation::tests::test_cost_fit_separates_base_and_draft_costs
+        PASS [   0.008s] ( 98/235) tur-engine backend::speculation::tests::test_head_drafts_only_when_their_cost_repays_them
+        PASS [   0.008s] ( 99/235) tur-engine backend::speculation::tests::test_identified_costs_survive_passes_without_drafts
+        PASS [   0.009s] (100/235) tur-engine backend::speculation::tests::test_incremental_index_matches_rebuilt_index
+        PASS [   0.010s] (101/235) tur-engine backend::speculation::tests::test_long_history_lookup_has_a_bounded_index
+        PASS [   0.008s] (102/235) tur-engine backend::speculation::tests::test_longest_latest_suffix_match_proposes_its_continuation
+        PASS [   0.008s] (103/235) tur-engine backend::speculation::tests::test_plan_drafts_while_expected_throughput_rises
+        PASS [   0.008s] (104/235) tur-engine backend::speculation::tests::test_unmeasured_costs_alternate_between_drafting_and_not
+        PASS [   0.008s] (105/235) tur-engine hybrid::tests::test_greedy_fast_path_keeps_the_first_maximum_and_rejects_nonfinite_rows
+        PASS [   0.008s] (106/235) tur-engine hybrid::tests::test_invalid_sampling_options_do_not_allocate_requests
+        PASS [   0.008s] (107/235) tur-engine hybrid::tests::test_penalty_history_counts_samples_and_rolls_back
+        PASS [   0.008s] (108/235) tur-engine hybrid::tests::test_revision_overflow_rejects_submission_and_restore_without_changes
+        PASS [   0.008s] (109/235) tur-engine hybrid::tests::test_rng_counter_overflow_leaves_bookkeeping_unchanged
+        PASS [   0.008s] (110/235) tur-engine hybrid::tests::test_rollback_restores_history_and_draws
+        PASS [   0.009s] (111/235) tur-engine::hybrid_contracts test_cancellation_holds_shared_model_until_completion
+        PASS [   0.009s] (112/235) tur-engine::hybrid_contracts test_cancellation_retains_inflight_state_and_does_not_publish_outputs
+        PASS [   0.009s] (113/235) tur-engine::hybrid_contracts test_checkpoint_fork_restore_crosses_partial_attention_pages_and_all_recurrent_layers
+        PASS [   0.008s] (114/235) tur-engine::hybrid_contracts test_checkpoint_tensor_inspection_cannot_mutate_shared_state
+        PASS [   0.028s] (115/235) tur-engine::hybrid_contracts test_deterministic_drafts_preserve_target_sampling_rng_penalties_and_every_layer
+        PASS [   0.013s] (116/235) tur-engine::hybrid_contracts test_grammar_parser_fork_speculation_restore_and_terminal_state_are_atomic
+        PASS [   0.009s] (117/235) tur-engine::hybrid_contracts test_incompatible_restore_and_foreign_handles_leave_state_unchanged
+        PASS [   0.008s] (118/235) tur-engine::hybrid_contracts test_independent_requests_match_single_execution_after_batch_reordering
+        PASS [   0.008s] (119/235) tur-engine::hybrid_contracts test_invalid_descriptors_are_rejected_before_model_execution
+        PASS [   0.008s] (120/235) tur-engine::hybrid_contracts test_invalid_output_is_isolated_and_its_state_writes_are_never_published
+        PASS [   0.014s] (121/235) tur-engine::hybrid_contracts test_no_output_positions_advance_only_model_state
+        PASS [   0.009s] (122/235) tur-engine::hybrid_contracts test_one_request_failure_does_not_affect_others
+        PASS [   0.008s] (123/235) tur-engine::hybrid_contracts test_ordinary_execution_retains_only_final_recurrent_boundary
+        PASS [   0.008s] (124/235) tur-engine::hybrid_contracts test_packed_prefill_matches_incremental_decode
+        PASS [   0.008s] (125/235) tur-engine::hybrid_contracts test_pool_exhaustion_fails_the_pass_before_execution_and_leaves_state_unchanged
+        PASS [   0.008s] (126/235) tur-engine::hybrid_contracts test_position_overflow_and_limit_are_checked
+        PASS [   0.008s] (127/235) tur-engine::hybrid_contracts test_published_descriptors_are_invalidated
+        PASS [   0.009s] (128/235) tur-engine::hybrid_contracts test_released_pages_and_slots_are_reclaimed_after_completion
+        PASS [   0.008s] (129/235) tur-engine::hybrid_contracts test_speculative_acceptance_follows_sampled_tokens
+        PASS [   0.009s] (130/235) tur-engine::hybrid_contracts test_speculative_rejection_keeps_only_the_verified_token
+        PASS [   0.011s] (131/235) tur-engine::hybrid_contracts test_terminal_grammar_does_not_fail_other_requests
+        PASS [   0.009s] (132/235) tur-engine::hybrid_contracts test_whole_batch_model_error_leaves_every_request_unchanged
+        PASS [   0.026s] (133/235) tur-engine::qwen3_5 test_batch_members_entering_and_leaving_do_not_leak_state
+        PASS [   0.018s] (134/235) tur-engine::qwen3_5 test_q8_projection_storage_tracks_f32
+        PASS [   0.019s] (135/235) tur-engine::qwen3_5 test_speculative_verification_reproduces_greedy_decode
+        PASS [   0.013s] (136/235) tur-engine::qwen3_5 test_vision_placeholders_fail_only_their_request
+        PASS [   0.079s] (137/235) tur-engine::qwen3_5 test_whole_chunked_and_incremental_prefill_agree
+        PASS [   0.077s] (138/235) tur-engine::qwen3_5_fused test_cached_last_logits_sample_like_the_pass_that_produced_them
+        PASS [   0.089s] (139/235) tur-engine::qwen3_5_fused test_decode_reads_pages_in_place_without_rebuilding_the_cache
+        PASS [   0.078s] (140/235) tur-engine::qwen3_5_fused test_execution_selection_and_declared_workspace
+        PASS [   0.153s] (141/235) tur-engine::qwen3_5_fused test_f16_recurrent_state_halves_slot_memory_and_tracks_f32_state
+        PASS [   0.128s] (142/235) tur-engine::qwen3_5_fused test_f16_replay_with_original_boundaries_preserves_next_logits
+        PASS [   0.136s] (143/235) tur-engine::qwen3_5_fused test_full_and_partial_prefix_forks_and_restores_continue_exactly
+        PASS [   0.085s] (144/235) tur-engine::qwen3_5_fused test_fused_batch_matches_each_sequence_alone
+        PASS [   0.273s] (145/235) tur-engine::qwen3_5_fused test_fused_chunked_and_incremental_prefill_match_reference_whole_prefill
+        PASS [   0.104s] (146/235) tur-engine::qwen3_5_fused test_fused_decode_reaches_a_stable_allocation_bound
+        PASS [   0.118s] (147/235) tur-engine::qwen3_5_fused test_fused_every_token_boundaries_match_reference
+        PASS [   0.131s] (148/235) tur-engine::qwen3_5_fused test_fused_layers_and_logits_match_reference_across_page_and_chunk_boundaries
+        PASS [   0.370s] (149/235) tur-engine::qwen3_5_fused test_fused_packed_formats_track_reference
+        PASS [   0.070s] (150/235) tur-engine::qwen3_5_fused test_grammar_masks_are_applied_on_the_device
+        PASS [   0.609s] (151/235) tur-engine::qwen3_5_fused test_kv_formats_and_page_sizes_on_the_fused_path
+        PASS [   0.098s] (152/235) tur-engine::qwen3_5_fused test_memory_pressure_fails_new_work_without_corrupting_live_requests
+        PASS [   0.112s] (153/235) tur-engine::qwen3_5_fused test_preload_weight_plans_match_every_format_and_tied_embedding_layout
+        PASS [   0.011s] (154/235) tur-engine::qwen3_5_moe test_moe_config_and_weight_mapping_match_the_pinned_checkpoint
+        PASS [   0.255s] (155/235) tur-engine::qwen3_5_moe test_moe_fused_packed_prefill_decode_and_rollback_match_reference
+        PASS [   0.036s] (156/235) tur-engine::qwen3_5_moe test_moe_reference_matches_independent_transformers_layers_and_logits
+        PASS [   0.180s] (157/235) tur-engine::qwen3_5_moe test_verification_windows_bound_drift_from_sequential_decoding
+        PASS [   0.010s] (158/235) tur-metal completion::tests::test_completion_retains_resources_until_fence
+        PASS [   0.008s] (159/235) tur-metal completion::tests::test_dropped_completion_releases_after_wait
+        PASS [   0.008s] (160/235) tur-metal completion::tests::test_failed_drop_quarantines_resources_until_fence_retry
+        PASS [   0.008s] (161/235) tur-metal completion::tests::test_failed_wait_keeps_resources_until_successful_retry
+        PASS [   0.008s] (162/235) tur-metal completion::tests::test_mutation_after_fence_requires_another_wait
+        PASS [   0.008s] (163/235) tur-metal completion::tests::test_notified_completion_reports_its_time_and_failures
+        PASS [   0.008s] (164/235) tur-metal completion::tests::test_quarantine_is_isolated_per_owner
+        PASS [   0.008s] (165/235) tur-metal kernels::tests::test_query_tiles_preserve_sequence_boundaries_and_tails
+        PASS [   0.008s] (166/235) tur-metal kernels::tests::test_query_tiles_reject_gaps_at_tile_boundaries_and_overflow
+        PASS [   0.008s] (167/235) tur-metal packed::tests::test_stacked_parts_and_row_ranges_match_the_whole_matrix
+        PASS [   0.008s] (168/235) tur-metal pool::tests::test_budget_includes_zero_slot_at_page_and_recurrent_boundaries
+        PASS [   0.008s] (169/235) tur-metal pool::tests::test_budget_splits_slots_then_pages_and_rejects_starved_pools
+        PASS [   0.008s] (170/235) tur-metal pool::tests::test_leases_retire_on_drop_and_reclaim_bumps_generations
+        PASS [   0.009s] (171/235) tur-metal pool::tests::test_q8_roundtrip_is_within_half_a_step_and_f16_is_exact_to_half
+        PASS [   0.010s] (172/235) tur-metal pool::tests::test_scatter_and_gather_follow_the_page_table_for_every_format
+        PASS [   0.048s] (173/235) tur-metal sampling::tests::test_categorical_draws_match_truncated_distributions
+        PASS [   0.008s] (174/235) tur-metal sampling::tests::test_explicit_fallback_samples_the_same_truncated_set
+        PASS [   0.008s] (175/235) tur-metal sampling::tests::test_penalties_follow_repetition_presence_and_frequency_rules
+        PASS [   0.008s] (176/235) tur-metal sampling::tests::test_ties_masks_and_invalid_rows
+        PASS [   0.008s] (177/235) tur-metal sampling::tests::test_uniform_is_reproducible_and_covers_the_unit_interval
+        PASS [   0.008s] (178/235) tur-metal sampling::tests::test_vectorizable_exponential_matches_the_standard_one
+        PASS [   0.008s] (179/235) tur-metal scratch::tests::test_empty_regions_reserve_nothing_and_overflow_is_rejected
+        PASS [   0.008s] (180/235) tur-metal scratch::tests::test_peak_tracks_overlapping_regions_with_pool_rounding
+        PASS [   0.008s] (181/235) tur-metal state::tests::test_appends_fill_the_tail_page_in_place_when_exclusive
+        PASS [   0.008s] (182/235) tur-metal state::tests::test_exhaustion_is_an_explicit_error_and_reclaim_restores_capacity
+        PASS [   0.008s] (183/235) tur-metal state::tests::test_partial_accept_selects_the_exact_boundary_and_releases_the_rest
+        PASS [   0.008s] (184/235) tur-metal state::tests::test_released_bindings_become_stale_after_reclaim
+        PASS [   0.008s] (185/235) tur-metal state::tests::test_reservations_validate_lengths_and_count_new_bytes
+        PASS [   0.008s] (186/235) tur-metal state::tests::test_shared_tail_is_copied_before_append_and_snapshots_stay_exact
+        PASS [   0.035s] (187/235) tur-metal::kernels test_add_rms_norm_returns_sum_and_normalized_sum
+        PASS [   0.041s] (188/235) tur-metal::kernels test_argmax_keeps_the_first_maximum_and_flags_nonfinite_rows
+        PASS [   0.181s] (189/235) tur-metal::kernels test_attention_paged_gqa_matches_reference_for_every_format_and_split
+        PASS [   0.033s] (190/235) tur-metal::kernels test_capabilities_and_pipelines_compile
+        PASS [   0.035s] (191/235) tur-metal::kernels test_completion_retains_kernel_outputs_until_the_fence
+        PASS [   0.036s] (192/235) tur-metal::kernels test_delta_conv_runs_ragged_sequences_in_one_dispatch
+        PASS [   0.341s] (193/235) tur-metal::kernels test_delta_scan_matches_scalar_recurrence_over_ragged_sequences
+        PASS [   8.402s] (194/235) tur-metal::kernels test_device_and_host_sampling_match_truncated_vocabulary_distributions
+        PASS [   0.109s] (195/235) tur-metal::kernels test_device_draws_match_exact_truncated_distributions
+        PASS [   0.045s] (196/235) tur-metal::kernels test_device_penalties_match_the_reference_and_invalid_rows_are_flagged
+        PASS [   0.060s] (197/235) tur-metal::kernels test_gemv_matches_dequantized_reference_for_every_batch_size
+        PASS [   0.062s] (198/235) tur-metal::kernels test_grammar_masks_restrict_argmax_and_sampling_to_allowed_tokens
+        PASS [   0.394s] (199/235) tur-metal::kernels test_grouped_expert_gemm_preserves_routing_skew_ties_and_packed_weights
+        PASS [   0.037s] (200/235) tur-metal::kernels test_invalid_inputs_are_rejected_before_encoding
+        PASS [   0.039s] (201/235) tur-metal::kernels test_kv_write_quantizes_into_paged_slots_like_the_host_reference
+        PASS [   0.039s] (202/235) tur-metal::kernels test_penalties_on_allocated_copies_repeat_exactly_in_any_entry_order
+        PASS [   0.035s] (203/235) tur-metal::kernels test_qk_norm_rope_reads_interleaved_heads_and_rotates_partially
+        PASS [   0.167s] (204/235) tur-metal::kernels test_quantized_kv_attention_stays_close_to_f32_attention
+        PASS [   0.043s] (205/235) tur-metal::kernels test_repeated_passes_reach_a_stable_allocation_bound
+        PASS [   0.035s] (206/235) tur-metal::kernels test_rms_norm_matches_reference_on_strided_rows
+        PASS [   0.524s] (207/235) tur-metal::kernels test_sampling_repeats_exactly_for_identical_inputs
+        PASS [   0.063s] (208/235) tur-metal::kernels test_swiglu_and_gated_rms_match_reference
+        PASS [   0.036s] (209/235) tur-metal::kernels test_tiled_attention_dispatch_preserves_decode_parallelism
+        PASS [   0.340s] (210/235) tur-metal::kernels test_tiled_attention_matches_reference_for_every_format_and_tile_shape
+        PASS [   0.010s] (211/235) tur-models backend::chat_template::tests::test_invalid_template_is_rejected
+        PASS [   0.009s] (212/235) tur-models backend::chat_template::tests::test_unset_thinking_differs_from_explicit_false
+        PASS [   0.008s] (213/235) tur-models backend::factory::tests::test_checkpoint_paths_cannot_escape_snapshot
+        PASS [   0.008s] (214/235) tur-models backend::factory::tests::test_mutable_remote_revision_rejected_without_network
+        PASS [   0.008s] (215/235) tur-models backend::tools::tests::test_parse_malformed_json_skipped
+        PASS [   0.008s] (216/235) tur-models backend::tools::tests::test_parse_multiple_tool_calls
+        PASS [   0.008s] (217/235) tur-models backend::tools::tests::test_parse_no_tool_calls
+        PASS [   0.008s] (218/235) tur-models backend::tools::tests::test_parse_single_tool_call
+        PASS [   0.008s] (219/235) tur-models backend::tools::tests::test_xml_calls_preserve_schema_types_and_reject_incomplete_calls
+        PASS [   0.010s] (220/235) tur-models models::qwen3_5::config::tests::test_flagship_weight_shapes_match_pinned_checkpoint_headers
+        PASS [   0.009s] (221/235) tur-models models::qwen3_5::config::tests::test_generation_defaults_merge_eos_and_sampling
+        PASS [   0.009s] (222/235) tur-models models::qwen3_5::config::tests::test_mtp_head_adds_its_tensors_and_one_attention_state_layer
+        PASS [   0.009s] (223/235) tur-models models::qwen3_5::config::tests::test_pinned_configs_parse_with_hybrid_layout
+        PASS [   0.009s] (224/235) tur-models models::qwen3_5::config::tests::test_tokenizer_modality_placeholders_are_forbidden
+        PASS [   0.009s] (225/235) tur-models models::qwen3_5::config::tests::test_unsupported_layouts_are_rejected
+        PASS [   0.009s] (226/235) tur-models models::qwen3_5::math::tests::test_attention_prefill_matches_incremental_queries
+        PASS [   0.014s] (227/235) tur-models models::qwen3_5::math::tests::test_chunked_delta_matches_recurrence_across_partial_chunks
+        PASS [   0.008s] (228/235) tur-models models::qwen3_5::math::tests::test_convolution_matches_stepwise_window_and_histories
+        PASS [   0.009s] (229/235) tur-models models::qwen3_5::math::tests::test_delta_split_sequence_equals_whole_sequence
+        PASS [   0.008s] (230/235) tur-models models::qwen3_5::math::tests::test_norms_follow_reference_formulas
+        PASS [   0.008s] (231/235) tur-models models::qwen3_5::math::tests::test_rotary_rotates_leading_halves_and_passes_tail
+        PASS [   0.008s] (232/235) tur-models models::qwen3_5::model::moe::tests::test_top_k_preserves_precision_ties_and_normalized_probabilities
+        PASS [   0.009s] (233/235) tur-models models::qwen3_5::weights::tests::test_streaming_headers_validate_layout_and_payload_length_before_reading_weights
+        PASS [   0.010s] (234/235) tur-models::qwen3_5 test_template_rejects_invalid_reasoning_effort
+        PASS [   0.013s] (235/235) tur-models::qwen3_5 test_templates_render_exactly_like_transformers
+────────────
+     Summary [  25.062s] 235 tests run: 235 passed, 8 skipped

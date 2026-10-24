@@ -13,7 +13,7 @@ use crate::hybrid::PackedForward;
 use candle_core::{DType, Tensor};
 use tur_core::{
     Result,
-    execution::{checked_elements, invalid},
+    execution::{KvLayout, checked_elements, invalid},
 };
 use tur_metal::{
     kernels::{DeltaShape, Heads, Kernels, PagedKv, RecurrentSpan, RecurrentSpans},
@@ -40,14 +40,7 @@ impl Fused {
         Ok(Self {
             inv_freq: kernels.rotary_frequencies(d.rotary_dim, d.theta)?,
             page,
-            delta: DeltaShape {
-                key_heads: d.key_heads,
-                value_heads: d.value_heads,
-                key_dim: d.key_dim,
-                value_dim: d.value_dim,
-                b_col: d.channels + d.value_width,
-                a_col: d.channels + d.value_width + d.value_heads,
-            },
+            delta: delta_shape(&d),
             kernels,
         })
     }
@@ -347,7 +340,25 @@ impl Qwen35 {
         n: usize,
         contexts: &[usize],
     ) -> Result<usize> {
-        workspace(&self.config, &fused.kernels, fused.page, n, contexts)
+        workspace(
+            &self.config,
+            &fused.kernels,
+            &self.description.kv,
+            n,
+            contexts,
+        )
+    }
+}
+
+/// Recurrent geometry of the fused kernels: the projection row is `q | k | v | z | b | a`.
+fn delta_shape(d: &Dims) -> DeltaShape {
+    DeltaShape {
+        key_heads: d.key_heads,
+        value_heads: d.value_heads,
+        key_dim: d.key_dim,
+        value_dim: d.value_dim,
+        b_col: d.channels + d.value_width,
+        a_col: d.channels + d.value_width + d.value_heads,
     }
 }
 
@@ -355,10 +366,11 @@ impl Qwen35 {
 pub(super) fn workspace(
     config: &Config,
     kernels: &Kernels,
-    page: usize,
+    kv: &KvLayout,
     n: usize,
     contexts: &[usize],
 ) -> Result<usize> {
+    let (page, kv_format) = (kv.page_tokens, kv.format);
     let d = Dims::new(config)?;
     let f = DType::F32;
     let hidden = config.text.hidden_size;
@@ -418,7 +430,14 @@ pub(super) fn workspace(
                 )?;
                 let q = plan.reserve(elements(q_width)?, f)?;
                 let key = plan.reserve(elements(kv_width)?, f)?;
-                let split = kernels.attention_scratch_bytes(n, d.heads, d.head_dim, max_visible);
+                let split = kernels.attention_scratch_bytes(
+                    n,
+                    d.heads,
+                    d.kv_heads,
+                    d.head_dim,
+                    max_visible,
+                    kv_format,
+                );
                 plan.transient(split, DType::U8)?;
                 let attended = plan.reserve(elements(q_width)?, f)?;
                 for region in [q, key, kv, q_gate] {
@@ -431,17 +450,9 @@ pub(super) fn workspace(
                 kinds.1 = true;
                 let proj = plan.reserve(elements(projection_width)?, f)?;
                 let mixed = plan.reserve(elements(d.channels)?, f)?;
-                // The scan's prepared rows (normalised q|k, q·k and gates) live beside
+                // The scan's prepared rows (q and k scales, q·k and gates) live beside
                 // its output.
-                let prepared = d
-                    .key_heads
-                    .checked_mul(d.key_dim)
-                    .and_then(|key_width| key_width.checked_mul(2))
-                    .and_then(|width| width.checked_add(d.key_heads))
-                    .and_then(|width| width.checked_add(d.value_heads.checked_mul(2)?))
-                    .map(|width| width.next_multiple_of(4))
-                    .ok_or_else(|| invalid("recurrent scan scratch overflow"))?;
-                let prepared = plan.reserve(elements(prepared)?, f)?;
+                let prepared = plan.reserve(elements(delta_shape(&d).prepared_width())?, f)?;
                 let core = plan.reserve(elements(d.value_width)?, f)?;
                 plan.release(prepared);
                 let gated = plan.reserve(elements(d.value_width)?, f)?;

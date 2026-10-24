@@ -1,0 +1,238 @@
+{
+  "schema_version": 2,
+  "checkpoint": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
+  "workload": "synthetic token ids; one prefill pass per prompt length; decode steps re-run one token over committed context without publishing",
+  "short_context": 128,
+  "warmup": 2,
+  "decode_steps": 12,
+  "activations": "F32",
+  "timing": "host wall time from a synchronized device through reservation, encoding and Device::synchronize",
+  "runs": [
+    {
+      "kv_format": "f16",
+      "page_tokens": 16,
+      "kv_token_bytes": 12288,
+      "recurrent_slot_bytes": 20201472,
+      "projection_bytes": 798887936,
+      "weight_bytes": 1309441280,
+      "prefill": [
+        {
+          "prompt_tokens": 2048,
+          "median_seconds": 1.5812515,
+          "tokens_per_second": 1295.1766369865893,
+          "samples_seconds": [
+            1.558052625,
+            1.5812515
+          ]
+        },
+        {
+          "prompt_tokens": 8192,
+          "median_seconds": 8.334407458,
+          "tokens_per_second": 982.9133074285556,
+          "samples_seconds": [
+            8.286297541,
+            8.334407458
+          ]
+        }
+      ],
+      "decode": [
+        {
+          "sequences": 1,
+          "context": 128,
+          "median_step_seconds": 0.017316959,
+          "tokens_per_second": 57.74685959584475,
+          "samples_seconds": [
+            0.017316959,
+            0.019898667,
+            0.017121292,
+            0.017097375,
+            0.017272958,
+            0.017259208,
+            0.017196375,
+            0.01713475,
+            0.017564166,
+            0.01736325,
+            0.017374959,
+            0.017439583
+          ],
+          "state_leased_bytes": 21774336
+        },
+        {
+          "sequences": 2,
+          "context": 128,
+          "median_step_seconds": 0.018235167,
+          "tokens_per_second": 109.67818391792079,
+          "samples_seconds": [
+            0.018366667,
+            0.018517792,
+            0.018298042,
+            0.018210416,
+            0.01817725,
+            0.018203875,
+            0.018235167,
+            0.018341,
+            0.018154375,
+            0.018155042,
+            0.018311,
+            0.018149083
+          ],
+          "state_leased_bytes": 43548672
+        },
+        {
+          "sequences": 4,
+          "context": 128,
+          "median_step_seconds": 0.023267,
+          "tokens_per_second": 171.91730777496025,
+          "samples_seconds": [
+            0.0235165,
+            0.025002833,
+            0.022695917,
+            0.023948958,
+            0.023508875,
+            0.023267,
+            0.02353325,
+            0.022921292,
+            0.0225475,
+            0.021737709,
+            0.021477875,
+            0.021306125
+          ],
+          "state_leased_bytes": 87097344
+        },
+        {
+          "sequences": 8,
+          "context": 128,
+          "median_step_seconds": 0.025454667,
+          "tokens_per_second": 314.28421357859446,
+          "samples_seconds": [
+            0.025323166,
+            0.02550475,
+            0.025454667,
+            0.025539958,
+            0.02544975,
+            0.025821792,
+            0.025434667,
+            0.025506625,
+            0.025345333,
+            0.025372625,
+            0.025639333,
+            0.0253815
+          ],
+          "state_leased_bytes": 174194688
+        },
+        {
+          "sequences": 16,
+          "context": 128,
+          "median_step_seconds": 0.043656333,
+          "tokens_per_second": 366.49894529620707,
+          "samples_seconds": [
+            0.043926292,
+            0.043472709,
+            0.043627917,
+            0.04384775,
+            0.043615,
+            0.043605917,
+            0.043712625,
+            0.0436945,
+            0.043644542,
+            0.04363425,
+            0.043718209,
+            0.043656333
+          ],
+          "state_leased_bytes": 348389376
+        },
+        {
+          "sequences": 1,
+          "context": 2048,
+          "median_step_seconds": 0.017359417,
+          "tokens_per_second": 57.605621202601455,
+          "samples_seconds": [
+            0.017718875,
+            0.017433167,
+            0.017222959,
+            0.017333625,
+            0.017228333,
+            0.017269459,
+            0.017346042,
+            0.017359417,
+            0.0174545,
+            0.01751225,
+            0.017293667,
+            0.017484
+          ],
+          "state_leased_bytes": 45367296
+        },
+        {
+          "sequences": 4,
+          "context": 2048,
+          "median_step_seconds": 0.025612458,
+          "tokens_per_second": 156.1739993873294,
+          "samples_seconds": [
+            0.025612458,
+            0.02541775,
+            0.026269583,
+            0.027157292,
+            0.02568625,
+            0.025609291,
+            0.025391125,
+            0.025588417,
+            0.0253485,
+            0.02568625,
+            0.025272792,
+            0.026059667
+          ],
+          "state_leased_bytes": 181469184
+        }
+      ],
+      "format": "q8_0",
+      "recurrent_state": "f32",
+      "execution": "Fused",
+      "load_seconds": 1.523211083
+    },
+    {
+      "format": "q8_0",
+      "execution": "Fused",
+      "kv_format": "f16",
+      "page_tokens": 16,
+      "engine": {
+        "generated_tokens": 32,
+        "median_token_seconds": 0.017255333,
+        "tokens_per_second": 57.953097746650265,
+        "samples_seconds": [
+          0.01857875,
+          0.017481458,
+          0.016525958,
+          0.016636958,
+          0.016602458,
+          0.016860083,
+          0.016619792,
+          0.016698,
+          0.016785916,
+          0.016723209,
+          0.016917833,
+          0.016917208,
+          0.017255333,
+          0.017353958,
+          0.017346625,
+          0.017482833,
+          0.017957375,
+          0.017883083,
+          0.016946167,
+          0.016827375,
+          0.016939625,
+          0.017027959,
+          0.01713625,
+          0.017157625,
+          0.017342,
+          0.017703917,
+          0.017708958,
+          0.019074125,
+          0.017770334,
+          0.018696291,
+          0.018503375,
+          0.017543958
+        ]
+      }
+    }
+  ]
+}

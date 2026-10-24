@@ -154,15 +154,16 @@ static inline void kv_dims(device const char *src, thread float (&x)[R]) {
     }
 }
 
-// One simdgroup per (head, split, token). Lane l reads each key and value row as C
-// vectors of V = min(R, 16 / sizeof(T)) values, vector c at dimensions V*l + 32*V*c, so
-// every load instruction covers one contiguous segment of the row: one 16-byte load per
-// row for F16 or Q8 at head dimension 256, and for Q8 one scale per vector (a vector never
-// straddles a 32-multiple group). Keys are taken ATTENTION_KEYS at a time, so their loads
-// are outstanding together. Online softmax keeps the running max/sum in F32. With one
-// split the gated output is written directly; otherwise unnormalised partial sums and
+// One simdgroup per (HG consecutive heads of one K/V head, split, token). Lane l reads
+// each key and value row as C vectors of V = min(R, 16 / sizeof(T)) values, vector c at
+// dimensions V*l + 32*V*c, so every load instruction covers one contiguous segment of the
+// row: one 16-byte load per row for F16 or Q8 at head dimension 256, and for Q8 one scale
+// per vector (a vector never straddles a 32-multiple group). Each loaded K and V vector
+// serves all HG query heads. Keys are taken ATTENTION_KEYS at a time, so their loads are
+// outstanding together. Online softmax keeps the running max/sum in F32. With one split
+// the gated output is written directly; otherwise unnormalised partial sums and
 // (max, sum) statistics go to scratch.
-template <uint R, typename T, uint QUANT>
+template <uint R, typename T, uint QUANT, uint HG>
 kernel void attention_kv(
     device const float *q [[buffer(0)]],
     device const T *k [[buffer(1)]],
@@ -184,33 +185,41 @@ kernel void attention_kv(
     constexpr uint U = ATTENTION_KEYS;
     constexpr uint V = R * sizeof(T) <= 16 ? R : 16 / sizeof(T);
     constexpr uint C = R / V;
+    uint head_groups = p.heads / HG;
     uint item = tg * sgs + sg;
-    if (item >= p.tokens * p.heads * p.splits) {
+    if (item >= p.tokens * head_groups * p.splits) {
         return;
     }
-    uint h = item % p.heads;
-    uint rest = item / p.heads;
+    uint h0 = (item % head_groups) * HG;
+    uint rest = item / head_groups;
     uint split = rest % p.splits;
     uint t = rest / p.splits;
-    uint g = h / (p.heads / p.kv_heads);
+    uint g = h0 / (p.heads / p.kv_heads);
     uint keys = visible[t];
     uint begin = split * p.split_keys;
     uint end = min(keys, begin + p.split_keys);
     uint base = first_block[t];
     uint groups = QUANT == 0 ? 0 : p.dim / p.group;
     uint dims[C], sidx[C];
-    float qv[C][V], acc[C][V];
-    device const float *qr = q + (ulong(t) * p.heads + h) * p.dim;
+    float qv[HG][C][V], acc[HG][C][V];
     for (uint c = 0; c < C; ++c) {
         dims[c] = V * lane + SIMD * V * c;
         sidx[c] = QUANT == 0 ? 0 : dims[c] / p.group;
-        kv_dims<V>(qr + dims[c], qv[c]);
-        for (uint i = 0; i < V; ++i) {
-            acc[c][i] = 0.0f;
+    }
+    for (uint x = 0; x < HG; ++x) {
+        device const float *qr = q + (ulong(t) * p.heads + h0 + x) * p.dim;
+        for (uint c = 0; c < C; ++c) {
+            kv_dims<V>(qr + dims[c], qv[x][c]);
+            for (uint i = 0; i < V; ++i) {
+                acc[x][c][i] = 0.0f;
+            }
         }
     }
-    float m = -FLT_MAX;
-    float l = 0.0f;
+    float m[HG], l[HG];
+    for (uint x = 0; x < HG; ++x) {
+        m[x] = -FLT_MAX;
+        l[x] = 0.0f;
+    }
     for (uint j0 = begin; j0 < end; j0 += U) {
         // Pool rows (slot * kv_heads + g; the host bounds them by 2^32) of this step's keys.
         // Keys past the range repeat the last one and get zero weight. A step inside one
@@ -227,73 +236,85 @@ kernel void attention_kv(
                 rows[u] = (table[base + j / p.page] * p.page + j % p.page) * p.kv_heads + g;
             }
         }
-        float score[U];
+        float score[HG][U];
         for (uint u = 0; u < U; ++u) {
             device const T *kr = k + ulong(rows[u]) * p.dim;
-            float partial_dot = 0.0f;
+            for (uint x = 0; x < HG; ++x) {
+                score[x][u] = 0.0f;
+            }
             for (uint c = 0; c < C; ++c) {
                 float kd[V];
                 kv_dims<V>(kr + dims[c], kd);
-                float d = 0.0f;
-                for (uint i = 0; i < V; ++i) {
-                    d = fma(qv[c][i], kd[i], d);
+                float ks = QUANT == 0 ? 1.0f : float(k_scales[ulong(rows[u]) * groups + sidx[c]]);
+                for (uint x = 0; x < HG; ++x) {
+                    float d = 0.0f;
+                    for (uint i = 0; i < V; ++i) {
+                        d = fma(qv[x][c][i], kd[i], d);
+                    }
+                    score[x][u] += QUANT == 0 ? d : d * ks;
                 }
-                partial_dot += QUANT == 0 ? d : d * float(k_scales[ulong(rows[u]) * groups + sidx[c]]);
             }
-            score[u] = partial_dot;
         }
-        float m_new = m;
-        for (uint u = 0; u < U; ++u) {
-            score[u] = simd_sum(score[u]) * p.scale;
-            m_new = j0 + u < end ? max(m_new, score[u]) : m_new;
-        }
-        float correction = exp(m - m_new);
-        float weight[U];
-        float total = 0.0f;
-        for (uint u = 0; u < U; ++u) {
-            weight[u] = j0 + u < end ? exp(score[u] - m_new) : 0.0f;
-            total += weight[u];
-        }
-        l = l * correction + total;
-        for (uint c = 0; c < C; ++c) {
-            for (uint i = 0; i < V; ++i) {
-                acc[c][i] *= correction;
+        float weight[HG][U];
+        for (uint x = 0; x < HG; ++x) {
+            float m_new = m[x];
+            for (uint u = 0; u < U; ++u) {
+                score[x][u] = simd_sum(score[x][u]) * p.scale;
+                m_new = j0 + u < end ? max(m_new, score[x][u]) : m_new;
             }
+            float correction = exp(m[x] - m_new);
+            float total = 0.0f;
+            for (uint u = 0; u < U; ++u) {
+                weight[x][u] = j0 + u < end ? exp(score[x][u] - m_new) : 0.0f;
+                total += weight[x][u];
+            }
+            l[x] = l[x] * correction + total;
+            for (uint c = 0; c < C; ++c) {
+                for (uint i = 0; i < V; ++i) {
+                    acc[x][c][i] *= correction;
+                }
+            }
+            m[x] = m_new;
         }
         for (uint u = 0; u < U; ++u) {
             device const T *vr = v + ulong(rows[u]) * p.dim;
             for (uint c = 0; c < C; ++c) {
                 float vd[V];
                 kv_dims<V>(vr + dims[c], vd);
-                float w = QUANT == 0 ? weight[u] : weight[u] * float(v_scales[ulong(rows[u]) * groups + sidx[c]]);
-                for (uint i = 0; i < V; ++i) {
-                    acc[c][i] = fma(w, vd[i], acc[c][i]);
+                float vs = QUANT == 0 ? 1.0f : float(v_scales[ulong(rows[u]) * groups + sidx[c]]);
+                for (uint x = 0; x < HG; ++x) {
+                    float w = QUANT == 0 ? weight[x][u] : weight[x][u] * vs;
+                    for (uint i = 0; i < V; ++i) {
+                        acc[x][c][i] = fma(w, vd[i], acc[x][c][i]);
+                    }
                 }
             }
         }
-        m = m_new;
     }
-    if (p.splits == 1) {
-        device const float *gr = gate + ulong(t) * p.gate_stride + p.gate_col + ulong(h) * p.gate_head_stride;
-        device float *o = out + (ulong(t) * p.heads + h) * p.dim;
-        float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    for (uint x = 0; x < HG; ++x) {
+        uint h = h0 + x;
+        if (p.splits == 1) {
+            device const float *gr = gate + ulong(t) * p.gate_stride + p.gate_col + ulong(h) * p.gate_head_stride;
+            device float *o = out + (ulong(t) * p.heads + h) * p.dim;
+            float inv = l[x] > 0.0f ? 1.0f / l[x] : 0.0f;
+            for (uint c = 0; c < C; ++c) {
+                for (uint i = 0; i < V; ++i) {
+                    o[dims[c] + i] = acc[x][c][i] * inv * sigmoid(gr[dims[c] + i]);
+                }
+            }
+            continue;
+        }
+        ulong slot = (ulong(t) * p.heads + h) * p.splits + split;
+        device float *pp = partial + slot * p.dim;
         for (uint c = 0; c < C; ++c) {
             for (uint i = 0; i < V; ++i) {
-                o[dims[c] + i] = acc[c][i] * inv * sigmoid(gr[dims[c] + i]);
+                pp[dims[c] + i] = acc[x][c][i];
             }
         }
-        return;
-    }
-    ulong slot = (ulong(t) * p.heads + h) * p.splits + split;
-    device float *pp = partial + slot * p.dim;
-    for (uint c = 0; c < C; ++c) {
-        for (uint i = 0; i < V; ++i) {
-            pp[dims[c] + i] = acc[c][i];
+        if (lane == 0) {
+            stats[2 * slot] = m[x];
+            stats[2 * slot + 1] = l[x];
         }
-    }
-    if (lane == 0) {
-        stats[2 * slot] = m;
-        stats[2 * slot + 1] = l;
     }
 }
 
@@ -560,17 +581,20 @@ kernel void attention_reduce_f32(
         device const uint *, device const uint *, device const float *, device float *, \
         device const uint *, constant TiledParams &, device const half *, device const half *, \
         threadgroup float *, uint, uint, uint, uint, uint);
+#define ATTENTION_KV(R, NAME, T, QUANT, HG, PREFIX) \
+    template [[host_name(PREFIX #R "_" #NAME)]] kernel void attention_kv<R, T, QUANT, HG>( \
+        device const float *, device const T *, device const T *, device const uint *, \
+        device const uint *, device const uint *, device const float *, device float *, \
+        device float *, device float *, constant AttentionParams &, device const half *, \
+        device const half *, uint, uint, uint, uint);
 #define KV_FORMAT(R, NAME, T, QUANT) \
     TILED(R, NAME, T, QUANT) \
     template [[host_name("kv_write_r" #R "_" #NAME)]] kernel void kv_write<R, T, QUANT>( \
         device const float *, device const float *, device const uint *, device const uint *, \
         device const uint *, device T *, device half *, device T *, device half *, \
         constant KvWriteParams &, uint, uint, uint, uint); \
-    template [[host_name("attention_r" #R "_" #NAME)]] kernel void attention_kv<R, T, QUANT>( \
-        device const float *, device const T *, device const T *, device const uint *, \
-        device const uint *, device const uint *, device const float *, device float *, \
-        device float *, device float *, constant AttentionParams &, device const half *, \
-        device const half *, uint, uint, uint, uint);
+    ATTENTION_KV(R, NAME, T, QUANT, 1, "attention_r") \
+    ATTENTION_KV(R, NAME, T, QUANT, 2, "attention_h2_r")
 // R registers per lane: head dimension 64, 128 or 256 over 32 lanes.
 #define ATTENTION(R) \
     KV_FORMAT(R, f32, float, 0) \

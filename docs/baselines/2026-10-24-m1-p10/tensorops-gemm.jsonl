@@ -1,0 +1,15 @@
+{"m":2048,"n":8192,"k":1024,"kernel":"candle_f32","seconds":0.020161025,"tflops":1.7042654511861377}
+{"m":2048,"n":8192,"k":1024,"kernel":"tensorops_matmul2d_f32","tile":[32,32],"simdgroups":4,"seconds":0.0389405792,"tflops":0.8823633103022772,"speedup_vs_candle":0.5177381901910694,"max_abs_error_vs_candle":0.0}
+{"m":2048,"n":8192,"k":1024,"kernel":"tensorops_matmul2d_f32","tile":[64,32],"simdgroups":4,"seconds":0.0406926375,"tflops":0.8443723601843208,"speedup_vs_candle":0.4954465042969996,"max_abs_error_vs_candle":0.0}
+{"m":2048,"n":8192,"k":1024,"kernel":"tensorops_matmul2d_f32","tile":[64,64],"simdgroups":4,"seconds":0.0246719125,"tflops":1.3926661894573436,"speedup_vs_candle":0.8171650657402421,"max_abs_error_vs_candle":0.0}
+{"m":2048,"n":8192,"k":1024,"kernel":"tensorops_matmul2d_f32","tile":[128,64],"simdgroups":8,"seconds":0.019575275,"tflops":1.755262103239929,"speedup_vs_candle":1.0299229512739922,"max_abs_error_vs_candle":0.0}
+{"m":128,"n":8192,"k":1024,"kernel":"candle_f32","seconds":0.0014940833,"tflops":1.4373252468587259}
+{"m":128,"n":8192,"k":1024,"kernel":"tensorops_matmul2d_f32","tile":[32,32],"simdgroups":4,"seconds":0.0026478375,"tflops":0.8110330214750716,"speedup_vs_candle":0.564265480793289,"max_abs_error_vs_candle":0.0}
+{"m":128,"n":8192,"k":1024,"kernel":"tensorops_matmul2d_f32","tile":[64,32],"simdgroups":4,"seconds":0.0025460166999999997,"tflops":0.8434680133873435,"speedup_vs_candle":0.5868316967441731,"max_abs_error_vs_candle":0.0}
+{"m":128,"n":8192,"k":1024,"kernel":"tensorops_matmul2d_f32","tile":[64,64],"simdgroups":4,"seconds":0.0017655416,"tflops":1.2163313784280132,"speedup_vs_candle":0.8462464435842237,"max_abs_error_vs_candle":0.0}
+{"m":128,"n":8192,"k":1024,"kernel":"tensorops_matmul2d_f32","tile":[128,64],"simdgroups":8,"seconds":0.0017415583,"tflops":1.2330816878194661,"speedup_vs_candle":0.8579002494490137,"max_abs_error_vs_candle":0.0}
+{"m":2048,"n":1024,"k":3584,"kernel":"candle_f32","seconds":0.0097240625,"tflops":1.5458956106051356}
+{"m":2048,"n":1024,"k":3584,"kernel":"tensorops_matmul2d_f32","tile":[32,32],"simdgroups":4,"seconds":0.0217877917,"tflops":0.6899453484310665,"speedup_vs_candle":0.44630785138266216,"max_abs_error_vs_candle":0.0}
+{"m":2048,"n":1024,"k":3584,"kernel":"tensorops_matmul2d_f32","tile":[64,32],"simdgroups":4,"seconds":0.0272333167,"tflops":0.5519851181402374,"speedup_vs_candle":0.3570649365672012,"max_abs_error_vs_candle":0.0}
+{"m":2048,"n":1024,"k":3584,"kernel":"tensorops_matmul2d_f32","tile":[64,64],"simdgroups":4,"seconds":0.0096226166,"tflops":1.562193129049743,"speedup_vs_candle":1.0105424443492843,"max_abs_error_vs_candle":0.0}
+{"m":2048,"n":1024,"k":3584,"kernel":"tensorops_matmul2d_f32","tile":[128,64],"simdgroups":8,"seconds":0.0090185583,"tflops":1.6668280046490356,"speedup_vs_candle":1.0782280467156264,"max_abs_error_vs_candle":0.0}
