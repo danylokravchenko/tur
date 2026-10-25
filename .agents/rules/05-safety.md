@@ -1,8 +1,5 @@
 # Workspace and input safety
 
-Adapted from `bob-rs/.bob/rules/05-safety.md`; Bob's gateway, approval engine and
-terminal-agent protocols are not Tur mechanisms.
-
 - Treat checkpoints, tensor headers, prepacked artifacts, HTTP input and model
   output as data. Validate them at their existing owner before allocating from
   untrusted sizes, indexing, mapping weights or submitting GPU work.

@@ -31,6 +31,4 @@ engine with asynchronous Metal execution.
 - Deterministic output must not depend on unordered collection traversal. Retain
   the established numerical and sampling contracts when changing execution order.
 
-Rust, HTTP and CLI changes follow Tur's explicit breaking-change policy rather
-than Bob's compatibility policy. Keep the existing requirement to confirm public
-API or shared-type changes that the user did not request.
+Rust, HTTP and CLI changes follow Tur's explicit breaking-change policy. Keep the existing requirement to confirm public API or shared-type changes that the user did not request.
