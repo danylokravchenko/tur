@@ -13,9 +13,14 @@
 
 ## Performance
 
-- **Comparative baseline.** Compare against pinned MLX-LM and llama.cpp on the same Mac at
-  matched quantization, with prompts of 128/2K/8K/32K tokens, concurrency from 1 to 16,
-  cold and warm prefixes, and sustained load.
+- **Long-prompt prefill.** llama.cpp prefills 8K-token prompts 8–14% faster than Tur on
+  the M1, while 2K-token prompts are level
+  ([Compared with llama.cpp](../guide/performance.md#compared-with-llamacpp)). The gap
+  grows with prompt length, which points at prefill attention (see tiled prefill attention
+  below) rather than the projections. Profile an 8K prefill by kernel before changing any.
+- **Comparative baseline.** llama.cpp is measured for Q8_0 and Q4_K_M at up to 16
+  sequences. Still to do: MLX-LM, 32K-token prompts, cold and warm prefixes, and sustained
+  load.
 - **Quality budgets.** Predeclared held-out budgets for language, code, tool/JSON and
   long-context retrieval, with confidence intervals.
 - **Chained MTP drafts.** A second draft through the head; an estimated 10% at one

@@ -214,3 +214,49 @@ K/V formats, from the same evaluation method:
 
 - Q8 K/V stays within 1e-4 nats of F32 K/V, with 99.3–99.8% top-1 agreement.
 - F16 K/V is indistinguishable from F32 (KL below 1e-7, 100% top-1).
+
+## Compared with llama.cpp
+
+llama.cpp 0.7.0 (build 11669, Homebrew) on the same Mac, with unsloth's Qwen3.5-0.8B GGUF
+files (revision `6ab461498e2023f6e3c1baea90a8f0fe38ab64d0`) and its defaults: Metal,
+F16 K/V. Its figures are the best of three runs. Q8_0 is the like-for-like format; GGUF
+Q4_K_M mixes Q4_K and Q6_K blocks (497 MiB), against Tur's all-Q4K projections.
+
+**Single sequence** (tokens/s; llama.cpp from `llama-bench`):
+
+| Test | Tur Q8_0 | llama.cpp Q8_0 | Tur Q4K | llama.cpp Q4_K_M |
+| --- | --- | --- | --- | --- |
+| Decode at 128 tokens | 58 | 51.4 | 92 | 65.6 |
+| Decode at 2K | 56 | 49.4 | 89 | 63.5 |
+| Decode at 8K | 50 | 46.2 | 75 | 58.9 |
+| Prefill 2K | 1,311 | 1,323 | 1,210 | 1,188 |
+| Prefill 8K | 1,002 | 1,142 | 958 | 1,037 |
+
+**Batched decode** (Q8_0, aggregate tokens/s at about 128 tokens of context; Tur from the
+`model` benchmark, llama.cpp from `llama-batched-bench`):
+
+| Sequences | 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| Tur | 58 | 108 | 181 | 311 | 357 |
+| llama.cpp | 51.6 | 85.6 | 138 | 201 | 230 |
+
+**Bursts** of N requests with 128-token prompts and 64 output tokens (output tokens/s over
+the burst). Tur's figures run through the scheduled pipeline with sampling; llama.cpp's
+are `llama-batched-bench` wall time for the same prefill and decode, with no scheduler and
+no sampling.
+
+| Concurrent | 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| Tur Q8_0, sampled | 49.6 | 85.8 | 121 | 186 | 204 |
+| llama.cpp Q8_0 | 47.6 | 75.5 | 114 | 155 | 170 |
+| llama.cpp Q4_K_M | 59.4 | 78.7 | 114 | 151 | 160 |
+
+Tur decodes 1.1–1.4× faster at one sequence and up to 1.55× faster at 8–16, and leads
+end-to-end bursts by 1.2× at 8–16 requests. Prefill is level at 2K tokens; at 8K,
+llama.cpp is 8–14% faster.
+
+```sh
+llama-bench -m <gguf> -p 2048,8192 -n 0 -r 3
+llama-bench -m <gguf> -p 0 -n 64 -d 128,2048,8192 -r 3
+llama-batched-bench -m <gguf> -c 4096 -b 2048 -ub 512 -npp 128 -ntg 64 -npl 1,2,4,8,16
+```
