@@ -29,7 +29,7 @@ fmt-check:
 test *args:
     cargo nextest run --workspace "$@"
 
-# Checkpoint-dependent tests; needs TUR_QWEN35_0_8B and the golden files.
+# Checkpoint-dependent tests; set the selected model and golden environment variables.
 test-checkpoint *args:
     cargo nextest run --workspace --run-ignored only "$@"
 

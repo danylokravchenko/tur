@@ -15,7 +15,7 @@ A single Mac is the deployment unit.
 - **Platform:** Apple Silicon macOS with Metal. CPU execution exists only as a numerical
   reference for tests.
 - **Models:** Qwen3.5-family hybrid text models: dense Qwen3.5 and Qwen3.8, and
-  experimentally the Qwen3.6 MoE. The architecture is selected from checkpoint fields,
+  experimentally the Qwen3.6 MoE, plus Gemma 4 text decoders. The architecture is selected from checkpoint fields,
   never from the name.
 - **Interfaces:** the `tur` CLI, an OpenAI-style HTTP API, and the Rust library.
 
@@ -24,8 +24,8 @@ A single Mac is the deployment unit.
 - Intel Macs, CUDA and Linux.
 - Image, video and audio input. These are rejected until encoders and their position
   handling exist.
-- Ordinary attention-only models. Ordinary Qwen3 and Granite were deleted rather than
-  kept.
+- Ordinary Qwen3 and Granite, whose previous implementations were deleted. Gemma 4
+  has a separate attention-only architecture adapter over the common engine.
 - Expert, attention or context parallelism, multi-machine serving, SSD spill and the
   Apple Neural Engine. All are deferred until a measured workload justifies them.
 
@@ -36,7 +36,8 @@ A single Mac is the deployment unit.
 | Qwen3.5-0.8B | Per-layer and logit agreement with Transformers (≤ 3.5e-6 relative error against a 1e-4 gate) on CPU and Metal; Q8_0 meets its 0.95 top-1 floor |
 | Qwen3.8-27B | Pinned config, tensor headers and template validated; shares the 0.8B code path; **not executed** (its Q4K weights exceed a 16 GB Mac) |
 | Qwen3.6-35B-A3B | Independent small Transformers fixture and pinned headers pass; full execution, quality and expert-kernel performance are open |
-| Gemma 4 | Assessed, not implemented |
+| Gemma 4 E2B | Text inference; pinned Transformers F32 architecture fixtures and real Q8_0 checkpoint generation validated |
+| Gemma 4 E4B / 12B / 26B-A4B / 31B | Architecture fixtures and configuration coverage; full checkpoints not executed |
 
 ## Principles
 

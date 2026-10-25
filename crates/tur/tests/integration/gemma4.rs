@@ -1,21 +1,22 @@
 //! Independent Gemma text conformance and paged-state lifecycle coverage.
-use crate::model_common::{self as common, max_relative, rows};
+#[cfg(feature = "metal")]
+use crate::model_common as common;
+use crate::model_common::{max_relative, rows};
 use candle_core::{DType, Device};
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::path::{Path, PathBuf};
+#[cfg(feature = "metal")]
+use std::sync::Arc;
 use tur_core::{
     Result,
     execution::{KvFormat, KvLayout, invalid},
 };
+#[cfg(feature = "metal")]
 use tur_metal::{pool::PoolConfig, state::ModelState};
-use tur_models::{
-    hybrid::{Boundaries, HybridModel, StatePool},
-    models::{
-        Execution, LoadOptions, WeightFormat,
-        gemma4::{Config, Gemma4},
-    },
+#[cfg(feature = "metal")]
+use tur_models::hybrid::{Boundaries, HybridModel, StatePool};
+use tur_models::models::{
+    Execution, LoadOptions, WeightFormat,
+    gemma4::{Config, Gemma4},
 };
 
 fn fixture(kind: &str) -> PathBuf {
@@ -39,6 +40,7 @@ fn options(
         mtp: None,
     }
 }
+#[cfg(feature = "metal")]
 fn pool(model: &Gemma4) -> Result<StatePool> {
     StatePool::new(
         Arc::new(model.description()),

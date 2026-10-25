@@ -21,7 +21,8 @@ rather than skip without it.
   | `reference` | Template fidelity; real-checkpoint agreement with Transformers |
   | `contracts` | `HybridEngine` state, fork/restore, speculation, cancellation, failures |
   | `engine`, `fused` | Qwen3.5 through the engine: reference versus fused paths, formats, boundaries |
-  | `moe` | MoE conformance against a Transformers fixture |
+  | `moe` | Qwen MoE conformance against a Transformers fixture |
+  | `gemma4` | Dense PLE/sharing, MoE and Unified conformance; cache lifecycle; canonical template bytes |
   | `quantization` | Calibration, GPTQ, budget allocation, prepacked artifacts |
   | `pipeline`, `scheduling`, `scheduling_metal` | Admission, stress, preemption, deadlines, budgets |
   | `prefix_reuse`, `speculation`, `prepacked` | Pipeline-level reuse, drafting and artifact loading |
@@ -58,7 +59,31 @@ export TUR_QWEN35_GOLDEN=/tmp/qwen35-golden.safetensors
 export TUR_QWEN35_MTP_GOLDEN=/tmp/qwen35-mtp-golden.safetensors
 python -I scripts/qwen3_5_reference.py --model "$TUR_QWEN35_0_8B" --golden "$TUR_QWEN35_GOLDEN"
 python -I scripts/qwen3_5_mtp_reference.py --model "$TUR_QWEN35_0_8B" --golden "$TUR_QWEN35_MTP_GOLDEN"
-just test-checkpoint
+just test-checkpoint -E 'not test(gemma4)'
+```
+
+The Gemma 4 E2B checkpoint is a second real-model test mule. Its test is ignored in the
+offline suite and needs the pinned local checkpoint and generated CPU reference:
+
+```sh
+export TUR_GEMMA4_E2B=/models/gemma-4-E2B-it
+export TUR_GEMMA4_GOLDEN=/tmp/gemma4-golden.safetensors
+python -I scripts/gemma4_reference.py --model "$TUR_GEMMA4_E2B" --golden "$TUR_GEMMA4_GOLDEN"
+just test-checkpoint -E 'test(gemma4_e2b_checkpoint)'
+```
+
+Download `google/gemma-4-E2B-it` at revision
+`3e22461f65e89153144f8adb70e3b8c2cc9845a7`. The generator streams one F32 text layer at a
+time and gathers PLE rows on demand, keeping the CPU reference within a smaller memory
+budget. It records per-layer states, prompt logits and a greedy continuation. Q8_0
+uses the same 95% next-token agreement floor as Qwen, plus greedy-prefix and EOS checks;
+the offline F32 fixtures use the separate 1e-4 equation-conformance gate.
+
+Regenerate offline Gemma fixtures with:
+
+```sh
+python -I scripts/gemma4_reference.py --tiny crates/tur/tests/fixtures/gemma4
+python -I scripts/gemma4_reference.py --templates crates/tur/tests/fixtures/gemma4/templates.json
 ```
 
 ## Reference scripts
@@ -71,6 +96,7 @@ in F32:
 | `qwen3_5_reference.py` | Per-layer hidden states, logits and greedy continuations of the 0.8B; rendered template cases |
 | `qwen3_5_mtp_reference.py` | The MTP head assembled from Transformers modules, with next-next-token accuracy |
 | `qwen3_5_moe_reference.py` | The offline MoE oracle on deterministic weights |
+| `gemma4_reference.py` | Dense, MoE and Unified F32 fixtures; Gemma template bytes; real E2B logits and greedy continuation |
 | `qwen3_6_reference_headers.py` | Qwen3.6 tensor headers via byte-range requests; no weights are downloaded |
 
 Run them with `python -I` and treat downloaded files as data.

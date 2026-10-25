@@ -1,8 +1,7 @@
 # Introduction
 
-Tur is a Rust inference engine for hybrid language models on Apple Silicon. It loads a
-Qwen3.5-family checkpoint, which interleaves Gated DeltaNet recurrent layers with gated
-full-attention layers, and runs it on fused Metal kernels. It serves the model through a
+Tur is a Rust inference engine for language models on Apple Silicon. It loads
+Qwen3.5-family hybrid decoders and Gemma 4 text decoders on common Metal infrastructure. It serves the model through a
 command-line tool, an OpenAI-style HTTP server, or a Rust library.
 
 What it does:
@@ -30,6 +29,8 @@ What it does:
 | Qwen3.5-0.8B (dense hybrid) | Validated against Transformers per layer and in logits on CPU and Metal |
 | Qwen3.8-27B (dense hybrid) | Same code path; config, tensor headers and template validated; not executed (needs more than 16 GB) |
 | Qwen3.6-35B-A3B (MoE hybrid) | Experimental: passes a small independent fixture and pinned headers only |
+| Gemma 4 E2B | Text inference; pinned Transformers F32 architecture fixtures and real Q8_0 checkpoint generation validated |
+| Gemma 4 E4B / 12B / 26B-A4B / 31B | Architecture fixtures and configuration coverage; full checkpoints not executed |
 
 Only text input is supported. All measurements so far come from one M1 with 16 GB, and
 every performance number in this book is from that machine unless stated otherwise.

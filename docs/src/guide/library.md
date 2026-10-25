@@ -16,7 +16,7 @@ use tur::{
     InferencePipeline, ModelFactory, ModelSource, Result,
     backend::pipeline::{GenerationRequest, PipelineConfig},
     hybrid::SamplingOptions,
-    models::qwen3_5::{DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, WeightFormat},
+    models::{DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, WeightFormat},
 };
 
 fn main() -> Result<()> {

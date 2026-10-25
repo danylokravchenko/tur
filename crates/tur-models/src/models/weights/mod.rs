@@ -55,10 +55,15 @@ impl Projection {
 
 /// Architecture-owned matrix layout used by the common weight planner.
 pub trait WeightLayout {
+    /// Loaded projection names, their checkpoint parts and checked dimensions.
     fn projection_layout(&self) -> Result<Vec<Projection>>;
+    /// Whether input embeddings and the LM head share checkpoint weights.
     fn embeddings_tied(&self) -> bool;
+    /// Padded vocabulary width of the projection and embedding.
     fn vocabulary(&self) -> usize;
+    /// Width of the residual stream and input embedding rows.
     fn residual_width(&self) -> usize;
+    /// Whether an optional native draft head is included in this layout.
     fn loads_mtp(&self) -> bool {
         false
     }

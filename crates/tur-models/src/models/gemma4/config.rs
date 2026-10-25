@@ -514,6 +514,7 @@ fn validate(t: &TextConfig) -> Result<()> {
         || !t.global_head_dim.is_multiple_of(2)
         || u32::try_from(t.vocab_size).is_err()
         || u32::try_from(t.max_position_embeddings).is_err()
+        || u32::try_from(t.sliding_window).is_err()
         || (t.hidden_size_per_layer_input > 0 && t.vocab_size_per_layer_input < t.vocab_size)
     {
         return Err(invalid("unsupported or invalid Gemma 4 text settings"));

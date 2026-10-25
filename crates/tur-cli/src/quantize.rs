@@ -3,8 +3,8 @@
 //! artifact that `run` and `serve` load as stored.
 use std::{io::Write, path::PathBuf, time::Instant};
 use tur::models::{
-    DEFAULT_RECURRENT_STATE, Embedding, Execution, LoadOptions, Method, Packer, Precision,
-    WeightFormat, WeightPlan,
+    DEFAULT_RECURRENT_STATE, Embedding, Execution, LoadOptions, Method, ModelConfig, Packer,
+    Precision, WeightFormat, WeightPlan,
 };
 use tur::{
     Result, TurError,
@@ -84,6 +84,15 @@ fn samples(args: &Args) -> Result<Vec<Vec<u32>>> {
 }
 
 pub(crate) fn quantize(args: &Args) -> Result<()> {
+    if matches!(
+        ModelConfig::from_json(&std::fs::read_to_string(args.model.join("config.json"))?)?,
+        ModelConfig::Gemma4(_)
+    ) {
+        return Err(TurError::Other(
+            "Gemma 4 offline prepacking is not implemented; use --weight-format with run or serve"
+                .into(),
+        ));
+    }
     let config = artifact_config(&args.model)?;
     let embedding = match args.embedding.as_deref() {
         None if config.tied_embeddings() => Embedding::Head,

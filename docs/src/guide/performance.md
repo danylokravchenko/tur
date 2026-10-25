@@ -164,7 +164,7 @@ was within noise. With 16, the conversations finished 11% sooner and last-turn T
 fell 30%. Single-turn, tool-loop and churn controls stayed within their run-to-run
 spread; first turns take no extra pass. Reproduce with `TUR_BENCH_WORKLOADS=prefix
 TUR_BENCH_SPACING=256 TUR_BENCH_PREFIX_ENTRIES=8 just bench serving`, then repeat with 16
-(set the pinned local checkpoint in `TUR_QWEN35_0_8B`).
+(set the pinned local checkpoint in `TUR_BENCH_MODEL`).
 
 ## Speculative decoding
 

@@ -11,7 +11,8 @@ use tur_core::{
     Result, TurError,
     execution::{KvFormat, KvLayout},
 };
-use tur_models::models::qwen3_5::{Manifest, Qwen35};
+use tur_models::models::TextModel;
+use tur_models::models::qwen3_5::Manifest;
 use tur_models::models::{Execution, LoadOptions, Weights};
 
 pub(crate) fn run(args: &[String]) -> Result<()> {
@@ -34,7 +35,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             .map_err(TurError::Other)?
             .into(),
     };
-    let model = Qwen35::load(
+    let model = TextModel::load(
         &dir,
         &LoadOptions {
             revision: "load-measurement".into(),

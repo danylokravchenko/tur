@@ -37,6 +37,9 @@ impl Moe {
             top_k,
         })
     }
+    pub(super) fn projection_bytes(&self) -> usize {
+        self.gate_up.resident_bytes() + self.down.resident_bytes()
+    }
     pub(super) fn bytes(&self) -> usize {
         [
             &self.router,

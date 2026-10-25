@@ -89,3 +89,62 @@ pub(crate) fn parse_tokens(raw: &serde_json::Value, vocab: usize) -> Result<Vec<
         })
         .collect()
 }
+
+/// Collect both flat Gemma special-token fields and Qwen's extra-special-token mapping.
+pub(crate) fn forbid_tokenizer_modalities(
+    forbidden: &mut Vec<u32>,
+    config: &str,
+    tokenizer: &str,
+) -> Result<()> {
+    let config: serde_json::Value = serde_json::from_str(config)?;
+    let tokenizer: serde_json::Value = serde_json::from_str(tokenizer)?;
+    let fields = config.as_object().into_iter().flatten().chain(
+        config["extra_special_tokens"]
+            .as_object()
+            .into_iter()
+            .flatten(),
+    );
+    let names: Vec<&str> = fields
+        .filter(|(key, _)| {
+            [
+                "audio", "image", "video", "vision", "boi", "eoi", "boa", "eoa",
+            ]
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        })
+        .filter_map(|(_, v)| v.as_str().or_else(|| v["content"].as_str()))
+        .collect();
+    for added in tokenizer["added_tokens"].as_array().into_iter().flatten() {
+        if added["content"]
+            .as_str()
+            .is_some_and(|s| names.contains(&s))
+        {
+            let id = added["id"]
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| invalid("invalid modality token ID"))?;
+            if !forbidden.contains(&id) {
+                forbidden.push(id);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert tokenizer modality IDs and preserve stop tokens"
+)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_flat_gemma_modality_fields_forbid_boundaries_and_preserve_chat_tokens() -> Result<()> {
+        let config = include_str!("../../../tur/tests/fixtures/gemma4/e2b/tokenizer_config.json");
+        let tokenizer = r#"{"added_tokens":[{"id":2,"content":"<bos>"},{"id":258883,"content":"<audio|>"},{"id":255999,"content":"<|image>"},{"id":106,"content":"<turn|>"},{"id":258880,"content":"<|image|>"}]}"#;
+        let mut forbidden = vec![258_880];
+        forbid_tokenizer_modalities(&mut forbidden, config, tokenizer)?;
+        assert_eq!(forbidden, vec![258_880, 258_883, 255_999]);
+        Ok(())
+    }
+}

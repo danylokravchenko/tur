@@ -45,6 +45,13 @@ chunk into registers before multiplying the current one, with one barrier per ch
 Q8 pools stage through one buffer, reading and dequantizing each chunk in place. Head dimensions
 64, 128 and 256 are supported, with GQA and the sigmoid output gate.
 
+Gemma uses the same packed matrix and RMS kernels. The per-query attention path also
+supports ungated output, explicit score scaling, sliding-window lower bounds and
+512-dimensional heads. These semantics apply to F32, F16 and Q8 pools, including
+split-K reduction. Qwen retains its existing gated scale and tiled-prefill selection;
+Gemma currently uses the per-query path for both prefill and decode. The MoE router can
+apply learned per-expert scales after top-k normalization without changing selection.
+
 ## Decisions
 
 Measured on an M1:
@@ -79,3 +86,7 @@ Measured on an M1:
   variants (see [Rejected experiments](../design/rejected.md)).
 - **Open:** the MoE wide tier (more than 16 rows per expert) trails Candle by 1.2–1.5×;
   tiled prefill attention runs at about 28% of the matrix units' F32 peak.
+
+- **Extend shared attention for Gemma semantics.** The window, ungated output and
+  512-dimensional path are checked against independent F64 scalar references across
+  K/V formats and splits. Gemma-specific launch tuning and tiled prefill remain open.

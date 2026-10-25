@@ -70,6 +70,17 @@ fn format_plan(config: &Config, options: &LoadOptions) -> Result<WeightPlan> {
     if matches!(options.weights, Weights::Prepacked(_)) {
         return Err(invalid("Gemma 4 prepacked artifacts are not implemented"));
     }
+    #[cfg(feature = "metal")]
+    if options.execution == Execution::Fused
+        && options.device.is_metal()
+        && [config.text.head_dim, config.text.global_head_dim]
+            .iter()
+            .any(|dim| !matches!(dim, 64 | 128 | 256 | 512))
+    {
+        return Err(invalid(
+            "Gemma 4 Metal attention supports head dimensions 64, 128, 256 and 512",
+        ));
+    }
     let plan = options.weights.plan(config)?;
     plan.validate(config)?;
     Ok(plan)
@@ -200,7 +211,14 @@ impl Layer {
 impl Gemma4 {
     /// Load only the validated text tower; multimodal inputs and native drafting are rejected.
     pub fn load(dir: &Path, options: &LoadOptions) -> Result<Self> {
-        let config = Config::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?;
+        let mut config = Config::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?;
+        if dir.join("tokenizer_config.json").exists() && dir.join("tokenizer.json").exists() {
+            crate::models::generation::forbid_tokenizer_modalities(
+                &mut config.forbidden,
+                &std::fs::read_to_string(dir.join("tokenizer_config.json"))?,
+                &std::fs::read_to_string(dir.join("tokenizer.json"))?,
+            )?;
+        }
         let plan = format_plan(&config, options)?;
         let checkpoint = checkpoint(dir, &config)?;
         let t = Tensors {
@@ -290,6 +308,35 @@ impl Gemma4 {
     /// Validated Gemma 4 settings.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+    /// Whether common Metal kernels or Candle reference operations execute passes.
+    pub fn execution(&self) -> Execution {
+        #[cfg(feature = "metal")]
+        if self.kernels.is_some() {
+            return Execution::Fused;
+        }
+        Execution::Reference
+    }
+    /// Resident bytes held by packed projection matrices.
+    pub fn projection_bytes(&self) -> usize {
+        let mut bytes = self.head.resident_bytes()
+            + self
+                .ple
+                .as_ref()
+                .map_or(0, |p| p.projection.resident_bytes());
+        for layer in &self.layers {
+            bytes += [&layer.q, &layer.o, &layer.gate, &layer.up, &layer.down]
+                .iter()
+                .map(|p| p.resident_bytes())
+                .sum::<usize>();
+            bytes += layer.k.as_ref().map_or(0, PackedLinear::resident_bytes)
+                + layer.v.as_ref().map_or(0, PackedLinear::resident_bytes);
+            bytes += layer.ple.as_ref().map_or(0, |p| {
+                p.gate.resident_bytes() + p.projection.resident_bytes()
+            });
+            bytes += layer.moe.as_ref().map_or(0, moe::Moe::projection_bytes);
+        }
+        bytes
     }
     /// Resident bytes loaded into the device.
     pub fn weight_bytes(&self) -> usize {

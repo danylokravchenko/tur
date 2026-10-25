@@ -96,3 +96,41 @@ impl TokenOutputStream {
         self.current_index = 0;
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert user and protocol decoding separately"
+)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_tool_decoding_preserves_special_delimiters_that_user_decoding_removes() -> Result<()> {
+        use tokenizers::{AddedToken, models::wordlevel::WordLevel};
+        let vocabulary = [
+            ("<|tool_call>".into(), 0),
+            ("call:lookup{}".into(), 1),
+            ("<tool_call|>".into(), 2),
+        ];
+        let model = WordLevel::builder()
+            .vocab(vocabulary.into_iter().collect())
+            .unk_token("call:lookup{}".into())
+            .build()
+            .map_err(|error| TurError::Tokenizer(error.to_string()))?;
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.add_special_tokens(&[
+            AddedToken::from("<|tool_call>", true),
+            AddedToken::from("<tool_call|>", true),
+        ]);
+        let mut stream = TokenOutputStream::new(tokenizer);
+        for token in [0, 1, 2] {
+            drop(stream.next_token(token)?);
+        }
+        assert_eq!(stream.decode_all()?, "call:lookup{}");
+        assert_eq!(
+            stream.decode_raw()?,
+            "<|tool_call> call:lookup{} <tool_call|>"
+        );
+        Ok(())
+    }
+}

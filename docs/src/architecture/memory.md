@@ -16,6 +16,16 @@ allocated once at load and never grown.
 Kernels read pages and slots in place through page tables and slot indices. Nothing is
 gathered or concatenated per pass.
 
+Gemma's per-layer embedding table is split by decoder layer into column tables. E2B
+uses 35 BF16 tables of 128 MiB each, rather than one multi-gigabyte Metal buffer.
+The shared loader bounds host chunks to 64 MiB and synchronizes each completed upload
+before proceeding, allowing Candle to reclaim device staging buffers. These are loading
+fences; request execution keeps its existing completion ownership.
+
+Only Gemma layers that produce their own K/V allocate attention pool layers. Reusing
+layers address those same physical owners. Sliding-window masking limits attention,
+while page leases retain the full logical prefix for restore and speculation.
+
 ## Snapshots and leases
 
 A `ModelState` is a page table plus one recurrent slot at an exact token boundary.
@@ -85,3 +95,8 @@ Measured on Qwen3.5-0.8B on an M1:
   Admission never relies on a sequence count alone.
 - **Low-bit K/V was rejected.** Every 4-bit format missed the quality budget by 10–30×
   (see [Rejected experiments](../design/rejected.md)).
+
+- **Account for Gemma PLE and shared K/V explicitly.** Resident PLE tables and activation
+  peaks enter the existing memory plan. Only K/V owners allocate state. E2B checkpoint
+  execution validates bounded staging; synthetic F32 fixtures validate shared-cache
+  chunking and rollback.

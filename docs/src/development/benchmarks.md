@@ -9,7 +9,8 @@ just bench <case> [args] > out.json
 
 Each case prints one JSON document to stdout and progress to stderr. Timed regions always
 end at device completion; timing only the enqueueing of GPU work would measure nothing.
-Most cases need a real checkpoint in `TUR_QWEN35_0_8B`.
+`model` and `serving` take a local Qwen or Gemma checkpoint in `TUR_BENCH_MODEL`.
+Qwen-specific quality studies continue to use `TUR_QWEN35_0_8B`.
 
 | Case | Measures | Main knobs |
 | --- | --- | --- |
@@ -34,6 +35,17 @@ workloads:
 - `reuse`: cold shared prompts, contention, agent loops, churn and no reuse;
   `TUR_BENCH_RESTORABLE_FIRST=1` admits restorable prefixes first.
 - `speculation`: prompt lookup and MTP over repetitive, novel and code prompts.
+
+For a bounded E2B engine measurement using the same benchmark path:
+
+```sh
+TUR_BENCH_MODEL="$TUR_GEMMA4_E2B" \
+TUR_BENCH_FORMATS=q8_0 TUR_BENCH_KV=f16 TUR_BENCH_PAGES=16 \
+TUR_BENCH_ONLY=engine TUR_BENCH_ENGINE_TOKENS=8 just bench model > gemma4-engine.json
+```
+
+Gemma's larger PLE tables make some wide batch/context sweeps exceed a 16 GB device.
+Start with one sequence and the engine case, then size measurements to the target Mac.
 
 ## Methodology
 

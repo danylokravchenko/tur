@@ -36,6 +36,18 @@ each request.
 | `--recurrent-state f32\|f16` | `f32` | Storage of DeltaNet matrix state |
 | `--cpu-reference` | off | Run the F32 CPU reference instead of Metal (development only) |
 
+Gemma 4 uses the same `run` and `serve` commands. For the pinned E2B development model:
+
+```sh
+tur run --model google/gemma-4-E2B-it \
+  --revision 3e22461f65e89153144f8adb70e3b8c2cc9845a7 \
+  --weight-format q8_0 --temperature 0 --thinking false --prompt 'What is the capital of France?'
+```
+
+Input remains text-only. Gemma native `--mtp` and offline `tur quantize` are not
+implemented. Use load-time conversion; Q4K additionally requires every projection's
+input width to fit its 256-element blocks.
+
 ## Passes and memory (`run`, `serve`)
 
 | Flag | Default | Meaning |

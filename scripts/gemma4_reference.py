@@ -21,7 +21,7 @@ def tiny_config(moe):
     return dict(
         architectures=["Gemma4ForCausalLM"], model_type="gemma4_text",
         hidden_size=64, intermediate_size=128, vocab_size=96,
-        num_hidden_layers=4, num_attention_heads=2, num_key_value_heads=1,
+        num_hidden_layers=4, num_attention_heads=2, num_key_value_heads=2 if moe else 1,
         head_dim=64, global_head_dim=512, num_global_key_value_heads=1,
         max_position_embeddings=2048, rms_norm_eps=1e-6,
         hidden_activation="gelu_pytorch_tanh", attention_bias=False,
@@ -40,7 +40,7 @@ def tiny_config(moe):
     )
 
 
-def trace(model, tokens, output, generate=0):
+def trace(model, tokens, output, generate=0, source=REVISION):
     data = {"tokens": tokens.to(torch.int64)}
     handles = []
     for index, layer in enumerate(model.model.layers):
@@ -56,7 +56,7 @@ def trace(model, tokens, output, generate=0):
         with torch.inference_mode():
             generated = model.generate(tokens, max_new_tokens=generate, do_sample=False, eos_token_id=[1, 106, 50], pad_token_id=0)
         data["greedy"] = generated[0, tokens.shape[-1]:].contiguous()
-    save_file(data, output, metadata={"transformers": transformers.__version__, "torch": torch.__version__, "revision": REVISION})
+    save_file(data, output, metadata={"transformers": transformers.__version__, "torch": torch.__version__, "revision": source})
 
 
 def tiny(root):
@@ -81,7 +81,7 @@ def tiny(root):
         weights = {name: value.to(torch.bfloat16).contiguous() for name, value in model.state_dict().items() if name != "lm_head.weight"}
         save_file(weights, directory / "model.safetensors")
         (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-        trace(model, torch.tensor([[2, 7, 5, 9, 3, 12, 7, 17, 4]]), directory / "golden.safetensors")
+        trace(model, torch.tensor([[2, 7, 5, 9, 3, 12, 7, 17, 4]]), directory / "golden.safetensors", source="synthetic-gemma4-v1")
 
 
 class DiskEmbedding(torch.nn.Module):

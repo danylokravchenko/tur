@@ -1140,13 +1140,11 @@ fn test_quantized_kv_attention_stays_close_to_f32_attention() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<()> {
-    let (device, kernels, _gpu) = setup()?;
+fn check_kv_write(kernels: &Kernels, device: &Device, dim: usize) -> Result<()> {
     let case = AttentionCase {
         heads: 4,
         kv_heads: 2,
-        dim: 128,
+        dim,
         page: 16,
         sequences: vec![(37, 3), (0, 20), (15, 1)],
     };
@@ -1167,8 +1165,8 @@ fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<
         KvFormat::Q8 { group: 128 },
     ] {
         let poison = vec![f32::NAN; slots * width];
-        let (key_pool, _) = stored(&device, &poison, slots, case.kv_heads, case.dim, format)?;
-        let (value_pool, _) = stored(&device, &poison, slots, case.kv_heads, case.dim, format)?;
+        let (key_pool, _) = stored(device, &poison, slots, case.kv_heads, case.dim, format)?;
+        let (value_pool, _) = stored(device, &poison, slots, case.kv_heads, case.dim, format)?;
         let pool = AttentionPool {
             key: key_pool,
             value: value_pool,
@@ -1178,14 +1176,14 @@ fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<
             head_dim: case.dim,
         };
         kernels.kv_write(
-            &upload(&device, &key, &[tokens, case.kv_heads, case.dim])?,
+            &upload(device, &key, &[tokens, case.kv_heads, case.dim])?,
             Heads {
                 count: case.kv_heads,
                 dim: case.dim,
                 head_stride: case.dim,
                 col_offset: 0,
             },
-            &upload(&device, &projection, &[tokens, 2 * width + 5])?,
+            &upload(device, &projection, &[tokens, 2 * width + 5])?,
             Heads {
                 count: case.kv_heads,
                 dim: case.dim,
@@ -1249,6 +1247,15 @@ fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<
                 }
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    for dim in [128, 512] {
+        check_kv_write(&kernels, &device, dim)?;
     }
     Ok(())
 }

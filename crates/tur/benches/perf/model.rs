@@ -1,9 +1,9 @@
-//! Qwen3.5 model-level benchmark on a real checkpoint: fused Metal passes over persistent
+//! Text model benchmark on a real checkpoint: fused Metal passes over persistent
 //! state pools for prefill and batched decode at several contexts, per weight and K/V
 //! format, plus engine overhead. Prints one JSON document. Every timed region ends at
 //! device completion.
 //!
-//! `TUR_QWEN35_0_8B=<snapshot> cargo bench --offline -p tur --bench perf -- model > out.json`
+//! `TUR_BENCH_MODEL=<snapshot> cargo bench --offline -p tur --bench perf -- model > out.json`
 //! narrows with `TUR_BENCH_FORMATS=q8_0,q4k` (entries may also be prepacked artifact directories), `TUR_BENCH_KV=f32,q8`, `TUR_BENCH_PAGES=16,64`,
 //! `TUR_BENCH_PREFILL=128,2048` and `TUR_BENCH_CONTEXTS=2048,8192`. `TUR_BENCH_REFERENCE=1`
 //! adds the F32 reference execution with F32 K/V. `TUR_BENCH_ONLY=prefill,decode,engine`
@@ -24,7 +24,8 @@ use tur_engine::hybrid::{
     Boundaries, HybridEngine, HybridModel, ModelState, PackedForward, PoolConfig, Reservation,
     SamplingOptions, SequenceForward, StatePool,
 };
-use tur_models::models::qwen3_5::{Manifest, Qwen35, is_artifact};
+use tur_models::models::TextModel;
+use tur_models::models::qwen3_5::{Manifest, is_artifact};
 use tur_models::models::{Execution, LoadOptions, WeightFormat, Weights, parse_recurrent_state};
 
 const SHORT_CONTEXT: usize = 128;
@@ -59,7 +60,7 @@ fn median(mut samples: Vec<f64>) -> f64 {
 }
 
 /// A pool holding `contexts` sequences plus one pass of new tokens each.
-fn pool(model: &Qwen35, contexts: &[usize], extra: usize) -> Result<StatePool> {
+fn pool(model: &TextModel, contexts: &[usize], extra: usize) -> Result<StatePool> {
     let description = model.description();
     let pages = contexts
         .iter()
@@ -92,7 +93,7 @@ fn medians(samples: &[Timed]) -> (f64, f64) {
 
 /// One forward pass of `sequences` with the last row of each as logits: reserve pages and
 /// slots, encode, wait. Nothing is committed, so the pass can repeat on the same states.
-fn pass(model: &Qwen35, pool: &StatePool, sequences: &[(&ModelState, &[u32])]) -> Result<Timed> {
+fn pass(model: &TextModel, pool: &StatePool, sequences: &[(&ModelState, &[u32])]) -> Result<Timed> {
     let mut packed = Vec::new();
     let mut positions = Vec::new();
     let mut ranges = Vec::new();
@@ -141,7 +142,7 @@ fn pass(model: &Qwen35, pool: &StatePool, sequences: &[(&ModelState, &[u32])]) -
 }
 
 /// Committed state after prefilling `prompt` in chunks of 2048 tokens.
-fn prefilled(model: &Qwen35, pool: &StatePool, prompt: &[u32]) -> Result<ModelState> {
+fn prefilled(model: &TextModel, pool: &StatePool, prompt: &[u32]) -> Result<ModelState> {
     let mut state = ModelState::new(pool);
     for piece in prompt.chunks(2048) {
         let mut reservation = state.reserve(piece.len(), Boundaries::Final)?;
@@ -170,7 +171,7 @@ fn prefilled(model: &Qwen35, pool: &StatePool, prompt: &[u32]) -> Result<ModelSt
     Ok(state)
 }
 
-fn prefill_case(model: &Qwen35, length: usize) -> Result<Value> {
+fn prefill_case(model: &TextModel, length: usize) -> Result<Value> {
     let pool = pool(model, &[0], length)?;
     let empty = ModelState::new(&pool);
     let prompt = tokens(length, 1);
@@ -190,7 +191,7 @@ fn prefill_case(model: &Qwen35, length: usize) -> Result<Value> {
     }))
 }
 
-fn decode_case(model: &Qwen35, batch: usize, context: usize) -> Result<Value> {
+fn decode_case(model: &TextModel, batch: usize, context: usize) -> Result<Value> {
     let pool = pool(model, &vec![context; batch], 1)?;
     let states = (0..batch)
         .map(|i| prefilled(model, &pool, &tokens(context, i + 2)))
@@ -220,7 +221,7 @@ fn decode_case(model: &Qwen35, batch: usize, context: usize) -> Result<Value> {
 
 /// Per-token latency through `HybridEngine` (reservation, forward, fence, sampling,
 /// publication).
-fn engine_case(model: Arc<Qwen35>, generated: usize) -> Result<Value> {
+fn engine_case(model: Arc<TextModel>, generated: usize) -> Result<Value> {
     let device = model.device().clone();
     let config = PoolConfig {
         pages: model.description().pages_for(SHORT_CONTEXT + generated) + 1,
@@ -286,7 +287,7 @@ fn selected(case: &str) -> bool {
     std::env::var("TUR_BENCH_ONLY").map_or(true, |only| only.split(',').any(|c| c == case))
 }
 
-fn measure(model: &Qwen35, prefill: &[usize], contexts: &[usize]) -> Result<Value> {
+fn measure(model: &TextModel, prefill: &[usize], contexts: &[usize]) -> Result<Value> {
     let prefill = if selected("prefill") { prefill } else { &[] };
     let prefill = prefill
         .iter()
@@ -315,8 +316,8 @@ fn measure(model: &Qwen35, prefill: &[usize], contexts: &[usize]) -> Result<Valu
 
 pub(crate) fn run() -> Result<()> {
     let dir = PathBuf::from(
-        std::env::var_os("TUR_QWEN35_0_8B")
-            .ok_or_else(|| TurError::Other("set TUR_QWEN35_0_8B".into()))?,
+        std::env::var_os("TUR_BENCH_MODEL")
+            .ok_or_else(|| TurError::Other("set TUR_BENCH_MODEL".into()))?,
     );
     let device = Device::new_metal(0)?;
     let prefill = env_sizes("TUR_BENCH_PREFILL", "128,2048")?;
@@ -343,10 +344,10 @@ pub(crate) fn run() -> Result<()> {
                 let recurrent = parse_recurrent_state(&state).map_err(TurError::Other)?;
                 for &page in &pages {
                     let load_start = Instant::now();
-                    let model = Qwen35::load(
+                    let model = TextModel::load(
                         &source,
                         &LoadOptions {
-                            revision: "Qwen/Qwen3.5-0.8B@2fc06364".into(),
+                            revision: source.display().to_string(),
                             weights: weights.clone(),
                             device: device.clone(),
                             execution: Execution::Fused,
@@ -388,7 +389,7 @@ pub(crate) fn run() -> Result<()> {
     }
     let document = json!({
         "schema_version": 3,
-        "checkpoint": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
+        "checkpoint": dir,
         "workload": "synthetic token ids; one prefill pass per prompt length; decode steps re-run one token over committed context without publishing",
         "short_context": SHORT_CONTEXT, "warmup": WARMUP, "decode_steps": DECODE_STEPS,
         "activations": "F32",

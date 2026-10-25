@@ -3,7 +3,10 @@
 
 use candle_core::{DType, Device, Tensor};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
-use tur_core::{Result, execution::invalid};
+use tur_core::{
+    Result,
+    execution::{PackedExecution, SequenceDescriptor, invalid},
+};
 use tur_engine::hybrid::{
     Boundaries, HybridEngine, HybridModel, ModelState, PackedForward, PoolConfig, Reservation,
     SamplingOptions, SequenceForward, SequenceStep, StatePool,

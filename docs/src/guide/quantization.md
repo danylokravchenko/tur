@@ -11,6 +11,10 @@ blocks directly. A SafeTensors checkpoint can be packed in two ways:
 These are not GGUF imports, and `q4k` is Q4_K packing rather than a promise of
 llama.cpp's Q4_K_M recipe.
 
+Offline artifacts and calibration currently cover the Qwen family. Gemma 4 uses the
+same packed matrix formats through load-time conversion, but does not yet support
+`tur quantize` artifacts.
+
 ## Writing an artifact
 
 ```sh

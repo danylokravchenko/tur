@@ -3,7 +3,7 @@
 //! inter-token latency and pass counts. Every pass ends at device completion, so a step's
 //! wall time includes its GPU work. Prints one JSON document.
 //!
-//! `TUR_QWEN35_0_8B=<snapshot> cargo bench --offline -p tur --bench perf -- serving > out.json`
+//! `TUR_BENCH_MODEL=<snapshot> cargo bench --offline -p tur --bench perf -- serving > out.json`
 //! narrows with `TUR_BENCH_CONCURRENCY=1,8` and `TUR_BENCH_OUTPUT=64`.
 //! `TUR_BENCH_SAMPLING=0.7,20,0.95` samples instead of greedy decoding,
 //! `TUR_BENCH_DEVICE_SAMPLING=0` samples on the host, and
@@ -977,9 +977,9 @@ fn speculation_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
 }
 
 pub(crate) fn run() -> Result<()> {
-    let dir = std::env::var("TUR_QWEN35_0_8B")
+    let dir = std::env::var("TUR_BENCH_MODEL")
         .map(PathBuf::from)
-        .map_err(|_| invalid("set TUR_QWEN35_0_8B to a Qwen3.5-0.8B snapshot"))?;
+        .map_err(|_| invalid("set TUR_BENCH_MODEL to a validated text checkpoint"))?;
     let concurrency = env_sizes("TUR_BENCH_CONCURRENCY", "1,2,4,8,16")?;
     let output = env_sizes("TUR_BENCH_OUTPUT", "64")?
         .first()

@@ -81,6 +81,32 @@ pub enum TextModel {
     Gemma4(Box<Gemma4>),
 }
 impl TextModel {
+    /// Load a validated architecture from a local checkpoint using shared placement settings.
+    pub fn load(dir: &Path, options: &LoadOptions) -> Result<Self> {
+        ModelConfig::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?
+            .load(dir, options)
+    }
+    /// Device holding immutable weights and executing model passes.
+    pub fn device(&self) -> &candle_core::Device {
+        match self {
+            Self::Qwen35(m) => m.device(),
+            Self::Gemma4(m) => m.device(),
+        }
+    }
+    /// Resident bytes of projection matrices, excluding embeddings and auxiliary tensors.
+    pub fn projection_bytes(&self) -> usize {
+        match self {
+            Self::Qwen35(m) => m.projection_bytes(),
+            Self::Gemma4(m) => m.projection_bytes(),
+        }
+    }
+    /// Switch between the common Metal path and the numerical reference on the same weights.
+    pub fn with_execution(self, execution: super::Execution) -> Result<Self> {
+        match self {
+            Self::Qwen35(m) => Ok(Self::Qwen35(Box::new((*m).with_execution(execution)?))),
+            Self::Gemma4(m) => Ok(Self::Gemma4(Box::new((*m).with_execution(execution)?))),
+        }
+    }
     /// Device bytes held by loaded weights.
     pub fn weight_bytes(&self) -> usize {
         match self {

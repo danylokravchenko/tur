@@ -9,10 +9,10 @@ formats, read the matching chapter of the book in [docs/src](docs/src/SUMMARY.md
 ## Project
 
 Tur is a Rust (edition 2024, Rust 1.99+) inference engine for Apple Silicon. It serves
-Qwen3.5/3.8 hybrid text models (Gated DeltaNet plus gated attention) on fused Metal
-kernels over Candle, with paged K/V and recurrent state pools, packed continuous
-batching, prefix reuse, device sampling and exact speculative decoding. CPU execution
-exists only as a numerical reference for tests.
+Qwen3.5-family hybrid and Gemma 4 text models on shared Metal kernels over Candle,
+with paged K/V and recurrent state pools, packed continuous batching, prefix reuse,
+device sampling and exact speculative decoding. CPU execution exists only as a
+numerical reference for tests.
 
 ## Layout
 
@@ -20,7 +20,7 @@ exists only as a numerical reference for tests.
 crates/
   tur-core/    shared errors (TurError, Result) and checked packed-execution descriptors
   tur-metal/   state pools, completion fences, Metal runtime, MSL kernels, packed weights, sampler
-  tur-models/  checkpoint loading and validation, Qwen3.5 model, chat templates, tool parsing
+  tur-models/  checkpoint loading and validation, Qwen and Gemma models, chat templates, tool parsing
   tur-engine/  HybridEngine, scheduler, prefix cache, speculation, pipeline, memory plan
   tur/         facade re-exports and the HTTP server library
     tests/integration/   every crate's integration tests, one binary

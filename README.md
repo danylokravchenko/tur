@@ -88,6 +88,8 @@ For an OpenAI client, set the base URL to `http://127.0.0.1:8080/v1` and the mod
 | **Qwen3.5-0.8B** | Validated against Transformers per layer and in logits, on CPU and Metal. |
 | **Qwen3.8-27B** | Same code path; config and headers validated. Not yet executed; needs more than 16 GB. |
 | **Qwen3.6-35B-A3B (MoE)** | Experimental. |
+| **Gemma 4 E2B** | Text inference validated with a pinned Transformers reference; Q8_0 checkpoint generation tested. |
+| **Gemma 4 E4B / 12B / 26B-A4B / 31B** | Architecture fixtures and configuration coverage; full checkpoints not executed. |
 
 Tur currently accepts **text input only**. Inference runs on Metal; CPU execution serves as a numerical reference for tests.
 
@@ -156,7 +158,7 @@ Tests need direct Metal access on an Apple Silicon Mac. Real-checkpoint tests ru
 | --- | --- |
 | `tur-core` | Shared errors and checked packed-execution descriptors |
 | `tur-metal` | State pools, completion fences, Metal kernels, packed weights, sampler |
-| `tur-models` | Checkpoint loading and validation, Qwen3.5 model, templates, tools |
+| `tur-models` | Checkpoint loading and validation, Qwen and Gemma models, templates, tools |
 | `tur-engine` | Engine, scheduler, prefix cache, speculation, pipeline, memory plan |
 | `tur` | Facade and HTTP server; integration tests and benchmarks |
 | `tur-cli` | The `tur` binary |

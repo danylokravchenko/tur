@@ -5,6 +5,12 @@ Two contracts separate the model from the machinery that drives it: `HybridModel
 
 ## The model contract
 
+`InferencePipeline` owns a `HybridEngine<TextModel>`. The `TextModel` enum selects Qwen
+or Gemma at load time; the engine, scheduler, pool leases, completion fences, prefix
+snapshots and sampling remain shared. Gemma declares only physical attention-cache
+owners in `ModelDescription`, so its sharing suffix consumes no duplicate K/V state.
+
+
 ```rust,ignore
 pub trait HybridModel: Send + Sync + 'static {
     fn description(&self) -> ModelDescription;
@@ -103,3 +109,7 @@ never reused while possibly still referenced, and the quarantine is per engine.
   tokens are known. Host encoding is 13–25% of a pass but already overlaps the GPU, and
   the device idles only 28–38 µs between passes, so a deeper pipeline is bounded at about
   1.003× (see [Rejected experiments](../design/rejected.md)).
+
+- **One engine for Qwen and Gemma.** Architecture dispatch changes the layer equations,
+  while the checked packed-execution and completion contracts stay common. Gemma's
+  numerical fixtures and F32 chunk/batch/fork tests exercise that same contract.

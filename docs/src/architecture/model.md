@@ -1,9 +1,12 @@
 # Model and checkpoints
 
-Tur implements one model family: the Qwen3.5 hybrid decoder, used by Qwen3.5, Qwen3.8
-(dense) and Qwen3.6 (mixture-of-experts). The code is in `tur-models`.
+Tur implements Qwen3.5-family hybrid decoders and Gemma 4 text decoders in `tur-models`.
+`ModelConfig` selects the model-specific configuration from checkpoint fields;
+`TextModel` dispatches execution through the existing `HybridModel` contract.
+Both families use the same engine, state pools, memory planner, packed projections,
+streaming weight loader, norms, rotary operations and attention kernels.
 
-## Architecture
+## Qwen architecture
 
 The decoder stacks two kinds of layers in the order the checkpoint's `layer_types`
 lists:
@@ -20,6 +23,31 @@ sigmoid-gated shared expert. Qwen3.5 checkpoints also ship a one-layer
 multi-token-prediction (MTP) head, which Tur can load as a drafter (see
 [Speculative decoding](speculation.md)).
 
+## Gemma 4 architecture
+
+Gemma 4 interleaves sliding-window and full attention. It uses learned Q/K RMS norms,
+unscaled Q·K scores, an unweighted value RMS norm, GELU-gated feed-forward layers,
+pre- and post-sublayer norms, a learned layer scalar, scaled embeddings and final
+logit softcapping. Global heads use proportional RoPE: the rotated coordinates span
+halves of the full head, with zero frequencies for the unrotated pairs.
+
+E2B and E4B add per-layer embeddings (PLE): token-specific layer inputs combine with a
+normalized projection of the initial embedding. A gated projection injects each layer's
+PLE signal after its feed-forward update. E2B also doubles the MLP width in its K/V-sharing
+suffix. Sharing layers reuse the last non-sharing layer of the same attention kind;
+only physical K/V owners allocate pool state. Sliding layers retain their pages but mask
+keys outside the window. There is no token eviction or alternate cache owner.
+
+The 31B and 12B Unified text decoders share the dense equations without PLE. The
+26B-A4B branch adds normalized top-k experts, learned per-expert scales and separately
+normalized dense/routed branches. Global K=V reuses the raw key projection for values,
+before key normalization and RoPE. Vision and audio encoders are not executed.
+
+E2B is the real-checkpoint development model:
+`google/gemma-4-E2B-it@3e22461f65e89153144f8adb70e3b8c2cc9845a7`.
+The other sizes have configuration and small architecture-fixture coverage; their full
+checkpoints have not been executed.
+
 ## Two execution paths
 
 - **Fused** is the Metal path used for serving. Every layer runs once over the packed
@@ -31,7 +59,7 @@ multi-token-prediction (MTP) head, which Tur can load as a drafter (see
 
 ## Validation
 
-`Config::from_json` accepts a checkpoint only through its explicit architecture
+`ModelConfig::from_json` accepts a checkpoint only through its explicit architecture
 identifiers:
 
 | `model_type` | `architectures` |
@@ -40,8 +68,12 @@ identifiers:
 | `qwen3_5_text` | `Qwen3_5ForCausalLM` |
 | `qwen3_5_moe` | `Qwen3_5MoeForConditionalGeneration` (settings in `text_config`) |
 | `qwen3_5_moe_text` | `Qwen3_5MoeForCausalLM` |
+| `gemma4` | `Gemma4ForConditionalGeneration` (settings in `text_config`) |
+| `gemma4_text` | `Gemma4ForCausalLM` |
+| `gemma4_unified` | `Gemma4UnifiedForConditionalGeneration` (settings in `text_config`) |
+| `gemma4_unified_text` | `Gemma4UnifiedForCausalLM` |
 
-It then rejects anything Tur does not implement:
+The Qwen parser rejects settings outside its implemented equations:
 
 - quantization configs, RoPE scaling and sliding windows;
 - MoE settings on dense architectures, unnormalized routing and MLP-only layers;
@@ -49,6 +81,12 @@ It then rejects anything Tur does not implement:
 - non-F32 recurrent state dtypes;
 - inconsistent dimensions or head counts, invalid partial-rotary settings, and M-RoPE
   layouts other than interleaved text-only sections.
+
+Gemma validates its own head widths, sharing topology, PLE and expert dimensions,
+GELU activation, causal text attention, default local RoPE and proportional global RoPE.
+Attention biases, dropout, arbitrary RoPE scaling, bidirectional text attention and
+external quantization configurations are rejected. Gemma native MTP heads and offline
+prepacked artifacts are not implemented; use load-time conversion for Gemma weights.
 
 Every weight shape is derived and checked before any payload is read. SafeTensors files
 are discovered from the index, their headers validated, and payloads read without mmap.
@@ -62,9 +100,12 @@ downloaded, and the repository must report exactly the requested commit.
 - **Chat template.** The checkpoint's Jinja template (`chat_template.jinja`, or the one in
   `tokenizer_config.json`) renders every request with MiniJinja. Thinking controls are
   template variables. Nothing is appended to prompts, and a missing or invalid template
-  fails loading.
+  fails loading. Tokenizer special-token variables, including Gemma's `bos_token`,
+  are passed to the template; Python mapping `get` and string methods retain their semantics.
 - **Tools.** Function definitions are passed to the template. Generated Qwen XML tool
-  calls are parsed with argument types taken from each tool's JSON schema.
+  calls are parsed with argument types taken from each tool's JSON schema. Gemma
+  `call:name{...}` blocks use their typed argument grammar. Tool parsing decodes protocol
+  tokens separately, so special delimiters survive without appearing in user text.
 - **Text only.** Image, video, audio and vision-boundary token IDs from the config are
   forbidden in prompts, and multimodal content is rejected.
 
@@ -73,7 +114,9 @@ downloaded, and the repository must report exactly the requested commit.
 Projections are stored as F32, Q8_0 or Q4K blocks (`PackedLinear`). Embedding tables can
 also be BF16, Q6K or Q5K, or gathered from the packed LM head on tied checkpoints. See
 [Prepacked weights](../guide/quantization.md) for the formats and the offline
-quantizer.
+quantizer. Gemma supports load-time F32/Q8_0/Q4K conversion where matrix columns fit
+the block format; the 26B expert width supports Q8_0 but not Q4K. PLE tables stay BF16
+in packed modes and F32 in uniform F32 mode.
 
 ## Decisions
 
@@ -91,3 +134,13 @@ quantizer.
   encoders and position handling exist.
 - **Recurrent accumulation stays F32.** The checkpoint's state dtype is F32, and
   quantization error in recurrent state persists through every later update.
+- **Share execution infrastructure across model families.** Model-specific equations
+  remain in each adapter; weight plans, packing, tokenizer metadata and state ownership
+  have one common implementation.
+- **Gemma conformance and quantization quality are separate gates.** Small pinned
+  Transformers 5.20.2 F32 fixtures cover dense PLE/sharing, MoE and Unified equations
+  per layer and in logits on CPU and Metal at 1e-4 relative error. The real E2B Q8_0
+  checkpoint passes the existing 95% next-token agreement floor and greedy-prefix /
+  termination checks. This is a short conformance case, not a held-out quality study.
+- **Keep PLE buffers bounded.** Store each layer's columns separately and fence streamed
+  uploads before staging the next chunk; E2B's BF16 PLE table alone is 4.375 GiB.

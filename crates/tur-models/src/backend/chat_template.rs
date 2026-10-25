@@ -210,13 +210,22 @@ fn template_error(message: impl Into<String>) -> minijinja::Error {
     minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, message.into())
 }
 
-/// Python `str` methods used by chat templates, with Python semantics.
+/// Python string and mapping methods used by checkpoint templates.
 fn python_method(
     _: &minijinja::State<'_, '_>,
     value: &minijinja::Value,
     method: &str,
     args: &[minijinja::Value],
 ) -> std::result::Result<minijinja::Value, minijinja::Error> {
+    if value.kind() == minijinja::value::ValueKind::Map && method == "get" {
+        let (key, default) = match args {
+            [key] => (key, minijinja::Value::from(())),
+            [key, default] => (key, default.clone()),
+            _ => return Err(template_error("get needs a key and an optional default")),
+        };
+        let item = value.get_item(key)?;
+        return Ok(if item.is_undefined() { default } else { item });
+    }
     let Some(text) = value.as_str() else {
         return Err(minijinja::Error::from(minijinja::ErrorKind::UnknownMethod));
     };
@@ -338,6 +347,21 @@ mod tests {
             )?,
             "no"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_special_token_context_ignores_tokenizer_flags() -> Result<()> {
+        let template = ChatTemplate::from_template(
+            "{{ bos_token }}{{ eos_token }}{% if add_bos_token is defined %}flag{% endif %}",
+        )?
+        .with_tokens(&serde_json::json!({
+            "bos_token": "<bos>",
+            "eos_token": {"content": "<eos>"},
+            "add_bos_token": false,
+            "add_eos_token": true
+        }))?;
+        assert_eq!(template.render(&[], &[], &RenderOptions::default())?, "<bos><eos>");
         Ok(())
     }
 

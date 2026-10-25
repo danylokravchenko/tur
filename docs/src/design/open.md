@@ -6,7 +6,8 @@
   them. Measure quality, the K/V format choice (Q8 is the likely default under 16 GB) and
   the MoE wide tier, which trails Candle by 1.2–1.5× and needs trained routing traces.
 - **Flagship MTP head** for expert checkpoints.
-- **Gemma 4** as a separate architecture adapter, not a renamed Qwen model.
+- **Gemma 4 follow-through.** Execute larger checkpoints on suitable Macs; establish
+  held-out quality budgets, tune prefill, and add native MTP and offline prepacking.
 - **More devices.** Every number so far is from one M1. Launch shapes and crossovers
   need per-device sweeps, and the minimum supported macOS and chip still has to be
   decided.

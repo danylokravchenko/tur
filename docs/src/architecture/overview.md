@@ -7,7 +7,7 @@ tur-core     shared errors (TurError, Result) and checked packed-execution descr
    ↑
 tur-metal    state pools, completion fences, Metal runtime and kernels, packed weights, sampler
    ↑
-tur-models   checkpoint validation and loading, the Qwen3.5 model, chat templates, tool parsing
+tur-models   checkpoint validation and loading, Qwen and Gemma text models, chat templates, tool parsing
    ↑
 tur-engine   HybridEngine, scheduler, prefix cache, speculation, InferencePipeline, memory plan
    ↑

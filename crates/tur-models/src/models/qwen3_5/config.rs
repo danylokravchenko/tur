@@ -241,31 +241,11 @@ impl Config {
         tokenizer_config: &str,
         tokenizer: &str,
     ) -> Result<()> {
-        let config: serde_json::Value = serde_json::from_str(tokenizer_config)?;
-        let tokenizer: serde_json::Value = serde_json::from_str(tokenizer)?;
-        let Some(extra) = config["extra_special_tokens"].as_object() else {
-            return Ok(());
-        };
-        let names: Vec<&str> = extra
-            .iter()
-            .filter(|(key, _)| {
-                ["audio", "image", "video", "vision"]
-                    .iter()
-                    .any(|m| key.starts_with(m))
-            })
-            .filter_map(|(_, value)| value.as_str())
-            .collect();
-        for added in tokenizer["added_tokens"].as_array().into_iter().flatten() {
-            let (Some(content), Some(id)) = (added["content"].as_str(), added["id"].as_u64())
-            else {
-                continue;
-            };
-            let id = u32::try_from(id).map_err(|_| invalid("added token overflow"))?;
-            if names.contains(&content) && !self.forbidden_tokens.contains(&id) {
-                self.forbidden_tokens.push(id);
-            }
-        }
-        Ok(())
+        crate::models::generation::forbid_tokenizer_modalities(
+            &mut self.forbidden_tokens,
+            tokenizer_config,
+            tokenizer,
+        )
     }
 
     /// Merge checkpoint sampling defaults with architecture stop tokens.
