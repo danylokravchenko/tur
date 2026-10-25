@@ -121,7 +121,8 @@ impl ChatTemplate {
 
     fn with_tokens(mut self, config: &serde_json::Value) -> Result<Self> {
         for (name, value) in config.as_object().into_iter().flatten() {
-            if !name.ends_with("_token") || value.is_null() {
+            // Tokenizer insertion policies are not special-token template variables.
+            if !name.ends_with("_token") || name.starts_with("add_") || value.is_null() {
                 continue;
             }
             let token = value
@@ -361,7 +362,10 @@ mod tests {
             "add_bos_token": false,
             "add_eos_token": true
         }))?;
-        assert_eq!(template.render(&[], &[], &RenderOptions::default())?, "<bos><eos>");
+        assert_eq!(
+            template.render(&[], &[], &RenderOptions::default())?,
+            "<bos><eos>"
+        );
         Ok(())
     }
 
