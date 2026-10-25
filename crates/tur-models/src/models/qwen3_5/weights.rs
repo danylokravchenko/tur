@@ -203,6 +203,40 @@ impl Checkpoint {
         )?)
     }
 
+    /// Gather only requested embedding rows, preserving token order and repetitions.
+    pub(super) fn gather_rows(&self, name: &str, ids: &[u32]) -> Result<Tensor> {
+        let (entry, mut file) = self.locate(name)?;
+        let [rows, cols] = entry.shape.as_slice() else {
+            return Err(invalid("embedding is not a matrix"));
+        };
+        let dtype = entry.candle_dtype(name)?;
+        let row_bytes = cols
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| invalid("embedding row size overflow"))?;
+        let size = ids
+            .len()
+            .checked_mul(row_bytes)
+            .ok_or_else(|| invalid("embedding sample size overflow"))?;
+        if ids.iter().any(|&id| id as usize >= *rows) {
+            return Err(invalid("embedding token outside vocabulary"));
+        }
+        let mut bytes = vec![0; size];
+        for (&id, row) in ids.iter().zip(bytes.chunks_exact_mut(row_bytes)) {
+            let offset = u64::from(id)
+                .checked_mul(row_bytes as u64)
+                .and_then(|offset| entry.offset.checked_add(offset))
+                .ok_or_else(|| invalid("embedding row offset overflow"))?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(row)?;
+        }
+        Ok(Tensor::from_raw_buffer(
+            &bytes,
+            dtype,
+            &[ids.len(), *cols],
+            &Device::Cpu,
+        )?)
+    }
+
     /// Read a matrix, or a stack of matrices as one `[Σ rows, cols]` matrix, `chunk`
     /// rows at a time: packing can release each chunk before the next is read, so no
     /// projection needs its full-precision payload in host memory at once.

@@ -13,6 +13,7 @@ use tur_engine::hybrid::HybridModel;
 use tur_models::models::qwen3_5::{
     Config, Conversion, Embedding, Execution, LoadOptions, Manifest, Method, Packer, Precision,
     Qwen35, Reference, WeightFormat, WeightPlan, Weights, allocate, sensitivities, write_artifact,
+    write_calibrated_artifact,
 };
 
 /// Two recurrent and two attention layers, every width a multiple of 256.
@@ -250,6 +251,135 @@ fn test_calibration_records_every_projection_input() -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_streamed_calibration_packs_the_same_weights_as_resident_calibration() -> Result<()> {
+    let _gpu = GPU.lock();
+    for (json, tied) in [(SMALL, false), (SMALL, true), (MOE, false)] {
+        let json = json.replace(
+            "\"tie_word_embeddings\": false",
+            &format!("\"tie_word_embeddings\": {tied}"),
+        );
+        let source = checkpoint(&json, 0.05, 0.1)?;
+        let config = Config::from_json(&json)?;
+        let plan = WeightPlan {
+            embedding: if tied {
+                Embedding::Head
+            } else {
+                Embedding::Table(Precision::Bf16)
+            },
+            ..WeightPlan::uniform(&config, WeightFormat::Q4K)?
+        };
+        let data = vec![vec![2, 8, 2], vec![5], vec![7, 11, 3, 2, 7]];
+        for device in [Device::Cpu, Device::new_metal(0)?] {
+            let model = load(&source.0, WeightFormat::F32.into(), &device)?;
+            for method in [Method::Imatrix, Method::Gptq] {
+                let calibration = model.calibrate(&data, method == Method::Gptq)?;
+                let packer = Packer {
+                    method,
+                    damp: 0.01,
+                    calibration: Some(&calibration),
+                };
+                let (expected, manifest) = artifact(&source, &plan, &packer)?;
+                let output = Checkpoint(
+                    source
+                        .0
+                        .with_extension(format!("stream-{}", uuid::Uuid::new_v4())),
+                );
+                let actual = write_calibrated_artifact(
+                    &Conversion {
+                        source: &source.0,
+                        identity: "fixture@0",
+                        output: &output.0,
+                        calibration: "synthetic token sequences",
+                    },
+                    &plan,
+                    &Packer {
+                        calibration: None,
+                        ..packer
+                    },
+                    &data,
+                    &device,
+                )?;
+                assert_eq!(actual, manifest);
+                // Compare stored payloads, independently of loading and inference.
+                let expected = candle_core::safetensors::load(
+                    expected.0.join(tur_models::models::qwen3_5::ARTIFACT_FILE),
+                    &Device::Cpu,
+                )?;
+                let actual = candle_core::safetensors::load(
+                    output.0.join(tur_models::models::qwen3_5::ARTIFACT_FILE),
+                    &Device::Cpu,
+                )?;
+                assert_eq!(actual.len(), expected.len());
+                for (name, expected) in expected {
+                    let actual = &actual[&name];
+                    assert_eq!(actual.dims(), expected.dims(), "{name}");
+                    assert_eq!(actual.dtype(), expected.dtype(), "{name}");
+                    let actual = actual
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    let expected = expected
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    assert!(actual == expected, "{name} {method:?} {device:?}");
+                }
+                assert!(
+                    !std::fs::read_dir(&output.0)?.any(|entry| entry.is_ok_and(|e| e
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".tur-calibration-")))
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_streamed_packing_failure_cleans_activations_without_publishing_an_artifact() -> Result<()> {
+    let source = small(false)?;
+    let config = Config::from_json(SMALL)?;
+    let plan = WeightPlan::uniform(&config, WeightFormat::Q4K)?;
+    let output = Checkpoint(source.0.with_extension("failed-stream"));
+    let result = write_calibrated_artifact(
+        &Conversion {
+            source: &source.0,
+            identity: "fixture@0",
+            output: &output.0,
+            calibration: "synthetic token sequences",
+        },
+        &plan,
+        &Packer {
+            method: Method::Gptq,
+            damp: 0.0,
+            calibration: None,
+        },
+        &[vec![2, 3, 2]],
+        &Device::Cpu,
+    );
+    assert!(matches!(
+        result,
+        Err(tur_core::TurError::InvalidExecution(_))
+    ));
+    assert!(
+        !output
+            .0
+            .join(tur_models::models::qwen3_5::ARTIFACT_FILE)
+            .exists()
+    );
+    for entry in std::fs::read_dir(&output.0)? {
+        assert!(
+            !entry?
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tur-calibration-")
+        );
     }
     Ok(())
 }

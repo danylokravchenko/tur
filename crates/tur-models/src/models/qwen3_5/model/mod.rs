@@ -6,7 +6,6 @@
 
 use super::{
     artifact::{self, Manifest},
-    calibration::{Calibration, Recorder},
     config::{Config, LayerKind, Projection},
     math::{self, DeltaInputs},
     plan::{self, Embedding, Precision, WeightPlan},
@@ -17,6 +16,7 @@ use crate::hybrid::{
     Addresses, Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward,
     SequenceForward, SequenceStep, StatePool,
 };
+use crate::quantization::{Calibration, Recorder};
 use candle_core::{DType, Device, Tensor};
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 use tur_core::{
@@ -73,6 +73,8 @@ macro_rules! projections {
         }
     }};
 }
+
+pub(super) mod streaming;
 
 /// Storage for projection matrices. Norms, gates, convolution and state stay F32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,6 +238,77 @@ struct Layer {
     post_norm: Tensor,
     mixer: Mixer,
     mlp: Mlp,
+}
+
+impl Layer {
+    fn load(tensors: &Tensors, config: &Config, i: usize) -> Result<Self> {
+        let device = &tensors.device;
+        let prefix = config.text_prefix();
+        let kind = &config.layer_kinds()[i];
+        let p = format!("{prefix}.layers.{i}");
+        let mixer = match kind {
+            LayerKind::FullAttention => {
+                Mixer::Attention(load_attention(tensors, &format!("{p}.self_attn"), device)?)
+            }
+            LayerKind::LinearAttention => {
+                let l = format!("{p}.linear_attn");
+                let conv = tensors.take(&format!("{l}.conv1d.weight"))?;
+                let a_log = tensors.take(&format!("{l}.A_log"))?.to_dtype(DType::F32)?;
+                Mixer::Delta(DeltaNet {
+                    proj: tensors.projection(&format!("{l}.in_proj"))?,
+                    conv: f32_on(&conv.squeeze(1)?, device)?,
+                    neg_a: a_log.exp()?.neg()?.to_device(device)?,
+                    dt_bias: f32_on(&tensors.take(&format!("{l}.dt_bias"))?, device)?,
+                    norm: f32_on(&tensors.take(&format!("{l}.norm.weight"))?, device)?,
+                    out: tensors.projection(&format!("{l}.out_proj"))?,
+                })
+            }
+        };
+        let mlp = match config.moe {
+            Some(settings) => Mlp::Moe(Box::new(moe::Moe::load(
+                tensors,
+                &format!("{p}.mlp"),
+                settings,
+                device,
+            )?)),
+            None => Mlp::Dense(DenseMlp::load(tensors, &format!("{p}.mlp"))?),
+        };
+        Ok(Self {
+            input_norm: centred(
+                &tensors.take(&format!("{p}.input_layernorm.weight"))?,
+                device,
+            )?,
+            post_norm: centred(
+                &tensors.take(&format!("{p}.post_attention_layernorm.weight"))?,
+                device,
+            )?,
+            mixer,
+            mlp,
+        })
+    }
+    fn reference(
+        &self,
+        dims: Dims,
+        x: Tensor,
+        pass: &Pass<'_, '_>,
+        index: usize,
+        recorder: Option<&Recorder>,
+    ) -> Result<Tensor> {
+        let h = math::rms(&x, &self.input_norm, dims.eps)?;
+        let mixed = match &self.mixer {
+            Mixer::Attention(a) => {
+                let rotary =
+                    math::rotary_tables(&pass.positions, dims.rotary_dim, dims.theta, x.device())?;
+                Qwen35::attention(dims, a, &h, &rotary, pass.pool, index, pass.spans, recorder)?
+            }
+            Mixer::Delta(net) => {
+                Qwen35::delta(dims, net, &h, pass.pool, index, pass.spans, recorder)?
+            }
+        };
+        let x = (x + mixed)?;
+        let h = math::rms(&x, &self.post_norm, dims.eps)?;
+        Ok((&x + Qwen35::mlp(self, &h, recorder)?)?)
+    }
 }
 
 struct DenseMlp {
@@ -627,47 +700,8 @@ impl Qwen35 {
         let dims = Dims::new(&config)?;
         let prefix = config.text_prefix().to_string();
         let mut layers = Vec::with_capacity(config.layer_kinds().len());
-        for (i, kind) in config.layer_kinds().iter().enumerate() {
-            let p = format!("{prefix}.layers.{i}");
-            let mixer = match kind {
-                LayerKind::FullAttention => {
-                    Mixer::Attention(load_attention(&tensors, &format!("{p}.self_attn"), device)?)
-                }
-                LayerKind::LinearAttention => {
-                    let l = format!("{p}.linear_attn");
-                    let conv = tensors.take(&format!("{l}.conv1d.weight"))?;
-                    let a_log = tensors.take(&format!("{l}.A_log"))?.to_dtype(DType::F32)?;
-                    Mixer::Delta(DeltaNet {
-                        proj: tensors.projection(&format!("{l}.in_proj"))?,
-                        conv: f32_on(&conv.squeeze(1)?, device)?,
-                        neg_a: a_log.exp()?.neg()?.to_device(device)?,
-                        dt_bias: f32_on(&tensors.take(&format!("{l}.dt_bias"))?, device)?,
-                        norm: f32_on(&tensors.take(&format!("{l}.norm.weight"))?, device)?,
-                        out: tensors.projection(&format!("{l}.out_proj"))?,
-                    })
-                }
-            };
-            let mlp = match config.moe {
-                Some(settings) => Mlp::Moe(Box::new(moe::Moe::load(
-                    &tensors,
-                    &format!("{p}.mlp"),
-                    settings,
-                    device,
-                )?)),
-                None => Mlp::Dense(DenseMlp::load(&tensors, &format!("{p}.mlp"))?),
-            };
-            layers.push(Layer {
-                input_norm: centred(
-                    &tensors.take(&format!("{p}.input_layernorm.weight"))?,
-                    device,
-                )?,
-                post_norm: centred(
-                    &tensors.take(&format!("{p}.post_attention_layernorm.weight"))?,
-                    device,
-                )?,
-                mixer,
-                mlp,
-            });
+        for i in 0..config.layer_kinds().len() {
+            layers.push(Layer::load(&tensors, &config, i)?);
         }
         let mtp = if config.mtp() {
             let p = "mtp.layers.0";
@@ -1023,7 +1057,7 @@ impl Qwen35 {
         reason = "mirrors the fused attention's inputs for differential tests"
     )]
     fn attention(
-        &self,
+        d: Dims,
         a: &Attention,
         h: &Tensor,
         rotary: &(Tensor, Tensor),
@@ -1032,7 +1066,6 @@ impl Qwen35 {
         spans: &[Span<'_>],
         recorder: Option<&Recorder>,
     ) -> Result<Tensor> {
-        let d = self.dims;
         let n = h.dim(0)?;
         if let Some(recorder) = recorder {
             recorder.record(&a.q, h)?;
@@ -1085,7 +1118,7 @@ impl Qwen35 {
     }
 
     fn delta(
-        &self,
+        d: Dims,
         net: &DeltaNet,
         h: &Tensor,
         pool: &StatePool,
@@ -1093,7 +1126,6 @@ impl Qwen35 {
         spans: &[Span<'_>],
         recorder: Option<&Recorder>,
     ) -> Result<Tensor> {
-        let d = self.dims;
         let n = h.dim(0)?;
         if let Some(recorder) = recorder {
             recorder.record(&net.proj, h)?;
@@ -1242,21 +1274,10 @@ impl Qwen35 {
         recorder: Option<&Recorder>,
     ) -> Result<(Tensor, Option<Tensor>)> {
         let d = self.dims;
-        let spans = pass.spans;
         let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
         let mut x = self.embedding(&ids)?;
-        let rotary = math::rotary_tables(&pass.positions, d.rotary_dim, d.theta, &self.device)?;
         for (index, layer) in self.layers.iter().enumerate() {
-            let h = math::rms(&x, &layer.input_norm, d.eps)?;
-            let mixed = match &layer.mixer {
-                Mixer::Attention(a) => {
-                    self.attention(a, &h, &rotary, pass.pool, index, spans, recorder)?
-                }
-                Mixer::Delta(net) => self.delta(net, &h, pass.pool, index, spans, recorder)?,
-            };
-            x = (x + mixed)?;
-            let h = math::rms(&x, &layer.post_norm, d.eps)?;
-            x = (&x + Self::mlp(layer, &h, recorder)?)?;
+            x = layer.reference(self.dims, x, pass, index, recorder)?;
             if let Some(trace) = trace.as_mut() {
                 trace.push(x.clone());
             }
@@ -1341,7 +1362,8 @@ impl Qwen35 {
         };
         let rotary = math::rotary_tables(&pass.positions, d.rotary_dim, d.theta, &self.device)?;
         let h = math::rms(&x, &mtp.layer.input_norm, d.eps)?;
-        x = (x + self.attention(
+        x = (x + Self::attention(
+            self.dims,
             a,
             &h,
             &rotary,

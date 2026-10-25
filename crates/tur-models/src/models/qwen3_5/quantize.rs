@@ -4,11 +4,12 @@
 use super::{
     Qwen35,
     artifact::{self, CalibrationInfo, Manifest, Quantizer, Writer},
-    calibration::{Calibration, Site},
     config::{Config, Projection},
+    model::streaming::calibrate_layers,
     plan::{Embedding, Precision, WeightPlan},
     weights::Checkpoint,
 };
+use crate::quantization::{Calibration, Site};
 use candle_core::{D, DType, Device, Tensor};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
@@ -95,6 +96,22 @@ impl Packer<'_> {
         projection: &Projection,
         precision: Precision,
     ) -> Result<Packed> {
+        let mut packed = Vec::new();
+        self.pack_chunks(checkpoint, projection, precision, |bytes| {
+            packed.extend_from_slice(bytes);
+            Ok(())
+        })?;
+        Ok(finish(packed, precision))
+    }
+
+    /// Share rounding and chunk order between in-memory loading and streamed artifacts.
+    fn pack_chunks(
+        &self,
+        checkpoint: &Checkpoint,
+        projection: &Projection,
+        precision: Precision,
+        mut consume: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
         let per_expert = projection.rows / projection.experts;
         let chunk = if projection.experts > 1 {
             per_expert
@@ -102,7 +119,6 @@ impl Packer<'_> {
             (STAGING_BYTES / (projection.cols * 4)).max(1)
         };
         let gptq = self.factor(projection)?;
-        let mut packed = Vec::new();
         let mut row = 0;
         for (part, _) in &projection.parts {
             for rows in checkpoint.take_rows(part, chunk)? {
@@ -112,6 +128,7 @@ impl Packer<'_> {
                     .to_vec1::<f32>()?;
                 let expert = row / per_expert;
                 row += values.len() / projection.cols;
+                let mut packed = Vec::new();
                 self.pack_rows(
                     &values,
                     projection,
@@ -120,9 +137,34 @@ impl Packer<'_> {
                     gptq.as_ref(),
                     &mut packed,
                 )?;
+                consume(&packed)?;
             }
         }
-        Ok(finish(packed, precision))
+        Ok(())
+    }
+
+    fn write(
+        &self,
+        checkpoint: &Checkpoint,
+        projection: &Projection,
+        precision: Precision,
+        writer: &mut Writer,
+    ) -> Result<()> {
+        let (dtype, shape) = match precision.ggml() {
+            Some(_) => (
+                safetensors::Dtype::U8,
+                vec![projection.rows, precision.bytes(1, projection.cols)?],
+            ),
+            None => (
+                safetensors::Dtype::F32,
+                vec![projection.rows, projection.cols],
+            ),
+        };
+        writer.put_stream(&projection.name, dtype, shape, |out| {
+            self.pack_chunks(checkpoint, projection, precision, |bytes| {
+                Ok(out.write_all(bytes)?)
+            })
+        })
     }
 
     /// Pack in-memory row-major `values` of `projection` with its precomputed `gptq` factor.
@@ -242,29 +284,91 @@ pub fn write_artifact(
     plan.validate(&config)?;
     let checkpoint = Checkpoint::open(conversion.source, &config)?;
     let mut writer = Writer::create(conversion.source, conversion.output)?;
-    let projections = config.projections()?;
-    let mut parts = std::collections::BTreeSet::new();
-    for projection in &projections {
-        parts.extend(projection.parts.iter().map(|(name, _)| name.clone()));
-        let precision = plan.precision(&projection.name)?;
-        match packer.pack(&checkpoint, projection, precision)? {
-            Packed::Blocks(bytes) => writer.put(
-                &projection.name,
-                safetensors::Dtype::U8,
-                vec![projection.rows, bytes.len() / projection.rows],
-                &bytes,
-            )?,
-            Packed::Dense(values) => writer.put(
-                &projection.name,
-                safetensors::Dtype::F32,
-                vec![projection.rows, projection.cols],
-                &values
-                    .iter()
-                    .flat_map(|v| v.to_le_bytes())
-                    .collect::<Vec<_>>(),
-            )?,
-        }
+    for projection in config.projections()? {
+        packer.write(
+            &checkpoint,
+            &projection,
+            plan.precision(&projection.name)?,
+            &mut writer,
+        )?;
     }
+    finish_artifact(conversion, &config, plan, packer, &checkpoint, writer)
+}
+
+/// Calibrate and pack one F32 layer at a time. Hidden states are spooled in temporary
+/// files under the output directory and removed on success or failure. Peak memory
+/// includes one F32 layer, its statistics and one calibration sample, never the full
+/// F32 model or all layers' Hessians. The MTP head is packed without calibration.
+/// `packer.calibration` must be `None`; statistics come from `samples`.
+pub fn write_calibrated_artifact(
+    conversion: &Conversion<'_>,
+    plan: &WeightPlan,
+    packer: &Packer<'_>,
+    samples: &[Vec<u32>],
+    device: &Device,
+) -> Result<Manifest> {
+    if packer.calibration.is_some() {
+        return Err(invalid("streaming conversion collects its own calibration"));
+    }
+    let config = artifact_config(conversion.source)?;
+    plan.validate(&config)?;
+    let checkpoint = Checkpoint::open(conversion.source, &config)?;
+    let mut writer = Writer::create(conversion.source, conversion.output)?;
+    let projections = config.projections()?;
+    let info = calibrate_layers(
+        conversion.source,
+        &config,
+        samples,
+        packer.method == Method::Gptq,
+        device,
+        conversion.output,
+        |calibration| {
+            let packer = Packer {
+                calibration: Some(calibration),
+                ..*packer
+            };
+            for projection in projections
+                .iter()
+                .filter(|p| calibration.sites.contains_key(&p.name))
+            {
+                packer.write(
+                    &checkpoint,
+                    projection,
+                    plan.precision(&projection.name)?,
+                    &mut writer,
+                )?;
+            }
+            Ok(())
+        },
+    )?;
+    for projection in projections.iter().filter(|p| p.name.starts_with("mtp.")) {
+        packer.write(
+            &checkpoint,
+            projection,
+            plan.precision(&projection.name)?,
+            &mut writer,
+        )?;
+    }
+    let packer = Packer {
+        calibration: Some(&info),
+        ..*packer
+    };
+    finish_artifact(conversion, &config, plan, &packer, &checkpoint, writer)
+}
+
+fn finish_artifact(
+    conversion: &Conversion<'_>,
+    config: &Config,
+    plan: &WeightPlan,
+    packer: &Packer<'_>,
+    checkpoint: &Checkpoint,
+    mut writer: Writer,
+) -> Result<Manifest> {
+    let parts: std::collections::BTreeSet<_> = config
+        .projections()?
+        .into_iter()
+        .flat_map(|p| p.parts.into_iter().map(|(name, _)| name))
+        .collect();
     let embedding = config.embedding_name();
     if let Embedding::Table(precision) = plan.embedding {
         let table = Projection {
@@ -274,29 +378,23 @@ pub fn write_artifact(
             cols: config.hidden_size(),
             experts: 1,
         };
-        let (dtype, shape, bytes) = match precision {
-            Precision::Bf16 => {
-                let table = checkpoint.take(&embedding)?.to_dtype(DType::BF16)?;
-                (
-                    safetensors::Dtype::BF16,
-                    vec![config.vocab_size(), config.hidden_size()],
-                    bf16_bytes(&table)?,
-                )
-            }
-            precision => match Packer::RTN.pack(&checkpoint, &table, precision)? {
-                Packed::Blocks(bytes) => (
-                    safetensors::Dtype::U8,
-                    vec![table.rows, bytes.len() / table.rows],
-                    bytes,
-                ),
-                Packed::Dense(values) => (
-                    safetensors::Dtype::F32,
-                    vec![table.rows, table.cols],
-                    values.iter().flat_map(|v| v.to_le_bytes()).collect(),
-                ),
-            },
-        };
-        writer.put(&embedding, dtype, shape, &bytes)?;
+        if precision == Precision::Bf16 {
+            writer.put_stream(
+                &embedding,
+                safetensors::Dtype::BF16,
+                vec![table.rows, table.cols],
+                |out| {
+                    for rows in checkpoint
+                        .take_rows(&embedding, (STAGING_BYTES / (table.cols * 4)).max(1))?
+                    {
+                        out.write_all(&bf16_bytes(&rows?.to_dtype(DType::BF16)?)?)?;
+                    }
+                    Ok(())
+                },
+            )?;
+        } else {
+            Packer::RTN.write(checkpoint, &table, precision, &mut writer)?;
+        }
     }
     for name in config.weight_shapes()?.into_keys() {
         if parts.contains(&name) || name == embedding {
@@ -323,7 +421,7 @@ pub fn write_artifact(
         }),
         plan: plan.clone(),
     };
-    writer.finish(&manifest, &config)?;
+    writer.finish(&manifest, config)?;
     Ok(manifest)
 }
 

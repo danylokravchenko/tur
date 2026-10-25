@@ -11,7 +11,7 @@ use super::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    io::{BufWriter, Read, Write},
+    io::{BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
 };
 use tur_core::{Result, execution::invalid};
@@ -244,8 +244,30 @@ impl Writer {
         shape: Vec<usize>,
         bytes: &[u8],
     ) -> Result<()> {
-        self.data.write_all(bytes)?;
-        let end = self.offset + bytes.len();
+        self.put_stream(name, dtype, shape, |out| Ok(out.write_all(bytes)?))
+    }
+
+    /// Write a tensor in bounded chunks without retaining its complete payload.
+    pub(super) fn put_stream(
+        &mut self,
+        name: &str,
+        dtype: safetensors::Dtype,
+        shape: Vec<usize>,
+        write: impl FnOnce(&mut dyn Write) -> Result<()>,
+    ) -> Result<()> {
+        let size = tur_core::execution::checked_elements(&shape)?
+            .checked_mul(dtype.bitsize() / 8)
+            .ok_or_else(|| invalid("artifact tensor size overflow"))?;
+        let end = self
+            .offset
+            .checked_add(size)
+            .ok_or_else(|| invalid("artifact payload size overflow"))?;
+        write(&mut self.data)?;
+        if self.data.stream_position()? != end as u64 {
+            return Err(invalid(format!(
+                "artifact tensor {name} has an incorrect payload size"
+            )));
+        }
         self.entries
             .push((name.to_owned(), dtype, shape, self.offset, end));
         self.offset = end;

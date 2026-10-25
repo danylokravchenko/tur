@@ -52,9 +52,25 @@ path and renamed into place, so a failed run leaves no half-written artifact.
 Every method emits ordinary GGML blocks, so the same kernels execute the result, and
 decode speed is unchanged at equal formats.
 
-Calibration text must never overlap the text you evaluate quality on. Calibration runs
-the F32 reference model over the samples, so it needs memory for the F32 weights; it does
-not yet scale to the 27B flagship on a 16 GB Mac.
+Calibration text must never overlap the text you evaluate quality on. Without
+`--budget-bits`, GPTQ and imatrix load one F32 layer, run the calibration samples through
+it, release it, and pack its projections before loading the next layer. Later layers
+receive the unquantized reference activations, preserving resident calibration's
+statistics. Embeddings are gathered directly from the checkpoint; calibrating the LM
+head does not load its weights. Artifact payloads are written in chunks, including
+embedding tables.
+
+Peak memory depends on the largest F32 layer, its input statistics and one sample's
+execution workspace. GPTQ also needs that layer's Hessians and one projection's
+factorization workspace. These still need to fit; a large MoE layer can remain limiting.
+Use `imatrix` to avoid Hessians, or `rtn` to avoid calibration entirely. Reducing
+`--sample-tokens` reduces activation workspace.
+
+Hidden states are spooled to two temporary files under the output directory, requiring
+up to `2 × calibration_tokens × hidden_size × 4` additional disk bytes. They are removed
+on success and ordinary errors. A forcibly terminated process can leave a
+`.tur-calibration-*` directory that can be deleted before retrying. Artifact publication
+also needs space for both the temporary payload and the completed weights file.
 
 ## Mixed precision
 
@@ -64,6 +80,8 @@ projections from `--weight-format` to `q8_0`, applying the largest divergence re
 per added byte first, until the budget is spent. The allocation assumes divergences add,
 which the measurements show is only approximately true. Q5K and Q6K are
 available only for embedding tables, because Tur has no small-batch kernels for them.
+This whole-model sensitivity measurement still keeps the complete F32 model and all
+calibration statistics in memory; `--budget-bits` does not use layer-wise calibration.
 
 ## Decisions
 
@@ -74,6 +92,12 @@ Measured on Qwen3.5-0.8B on an M1:
 - **GPTQ is the default artifact method.** At equal bytes it cuts Q4K's KL divergence
   from F32 by 49–59% on held-out prose, code and retrieval text, and by 12% on tool/JSON
   text, where it ties with `imatrix`.
+- **Uniform calibrated conversion streams layers.** Shared calibration infrastructure
+  owns disk-backed activations and layer/statistics lifetimes; model adapters supply
+  loading and reference execution. Dense, tied and MoE fixture payloads match resident
+  calibration on CPU and Metal for GPTQ and imatrix. This removes the whole-model F32
+  requirement without calibrating against already quantized layers. Large-checkpoint
+  peak memory has not yet been measured.
 - **Mixed precision is opt-in.** At 5.5 bits per weight, KL falls another 34–58% for 23%
   more resident bytes, at 0.86× single-sequence decode speed.
 - **Tied checkpoints gather embeddings from the packed LM head** (`--embedding head`, the

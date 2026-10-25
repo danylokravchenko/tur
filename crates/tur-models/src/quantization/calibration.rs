@@ -38,7 +38,14 @@ pub struct Calibration {
     pub fingerprint: u64,
 }
 
+#[derive(Hash, PartialEq, Eq)]
+enum Identity {
+    Projection(usize),
+    Named(String),
+}
+
 struct Accumulator {
+    cols: usize,
     tokens: Vec<usize>,
     squares: Vec<Option<Tensor>>,
     hessian: Option<Tensor>,
@@ -46,13 +53,13 @@ struct Accumulator {
 
 /// Sums inputs on the device during reference passes, keyed by weight identity; names
 /// are attached afterwards from the model's projection order.
-pub(super) struct Recorder {
+pub(crate) struct Recorder {
     hessians: bool,
-    sums: RefCell<HashMap<usize, Accumulator>>,
+    sums: RefCell<HashMap<Identity, Accumulator>>,
 }
 
 impl Recorder {
-    pub(super) fn new(hessians: bool) -> Self {
+    pub(crate) fn new(hessians: bool) -> Self {
         Self {
             hessians,
             sums: RefCell::new(HashMap::new()),
@@ -60,36 +67,52 @@ impl Recorder {
     }
 
     /// Record the `[rows, in]` input of `layer`.
-    pub(super) fn record(&self, layer: &PackedLinear, x: &Tensor) -> Result<()> {
+    pub(crate) fn record(&self, layer: &PackedLinear, x: &Tensor) -> Result<()> {
         self.record_expert(layer, 0, 1, x)
     }
 
     /// Record the input routed to `expert` of `experts` sharing the stacked `layer`.
     /// Second moments are kept for ordinary projections only.
-    pub(super) fn record_expert(
+    pub(crate) fn record_expert(
         &self,
         layer: &PackedLinear,
         expert: usize,
         experts: usize,
         x: &Tensor,
     ) -> Result<()> {
-        let x = x.to_dtype(DType::F32)?.contiguous()?;
-        let rows = x.dim(0)?;
         if x.dim(1)? != layer.in_features() || expert >= experts {
             return Err(invalid("calibration input does not match its projection"));
         }
+        self.accumulate(
+            Identity::Projection(std::ptr::from_ref(layer).addr()),
+            expert,
+            experts,
+            x,
+        )
+    }
+
+    /// Record a named projection input without loading weights that are never multiplied.
+    pub(crate) fn record_named(&self, name: &str, x: &Tensor) -> Result<()> {
+        self.accumulate(Identity::Named(name.to_owned()), 0, 1, x)
+    }
+
+    fn accumulate(&self, key: Identity, expert: usize, experts: usize, x: &Tensor) -> Result<()> {
+        let x = x.to_dtype(DType::F32)?.contiguous()?;
+        let rows = x.dim(0)?;
+        let cols = x.dim(1)?;
         let mut sums = self.sums.borrow_mut();
-        let entry = sums
-            .entry(std::ptr::from_ref(layer).addr())
-            .or_insert_with(|| Accumulator {
-                tokens: vec![0; experts],
-                squares: vec![None; experts],
-                hessian: None,
-            });
-        if entry.tokens.len() != experts {
-            return Err(invalid("calibration expert count changed"));
+        let entry = sums.entry(key).or_insert_with(|| Accumulator {
+            cols,
+            tokens: vec![0; experts],
+            squares: vec![None; experts],
+            hessian: None,
+        });
+        if entry.tokens.len() != experts || entry.cols != cols {
+            return Err(invalid("calibration input dimensions changed"));
         }
-        entry.tokens[expert] += rows;
+        entry.tokens[expert] = entry.tokens[expert]
+            .checked_add(rows)
+            .ok_or_else(|| invalid("calibration token count overflow"))?;
         let squares = x.sqr()?.sum(0)?;
         entry.squares[expert] = Some(match entry.squares[expert].take() {
             Some(sum) => (sum + squares)?,
@@ -106,7 +129,7 @@ impl Recorder {
     }
 
     /// Normalise the sums into means and name them by `projections`.
-    pub(super) fn finish(
+    pub(crate) fn finish(
         self,
         projections: &[(String, &PackedLinear)],
         samples: usize,
@@ -115,11 +138,24 @@ impl Recorder {
     ) -> Result<Calibration> {
         let mut sums = self.sums.into_inner();
         let mut sites = BTreeMap::new();
-        for (name, layer) in projections {
-            let Some(sum) = sums.remove(&std::ptr::from_ref(*layer).addr()) else {
+        let mut named: Vec<_> = projections
+            .iter()
+            .map(|(name, layer)| {
+                (
+                    name.clone(),
+                    Identity::Projection(std::ptr::from_ref(*layer).addr()),
+                )
+            })
+            .collect();
+        named.extend(sums.keys().filter_map(|key| match key {
+            Identity::Named(name) => Some((name.clone(), Identity::Named(name.clone()))),
+            Identity::Projection(_) => None,
+        }));
+        for (name, key) in named {
+            let Some(sum) = sums.remove(&key) else {
                 continue;
             };
-            let cols = layer.in_features();
+            let cols = sum.cols;
             let squares = sum
                 .squares
                 .iter()
@@ -137,7 +173,7 @@ impl Recorder {
                 })
                 .transpose()?;
             sites.insert(
-                name.clone(),
+                name,
                 Site {
                     tokens: sum.tokens,
                     squares,

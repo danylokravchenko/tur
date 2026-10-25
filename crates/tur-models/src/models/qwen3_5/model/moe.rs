@@ -1,7 +1,7 @@
 //! Qwen3.5 `MoE` feed-forward block: normalized top-k and sigmoid-gated shared expert.
 
 use super::{DenseMlp, Tensors, f32_on};
-use crate::models::qwen3_5::{calibration::Recorder, config::MoeConfig};
+use crate::{models::qwen3_5::config::MoeConfig, quantization::Recorder};
 use candle_core::{Device, Tensor};
 use tur_core::{Result, execution::invalid};
 use tur_metal::packed::PackedLinear;
