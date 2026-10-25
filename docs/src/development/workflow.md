@@ -13,6 +13,7 @@ The `justfile` holds every routine task:
 | `just test-checkpoint` | Ignored real-checkpoint tests (see [Testing](testing.md)) |
 | `just ci` | `fmt-check`, `lint`, `check` and `test`: run before calling work done |
 | `just build` | Release build of `tur` |
+| `just install [args]` | Install `tur` with `install.sh`; arguments go to `cargo install` |
 | `just run …` / `just serve …` | The CLI against the pinned development checkpoint |
 | `just quantize <dir> <out> …` | `tur quantize` |
 | `just bench <case>` | One [benchmark](benchmarks.md) case |

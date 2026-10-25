@@ -8,12 +8,15 @@ Apple Silicon Mac.
 
 ```sh
 git clone https://github.com/danylokravchenko/tur && cd tur
-cargo install --path crates/tur-cli     # puts `tur` in ~/.cargo/bin
+./install.sh                          # puts `tur` in ~/.cargo/bin by default
 tur --help
 ```
 
-Building takes a few minutes the first time. `cargo build --release --bin tur` works
-too; the binary is then `target/release/tur`.
+Install Rust through rustup first; the checkout selects Rust 1.99.0 automatically.
+Building takes a few minutes the first time. The script also replaces an existing
+installation. Use `./install.sh --root "$HOME/.local"` for `~/.local/bin`, and ensure
+the destination's `bin` directory is on your `PATH`. `cargo build --release --bin tur`
+works too; the binary is then `target/release/tur`.
 
 ## 2. Pick and pin a model
 

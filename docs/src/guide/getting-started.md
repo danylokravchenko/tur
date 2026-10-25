@@ -7,12 +7,27 @@ This page is the reference for what Tur needs. For a guided first run, follow th
 
 - A Mac with Apple Silicon and direct access to its Metal device. Virtual machines and
   sandboxes without GPU access fail at startup with "no accessible Metal device".
-- Rust 1.99 or later (edition 2024).
+- Rust installed through rustup. The checkout's `rust-toolchain.toml` selects Rust
+  1.99.0 (edition 2024), rustfmt and Clippy. The minimum supported Rust version is 1.99.
 - Optional: [`just`](https://github.com/casey/just) for the task recipes,
   [`cargo-nextest`](https://nexte.st) for tests, and
   [`mdbook`](https://rust-lang.github.io/mdBook/) for this book.
 
 ## Build
+
+Install the release binary from the checkout:
+
+```sh
+./install.sh                        # or: just install
+./install.sh --root "$HOME/.local"   # installs into ~/.local/bin
+```
+
+The default destination is `~/.cargo/bin`; Cargo's `CARGO_INSTALL_ROOT`,
+`CARGO_HOME` and install configuration overrides are respected. Add the destination's
+`bin` directory to `PATH`. The script uses `Cargo.lock`, replaces an existing `tur`
+installation, and forwards its arguments to `cargo install`.
+
+To build without installing:
 
 ```sh
 cargo build --release --bin tur      # or: just build
@@ -74,3 +89,10 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 The server loads and validates the model before it binds the listener, so a listening
 server is ready to answer. See [HTTP API](http-api.md) for the request format.
+
+## Decisions
+
+- Pin Rust 1.99.0 with rustfmt and Clippy: it matches the workspace's minimum Rust
+  version and supplies the tools used by `just ci`.
+- Install through Cargo with `--locked`: the CLI uses the checked-in dependency graph
+  and Cargo's existing destination options.

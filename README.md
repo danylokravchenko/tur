@@ -48,7 +48,7 @@ All tables and settings: [Measured performance](docs/src/guide/performance.md).
 ## Quickstart
 
 ```sh
-cargo install --path crates/tur-cli
+./install.sh                          # installs to ~/.cargo/bin by default
 
 export TUR_MODEL=Qwen/Qwen3.5-0.8B
 export TUR_REVISION=2fc06364715b967f1860aea9cf38778875588b17
@@ -56,6 +56,9 @@ export TUR_REVISION=2fc06364715b967f1860aea9cf38778875588b17
 tur run --prompt 'Write one sentence about the Moon.' --temperature 0 -n 64 --thinking false
 tur serve --served-model-name qwen        # http://127.0.0.1:8080/v1/chat/completions
 ```
+
+Use `./install.sh --root "$HOME/.local"` to install into `~/.local/bin` instead.
+Ensure the destination's `bin` directory is on your `PATH`.
 
 ```sh
 curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
@@ -94,7 +97,8 @@ The book in [`docs/`](docs/src/SUMMARY.md) is the full documentation. Serve it w
 
 ## Development
 
-Rust 1.99+ on an Apple Silicon Mac. [`just`](https://github.com/casey/just) runs every
+An Apple Silicon Mac with Rust installed through rustup. `rust-toolchain.toml` pins
+Rust 1.99.0 with rustfmt and Clippy. [`just`](https://github.com/casey/just) runs every
 task:
 
 ```sh

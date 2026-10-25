@@ -39,6 +39,10 @@ ci: fmt-check lint check test
 build:
     cargo build --release --bin tur
 
+# Install the release binary; extra arguments go to cargo install.
+install *args:
+    ./install.sh "$@"
+
 # One completion: `just run --prompt 'Hello' -n 64`.
 run *args:
     cargo run --release --bin tur -- run --model {{model}} --revision {{revision}} "$@"
