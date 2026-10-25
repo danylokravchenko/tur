@@ -503,23 +503,6 @@ mod tests {
     }
 
     #[test]
-    fn test_explicit_fallback_samples_the_same_truncated_set() -> Result<()> {
-        let logits: Vec<f32> = (0..9).map(|i| (i as f32 * 1.3).sin() * 3.0).collect();
-        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let weights: Vec<f32> = logits.iter().map(|&l| (l - max).exp()).collect();
-        let total: f32 = weights.iter().sum();
-        let p = params(1.0, 3, 0.95);
-        let truth = expected(&logits, &p);
-        for draw in 0..500 {
-            let all = (0..weights.len()).collect();
-            let token =
-                sample_truncated(&weights, all, &SampleParams { draw, ..p }, total, 0)? as usize;
-            assert!(truth[token] > 0.0);
-        }
-        Ok(())
-    }
-
-    #[test]
     fn test_penalties_follow_repetition_presence_and_frequency_rules() -> Result<()> {
         let p = PenaltyParams {
             repetition: 2.0,

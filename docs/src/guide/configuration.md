@@ -121,6 +121,7 @@ flags. The defaults remain the measured settings described in the architecture c
 | `engine.target_pass_ms` | 60 | Positive target pass duration while decodes run; the adaptive scheduler also allows twice the estimated decode cost |
 | `engine.max_queue_wait_ms` | 2000 | Queue age after which the oldest prefill ignores the cost target; 0 applies the guard immediately |
 | `engine.prefix_spacing` | 256 | Tokens between snapshots; positive multiple of the K/V page size while reuse is enabled |
+| `engine.prefix_restorable_first` | `false` | Admit waiting requests with a restorable snapshot ahead of older cold ones, until the oldest waits `max_queue_wait_ms`; lowers warm TTFT at the cost of cold TTFT and throughput (see [Prefix reuse](../architecture/prefix-reuse.md)) |
 | `server.stream_channel_capacity` | 64 | Positive number of queued text messages per streaming request |
 | `server.stream_max_buffered_bytes` | 16384 | Positive pending-text limit per streaming request; exceeding it cancels a slow client |
 

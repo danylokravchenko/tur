@@ -104,6 +104,18 @@ tur serve --max-batch-size 8 --prefix-snapshots 16
 - Users who reach a cold shared prompt at the same time wait for the first one to
   compute it, so they don't compute it eight times.
 - Leave `--mtp` off: it disables prefix reuse.
+- When most requests share a warm prompt and their first token matters more than
+  throughput, let restorable requests pass older cold ones:
+
+  ```toml
+  [engine]
+  prefix_restorable_first = true
+  ```
+
+  On the 0.8B, warm requests queued behind cold ones got their first token 5.4× sooner
+  (4.43 → 0.82 s), while cold requests waited 15% longer and throughput fell 10%. The
+  queue-age limit (`max_queue_wait_ms`, 2 s) still bounds how long a cold request is
+  passed over.
 - Separate tenants with the `cache_salt` request field.
 - Check `usage.prompt_tokens_details.cached_tokens` in responses to see what was reused.
 

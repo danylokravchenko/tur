@@ -65,6 +65,12 @@ Measured on Qwen3.5-0.8B on an M1:
   in 3 of 5 waves, where LRU order kept it in none. An agent loop cached 83% of its prompt
   tokens instead of 72% and finished 1.25× sooner. Low-reuse, decode-only and mixed
   traffic were unchanged.
+- **Restorable prefixes first, opt-in.** With `engine.prefix_restorable_first`, waiting
+  requests with a restorable snapshot take free slots ahead of older cold ones until the
+  oldest waits the queue-age limit. Under warm-cold contention (16 requests, 4 slots)
+  warm TTFT fell 5.4× (4.43 → 0.82 s) while cold TTFT rose 15% and throughput fell 10%
+  (44.6 → 39.9 tok/s); the other reuse workloads were unchanged. It stays off by
+  default because it slows unrelated requests.
 - **No radix tree.** The indexed hash lookup costs 6.6 µs for a 32K-token hit, down from
   152 µs, and under 0.1 µs for a miss.
 - **Prefix reuse and the MTP drafter are mutually exclusive.** A snapshot at boundary B

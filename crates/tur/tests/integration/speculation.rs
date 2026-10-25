@@ -125,6 +125,7 @@ fn test_prefix_snapshots_remain_at_the_accepted_boundary() -> Result<()> {
         entries: 8,
         spacing: 16,
         state_share: None,
+        restorable_first: false,
     };
     let mut pipeline = InferencePipeline::new(&fixture.factory(), cfg)?;
     let request = GenerationRequest::new("t5 t5 t5 t5 t5 t5 t5 t5".into(), 40);

@@ -36,9 +36,12 @@ impl InferencePipeline {
 
     /// For the oldest waiting requests without state, while running slots remain, restore
     /// their deepest verified snapshot, or let them wait for a producer (see
-    /// [`Self::awaits`]); a waiting one takes no slot. Restored requests run their remaining
-    /// prompt; a snapshot of the whole prompt samples the first output from its logits
-    /// without a pass.
+    /// [`Self::awaits`]); a waiting one takes no slot. With
+    /// [`PrefixConfig::restorable_first`](crate::backend::prefix::PrefixConfig) and the
+    /// oldest waiting request younger than the queue-age limit, only restored requests take
+    /// slots here, so they pass older misses. Restored requests run their remaining prompt;
+    /// a snapshot of the whole prompt samples the first output from its logits without a
+    /// pass.
     fn restore_prefixes(&mut self, output: &mut BatchStepOutput) -> Result<()> {
         if !self.prefix.config().enabled() {
             return Ok(());
@@ -60,6 +63,10 @@ impl InferencePipeline {
             .config()
             .max_running
             .saturating_sub(producers.len());
+        let restorable_first = self.prefix.config().restorable_first
+            && waiting.first().is_some_and(|(arrival, _)| {
+                now.saturating_duration_since(*arrival) < self.scheduler.config().max_queue_wait
+            });
         let inserted = self.prefix.stats().inserted;
         for (_, id) in waiting {
             if free == 0 {
@@ -74,7 +81,9 @@ impl InferencePipeline {
                 continue;
             }
             producers.push(id);
-            free -= 1;
+            if !restorable_first {
+                free -= 1;
+            }
             let pending = self
                 .pending
                 .get_mut(&id)
@@ -93,6 +102,9 @@ impl InferencePipeline {
                 pending.prefix_checked = Some(inserted);
                 continue;
             };
+            if restorable_first {
+                free -= 1;
+            }
             pending.handle = self.engine.adopt(pending.handle, &hit.state)?;
             pending.consumed = hit.length;
             pending.running = true;

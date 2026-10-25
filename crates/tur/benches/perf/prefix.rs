@@ -87,6 +87,7 @@ pub(crate) fn run() -> Result<()> {
                 spacing: SPACING,
                 entries,
                 state_share: None,
+                restorable_first: false,
             });
             // Fill the cache with snapshots of other prompts at their deepest boundary,
             // and one of the probed prompt's own first half.

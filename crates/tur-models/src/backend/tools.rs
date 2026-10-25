@@ -95,51 +95,55 @@ fn parse_xml_call(text: &str, tools: &[ToolDefinition]) -> Option<ToolCall> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert tool-call parsing contracts"
+)]
 mod tests {
     use super::*;
+    use crate::Result;
 
     #[test]
-    fn test_parse_single_tool_call() {
-        let text = r#"Sure, let me check the weather.
+    fn test_json_calls_preserve_names_arguments_order_and_skip_malformed_blocks() -> Result<()> {
+        for (text, expected) in [
+            (
+                r#"Sure, let me check the weather.
 <tool_call>
 {"name": "get_weather", "arguments": {"location": "Paris", "unit": "celsius"}}
-</tool_call>"#;
-
-        let calls = ToolCall::parse_from_output(text, &[]);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "get_weather");
-        assert_eq!(calls[0].arguments["location"], "Paris");
-    }
-
-    #[test]
-    fn test_parse_multiple_tool_calls() {
-        let text = r#"<tool_call>
+</tool_call>"#,
+                serde_json::json!([{
+                    "name": "get_weather", "arguments": {"location": "Paris", "unit": "celsius"}
+                }]),
+            ),
+            (
+                r#"<tool_call>
 {"name": "search", "arguments": {"query": "rust"}}
 </tool_call>
 <tool_call>
 {"name": "fetch", "arguments": {"url": "https://example.com"}}
-</tool_call>"#;
-
-        let calls = ToolCall::parse_from_output(text, &[]);
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "search");
-        assert_eq!(calls[1].name, "fetch");
-    }
-
-    #[test]
-    fn test_parse_no_tool_calls() {
-        let calls = ToolCall::parse_from_output("Just a normal response with no tool calls.", &[]);
-        assert!(calls.is_empty());
-    }
-
-    #[test]
-    fn test_parse_malformed_json_skipped() {
-        let text = r#"<tool_call>not json</tool_call>
-<tool_call>{"name": "ok", "arguments": {}}</tool_call>"#;
-
-        let calls = ToolCall::parse_from_output(text, &[]);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "ok");
+</tool_call>"#,
+                serde_json::json!([
+                    {"name": "search", "arguments": {"query": "rust"}},
+                    {"name": "fetch", "arguments": {"url": "https://example.com"}}
+                ]),
+            ),
+            (
+                "Just a normal response with no tool calls.",
+                serde_json::json!([]),
+            ),
+            (
+                r#"<tool_call>not json</tool_call>
+<tool_call>{"name": "ok", "arguments": {}}</tool_call>"#,
+                serde_json::json!([{"name": "ok", "arguments": {}}]),
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_value(ToolCall::parse_from_output(text, &[]))?,
+                expected,
+                "{text}"
+            );
+        }
+        Ok(())
     }
     #[test]
     fn test_xml_calls_preserve_schema_types_and_reject_incomplete_calls() {

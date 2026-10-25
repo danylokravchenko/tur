@@ -422,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_leases_never_exceed_the_limit() {
+    fn test_concurrent_leases_never_exceed_the_limit() -> Result<()> {
         let budget = DeviceBudget::new(Some(1000));
         let leases: Vec<BudgetLease> = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..8)
@@ -435,15 +435,20 @@ mod tests {
                     })
                 })
                 .collect();
-            workers
+            let leases = workers
                 .into_iter()
-                .filter_map(|w| w.join().ok())
-                .flatten()
-                .collect()
-        });
+                .map(|worker| {
+                    worker
+                        .join()
+                        .map_err(|_| invalid("budget lease worker panicked"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok::<Vec<BudgetLease>, TurError>(leases.into_iter().flatten().collect())
+        })?;
         assert_eq!(leases.len(), 142);
         assert_eq!(budget.leased(), 994);
         drop(leases);
         assert_eq!(budget.leased(), 0);
+        Ok(())
     }
 }

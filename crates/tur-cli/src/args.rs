@@ -152,6 +152,8 @@ pub(crate) struct PipelineArgs {
     max_queue_wait_ms: Option<u64>,
     #[arg(skip)]
     prefix_spacing: Option<usize>,
+    #[arg(skip)]
+    prefix_restorable_first: Option<bool>,
 }
 
 impl PipelineArgs {
@@ -165,7 +167,8 @@ impl PipelineArgs {
         min_prefill_tokens,
         target_pass_ms,
         max_queue_wait_ms,
-        prefix_spacing
+        prefix_spacing,
+        prefix_restorable_first
     );
 
     pub(crate) fn config(&self, max_batch_size: usize) -> Result<PipelineConfig> {
@@ -188,6 +191,9 @@ impl PipelineArgs {
         config.state_bytes = state_bytes;
         config.device_sampling = self.device_sampling.unwrap_or(config.device_sampling);
         config.prefix.spacing = self.prefix_spacing.unwrap_or(config.prefix.spacing);
+        config.prefix.restorable_first = self
+            .prefix_restorable_first
+            .unwrap_or(config.prefix.restorable_first);
         let scheduler = &mut config.scheduler;
         scheduler.max_waiting_tokens = self
             .max_waiting_tokens

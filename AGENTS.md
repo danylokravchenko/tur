@@ -114,3 +114,17 @@ Engineering expectations:
 - Keep the book current. A changed default, flag, endpoint or mechanism updates its
   chapter in `docs/src`, including the chapter's "Decisions" section. Keep decisions to
   the choice and its evidence, not narrative. `just docs-build` must pass.
+
+## Agent workflows
+
+Read the applicable rules before working; these adapt `bob-rs/.bob/rules/` to Tur:
+
+- [Task scope and completion](.agents/rules/01-overview.md)
+- [Code changes and diagnosis](.agents/rules/02-coding.md)
+- [Test evidence and failures](.agents/rules/03-testing.md)
+- [Performance, concurrency and resources](.agents/rules/04-performance-correctness.md)
+- [Workspace and input safety](.agents/rules/05-safety.md)
+
+For test authoring or a requested test audit, use
+[test-audit](.agents/skills/test-audit/SKILL.md). Its authoring gate applies to tests
+being written or changed; a broader audit runs only when requested.

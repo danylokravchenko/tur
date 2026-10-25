@@ -203,11 +203,15 @@ impl ModelFactory {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert checkpoint validation outcomes"
+)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_checkpoint_paths_cannot_escape_snapshot() {
+    fn test_checkpoint_paths_cannot_escape_snapshot() -> Result<()> {
         for name in [
             "../weights.safetensors",
             "/tmp/weights.safetensors",
@@ -216,11 +220,12 @@ mod tests {
         ] {
             assert!(checkpoint_file(name).is_err());
         }
-        assert!(checkpoint_file("model-00001-of-00002.safetensors").is_ok());
+        checkpoint_file("model-00001-of-00002.safetensors")?;
+        Ok(())
     }
 
     #[test]
-    fn test_mutable_remote_revision_rejected_without_network() {
+    fn test_mutable_remote_revision_rejected_without_network() -> Result<()> {
         let factory = ModelFactory {
             source: ModelSource::HuggingFace("Qwen/Qwen3.5-0.8B".into()),
             revision: "main".into(),
@@ -229,6 +234,14 @@ mod tests {
             kv: crate::models::qwen3_5::DEFAULT_KV_LAYOUT,
             recurrent: crate::models::qwen3_5::DEFAULT_RECURRENT_STATE,
         };
-        assert!(factory.resolve().is_err());
+        let error = factory
+            .resolve()
+            .err()
+            .ok_or_else(|| hub_error("mutable revision was accepted"))?;
+        assert!(matches!(
+            error,
+            TurError::HfHub(message) if message.contains("immutable 40-character commit")
+        ));
+        Ok(())
     }
 }

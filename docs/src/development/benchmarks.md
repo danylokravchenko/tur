@@ -29,7 +29,8 @@ workloads:
 - `grammar`: every token masked.
 - `arrivals`: open-loop Poisson arrivals, serial versus overlapped intake.
 - `prefix`: a shared system prompt at several snapshot spacings.
-- `reuse`: cold shared prompts, contention, agent loops, churn and no reuse.
+- `reuse`: cold shared prompts, contention, agent loops, churn and no reuse;
+  `TUR_BENCH_RESTORABLE_FIRST=1` admits restorable prefixes first.
 - `speculation`: prompt lookup and MTP over repetitive, novel and code prompts.
 
 ## Methodology

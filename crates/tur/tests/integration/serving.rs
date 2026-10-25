@@ -11,6 +11,7 @@ use tower::ServiceExt;
 use tur::{
     Result, TurError,
     backend::{
+        chat_template::Role,
         memory::DeviceBudget,
         pipeline::{GenerationRequest, PipelineConfig},
     },
@@ -198,7 +199,7 @@ async fn test_stalled_stream_is_cancelled_with_bounded_buffering() -> Result<()>
 }
 
 #[tokio::test]
-async fn test_http_preserves_sampling_thinking_and_tool_history() -> Result<()> {
+async fn test_http_preserves_limits_sampling_thinking_and_tool_history() -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<WorkerMsg>(1);
     let state = AppState {
         workers: HashMap::from([("tiny".into(), PipelineWorker::from_sender(tx))]),
@@ -209,6 +210,21 @@ async fn test_http_preserves_sampling_thinking_and_tool_history() -> Result<()> 
             .recv()
             .await
             .ok_or_else(|| TurError::Other("missing request".into()))?;
+        assert_eq!(msg.request.max_tokens, 64);
+        assert_eq!(
+            msg.request
+                .messages
+                .iter()
+                .map(|message| (message.role, message.content.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (Role::System, "You are helpful."),
+                (Role::User, "query"),
+                (Role::Assistant, ""),
+                (Role::Tool, "value"),
+                (Role::User, "continue"),
+            ]
+        );
         assert_eq!(msg.request.sampling.temperature, Some(0.0));
         assert_eq!(msg.request.sampling.top_k, Some(1));
         assert_eq!(msg.request.sampling.top_p, Some(1.0));
@@ -217,10 +233,10 @@ async fn test_http_preserves_sampling_thinking_and_tool_history() -> Result<()> 
         assert_eq!(msg.request.render.preserve_thinking, Some(true));
         assert_eq!(msg.request.seed, 7);
         assert_eq!(
-            msg.request.messages[1].reasoning_content.as_deref(),
+            msg.request.messages[2].reasoning_content.as_deref(),
             Some("reason")
         );
-        assert_eq!(msg.request.messages[1].tool_calls[0].arguments["id"], "123");
+        assert_eq!(msg.request.messages[2].tool_calls[0].arguments["id"], "123");
         drop(msg.token_tx);
         drop(
             msg.result_tx
@@ -241,10 +257,10 @@ async fn test_http_preserves_sampling_thinking_and_tool_history() -> Result<()> 
         Ok::<(), TurError>(())
     });
     let response = build_router(state).oneshot(request(&json!({
-        "messages":[{"role":"user","content":"query"}, {"role":"assistant","reasoning_content":"reason","tool_calls":[{
+        "messages":[{"role":"system","content":"You are helpful."}, {"role":"user","content":"query"}, {"role":"assistant","reasoning_content":"reason","tool_calls":[{
             "id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"id\":\"123\"}"}
         }]}, {"role":"tool","tool_call_id":"call_1","content":"value"}, {"role":"user","content":"continue"}],
-        "temperature":0.0,"top_k":1,"top_p":1.0,"enable_thinking":false,"reasoning_effort":"low","preserve_thinking":true,"seed":7
+        "max_tokens":64,"temperature":0.0,"top_k":1,"top_p":1.0,"enable_thinking":false,"reasoning_effort":"low","preserve_thinking":true,"seed":7
     }))?).await.map_err(|error| TurError::Other(error.to_string()))?;
     assert_eq!(response.status(), StatusCode::OK);
     handle

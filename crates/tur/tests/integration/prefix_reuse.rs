@@ -2,7 +2,7 @@
 //! wrong state changes generated text: warmed prefixes continue like cold runs, save
 //! their prefill, stay inside their namespace, yield memory before running requests do,
 //! and leave no state behind. Requests reaching a cold shared prefix together wait for
-//! the oldest to compute it.
+//! the oldest to compute it, and restorable requests pass older cold ones only when asked.
 use crate::common::Checkpoint;
 use std::{collections::HashMap, time::Duration};
 use tur::{
@@ -39,6 +39,7 @@ fn cached(entries: usize) -> PipelineConfig {
             spacing: 16,
             entries,
             state_share: None,
+            restorable_first: false,
         },
         ..PipelineConfig::new(4, 64)
     }
@@ -351,6 +352,58 @@ fn test_aged_requests_and_other_namespaces_never_wait() -> Result<()> {
             .as_ref()
             .map_err(|error| TurError::Other(error.to_string()))?;
         assert_eq!(stats.cached_tokens, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_restorable_requests_pass_older_cold_ones_only_when_enabled() -> Result<()> {
+    let fixture = Checkpoint::random()?;
+    // Three cold prompts sharing no aligned prefix with the warmed one, then a request that
+    // restores 48 warmed tokens.
+    let requests = [
+        request(prompt(0, 40, 0), 40),
+        request(prompt(0, 40, 1), 41),
+        request(prompt(0, 40, 2), 42),
+        request(prompt(48, 3, 3), 43),
+    ];
+    let expected = cold(&fixture, &requests)?;
+    for restorable_first in [false, true] {
+        let mut config = PipelineConfig {
+            prefix: PrefixConfig {
+                spacing: 16,
+                entries: 16,
+                state_share: None,
+                restorable_first,
+            },
+            ..PipelineConfig::new(2, 64)
+        };
+        config.scheduler.max_queue_wait = Duration::from_secs(60);
+        let mut pipeline = InferencePipeline::new(&fixture.factory(), config)?;
+        pipeline.run(&request(prompt(48, 5, 9), 44), |_| {})?;
+        let mut ids = HashMap::new();
+        for (index, request) in requests.iter().enumerate() {
+            ids.insert(pipeline.submit_request(request)?, index);
+        }
+        // Pass at which each request finished.
+        let mut finished = HashMap::new();
+        for pass in 0..10_000 {
+            if pipeline.active_request_count() == 0 {
+                break;
+            }
+            for (id, result) in pipeline.step_streaming()?.completed {
+                let index = ids[&id];
+                let stats = result?;
+                assert_eq!(&stats.generated_text, &expected[index], "request {index}");
+                assert_eq!(stats.cached_tokens >= 48, index == 3, "request {index}");
+                finished.insert(index, pass);
+            }
+        }
+        assert_eq!(finished.len(), requests.len());
+        // Two slots: by default the restorable request waits for a cold one to finish;
+        // restorable first, it takes the second slot ahead of the second cold request.
+        let (warm, second) = (finished.get(&3), finished.get(&1));
+        assert_eq!(warm < second, restorable_first, "{finished:?}");
     }
     Ok(())
 }

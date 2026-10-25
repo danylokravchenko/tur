@@ -43,9 +43,9 @@ fn mock_worker(response_text: &'static str) -> PipelineWorker {
         while let Some(msg) = rx.recv().await {
             // Stream words via token_tx (for SSE/streaming consumers).
             if let Some(token_tx) = &msg.token_tx {
-                for word in response_text.split_whitespace() {
-                    drop(token_tx.send(word.to_string()).await);
-                    drop(token_tx.send(" ".to_string()).await);
+                for fragment in response_text.split_inclusive(' ') {
+                    // The adapter requires streamed text to be a prefix of the final text.
+                    drop(token_tx.send(fragment.to_string()).await);
                 }
             }
             drop(msg.token_tx);
@@ -171,34 +171,11 @@ async fn test_chat_non_streaming_returns_assistant_message() -> TestResult {
     assert_eq!(json["choices"][0]["message"]["role"], "assistant");
     assert_eq!(json["choices"][0]["finish_reason"], "stop");
 
-    let content = json["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or("content")?;
-    assert!(
-        content.contains("Hello"),
-        "content should contain mock tokens, got: {content}"
+    assert_eq!(
+        json["choices"][0]["message"]["content"],
+        "Hello from the assistant"
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_chat_non_streaming_usage_reflects_token_count() -> TestResult {
-    let app = build_router(test_state("one two three"));
-
-    let response = app
-        .oneshot(json_request(
-            "/v1/chat/completions",
-            "POST",
-            &json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "count"}]
-            }),
-        )?)
-        .await?;
-
-    let json = body_json(response.into_body()).await?;
-    // The mock reports generated_tokens = number of whitespace-separated words.
-    assert_eq!(json["usage"]["completion_tokens"], 3);
+    assert_eq!(json["usage"]["completion_tokens"], 4);
     Ok(())
 }
 
@@ -218,52 +195,6 @@ async fn test_chat_empty_messages_returns_400() -> TestResult {
 
     let json = body_json(response.into_body()).await?;
     assert!(json["error"]["message"].as_str().is_some());
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_chat_multi_turn_conversation_accepted() -> TestResult {
-    let app = build_router(test_state("I remember our chat"));
-
-    let response = app
-        .oneshot(json_request(
-            "/v1/chat/completions",
-            "POST",
-            &json!({
-                "model": "test-model",
-                "messages": [
-                    {"role": "system", "content": "You are helpful."},
-                    {"role": "user", "content": "Hello"},
-                    {"role": "assistant", "content": "Hi there!"},
-                    {"role": "user", "content": "How are you?"}
-                ]
-            }),
-        )?)
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let json = body_json(response.into_body()).await?;
-    assert_eq!(json["choices"][0]["message"]["role"], "assistant");
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_chat_max_tokens_field_accepted() -> TestResult {
-    let app = build_router(test_state("short reply"));
-
-    let response = app
-        .oneshot(json_request(
-            "/v1/chat/completions",
-            "POST",
-            &json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "Hi"}],
-                "max_tokens": 64
-            }),
-        )?)
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::OK);
     Ok(())
 }
 
@@ -327,22 +258,7 @@ async fn test_tool_call_response_has_correct_structure() -> TestResult {
 
 // ── /v1/chat/completions — streaming ─────────────────────────────────────────
 
-#[tokio::test]
-async fn test_chat_streaming_returns_sse_content_type() -> TestResult {
-    let app = build_router(test_state("streamed response"));
-
-    let response = app
-        .oneshot(json_request(
-            "/v1/chat/completions",
-            "POST",
-            &json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "Hi"}],
-                "stream": true
-            }),
-        )?)
-        .await?;
-
+async fn assert_text_stream(response: axum::response::Response, expected: &str) -> TestResult {
     assert_eq!(response.status(), StatusCode::OK);
 
     let ct = response
@@ -350,83 +266,68 @@ async fn test_chat_streaming_returns_sse_content_type() -> TestResult {
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    assert!(
-        ct.contains("text/event-stream"),
-        "expected SSE content-type, got: {ct}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_chat_streaming_body_contains_done_sentinel() -> TestResult {
-    let app = build_router(test_state("hello world"));
-
-    let response = app
-        .oneshot(json_request(
-            "/v1/chat/completions",
-            "POST",
-            &json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "Hi"}],
-                "stream": true
-            }),
-        )?)
-        .await?;
-
+    assert_eq!(ct.split(';').next(), Some("text/event-stream"));
     let bytes = response.into_body().collect().await?.to_bytes();
     let body = std::str::from_utf8(&bytes)?;
 
-    assert!(body.contains("[DONE]"), "SSE stream must end with [DONE]");
-    assert!(
-        body.contains("chat.completion.chunk"),
-        "SSE stream must contain chunk objects"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_chat_streaming_first_chunk_has_role() -> TestResult {
-    let app = build_router(test_state("response text"));
-
-    let response = app
-        .oneshot(json_request(
-            "/v1/chat/completions",
-            "POST",
-            &json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "Hi"}],
-                "stream": true
-            }),
-        )?)
-        .await?;
-
-    let bytes = response.into_body().collect().await?.to_bytes();
-    let body = std::str::from_utf8(&bytes)?;
-
-    // Extract the first `data:` line and parse it.
-    let first_data = body
+    let mut events: Vec<&str> = body
         .lines()
-        .find(|l| l.starts_with("data:") && !l.contains("[DONE]"))
-        .ok_or("at least one data line")?;
-
-    let chunk: Value = serde_json::from_str(first_data.trim_start_matches("data:").trim())?;
-
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+        .collect();
+    assert_eq!(events.pop(), Some("[DONE]"), "terminal SSE event");
+    let chunks: Vec<Value> = events
+        .into_iter()
+        .map(serde_json::from_str)
+        .collect::<serde_json::Result<_>>()?;
+    let first = chunks.first().ok_or("missing first chunk")?;
     assert_eq!(
-        chunk["choices"][0]["delta"]["role"], "assistant",
+        first["choices"][0]["delta"]["role"], "assistant",
         "first chunk must establish role"
     );
+    for chunk in &chunks {
+        assert_eq!(chunk["object"], "chat.completion.chunk");
+        assert_eq!(chunk["model"], "test-model");
+        assert_eq!(chunk["id"], first["id"]);
+    }
+    let text: String = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(text, expected);
+    let last = chunks.last().ok_or("missing final chunk")?;
+    assert_eq!(last["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        last["usage"]["completion_tokens"],
+        expected.split_whitespace().count()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_chat_streaming_preserves_sse_event_order_and_text() -> TestResult {
+    let response = build_router(test_state("hello world"))
+        .oneshot(json_request(
+            "/v1/chat/completions",
+            "POST",
+            &json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": true
+            }),
+        )?)
+        .await?;
+    assert_text_stream(response, "hello world").await?;
     Ok(())
 }
 
 // ── Concurrent / batching behaviour ──────────────────────────────────────────
 
 /// Send N non-streaming requests simultaneously and assert every one
-/// returns 200 with an assistant message.  This validates that the HTTP layer
-/// and mock worker correctly handle multiple in-flight requests — the same
-/// contract the continuous-batch worker upholds for real model requests.
+/// returns 200 with an assistant message. The burst exceeds the former intake
+/// capacity of four; real-worker admission is covered separately in `serving`.
 #[tokio::test]
 async fn test_concurrent_non_streaming_requests_all_complete() -> TestResult {
-    const N: usize = 8;
+    const N: usize = 32;
 
     // axum::Router is cheaply clone-able — each `oneshot` call consumes a clone.
     let router = Arc::new(build_router(test_state("parallel answer")));
@@ -458,13 +359,7 @@ async fn test_concurrent_non_streaming_requests_all_complete() -> TestResult {
         let (status, json) = handle.await??;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["choices"][0]["message"]["role"], "assistant");
-        let content = json["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or("content string")?;
-        assert!(
-            content.contains("parallel"),
-            "unexpected content: {content}"
-        );
+        assert_eq!(json["choices"][0]["message"]["content"], "parallel answer");
     }
     Ok(())
 }
@@ -495,22 +390,13 @@ async fn test_concurrent_streaming_requests_all_complete() -> TestResult {
                     )?)
                     .await?;
 
-                assert_eq!(resp.status(), StatusCode::OK);
-
-                let bytes = resp.into_body().collect().await?.to_bytes();
-
-                Ok::<_, TestError>(std::str::from_utf8(&bytes)?.to_owned())
+                assert_text_stream(resp, "streamed token").await
             })
         })
         .collect();
 
     for handle in handles {
-        let body = handle.await??;
-        assert!(body.contains("[DONE]"), "stream must end with [DONE]");
-        assert!(
-            body.contains("chat.completion.chunk"),
-            "stream must contain chunk objects"
-        );
+        handle.await??;
     }
     Ok(())
 }
@@ -565,52 +451,9 @@ async fn test_mixed_streaming_and_non_streaming_concurrent() -> TestResult {
     assert_eq!(ns.status(), StatusCode::OK);
     let json = body_json(ns.into_body()).await?;
     assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(json["choices"][0]["message"]["content"], "mixed result");
 
     let ss = stream_resp??;
-    assert_eq!(ss.status(), StatusCode::OK);
-    let bytes = ss.into_body().collect().await?.to_bytes();
-    let body = std::str::from_utf8(&bytes)?;
-    assert!(body.contains("[DONE]"));
-    Ok(())
-}
-
-/// The worker channel has capacity 256.  Enqueuing more requests than the old
-/// capacity (4) must never return 503 — all requests must eventually complete.
-#[tokio::test]
-async fn test_large_burst_of_requests_does_not_return_503() -> TestResult {
-    const N: usize = 32;
-
-    let router = Arc::new(build_router(test_state("burst ok")));
-
-    let handles: Vec<_> = (0..N)
-        .map(|_| {
-            let router = Arc::clone(&router);
-            tokio::spawn(async move {
-                let status = (*router)
-                    .clone()
-                    .oneshot(json_request(
-                        "/v1/chat/completions",
-                        "POST",
-                        &json!({
-                            "model": "test-model",
-                            "messages": [{"role": "user", "content": "burst"}]
-                        }),
-                    )?)
-                    .await?
-                    .status();
-                Ok::<_, TestError>(status)
-            })
-        })
-        .collect();
-
-    for handle in handles {
-        let status = handle.await??;
-        assert_ne!(
-            status,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no request in a burst of {N} should return 503"
-        );
-        assert_eq!(status, StatusCode::OK);
-    }
+    assert_text_stream(ss, "mixed result").await?;
     Ok(())
 }

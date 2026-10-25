@@ -50,6 +50,10 @@ pub struct PrefixConfig {
     /// Most of the state pool's bytes snapshots may take; fewer are retained when
     /// `entries` slots would exceed it. `None` retains exactly `entries`.
     pub state_share: Option<f64>,
+    /// Waiting requests with a restorable snapshot take free running slots ahead of older
+    /// requests without one, until the oldest waiting request reaches the queue-age limit.
+    /// It trades cold latency and throughput for warm latency, so it is off by default.
+    pub restorable_first: bool,
 }
 
 impl PrefixConfig {
@@ -61,6 +65,7 @@ impl PrefixConfig {
         spacing: Self::DEFAULT_SPACING,
         entries: 0,
         state_share: None,
+        restorable_first: false,
     };
 
     /// Default share of state memory for snapshots.
@@ -512,6 +517,7 @@ mod tests {
             spacing: 4,
             entries,
             state_share: None,
+            restorable_first: false,
         })
     }
 
@@ -751,6 +757,7 @@ mod tests {
                 spacing: 24,
                 entries: 1,
                 state_share: None,
+                restorable_first: false,
             }
             .validate(16)
             .is_err()

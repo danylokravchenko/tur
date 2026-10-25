@@ -8,7 +8,8 @@
 //! `TUR_BENCH_SAMPLING=0.7,20,0.95` samples instead of greedy decoding,
 //! `TUR_BENCH_DEVICE_SAMPLING=0` samples on the host, and
 //! `TUR_BENCH_WORKLOADS=prefix TUR_BENCH_SPACING=0,256` runs the prefix-reuse workloads and
-//! `TUR_BENCH_WORKLOADS=reuse` the prefix-scheduling ones on default pipelines;
+//! `TUR_BENCH_WORKLOADS=reuse` the prefix-scheduling ones on default pipelines
+//! (`TUR_BENCH_RESTORABLE_FIRST=1` admits restorable prefixes first);
 //! `TUR_BENCH_WORKLOADS=arrivals TUR_BENCH_RATE=2,4` runs open-loop Poisson arrivals, and
 //! `TUR_BENCH_WORKLOADS=grammar` grammar-constrained requests.
 //! `TUR_BENCH_WORKLOADS=speculation TUR_BENCH_DRAFT=0,4` compares adaptive prompt lookup
@@ -278,6 +279,7 @@ fn prefix_runs(
             spacing,
             entries: 16,
             state_share: None,
+            restorable_first: false,
         }
     };
     let mut pipeline = InferencePipeline::new(factory, config)?;
@@ -406,7 +408,10 @@ fn reuse_pipeline(
     running: usize,
     options: SamplingOptions,
 ) -> Result<InferencePipeline> {
-    let mut pipeline = InferencePipeline::new(factory, PipelineConfig::new(running, CHUNK))?;
+    let mut config = PipelineConfig::new(running, CHUNK);
+    config.prefix.restorable_first =
+        std::env::var("TUR_BENCH_RESTORABLE_FIRST").is_ok_and(|v| v == "1");
+    let mut pipeline = InferencePipeline::new(factory, config)?;
     let warm = Burst {
         prompts: vec![prompt(tokenizer, 300, 99)?],
         output: 8,

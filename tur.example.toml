@@ -26,6 +26,7 @@ max_waiting_tokens = 1048576
 target_pass_ms = 60
 max_queue_wait_ms = 2000
 prefix_spacing = 256     # Positive multiple of kv_page_tokens while reuse is enabled.
+prefix_restorable_first = false # Restorable prompts pass older cold ones in the queue.
 
 [server]                 # Used only by serve.
 listen = "127.0.0.1:8080"

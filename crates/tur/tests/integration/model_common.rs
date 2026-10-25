@@ -59,6 +59,15 @@ pub(crate) fn checkpoint(config: &str, scale: f32, norm_scale: f32) -> Result<Ch
 
 /// Largest absolute difference relative to the largest reference magnitude.
 pub(crate) fn max_relative(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
+    // Zip ignores missing tails, and max can discard NaN differences.
+    assert_eq!(a.len(), b.len(), "numerical comparison row count");
+    for (index, (actual, expected)) in a.iter().zip(b).enumerate() {
+        assert_eq!(actual.len(), expected.len(), "row {index} width");
+        assert!(
+            actual.iter().chain(expected).all(|value| value.is_finite()),
+            "nonfinite numerical comparison in row {index}"
+        );
+    }
     let scale = b
         .iter()
         .flatten()

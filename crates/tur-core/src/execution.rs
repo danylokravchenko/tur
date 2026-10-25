@@ -697,18 +697,20 @@ mod tests {
     }
 
     #[test]
-    fn test_kv_format_names_round_trip() {
-        for format in [
-            KvFormat::F32,
-            KvFormat::F16,
-            KvFormat::Q8,
-            KvFormat::Q8 { group: 64 },
+    fn test_kv_format_names_round_trip() -> Result<()> {
+        for (format, name) in [
+            (KvFormat::F32, "f32"),
+            (KvFormat::F16, "f16"),
+            (KvFormat::Q8, "q8_32"),
+            (KvFormat::Q8 { group: 64 }, "q8_64"),
         ] {
-            assert_eq!(format.to_string().parse::<KvFormat>(), Ok(format));
+            assert_eq!(format.to_string(), name);
+            assert_eq!(name.parse::<KvFormat>().map_err(invalid)?, format);
         }
         assert_eq!("q8".parse::<KvFormat>(), Ok(KvFormat::Q8 { group: 32 }));
         assert!("q4".parse::<KvFormat>().is_err());
         assert!("q8_x".parse::<KvFormat>().is_err());
+        Ok(())
     }
 
     #[test]

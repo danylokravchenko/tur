@@ -58,6 +58,7 @@ fn golden() -> Result<(Vec<u32>, Vec<Tensor>, Tensor)> {
 fn compare(model: &Qwen35) -> Result<()> {
     let (ids, expected_layers, logits) = golden()?;
     let (layers, actual) = model.trace(&ids, &(0..ids.len()).collect::<Vec<_>>())?;
+    assert_eq!(layers.len(), expected_layers.len(), "hidden state count");
     for (index, (actual, expected)) in layers.iter().zip(expected_layers).enumerate() {
         let error = max_relative(&actual.to_vec2::<f32>()?, &expected.to_vec2::<f32>()?);
         assert!(error < 1e-4, "layer {index}: {error}");

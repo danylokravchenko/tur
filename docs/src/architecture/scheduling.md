@@ -14,7 +14,9 @@ model.
    again before publication: work that finishes late fails, and its state is released.
    A pass already on the GPU is fenced, not interrupted.
 2. **Restore prefixes.** Waiting requests whose prompts start with a retained snapshot
-   adopt it and skip that part of prefill (see [Prefix reuse](prefix-reuse.md)).
+   adopt it and skip that part of prefill (see [Prefix reuse](prefix-reuse.md)), oldest
+   first. With `engine.prefix_restorable_first`, restorable requests take free slots
+   ahead of older cold ones until the oldest waits `max_queue_wait`.
 3. **Decodes first.** Every running decode gets one token, in strict rotation by when it
    last ran, so a decode skipped for lack of budget runs first next time. While prefill
    work exists, `min_prefill_tokens` of the pass is held back for it.
@@ -83,6 +85,6 @@ and a request that cannot fit the state pool even alone, are rejected at submiss
 - **One shared device budget.** Several models on one device lease from one budget
   instead of each assuming the whole device. Arbitration is tested with two loaded tiny
   models; the server loads one.
-- **Admitting restorable prefixes first was rejected.** It lowered warm TTFT 5.1× but
-  raised cold TTFT 17% and cut throughput 10% (see
-  [Rejected experiments](../design/rejected.md)).
+- **Admitting restorable prefixes first is opt-in.** Under warm-cold contention it lowered
+  warm TTFT 5.4× but raised cold TTFT 15% and cut throughput 10%, so arrival order stays
+  the default (see [Prefix reuse](prefix-reuse.md)).

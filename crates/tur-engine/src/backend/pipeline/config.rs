@@ -46,6 +46,7 @@ impl PipelineConfig {
                 spacing: PrefixConfig::DEFAULT_SPACING,
                 entries: max_batch_size,
                 state_share: Some(PrefixConfig::DEFAULT_STATE_SHARE),
+                restorable_first: false,
             },
             device_sampling: true,
             speculation: SpeculationConfig::DISABLED,

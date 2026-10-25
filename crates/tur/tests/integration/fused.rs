@@ -135,6 +135,7 @@ fn snapshot(state: &ModelState) -> Result<Vec<Vec<Vec<f32>>>> {
 
 fn snapshot_error(a: &ModelState, b: &ModelState) -> Result<f32> {
     let (a, b) = (snapshot(a)?, snapshot(b)?);
+    assert_eq!(a.len(), b.len(), "snapshot layer count");
     Ok(a.iter()
         .zip(&b)
         .map(|(x, y)| max_relative(x, y))
@@ -153,9 +154,11 @@ fn test_fused_layers_and_logits_match_reference_across_page_and_chunk_boundaries
     let tokens = prompt(513, 0);
     let all: Vec<usize> = (0..tokens.len()).collect();
     let (fused_layers, fused_logits) = fused.trace(&tokens, &all)?;
+    assert_eq!(fused_layers.len(), fused.description().layers.len());
     let reference = fused.with_execution(Execution::Reference)?;
     assert_eq!(reference.execution(), Execution::Reference);
     let (layers, logits) = reference.trace(&tokens, &all)?;
+    assert_eq!(fused_layers.len(), layers.len(), "hidden state count");
     for (i, (a, b)) in fused_layers.iter().zip(&layers).enumerate() {
         let error = max_relative(&rows(a)?, &rows(b)?);
         assert!(error < 1e-4, "layer {i}: {error}");
