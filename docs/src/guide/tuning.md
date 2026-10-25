@@ -4,6 +4,24 @@ The defaults favor one resident model and interactive latency. This page explain
 each knob trades, gives recipes for common situations, and shows how to measure the
 result. The [Architecture](../architecture/overview.md) chapters explain the mechanisms.
 
+## Persist tuning settings
+
+Store reusable settings in [`tur.toml`](configuration.md) instead of repeating flags.
+For example:
+
+```toml
+[engine]
+prefill_chunk_size = 512
+
+[server]
+max_batch_size = 2
+request_timeout_secs = 120
+```
+
+`tur serve --max-batch-size 4` overrides just that setting for one start. Advanced
+scheduler timing, waiting-token and streaming limits are configurable in the file
+without adding more command-line flags.
+
 ## Read the memory plan first
 
 Every start logs the plan:

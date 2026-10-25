@@ -8,15 +8,28 @@ tur serve     Serve one resident model over an OpenAI-style HTTP API
 tur quantize  Prepack weights offline, optionally calibrated, for direct loading
 ```
 
-`tur <command> --help` prints every flag with its default. This page groups them by
-purpose.
+`tur <command> --help` prints every flag. This page lists their defaults and groups them
+by purpose.
+
+## Configuration
+
+`run` and `serve` read `./tur.toml` when it exists. Start with the repository's
+`tur.example.toml`; see [Configuration](configuration.md) for every key, file-only
+scheduler and streaming settings, and examples.
+
+Explicit CLI arguments override `TUR_MODEL` / `TUR_REVISION`, which override file values.
+Omitted settings keep their existing defaults. `--config <path>` selects another file;
+`--no-config` disables discovery. Both flags work before or after the command and are
+mutually exclusive. Prompts, tools files, CPU reference mode and quantization jobs use
+CLI arguments. `[generation]` defaults apply to `run`; HTTP generation settings stay in
+each request.
 
 ## Model and state (`run`, `serve`)
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--model <dir or org/name>` | required (`TUR_MODEL`) | An existing directory loads locally; anything else names a Hugging Face repository |
-| `--revision <rev>` | required (`TUR_REVISION`) | A 40-character commit for remote models; your own identity for local ones |
+| `--model <dir or org/name>` | required via flag, `TUR_MODEL` or TOML | An existing directory loads locally; anything else names a Hugging Face repository |
+| `--revision <rev>` | required via flag, `TUR_REVISION` or TOML | A 40-character commit for remote models; your own identity for local ones |
 | `--weight-format f32\|q8_0\|q4k` | `q8_0` | Convert SafeTensors projections into this resident format at load time. Omit it for a [prepacked artifact](quantization.md), which loads as stored |
 | `--kv-format f32\|f16\|q8\|q8_<group>` | `f16` | Storage of attention keys and values; `q8` uses one scale per 32 values |
 | `--kv-page-tokens <n>` | 16 | Tokens per K/V page |
@@ -30,7 +43,7 @@ purpose.
 | `--prefill-chunk-size <n>` | 256 | Largest prefill chunk one request contributes to one pass |
 | `--state-memory-mb <n>` | derived | Memory for K/V pages and recurrent state. By default each concurrent request gets room for an 8K-token context within the device's working set |
 | `--speculative-draft <n>` | 0 | Most prompt-lookup drafts per decode; 0 disables speculation |
-| `--mtp` | off | Also draft with the checkpoint's multi-token-prediction head; implies at least one draft and disables prefix reuse |
+| `--mtp [true\|false]` | off | Also draft with the checkpoint's multi-token-prediction head; implies at least one draft and disables prefix reuse |
 
 Speculation needs F32 recurrent state; with `--recurrent-state f16` it is switched off
 with a warning. See [Speculative decoding](../architecture/speculation.md) for when it
@@ -92,3 +105,12 @@ See [Prepacked weights](quantization.md) for the workflow.
 
 Logs go to stderr through `tracing`. `RUST_LOG` sets the filter (default `info`), for
 example `RUST_LOG=tur_engine=debug`.
+
+
+## Decisions
+
+- **Preserve common flags as overrides.** Model, memory, generation and serving flags
+  remain available alongside TOML; `--mtp false` can undo a file's boolean default.
+  Less common scheduler and stream bounds are file-only to keep the CLI manageable.
+- **Keep invocation inputs explicit.** Prompts, tool files, CPU reference mode and
+  quantization jobs remain command-line inputs; logging remains in `RUST_LOG`.

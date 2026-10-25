@@ -7,6 +7,7 @@
 - [Quickstart](guide/quickstart.md)
 - [Measured performance](guide/performance.md)
 - [Requirements and checkpoints](guide/getting-started.md)
+- [Configuration](guide/configuration.md)
 - [Command line](guide/cli.md)
 - [HTTP API](guide/http-api.md)
 - [Prepacked weights](guide/quantization.md)

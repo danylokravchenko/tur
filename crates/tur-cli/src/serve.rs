@@ -2,37 +2,43 @@ use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
 use tur::{
     Result, TurError,
-    backend::{memory::DeviceBudget, prefix::PrefixConfig},
+    backend::{memory::DeviceBudget, pipeline::PipelineConfig},
     server::{
         AppState, run_server,
         worker::{PipelineWorker, StreamConfig, WorkerConfig},
     },
 };
 
-use crate::args::{ModelArgs, PipelineArgs};
+use crate::{
+    args::{ModelArgs, PipelineArgs},
+    config::inherit,
+};
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Default, serde::Deserialize, clap::Args)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct Args {
     #[command(flatten)]
+    #[serde(skip)]
     model: ModelArgs,
     #[command(flatten)]
+    #[serde(skip)]
     pipeline: PipelineArgs,
-    /// Model ID accepted by /v1/chat/completions and listed by /v1/models.
-    #[arg(long, default_value = "qwen-hybrid")]
-    served_model_name: String,
-    /// Address the HTTP listener binds once the model has loaded.
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    listen: SocketAddr,
-    /// Requests holding model state at once.
-    #[arg(long, default_value_t = 8)]
-    max_batch_size: usize,
+    /// Model ID accepted by /v1/chat/completions and listed by /v1/models (default: qwen-hybrid).
+    #[arg(long)]
+    served_model_name: Option<String>,
+    /// Address the HTTP listener binds once the model has loaded (default: 127.0.0.1:8080).
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+    /// Requests holding model state at once (default: 8).
+    #[arg(long)]
+    max_batch_size: Option<usize>,
     /// Tokens in one packed pass. Default: 2048, or more to fit one prefill chunk beside
     /// every decode.
     #[arg(long)]
     max_batch_tokens: Option<usize>,
-    /// Requests queued for admission before new ones are rejected.
-    #[arg(long, default_value_t = 256)]
-    max_waiting: usize,
+    /// Requests queued for admission before new ones are rejected (default: 256).
+    #[arg(long)]
+    max_waiting: Option<usize>,
     /// Fail requests not finished this many seconds after arrival.
     #[arg(long)]
     request_timeout_secs: Option<u64>,
@@ -41,42 +47,214 @@ pub(crate) struct Args {
     /// prefix reuse.
     #[arg(long)]
     prefix_snapshots: Option<usize>,
+    #[arg(skip)]
+    stream_channel_capacity: Option<usize>,
+    #[arg(skip)]
+    stream_max_buffered_bytes: Option<usize>,
+}
+
+impl Args {
+    inherit!(
+        served_model_name,
+        listen,
+        max_batch_size,
+        max_batch_tokens,
+        max_waiting,
+        request_timeout_secs,
+        prefix_snapshots,
+        stream_channel_capacity,
+        stream_max_buffered_bytes
+    );
+
+    pub(crate) fn configure(&mut self, settings: crate::config::FileSettings) {
+        self.model.inherit(settings.model);
+        self.pipeline.inherit(settings.engine);
+        self.inherit(settings.server);
+    }
+
+    fn pipeline_config(&self) -> Result<PipelineConfig> {
+        let mut pipeline = self.pipeline.config(self.max_batch_size.unwrap_or(8))?;
+        if let Some(entries) = self.prefix_snapshots {
+            pipeline.prefix.entries = entries;
+            pipeline.prefix.state_share = None;
+        }
+        let scheduler = &mut pipeline.scheduler;
+        scheduler.max_batch_tokens = self.max_batch_tokens.unwrap_or(scheduler.max_batch_tokens);
+        scheduler.max_waiting = self.max_waiting.unwrap_or(scheduler.max_waiting);
+        scheduler.validate()?;
+        Ok(pipeline)
+    }
+
+    fn stream_config(&self) -> Result<StreamConfig> {
+        let defaults = StreamConfig::default();
+        let stream = StreamConfig {
+            channel_capacity: self
+                .stream_channel_capacity
+                .unwrap_or(defaults.channel_capacity),
+            max_buffered_bytes: self
+                .stream_max_buffered_bytes
+                .unwrap_or(defaults.max_buffered_bytes),
+        };
+        if stream.channel_capacity == 0
+            || stream.channel_capacity > tokio::sync::Semaphore::MAX_PERMITS
+            || stream.max_buffered_bytes == 0
+        {
+            return Err(TurError::Other(
+                "server streaming limits must be positive and channel capacity must fit Tokio semaphore limits".into(),
+            ));
+        }
+        Ok(stream)
+    }
 }
 
 pub(crate) async fn serve(args: Args) -> Result<()> {
-    if args.served_model_name.trim().is_empty() {
+    let stream = args.stream_config()?;
+    let pipeline = args.pipeline_config()?;
+    let default_model = args
+        .served_model_name
+        .unwrap_or_else(|| "qwen-hybrid".into());
+    if default_model.trim().is_empty() {
         return Err(TurError::Other(
             "served model name must not be empty".into(),
         ));
     }
-    let mut pipeline = args.pipeline.config(args.max_batch_size)?;
-    if let Some(entries) = args.prefix_snapshots {
-        pipeline.prefix = PrefixConfig {
-            entries,
-            state_share: None,
-            ..pipeline.prefix
-        };
-    }
-    let scheduler = &mut pipeline.scheduler;
-    scheduler.max_batch_tokens = args.max_batch_tokens.unwrap_or(scheduler.max_batch_tokens);
-    scheduler.max_waiting = args.max_waiting;
     let factory = args.model.factory()?;
+    pipeline.prefix.validate(factory.kv.page_tokens)?;
     // Load before binding the listener so readiness means a validated, usable checkpoint.
     let worker = PipelineWorker::spawn(WorkerConfig {
         budget: DeviceBudget::for_device(&factory.device),
         factory,
         pipeline,
         request_timeout: args.request_timeout_secs.map(Duration::from_secs),
-        stream: StreamConfig::default(),
+        stream,
     })?;
-    let default_model = args.served_model_name;
     let workers = HashMap::from([(default_model.clone(), worker)]);
     run_server(
         AppState {
             workers,
             default_model,
         },
-        args.listen,
+        args.listen
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080))),
     )
     .await
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert fallible server configuration"
+)]
+mod tests {
+    use super::*;
+    use crate::{Command, config::FileSettings, parse_cli};
+
+    fn arguments(values: &[&str]) -> Result<Args> {
+        match parse_cli(values)?.command {
+            Command::Serve(args) => Ok(args),
+            _ => Err(TurError::Other("expected serve arguments".into())),
+        }
+    }
+
+    #[test]
+    fn test_server_file_limits_and_cli_overrides_reach_pipeline() -> Result<()> {
+        let settings: FileSettings = toml::from_str(
+            r#"
+            [engine]
+            prefill_chunk_size = 512
+            target_pass_ms = 80
+            max_queue_wait_ms = 350
+            min_prefill_tokens = 16
+            max_waiting_tokens = 10000
+            prefix_spacing = 512
+            device_sampling = false
+            speculative_draft = 4
+            mtp = true
+            [server]
+            listen = "127.0.0.1:9000"
+            max_batch_size = 16
+            max_batch_tokens = 4096
+            max_waiting = 30
+            prefix_snapshots = 20
+            request_timeout_secs = 60
+            stream_channel_capacity = 10
+            stream_max_buffered_bytes = 2048
+        "#,
+        )
+        .map_err(|error| TurError::Other(error.to_string()))?;
+        let mut args = arguments(&[
+            "tur",
+            "serve",
+            "--max-batch-size",
+            "2",
+            "--prefix-snapshots",
+            "0",
+            "--speculative-draft",
+            "0",
+            "--mtp",
+            "false",
+        ])?;
+        args.configure(settings);
+        let pipeline = args.pipeline_config()?;
+        let scheduler = pipeline.scheduler;
+        assert_eq!(scheduler.max_running, 2);
+        assert_eq!(scheduler.max_chunk, 512);
+        assert_eq!(scheduler.max_batch_tokens, 4096);
+        assert_eq!(scheduler.max_waiting, 30);
+        assert_eq!(scheduler.max_waiting_tokens, 10000);
+        assert_eq!(scheduler.min_prefill_tokens, 16);
+        assert_eq!(scheduler.target_pass, Duration::from_millis(80));
+        assert_eq!(scheduler.max_queue_wait, Duration::from_millis(350));
+        assert!(!pipeline.device_sampling);
+        assert!(!pipeline.speculation.enabled());
+        assert_eq!(pipeline.prefix.entries, 0);
+        assert_eq!(pipeline.prefix.spacing, 512);
+        assert_eq!(
+            args.stream_config()?,
+            StreamConfig {
+                channel_capacity: 10,
+                max_buffered_bytes: 2048
+            }
+        );
+        assert_eq!(args.listen, Some(SocketAddr::from(([127, 0, 0, 1], 9000))));
+        assert_eq!(args.request_timeout_secs, Some(60));
+        Ok(())
+    }
+
+    #[test]
+    fn test_server_derived_defaults_use_resolved_inputs() -> Result<()> {
+        let mut args = arguments(&["tur", "serve"])?;
+        args.configure(
+            toml::from_str("[engine]\nprefill_chunk_size = 4096\n[server]\nmax_batch_size = 3")
+                .map_err(|error| TurError::Other(error.to_string()))?,
+        );
+        let pipeline = args.pipeline_config()?;
+        assert_eq!(pipeline.scheduler.max_batch_tokens, 4099);
+        assert_eq!(pipeline.prefix.entries, 3);
+        assert_eq!(pipeline.prefix.state_share, Some(0.125));
+        assert_eq!(args.stream_config()?, StreamConfig::default());
+        Ok(())
+    }
+
+    #[test]
+    fn test_invalid_server_limits_fail_before_loading() -> Result<()> {
+        for text in [
+            "[engine]\ntarget_pass_ms = 0",
+            "[engine]\nmin_prefill_tokens = 257",
+            "[server]\nmax_batch_size = 0",
+            "[server]\nmax_batch_tokens = 1",
+            "[server]\nstream_channel_capacity = 0",
+            "[server]\nstream_max_buffered_bytes = 0",
+        ] {
+            let mut args = arguments(&["tur", "serve"])?;
+            args.configure(
+                toml::from_str(text).map_err(|error| TurError::Other(error.to_string()))?,
+            );
+            assert!(
+                args.pipeline_config().is_err() || args.stream_config().is_err(),
+                "accepted {text}"
+            );
+        }
+        Ok(())
+    }
 }

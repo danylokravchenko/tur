@@ -47,22 +47,27 @@ Retained prefix snapshots are evicted before any running request is preempted.
 
 ## Limits
 
-| Setting | Default | Flag |
+| Setting | Default | CLI / TOML |
 | --- | --- | --- |
 | `max_running` | 8 (serve), 1 (run) | `--max-batch-size` |
 | `max_waiting` | 256 | `--max-waiting` |
-| `max_waiting_tokens` | 1,048,576 prompt tokens | library only |
+| `max_waiting_tokens` | 1,048,576 prompt tokens | TOML: `engine.max_waiting_tokens` |
 | `max_batch_tokens` | `max(2048, chunk + max_running)` | `--max-batch-tokens` |
 | `max_chunk` | 256 | `--prefill-chunk-size` |
-| `min_prefill_tokens` | `min(max_chunk, 32)` | library only |
-| `target_pass` | 60 ms | library only |
-| `max_queue_wait` | 2 s | library only |
+| `min_prefill_tokens` | `min(max_chunk, 32)` | TOML: `engine.min_prefill_tokens` |
+| `target_pass` | 60 ms | TOML: `engine.target_pass_ms` |
+| `max_queue_wait` | 2 s | TOML: `engine.max_queue_wait_ms` |
+
+Flag-backed settings also have [TOML equivalents](../guide/configuration.md).
 
 Submissions beyond `max_waiting` or `max_waiting_tokens` are rejected immediately
 (`QueueFull`, HTTP 429). A positive output limit that cannot fit the model's context,
 and a request that cannot fit the state pool even alone, are rejected at submission.
 
 ## Decisions
+
+- **Operational bounds can persist in TOML.** Scheduler timing and waiting-token limits
+  are file settings; the measured defaults and adaptive policy are unchanged.
 
 - **Decode priority with bounded, adaptive prefill.** On a mixed 128/2K-token workload,
   this cut p95 decoded-text intervals 3.7× against the earlier unscheduled loop. Throughput

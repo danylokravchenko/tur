@@ -33,8 +33,15 @@ Each streaming request has a bounded channel (64 messages) and a coalescing buff
 - **Disconnects** are detected every pass, while the device runs, and release the
   request's state.
 
+The listener, model ID, admission and deadline settings, prefix retention and streaming
+bounds can be set in [`tur.toml`](../guide/configuration.md). CLI flags override file
+values. Streaming limits are file-only controls, checked before loading the model.
+
 ## Decisions
 
+- **Persist deployment settings in TOML.** Stream channel and pending-text bounds join
+  the existing server limits without adding more flags. HTTP generation settings remain
+  per request.
 - **One resident model per server.** Multi-model arbitration exists in the library (one
   `DeviceBudget` shared by several pipelines), but the server loads one model.
 - **Overlap intake with execution.** Under streaming Poisson arrivals, TTFT p50 fell

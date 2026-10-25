@@ -57,6 +57,10 @@ tur run --prompt 'Write one sentence about the Moon.' --temperature 0 -n 64 --th
 tur serve --served-model-name qwen        # http://127.0.0.1:8080/v1/chat/completions
 ```
 
+To keep model and tuning settings in a file, copy [`tur.example.toml`](tur.example.toml)
+to `tur.toml`, then use `tur run` or `tur serve`. Flags override file values; see
+[Configuration](docs/src/guide/configuration.md) for precedence and all available keys.
+
 Use `./install.sh --root "$HOME/.local"` to install into `~/.local/bin` instead.
 Ensure the destination's `bin` directory is on your `PATH`.
 
@@ -82,6 +86,7 @@ The book in [`docs/`](docs/src/SUMMARY.md) is the full documentation. Serve it w
 - **Guide:**
   - [Quickstart](docs/src/guide/quickstart.md)
   - [Measured performance](docs/src/guide/performance.md)
+  - [Configuration](docs/src/guide/configuration.md)
   - [Command line](docs/src/guide/cli.md)
   - [HTTP API](docs/src/guide/http-api.md)
   - [Choosing a quantization](docs/src/guide/choosing-quantization.md)

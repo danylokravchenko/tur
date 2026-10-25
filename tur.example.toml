@@ -1,0 +1,60 @@
+# Copy to tur.toml in your working directory, then run `tur run` or `tur serve`.
+# Or select a file: tur serve --config /path/to/tur.toml
+# CLI arguments > TUR_MODEL/TUR_REVISION > this file > built-in defaults.
+# Every key is optional. The model source and revision must be supplied somewhere.
+# Paths from this file are relative to its directory. No ~ or environment expansion.
+
+[model]
+source = "Qwen/Qwen3.5-0.8B" # Or a local path, e.g. "./models/qwen3.5-0.8b".
+revision = "2fc06364715b967f1860aea9cf38778875588b17"
+# weight_format = "q8_0"   # f32, q8_0, q4k. Omit to load a prepacked artifact as stored.
+kv_format = "f16"         # f32, f16, q8 (= q8_32), q8_<group>.
+kv_page_tokens = 16
+recurrent_state = "f32"   # f32 or f16; speculation needs f32.
+
+[engine]                 # Shared by run and serve.
+prefill_chunk_size = 256
+# state_memory_mb = 2048  # Omit for an 8K-token context per concurrent request,
+                         # capped by available device memory. This example value is MiB.
+speculative_draft = 0     # Prompt-lookup drafts per sequence; 0 disables them.
+mtp = false              # Native MTP; implies >= 1 draft and disables prefix reuse.
+
+# Advanced settings available only in TOML. Defaults shown.
+device_sampling = true
+max_waiting_tokens = 1048576
+# min_prefill_tokens = 32 # Default: min(prefill_chunk_size, 32).
+target_pass_ms = 60
+max_queue_wait_ms = 2000
+prefix_spacing = 256     # Positive multiple of kv_page_tokens while reuse is enabled.
+
+[server]                 # Used only by serve.
+listen = "127.0.0.1:8080"
+served_model_name = "qwen-hybrid"
+max_batch_size = 8
+# max_batch_tokens = 2048 # Default: max(2048, prefill_chunk_size + max_batch_size).
+max_waiting = 256
+# request_timeout_secs = 120 # Omit for no server deadline (includes time in queue).
+# prefix_snapshots = 8    # Default: one per running request, capped at 1/8 of state
+                         # memory. An explicit count removes that cap; 0 disables reuse.
+
+# Advanced streaming limits available only in TOML. Both must be positive.
+stream_channel_capacity = 64
+stream_max_buffered_bytes = 16384
+
+[generation]             # Defaults for run only. HTTP clients set these per request.
+max_tokens = 128
+seed = 299792458
+# Omit sampling controls to inherit the checkpoint's generation_config.json.
+# temperature = 0.7      # 0 is greedy.
+# top_p = 0.95
+# top_k = 20
+# repetition_penalty = 1.0
+# presence_penalty = 0.0
+# frequency_penalty = 0.0
+# Omit thinking controls to preserve the checkpoint's chat template defaults.
+# thinking = false
+# reasoning_effort = "medium" # low, medium, xhigh.
+# preserve_thinking = false
+
+# Prompts, --tools files, --cpu-reference and quantize jobs stay on the command line.
+# Logging stays in RUST_LOG; Hugging Face credentials/cache stay in HF_TOKEN/HF_HOME.
