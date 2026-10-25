@@ -1,0 +1,5 @@
+A warehouse has six boxes, each containing eight red markers and four blue markers. Two boxes are sent to a school. How many markers remain in the warehouse?
+
+Each box contains eight plus four, or twelve markers. Sending two of the six boxes leaves four boxes. Four times twelve is forty-eight, so forty-eight markers remain. The red and blue counts can also be tracked separately: thirty-two red markers and sixteen blue markers remain. Their sum is forty-eight.
+
+Now suppose three additional blue markers are placed in each remaining box. Four boxes receive three markers each, adding twelve markers. The new total is sixty. The number of red markers remains thirty-two, and the number of blue markers becomes twenty-eight. Adding thirty-two and twenty-eight gives sixty, which agrees with the total calculated directly.

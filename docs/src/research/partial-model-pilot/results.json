@@ -1,0 +1,1480 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-25",
+  "hardware": {
+    "chip": "Apple M1",
+    "memory_gb": 16,
+    "model": "MacBookPro17,1",
+    "macos": "26.6.2"
+  },
+  "source": "Qwen/Qwen3.5-0.8B",
+  "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "base_git_revision": "576c4fd746b7873f348465731c9094c93b727220",
+  "working_tree": "pilot implementation added on top of base_git_revision",
+  "protocol": {
+    "weights": "Q8_0 except full-model Q4K control",
+    "activations": "F32",
+    "kv": "F32",
+    "recurrent": "F32",
+    "page_tokens": 16,
+    "chunk_tokens": 64,
+    "token_limit": 256,
+    "calibration_tokens": 256,
+    "quality_loss_allowance": null,
+    "latency_ceiling": null,
+    "scope": "small authored diagnostics; no task benchmark, recovery or equal-total-memory comparison"
+  },
+  "corpus_sha256": {
+    "calibration.txt": "4768d2b7f19ff97a2e68911c15fa95307014084bb3307fb885223820441b068a",
+    "code.txt": "b7067f6127b9fe65421639f558a6c79a577d207858abf211ac4d4e1d3bdf0974",
+    "json.txt": "10caf4d344b72b733d7797804bf901a25783389cca3e5a9d8b9544c983dacdd1",
+    "prose.txt": "914ee00e8de288a1f6d87c7de2c1ecb1382920bea337548bfd5e4304d49b0518",
+    "reasoning.txt": "038b4e182d60ce4eb49027505dbab22c94b0233372cc60b7ab79ce2996b3fc26"
+  },
+  "candidates": {
+    "control": {
+      "schema_version": 1,
+      "method": "permanent dense decoder-layer removal; no recovery",
+      "source_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+      "source_config_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+      "source_files": [
+        {
+          "file": "model.safetensors-00001-of-00001.safetensors",
+          "bytes": 1746942600,
+          "sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+        }
+      ],
+      "copied_files_sha256": {
+        "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+        "tokenizer_config.json": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c",
+        "chat_template.jinja": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+        "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+        "merges.txt": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+        "LICENSE": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+      },
+      "source_text_parameters": 752393024,
+      "retained_text_parameters": 752393024,
+      "retained_layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "removed_layers": [],
+      "layer_mapping": {
+        "0": 0,
+        "1": 1,
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "5": 5,
+        "6": 6,
+        "7": 7,
+        "8": 8,
+        "9": 9,
+        "10": 10,
+        "11": 11,
+        "12": 12,
+        "13": 13,
+        "14": 14,
+        "15": 15,
+        "16": 16,
+        "17": 17,
+        "18": 18,
+        "19": 19,
+        "20": 20,
+        "21": 21,
+        "22": 22,
+        "23": 23
+      },
+      "protected": "first, last and every full-attention layer",
+      "excluded": [
+        "vision tower",
+        "MTP head"
+      ],
+      "precision": "unchanged source tensor bytes",
+      "payload_bytes": 1504791232,
+      "weights_sha256": "5b92004c80e592d3d2aa0e549cdb5a0267230ccc5c353c0f538a7616e70b84f5",
+      "config_sha256": "560af8f2e553afc8675cece20ce0577908e8a8e70f08c4bc6431655892606e5d"
+    },
+    "22": {
+      "schema_version": 1,
+      "method": "permanent dense decoder-layer removal; no recovery",
+      "source_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+      "source_config_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+      "source_files": [
+        {
+          "file": "model.safetensors-00001-of-00001.safetensors",
+          "bytes": 1746942600,
+          "sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+        }
+      ],
+      "copied_files_sha256": {
+        "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+        "tokenizer_config.json": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c",
+        "chat_template.jinja": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+        "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+        "merges.txt": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+        "LICENSE": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+      },
+      "source_text_parameters": 752393024,
+      "retained_text_parameters": 709282304,
+      "retained_layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        22,
+        23
+      ],
+      "removed_layers": [
+        20,
+        21
+      ],
+      "layer_mapping": {
+        "0": 0,
+        "1": 1,
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "5": 5,
+        "6": 6,
+        "7": 7,
+        "8": 8,
+        "9": 9,
+        "10": 10,
+        "11": 11,
+        "12": 12,
+        "13": 13,
+        "14": 14,
+        "15": 15,
+        "16": 16,
+        "17": 17,
+        "18": 18,
+        "19": 19,
+        "20": 22,
+        "21": 23
+      },
+      "protected": "first, last and every full-attention layer",
+      "excluded": [
+        "vision tower",
+        "MTP head"
+      ],
+      "precision": "unchanged source tensor bytes",
+      "payload_bytes": 1418569216,
+      "weights_sha256": "e5c277f8804cd4d7b9ca355ace5fc8b5b4067d62d6ea777e245cedf7e50c3907",
+      "config_sha256": "664a8b237bd6faded3a4927efc8d12e694e03124fc54aaa709ade0542bac4119"
+    },
+    "20": {
+      "schema_version": 1,
+      "method": "permanent dense decoder-layer removal; no recovery",
+      "source_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+      "source_config_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+      "source_files": [
+        {
+          "file": "model.safetensors-00001-of-00001.safetensors",
+          "bytes": 1746942600,
+          "sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+        }
+      ],
+      "copied_files_sha256": {
+        "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+        "tokenizer_config.json": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c",
+        "chat_template.jinja": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+        "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+        "merges.txt": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+        "LICENSE": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+      },
+      "source_text_parameters": 752393024,
+      "retained_text_parameters": 666171584,
+      "retained_layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        23
+      ],
+      "removed_layers": [
+        12,
+        20,
+        21,
+        22
+      ],
+      "layer_mapping": {
+        "0": 0,
+        "1": 1,
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "5": 5,
+        "6": 6,
+        "7": 7,
+        "8": 8,
+        "9": 9,
+        "10": 10,
+        "11": 11,
+        "12": 13,
+        "13": 14,
+        "14": 15,
+        "15": 16,
+        "16": 17,
+        "17": 18,
+        "18": 19,
+        "19": 23
+      },
+      "protected": "first, last and every full-attention layer",
+      "excluded": [
+        "vision tower",
+        "MTP head"
+      ],
+      "precision": "unchanged source tensor bytes",
+      "payload_bytes": 1332347200,
+      "weights_sha256": "a5df6c9192992b4239e879fe8406e18da2147445bb0fafb8da3f864d6cb25738",
+      "config_sha256": "f1d3f4d1ff9d8ff0d207a78d02e3c12aeb1ec261593f54b4df8078e24aefb55f"
+    },
+    "18": {
+      "schema_version": 1,
+      "method": "permanent dense decoder-layer removal; no recovery",
+      "source_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+      "source_config_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+      "source_files": [
+        {
+          "file": "model.safetensors-00001-of-00001.safetensors",
+          "bytes": 1746942600,
+          "sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+        }
+      ],
+      "copied_files_sha256": {
+        "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+        "tokenizer_config.json": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c",
+        "chat_template.jinja": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+        "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+        "merges.txt": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+        "LICENSE": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+      },
+      "source_text_parameters": 752393024,
+      "retained_text_parameters": 623060864,
+      "retained_layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        10,
+        11,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        23
+      ],
+      "removed_layers": [
+        9,
+        12,
+        13,
+        20,
+        21,
+        22
+      ],
+      "layer_mapping": {
+        "0": 0,
+        "1": 1,
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "5": 5,
+        "6": 6,
+        "7": 7,
+        "8": 8,
+        "9": 10,
+        "10": 11,
+        "11": 14,
+        "12": 15,
+        "13": 16,
+        "14": 17,
+        "15": 18,
+        "16": 19,
+        "17": 23
+      },
+      "protected": "first, last and every full-attention layer",
+      "excluded": [
+        "vision tower",
+        "MTP head"
+      ],
+      "precision": "unchanged source tensor bytes",
+      "payload_bytes": 1246125184,
+      "weights_sha256": "586db1d396bf72ae32a58300e5e5909ef8ad3964ed93e1605cd57d6bbe0f4679",
+      "config_sha256": "5cdcbe9959b9de4180c44520f9ce323d330dd567e70266342cb2634bc53a22d7"
+    }
+  },
+  "quality": {
+    "code": {
+      "positions": 215,
+      "reference_weight_bytes": 1309441280,
+      "variants": [
+        {
+          "variant": "partial-model-control",
+          "weight_bytes": 1309441280,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            215
+          ],
+          "count": 215,
+          "mean_kl": 0.0,
+          "max_kl": 0.0,
+          "top1_agreement": 1.0,
+          "top1_accuracy": 0.7023255813953488,
+          "reference_top1_accuracy": 0.7023255813953488,
+          "mean_nll": 1.4441673716589252,
+          "reference_mean_nll": 1.4441673716589252
+        },
+        {
+          "variant": "partial-model-22",
+          "weight_bytes": 1263478784,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            215
+          ],
+          "count": 215,
+          "mean_kl": 0.18465723677983015,
+          "max_kl": 6.004391193389893,
+          "top1_agreement": 0.8511627906976744,
+          "top1_accuracy": 0.6651162790697674,
+          "reference_top1_accuracy": 0.7023255813953488,
+          "mean_nll": 1.637713385970084,
+          "reference_mean_nll": 1.4441673716589252
+        },
+        {
+          "variant": "partial-model-20",
+          "weight_bytes": 1217516288,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            215
+          ],
+          "count": 215,
+          "mean_kl": 0.9134908351021126,
+          "max_kl": 4.730922698974609,
+          "top1_agreement": 0.6186046511627907,
+          "top1_accuracy": 0.5627906976744186,
+          "reference_top1_accuracy": 0.7023255813953488,
+          "mean_nll": 2.221662917661719,
+          "reference_mean_nll": 1.4441673716589252
+        },
+        {
+          "variant": "partial-model-18",
+          "weight_bytes": 1171553792,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            215
+          ],
+          "count": 215,
+          "mean_kl": 1.603449856762796,
+          "max_kl": 6.538921356201172,
+          "top1_agreement": 0.4325581395348837,
+          "top1_accuracy": 0.37209302325581395,
+          "reference_top1_accuracy": 0.7023255813953488,
+          "mean_nll": 2.9086515127830097,
+          "reference_mean_nll": 1.4441673716589252
+        },
+        {
+          "variant": "q4k",
+          "weight_bytes": 933494016,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            215
+          ],
+          "count": 215,
+          "mean_kl": 0.04575445726679475,
+          "max_kl": 0.37316304445266724,
+          "top1_agreement": 0.9441860465116279,
+          "top1_accuracy": 0.7162790697674418,
+          "reference_top1_accuracy": 0.7023255813953488,
+          "mean_nll": 1.4743784593775058,
+          "reference_mean_nll": 1.4441673716589252
+        }
+      ]
+    },
+    "prose": {
+      "positions": 155,
+      "reference_weight_bytes": 1309441280,
+      "variants": [
+        {
+          "variant": "partial-model-control",
+          "weight_bytes": 1309441280,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            155
+          ],
+          "count": 155,
+          "mean_kl": 0.0,
+          "max_kl": 0.0,
+          "top1_agreement": 1.0,
+          "top1_accuracy": 0.3419354838709677,
+          "reference_top1_accuracy": 0.3419354838709677,
+          "mean_nll": 3.4408146494561094,
+          "reference_mean_nll": 3.4408146494561094
+        },
+        {
+          "variant": "partial-model-22",
+          "weight_bytes": 1263478784,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            155
+          ],
+          "count": 155,
+          "mean_kl": 0.3339642741026417,
+          "max_kl": 3.5007667541503906,
+          "top1_agreement": 0.7161290322580646,
+          "top1_accuracy": 0.3032258064516129,
+          "reference_top1_accuracy": 0.3419354838709677,
+          "mean_nll": 3.787881538500228,
+          "reference_mean_nll": 3.4408146494561094
+        },
+        {
+          "variant": "partial-model-20",
+          "weight_bytes": 1217516288,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            155
+          ],
+          "count": 155,
+          "mean_kl": 1.133412411136012,
+          "max_kl": 3.621091604232788,
+          "top1_agreement": 0.3870967741935484,
+          "top1_accuracy": 0.18064516129032257,
+          "reference_top1_accuracy": 0.3419354838709677,
+          "mean_nll": 4.6029863910569295,
+          "reference_mean_nll": 3.4408146494561094
+        },
+        {
+          "variant": "partial-model-18",
+          "weight_bytes": 1171553792,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            155
+          ],
+          "count": 155,
+          "mean_kl": 1.5893929286349204,
+          "max_kl": 6.257527828216553,
+          "top1_agreement": 0.3096774193548387,
+          "top1_accuracy": 0.12903225806451613,
+          "reference_top1_accuracy": 0.3419354838709677,
+          "mean_nll": 5.043371259204803,
+          "reference_mean_nll": 3.4408146494561094
+        },
+        {
+          "variant": "q4k",
+          "weight_bytes": 933494016,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            155
+          ],
+          "count": 155,
+          "mean_kl": 0.11141993523013943,
+          "max_kl": 0.47326529026031494,
+          "top1_agreement": 0.8064516129032258,
+          "top1_accuracy": 0.3225806451612903,
+          "reference_top1_accuracy": 0.3419354838709677,
+          "mean_nll": 3.595972738672431,
+          "reference_mean_nll": 3.4408146494561094
+        }
+      ]
+    },
+    "json": {
+      "positions": 210,
+      "reference_weight_bytes": 1309441280,
+      "variants": [
+        {
+          "variant": "partial-model-control",
+          "weight_bytes": 1309441280,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            210
+          ],
+          "count": 210,
+          "mean_kl": 0.0,
+          "max_kl": 0.0,
+          "top1_agreement": 1.0,
+          "top1_accuracy": 0.4714285714285714,
+          "reference_top1_accuracy": 0.4714285714285714,
+          "mean_nll": 2.6036807103163957,
+          "reference_mean_nll": 2.6036807103163957
+        },
+        {
+          "variant": "partial-model-22",
+          "weight_bytes": 1263478784,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            210
+          ],
+          "count": 210,
+          "mean_kl": 0.259389380529631,
+          "max_kl": 2.661522626876831,
+          "top1_agreement": 0.7857142857142857,
+          "top1_accuracy": 0.43333333333333335,
+          "reference_top1_accuracy": 0.4714285714285714,
+          "mean_nll": 2.8557770761689643,
+          "reference_mean_nll": 2.6036807103163957
+        },
+        {
+          "variant": "partial-model-20",
+          "weight_bytes": 1217516288,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            210
+          ],
+          "count": 210,
+          "mean_kl": 1.2003232025430493,
+          "max_kl": 5.992853164672852,
+          "top1_agreement": 0.45714285714285713,
+          "top1_accuracy": 0.3333333333333333,
+          "reference_top1_accuracy": 0.4714285714285714,
+          "mean_nll": 3.643931423994668,
+          "reference_mean_nll": 2.6036807103163957
+        },
+        {
+          "variant": "partial-model-18",
+          "weight_bytes": 1171553792,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            210
+          ],
+          "count": 210,
+          "mean_kl": 1.6081891188198434,
+          "max_kl": 7.06391716003418,
+          "top1_agreement": 0.37142857142857144,
+          "top1_accuracy": 0.26666666666666666,
+          "reference_top1_accuracy": 0.4714285714285714,
+          "mean_nll": 3.9763660714418316,
+          "reference_mean_nll": 2.6036807103163957
+        },
+        {
+          "variant": "q4k",
+          "weight_bytes": 933494016,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            210
+          ],
+          "count": 210,
+          "mean_kl": 0.10256253317779954,
+          "max_kl": 1.3209511041641235,
+          "top1_agreement": 0.8666666666666667,
+          "top1_accuracy": 0.45714285714285713,
+          "reference_top1_accuracy": 0.4714285714285714,
+          "mean_nll": 2.709115879444982,
+          "reference_mean_nll": 2.6036807103163957
+        }
+      ]
+    },
+    "reasoning": {
+      "positions": 161,
+      "reference_weight_bytes": 1309441280,
+      "variants": [
+        {
+          "variant": "partial-model-control",
+          "weight_bytes": 1309441280,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            161
+          ],
+          "count": 161,
+          "mean_kl": 0.0,
+          "max_kl": 0.0,
+          "top1_agreement": 1.0,
+          "top1_accuracy": 0.484472049689441,
+          "reference_top1_accuracy": 0.484472049689441,
+          "mean_nll": 2.043951321302144,
+          "reference_mean_nll": 2.043951321302144
+        },
+        {
+          "variant": "partial-model-22",
+          "weight_bytes": 1263478784,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            161
+          ],
+          "count": 161,
+          "mean_kl": 0.2847904598850884,
+          "max_kl": 3.661790609359741,
+          "top1_agreement": 0.7515527950310559,
+          "top1_accuracy": 0.40372670807453415,
+          "reference_top1_accuracy": 0.484472049689441,
+          "mean_nll": 2.3923195121088208,
+          "reference_mean_nll": 2.043951321302144
+        },
+        {
+          "variant": "partial-model-20",
+          "weight_bytes": 1217516288,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            161
+          ],
+          "count": 161,
+          "mean_kl": 1.2628449891051798,
+          "max_kl": 5.7664337158203125,
+          "top1_agreement": 0.43478260869565216,
+          "top1_accuracy": 0.2732919254658385,
+          "reference_top1_accuracy": 0.484472049689441,
+          "mean_nll": 3.269850721825724,
+          "reference_mean_nll": 2.043951321302144
+        },
+        {
+          "variant": "partial-model-18",
+          "weight_bytes": 1171553792,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            161
+          ],
+          "count": 161,
+          "mean_kl": 1.8012528712890163,
+          "max_kl": 6.714587211608887,
+          "top1_agreement": 0.2919254658385093,
+          "top1_accuracy": 0.20496894409937888,
+          "reference_top1_accuracy": 0.484472049689441,
+          "mean_nll": 3.7739610753791486,
+          "reference_mean_nll": 2.043951321302144
+        },
+        {
+          "variant": "q4k",
+          "weight_bytes": 933494016,
+          "kv_token_bytes": 24576,
+          "positions": [
+            0,
+            161
+          ],
+          "count": 161,
+          "mean_kl": 0.08010782242386735,
+          "max_kl": 1.0290484428405762,
+          "top1_agreement": 0.8322981366459627,
+          "top1_accuracy": 0.4720496894409938,
+          "reference_top1_accuracy": 0.484472049689441,
+          "mean_nll": 2.199864235626366,
+          "reference_mean_nll": 2.043951321302144
+        }
+      ]
+    }
+  },
+  "generation": {
+    "prompt": "Write a Python function sum_even(numbers) that returns the sum of the even integers in numbers. Return only the code.",
+    "temperature": 0,
+    "thinking": false,
+    "max_tokens": 128,
+    "seed": 299792458,
+    "results": [
+      {
+        "variant": "original-q8",
+        "output": "def sum_even(numbers):\n    return sum(x for x in numbers if x % 2 == 0)\n",
+        "prompt_tokens": 36,
+        "generated_tokens": 24,
+        "finish_reason": "stop"
+      },
+      {
+        "variant": "original-q4",
+        "output": "def sum_even(numbers):\n    return sum(x for x in numbers if x % 2 == 0)\n",
+        "prompt_tokens": 36,
+        "generated_tokens": 24,
+        "finish_reason": "stop"
+      },
+      {
+        "variant": "22-layers",
+        "output": "import PythonFunctionSumEvenNumbers\n\n# Example usage:\n# print(sum_even(1, 2, 3, 4, 5, 6, 7, 8, 9, 10))\n",
+        "prompt_tokens": 36,
+        "generated_tokens": 48,
+        "finish_reason": "stop"
+      },
+      {
+        "variant": "20-layers",
+        "output": "```python\ndef sum_even(numbers):\n    total = 0\n    \n    # Iterate over each integer in the input list or tuple.\n    # Note: Original behavior was iter over integers but original behavior was iter over integers.\n    # Original behavior was iter over integers but original behavior was iter over integers.\n    # Original behavior was iter over integers but original behavior was iter over integers.\n    original behavior was iter over integers.\n    original behavior was iter over integers.\n    original behavior was iter over integers.\n    original behavior was iter over integers.\n    original behavior was iter over integers.\n   \n",
+        "prompt_tokens": 36,
+        "generated_tokens": 128,
+        "finish_reason": "length"
+      },
+      {
+        "variant": "18-layers",
+        "output": "```python\ndef sum_even(x):\n    # Initialize empty stack of even numbers from the start of the list ````for ````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````\n",
+        "prompt_tokens": 36,
+        "generated_tokens": 128,
+        "finish_reason": "length"
+      }
+    ]
+  },
+  "width": {
+    "method": "E[post-SwiGLU activation^2] * squared L2 norm of matching down-projection column; ignores cross-neuron correlations",
+    "calibration_weights": "f32",
+    "calibration": {
+      "file": "calibration.txt",
+      "tokens": 256,
+      "text_fnv1a": "5e0f3c6cae5a8a95",
+      "tokens_fnv1a": "47fda088d7f42eb1"
+    },
+    "calibration_report_sha256": "b527fc3c0c37d14c4af9f9104a89bfe896a523acefd75f7970ebeac4ef3da9ec",
+    "calibration_report_local": "target/partial-neuron-influence.json",
+    "candidates": {
+      "3584": {
+        "schema_version": 1,
+        "method": "coupled gate/up rows and down columns; no recovery",
+        "source_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+        "source_config_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+        "source_files": [
+          {
+            "file": "model.safetensors-00001-of-00001.safetensors",
+            "bytes": 1746942600,
+            "sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+          }
+        ],
+        "copied_files_sha256": {
+          "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+          "tokenizer_config.json": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c",
+          "chat_template.jinja": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+          "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+          "merges.txt": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+          "LICENSE": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+        },
+        "source_text_parameters": 752393024,
+        "retained_text_parameters": 752393024,
+        "retained_layers": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "removed_layers": [],
+        "layer_mapping": {
+          "0": 0,
+          "1": 1,
+          "2": 2,
+          "3": 3,
+          "4": 4,
+          "5": 5,
+          "6": 6,
+          "7": 7,
+          "8": 8,
+          "9": 9,
+          "10": 10,
+          "11": 11,
+          "12": 12,
+          "13": 13,
+          "14": 14,
+          "15": 15,
+          "16": 16,
+          "17": 17,
+          "18": 18,
+          "19": 19,
+          "20": 20,
+          "21": 21,
+          "22": 22,
+          "23": 23
+        },
+        "protected": "all layers, mixers and residual width",
+        "excluded": [
+          "vision tower",
+          "MTP head"
+        ],
+        "precision": "unchanged source tensor bytes",
+        "payload_bytes": 1504791232,
+        "weights_sha256": "5b92004c80e592d3d2aa0e549cdb5a0267230ccc5c353c0f538a7616e70b84f5",
+        "config_sha256": "560af8f2e553afc8675cece20ce0577908e8a8e70f08c4bc6431655892606e5d",
+        "retained_neurons_sha256": "33a548c08d1a549d5321e67ff4710bf7ead79d81a5542421bb67620b9b70db4a",
+        "manifest_local": "target/partial-width-3584/partial-model.json"
+      },
+      "2688": {
+        "schema_version": 1,
+        "method": "coupled gate/up rows and down columns; no recovery",
+        "source_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+        "source_config_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+        "source_files": [
+          {
+            "file": "model.safetensors-00001-of-00001.safetensors",
+            "bytes": 1746942600,
+            "sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+          }
+        ],
+        "copied_files_sha256": {
+          "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+          "tokenizer_config.json": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c",
+          "chat_template.jinja": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+          "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+          "merges.txt": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+          "LICENSE": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+        },
+        "source_text_parameters": 752393024,
+        "retained_text_parameters": 686332736,
+        "retained_layers": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "removed_layers": [],
+        "layer_mapping": {
+          "0": 0,
+          "1": 1,
+          "2": 2,
+          "3": 3,
+          "4": 4,
+          "5": 5,
+          "6": 6,
+          "7": 7,
+          "8": 8,
+          "9": 9,
+          "10": 10,
+          "11": 11,
+          "12": 12,
+          "13": 13,
+          "14": 14,
+          "15": 15,
+          "16": 16,
+          "17": 17,
+          "18": 18,
+          "19": 19,
+          "20": 20,
+          "21": 21,
+          "22": 22,
+          "23": 23
+        },
+        "protected": "all layers, mixers and residual width",
+        "excluded": [
+          "vision tower",
+          "MTP head"
+        ],
+        "precision": "unchanged source tensor bytes",
+        "payload_bytes": 1372670656,
+        "weights_sha256": "97a5b6ad42adaf8c33b91c03de7b840be7b89743eb1c094d8e0f0dee60520c8b",
+        "config_sha256": "1cd914bd917c9a5d3897521c6350e34bfe00cac57f0e65d7fd869892e67fada8",
+        "retained_neurons_sha256": "3006fd609079953ae51f25844c18c0590c5afc28db7246a7b80dfa6f7b339cfb",
+        "manifest_local": "target/partial-width-2688/partial-model.json"
+      },
+      "1792": {
+        "schema_version": 1,
+        "method": "coupled gate/up rows and down columns; no recovery",
+        "source_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+        "source_config_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+        "source_files": [
+          {
+            "file": "model.safetensors-00001-of-00001.safetensors",
+            "bytes": 1746942600,
+            "sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+          }
+        ],
+        "copied_files_sha256": {
+          "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+          "tokenizer_config.json": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c",
+          "chat_template.jinja": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+          "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+          "merges.txt": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+          "LICENSE": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+        },
+        "source_text_parameters": 752393024,
+        "retained_text_parameters": 620272448,
+        "retained_layers": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "removed_layers": [],
+        "layer_mapping": {
+          "0": 0,
+          "1": 1,
+          "2": 2,
+          "3": 3,
+          "4": 4,
+          "5": 5,
+          "6": 6,
+          "7": 7,
+          "8": 8,
+          "9": 9,
+          "10": 10,
+          "11": 11,
+          "12": 12,
+          "13": 13,
+          "14": 14,
+          "15": 15,
+          "16": 16,
+          "17": 17,
+          "18": 18,
+          "19": 19,
+          "20": 20,
+          "21": 21,
+          "22": 22,
+          "23": 23
+        },
+        "protected": "all layers, mixers and residual width",
+        "excluded": [
+          "vision tower",
+          "MTP head"
+        ],
+        "precision": "unchanged source tensor bytes",
+        "payload_bytes": 1240550080,
+        "weights_sha256": "318783c9ba2f659dc814dc6718da88ed38f1a71c050b871d8b3cba15be7fc37d",
+        "config_sha256": "e2d61e0548f5d423cb39f81702b92eb23d2e61a1e175c2f4c598ec46067fd5bf",
+        "retained_neurons_sha256": "f865976bbdfa372ca887b49dc4959b0d64ac7c6b230f452f284ca9759e550305",
+        "manifest_local": "target/partial-width-1792/partial-model.json"
+      },
+      "896": {
+        "schema_version": 1,
+        "method": "coupled gate/up rows and down columns; no recovery",
+        "source_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+        "source_config_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+        "source_files": [
+          {
+            "file": "model.safetensors-00001-of-00001.safetensors",
+            "bytes": 1746942600,
+            "sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+          }
+        ],
+        "copied_files_sha256": {
+          "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+          "tokenizer_config.json": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c",
+          "chat_template.jinja": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+          "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+          "merges.txt": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+          "LICENSE": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+        },
+        "source_text_parameters": 752393024,
+        "retained_text_parameters": 554212160,
+        "retained_layers": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "removed_layers": [],
+        "layer_mapping": {
+          "0": 0,
+          "1": 1,
+          "2": 2,
+          "3": 3,
+          "4": 4,
+          "5": 5,
+          "6": 6,
+          "7": 7,
+          "8": 8,
+          "9": 9,
+          "10": 10,
+          "11": 11,
+          "12": 12,
+          "13": 13,
+          "14": 14,
+          "15": 15,
+          "16": 16,
+          "17": 17,
+          "18": 18,
+          "19": 19,
+          "20": 20,
+          "21": 21,
+          "22": 22,
+          "23": 23
+        },
+        "protected": "all layers, mixers and residual width",
+        "excluded": [
+          "vision tower",
+          "MTP head"
+        ],
+        "precision": "unchanged source tensor bytes",
+        "payload_bytes": 1108429504,
+        "weights_sha256": "ee73072f090e70212e7d442c46f0ec644f8bfebcd5c820f9649518006dc67614",
+        "config_sha256": "f2968e036c8e9be4ff25db4e4f0f4efbaabe5f586c2684992e65766261aae356",
+        "retained_neurons_sha256": "4436670e711f83b16bf7673b76fb8201d51980f18faf8a211d752b28946dd1c9",
+        "manifest_local": "target/partial-width-896/partial-model.json"
+      }
+    },
+    "quality": {
+      "code": {
+        "positions": 215,
+        "reference_weight_bytes": 1309441280,
+        "variants": [
+          {
+            "variant": "partial-width-3584",
+            "weight_bytes": 1309441280,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              215
+            ],
+            "count": 215,
+            "mean_kl": 0.0,
+            "max_kl": 0.0,
+            "top1_agreement": 1.0,
+            "top1_accuracy": 0.7023255813953488,
+            "reference_top1_accuracy": 0.7023255813953488,
+            "mean_nll": 1.4441673716589252,
+            "reference_mean_nll": 1.4441673716589252
+          },
+          {
+            "variant": "partial-width-2688",
+            "weight_bytes": 1239252224,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              215
+            ],
+            "count": 215,
+            "mean_kl": 0.4334628326376914,
+            "max_kl": 4.811431407928467,
+            "top1_agreement": 0.7488372093023256,
+            "top1_accuracy": 0.6232558139534884,
+            "reference_top1_accuracy": 0.7023255813953488,
+            "mean_nll": 1.9337449105707432,
+            "reference_mean_nll": 1.4441673716589252
+          },
+          {
+            "variant": "partial-width-1792",
+            "weight_bytes": 1169063168,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              215
+            ],
+            "count": 215,
+            "mean_kl": 0.8332035435907972,
+            "max_kl": 5.815096855163574,
+            "top1_agreement": 0.6232558139534884,
+            "top1_accuracy": 0.5441860465116279,
+            "reference_top1_accuracy": 0.7023255813953488,
+            "mean_nll": 2.176626963479472,
+            "reference_mean_nll": 1.4441673716589252
+          },
+          {
+            "variant": "partial-width-896",
+            "weight_bytes": 1098874112,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              215
+            ],
+            "count": 215,
+            "mean_kl": 1.5889726693958564,
+            "max_kl": 7.858911991119385,
+            "top1_agreement": 0.5302325581395348,
+            "top1_accuracy": 0.4418604651162791,
+            "reference_top1_accuracy": 0.7023255813953488,
+            "mean_nll": 2.8958546392879514,
+            "reference_mean_nll": 1.4441673716589252
+          }
+        ]
+      },
+      "prose": {
+        "positions": 155,
+        "reference_weight_bytes": 1309441280,
+        "variants": [
+          {
+            "variant": "partial-width-3584",
+            "weight_bytes": 1309441280,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              155
+            ],
+            "count": 155,
+            "mean_kl": 0.0,
+            "max_kl": 0.0,
+            "top1_agreement": 1.0,
+            "top1_accuracy": 0.3419354838709677,
+            "reference_top1_accuracy": 0.3419354838709677,
+            "mean_nll": 3.4408146494561094,
+            "reference_mean_nll": 3.4408146494561094
+          },
+          {
+            "variant": "partial-width-2688",
+            "weight_bytes": 1239252224,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              155
+            ],
+            "count": 155,
+            "mean_kl": 0.6217160684447135,
+            "max_kl": 3.298459768295288,
+            "top1_agreement": 0.567741935483871,
+            "top1_accuracy": 0.3161290322580645,
+            "reference_top1_accuracy": 0.3419354838709677,
+            "mean_nll": 4.211189971383541,
+            "reference_mean_nll": 3.4408146494561094
+          },
+          {
+            "variant": "partial-width-1792",
+            "weight_bytes": 1169063168,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              155
+            ],
+            "count": 155,
+            "mean_kl": 1.4394116702579682,
+            "max_kl": 6.332022190093994,
+            "top1_agreement": 0.43870967741935485,
+            "top1_accuracy": 0.22580645161290322,
+            "reference_top1_accuracy": 0.3419354838709677,
+            "mean_nll": 4.944567015478688,
+            "reference_mean_nll": 3.4408146494561094
+          },
+          {
+            "variant": "partial-width-896",
+            "weight_bytes": 1098874112,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              155
+            ],
+            "count": 155,
+            "mean_kl": 2.5429738508116815,
+            "max_kl": 7.406482696533203,
+            "top1_agreement": 0.3161290322580645,
+            "top1_accuracy": 0.14838709677419354,
+            "reference_top1_accuracy": 0.3419354838709677,
+            "mean_nll": 5.974020108340248,
+            "reference_mean_nll": 3.4408146494561094
+          }
+        ]
+      },
+      "json": {
+        "positions": 210,
+        "reference_weight_bytes": 1309441280,
+        "variants": [
+          {
+            "variant": "partial-width-3584",
+            "weight_bytes": 1309441280,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              210
+            ],
+            "count": 210,
+            "mean_kl": 0.0,
+            "max_kl": 0.0,
+            "top1_agreement": 1.0,
+            "top1_accuracy": 0.4714285714285714,
+            "reference_top1_accuracy": 0.4714285714285714,
+            "mean_nll": 2.6036807103163957,
+            "reference_mean_nll": 2.6036807103163957
+          },
+          {
+            "variant": "partial-width-2688",
+            "weight_bytes": 1239252224,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              210
+            ],
+            "count": 210,
+            "mean_kl": 0.4763099782449163,
+            "max_kl": 3.3760175704956055,
+            "top1_agreement": 0.6619047619047619,
+            "top1_accuracy": 0.38571428571428573,
+            "reference_top1_accuracy": 0.4714285714285714,
+            "mean_nll": 3.176758668054286,
+            "reference_mean_nll": 2.6036807103163957
+          },
+          {
+            "variant": "partial-width-1792",
+            "weight_bytes": 1169063168,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              210
+            ],
+            "count": 210,
+            "mean_kl": 1.0557925616823403,
+            "max_kl": 5.664630889892578,
+            "top1_agreement": 0.5333333333333333,
+            "top1_accuracy": 0.32857142857142857,
+            "reference_top1_accuracy": 0.4714285714285714,
+            "mean_nll": 3.880783888901351,
+            "reference_mean_nll": 2.6036807103163957
+          },
+          {
+            "variant": "partial-width-896",
+            "weight_bytes": 1098874112,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              210
+            ],
+            "count": 210,
+            "mean_kl": 2.0981681733863384,
+            "max_kl": 8.65833568572998,
+            "top1_agreement": 0.36666666666666664,
+            "top1_accuracy": 0.23333333333333334,
+            "reference_top1_accuracy": 0.4714285714285714,
+            "mean_nll": 4.855806720094655,
+            "reference_mean_nll": 2.6036807103163957
+          }
+        ]
+      },
+      "reasoning": {
+        "positions": 161,
+        "reference_weight_bytes": 1309441280,
+        "variants": [
+          {
+            "variant": "partial-width-3584",
+            "weight_bytes": 1309441280,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              161
+            ],
+            "count": 161,
+            "mean_kl": 0.0,
+            "max_kl": 0.0,
+            "top1_agreement": 1.0,
+            "top1_accuracy": 0.484472049689441,
+            "reference_top1_accuracy": 0.484472049689441,
+            "mean_nll": 2.043951321302144,
+            "reference_mean_nll": 2.043951321302144
+          },
+          {
+            "variant": "partial-width-2688",
+            "weight_bytes": 1239252224,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              161
+            ],
+            "count": 161,
+            "mean_kl": 0.565165281377484,
+            "max_kl": 3.1630940437316895,
+            "top1_agreement": 0.6459627329192547,
+            "top1_accuracy": 0.39751552795031053,
+            "reference_top1_accuracy": 0.484472049689441,
+            "mean_nll": 2.8047502176719177,
+            "reference_mean_nll": 2.043951321302144
+          },
+          {
+            "variant": "partial-width-1792",
+            "weight_bytes": 1169063168,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              161
+            ],
+            "count": 161,
+            "mean_kl": 1.4746445866781779,
+            "max_kl": 6.6548638343811035,
+            "top1_agreement": 0.4409937888198758,
+            "top1_accuracy": 0.2857142857142857,
+            "reference_top1_accuracy": 0.484472049689441,
+            "mean_nll": 3.7845914063227553,
+            "reference_mean_nll": 2.043951321302144
+          },
+          {
+            "variant": "partial-width-896",
+            "weight_bytes": 1098874112,
+            "kv_token_bytes": 24576,
+            "positions": [
+              0,
+              161
+            ],
+            "count": 161,
+            "mean_kl": 2.104950266467951,
+            "max_kl": 9.0572509765625,
+            "top1_agreement": 0.37267080745341613,
+            "top1_accuracy": 0.2422360248447205,
+            "reference_top1_accuracy": 0.484472049689441,
+            "mean_nll": 4.340632308057584,
+            "reference_mean_nll": 2.043951321302144
+          }
+        ]
+      }
+    },
+    "generation": {
+      "prompt": "Write a Python function sum_even(numbers) that returns the sum of the even integers in numbers. Return only the code.",
+      "temperature": 0,
+      "thinking": false,
+      "max_tokens": 128,
+      "seed": 299792458,
+      "results": [
+        {
+          "variant": "width-3584",
+          "output": "def sum_even(numbers):\n    return sum(x for x in numbers if x % 2 == 0)\n",
+          "prompt_tokens": 36,
+          "generated_tokens": 24,
+          "finish_reason": "stop"
+        },
+        {
+          "variant": "width-2688",
+          "output": "def sum_even(numbers):\n    # Iterate through numbers and check if they are even\n    # If a number is even, add it to the list\n    # If a number is odd, remove it from the list\n    # Return the list\n    # If list is empty, return empty list\n    # If list contains numbers, return list\n    # If list contains numbers, return list\n    # If list contains numbers, return list\n    # If list contains numbers, return list\n    # If list contains numbers, return list\n    # If list contains numbers, return list\n    # If list contains\n",
+          "prompt_tokens": 36,
+          "generated_tokens": 128,
+          "finish_reason": "length"
+        },
+        {
+          "variant": "width-1792",
+          "output": "```python\ndef sum_even(numbers):\n# Calculate the sum of the even integers\n# Return the sum of the numbers\n# Return the code\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return the function\n# Return\n",
+          "prompt_tokens": 36,
+          "generated_tokens": 128,
+          "finish_reason": "length"
+        },
+        {
+          "variant": "width-896",
+          "output": "#sum_even(numbers)\n\n#return the code\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n\n#\n",
+          "prompt_tokens": 36,
+          "generated_tokens": 128,
+          "finish_reason": "length"
+        }
+      ]
+    }
+  },
+  "validation": {
+    "just_ci": "passed; formatting, strict Clippy, both feature configurations, 275 tests passed, 8 ignored checkpoint tests skipped",
+    "export_tests": "7 passed; python3 -B -I scripts/test_partial_model.py",
+    "docs_build": "passed",
+    "diff_check": "passed"
+  }
+}

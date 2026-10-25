@@ -1,0 +1,250 @@
+{
+  "schema_version": 1,
+  "source_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "config": {
+    "architectures": [
+      "Qwen3_5ForConditionalGeneration"
+    ],
+    "image_token_id": 248056,
+    "model_type": "qwen3_5",
+    "text_config": {
+      "attention_bias": false,
+      "attention_dropout": 0.0,
+      "attn_output_gate": true,
+      "dtype": "bfloat16",
+      "eos_token_id": 248044,
+      "full_attention_interval": 4,
+      "head_dim": 256,
+      "hidden_act": "silu",
+      "hidden_size": 1024,
+      "initializer_range": 0.02,
+      "intermediate_size": 3584,
+      "layer_types": [
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention"
+      ],
+      "linear_conv_kernel_dim": 4,
+      "linear_key_head_dim": 128,
+      "linear_num_key_heads": 16,
+      "linear_num_value_heads": 16,
+      "linear_value_head_dim": 128,
+      "max_position_embeddings": 262144,
+      "mlp_only_layers": [],
+      "model_type": "qwen3_5_text",
+      "mtp_num_hidden_layers": 1,
+      "mtp_use_dedicated_embeddings": false,
+      "num_attention_heads": 8,
+      "num_hidden_layers": 24,
+      "num_key_value_heads": 2,
+      "rms_norm_eps": 1e-06,
+      "tie_word_embeddings": true,
+      "use_cache": true,
+      "vocab_size": 248320,
+      "mamba_ssm_dtype": "float32",
+      "rope_parameters": {
+        "mrope_interleaved": true,
+        "mrope_section": [
+          11,
+          11,
+          10
+        ],
+        "rope_type": "default",
+        "rope_theta": 10000000,
+        "partial_rotary_factor": 0.25
+      }
+    },
+    "tie_word_embeddings": true,
+    "transformers_version": "4.57.0.dev0",
+    "video_token_id": 248057,
+    "vision_config": {
+      "deepstack_visual_indexes": [],
+      "depth": 12,
+      "hidden_act": "gelu_pytorch_tanh",
+      "hidden_size": 768,
+      "in_channels": 3,
+      "initializer_range": 0.02,
+      "intermediate_size": 3072,
+      "model_type": "qwen3_5",
+      "num_heads": 12,
+      "num_position_embeddings": 2304,
+      "out_hidden_size": 1024,
+      "patch_size": 16,
+      "spatial_merge_size": 2,
+      "temporal_patch_size": 2
+    },
+    "vision_end_token_id": 248054,
+    "vision_start_token_id": 248053
+  },
+  "weights": "q8_0",
+  "kv": "f32",
+  "recurrent": "f32",
+  "calibration": {
+    "file": "calibration.txt",
+    "tokens": 256,
+    "text_fnv1a": "5e0f3c6cae5a8a95",
+    "tokens_fnv1a": "47fda088d7f42eb1"
+  },
+  "metric": "mean per-token 1 - cosine(layer input, layer output); layer 0 protected",
+  "scores": [
+    {
+      "layer": 1,
+      "kind": "linear_attention",
+      "influence": 0.16794922993295586,
+      "protected": false
+    },
+    {
+      "layer": 2,
+      "kind": "linear_attention",
+      "influence": 0.20417842670469508,
+      "protected": false
+    },
+    {
+      "layer": 3,
+      "kind": "full_attention",
+      "influence": 0.1904926202033629,
+      "protected": true
+    },
+    {
+      "layer": 4,
+      "kind": "linear_attention",
+      "influence": 0.17586305373921768,
+      "protected": false
+    },
+    {
+      "layer": 5,
+      "kind": "linear_attention",
+      "influence": 0.14993717873333334,
+      "protected": false
+    },
+    {
+      "layer": 6,
+      "kind": "linear_attention",
+      "influence": 0.14132845185062326,
+      "protected": false
+    },
+    {
+      "layer": 7,
+      "kind": "full_attention",
+      "influence": 0.125938833687481,
+      "protected": true
+    },
+    {
+      "layer": 8,
+      "kind": "linear_attention",
+      "influence": 0.08981434429246242,
+      "protected": false
+    },
+    {
+      "layer": 9,
+      "kind": "linear_attention",
+      "influence": 0.07826722005988793,
+      "protected": false
+    },
+    {
+      "layer": 10,
+      "kind": "linear_attention",
+      "influence": 0.08543095012165786,
+      "protected": false
+    },
+    {
+      "layer": 11,
+      "kind": "full_attention",
+      "influence": 0.0890573132322491,
+      "protected": true
+    },
+    {
+      "layer": 12,
+      "kind": "linear_attention",
+      "influence": 0.07488631469230084,
+      "protected": false
+    },
+    {
+      "layer": 13,
+      "kind": "linear_attention",
+      "influence": 0.07736918612633086,
+      "protected": false
+    },
+    {
+      "layer": 14,
+      "kind": "linear_attention",
+      "influence": 0.11267434125223348,
+      "protected": false
+    },
+    {
+      "layer": 15,
+      "kind": "full_attention",
+      "influence": 0.14299975000733178,
+      "protected": true
+    },
+    {
+      "layer": 16,
+      "kind": "linear_attention",
+      "influence": 0.11914364732205356,
+      "protected": false
+    },
+    {
+      "layer": 17,
+      "kind": "linear_attention",
+      "influence": 0.08065871109978544,
+      "protected": false
+    },
+    {
+      "layer": 18,
+      "kind": "linear_attention",
+      "influence": 0.08053062949425051,
+      "protected": false
+    },
+    {
+      "layer": 19,
+      "kind": "full_attention",
+      "influence": 0.07107538276518516,
+      "protected": true
+    },
+    {
+      "layer": 20,
+      "kind": "linear_attention",
+      "influence": 0.0544592787039784,
+      "protected": false
+    },
+    {
+      "layer": 21,
+      "kind": "linear_attention",
+      "influence": 0.04311890284793931,
+      "protected": false
+    },
+    {
+      "layer": 22,
+      "kind": "linear_attention",
+      "influence": 0.06668658523066609,
+      "protected": false
+    },
+    {
+      "layer": 23,
+      "kind": "full_attention",
+      "influence": 0.3034848491567916,
+      "protected": true
+    }
+  ]
+}

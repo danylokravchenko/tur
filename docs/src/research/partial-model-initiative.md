@@ -1,6 +1,7 @@
 # Initiative: preserve large-model capability within a small memory budget
 
-Created: 2026-10-24. Status: research backlog; no implementation or experiments started.
+Created: 2026-10-24. Status: dense 0.8B depth/width pilots implemented and measured
+on 2026-10-25; Flash-Next expert selection remains research backlog.
 Primary target: **Qwen/Qwen3.8-Flash-Next**, initially text-only on Apple Silicon.
 
 ## Objective and hypothesis
@@ -61,6 +62,30 @@ alternatives and controls. This is a focused reading list, not an exhaustive sur
 reported numbers above have not been reproduced in Tur.
 
 ## Experimental plan
+
+### Initial local pilot: dense Qwen3.5-0.8B
+
+The [first pilot](partial-model-pilot.md) uses the existing pinned 0.8B checkpoint
+on the 16 GB M1. This model has dense MLPs, so it tests permanent decoder-layer
+removal and MLP width reduction rather than expert selection. Calibration ranks
+recurrent layers by residual cosine distance; the first, last and every
+full-attention layer remain intact.
+Exports with 22, 20 and 18 layers contain 709M, 666M and 623M text parameters.
+
+Keeping all 24 layers and retaining 75%, 50% or 25% of each MLP's intermediate neurons
+produces 686M, 620M or 554M text parameters. Matched gate/up rows and down columns are
+selected using F32 calibration activation energy weighted by down-column norms.
+
+The all-layer and all-width controls have zero measured KL and 100% top-1 agreement
+with the original on the four small diagnostic samples. All reduced candidates lose substantial fidelity and fail
+a code-generation smoke check. Full-model Q4K uses fewer resident weight bytes and
+has lower KL in every sample than any reduced Q8_0 candidate. This rejects **these
+unrecovered selection methods on this checkpoint**, not pruning or width reduction
+in general. Better selection and recovery/distillation remain open. No candidate
+is promoted.
+The exporter, calibration command, corpus, manifests and measurements provide the
+starting point for better selection or recovery; they do not establish Flash-Next
+support or performance at a fixed total memory budget.
 
 ### 1. Fix the question and establish references
 

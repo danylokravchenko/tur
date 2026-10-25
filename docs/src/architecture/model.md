@@ -77,6 +77,13 @@ quantizer.
 
 ## Decisions
 
+- **Partial-model experiments export ordinary text checkpoints offline.** The
+  [0.8B pilot](../research/partial-model-pilot.md) physically removes and renumbers
+  selected layers, or shrinks all MLPs with coupled gate/up rows and down columns,
+  recording original IDs. The runtime follows explicit `layer_types` and dimensions;
+  it needs no alternate pruning execution path. All-layer and all-width exports
+  had zero measured KL and 100% top-1 agreement with Q8_0 on four diagnostic samples. Both unrecovered
+  reductions damaged generation and are not supported quality configurations.
 - **The architecture comes from checkpoint fields, never from the model's name.**
   Mapping every "qwen3" name to one decoder would silently run the wrong mathematics.
 - **Correctness comes from pinned external references.** The 0.8B checkpoint matches

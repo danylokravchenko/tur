@@ -17,7 +17,9 @@ Most cases need a real checkpoint in `TUR_QWEN35_0_8B`.
 | `model` | Model-level prefill and batched decode at several contexts, per weight and K/V format; engine overhead | `TUR_BENCH_FORMATS` (formats or artifact dirs), `TUR_BENCH_KV`, `TUR_BENCH_PAGES`, `TUR_BENCH_PREFILL`, `TUR_BENCH_CONTEXTS`, `TUR_BENCH_REFERENCE=1`, `TUR_BENCH_ONLY=prefill,decode,engine` |
 | `serving` | Throughput, TTFT and inter-token latency through the pipeline | `TUR_BENCH_WORKLOADS=decode,mixed,grammar,arrivals,prefix,reuse,speculation`, `TUR_BENCH_CONCURRENCY`, `TUR_BENCH_OUTPUT`, `TUR_BENCH_SAMPLING=0.7,20,0.95` |
 | `prefix` | Host cost of prefix keys, lookups and eviction (CPU, no checkpoint) | none |
-| `kv_quality` | Teacher-forced KL, top-1 and NLL of K/V, state and weight variants against an F32 reference | `TUR_EVAL_TEXT`, `TUR_EVAL_KV`, `TUR_EVAL_STATE`, `TUR_EVAL_WEIGHTS`, `TUR_EVAL_TOKENS`, `TUR_EVAL_GENERATE` |
+| `kv_quality` | Teacher-forced KL, top-1 and NLL of K/V, state and weight variants against a reference with F32 state | `TUR_EVAL_TEXT`, `TUR_EVAL_KV`, `TUR_EVAL_STATE`, `TUR_EVAL_WEIGHTS` (formats, artifact dirs or Q8_0 checkpoint dirs), `TUR_EVAL_REFERENCE`, `TUR_EVAL_TOKENS`, `TUR_EVAL_GENERATE` |
+| `layer_influence <checkpoint> <revision> <calibration.txt> [tokens]` | Per-layer residual cosine distance for dense partial-model calibration; Q8_0 weights and F32 state | Token limit defaults to 256; first, last and full-attention layers are protected by the exporter |
+| `neuron_influence <checkpoint> <revision> <calibration.txt> [tokens]` | Post-SwiGLU activation energy weighted by down-column norms for dense MLP width pruning; F32 calibration | Token limit defaults to 256; the exporter keeps every layer and couples gate/up rows to down columns |
 | `tensorops` | Metal 4 TensorOps capability and F32 GEMM against Candle | none |
 | `load_weights <dir> <variant>` | Load time and resident bytes of `f32`, `q8_0`, `q4k` or `prepacked` | wrap in `/usr/bin/time -l` for peak memory |
 
@@ -34,6 +36,13 @@ workloads:
 - `reuse`: cold shared prompts, contention, agent loops, churn and no reuse;
   `TUR_BENCH_RESTORABLE_FIRST=1` admits restorable prefixes first.
 - `speculation`: prompt lookup and MTP over repetitive, novel and code prompts.
+
+Use absolute input paths: Cargo runs the bench binary from `crates/tur`. Separate
+checkpoint comparisons require byte-identical `tokenizer.json` files. Plain
+checkpoints in `TUR_EVAL_WEIGHTS` always use Q8_0; use the default Q8_0 reference to
+isolate pruning. See the [dense pilot](../research/partial-model-pilot.md) for export
+and reproduction commands. `kv_quality` schema 3 records the reference directory
+and config rather than assuming that every input is the development checkpoint.
 
 ## Methodology
 

@@ -1,0 +1,9 @@
+Convert the following support request to JSON. The caller wants to reserve two seats on the morning train to Berlin on November 3. They prefer a quiet carriage and have not supplied an email address. Preserve missing information as null rather than inventing a value.
+
+{"destination":"Berlin","date":"2026-11-03","departure_period":"morning","passengers":2,"quiet_carriage":true,"email":null}
+
+A tool call uses the function name find_trains and an arguments object containing destination, date and passengers. It searches for available services; it does not confirm a booking or charge the caller.
+
+{"name":"find_trains","arguments":{"destination":"Berlin","date":"2026-11-03","passengers":2}}
+
+The returned JSON must use double quotes for object keys and string values. A boolean uses the literal true or false. A missing value uses null. Do not wrap the response in a Markdown code fence when the client expects a JSON document.

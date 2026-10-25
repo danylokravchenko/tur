@@ -1,0 +1,33 @@
+Review this Rust implementation of a bounded queue. The queue owns its messages and rejects new entries when its capacity is reached. A failed insertion returns the original value so the caller can retry or report the error.
+
+use std::collections::VecDeque;
+
+struct Queue<T> {
+    items: VecDeque<T>,
+    capacity: usize,
+}
+
+impl<T> Queue<T> {
+    fn push(&mut self, value: T) -> Result<(), T> {
+        if self.items.len() >= self.capacity {
+            return Err(value);
+        }
+        self.items.push_back(value);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        self.items.pop_front()
+    }
+}
+
+The push operation checks the capacity before changing the queue. The pop operation removes the oldest value. No additional synchronization is necessary when a single execution owner holds the queue. If several asynchronous tasks submit work, use bounded messages to transfer ownership to that execution owner.
+
+For a byte range, validate its end with checked arithmetic before slicing. A start offset and length can each be valid integers while their sum overflows. Check the resulting end against the buffer length and preserve the distinction between bytes and element counts.
+
+fn range_end(start: usize, length: usize, available: usize) -> Option<usize> {
+    let end = start.checked_add(length)?;
+    (end <= available).then_some(end)
+}
+
+A test should exercise an empty range, a range ending exactly at the boundary, an out-of-bounds range and an overflowing sum. Successful error propagation is part of the interface contract.

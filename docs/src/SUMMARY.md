@@ -40,3 +40,4 @@
 - [Rejected experiments](design/rejected.md)
 - [Open work](design/open.md)
 - [Research: partial models](research/partial-model-initiative.md)
+  - [Dense 0.8B pruning pilot](research/partial-model-pilot.md)

@@ -13,8 +13,11 @@
 //!
 //! Weights default to `Q8_0` for every model. `TUR_EVAL_REFERENCE=f32` sets the reference's
 //! weights; `TUR_EVAL_WEIGHTS` (default none) adds variants with F32 K/V and state, each
-//! `f32`, `q8_0`, `q4k` or a prepacked artifact directory. With `TUR_EVAL_MARKED=1`, text
-//! between `⟦` and `⟧` (markers removed) is also scored separately, e.g. retrieval answers.
+//! `f32`, `q8_0`, `q4k` or a prepacked artifact directory.
+//! A plain checkpoint directory in `TUR_EVAL_WEIGHTS` loads with `Q8_0` weights, allowing
+//! partial-model comparisons. Its tokenizer must be byte-identical to the reference.
+//! With `TUR_EVAL_MARKED=1`, text between `⟦` and `⟧` (markers removed) is also scored
+//! separately, e.g. retrieval answers.
 //! `TUR_EVAL_GENERATE=<n>` also keeps each model's state at 1K, 2K, 4K and 8K tokens and,
 //! after the teacher-forced pass, forks those snapshots (a second turn reusing the first
 //! turn's cached state) to feed the text's next token and decode `n` greedy tokens,
@@ -72,7 +75,7 @@ impl Runner {
         let model = Qwen35::load(
             &dir,
             &LoadOptions {
-                revision: "Qwen/Qwen3.5-0.8B@2fc06364".into(),
+                revision: dir.display().to_string(),
                 weights,
                 device: device.clone(),
                 execution: Execution::Fused,
@@ -174,11 +177,12 @@ struct Variant {
     weights: WeightVariant,
 }
 
-/// A conversion format of the checkpoint, or a prepacked artifact directory.
+/// A conversion format, prepacked artifact or separate `Q8_0` checkpoint.
 #[derive(Clone, Debug)]
 enum WeightVariant {
     Format(WeightFormat),
     Artifact(PathBuf),
+    Checkpoint(PathBuf),
 }
 
 impl WeightVariant {
@@ -187,23 +191,33 @@ impl WeightVariant {
         if is_artifact(&path) {
             return Ok(Self::Artifact(path));
         }
+        if path.join("config.json").is_file() {
+            return Ok(Self::Checkpoint(path));
+        }
         Ok(Self::Format(name.parse().map_err(TurError::Other)?))
     }
 
     fn name(&self) -> String {
         match self {
             Self::Format(format) => format!("{format:?}").to_lowercase(),
-            Self::Artifact(path) => path.display().to_string(),
+            Self::Artifact(path) | Self::Checkpoint(path) => path.display().to_string(),
         }
     }
 
     fn load(&self, checkpoint: &Path) -> Result<(PathBuf, Weights)> {
+        if let Self::Artifact(dir) | Self::Checkpoint(dir) = self
+            && std::fs::read(checkpoint.join("tokenizer.json"))?
+                != std::fs::read(dir.join("tokenizer.json"))?
+        {
+            return Err(invalid("quality comparison requires identical tokenizers"));
+        }
         Ok(match self {
             Self::Format(format) => (checkpoint.to_path_buf(), (*format).into()),
             Self::Artifact(dir) => (
                 dir.clone(),
                 Weights::Prepacked(Arc::new(Manifest::read(dir)?)),
             ),
+            Self::Checkpoint(dir) => (dir.clone(), WeightFormat::Q8_0.into()),
         })
     }
 }
@@ -390,7 +404,11 @@ pub(crate) fn run() -> Result<()> {
         .map(|&(start, _)| spans.iter().any(|s| s.contains(&start)))
         .collect();
     tokens.truncate(limit + 1);
-    let evaluated = tokens.len() - 1;
+    let evaluated = tokens
+        .len()
+        .checked_sub(1)
+        .filter(|&n| n > 0)
+        .ok_or_else(|| invalid("quality evaluation needs at least two tokens"))?;
     let device = Device::new_metal(0)?;
     let reference_weights = WeightVariant::parse(
         &std::env::var("TUR_EVAL_REFERENCE").unwrap_or_else(|_| "q8_0".into()),
@@ -498,14 +516,15 @@ pub(crate) fn run() -> Result<()> {
         )
         .collect();
     let document = json!({
-        "schema_version": 2,
-        "checkpoint": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
+        "schema_version": 3,
+        "checkpoint": dir,
+        "reference_config": serde_json::from_slice::<Value>(&std::fs::read(dir.join("config.json"))?)?,
         "weights": "q8_0 unless a result names other weights",
         "reference_weights": reference_weights.name(), "reference_weight_bytes": reference.model.weight_bytes(),
         "reference_kv": "f32", "reference_state": "f32", "page_tokens": 16,
         "text": text_path.file_name().map(|n| n.to_string_lossy().into_owned()),
         "text_bytes": text.len(), "evaluated_positions": evaluated, "chunk": chunk_tokens,
-        "metric": "teacher-forced next-token distributions; KL(F32 reference || variant) in nats",
+        "metric": "teacher-forced next-token distributions; KL(reference || variant) in nats; weight formats recorded separately",
         "results": results,
     });
     let output = serde_json::to_string_pretty(&document)?;

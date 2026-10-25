@@ -1,6 +1,7 @@
 # Rejected experiments
 
-Every row was built or bounded, measured on the M1, and removed from the tree. Patches
+These experiments were built or bounded on the M1 and rejected as defaults. The
+partial-model pilot retains its research tooling. Older deleted implementations
 remain recoverable from commit `99b073e`:
 
 ```sh
@@ -10,6 +11,8 @@ git show 99b073e:<path> > change.patch
 
 | Experiment | Result | Patch |
 | --- | --- | --- |
+| Permanent low-influence recurrent-layer removal from Qwen3.5-0.8B, without recovery | Keeping 22/20/18 layers removes 5.7/11.5/17.2% of text parameters. Every candidate fails a code-generation smoke check; full-model Q4K uses less resident weight memory and has lower KL on all four small held-out samples. [Protocol and measurements](../research/partial-model-pilot.md). Research tooling retained; no runtime default changed | — |
+| Activation-energy MLP width pruning of Qwen3.5-0.8B, without recovery | Retaining 75/50/25% MLP width keeps every layer and removes 8.8/17.6/26.3% of text parameters. All candidates fail the code-generation smoke check; full Q4K is smaller in resident weight bytes and has lower KL in every sample. [Protocol and measurements](../research/partial-model-pilot.md). Research tooling retained | — |
 | Chunked (WY/UT) DeltaNet prefill on the matrix units | Correct at every boundary, but 0.41–0.66× the token scan at every shape and batch | `rejected-chunked-delta.patch` |
 | Low-bit K/V: groupwise Q4, KIVI-style asymmetric Q4, TurboQuant with and without QJL, 5/6-bit variants | Every 4-bit format missed the quality budget (mean KL ≤ 1e-3, top-1 ≥ 98% per domain) by 10–30×. Values dominate the error, and each extra bit cuts KL about 4×. The only passing format (6-bit TurboQuant keys, Q8 values) saved 1.17× over Q8 and decoded 2–7% slower | `rejected-low-bit-formats.patch` |
 | Batch-invariant execution | Bit-identical across batch size, order and chunking (default kernels differ in 11 of 15 comparisons), but 0.52–0.60× prefill and 0.59–0.87× single-sequence decode | `rejected-batch-invariance.patch` |

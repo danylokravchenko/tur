@@ -11,14 +11,14 @@ mod kernels;
 mod kv_quality;
 mod load_weights;
 mod model;
+mod partial_model;
 mod prefix;
 mod serving;
 mod tensorops;
 
 use tur_core::{Result, TurError};
 
-const CASES: &str =
-    "kernels | model | serving | prefix | kv_quality | tensorops | load_weights <dir> <variant>";
+const CASES: &str = "kernels | model | serving | prefix | kv_quality | layer_influence | neuron_influence | tensorops | load_weights <dir> <variant>";
 
 fn main() -> Result<()> {
     // `cargo bench` passes `--bench`; every other argument belongs to the case.
@@ -36,6 +36,8 @@ fn main() -> Result<()> {
         "serving" => serving::run(),
         "prefix" => prefix::run(),
         "kv_quality" => kv_quality::run(),
+        "layer_influence" => partial_model::run(rest, false),
+        "neuron_influence" => partial_model::run(rest, true),
         "tensorops" => tensorops::run(),
         "load_weights" => load_weights::run(rest),
         _ => Err(TurError::Other(format!(
