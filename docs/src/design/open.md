@@ -40,8 +40,5 @@
 - **Production hardening.** Health and readiness endpoints, request metrics, graceful
   shutdown, stop sequences, model revision reporting, and memory and kernel diagnostics.
 - **Soak tests.** Multi-hour cancellation and churn runs for thermal and leak behaviour.
-- **Multi-turn reuse.** When a template re-renders history differently from the
-  generated text, reuse loses up to 255 tokens per turn. Fixing it needs a pass boundary
-  where the next turn's rendering diverges.
 - **Lints.** Ratchet `indexing_slicing` (678 sites today) crate by crate, starting with
   `tur-core` and `tur-cli`.

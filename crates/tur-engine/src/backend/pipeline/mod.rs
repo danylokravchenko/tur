@@ -58,6 +58,8 @@ struct Pending {
     /// The prompt, then every sampled token; the first `consumed` are in model state.
     tokens: Vec<u32>,
     prompt_tokens: usize,
+    /// Predicted last shared token before the template rewrites this turn as history.
+    turn_boundary: Option<usize>,
     consumed: usize,
     /// Original committed pass ends. Replay never splits or combines these chunks:
     /// doing so changes the rounding points of narrow recurrent state.
@@ -100,9 +102,13 @@ impl Pending {
         self.tokens.len() - self.prompt_tokens
     }
 
-    /// Scheduling view. Prefill chunks end at or before `boundary` (the next snapshot
-    /// position), so recurrent state exists at every aligned position.
+    /// Scheduling view. Prefill chunks stop at aligned and predicted turn boundaries,
+    /// so each snapshot has the recurrent state written at exactly its position.
     fn candidate(&self, id: Uuid, boundary: Option<usize>) -> Candidate {
+        let boundary = boundary
+            .into_iter()
+            .chain(self.turn_boundary.filter(|&end| end > self.consumed))
+            .min();
         let unconsumed = self.tokens.len() - self.consumed;
         let next = self.boundaries.partition_point(|&end| end <= self.consumed);
         let replay = self

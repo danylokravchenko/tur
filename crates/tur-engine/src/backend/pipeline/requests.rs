@@ -137,6 +137,45 @@ fn sampling(overrides: SamplingOptions, defaults: &GenerationDefaults) -> Sampli
 }
 
 impl InferencePipeline {
+    /// Predict where a new user turn would first rewrite this prompt. Only token
+    /// equality at lookup authorizes a restore; the probe just chooses a pass end.
+    fn turn_boundary(&self, request: &GenerationRequest, tokens: &[u32]) -> Option<usize> {
+        // A first turn has no demonstrated conversational reuse; splitting it adds a
+        // pass to ordinary single-turn requests. Start predicting once history exists.
+        if !self.prefix.config().enabled()
+            || !request.render.add_generation_prompt
+            || !request
+                .messages
+                .iter()
+                .any(|message| message.role == Role::Assistant)
+        {
+            return None;
+        }
+        let mut messages = request.messages.clone();
+        messages.extend([
+            ChatMessage::new(Role::Assistant, ""),
+            ChatMessage::new(Role::User, ""),
+        ]);
+        let options = RenderOptions {
+            add_generation_prompt: false,
+            ..request.render.clone()
+        };
+        // A template may reject synthetic empty turns. That makes the prediction
+        // unavailable, without invalidating the actual request that already rendered.
+        let rendered = self
+            .template
+            .render(&messages, &request.tools, &options)
+            .ok()?;
+        let future = self.tokenizer.encode(rendered, false).ok()?;
+        let boundary = tokens
+            .iter()
+            .zip(future.get_ids())
+            .take_while(|(current, future)| current == future)
+            .count();
+        (boundary > 0 && boundary < tokens.len() && !self.prefix.is_boundary(boundary))
+            .then_some(boundary)
+    }
+
     /// Render, tokenize and queue one text conversation with independent sampling state.
     /// Fails if the waiting queue is full or the request could never fit the state pool.
     pub fn submit_request(&mut self, request: &GenerationRequest) -> Result<Uuid> {
@@ -196,6 +235,7 @@ impl InferencePipeline {
             });
         self.scheduler
             .admit(waiting, waiting_tokens, tokens.len())?;
+        let turn_boundary = self.turn_boundary(request, &tokens);
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(TurError::DeadlineExceeded);
         }
@@ -226,6 +266,7 @@ impl InferencePipeline {
             Pending {
                 handle,
                 prompt_tokens: tokens.len(),
+                turn_boundary,
                 tokens,
                 consumed: 0,
                 boundaries: Vec::new(),
@@ -355,7 +396,9 @@ impl InferencePipeline {
                 break;
             }
         }
-        if (self.prefix.is_boundary(pending.consumed) || prompt_end)
+        if (self.prefix.is_boundary(pending.consumed)
+            || prompt_end
+            || pending.turn_boundary == Some(pending.consumed))
             && let Some(prefix) = pending.tokens.get(..pending.consumed)
         {
             self.prefix.extend(&mut pending.keys, prefix);

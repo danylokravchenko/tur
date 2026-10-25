@@ -11,8 +11,17 @@ plus recurrent slot) after some request's first `n` tokens.
   cross one, so these boundaries always exist.
 - **The end of each prompt**, together with the logits of its last token. An identical
   prompt then samples its first output without running a model pass.
+- **A predicted template-divergence boundary**, for prompts containing assistant history.
+  This preserves the matching tokens before a generation opener is rewritten next turn.
 - **The last consumed token of each finished request.** A conversation's next turn can
   resume right after the reply.
+
+To predict a rewrite, the pipeline renders a probe with an empty assistant reply and a
+new empty user turn, without a generation opener. Its longest token prefix shared with
+the actual prompt becomes an extra prefill pass boundary. A template that rejects the
+probe keeps the ordinary boundaries, as does a prompt with no assistant history. The
+first turn therefore takes no extra pass. A prediction never authorizes a restore:
+lookup still verifies every token of the actual next request.
 
 Snapshots share leases with the request that produced them, so taking one copies
 nothing. It keeps one recurrent slot and its pages alive. A snapshot that ends inside a
@@ -76,6 +85,12 @@ Measured on Qwen3.5-0.8B on an M1:
 - **Prefix reuse and the MTP drafter are mutually exclusive.** A snapshot at boundary B
   cannot hold the head's entry for B − 1, which depends on the token sampled after B, so
   enabling `--mtp` disables reuse.
-- **Known gap.** When a template re-renders history differently from the generated text
-  (Qwen's empty think block), reply snapshots miss. Reuse then falls back to aligned
-  snapshots and loses up to 255 tokens per turn.
+- **Predict template divergence once assistant history exists.** A retained boundary
+  avoids up to 255 tokens of extra replay before a rewrite at 256-token spacing; the
+  reply after the rewrite still needs recomputing. Four conversations of six turns with
+  16 snapshots cached 68% of prompt tokens instead of 52%, cut last-turn TTFT 30% and
+  finished 11% sooner. With eight snapshots, eviction limited the gain to 2% lower
+  last-turn TTFT at unchanged total time. The cache budget is unchanged; see
+  [Measured performance](../guide/performance.md#prefix-reuse) for the repeat spread.
+  Taking these boundaries on first turns too raised cold single-request TTFT 15%, so
+  first turns retain their ordinary passes.

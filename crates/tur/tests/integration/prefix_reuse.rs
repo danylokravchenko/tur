@@ -163,6 +163,96 @@ fn test_a_next_turn_resumes_after_the_previous_reply() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "metal")]
+fn test_template_divergence_restores_the_last_shared_token() -> Result<()> {
+    let fixture = Checkpoint::fused()?;
+    // Keep the pinned template's history rules, spelling its delimiters with tokens
+    // from the tiny fixture's vocabulary so distinct delimiters cannot collapse to UNK.
+    let template = include_str!("../fixtures/checkpoints/small-chat_template.jinja")
+        .replace("<|im_start|>", " t90 ")
+        .replace("<|im_end|>", " t91 ")
+        .replace("<think>", " t92 ")
+        .replace("</think>", " t93 ");
+    std::fs::write(fixture.0.join("chat_template.jinja"), template)?;
+    let mut factory = fixture.factory();
+    factory.device = candle_core::Device::new_metal(0)?;
+    let mut pipeline = InferencePipeline::new(&factory, cached(16))?;
+    let single = request(prompt(22, 0, 0), 1);
+    let stats = pipeline.run(&single, |_| {})?;
+    // A single-turn request keeps its two ordinary prefill passes, without a third
+    // pass to save a speculative future turn.
+    assert_eq!(
+        pipeline.scheduler().iteration(),
+        stats.generated_tokens as u64 + 1
+    );
+    pipeline.clear_prefix_cache();
+    let mut first = request(String::new(), 1);
+    first.messages = vec![
+        ChatMessage::new(Role::User, "t2"),
+        ChatMessage::new(Role::Assistant, "t3"),
+        ChatMessage::new(Role::User, prompt(14, 0, 0)),
+    ];
+    let reply = pipeline.run(&first, |_| {})?;
+    // The earlier exchange adds eight tokens, the last user wrapper and assistant
+    // header add five, and the empty think block adds two. A new user drops that block.
+    assert_eq!(reply.prompt_tokens, 29);
+    let repeated = pipeline.run(&first, |_| {})?;
+    assert_eq!(repeated.cached_tokens, 29);
+    assert_eq!(repeated.generated_text, reply.generated_text);
+    let mut next = request(String::new(), 2);
+    next.messages.clone_from(&first.messages);
+    next.messages
+        .push(ChatMessage::new(Role::Assistant, reply.generated_text));
+    next.messages
+        .push(ChatMessage::new(Role::User, prompt(0, 7, 3)));
+    let expected = cold(&fixture, std::slice::from_ref(&next))?;
+    let stats = pipeline.run(&next, |_| {})?;
+    assert_eq!(stats.generated_text, expected[0]);
+    assert_eq!(stats.cached_tokens, 27);
+    pipeline.clear_prefix_cache();
+    let usage = pipeline.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+
+    // A concurrent follower must wait for the same unaligned boundary instead of
+    // restoring the shallower aligned snapshot before the producer reaches it.
+    let outcomes = burst(&mut pipeline, &[first, next], |_, _, _| Ok(()))?;
+    let follower = outcomes
+        .get(&1)
+        .ok_or_else(|| TurError::Other("next turn did not finish".into()))?
+        .as_ref()
+        .map_err(|error| TurError::Other(error.to_string()))?;
+    assert_eq!(follower.generated_text, expected[0]);
+    assert_eq!(follower.cached_tokens, 27);
+    Ok(())
+}
+
+#[test]
+fn test_templates_rejecting_empty_turns_still_accept_valid_requests() -> Result<()> {
+    let fixture = Checkpoint::random()?;
+    std::fs::write(
+        fixture.0.join("chat_template.jinja"),
+        "{% for m in messages %}{% if not m.content %}{{ raise_exception('empty turn') }}\
+         {% endif %}{{ m.content }} {% endfor %}\
+         {% if add_generation_prompt %}t90 t91{% endif %}",
+    )?;
+    let mut request = request(String::new(), 1);
+    request.messages = vec![
+        ChatMessage::new(Role::User, "t2"),
+        ChatMessage::new(Role::Assistant, "t3"),
+        ChatMessage::new(Role::User, prompt(20, 0, 0)),
+    ];
+    let expected = cold(&fixture, std::slice::from_ref(&request))?;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), cached(8))?;
+    let stats = pipeline.run(&request, |_| {})?;
+    assert_eq!(stats.generated_text, expected[0]);
+    assert_eq!(stats.cached_tokens, 0);
+    let repeated = pipeline.run(&request, |_| {})?;
+    assert_eq!(repeated.generated_text, expected[0]);
+    assert_eq!(repeated.cached_tokens, 24);
+    Ok(())
+}
+
+#[test]
 fn test_snapshots_yield_memory_and_concurrent_reuse_matches_cold_runs() -> Result<()> {
     let fixture = Checkpoint::random()?;
     // Eight requests over one 48-token shared prefix with tails of 1–15 tokens.

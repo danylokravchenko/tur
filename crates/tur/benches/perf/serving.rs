@@ -7,8 +7,9 @@
 //! narrows with `TUR_BENCH_CONCURRENCY=1,8` and `TUR_BENCH_OUTPUT=64`.
 //! `TUR_BENCH_SAMPLING=0.7,20,0.95` samples instead of greedy decoding,
 //! `TUR_BENCH_DEVICE_SAMPLING=0` samples on the host, and
-//! `TUR_BENCH_WORKLOADS=prefix TUR_BENCH_SPACING=0,256` runs the prefix-reuse workloads and
-//! `TUR_BENCH_WORKLOADS=reuse` the prefix-scheduling ones on default pipelines
+//! `TUR_BENCH_WORKLOADS=prefix TUR_BENCH_SPACING=0,256` runs the prefix-reuse workloads
+//! (`TUR_BENCH_PREFIX_ENTRIES=8` changes their snapshot capacity; default 16), and
+//! `TUR_BENCH_WORKLOADS=reuse` runs the prefix-scheduling ones on default pipelines
 //! (`TUR_BENCH_RESTORABLE_FIRST=1` admits restorable prefixes first);
 //! `TUR_BENCH_WORKLOADS=arrivals TUR_BENCH_RATE=2,4` runs open-loop Poisson arrivals, and
 //! `TUR_BENCH_WORKLOADS=grammar` grammar-constrained requests.
@@ -272,12 +273,17 @@ fn prefix_runs(
     options: SamplingOptions,
 ) -> Result<Vec<Value>> {
     let mut config = PipelineConfig::new(8, CHUNK);
+    let entries = std::env::var("TUR_BENCH_PREFIX_ENTRIES").map_or(Ok(16), |value| {
+        value
+            .parse::<usize>()
+            .map_err(|_| invalid("TUR_BENCH_PREFIX_ENTRIES"))
+    })?;
     config.prefix = if spacing == 0 {
         PrefixConfig::DISABLED
     } else {
         PrefixConfig {
             spacing,
-            entries: 16,
+            entries,
             state_share: None,
             restorable_first: false,
         }
@@ -376,6 +382,7 @@ fn prefix_runs(
     let prefix = pipeline.prefix_stats();
     runs.push(
         json!({"workload": "multi_turn", "spacing": spacing, "conversations": 4, "turns": turns,
+        "retained_entries": pipeline.memory_plan().retained,
         "prefix": format!("{prefix:?}"), "snapshot_slot_bytes": slot_bytes}),
     );
     Ok(runs)

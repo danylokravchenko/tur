@@ -143,6 +143,29 @@ the tree.
 Eight users behind an already *warm* 1.5K-token system prompt get their first token in
 0.56 s p50. Without prefix snapshots, the same burst takes 9.46 s.
 
+Template-divergence snapshots were measured separately on 2026-10-25: four conversations
+of six turns, a 256-token initial user message, 64-token follow-ups and up to 48 output
+tokens per turn, greedy. The M1 ran macOS 26.6.2 on AC power with low-power mode off,
+Qwen3.5-0.8B at revision `2fc06364`, Q8_0 weights, F16 K/V and F32 recurrent state.
+Baseline `ae3f9de` and the implementation used equal snapshot budgets and 256-token
+spacing. Values are three-run medians with min–max ranges:
+
+| Snapshots | Metric | Ordinary boundaries | Also predict template divergence |
+| --- | --- | --- | --- |
+| 8 | Prompt tokens cached | 40.9% | 44.5% |
+| | Last-turn TTFT p50 | 1.498 s (1.495–1.506) | 1.462 s (1.462–1.475) |
+| | Six-turn wall time | 13.17 s (13.17–13.41) | 13.17 s (13.00–13.18) |
+| 16 | Prompt tokens cached | 52.1% | 68.3% |
+| | Last-turn TTFT p50 | 1.134 s (1.120–1.149) | 0.792 s (0.775–0.837) |
+| | Six-turn wall time | 12.18 s (12.05–12.26) | 10.86 s (10.78–10.89) |
+
+The extra boundary helps only while retained: at eight snapshots the total-time gain
+was within noise. With 16, the conversations finished 11% sooner and last-turn TTFT
+fell 30%. Single-turn, tool-loop and churn controls stayed within their run-to-run
+spread; first turns take no extra pass. Reproduce with `TUR_BENCH_WORKLOADS=prefix
+TUR_BENCH_SPACING=256 TUR_BENCH_PREFIX_ENTRIES=8 just bench serving`, then repeat with 16
+(set the pinned local checkpoint in `TUR_QWEN35_0_8B`).
+
 ## Speculative decoding
 
 80 output tokens per request; three repeats each; output tok/s (aggregate).

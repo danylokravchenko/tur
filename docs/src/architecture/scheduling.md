@@ -31,8 +31,8 @@ model.
    - **Queue-age guard.** The oldest prefill waiting longer than `max_queue_wait`
      ignores the cost target, within the pass's token cap. If younger requests hold the
      memory or running slots it needs, the newest of them is preempted.
-   - **Chunk boundaries.** Chunks never cross a prefix-snapshot boundary, so snapshots
-     land on aligned positions.
+   - **Chunk boundaries.** Chunks stop at aligned and predicted template-divergence
+     snapshot positions, so recurrent state exists at each exact boundary.
 5. **Memory.** A chunk that admits a request must leave one page of growth for every
    running sequence. A decode that does not fit preempts the newest running request.
 

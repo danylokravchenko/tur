@@ -9,6 +9,8 @@
 //!   one;
 //! - the end of each prompt, with the logits of its last token, so an identical prompt
 //!   samples its first output without a model pass;
+//! - a predicted template-divergence boundary in prompts containing assistant history,
+//!   so the next user turn can reuse the tokens before rewritten reasoning blocks;
 //! - the last consumed token of each finished request, so a conversation's next turn can
 //!   resume after the reply.
 //!
@@ -244,8 +246,8 @@ impl PrefixCache {
         self.config.enabled() && position > 0 && position.is_multiple_of(self.config.spacing)
     }
 
-    /// Deepest snapshot a request computing a `prompt`-token prompt will insert within the
-    /// first `shared` tokens of its sequence: its prompt end, or an aligned boundary.
+    /// Deepest aligned or prompt-end snapshot a request computing a `prompt`-token
+    /// prompt will insert within the first `shared` tokens of its sequence.
     pub fn reachable(&self, shared: usize, prompt: usize) -> usize {
         if !self.config.enabled() {
             0

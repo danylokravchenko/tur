@@ -28,7 +28,9 @@ workloads:
 - `mixed`: 128- and 2K-token prompts together.
 - `grammar`: every token masked.
 - `arrivals`: open-loop Poisson arrivals, serial versus overlapped intake.
-- `prefix`: a shared system prompt at several snapshot spacings.
+- `prefix`: a shared system prompt and four conversations of six turns at several
+  snapshot spacings. `TUR_BENCH_PREFIX_ENTRIES` sets snapshot capacity (default 16);
+  use 8 to check the default serving capacity.
 - `reuse`: cold shared prompts, contention, agent loops, churn and no reuse;
   `TUR_BENCH_RESTORABLE_FIRST=1` admits restorable prefixes first.
 - `speculation`: prompt lookup and MTP over repetitive, novel and code prompts.

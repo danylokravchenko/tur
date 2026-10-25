@@ -25,6 +25,10 @@ impl InferencePipeline {
             self.pending.get(id).is_some_and(|producer| {
                 let shared = waiter.keys.shared(&producer.keys).min(waiter.prompt_tokens);
                 let depth = self.prefix.reachable(shared, producer.prompt_tokens);
+                let depth = producer
+                    .turn_boundary
+                    .filter(|&boundary| boundary <= shared)
+                    .map_or(depth, |boundary| depth.max(boundary));
                 depth > producer.consumed
                     && depth
                         > *cached
