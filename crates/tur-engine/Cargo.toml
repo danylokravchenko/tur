@@ -1,0 +1,28 @@
+[package]
+name = "tur-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tur-core = { path = "../tur-core", default-features = false }
+tur-metal = { path = "../tur-metal", default-features = false }
+tur-models = { path = "../tur-models", default-features = false }
+tracing.workspace = true
+candle-core.workspace = true
+tokenizers.workspace = true
+llguidance.workspace = true
+toktrie_hf_tokenizers.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[features]
+default = ["metal"]
+metal = ["candle-core/metal", "tur-core/metal", "tur-metal/metal", "tur-models/metal"]
+
+[lints]
+workspace = true

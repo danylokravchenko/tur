@@ -1,0 +1,50 @@
+[package]
+name = "tur"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "A strong inference engine"
+readme = "../../README.md"
+
+[dependencies]
+tur-core = { path = "../tur-core", default-features = false }
+tur-metal = { path = "../tur-metal", default-features = false }
+tur-models = { path = "../tur-models", default-features = false }
+tur-engine = { path = "../tur-engine", default-features = false }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+candle-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+metal = { workspace = true, optional = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+async-stream = { workspace = true }
+
+[dev-dependencies]
+tokenizers.workspace = true
+tower.workspace = true
+http-body-util.workspace = true
+parking_lot.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+candle-metal-kernels.workspace = true
+objc2-metal.workspace = true
+
+[features]
+default = ["metal"]
+metal = ["tur-engine/metal", "tur-metal/metal", "tur-models/metal", "tur-core/metal", "candle-core/metal", "dep:metal"]
+
+[[bench]]
+name = "perf"
+harness = false
+required-features = ["metal"]
+
+[lints]
+workspace = true

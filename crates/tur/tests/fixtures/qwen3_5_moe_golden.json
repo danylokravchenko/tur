@@ -1,0 +1,151 @@
+{
+  "transformers": "5.20.2",
+  "torch": "2.14.1",
+  "device": "cpu",
+  "dtype": "float32",
+  "weight_format": "BF16 values promoted to F32",
+  "scale": 0.03,
+  "norm_scale": 0.1,
+  "upstream_reference": "ea52711b4850c332be3f778396ce882ab84a9011",
+  "shapes": {
+    "lm_head.weight": [
+      96,
+      256
+    ],
+    "model.embed_tokens.weight": [
+      96,
+      256
+    ],
+    "model.layers.0.input_layernorm.weight": [
+      256
+    ],
+    "model.layers.0.linear_attn.A_log": [
+      4
+    ],
+    "model.layers.0.linear_attn.conv1d.weight": [
+      512,
+      1,
+      4
+    ],
+    "model.layers.0.linear_attn.dt_bias": [
+      4
+    ],
+    "model.layers.0.linear_attn.in_proj_a.weight": [
+      4,
+      256
+    ],
+    "model.layers.0.linear_attn.in_proj_b.weight": [
+      4,
+      256
+    ],
+    "model.layers.0.linear_attn.in_proj_qkv.weight": [
+      512,
+      256
+    ],
+    "model.layers.0.linear_attn.in_proj_z.weight": [
+      256,
+      256
+    ],
+    "model.layers.0.linear_attn.norm.weight": [
+      64
+    ],
+    "model.layers.0.linear_attn.out_proj.weight": [
+      256,
+      256
+    ],
+    "model.layers.0.mlp.experts.down_proj": [
+      8,
+      256,
+      256
+    ],
+    "model.layers.0.mlp.experts.gate_up_proj": [
+      8,
+      512,
+      256
+    ],
+    "model.layers.0.mlp.gate.weight": [
+      8,
+      256
+    ],
+    "model.layers.0.mlp.shared_expert.down_proj.weight": [
+      256,
+      256
+    ],
+    "model.layers.0.mlp.shared_expert.gate_proj.weight": [
+      256,
+      256
+    ],
+    "model.layers.0.mlp.shared_expert.up_proj.weight": [
+      256,
+      256
+    ],
+    "model.layers.0.mlp.shared_expert_gate.weight": [
+      1,
+      256
+    ],
+    "model.layers.0.post_attention_layernorm.weight": [
+      256
+    ],
+    "model.layers.1.input_layernorm.weight": [
+      256
+    ],
+    "model.layers.1.mlp.experts.down_proj": [
+      8,
+      256,
+      256
+    ],
+    "model.layers.1.mlp.experts.gate_up_proj": [
+      8,
+      512,
+      256
+    ],
+    "model.layers.1.mlp.gate.weight": [
+      8,
+      256
+    ],
+    "model.layers.1.mlp.shared_expert.down_proj.weight": [
+      256,
+      256
+    ],
+    "model.layers.1.mlp.shared_expert.gate_proj.weight": [
+      256,
+      256
+    ],
+    "model.layers.1.mlp.shared_expert.up_proj.weight": [
+      256,
+      256
+    ],
+    "model.layers.1.mlp.shared_expert_gate.weight": [
+      1,
+      256
+    ],
+    "model.layers.1.post_attention_layernorm.weight": [
+      256
+    ],
+    "model.layers.1.self_attn.k_norm.weight": [
+      64
+    ],
+    "model.layers.1.self_attn.k_proj.weight": [
+      128,
+      256
+    ],
+    "model.layers.1.self_attn.o_proj.weight": [
+      256,
+      256
+    ],
+    "model.layers.1.self_attn.q_norm.weight": [
+      64
+    ],
+    "model.layers.1.self_attn.q_proj.weight": [
+      512,
+      256
+    ],
+    "model.layers.1.self_attn.v_proj.weight": [
+      128,
+      256
+    ],
+    "model.norm.weight": [
+      256
+    ]
+  }
+}

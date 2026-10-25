@@ -1,0 +1,28 @@
+[package]
+name = "tur-metal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tur-core = { path = "../tur-core", default-features = false }
+candle-core.workspace = true
+parking_lot.workspace = true
+candle-metal-kernels = { workspace = true, optional = true }
+objc2-metal = { workspace = true, optional = true }
+
+[features]
+default = ["metal"]
+metal = [
+    "candle-core/metal",
+    "tur-core/metal",
+    "dep:candle-metal-kernels",
+    "dep:objc2-metal",
+]
+
+[lints]
+workspace = true

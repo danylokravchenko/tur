@@ -1,168 +1,158 @@
-[package]
-name = "tur"
-version = "0.1.0"
+[workspace]
+members = [
+    "crates/tur-core",
+    "crates/tur-metal",
+    "crates/tur-models",
+    "crates/tur-engine",
+    "crates/tur",
+    "crates/tur-cli",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.99"
 description = "A strong inference engine"
 repository = "https://github.com/danylokravchenko/tur"
 authors = ["danylo.kravchenko.r@gmail.com"]
-license-file = "LICENSE"
-readme = "README.md"
+license = "Apache-2.0"
 publish = false
 
-[dependencies]
+[workspace.dependencies]
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-candle-core = "0.10.2"
-candle-nn = "0.10.2"
-candle-transformers = "0.10.2"
-# candle-flash-attn = "0.10.2"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
 tokenizers = "0.21"
 llguidance = { version = "1.7.5", default-features = false, features = ["lark"] }
 toktrie_hf_tokenizers = "1.7.5"
-toktrie = "1.7.5"
 
 serde = { version = "1.0.228", features = ["serde_derive"] }
-serde_json = "1.0.149"
-minijinja = { version = "2.19.0", features = ["builtins", "json"] }
+serde_json = { version = "1.0.149", features = ["preserve_order"] }
+toml = "0.9.12"
+minijinja = { version = "2.19.0", features = ["builtins", "json", "preserve_order"] }
 thiserror = "2.0.18"
 parking_lot = "0.12.5"
-indicatif = "0.18.4"
 uuid = { version = "1.23.1", features = ["v4"] }
-metal = { version = "0.33.0", features = ["mps"], optional = true }
+metal = { version = "0.33.0", features = ["mps"] }
 hf-hub = "0.5.0"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 axum = { version = "0.8.9", features = ["json", "macros"] }
 tokio = { version = "1.52.3", features = ["full"] }
 tower-http = { version = "0.6.11", features = ["cors", "trace"] }
 async-stream = "0.3.6"
-either = { version = "1.15.0", features = ["serde"] }
-num-traits = "0.2.19"
-rayon = "1.12.0"
-libc = { version = "0.2.147" }
-half = "2.7.1"
-ahash = "0.8.12"
 
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6.1"
 
-[dev-dependencies]
-safetensors = "0.7.0"
-bytemuck = "1.25.0"
-criterion = {version = "0.8.2", features = ["html_reports"]}
+safetensors = "0.8.0"
 tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1.3"
-
-[features]
-default = ["metal"]
-flash-attn = []
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal", "dep:metal"]
-
-[[bench]]
-name = "tur"
-harness = false
+candle-metal-kernels = "=0.11.0"
+objc2-metal = "=0.3.2"
 
 [workspace.lints.rust]
-unsafe_code = "warn"             # Warn unsafe code
-missing_docs = "allow"           # Allow missing documentation
-unused_must_use = "deny"         # Deny ignoring Result/Option returns
+unsafe_code = "forbid"
+unused_must_use = "deny"
+missing_docs = "allow"                 # 390+ public items lack docs; enable per crate as they are written
+unreachable_pub = "warn"               # visibility states the real boundary: `pub` only if exported
+unused_qualifications = "warn"
+trivial_numeric_casts = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
-multiple_crate_versions = "allow"
-# ==============================================================================
-# RESTRICTION GROUP - Explicitly opt-in to strict checks
-# ==============================================================================
-# These lints catch patterns that should never appear in the codebase
+# Groups first; individual lints below override them.
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+multiple_crate_versions = "allow"      # transitive duplicates are outside our control
 
-# Error Handling - No panics, unwraps, or expects
+# No panics: every failure is a `TurError`.
 unwrap_used = "deny"
 expect_used = "deny"
+get_unwrap = "deny"
+unwrap_in_result = "deny"
 panic = "deny"
-unimplemented = "deny"
-todo = "warn"
-unreachable = "deny"
 panic_in_result_fn = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+todo = "deny"
+exit = "deny"
+string_slice = "deny"                  # panics off a UTF-8 boundary
 
-# Memory & Performance
-clone_on_ref_ptr = "warn"        # Cloning Arc/Rc is cheap, document it
-unnecessary_cast = "warn"
+# No silently discarded results or suppressions without a reason.
+let_underscore_must_use = "deny"
+allow_attributes_without_reason = "deny"
+try_err = "warn"
+
+# Concurrency: locks are parking_lot (clippy.toml), never held across await.
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+mutex_atomic = "warn"
+mutex_integer = "warn"
+rc_mutex = "warn"
+mem_forget = "deny"
+
+# Modular structure: small functions, one module-file style, encapsulated structs.
+too_many_lines = "warn"                # threshold in clippy.toml
+cognitive_complexity = "warn"          # threshold in clippy.toml
+self_named_module_files = "warn"       # a module with children lives in `name/mod.rs`
+partial_pub_fields = "warn"            # a struct is plain data (all pub) or encapsulated (none)
+same_name_method = "warn"
+module_name_repetitions = "allow"
+
+# Memory and numerics.
+clone_on_ref_ptr = "warn"              # make `Arc` clones explicit with `Arc::clone`
 redundant_clone = "warn"
 large_stack_arrays = "warn"
 large_types_passed_by_value = "warn"
+large_include_file = "warn"
+rc_buffer = "warn"
+lossy_float_literal = "warn"
+float_cmp_const = "warn"
+suboptimal_flops = "warn"
+imprecise_flops = "warn"
+fn_to_numeric_cast_any = "warn"
 
-# Async patterns
-await_holding_lock = "deny"      # Never hold locks across await points
-await_holding_refcell_ref = "deny"
-
-# Code Quality
-dbg_macro = "warn"               # Remove debug prints before commit
-print_stdout = "warn"            # Use proper logging instead
+# Code quality.
+dbg_macro = "deny"
+print_stdout = "warn"                  # binaries and benches opt in with a reason
 print_stderr = "warn"
-exit = "deny"                    # Don't call std::process::exit
-mem_forget = "deny"              # Don't forget to drop resources
+string_add = "warn"
+format_push_string = "warn"
+verbose_file_reads = "warn"
+infinite_loop = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+empty_structs_with_brackets = "warn"
+redundant_type_annotations = "warn"
+use_self = "warn"
+option_if_let_else = "warn"
 
-# String handling
-string_add = "warn"              # Prefer format! or push_str
-string_slice = "warn"            # Can panic on invalid UTF-8 boundaries
-
-# ==============================================================================
-# PEDANTIC GROUP - High quality code standards
-# ==============================================================================
-pedantic = { level = "warn", priority = -1 }
-
-# Selectively allow some pedantic lints that may be too strict
-module_name_repetitions = "allow"
+# Pedantic lints that cost more than they catch here.
 must_use_candidate = "allow"
-missing_errors_doc = "allow"     # Can be too noisy
-missing_panics_doc = "allow"     # We don't panic anyway
-cast_possible_truncation = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"           # nothing panics
+cast_possible_truncation = "allow"     # shape arithmetic is validated before casts
 cast_precision_loss = "allow"
 cast_sign_loss = "allow"
 cast_possible_wrap = "allow"
-similar_names = "allow"          # Sometimes similar names are fine
-too_many_lines = "allow"         # Handled by cognitive complexity
+similar_names = "allow"
 
-# ==============================================================================
-# NURSERY GROUP - Experimental but useful lints
-# ==============================================================================
-# These are newer lints that may have false positives but catch real issues
-use_self = "warn"
-option_if_let_else = "warn"
-redundant_pub_crate = "warn"
-suboptimal_flops = "warn"
-imprecise_flops = "warn"
+# Host reference math (Candle CPU ops, kernel references, the sampler, quantization)
+# dominates test time unoptimized: the suite takes ~22 s instead of ~140 s.
+[profile.dev.package."*"]
+opt-level = 2
 
-# ==============================================================================
-# CARGO GROUP - Cargo.toml best practices
-# ==============================================================================
-cargo = { level = "warn", priority = -1 }
+[profile.dev.package.tur-metal]
+opt-level = 2
 
-# ==============================================================================
-# PERFORMANCE GROUP - Optimize hot paths
-# ==============================================================================
-perf = { level = "warn", priority = -1 }
-
-# ==============================================================================
-# STYLE GROUP - Consistent code style
-# ==============================================================================
-style = { level = "warn", priority = -1 }
-
-# ==============================================================================
-# COMPLEXITY GROUP - Reduce cognitive load
-# ==============================================================================
-complexity = { level = "warn", priority = -1 }
-
-# ==============================================================================
-# CORRECTNESS GROUP - Catch bugs
-# ==============================================================================
-correctness = { level = "deny", priority = -1 }
-
-# ==============================================================================
-# SUSPICIOUS GROUP - Likely bugs
-# ==============================================================================
-suspicious = { level = "warn", priority = -1 }
+[profile.dev.package.tur-models]
+opt-level = 2
 
 [profile.pre-release]
 inherits = "release"

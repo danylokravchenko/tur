@@ -1,0 +1,10 @@
+[book]
+title = "Tur"
+description = "A Rust inference engine for hybrid language models on Apple Silicon"
+authors = ["Danylo Kravchenko"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/danylokravchenko/tur"
+edit-url-template = "https://github.com/danylokravchenko/tur/edit/main/docs/{path}"
