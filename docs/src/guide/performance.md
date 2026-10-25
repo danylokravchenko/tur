@@ -47,11 +47,11 @@ and the formats converge.
 
 | Weights | 2K tokens | 8K tokens |
 | --- | --- | --- |
-| Q8_0 | 1,311 | 1,002 |
-| Q4K | 1,210 | 958 |
+| Q8_0 | 1,311 | 1,031 |
+| Q4K | 1,210 | 982 |
 | Mixed 5.5-bit | 1,245 | — |
 
-A 2K-token prompt therefore takes about 1.6 s; an 8K-token prompt about 8.2 s.
+A 2K-token prompt therefore takes about 1.6 s; an 8K-token prompt about 7.9 s.
 
 ## Serving
 
@@ -230,7 +230,7 @@ Q4_K_M mixes Q4_K and Q6_K blocks (497 MiB), against Tur's all-Q4K projections.
 | Decode at 2K | 56 | 49.4 | 89 | 63.5 |
 | Decode at 8K | 50 | 46.2 | 75 | 58.9 |
 | Prefill 2K | 1,311 | 1,323 | 1,210 | 1,188 |
-| Prefill 8K | 1,002 | 1,142 | 958 | 1,037 |
+| Prefill 8K | 1,031 | 1,142 | 982 | 1,037 |
 
 **Batched decode** (Q8_0, aggregate tokens/s at about 128 tokens of context; Tur from the
 `model` benchmark, llama.cpp from `llama-batched-bench`):
@@ -253,7 +253,7 @@ no sampling.
 
 Tur decodes 1.1–1.4× faster at one sequence and up to 1.55× faster at 8–16, and leads
 end-to-end bursts by 1.2× at 8–16 requests. Prefill is level at 2K tokens; at 8K,
-llama.cpp is 8–14% faster.
+llama.cpp is 6–11% faster.
 
 ```sh
 llama-bench -m <gguf> -p 2048,8192 -n 0 -r 3

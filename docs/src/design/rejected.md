@@ -15,6 +15,8 @@ git show 99b073e:<path> > change.patch
 | Batch-invariant execution | Bit-identical across batch size, order and chunking (default kernels differ in 11 of 15 comparisons), but 0.52–0.60× prefill and 0.59–0.87× single-sequence decode | `rejected-batch-invariance.patch` |
 | Admitting restorable prefixes first | Warm TTFT 5.1× lower, but cold TTFT +17% and throughput −10%: it starves unrelated requests | `rejected-hits-first.patch` |
 | Carrying a decode-free prefill budget into mixed passes | 4–5% slower under contention and churn | `rejected-budget-carry.patch` |
+| Prefetched staging over Q8 pools in tiled attention | 9–42% slower at every shape; with the scale reads replaced by constants still 2% slower at 8K, so better scale handling cannot win | — |
+| Prefetching tiled-attention chunks two steps ahead | Slower than one step at 8K (F16: 393 against 379 ms; F32: 402 against 376), from the extra registers | — |
 | Next-pass overlap, submission depth 2, command reuse | Not built: encoding already overlaps the GPU and the device idles 28–38 µs per pass, so the gain is bounded at about 1.003× | — |
 | Metal TensorOps for projections | Available on the M1 without unsafe bindings, but F32 GEMM ran at only 0.86–1.08× Candle | — |
 | Q4K GEMV unpacking each block before the batch loop | 1.6–1.8× slower: unpacked values cut occupancy | — |

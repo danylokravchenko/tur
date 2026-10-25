@@ -39,7 +39,10 @@ attention matrix. Online softmax and every accumulator stay in F32, and Q8 keys 
 values are dequantized once per staged tile.
 
 The tiled prefill kernel handles 32 queries of one head per 128-thread threadgroup. It
-sweeps keys in 32-row blocks, staging K and V in 64-dimension chunks. Head dimensions
+sweeps keys in 32-row blocks, staging K and V in 64-dimension chunks. Over F32 and F16
+pools, chunks alternate between two staging buffers and each thread reads the next
+chunk into registers before multiplying the current one, with one barrier per chunk.
+Q8 pools stage through one buffer, reading and dequantizing each chunk in place. Head dimensions
 64, 128 and 256 are supported, with GQA and the sigmoid output gate.
 
 ## Decisions
@@ -62,6 +65,12 @@ Measured on an M1:
 - **Two heads per simdgroup for Q8 decode attention.** 1.06–1.25× faster attention and up
   to 1.09× model decode at 8K context. It was not adopted for F32/F16 pools, where it
   ties or loses, and four heads lose everywhere.
+- **Prefetched staging for F32 and F16 pools.** One 8K-token prefill pass's attention
+  fell from 408 to 379 ms per layer (F16), chunks after a long context are 3–20% faster,
+  and whole 8K prefill is 2% faster; 2K prefill and short prompts are unchanged. Removing
+  the K/V reads entirely would have cut it to 256 ms, so read latency is only partly
+  hidden. Q8 pools keep single-buffered staging (see
+  [Rejected experiments](../design/rejected.md)).
 - **F32 activations.** F16/BF16 activations would be faster at 9–16 rows, but are
   deferred until held-out quality budgets exist.
 - **Launch shapes are M1 tuning,** not constants for every device. The DeltaNet scan's
@@ -69,4 +78,4 @@ Measured on an M1:
 - **Rejected:** chunked (WY/UT) DeltaNet prefill, TensorOps GEMM, and seven kernel
   variants (see [Rejected experiments](../design/rejected.md)).
 - **Open:** the MoE wide tier (more than 16 rows per expert) trails Candle by 1.2–1.5×;
-  tiled prefill attention runs at about 25% of the matrix units' F32 peak.
+  tiled prefill attention runs at about 28% of the matrix units' F32 peak.

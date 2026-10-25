@@ -329,6 +329,11 @@ kernel void attention_kv(
 #define TQ 32
 #define TK 32
 #define TD 64
+// Threads per tiled threadgroup (`TILE_THREADS`), the float4 loads each makes per staged
+// chunk, and the key distance between them.
+#define TT 128
+#define LOADS (TK * TD / 4 / TT)
+#define KEY_STRIDE (TT / (TD / 4))
 
 struct TiledParams {
     uint tiles;
@@ -366,6 +371,93 @@ static inline float4 kv_vector(device const T *data, device const half *scales, 
     return QUANT == 0 ? x : x * float(scales[head * (dim / group) + d / group]);
 }
 
+// Pool slots of the keys this thread stages in the block at `kb`; keys past `keys` read slot 0.
+static inline void kv_slots(thread uint *slot, device const uint *table, uint base, uint kb, uint keys, uint key0, uint page) {
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < LOADS; ++i) {
+        uint j = kb + key0 + i * KEY_STRIDE;
+        slot[i] = j < keys ? table[base + j / page] * page + j % page : 0;
+    }
+}
+
+// This thread's share of one staged F32 or F16 chunk: dimensions d..d+4 of its keys as
+// stored, zero past `keys`. Converting here would wait on the reads at once.
+template <typename T>
+static inline void kv_fetch(thread vec<T, 4> *raw, device const T *data, thread const uint *slot, uint kb, uint keys, uint key0, uint kv_heads, uint g, uint dim, uint d) {
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < LOADS; ++i) {
+        ulong head = ulong(slot[i]) * kv_heads + g;
+        raw[i] = kb + key0 + i * KEY_STRIDE < keys ? *(device const vec<T, 4> *)(data + head * dim + d) : vec<T, 4>(0);
+    }
+}
+
+// Q·K over dimension chunk `c` of the staged keys, accumulated into the score tiles.
+static inline void tile_scores(thread simdgroup_float8x8 *s, threadgroup const float *stage, device const float *qr, uint c, ushort2 fc, float scale) {
+    #pragma clang loop unroll(full)
+    for (uint x = 0; x < TD / 8; ++x) {
+        simdgroup_float8x8 a;
+        // The clamped token also keeps partial query tiles inside the allocation.
+        float2 pair = *(device const float2 *)(qr + c * TD + 8 * x + fc.y);
+        a.thread_elements()[0] = pair[0] * scale;
+        a.thread_elements()[1] = pair[1] * scale;
+        #pragma clang loop unroll(full)
+        for (uint kt = 0; kt < TK / 8; ++kt) {
+            simdgroup_float8x8 b;
+            simdgroup_load(b, stage + 8 * kt * TD + 8 * x, TD, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(s[kt], a, b, s[kt]);
+        }
+    }
+}
+
+// Online softmax on this lane's two elements per key tile of the block at `kb`, all in
+// one row: scores become weights, and the output and running sums are rescaled.
+template <uint CHUNKS>
+static inline void tile_softmax(thread simdgroup_float8x8 *s, thread simdgroup_float8x8 *o, thread float &m, thread float &l, uint kb, uint limit, ushort2 fc) {
+    float block = -FLT_MAX;
+    #pragma clang loop unroll(full)
+    for (uint kt = 0; kt < TK / 8; ++kt) {
+        #pragma clang loop unroll(full)
+        for (uint e = 0; e < 2; ++e) {
+            uint key = kb + 8 * kt + fc.y + e;
+            float score = s[kt].thread_elements()[e];
+            block = key < limit ? max(block, score) : block;
+        }
+    }
+    float m_new = max(m, row_max(block));
+    float total = 0.0f;
+    #pragma clang loop unroll(full)
+    for (uint kt = 0; kt < TK / 8; ++kt) {
+        #pragma clang loop unroll(full)
+        for (uint e = 0; e < 2; ++e) {
+            uint key = kb + 8 * kt + fc.y + e;
+            float weight = key < limit ? exp(s[kt].thread_elements()[e] - m_new) : 0.0f;
+            s[kt].thread_elements()[e] = weight;
+            total += weight;
+        }
+    }
+    float correction = exp(m - m_new);
+    l = l * correction + row_sum(total);
+    m = m_new;
+    #pragma clang loop unroll(full)
+    for (uint x = 0; x < 8 * CHUNKS; ++x) {
+        o[x].thread_elements()[0] *= correction;
+        o[x].thread_elements()[1] *= correction;
+    }
+}
+
+// P·V over dimension chunk `c` of the staged values, accumulated into the output tiles.
+static inline void tile_values(thread simdgroup_float8x8 *o, thread const simdgroup_float8x8 *s, threadgroup const float *stage, uint c) {
+    #pragma clang loop unroll(full)
+    for (uint kt = 0; kt < TK / 8; ++kt) {
+        #pragma clang loop unroll(full)
+        for (uint u = 0; u < TD / 8; ++u) {
+            simdgroup_float8x8 b;
+            simdgroup_load(b, stage + 8 * kt * TD + 8 * u, TD, ulong2(0, 0), false);
+            simdgroup_multiply_accumulate(o[8 * c + u], s[kt], b, o[8 * c + u]);
+        }
+    }
+}
+
 template <uint CHUNKS, typename T, uint QUANT>
 kernel void attention_tiled(
     device const float *q [[buffer(0)]],
@@ -395,8 +487,6 @@ kernel void attention_tiled(
     uint t0 = tiles[2 * tile];
     uint n = tiles[2 * tile + 1];
     uint g = h / (p.heads / p.kv_heads);
-    threadgroup float *stage = shared;
-    threadgroup uint *slots = (threadgroup uint *)(stage + TK * TD);
 
     ushort2 fc = fragment_coord(lane);
     uint row = 8 * sg + fc.x;
@@ -417,95 +507,98 @@ kernel void attention_tiled(
     }
     float m = -FLT_MAX;
     float l = 0.0f;
-    for (uint kb = 0; kb < keys; kb += TK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < TK) {
-            uint j = kb + tid;
-            slots[tid] = j < keys ? table[base + j / p.page] * p.page + j % p.page : 0;
-        }
-        simdgroup_float8x8 s[TK / 8];
-        #pragma clang loop unroll(full)
-        for (uint kt = 0; kt < TK / 8; ++kt) {
-            s[kt] = simdgroup_float8x8(0.0f);
-        }
-        #pragma clang loop unroll(full)
-        for (uint c = 0; c < CHUNKS; ++c) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint i = tid; i < TK * TD / 4; i += threads) {
-                uint key = i / (TD / 4);
-                uint d = 4 * (i % (TD / 4));
-                ulong head = ulong(slots[key]) * p.kv_heads + g;
-                *(threadgroup float4 *)(stage + key * TD + d) = kb + key < keys
-                    ? kv_vector<T, QUANT>(k, k_scales, head, D, c * TD + d, p.group)
-                    : float4(0.0f);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            #pragma clang loop unroll(full)
-            for (uint x = 0; x < TD / 8; ++x) {
-                simdgroup_float8x8 a;
-                // The clamped token also keeps partial query tiles inside the allocation.
-                float2 pair = *(device const float2 *)(qr + c * TD + 8 * x + fc.y);
-                a.thread_elements()[0] = pair[0] * p.scale;
-                a.thread_elements()[1] = pair[1] * p.scale;
-                #pragma clang loop unroll(full)
-                for (uint kt = 0; kt < TK / 8; ++kt) {
-                    simdgroup_float8x8 b;
-                    simdgroup_load(b, stage + 8 * kt * TD + 8 * x, TD, ulong2(0, 0), true);
-                    simdgroup_multiply_accumulate(s[kt], a, b, s[kt]);
-                }
-            }
-        }
-        // Online softmax on this lane's two elements per key tile, all in row `row`.
-        float block = -FLT_MAX;
-        #pragma clang loop unroll(full)
-        for (uint kt = 0; kt < TK / 8; ++kt) {
-            #pragma clang loop unroll(full)
-            for (uint e = 0; e < 2; ++e) {
-                uint key = kb + 8 * kt + fc.y + e;
-                float score = s[kt].thread_elements()[e];
-                block = key < limit ? max(block, score) : block;
-            }
-        }
-        float m_new = max(m, row_max(block));
-        float total = 0.0f;
-        #pragma clang loop unroll(full)
-        for (uint kt = 0; kt < TK / 8; ++kt) {
-            #pragma clang loop unroll(full)
-            for (uint e = 0; e < 2; ++e) {
-                uint key = kb + 8 * kt + fc.y + e;
-                float weight = key < limit ? exp(s[kt].thread_elements()[e] - m_new) : 0.0f;
-                s[kt].thread_elements()[e] = weight;
-                total += weight;
-            }
-        }
-        float correction = exp(m - m_new);
-        l = l * correction + row_sum(total);
-        m = m_new;
-        #pragma clang loop unroll(full)
-        for (uint x = 0; x < 8 * CHUNKS; ++x) {
-            o[x].thread_elements()[0] *= correction;
-            o[x].thread_elements()[1] *= correction;
-        }
-        #pragma clang loop unroll(full)
-        for (uint c = 0; c < CHUNKS; ++c) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint i = tid; i < TK * TD / 4; i += threads) {
-                uint key = i / (TD / 4);
-                uint d = 4 * (i % (TD / 4));
-                ulong head = ulong(slots[key]) * p.kv_heads + g;
-                *(threadgroup float4 *)(stage + key * TD + d) = kb + key < keys
-                    ? kv_vector<T, QUANT>(v, v_scales, head, D, c * TD + d, p.group)
-                    : float4(0.0f);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint key0 = tid / (TD / 4);
+    uint d0 = 4 * (tid % (TD / 4));
+    if (QUANT == 0) {
+        // F32 and F16 chunks stream through two staging buffers. Each thread stages the
+        // same keys of every chunk, and issues the next chunk's reads before this chunk's
+        // matrix work so their latency overlaps it; one barrier per chunk orders the
+        // buffers.
+        uint slot[LOADS];
+        uint next_slot[LOADS];
+        vec<T, 4> fetched[LOADS];
+        kv_slots(slot, table, base, 0, keys, key0, p.page);
+        kv_fetch<T>(fetched, k, slot, 0, keys, key0, p.kv_heads, g, D, d0);
+        for (uint kb = 0; kb < keys; kb += TK) {
+            kv_slots(next_slot, table, base, kb + TK, keys, key0, p.page);
+            simdgroup_float8x8 s[TK / 8];
             #pragma clang loop unroll(full)
             for (uint kt = 0; kt < TK / 8; ++kt) {
+                s[kt] = simdgroup_float8x8(0.0f);
+            }
+            // 2 * CHUNKS steps per block keep every step's buffer constant.
+            #pragma clang loop unroll(full)
+            for (uint step = 0; step < 2 * CHUNKS; ++step) {
+                threadgroup float *stage = shared + (step % 2) * TK * TD;
                 #pragma clang loop unroll(full)
-                for (uint u = 0; u < TD / 8; ++u) {
-                    simdgroup_float8x8 b;
-                    simdgroup_load(b, stage + 8 * kt * TD + 8 * u, TD, ulong2(0, 0), false);
-                    simdgroup_multiply_accumulate(o[8 * c + u], s[kt], b, o[8 * c + u]);
+                for (uint i = 0; i < LOADS; ++i) {
+                    *(threadgroup float4 *)(stage + (key0 + i * KEY_STRIDE) * TD + d0) = float4(fetched[i]);
                 }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (step + 1 < CHUNKS) {
+                    kv_fetch<T>(fetched, k, slot, kb, keys, key0, p.kv_heads, g, D, (step + 1) * TD + d0);
+                } else if (step + 1 < 2 * CHUNKS) {
+                    kv_fetch<T>(fetched, v, slot, kb, keys, key0, p.kv_heads, g, D, (step + 1 - CHUNKS) * TD + d0);
+                } else if (kb + TK < keys) {
+                    kv_fetch<T>(fetched, k, next_slot, kb + TK, keys, key0, p.kv_heads, g, D, d0);
+                }
+                if (step < CHUNKS) {
+                    tile_scores(s, stage, qr, step, fc, p.scale);
+                } else {
+                    tile_values(o, s, stage, step - CHUNKS);
+                }
+                if (step == CHUNKS - 1) {
+                    tile_softmax<CHUNKS>(s, o, m, l, kb, limit, fc);
+                }
+            }
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < LOADS; ++i) {
+                slot[i] = next_slot[i];
+            }
+        }
+    } else {
+        // Q8 chunks are read, dequantized and staged in one buffer, two barriers per
+        // chunk: prefetching them, with their scales, was 9-42% slower at every shape.
+        threadgroup uint *slots = (threadgroup uint *)(shared + TK * TD);
+        for (uint kb = 0; kb < keys; kb += TK) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid < TK) {
+                uint j = kb + tid;
+                slots[tid] = j < keys ? table[base + j / p.page] * p.page + j % p.page : 0;
+            }
+            simdgroup_float8x8 s[TK / 8];
+            #pragma clang loop unroll(full)
+            for (uint kt = 0; kt < TK / 8; ++kt) {
+                s[kt] = simdgroup_float8x8(0.0f);
+            }
+            #pragma clang loop unroll(full)
+            for (uint c = 0; c < CHUNKS; ++c) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint i = tid; i < TK * TD / 4; i += threads) {
+                    uint key = i / (TD / 4);
+                    uint d = 4 * (i % (TD / 4));
+                    ulong head = ulong(slots[key]) * p.kv_heads + g;
+                    *(threadgroup float4 *)(shared + key * TD + d) = kb + key < keys
+                        ? kv_vector<T, QUANT>(k, k_scales, head, D, c * TD + d, p.group)
+                        : float4(0.0f);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                tile_scores(s, shared, qr, c, fc, p.scale);
+            }
+            tile_softmax<CHUNKS>(s, o, m, l, kb, limit, fc);
+            #pragma clang loop unroll(full)
+            for (uint c = 0; c < CHUNKS; ++c) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint i = tid; i < TK * TD / 4; i += threads) {
+                    uint key = i / (TD / 4);
+                    uint d = 4 * (i % (TD / 4));
+                    ulong head = ulong(slots[key]) * p.kv_heads + g;
+                    *(threadgroup float4 *)(shared + key * TD + d) = kb + key < keys
+                        ? kv_vector<T, QUANT>(v, v_scales, head, D, c * TD + d, p.group)
+                        : float4(0.0f);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                tile_values(o, s, shared, c);
             }
         }
     }

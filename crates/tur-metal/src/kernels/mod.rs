@@ -1221,9 +1221,9 @@ impl Kernels {
         }
     }
 
-    /// Threadgroup memory of the tiled kernel's staging buffer and physical slots.
+    /// Threadgroup memory of the tiled kernel: two staging buffers of `TILE_KEYS` keys by `TILE_DIMS` F32 dimensions.
     fn tiled_memory_bytes() -> usize {
-        (TILE_KEYS * TILE_DIMS + TILE_KEYS) * 4
+        2 * TILE_KEYS * TILE_DIMS * 4
     }
 
     /// Whether a pass with `kv` addressing and `heads` query heads runs the tiled kernel.
