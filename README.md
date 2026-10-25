@@ -32,18 +32,18 @@ output tokens:
 
 | Concurrent requests | Output tok/s | TTFT p50 | Inter-token p50 |
 | --- | --- | --- | --- |
-| 1 | 49 | 0.15 s | 17.8 ms |
-| 4 | 118 | 0.47 s | 23.0 ms |
-| 8 | 184 | 0.88 s | 27.2 ms |
-| 16 | 200 | 1.69 s | 46.3 ms |
+| 1 | 50 | 0.14 s | 17.8 ms |
+| 4 | 121 | 0.45 s | 22.7 ms |
+| 8 | 186 | 0.87 s | 26.9 ms |
+| 16 | 204 | 1.63 s | 46.0 ms |
 
-- Single-sequence decode: 57 tok/s with Q8_0, 91 tok/s with Q4K.
+- Single-sequence decode: 58 tok/s with Q8_0, 92 tok/s with Q4K.
 - Prefill: about 1,300 tok/s at 2K tokens.
 - Prefix reuse: a cold shared 1.5K-token prompt reached by eight users gets its first
-  token in 1.7 s instead of 9.6 s.
+  token in 1.7 s instead of 9.6 s under the earlier eviction policy.
 - Speculation: prompt lookup reaches up to 2.9× on repetitive output.
 
-All tables, with sources and settings: [Measured performance](docs/src/guide/performance.md).
+All tables and settings: [Measured performance](docs/src/guide/performance.md).
 
 ## Quickstart
 

@@ -55,11 +55,11 @@ A single Mac is the deployment unit.
 
 ## Where the evidence is
 
-This book keeps the decisions. The phase reports, raw benchmark JSON and rejected
-patches behind them were removed from the tree and remain in git history at commit
-`99b073e`, under `docs/`:
+This book keeps the decisions and the current measurements
+([Measured performance](../guide/performance.md)). The development notes, raw benchmark
+output and rejected patches behind the decisions were removed from the tree and remain in
+git history at commit `99b073e`:
 
 ```sh
-git show 99b073e:docs/apple-silicon-p15-prefix.md
-git show 99b073e:docs/baselines/2026-10-24-m1-p13/rejected-batch-invariance.patch
+git ls-tree -r --name-only 99b073e docs
 ```
