@@ -342,11 +342,9 @@ impl PipelineWorker {
 )]
 mod tests {
     use super::*;
-    use crate::{
-        ModelSource,
-        models::qwen3_5::{DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, WeightFormat},
-    };
+    use crate::ModelSource;
     use candle_core::Device;
+    use tur_models::models::{DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, WeightFormat};
 
     #[test]
     fn test_refilled_intake_returns_to_execution_within_its_limit() -> Result<()> {

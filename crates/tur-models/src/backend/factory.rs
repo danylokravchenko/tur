@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! Revision-pinned checkpoint loading for the hybrid text model.
 
+use crate::models::GenerationDefaults;
+use crate::models::{DraftHead, Execution, LoadOptions, WeightFormat, Weights};
 use std::{
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -14,9 +16,9 @@ use tur_core::execution::KvLayout;
 use crate::{
     Result, TurError,
     backend::chat_template::ChatTemplate,
-    models::qwen3_5::{
-        Config, DraftHead, Execution, GenerationDefaults, LoadOptions, Manifest, Qwen35,
-        WeightFormat, Weights, is_artifact,
+    models::{
+        ModelConfig, TextModel,
+        qwen3_5::{Manifest, is_artifact},
     },
 };
 
@@ -82,7 +84,7 @@ impl ModelFactory {
             self.revision.clone(),
         ));
         let config_path = repo.get("config.json").map_err(hub_error)?;
-        Config::from_json(&std::fs::read_to_string(&config_path)?)?;
+        ModelConfig::from_json(&std::fs::read_to_string(&config_path)?)?;
         let info = repo.info().map_err(hub_error)?;
         if info.sha != self.revision {
             return Err(hub_error(
@@ -116,7 +118,7 @@ impl ModelFactory {
     /// `Q8_0/Q4K` explicitly convert `SafeTensors` matrices into packed resident weights;
     /// a prepacked artifact is uploaded as stored. Legacy ordinary-attention GGUF
     /// checkpoints are unsupported.
-    pub fn create_model(&self) -> Result<(Qwen35, Tokenizer, ChatTemplate, GenerationDefaults)> {
+    pub fn create_model(&self) -> Result<(TextModel, Tokenizer, ChatTemplate, GenerationDefaults)> {
         let (model, tokenizer, template, defaults, ()) =
             self.create_model_with(None, |_, _| Ok(()))?;
         Ok((model, tokenizer, template, defaults))
@@ -128,10 +130,10 @@ impl ModelFactory {
     pub fn create_model_with<R>(
         &self,
         draft: Option<DraftHead>,
-        reserve: impl FnOnce(&Config, &LoadOptions) -> Result<R>,
-    ) -> Result<(Qwen35, Tokenizer, ChatTemplate, GenerationDefaults, R)> {
+        reserve: impl FnOnce(&ModelConfig, &LoadOptions) -> Result<R>,
+    ) -> Result<(TextModel, Tokenizer, ChatTemplate, GenerationDefaults, R)> {
         let dir = self.resolve()?;
-        let config = Config::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?;
+        let config = ModelConfig::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?;
         let generation = match std::fs::read_to_string(dir.join("generation_config.json")) {
             Ok(json) => Some(json),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -197,7 +199,7 @@ impl ModelFactory {
             config
         };
         let reservation = reserve(&config, &options)?;
-        let model = Qwen35::load(&dir, &options)?;
+        let model = config.load(&dir, &options)?;
         Ok((model, tokenizer, template, defaults, reservation))
     }
 }
@@ -231,8 +233,8 @@ mod tests {
             revision: "main".into(),
             format: Some(WeightFormat::F32),
             device: Device::Cpu,
-            kv: crate::models::qwen3_5::DEFAULT_KV_LAYOUT,
-            recurrent: crate::models::qwen3_5::DEFAULT_RECURRENT_STATE,
+            kv: crate::models::DEFAULT_KV_LAYOUT,
+            recurrent: crate::models::DEFAULT_RECURRENT_STATE,
         };
         let error = factory
             .resolve()

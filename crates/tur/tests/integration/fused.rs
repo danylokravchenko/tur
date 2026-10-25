@@ -11,6 +11,7 @@
 //! `TUR_QWEN35_0_8B`; the reference itself is validated against Transformers.
 
 use crate::model_common as common;
+use tur_models::models::{Execution, LoadOptions, WeightFormat};
 
 use crate::model_common::{Checkpoint, forward, max_relative, prefill, rows};
 use candle_core::{DType, Device, Tensor};
@@ -24,7 +25,7 @@ use tur_engine::hybrid::{
     SequenceForward, StatePool,
 };
 use tur_metal::state::LayerSnapshot;
-use tur_models::models::qwen3_5::{Execution, LoadOptions, Qwen35, WeightFormat};
+use tur_models::models::qwen3_5::Qwen35;
 
 /// Kernel-supported head sizes, two attention layers and projection widths that are
 /// multiples of 256 so Q4K applies everywhere. No modality placeholder: engine tests feed

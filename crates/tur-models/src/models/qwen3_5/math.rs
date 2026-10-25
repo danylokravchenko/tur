@@ -4,20 +4,12 @@
 )]
 //! F32 reference operations over one sequence. State tensors are values; no input is mutated.
 
+pub(super) use crate::models::math::{attention, repeat_heads, rms, rotary, rotary_tables};
 use candle_core::{D, DType, Device, Tensor};
 use tur_core::{Result, execution::invalid};
 
 /// Chunk length of the parallel delta rule, as in the reference implementation.
 pub(super) const DELTA_CHUNK: usize = 64;
-/// Query rows per attention block; bounds the score matrix during long prefill.
-const ATTENTION_BLOCK: usize = 256;
-
-/// `x * rsqrt(mean(x²) + eps) * scale` over the last dimension. Zero-centred norms pass
-/// `1 + weight` as `scale`; the loader folds that offset in once.
-pub(super) fn rms(x: &Tensor, scale: &Tensor, eps: f64) -> Result<Tensor> {
-    let inv = (x.sqr()?.mean_keepdim(D::Minus1)? + eps)?.sqrt()?.recip()?;
-    Ok(x.broadcast_mul(&inv)?.broadcast_mul(scale)?)
-}
 
 /// Gated `RMSNorm`: normalise, scale by the (not zero-centred) weight, then gate with SiLU(z).
 pub(super) fn gated_rms(x: &Tensor, z: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
@@ -77,20 +69,6 @@ pub(super) fn convolution(
         output: candle_nn::ops::silu(&output)?,
         histories,
     })
-}
-
-/// Repeat each head `groups` times consecutively (`repeat_interleave` on the head axis).
-pub(super) fn repeat_heads(x: &Tensor, groups: usize) -> Result<Tensor> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let (n, heads, dim) = x.dims3()?;
-    let total = heads
-        .checked_mul(groups)
-        .ok_or_else(|| invalid("head count overflow"))?;
-    Ok(x.unsqueeze(2)?
-        .broadcast_as((n, heads, groups, dim))?
-        .reshape((n, total, dim))?)
 }
 
 /// Inputs of the gated delta rule for one sequence, already split into heads.
@@ -261,94 +239,6 @@ pub(super) fn delta_chunked(inputs: &DeltaInputs<'_>, state: &Tensor) -> Result<
     })
 }
 
-/// Rotary tables `[n, dim/2]` for text positions, computed in F32 like the reference.
-pub(super) fn rotary_tables(
-    positions: &[usize],
-    dim: usize,
-    theta: f64,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
-    let half = dim / 2;
-    let inv: Vec<f32> = (0..half)
-        .map(|i| 1.0 / (theta as f32).powf((2 * i) as f32 / dim as f32))
-        .collect();
-    let mut cos = Vec::with_capacity(positions.len() * half);
-    let mut sin = Vec::with_capacity(positions.len() * half);
-    for &p in positions {
-        for &f in &inv {
-            let angle = p as f32 * f;
-            cos.push(angle.cos());
-            sin.push(angle.sin());
-        }
-    }
-    let shape = (positions.len(), half);
-    Ok((
-        Tensor::from_vec(cos, shape, device)?,
-        Tensor::from_vec(sin, shape, device)?,
-    ))
-}
-
-/// Rotate the leading `2 * cos.dim(1)` coordinates of `[n, heads, head_dim]` using split
-/// halves; the remaining coordinates pass through.
-pub(super) fn rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let (n, _, head_dim) = x.dims3()?;
-    let half = cos.dim(1)?;
-    if cos.dims() != [n, half] || 2 * half > head_dim {
-        return Err(invalid("invalid rotary dimension"));
-    }
-    let cos = cos.unsqueeze(1)?;
-    let sin = sin.unsqueeze(1)?;
-    let left = x.narrow(2, 0, half)?;
-    let right = x.narrow(2, half, half)?;
-    let first = (left.broadcast_mul(&cos)? - right.broadcast_mul(&sin)?)?;
-    let second = (right.broadcast_mul(&cos)? + left.broadcast_mul(&sin)?)?;
-    let pass = x.narrow(2, 2 * half, head_dim - 2 * half)?;
-    Ok(Tensor::cat(&[first, second, pass], 2)?)
-}
-
-/// Causal grouped-query attention for `n` new queries at positions `past..past+n`.
-/// `keys`/`values` hold all `past + n` positions as `[length, kv_heads, head_dim]`.
-pub(super) fn attention(q: &Tensor, keys: &Tensor, values: &Tensor, past: usize) -> Result<Tensor> {
-    let (n, heads, dim) = q.dims3()?;
-    let (length, kv_heads, kdim) = keys.dims3()?;
-    if kv_heads == 0
-        || !heads.is_multiple_of(kv_heads)
-        || kdim != dim
-        || values.dims() != keys.dims()
-        || past.checked_add(n) != Some(length)
-    {
-        return Err(invalid("invalid gated attention dimensions"));
-    }
-    let groups = heads / kv_heads;
-    let keys = repeat_heads(keys, groups)?.transpose(0, 1)?.contiguous()?;
-    let values = repeat_heads(values, groups)?
-        .transpose(0, 1)?
-        .contiguous()?;
-    let keys_t = keys.transpose(1, 2)?.contiguous()?;
-    let scale = (dim as f64).sqrt().recip();
-    let mut blocks = Vec::with_capacity(n.div_ceil(ATTENTION_BLOCK));
-    for start in (0..n).step_by(ATTENTION_BLOCK) {
-        let rows = ATTENTION_BLOCK.min(n - start);
-        let visible = past + start + rows;
-        let q_block = q.narrow(0, start, rows)?.transpose(0, 1)?.contiguous()?;
-        let scores = (q_block.matmul(&keys_t.narrow(2, 0, visible)?.contiguous()?)? * scale)?;
-        let mask: Vec<f32> = (0..rows * visible)
-            .map(|i| {
-                if i % visible <= past + start + i / visible {
-                    0.0
-                } else {
-                    f32::NEG_INFINITY
-                }
-            })
-            .collect();
-        let mask = Tensor::from_vec(mask, (1, rows, visible), q.device())?;
-        let probs = candle_nn::ops::softmax_last_dim(&scores.broadcast_add(&mask)?)?;
-        let block = probs.matmul(&values.narrow(1, 0, visible)?.contiguous()?)?;
-        blocks.push(block.transpose(0, 1)?);
-    }
-    Ok(Tensor::cat(&blocks, 0)?.contiguous()?)
-}
-
 #[cfg(test)]
 #[allow(
     clippy::panic_in_result_fn,
@@ -492,13 +382,15 @@ mod tests {
         let q = random(&[6, 4, 8], 1)?;
         let keys = random(&[6, 2, 8], 2)?;
         let values = random(&[6, 2, 8], 3)?;
-        let whole = attention(&q, &keys, &values, 0)?;
+        let whole = attention(&q, &keys, &values, 0, 8.0f64.sqrt().recip(), None)?;
         for t in 0..6 {
             let step = attention(
                 &q.narrow(0, t, 1)?,
                 &keys.narrow(0, 0, t + 1)?,
                 &values.narrow(0, 0, t + 1)?,
                 t,
+                8.0f64.sqrt().recip(),
+                None,
             )?;
             assert!(max_diff(&step.get(0)?, &whole.get(t)?)? < 1e-6);
         }

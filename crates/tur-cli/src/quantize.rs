@@ -2,13 +2,16 @@
 //! precision under a byte budget from measured sensitivities, and write a prepacked
 //! artifact that `run` and `serve` load as stored.
 use std::{io::Write, path::PathBuf, time::Instant};
+use tur::models::{
+    DEFAULT_RECURRENT_STATE, Embedding, Execution, LoadOptions, Method, Packer, Precision,
+    WeightFormat, WeightPlan,
+};
 use tur::{
     Result, TurError,
     core::execution::{KvFormat, KvLayout},
     models::qwen3_5::{
-        Config, Conversion, DEFAULT_RECURRENT_STATE, Embedding, Execution, LoadOptions, Method,
-        Packer, Precision, Qwen35, Reference, WeightFormat, WeightPlan, allocate, artifact_config,
-        sensitivities, write_artifact, write_calibrated_artifact,
+        Config, Conversion, Qwen35, Reference, allocate, artifact_config, sensitivities,
+        write_artifact, write_calibrated_artifact,
     },
     quantization::Calibration,
 };

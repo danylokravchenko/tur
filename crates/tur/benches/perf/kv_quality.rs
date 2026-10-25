@@ -33,10 +33,8 @@ use tur_core::{
 use tur_engine::hybrid::{
     Boundaries, HybridModel, ModelState, PackedForward, PoolConfig, SequenceForward, StatePool,
 };
-use tur_models::models::qwen3_5::{
-    Execution, LoadOptions, Manifest, Qwen35, WeightFormat, Weights, is_artifact,
-    parse_recurrent_state,
-};
+use tur_models::models::qwen3_5::{Manifest, Qwen35, is_artifact};
+use tur_models::models::{Execution, LoadOptions, WeightFormat, Weights, parse_recurrent_state};
 
 const BUCKETS: [usize; 5] = [0, 1024, 2048, 4096, 8192];
 /// Contexts whose states seed generated continuations.

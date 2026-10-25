@@ -21,7 +21,7 @@ use tur_models::{
         chat_template::{ChatMessage, RenderOptions, Role},
         tools::{ToolCall, ToolDefinition},
     },
-    models::qwen3_5::GenerationDefaults,
+    models::GenerationDefaults,
 };
 use uuid::Uuid;
 
@@ -421,7 +421,7 @@ impl InferencePipeline {
         let tool_calls = if pending.tools.is_empty() {
             Vec::new()
         } else {
-            ToolCall::parse_from_output(&generated_text, &pending.tools)
+            ToolCall::parse_from_output(&pending.stream.decode_raw()?, &pending.tools)
         };
         let elapsed = pending.arrival.elapsed();
         if pending

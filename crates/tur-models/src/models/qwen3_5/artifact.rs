@@ -2,12 +2,10 @@
 //! GGML blocks the kernels read, beside copies of the source's config, tokenizer and
 //! template. Loading uploads each tensor as stored; nothing is converted or expanded.
 
-use super::{
-    config::Config,
-    plan::{Embedding, Precision, WeightPlan, fnv1a},
-    quantize::Method,
-    weights::Checkpoint,
-};
+use super::config::Config;
+use crate::models::checkpoint::Checkpoint;
+use crate::models::weights::fnv1a;
+use crate::models::{Embedding, Method, Precision, WeightPlan};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,

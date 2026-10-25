@@ -23,6 +23,14 @@ impl TokenOutputStream {
         self.tokenizer
     }
 
+    /// Preserve protocol delimiters for tool parsing; user-facing decoding still removes
+    /// special tokens, as the tokenizer requests.
+    pub(crate) fn decode_raw(&self) -> Result<String> {
+        self.tokenizer
+            .decode(&self.tokens, false)
+            .map_err(|err| TurError::Tokenizer(format!("cannot decode tool output: {err}")))
+    }
+
     fn decode(&self, tokens: &[u32]) -> Result<String> {
         match self.tokenizer.decode(tokens, true) {
             Ok(str) => Ok(str),

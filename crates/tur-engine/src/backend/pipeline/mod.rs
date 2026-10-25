@@ -32,9 +32,10 @@ use std::{
 };
 use tokenizers::Tokenizer;
 use tur_core::execution::{StateHandle, invalid};
+use tur_models::models::GenerationDefaults;
 use tur_models::{
     backend::{chat_template::ChatTemplate, tools::ToolDefinition},
-    models::qwen3_5::{GenerationDefaults, Qwen35},
+    models::TextModel,
 };
 use uuid::Uuid;
 
@@ -145,7 +146,7 @@ impl Pending {
 /// boundaries preserved. Batch-dependent floating-point paths may still affect logits.
 /// A request that cannot fit even alone fails with [`crate::TurError::MemoryAllocation`].
 pub struct InferencePipeline {
-    engine: HybridEngine<Qwen35>,
+    engine: HybridEngine<TextModel>,
     tokenizer: Tokenizer,
     template: ChatTemplate,
     defaults: GenerationDefaults,

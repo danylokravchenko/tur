@@ -34,7 +34,7 @@ use tur_engine::{
     },
     hybrid::SamplingOptions,
 };
-use tur_models::models::qwen3_5::{
+use tur_models::models::{
     DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, DraftHead, WeightFormat, parse_recurrent_state,
 };
 

@@ -94,6 +94,8 @@ struct AttentionParams {
     uint gate_head_stride;
     uint group;
     float scale;
+    uint window;
+    uint ungated;
 };
 
 // Keys per attention_kv step: their table lookups and K/V loads are all in flight at once,
@@ -136,6 +138,15 @@ static inline void kv_dims(device const half *src, thread float (&x)[R]) {
 
 template <uint R>
 static inline void kv_dims(device const char *src, thread float (&x)[R]) {
+    if (R == 16) {
+        uint4 words = *(device const uint4 *)src;
+        for (uint i=0; i<4; ++i) {
+            char4 v = as_type<char4>(words[i]);
+            x[4*i]=float(v.x); x[4*i+1]=float(v.y);
+            x[4*i+2]=float(v.z); x[4*i+3]=float(v.w);
+        }
+        return;
+    }
     if (R == 2) {
         char2 c = as_type<char2>(*(device const ushort *)src);
         x[0] = float(c.x); x[1] = float(c.y);
@@ -196,8 +207,9 @@ kernel void attention_kv(
     uint t = rest / p.splits;
     uint g = h0 / (p.heads / p.kv_heads);
     uint keys = visible[t];
-    uint begin = split * p.split_keys;
-    uint end = min(keys, begin + p.split_keys);
+    uint split_begin = split * p.split_keys;
+    uint begin = max(split_begin, p.window > 0 && keys > p.window ? keys - p.window : 0u);
+    uint end = min(keys, split_begin + p.split_keys);
     uint base = first_block[t];
     uint groups = QUANT == 0 ? 0 : p.dim / p.group;
     uint dims[C], sidx[C];
@@ -299,7 +311,7 @@ kernel void attention_kv(
             float inv = l[x] > 0.0f ? 1.0f / l[x] : 0.0f;
             for (uint c = 0; c < C; ++c) {
                 for (uint i = 0; i < V; ++i) {
-                    o[dims[c] + i] = acc[x][c][i] * inv * sigmoid(gr[dims[c] + i]);
+                    o[dims[c] + i] = acc[x][c][i] * inv * (p.ungated ? 1.0f : sigmoid(gr[dims[c] + i]));
                 }
             }
             continue;
@@ -664,7 +676,7 @@ kernel void attention_reduce_f32(
     float inv = l > 0.0f ? 1.0f / l : 0.0f;
     for (uint r = 0; r < R; ++r) {
         uint i = lane + SIMD * r;
-        o[i] = acc[r] * inv * sigmoid(gr[i]);
+        o[i] = acc[r] * inv * (p.ungated ? 1.0f : sigmoid(gr[i]));
     }
 }
 
@@ -700,3 +712,11 @@ ATTENTION(2)
 ATTENTION(4)
 ATTENTION(8)
 
+
+// Global Gemma heads use 512 dimensions; the per-query kernel bounds register use.
+KV_FORMAT(16, f32, float, 0)
+KV_FORMAT(16, f16, half, 0)
+KV_FORMAT(16, q8, char, 1)
+template [[host_name("attention_reduce_r16_f32")]] kernel void attention_reduce_f32<16>(
+    device const float *, device const float *, device const float *, device float *,
+    constant AttentionParams &, uint, uint, uint, uint);

@@ -1,6 +1,5 @@
 //! `SafeTensors` checkpoint discovery, header validation and payload loading without mmap.
 
-use super::config::Config;
 use candle_core::{DType, Device, Tensor};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -14,17 +13,17 @@ const MAX_HEADER_BYTES: u64 = 256 << 20;
 
 /// One tensor's location and declared layout.
 #[derive(Clone)]
-pub(super) struct Entry {
+pub(crate) struct Entry {
     file: usize,
-    pub(super) shape: Vec<usize>,
-    pub(super) dtype: safetensors::Dtype,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) dtype: safetensors::Dtype,
     offset: u64,
-    pub(super) bytes: usize,
+    pub(crate) bytes: usize,
 }
 
 impl Entry {
     /// Candle element type of a readable tensor.
-    pub(super) fn candle_dtype(&self, name: &str) -> Result<DType> {
+    pub(crate) fn candle_dtype(&self, name: &str) -> Result<DType> {
         match self.dtype {
             safetensors::Dtype::BF16 => Ok(DType::BF16),
             safetensors::Dtype::F16 => Ok(DType::F16),
@@ -36,7 +35,7 @@ impl Entry {
 }
 
 /// Validated tensors spread over one or more `SafeTensors` files, read on demand.
-pub(super) struct Checkpoint {
+pub(crate) struct Checkpoint {
     files: Vec<PathBuf>,
     entries: BTreeMap<String, Entry>,
 }
@@ -75,7 +74,7 @@ fn header(path: &Path) -> Result<(safetensors::tensor::Metadata, HashMap<String,
     Ok((metadata, strings, start))
 }
 
-fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let index = dir.join("model.safetensors.index.json");
     if index.exists() {
         let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(index)?)?;
@@ -110,7 +109,7 @@ fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
 
 impl Checkpoint {
     /// Every tensor of `files` with each file's metadata strings; no payload is read.
-    pub(super) fn scan(files: Vec<PathBuf>) -> Result<(Self, Vec<HashMap<String, String>>)> {
+    pub(crate) fn scan(files: Vec<PathBuf>) -> Result<(Self, Vec<HashMap<String, String>>)> {
         let mut entries = BTreeMap::new();
         let mut metadata = Vec::with_capacity(files.len());
         for (index, path) in files.iter().enumerate() {
@@ -134,18 +133,19 @@ impl Checkpoint {
         Ok((Self { files, entries }, metadata))
     }
 
-    /// Match every header of a source checkpoint against the config before any payload
-    /// is read. Tensors outside the text tower (vision, an unloaded MTP head) are dropped;
-    /// unexpected text tensors are rejected.
-    pub(super) fn open(dir: &Path, config: &Config) -> Result<Self> {
-        let expected = config.weight_shapes()?;
-        let prefix = format!("{}.", config.text_prefix());
+    pub(crate) fn open_shapes(
+        dir: &Path,
+        expected: &BTreeMap<String, Vec<usize>>,
+        text_prefix: &str,
+        tied: bool,
+    ) -> Result<Self> {
+        let prefix = format!("{text_prefix}.");
         let (mut checkpoint, _) = Self::scan(weight_files(dir)?)?;
         let mut entries = BTreeMap::new();
         for (name, entry) in std::mem::take(&mut checkpoint.entries) {
             let text = name.starts_with(&prefix) || name == "lm_head.weight";
             let Some(shape) = expected.get(&name) else {
-                if text && !(name == "lm_head.weight" && config.tied_embeddings()) {
+                if text && !(name == "lm_head.weight" && tied) {
                     return Err(invalid(format!("unexpected text tensor {name}")));
                 }
                 continue;
@@ -169,7 +169,7 @@ impl Checkpoint {
         Ok(checkpoint)
     }
 
-    pub(super) fn entries(&self) -> &BTreeMap<String, Entry> {
+    pub(crate) fn entries(&self) -> &BTreeMap<String, Entry> {
         &self.entries
     }
 
@@ -185,7 +185,7 @@ impl Checkpoint {
     }
 
     /// Read just this tensor's payload, after every header has passed validation.
-    pub(super) fn take_raw(&self, name: &str) -> Result<(Entry, Vec<u8>)> {
+    pub(crate) fn take_raw(&self, name: &str) -> Result<(Entry, Vec<u8>)> {
         let (entry, mut file) = self.locate(name)?;
         let mut bytes = vec![0u8; entry.bytes];
         file.read_exact(&mut bytes)?;
@@ -193,7 +193,7 @@ impl Checkpoint {
     }
 
     /// Read this tensor onto the host in its stored element type.
-    pub(super) fn take(&self, name: &str) -> Result<Tensor> {
+    pub(crate) fn take(&self, name: &str) -> Result<Tensor> {
         let (entry, bytes) = self.take_raw(name)?;
         Ok(Tensor::from_raw_buffer(
             &bytes,
@@ -204,7 +204,7 @@ impl Checkpoint {
     }
 
     /// Gather only requested embedding rows, preserving token order and repetitions.
-    pub(super) fn gather_rows(&self, name: &str, ids: &[u32]) -> Result<Tensor> {
+    pub(crate) fn gather_rows(&self, name: &str, ids: &[u32]) -> Result<Tensor> {
         let (entry, mut file) = self.locate(name)?;
         let [rows, cols] = entry.shape.as_slice() else {
             return Err(invalid("embedding is not a matrix"));
@@ -240,7 +240,7 @@ impl Checkpoint {
     /// Read a matrix, or a stack of matrices as one `[Σ rows, cols]` matrix, `chunk`
     /// rows at a time: packing can release each chunk before the next is read, so no
     /// projection needs its full-precision payload in host memory at once.
-    pub(super) fn take_rows(&self, name: &str, chunk: usize) -> Result<Rows> {
+    pub(crate) fn take_rows(&self, name: &str, chunk: usize) -> Result<Rows> {
         let (entry, file) = self.locate(name)?;
         let dtype = entry.candle_dtype(name)?;
         let (rows, cols) = match entry.shape.as_slice() {
@@ -262,7 +262,7 @@ impl Checkpoint {
 }
 
 /// Row chunks of one checkpoint matrix, read in order on demand.
-pub(super) struct Rows {
+pub(crate) struct Rows {
     file: std::fs::File,
     dtype: DType,
     cols: usize,

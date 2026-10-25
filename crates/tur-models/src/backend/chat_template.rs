@@ -7,6 +7,7 @@ use crate::{Result, TurError};
 /// Renders a checkpoint's own Hugging Face-compatible Jinja2 chat template.
 pub struct ChatTemplate {
     source: String,
+    tokens: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Message author for [`ChatTemplate::render`].
@@ -89,7 +90,7 @@ impl ChatTemplate {
                 )
             })?
             .to_string();
-        Self::from_template(template_str)
+        Self::from_template(template_str)?.with_tokens(&config)
     }
 
     /// Build a `ChatTemplate` from a raw Jinja2 template string.
@@ -101,16 +102,35 @@ impl ChatTemplate {
         faithful_environment()
             .add_template("chat", &source)
             .map_err(|e| TurError::Other(format!("invalid chat template syntax: {e}")))?;
-        Ok(Self { source })
+        Ok(Self {
+            source,
+            tokens: serde_json::Map::new(),
+        })
     }
 
     /// Load a standalone `chat_template.jinja`, falling back to `tokenizer_config.json`.
     pub fn from_model_dir(dir: &Path) -> Result<Self> {
         let jinja = dir.join("chat_template.jinja");
         if jinja.exists() {
-            return Self::from_template(std::fs::read_to_string(jinja)?);
+            let config: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("tokenizer_config.json"))?)?;
+            return Self::from_template(std::fs::read_to_string(jinja)?)?.with_tokens(&config);
         }
         Self::from_tokenizer_config(&dir.join("tokenizer_config.json"))
+    }
+
+    fn with_tokens(mut self, config: &serde_json::Value) -> Result<Self> {
+        for (name, value) in config.as_object().into_iter().flatten() {
+            if !name.ends_with("_token") || value.is_null() {
+                continue;
+            }
+            let token = value
+                .as_str()
+                .or_else(|| value.get("content").and_then(serde_json::Value::as_str))
+                .ok_or_else(|| TurError::Tokenizer(format!("invalid {name}")))?;
+            self.tokens.insert(name.clone(), token.into());
+        }
+        Ok(self)
     }
 
     /// Render exactly as Hugging Face `apply_chat_template` does: Jinja2 `trim_blocks` and
@@ -125,7 +145,7 @@ impl ChatTemplate {
         let mut env = faithful_environment();
         env.add_template("chat", &self.source)
             .map_err(|e| TurError::Other(format!("chat template compile error: {e}")))?;
-        let mut ctx = serde_json::Map::new();
+        let mut ctx = self.tokens.clone();
         ctx.insert("messages".into(), serde_json::to_value(messages)?);
         ctx.insert(
             "add_generation_prompt".into(),

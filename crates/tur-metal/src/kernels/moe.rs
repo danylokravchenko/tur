@@ -30,6 +30,7 @@ struct RouteParams {
     experts: u32,
     top_k: u32,
     stride: u32,
+    scaled: u32,
 }
 #[repr(C)]
 struct ExpertParams {
@@ -89,6 +90,26 @@ impl Kernels {
     /// All metadata stays on this device and has a bounded size proportional to tokens × k;
     /// the permutation keeps each expert's rows in assignment order.
     pub fn route(&self, logits: &Tensor, top_k: usize) -> Result<ExpertRoutes> {
+        self.routing(logits, top_k, None)
+    }
+
+    /// Normalized top-k routing with a learned scale applied to each selected expert's
+    /// probability after normalization. Selection remains based on the original logits.
+    pub fn route_scaled(
+        &self,
+        logits: &Tensor,
+        top_k: usize,
+        scales: &Tensor,
+    ) -> Result<ExpertRoutes> {
+        self.routing(logits, top_k, Some(scales))
+    }
+
+    fn routing(
+        &self,
+        logits: &Tensor,
+        top_k: usize,
+        scales: Option<&Tensor>,
+    ) -> Result<ExpertRoutes> {
         let x = self.view(logits)?;
         let (tokens, experts) = (x.rows, x.cols);
         let assignments = tokens
@@ -105,11 +126,17 @@ impl Kernels {
                 "MoE routing needs nonempty rows, 1..=256 experts, valid top-k and ≤2^24 assignments",
             ));
         }
+        let sv = scales.map(|s| self.view(s)).transpose()?;
+        if let Some(sv) = &sv {
+            sv.expect(1, experts, "expert scales")?;
+            sv.contiguous("expert scales")?;
+        }
         let p = RouteParams {
             tokens: to_u32(tokens, "tokens")?,
             experts: to_u32(experts, "experts")?,
             top_k: to_u32(top_k, "top-k")?,
             stride: to_u32(x.row_stride, "stride")?,
+            scaled: u32::from(scales.is_some()),
         };
         let selected = self.output(tokens, top_k * 2)?;
         self.runtime.dispatch(
@@ -121,6 +148,7 @@ impl Kernels {
                 x.bind(e, 0)?;
                 selected.bind(e, 1);
                 e.set_bytes(2, &p);
+                sv.as_ref().unwrap_or(&x).bind(e, 3)?;
                 Ok(())
             },
         )?;

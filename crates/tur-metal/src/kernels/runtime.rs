@@ -18,7 +18,8 @@ use tur_core::{Result, TurError, execution::invalid};
 /// Version of the buffer layouts the kernels assume. Bump when any binding layout changes.
 /// 2: paged K/V pools in F32/F16/Q8 and slot-addressed recurrent state.
 /// 3: tiled prefill attention over query tiles.
-pub const LAYOUT_VERSION: u32 = 3;
+/// 4: windowed ungated attention and learned expert route scales.
+pub const LAYOUT_VERSION: u32 = 4;
 
 // Runtime Metal compilation has no local include search path, so embed the families as
 // one source string with shared helpers first.
@@ -103,6 +104,19 @@ const FUNCTIONS: &[&str] = &[
     "attention_reduce_r2_f32",
     "attention_reduce_r4_f32",
     "attention_reduce_r8_f32",
+    "kv_write_r16_f32",
+    "kv_write_r16_f16",
+    "kv_write_r16_q8",
+    "attention_r16_f32",
+    "attention_r16_f16",
+    "attention_r16_q8",
+    "attention_h2_r16_f32",
+    "attention_h2_r16_f16",
+    "attention_h2_r16_q8",
+    "attention_tiled_r16_f32",
+    "attention_tiled_r16_f16",
+    "attention_tiled_r16_q8",
+    "attention_reduce_r16_f32",
     "qmv_q8_0_b1_f32",
     "qmv_q8_0_b2_f32",
     "qmv_q8_0_b3_f32",

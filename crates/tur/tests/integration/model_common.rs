@@ -5,8 +5,8 @@ use candle_core::{DType, Device, Tensor};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tur_core::{Result, execution::invalid};
 use tur_engine::hybrid::{
-    Boundaries, HybridModel, ModelState, PackedForward, PoolConfig, Reservation, SequenceForward,
-    SequenceStep, StatePool,
+    Boundaries, HybridEngine, HybridModel, ModelState, PackedForward, PoolConfig, Reservation,
+    SamplingOptions, SequenceForward, SequenceStep, StatePool,
 };
 use tur_models::models::qwen3_5::{Config, Qwen35};
 
@@ -95,7 +95,7 @@ pub(crate) fn pool(model: &Qwen35, pages: usize, slots: usize) -> Result<StatePo
 /// One forward pass of `(state, new tokens, boundaries)` sequences sharing a pool, with
 /// logits at every new token. The reservations hold each pass's writes until committed.
 pub(crate) fn forward(
-    model: &Qwen35,
+    model: &impl HybridModel,
     sequences: &[(&ModelState, &[u32], Boundaries)],
 ) -> Result<(Vec<Result<SequenceStep>>, Vec<Reservation>)> {
     let pool = sequences
@@ -148,7 +148,7 @@ pub(crate) fn rows(tensor: &Tensor) -> Result<Vec<Vec<f32>>> {
 /// Feed `tokens` in `chunk`-sized pieces from `state`; returns every position's logits
 /// and the final state. Released pages are reclaimed after each synchronized pass.
 pub(crate) fn prefill(
-    model: &Qwen35,
+    model: &impl HybridModel,
     state: ModelState,
     tokens: &[u32],
     chunk: usize,
@@ -164,8 +164,51 @@ pub(crate) fn prefill(
             .ok_or_else(|| invalid("missing reservation"))?;
         state = reservation.commit(piece.len())?;
         drop(reservations);
-        model.device().synchronize()?;
+        state.pool().device().synchronize()?;
         state.pool().reclaim();
     }
     Ok((out, state))
+}
+
+pub(crate) fn generate<M: HybridModel>(
+    model: Arc<M>,
+    device: Device,
+    pool: PoolConfig,
+    prompt: &[u32],
+    stops: &[u32],
+    limit: usize,
+) -> Result<Vec<u32>> {
+    let mut engine = HybridEngine::new(model, device, pool)?;
+    let h = engine.allocate(0, SamplingOptions::default(), None)?;
+    let mut out = Vec::new();
+    let mut next = prompt.to_vec();
+    while out.len() < limit {
+        let meta = engine.metadata(h.request)?;
+        let n = next.len();
+        engine.submit(PackedExecution {
+            positions: (0..n).map(|i| meta.position + i).collect(),
+            tokens: std::mem::take(&mut next),
+            sequences: vec![SequenceDescriptor {
+                state: meta.handle,
+                tokens: 0..n,
+                outputs: vec![n - 1],
+                speculative: false,
+            }],
+        })?;
+        let token = engine
+            .finish()?
+            .pop()
+            .ok_or_else(|| invalid("missing result"))?
+            .outcome?
+            .outputs
+            .first()
+            .map(|o| o.token)
+            .ok_or_else(|| invalid("no output"))?;
+        out.push(token);
+        if stops.contains(&token) {
+            break;
+        }
+        next = vec![token];
+    }
+    Ok(out)
 }

@@ -8,10 +8,9 @@ use tur::{
         prefix::PrefixConfig,
         speculation::SpeculationConfig,
     },
-    models::qwen3_5::{
-        Conversion, Packer, WeightFormat, WeightPlan, artifact_config, write_artifact,
-    },
+    models::qwen3_5::{Conversion, artifact_config, write_artifact},
 };
+use tur_models::models::{Packer, WeightFormat, WeightPlan};
 
 #[test]
 fn test_factory_serves_artifacts_exactly_like_load_time_conversion() -> Result<()> {

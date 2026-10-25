@@ -20,7 +20,7 @@ use std::{
     ops::RangeInclusive,
 };
 use tur_core::{Result, execution::invalid};
-use tur_models::models::qwen3_5::DraftHead;
+use tur_models::models::DraftHead;
 
 /// Prune periodically to retain at most two windows of lookup history.
 const INDEX_WINDOW: usize = 8192;

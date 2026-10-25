@@ -1,5 +1,7 @@
 //! Validated text configuration for dense and expert Qwen3.5 architectures (3.8/3.6).
 
+use crate::models::generation::{GenerationDefaults, parse_tokens};
+use crate::models::weights::{Projection, WeightLayout};
 use candle_core::DType;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -10,44 +12,6 @@ use tur_core::{
         checked_elements, invalid,
     },
 };
-
-/// One loaded projection: checkpoint matrices stacked along output rows into the matrix
-/// the model multiplies by. Names are stable keys for weight plans, calibration
-/// statistics and prepacked artifacts.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Projection {
-    /// Checkpoint module path of the loaded matrix, e.g. `….layers.0.self_attn.kv_proj`.
-    pub name: String,
-    /// Checkpoint tensors in stacking order, with the output rows each contributes.
-    pub parts: Vec<(String, usize)>,
-    pub rows: usize,
-    pub cols: usize,
-    /// Experts of a stacked expert bank, each owning `rows / experts` rows; 1 otherwise.
-    pub experts: usize,
-}
-
-impl Projection {
-    fn new(name: String, parts: Vec<(String, usize)>, cols: usize) -> Self {
-        let rows = parts.iter().map(|(_, rows)| rows).sum();
-        Self {
-            name,
-            parts,
-            rows,
-            cols,
-            experts: 1,
-        }
-    }
-
-    fn bank(name: String, experts: usize, rows: usize, cols: usize) -> Self {
-        Self {
-            parts: vec![(name.clone(), experts * rows)],
-            name,
-            rows: experts * rows,
-            cols,
-            experts,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -109,32 +73,6 @@ pub(super) struct TextConfig {
     pub eos_token_id: serde_json::Value,
     #[serde(default)]
     pub mamba_ssm_dtype: Option<String>,
-}
-
-/// Sampling defaults and stop tokens from `generation_config.json`.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct GenerationDefaults {
-    pub eos_tokens: Vec<u32>,
-    pub temperature: Option<f64>,
-    pub top_k: Option<usize>,
-    pub top_p: Option<f64>,
-    pub repetition_penalty: Option<f64>,
-}
-
-#[derive(Deserialize)]
-struct RawGeneration {
-    #[serde(default)]
-    eos_token_id: Option<serde_json::Value>,
-    #[serde(default)]
-    do_sample: Option<bool>,
-    #[serde(default)]
-    temperature: Option<f64>,
-    #[serde(default)]
-    top_k: Option<usize>,
-    #[serde(default)]
-    top_p: Option<f64>,
-    #[serde(default)]
-    repetition_penalty: Option<f64>,
 }
 
 /// Architecture-specific settings. Construction validates the complete text layout.
@@ -259,6 +197,18 @@ impl Config {
         Ok(config)
     }
 
+    pub(crate) fn open_checkpoint(
+        &self,
+        dir: &std::path::Path,
+    ) -> Result<crate::models::checkpoint::Checkpoint> {
+        crate::models::checkpoint::Checkpoint::open_shapes(
+            dir,
+            &self.weight_shapes()?,
+            self.text_prefix(),
+            self.tied_embeddings(),
+        )
+    }
+
     /// Exclusive text positional limit.
     pub fn max_position(&self) -> usize {
         self.text.max_position_embeddings
@@ -318,42 +268,9 @@ impl Config {
         Ok(())
     }
 
-    /// Parse `generation_config.json`, merging its EOS IDs after the architecture's.
-    /// Sampling values are ignored when `do_sample` is false.
+    /// Merge checkpoint sampling defaults with architecture stop tokens.
     pub fn generation_defaults(&self, json: Option<&str>) -> Result<GenerationDefaults> {
-        let mut defaults = GenerationDefaults {
-            eos_tokens: self.eos.clone(),
-            ..Default::default()
-        };
-        let Some(json) = json else {
-            return Ok(defaults);
-        };
-        let raw: RawGeneration = serde_json::from_str(json)?;
-        if let Some(eos) = &raw.eos_token_id {
-            for id in parse_tokens(eos, self.text.vocab_size)? {
-                if !defaults.eos_tokens.contains(&id) {
-                    defaults.eos_tokens.push(id);
-                }
-            }
-        }
-        if raw.do_sample != Some(false) {
-            if raw.temperature.is_some_and(|t| !t.is_finite() || t < 0.0)
-                || raw
-                    .top_p
-                    .is_some_and(|p| !p.is_finite() || p <= 0.0 || p > 1.0)
-                || raw.top_k == Some(0)
-                || raw
-                    .repetition_penalty
-                    .is_some_and(|r| !r.is_finite() || r <= 0.0)
-            {
-                return Err(invalid("invalid generation sampling defaults"));
-            }
-            defaults.temperature = raw.temperature;
-            defaults.top_k = raw.top_k;
-            defaults.top_p = raw.top_p;
-            defaults.repetition_penalty = raw.repetition_penalty;
-        }
-        Ok(defaults)
+        crate::models::generation::defaults(&self.eos, self.vocab_size(), json)
     }
 
     pub(super) fn layer_kinds(&self) -> &[LayerKind] {
@@ -747,7 +664,7 @@ impl Config {
     }
 
     /// Checkpoint name prefix owned by the text tower; other prefixes are ignored.
-    pub(super) fn text_prefix(&self) -> &str {
+    pub(crate) fn text_prefix(&self) -> &str {
         &self.prefix
     }
 
@@ -908,26 +825,22 @@ fn modality_tokens(raw: &serde_json::Value) -> Result<Vec<u32>> {
     Ok(forbidden_tokens)
 }
 
-fn parse_tokens(raw: &serde_json::Value, vocab: usize) -> Result<Vec<u32>> {
-    let values = raw
-        .as_array()
-        .map_or_else(|| vec![raw.clone()], Clone::clone);
-    if values.is_empty() {
-        return Err(invalid("empty EOS list"));
+impl WeightLayout for Config {
+    fn projection_layout(&self) -> Result<Vec<Projection>> {
+        self.projections()
     }
-    values
-        .iter()
-        .map(|v| {
-            let id = v
-                .as_u64()
-                .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| invalid("invalid EOS ID"))?;
-            if id as usize >= vocab {
-                return Err(invalid("EOS outside vocabulary"));
-            }
-            Ok(id)
-        })
-        .collect()
+    fn embeddings_tied(&self) -> bool {
+        self.tied_embeddings()
+    }
+    fn vocabulary(&self) -> usize {
+        self.vocab_size()
+    }
+    fn residual_width(&self) -> usize {
+        self.hidden_size()
+    }
+    fn loads_mtp(&self) -> bool {
+        self.mtp()
+    }
 }
 
 #[cfg(test)]

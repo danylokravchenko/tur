@@ -110,6 +110,8 @@ struct AttentionParams {
     gate_head_stride: u32,
     group: u32,
     scale: f32,
+    window: u32,
+    ungated: u32,
 }
 
 #[repr(C)]
@@ -1311,6 +1313,7 @@ impl Kernels {
             64 => 2,
             128 => 4,
             256 => 8,
+            512 => 16,
             _ => return Err(invalid(format!("no {prefix} kernel for head dim {dim}"))),
         };
         let suffix = match format {
@@ -1404,8 +1407,46 @@ impl Kernels {
         gate_source: &Tensor,
         gate: Heads,
     ) -> Result<Tensor> {
+        self.attend(q, pool, kv, Some((gate_source, gate)), None, None)
+    }
+
+    /// Causal paged attention with an optional sliding window, explicit score scale and
+    /// no output gate. Window bounds count tokens including the current position.
+    pub fn attention_ungated(
+        &self,
+        q: &Tensor,
+        pool: &AttentionPool,
+        kv: &PagedKv,
+        window: Option<usize>,
+        scale: f64,
+    ) -> Result<Tensor> {
+        if window == Some(0) || !scale.is_finite() || scale <= 0.0 {
+            return Err(invalid("invalid attention window or scale"));
+        }
+        self.attend(q, pool, kv, None, window, Some(scale))
+    }
+
+    fn attend(
+        &self,
+        q: &Tensor,
+        pool: &AttentionPool,
+        kv: &PagedKv,
+        output_gate: Option<(&Tensor, Heads)>,
+        window: Option<usize>,
+        scale: Option<f64>,
+    ) -> Result<Tensor> {
         let (tokens, heads, dim) = q.dims3()?;
         let kv_heads = pool.kv_heads;
+        let fallback = q.reshape((tokens, heads * dim))?;
+        let (gate_source, gate) = output_gate.unwrap_or((
+            &fallback,
+            Heads {
+                count: heads,
+                dim,
+                head_stride: dim,
+                col_offset: 0,
+            },
+        ));
         if kv_heads == 0
             || !heads.is_multiple_of(kv_heads)
             || pool.head_dim != dim
@@ -1432,7 +1473,7 @@ impl Kernels {
         if gv.rows != tokens || gate.col_offset + (heads - 1) * gate.head_stride + dim > gv.cols {
             return Err(invalid("attention gate exceeds its projection"));
         }
-        if self.attention_tiled(kv, heads, dim) {
+        if output_gate.is_some() && self.attention_tiled(kv, heads, dim) {
             return self.attention_tiles(
                 &qv,
                 pool,
@@ -1467,7 +1508,9 @@ impl Kernels {
             gate_col: to_u32(gate.col_offset, "gate column")?,
             gate_head_stride: to_u32(gate.head_stride, "gate head stride")?,
             group: to_u32(pool.format.group().unwrap_or(32), "group")?,
-            scale: (dim as f64).sqrt().recip() as f32,
+            scale: scale.unwrap_or_else(|| (dim as f64).sqrt().recip()) as f32,
+            window: to_u32(window.unwrap_or(0), "attention window")?,
+            ungated: u32::from(output_gate.is_none()),
         };
         let items = tokens * heads;
         let out = self.output(items, dim)?;

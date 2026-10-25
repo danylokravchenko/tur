@@ -5,23 +5,22 @@
 //! Packed Qwen3.5/3.8 text execution over explicit hybrid state.
 
 use super::{
-    artifact::{self, Manifest},
-    config::{Config, LayerKind, Projection},
+    artifact,
+    config::{Config, LayerKind},
     math::{self, DeltaInputs},
-    plan::{self, Embedding, Precision, WeightPlan},
-    quantize::{Packer, STAGING_BYTES},
-    weights::Checkpoint,
 };
 use crate::hybrid::{
     Addresses, Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward,
     SequenceForward, SequenceStep, StatePool,
 };
+use crate::models::weights::{Embeddings, Tensors};
+use crate::models::{Execution, LoadOptions, Weights};
 use crate::quantization::{Calibration, Recorder};
 use candle_core::{DType, Device, Tensor};
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 use tur_core::{
     Result,
-    execution::{KvFormat, KvLayout, ModelDescription, checked_elements, invalid},
+    execution::{ModelDescription, checked_elements, invalid},
 };
 use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
 
@@ -75,140 +74,6 @@ macro_rules! projections {
 }
 
 pub(super) mod streaming;
-
-/// Storage for projection matrices. Norms, gates, convolution and state stay F32.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WeightFormat {
-    /// Full-precision reference.
-    F32,
-    /// Groupwise 8-bit (32-element blocks, one scale).
-    Q8_0,
-    /// Groupwise 4-bit K-quant (256-element super-blocks).
-    Q4K,
-}
-
-impl std::str::FromStr for WeightFormat {
-    type Err = String;
-
-    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        match value.to_ascii_lowercase().as_str() {
-            "f32" => Ok(Self::F32),
-            "q8_0" => Ok(Self::Q8_0),
-            "q4k" => Ok(Self::Q4K),
-            _ => Err("weight format must be f32, q8_0 or q4k (SafeTensors conversion)".into()),
-        }
-    }
-}
-
-impl WeightFormat {
-    fn tag(self) -> &'static str {
-        match self {
-            Self::F32 => "f32",
-            Self::Q8_0 => "q8_0",
-            Self::Q4K => "q4k",
-        }
-    }
-}
-
-/// Where projection weights come from and how they are stored.
-#[derive(Clone, Debug)]
-pub enum Weights {
-    /// Convert `SafeTensors` at load time, every projection in one format.
-    Uniform(WeightFormat),
-    /// Convert `SafeTensors` at load time by an explicit plan, rounding to nearest.
-    Plan(Arc<WeightPlan>),
-    /// Upload the directory's prepacked artifact as stored. The manifest, read when the
-    /// load was planned, must still describe the artifact.
-    Prepacked(Arc<Manifest>),
-}
-
-impl From<WeightFormat> for Weights {
-    fn from(format: WeightFormat) -> Self {
-        Self::Uniform(format)
-    }
-}
-
-impl Weights {
-    /// Storage precision of every projection and the embedding.
-    pub fn plan(&self, config: &Config) -> Result<WeightPlan> {
-        match self {
-            Self::Uniform(format) => WeightPlan::uniform(config, *format),
-            Self::Plan(plan) => Ok(plan.as_ref().clone()),
-            Self::Prepacked(manifest) => Ok(manifest.plan.clone()),
-        }
-    }
-
-    /// Weight identity appended to the checkpoint revision.
-    fn tag(&self) -> String {
-        match self {
-            Self::Uniform(format) => format.tag().to_owned(),
-            Self::Plan(plan) => plan.tag(),
-            Self::Prepacked(manifest) => manifest.identity(),
-        }
-    }
-}
-
-/// Which implementation executes the model.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Execution {
-    /// Fused Metal kernels on a Metal device; the reference on the CPU, which has no
-    /// kernels. A Metal model never falls back to the CPU.
-    #[default]
-    Fused,
-    /// F32 reference operations over Candle tensors: the numerical oracle the fused
-    /// kernels are tested against, on any device.
-    Reference,
-}
-
-/// K/V storage chosen from M1 measurements (`docs/src/architecture/memory.md`): F16 was the
-/// fastest format end to end and indistinguishable from F32 in quality; page sizes of
-/// 16–128 tokens performed alike, and 16 wastes the least tail memory. Q8 halves K/V
-/// memory again for capacity-bound deployments.
-pub const DEFAULT_KV_LAYOUT: KvLayout = KvLayout {
-    page_tokens: 16,
-    format: KvFormat::F16,
-    version: tur_core::execution::KV_LAYOUT_VERSION,
-};
-
-/// Recurrent matrix storage. F32 until a quality evaluation justifies a narrower format.
-pub const DEFAULT_RECURRENT_STATE: DType = DType::F32;
-
-/// Parse a recurrent state storage name: `f32`, `f16` or `bf16`.
-pub fn parse_recurrent_state(name: &str) -> std::result::Result<DType, String> {
-    match name {
-        "f32" => Ok(DType::F32),
-        "f16" => Ok(DType::F16),
-        "bf16" => Ok(DType::BF16),
-        _ => Err(format!(
-            "recurrent state must be f32, f16 or bf16, not '{name}'"
-        )),
-    }
-}
-
-/// How to place a checkpoint.
-#[derive(Clone, Debug)]
-pub struct LoadOptions {
-    /// Exact checkpoint identity (repository and commit). The weight identity is appended.
-    pub revision: String,
-    pub weights: Weights,
-    pub device: Device,
-    pub execution: Execution,
-    /// Paged K/V page size and storage format; part of the state identity.
-    pub kv: KvLayout,
-    /// Storage of recurrent matrix state (F32, F16 or BF16); part of the state identity.
-    pub recurrent: DType,
-    /// Load the checkpoint's native multi-token prediction head ([`Config::with_mtp`]).
-    pub mtp: Option<DraftHead>,
-}
-
-/// The checkpoint's native multi-token prediction head, loaded for drafting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DraftHead {
-    /// Draft only token IDs below this bound, using a copy of the LM head's leading
-    /// rows. Byte-level BPE assigns IDs in merge order, so low IDs are frequent tokens.
-    /// `None` uses the whole LM head.
-    pub vocab: Option<usize>,
-}
 
 struct Attention {
     q: PackedLinear,
@@ -425,16 +290,6 @@ impl MtpHead {
     }
 }
 
-/// Input embedding storage.
-enum Embeddings {
-    /// A dense F32 or BF16 table.
-    Table(Tensor),
-    /// A packed table, dequantized one gathered row at a time.
-    Packed(PackedLinear),
-    /// Rows of the tied LM head: no second table.
-    Head,
-}
-
 /// One live sequence's rows within the packed hidden states and its resolved state.
 struct Span<'a> {
     start: usize,
@@ -475,16 +330,6 @@ fn centred(tensor: &Tensor, device: &Device) -> Result<Tensor> {
     Ok((tensor.to_dtype(DType::F32)? + 1.0)?.to_device(device)?)
 }
 
-/// Validated weight source of one load: a `SafeTensors` checkpoint converted by a plan,
-/// or a prepacked artifact uploaded as stored.
-struct Tensors {
-    checkpoint: Checkpoint,
-    prepacked: bool,
-    plan: WeightPlan,
-    projections: BTreeMap<String, Projection>,
-    device: Device,
-}
-
 impl Tensors {
     fn open(dir: &Path, config: &Config, weights: &Weights, device: &Device) -> Result<Self> {
         let (checkpoint, plan, prepacked) = match weights {
@@ -505,7 +350,7 @@ impl Tensors {
                 }
                 let plan = weights.plan(config)?;
                 plan.validate(config)?;
-                (Checkpoint::open(dir, config)?, plan, false)
+                (config.open_checkpoint(dir)?, plan, false)
             }
         };
         Ok(Self {
@@ -519,97 +364,6 @@ impl Tensors {
                 .collect(),
             device: device.clone(),
         })
-    }
-
-    /// A small tensor (norm, gate, convolution) on the host in its stored dtype.
-    fn take(&self, name: &str) -> Result<Tensor> {
-        self.checkpoint.take(name)
-    }
-
-    /// Projection `name` on the device in its planned precision.
-    fn projection(&self, name: &str) -> Result<PackedLinear> {
-        let projection = self
-            .projections
-            .get(name)
-            .ok_or_else(|| invalid(format!("model has no projection {name}")))?;
-        let precision = self.plan.precision(name)?;
-        let shape = (projection.rows, projection.cols);
-        if self.prepacked {
-            return self.stored(name, precision, shape);
-        }
-        Packer::RTN
-            .pack(&self.checkpoint, projection, precision)?
-            .upload(precision, shape, &self.device)
-    }
-
-    /// An artifact matrix uploaded exactly as stored; its layout was validated on open.
-    fn stored(
-        &self,
-        name: &str,
-        precision: Precision,
-        shape: (usize, usize),
-    ) -> Result<PackedLinear> {
-        let (entry, bytes) = self.checkpoint.take_raw(name)?;
-        match precision.ggml() {
-            Some(format) => PackedLinear::from_blocks(&bytes, format, shape, &self.device),
-            None => PackedLinear::dense(
-                &Tensor::from_raw_buffer(
-                    &bytes,
-                    entry.candle_dtype(name)?,
-                    &entry.shape,
-                    &Device::Cpu,
-                )?,
-                &self.device,
-            ),
-        }
-    }
-
-    /// The input embedding in its planned storage. Dense tables are filled on the device
-    /// a staging chunk at a time, so the host never holds the whole table.
-    fn embedding(&self, config: &Config) -> Result<Embeddings> {
-        let name = config.embedding_name();
-        let (rows, cols) = (config.vocab_size(), config.hidden_size());
-        let precision = match self.plan.embedding {
-            Embedding::Head => return Ok(Embeddings::Head),
-            Embedding::Table(precision) => precision,
-        };
-        let dtype = match precision {
-            Precision::F32 => DType::F32,
-            Precision::Bf16 => DType::BF16,
-            _ if self.prepacked => {
-                return Ok(Embeddings::Packed(self.stored(
-                    &name,
-                    precision,
-                    (rows, cols),
-                )?));
-            }
-            _ => {
-                let table = Projection {
-                    name: name.clone(),
-                    parts: vec![(name, rows)],
-                    rows,
-                    cols,
-                    experts: 1,
-                };
-                return Ok(Embeddings::Packed(
-                    Packer::RTN
-                        .pack(&self.checkpoint, &table, precision)?
-                        .upload(precision, (rows, cols), &self.device)?,
-                ));
-            }
-        };
-        let table = Tensor::zeros((rows, cols), dtype, &self.device)?;
-        let mut row = 0;
-        for chunk in self
-            .checkpoint
-            .take_rows(&name, (STAGING_BYTES / (cols * 4)).max(1))?
-        {
-            let chunk = chunk?.to_dtype(dtype)?.to_device(&self.device)?;
-            let count = chunk.dim(0)?;
-            table.slice_set(&chunk, 0, row)?;
-            row += count;
-        }
-        Ok(Embeddings::Table(table))
     }
 }
 
@@ -742,7 +496,11 @@ impl Qwen35 {
             }),
             (mtp, _) => mtp,
         };
-        let embed = tensors.embedding(&config)?;
+        let embed = tensors.embedding(
+            &config.embedding_name(),
+            config.vocab_size(),
+            config.hidden_size(),
+        )?;
         let norm = centred(&tensors.take(&format!("{prefix}.norm.weight"))?, device)?;
         let revision = format!("{}#{}", options.revision, options.weights.tag());
         Self {
@@ -792,13 +550,7 @@ impl Qwen35 {
     /// convolution and gate parameters. An embedding gathered from the head adds none.
     pub fn weight_bytes(&self) -> usize {
         let bytes = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
-        let mut total = self.projection_bytes()
-            + bytes(&self.norm)
-            + match &self.embed {
-                Embeddings::Table(table) => bytes(table),
-                Embeddings::Packed(table) => table.resident_bytes(),
-                Embeddings::Head => 0,
-            };
+        let mut total = self.projection_bytes() + bytes(&self.norm) + self.embed.bytes();
         if let Some(mtp) = &self.mtp {
             total += bytes(&mtp.embedding_norm) + bytes(&mtp.hidden_norm) + bytes(&mtp.norm);
         }
@@ -933,7 +685,7 @@ impl Qwen35 {
             &named,
             samples.len(),
             samples.iter().map(Vec::len).sum(),
-            plan::fnv1a(&ids),
+            crate::models::weights::fnv1a(&ids),
         )
     }
 
@@ -985,11 +737,7 @@ impl Qwen35 {
 
     /// F32 input embeddings of `ids`.
     fn embedding(&self, ids: &Tensor) -> Result<Tensor> {
-        Ok(match &self.embed {
-            Embeddings::Table(table) => table.index_select(ids, 0)?.to_dtype(DType::F32)?,
-            Embeddings::Packed(table) => table.rows(ids)?,
-            Embeddings::Head => self.lm_head.rows(ids)?,
-        })
+        self.embed.rows(ids, &self.lm_head)
     }
 
     /// Device holding the weights; an engine executing this model must use the same handle.
@@ -1107,6 +855,8 @@ impl Qwen35 {
                 &keys,
                 &values,
                 span.past,
+                (d.head_dim as f64).sqrt().recip(),
+                None,
             )?);
         }
         let attended = Tensor::cat(&outputs, 0)?.reshape((n, d.heads * d.head_dim))?;

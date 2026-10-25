@@ -1,4 +1,4 @@
-struct MoeRouteParams { uint tokens, experts, top_k, stride; };
+struct MoeRouteParams { uint tokens, experts, top_k, stride, scaled; };
 struct ExpertParams { uint rows, experts, top_k, width, stride, out, routed; };
 struct ScatterParams { uint tokens, top_k, width, stride, shared, shared_stride, gate_stride; };
 
@@ -14,7 +14,7 @@ struct ScatterParams { uint tokens, top_k, width, stride, shared, shared_stride,
 // simdgroup max reductions over exact F32 scores, ties to the lowest expert ID (both
 // signs of zero compare equal), and normalizes in rank order as the host reference does.
 kernel void moe_route_f32(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
-    constant MoeRouteParams &p [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
+    constant MoeRouteParams &p [[buffer(2)]], device const float *scales [[buffer(3)]], uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
     float scores[MOE_LANE_EXPERTS];
     bool taken[MOE_LANE_EXPERTS];
@@ -54,7 +54,7 @@ kernel void moe_route_f32(device const float *x [[buffer(0)]], device float *y [
         sum += weight;
         if (lane == 0) { out[n * 2] = float(id); out[n * 2 + 1] = weight; }
     }
-    if (lane == 0) for (uint n = 0; n < p.top_k; ++n) out[n * 2 + 1] /= sum;
+    if (lane == 0) for (uint n = 0; n < p.top_k; ++n) out[n * 2 + 1] = (out[n * 2 + 1] / sum) * (p.scaled ? scales[uint(out[n * 2])] : 1.0f);
 }
 
 // Per block of assignments: each expert's count, and each assignment's rank among the

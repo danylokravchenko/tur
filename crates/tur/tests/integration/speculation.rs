@@ -11,7 +11,7 @@ use tur::{
     },
     core::execution::invalid,
     hybrid::SamplingOptions,
-    models::qwen3_5::DraftHead,
+    models::DraftHead,
 };
 
 fn config(drafts: usize, batch: usize) -> PipelineConfig {
@@ -177,7 +177,7 @@ fn test_speculative_device_sampling_preserves_seeded_penalties_and_outputs() -> 
     let fixture = Checkpoint::fused()?;
     let mut factory = fixture.factory();
     factory.device = candle_core::Device::new_metal(0)?;
-    factory.format = Some(tur::models::qwen3_5::WeightFormat::Q8_0);
+    factory.format = Some(tur::models::WeightFormat::Q8_0);
     let mut plain = InferencePipeline::new(&factory, config(0, 1))?;
     let mut speculative = InferencePipeline::new(&factory, config(3, 1))?;
     let mut request = GenerationRequest::new(
@@ -396,7 +396,7 @@ fn test_fused_mtp_drafts_preserve_target_sampling() -> Result<()> {
     let fixture = Checkpoint::fused_mtp()?;
     let mut factory = fixture.factory();
     factory.device = candle_core::Device::new_metal(0)?;
-    factory.format = Some(tur::models::qwen3_5::WeightFormat::Q8_0);
+    factory.format = Some(tur::models::WeightFormat::Q8_0);
     assert_mtp_preserves_outputs(&factory)
 }
 

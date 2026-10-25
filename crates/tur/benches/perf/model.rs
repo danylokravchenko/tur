@@ -24,10 +24,8 @@ use tur_engine::hybrid::{
     Boundaries, HybridEngine, HybridModel, ModelState, PackedForward, PoolConfig, Reservation,
     SamplingOptions, SequenceForward, StatePool,
 };
-use tur_models::models::qwen3_5::{
-    Execution, LoadOptions, Manifest, Qwen35, WeightFormat, Weights, is_artifact,
-    parse_recurrent_state,
-};
+use tur_models::models::qwen3_5::{Manifest, Qwen35, is_artifact};
+use tur_models::models::{Execution, LoadOptions, WeightFormat, Weights, parse_recurrent_state};
 
 const SHORT_CONTEXT: usize = 128;
 const DECODE_STEPS: usize = 12;

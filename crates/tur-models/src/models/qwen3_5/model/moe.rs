@@ -1,6 +1,7 @@
 //! Qwen3.5 `MoE` feed-forward block: normalized top-k and sigmoid-gated shared expert.
 
 use super::{DenseMlp, Tensors, f32_on};
+use crate::models::math::route;
 use crate::{models::qwen3_5::config::MoeConfig, quantization::Recorder};
 use candle_core::{Device, Tensor};
 use tur_core::{Result, execution::invalid};
@@ -121,34 +122,6 @@ impl Moe {
             },
         )
     }
-}
-
-/// F32 top-k probabilities, normalized over the selected experts. Softmax over all
-/// experts cancels in the renormalization; subtract the selected maximum for stability.
-#[allow(
-    clippy::float_cmp,
-    reason = "routing ties include both signs of zero, as on the device"
-)]
-fn route(logits: &[f32], top_k: usize) -> Result<(Vec<usize>, Vec<f32>)> {
-    if top_k == 0 || top_k > logits.len() || logits.iter().any(|x| !x.is_finite()) {
-        return Err(invalid("invalid MoE router scores or top-k"));
-    }
-    let mut indices: Vec<usize> = (0..logits.len()).collect();
-    indices.sort_unstable_by(|&a, &b| {
-        if logits[a] == logits[b] {
-            a.cmp(&b)
-        } else {
-            logits[b].total_cmp(&logits[a])
-        }
-    });
-    indices.truncate(top_k);
-    let max = logits[indices[0]];
-    let mut weights: Vec<f32> = indices.iter().map(|&i| (logits[i] - max).exp()).collect();
-    let sum: f32 = weights.iter().sum();
-    for weight in &mut weights {
-        *weight /= sum;
-    }
-    Ok((indices, weights))
 }
 
 #[cfg(test)]

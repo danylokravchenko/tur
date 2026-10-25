@@ -1,6 +1,9 @@
 //! Prepacked weight artifacts, calibration statistics, GPTQ and byte-budget allocation on
 //! small random checkpoints.
 use crate::model_common as common;
+use tur_models::models::{
+    Embedding, Execution, LoadOptions, Method, Packer, Precision, WeightFormat, WeightPlan, Weights,
+};
 
 use crate::model_common::{Checkpoint, checkpoint};
 use candle_core::{DType, Device};
@@ -11,8 +14,7 @@ use tur_core::{
 };
 use tur_engine::hybrid::HybridModel;
 use tur_models::models::qwen3_5::{
-    Config, Conversion, Embedding, Execution, LoadOptions, Manifest, Method, Packer, Precision,
-    Qwen35, Reference, WeightFormat, WeightPlan, Weights, allocate, sensitivities, write_artifact,
+    Config, Conversion, Manifest, Qwen35, Reference, allocate, sensitivities, write_artifact,
     write_calibrated_artifact,
 };
 

@@ -1,5 +1,6 @@
 //! Flags shared by `run` and `serve`.
 use std::{path::Path, time::Duration};
+use tur::models::{DEFAULT_KV_LAYOUT, WeightFormat, parse_recurrent_state};
 
 use candle_core::DType;
 use clap::builder::{PossibleValuesParser, TypedValueParser as _};
@@ -8,7 +9,6 @@ use tur::{
     ModelFactory, ModelSource, Result, TurError,
     backend::{pipeline::PipelineConfig, speculation::SpeculationConfig},
     core::execution::{KvFormat, KvLayout},
-    models::qwen3_5::{DEFAULT_KV_LAYOUT, WeightFormat, parse_recurrent_state},
 };
 
 use crate::config::{inherit, optional_from_str, optional_recurrent};

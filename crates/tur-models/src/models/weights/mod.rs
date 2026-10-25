@@ -1,7 +1,12 @@
 //! Per-projection storage precision under a resident byte budget.
 
-use super::{WeightFormat, config::Config};
+mod loading;
+mod packing;
+use super::WeightFormat;
 use candle_core::quantized::GgmlDType;
+pub(crate) use loading::{Embeddings, Tensors};
+pub(crate) use packing::STAGING_BYTES;
+pub use packing::{Method, Packer};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tur_core::{
@@ -9,6 +14,55 @@ use tur_core::{
     execution::{checked_elements, invalid},
 };
 use tur_metal::quantize::packed_bytes;
+
+/// One loaded projection: checkpoint matrices stacked along output rows into the matrix
+/// the model multiplies by. Names are stable keys for weight plans, calibration
+/// statistics and prepacked artifacts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Projection {
+    /// Checkpoint module path of the loaded matrix, e.g. `….layers.0.self_attn.kv_proj`.
+    pub name: String,
+    /// Checkpoint tensors in stacking order, with the output rows each contributes.
+    pub parts: Vec<(String, usize)>,
+    pub rows: usize,
+    pub cols: usize,
+    /// Experts of a stacked expert bank, each owning `rows / experts` rows; 1 otherwise.
+    pub experts: usize,
+}
+
+impl Projection {
+    pub(crate) fn new(name: String, parts: Vec<(String, usize)>, cols: usize) -> Self {
+        let rows = parts.iter().map(|(_, rows)| rows).sum();
+        Self {
+            name,
+            parts,
+            rows,
+            cols,
+            experts: 1,
+        }
+    }
+
+    pub(crate) fn bank(name: String, experts: usize, rows: usize, cols: usize) -> Self {
+        Self {
+            parts: vec![(name.clone(), experts * rows)],
+            name,
+            rows: experts * rows,
+            cols,
+            experts,
+        }
+    }
+}
+
+/// Architecture-owned matrix layout used by the common weight planner.
+pub trait WeightLayout {
+    fn projection_layout(&self) -> Result<Vec<Projection>>;
+    fn embeddings_tied(&self) -> bool;
+    fn vocabulary(&self) -> usize;
+    fn residual_width(&self) -> usize;
+    fn loads_mtp(&self) -> bool {
+        false
+    }
+}
 
 /// Storage of one weight matrix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -114,16 +168,16 @@ pub struct WeightPlan {
 impl WeightPlan {
     /// Every projection in `format`. F32 shares a tied head with the embedding; packed
     /// formats keep a BF16 table, from which only gathered rows become F32.
-    pub fn uniform(config: &Config, format: WeightFormat) -> Result<Self> {
+    pub fn uniform(config: &impl WeightLayout, format: WeightFormat) -> Result<Self> {
         let precision = Precision::from(format);
-        let embedding = match (format, config.tied_embeddings()) {
+        let embedding = match (format, config.embeddings_tied()) {
             (WeightFormat::F32, true) => Embedding::Head,
             (WeightFormat::F32, false) => Embedding::Table(Precision::F32),
             _ => Embedding::Table(Precision::Bf16),
         };
         Ok(Self {
             projections: config
-                .projections()?
+                .projection_layout()?
                 .into_iter()
                 .map(|p| (p.name, precision))
                 .collect(),
@@ -142,14 +196,14 @@ impl WeightPlan {
     /// Check that the plan covers `config`'s projections in executable precisions (plus,
     /// at most, those of an MTP head the config does not load) and that a shared
     /// embedding has a tied head to share.
-    pub fn validate(&self, config: &Config) -> Result<()> {
-        let projections = config.projections()?;
+    pub fn validate(&self, config: &impl WeightLayout) -> Result<()> {
+        let projections = config.projection_layout()?;
         let names: std::collections::BTreeSet<&str> =
             projections.iter().map(|p| p.name.as_str()).collect();
         if let Some(extra) = self
             .projections
             .keys()
-            .find(|n| !names.contains(n.as_str()) && (config.mtp() || !n.starts_with("mtp.")))
+            .find(|n| !names.contains(n.as_str()) && (config.loads_mtp() || !n.starts_with("mtp.")))
         {
             return Err(invalid(format!(
                 "weight plan names {extra}, which the model does not have"
@@ -167,25 +221,25 @@ impl WeightPlan {
             precision.bytes(p.rows, p.cols)?;
         }
         match self.embedding {
-            Embedding::Head if !config.tied_embeddings() => Err(invalid(
+            Embedding::Head if !config.embeddings_tied() => Err(invalid(
                 "an untied checkpoint has no head to gather embeddings from",
             )),
             Embedding::Table(precision) => precision
-                .bytes(config.vocab_size(), config.hidden_size())
+                .bytes(config.vocabulary(), config.residual_width())
                 .map(|_| ()),
             Embedding::Head => Ok(()),
         }
     }
 
     /// Resident bytes of the projections and embedding table.
-    pub fn bytes(&self, config: &Config) -> Result<usize> {
+    pub fn bytes(&self, config: &impl WeightLayout) -> Result<usize> {
         let mut total = match self.embedding {
             Embedding::Head => 0,
             Embedding::Table(precision) => {
-                precision.bytes(config.vocab_size(), config.hidden_size())?
+                precision.bytes(config.vocabulary(), config.residual_width())?
             }
         };
-        for p in config.projections()? {
+        for p in config.projection_layout()? {
             total = total
                 .checked_add(self.precision(&p.name)?.bytes(p.rows, p.cols)?)
                 .ok_or_else(|| invalid("weight total overflow"))?;
@@ -214,7 +268,7 @@ impl WeightPlan {
 }
 
 /// 64-bit FNV-1a: a stable content fingerprint for identities, not a security hash.
-pub(super) fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &b| {
         (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     })
@@ -227,6 +281,7 @@ pub(super) fn fnv1a(bytes: &[u8]) -> u64 {
 )]
 mod tests {
     use super::*;
+    use crate::models::qwen3_5::Config;
 
     const SMALL: &str =
         include_str!("../../../../tur/tests/fixtures/checkpoints/small-config.json");
@@ -241,7 +296,7 @@ mod tests {
         }
         let mut plan = WeightPlan::uniform(&config, WeightFormat::Q4K)?;
         let q4k = plan.bytes(&config)?;
-        let first = config.projections()?.remove(0);
+        let first = config.projection_layout()?.remove(0);
         plan.projections.insert(first.name.clone(), Precision::Q8_0);
         plan.validate(&config)?;
         assert!(plan.tag().starts_with("mixed-"));
