@@ -243,6 +243,10 @@ impl Config {
             "sliding_attention"
         }]
     }
+    /// Whether layer `i` reads a sliding window, and so stores keys in window pages.
+    pub(super) fn windowed(&self, i: usize) -> bool {
+        self.text.layer_types[i] == LayerKind::SlidingAttention
+    }
     pub(super) fn state_layer(&self, i: usize) -> usize {
         self.owners[..self.owners[i]]
             .iter()
@@ -264,6 +268,9 @@ impl Config {
                 .map(|(i, _)| LayerStateKind::Attention {
                     kv_heads: self.kv_heads(i),
                     head_dim: self.dim(i),
+                    // One key beyond the window: the assistant drafts from a sliding
+                    // window of `sliding_window + 1` target keys.
+                    window: self.windowed(i).then_some(self.text.sliding_window + 1),
                 })
                 .collect(),
             kv,
@@ -477,6 +484,14 @@ impl WeightLayout for Config {
 }
 
 fn validate(t: &TextConfig) -> Result<()> {
+    if t.num_kv_shared_layers >= t.num_hidden_layers {
+        return Err(invalid("Gemma 4 shares K/V of every layer"));
+    }
+    validate_equations(t)
+}
+
+/// The implemented layer equations, independent of which layers own K/V.
+pub(super) fn validate_equations(t: &TextConfig) -> Result<()> {
     if [
         t.hidden_size,
         t.intermediate_size,
@@ -492,7 +507,6 @@ fn validate(t: &TextConfig) -> Result<()> {
     .contains(&0)
         || !matches!(t.model_type.as_str(), "gemma4_text" | "gemma4_unified_text")
         || t.layer_types.len() != t.num_hidden_layers
-        || t.num_kv_shared_layers >= t.num_hidden_layers
         || !t.num_attention_heads.is_multiple_of(t.num_key_value_heads)
         || t.num_global_key_value_heads
             .is_some_and(|h| h == 0 || !t.num_attention_heads.is_multiple_of(h))

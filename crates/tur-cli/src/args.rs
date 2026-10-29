@@ -1,13 +1,13 @@
 //! Flags shared by `run` and `serve`.
 use std::{path::Path, time::Duration};
-use tur::models::{DEFAULT_KV_LAYOUT, WeightFormat, parse_recurrent_state};
+use tur::models::{DEFAULT_KV_LAYOUT, DraftHead, WeightFormat, parse_recurrent_state};
 
 use candle_core::DType;
 use clap::builder::{PossibleValuesParser, TypedValueParser as _};
 use serde::Deserialize;
 use tur::{
     ModelFactory, ModelSource, Result, TurError,
-    backend::{pipeline::PipelineConfig, speculation::SpeculationConfig},
+    backend::{factory::resolve_drafter, pipeline::PipelineConfig, speculation::SpeculationConfig},
     core::execution::{KvFormat, KvLayout},
 };
 
@@ -140,6 +140,14 @@ pub(crate) struct PipelineArgs {
     /// least one draft and disables prefix reuse.
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     mtp: Option<bool>,
+    /// Draft from a separate multi-token prediction checkpoint (a Gemma 4 assistant): a
+    /// local directory or a Hugging Face repository at `--draft-revision`. Implies at
+    /// least one draft and disables prefix reuse.
+    #[arg(long)]
+    draft_model: Option<String>,
+    /// Immutable commit of a remote `--draft-model`, or an identity for a local one.
+    #[arg(long)]
+    draft_revision: Option<String>,
     #[arg(skip)]
     device_sampling: Option<bool>,
     #[arg(skip)]
@@ -162,6 +170,8 @@ impl PipelineArgs {
         state_memory_mb,
         speculative_draft,
         mtp,
+        draft_model,
+        draft_revision,
         device_sampling,
         max_waiting_tokens,
         min_prefill_tokens,
@@ -183,7 +193,24 @@ impl PipelineArgs {
         let mut config =
             PipelineConfig::new(max_batch_size, self.prefill_chunk_size.unwrap_or(256));
         let drafts = self.speculative_draft.unwrap_or(0);
-        config.speculation = if self.mtp.unwrap_or(false) {
+        config.speculation = if let Some(model) = &self.draft_model {
+            let revision = self
+                .draft_revision
+                .as_deref()
+                .ok_or_else(|| TurError::Other("--draft-model needs --draft-revision".into()))?;
+            let source = if Path::new(model).is_dir() {
+                ModelSource::LocalPath(model.into())
+            } else {
+                ModelSource::HuggingFace(model.clone())
+            };
+            SpeculationConfig {
+                mtp: Some(DraftHead {
+                    vocab: None,
+                    model: Some(resolve_drafter(&source, revision)?),
+                }),
+                ..SpeculationConfig::new(drafts.max(1))
+            }
+        } else if self.mtp.unwrap_or(false) {
             SpeculationConfig::with_mtp(drafts.max(1))
         } else {
             SpeculationConfig::new(drafts)

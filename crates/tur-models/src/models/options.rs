@@ -1,6 +1,6 @@
 //! Placement and execution settings shared by text models.
 use super::{
-    qwen3_5::Manifest,
+    artifact::Manifest,
     weights::{WeightLayout, WeightPlan},
 };
 use candle_core::{DType, Device};
@@ -135,11 +135,15 @@ pub struct LoadOptions {
     pub mtp: Option<DraftHead>,
 }
 
-/// The checkpoint's native multi-token prediction head, loaded for drafting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A native multi-token prediction drafter, loaded for drafting: Qwen3.5's head inside
+/// the checkpoint, or a Gemma 4 assistant checkpoint beside it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DraftHead {
     /// Draft only token IDs below this bound, using a copy of the LM head's leading
     /// rows. Byte-level BPE assigns IDs in merge order, so low IDs are frequent tokens.
-    /// `None` uses the whole LM head.
+    /// `None` uses the whole LM head. Qwen3.5 only.
     pub vocab: Option<usize>,
+    /// Local directory of a separate drafter checkpoint (a Gemma 4 assistant); `None`
+    /// loads the head inside the target checkpoint.
+    pub model: Option<std::path::PathBuf>,
 }

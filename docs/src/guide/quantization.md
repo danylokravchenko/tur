@@ -11,9 +11,12 @@ blocks directly. A SafeTensors checkpoint can be packed in two ways:
 These are not GGUF imports, and `q4k` is Q4_K packing rather than a promise of
 llama.cpp's Q4_K_M recipe.
 
-Offline artifacts and calibration currently cover the Qwen family. Gemma 4 uses the
-same packed matrix formats through load-time conversion, but does not yet support
-`tur quantize` artifacts.
+Calibration (`imatrix`, `gptq`, `--budget-bits`) covers the Qwen family. Gemma 4
+artifacts use round-to-nearest packing: `tur quantize --method rtn --weight-format q8_0`.
+Per-layer embedding tables and norms are copied as stored, and unused sharing-layer K/V
+and multimodal tensors are left out. An E2B Q8_0 artifact is 6.7 GB, packs in 26 s at
+0.2 GB peak host memory, and loads in 4.8–5.5 s against 11.1–12.3 s for load-time
+conversion; its default `--embedding head` gathers embeddings from the packed LM head.
 
 ## Writing an artifact
 

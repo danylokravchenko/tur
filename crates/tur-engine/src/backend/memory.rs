@@ -61,6 +61,9 @@ pub struct PlanInputs {
     /// Recurrent slots for the per-token boundaries of speculative drafts, one per
     /// drafted token, so one sequence can verify its longest draft beside full snapshots.
     pub draft_slots: usize,
+    /// Most tokens one sequence adds in a pass (a prefill chunk or a verified draft):
+    /// windowed layers hold their window plus these pages.
+    pub pass_tokens: usize,
     /// Explicit state pool budget in bytes; otherwise sized for [`DEFAULT_CONTEXT_TOKENS`]
     /// per sequence within the device limit.
     pub state_bytes: Option<usize>,
@@ -97,11 +100,23 @@ impl MemoryPlan {
             bytes
         } else {
             let context = DEFAULT_CONTEXT_TOKENS.min(description.max_position);
+            let window_pages = match description.window() {
+                Some(window) => inputs
+                    .sequences
+                    .checked_add(inputs.retained)
+                    .and_then(|holders| {
+                        let held = window.checked_add(inputs.pass_tokens)?;
+                        holders.checked_mul(description.pages_for(held).checked_add(1)?)
+                    })
+                    .ok_or_else(|| invalid("window page count overflow"))?,
+                None => 0,
+            };
             let wanted = PoolConfig {
                 pages: description
-                    .pages_for(context)
+                    .full_pages_for(context)
                     .checked_mul(inputs.sequences)
                     .ok_or_else(|| invalid("page count overflow"))?,
+                window_pages,
                 recurrent_slots: inputs
                     .sequences
                     .checked_mul(2)
@@ -131,7 +146,13 @@ impl MemoryPlan {
         let extra = retained
             .checked_add(draft_slots)
             .ok_or_else(|| invalid("recurrent slot count overflow"))?;
-        let config = PoolConfig::for_budget(description, bytes, inputs.sequences, extra)?;
+        let config = PoolConfig::for_budget(
+            description,
+            bytes,
+            inputs.sequences,
+            extra,
+            inputs.pass_tokens,
+        )?;
         let plan = Self {
             weights: inputs.weights,
             state_pool: config.bytes(description)?,
@@ -257,6 +278,7 @@ mod tests {
                 LayerStateKind::Attention {
                     kv_heads: 1,
                     head_dim: 32,
+                    window: None,
                 },
                 LayerStateKind::Recurrent {
                     conv_channels: 4,
@@ -283,6 +305,7 @@ mod tests {
             retained: 0,
             retained_share: None,
             draft_slots: 0,
+            pass_tokens: 1,
             state_bytes,
             limit,
             reserved: 0,

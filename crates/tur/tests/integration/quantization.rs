@@ -14,9 +14,9 @@ use tur_core::{
 };
 use tur_engine::hybrid::HybridModel;
 use tur_models::models::qwen3_5::{
-    Config, Conversion, Manifest, Qwen35, Reference, allocate, sensitivities, write_artifact,
-    write_calibrated_artifact,
+    Config, Qwen35, Reference, allocate, sensitivities, write_artifact, write_calibrated_artifact,
 };
+use tur_models::models::{Conversion, Manifest};
 
 /// Two recurrent and two attention layers, every width a multiple of 256.
 const SMALL: &str = r#"{
@@ -214,7 +214,7 @@ fn test_artifact_validation_rejects_changed_configs_stale_manifests_and_conversi
     std::fs::write(&config_path, &original)?;
     assert!(Manifest::read(&dir.0).is_ok());
     // A truncated payload no longer matches its header.
-    let weights = dir.0.join(tur_models::models::qwen3_5::ARTIFACT_FILE);
+    let weights = dir.0.join(tur_models::models::ARTIFACT_FILE);
     let bytes = std::fs::read(&weights)?;
     std::fs::write(&weights, &bytes[..bytes.len() - 1])?;
     assert!(Manifest::read(&dir.0).is_err());
@@ -309,11 +309,11 @@ fn test_streamed_calibration_packs_the_same_weights_as_resident_calibration() ->
                 assert_eq!(actual, manifest);
                 // Compare stored payloads, independently of loading and inference.
                 let expected = candle_core::safetensors::load(
-                    expected.0.join(tur_models::models::qwen3_5::ARTIFACT_FILE),
+                    expected.0.join(tur_models::models::ARTIFACT_FILE),
                     &Device::Cpu,
                 )?;
                 let actual = candle_core::safetensors::load(
-                    output.0.join(tur_models::models::qwen3_5::ARTIFACT_FILE),
+                    output.0.join(tur_models::models::ARTIFACT_FILE),
                     &Device::Cpu,
                 )?;
                 assert_eq!(actual.len(), expected.len());
@@ -369,12 +369,7 @@ fn test_streamed_packing_failure_cleans_activations_without_publishing_an_artifa
         result,
         Err(tur_core::TurError::InvalidExecution(_))
     ));
-    assert!(
-        !output
-            .0
-            .join(tur_models::models::qwen3_5::ARTIFACT_FILE)
-            .exists()
-    );
+    assert!(!output.0.join(tur_models::models::ARTIFACT_FILE).exists());
     for entry in std::fs::read_dir(&output.0)? {
         assert!(
             !entry?

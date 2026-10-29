@@ -1086,6 +1086,69 @@ fn test_tiled_attention_matches_reference_for_every_format_and_tile_shape() -> R
 }
 
 #[test]
+fn test_tiled_ungated_windowed_attention_matches_scalar_reference() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    let tiled = kernels.clone().with_tuning(Tuning {
+        attention_tiled_ungated_groups: 0,
+        ..kernels.tuning()
+    })?;
+    for dim in [64, 128, 256] {
+        // Tiles crossing pages and key blocks, a long prefill continuing committed keys,
+        // and windows shorter than, across and longer than one 32-key block.
+        let case = AttentionCase {
+            heads: 4,
+            kv_heads: 1,
+            dim,
+            page: 16,
+            sequences: vec![(37, 70), (0, 33), (90, 5)],
+        };
+        let (key, value, slots, table, first, visible) = paged_pool(&case, 31);
+        let tokens = visible.len();
+        let q = values(tokens * case.heads * dim, 21, 0.1);
+        let query = upload(&device, &q, &[tokens, case.heads, dim])?;
+        let gate = vec![0.0; tokens * case.heads * 2 * dim];
+        let paged = tiled.paged_kv(case.page, slots, &table, &first, &visible)?;
+        assert!(tiled.attention_tiled_ungated(&paged, case.heads, dim));
+        assert!(!kernels.attention_tiled_ungated(&paged, case.heads, dim));
+        for format in [KvFormat::F32, KvFormat::F16, KvFormat::Q8] {
+            let (key, k_exact) = stored(&device, &key, slots, case.kv_heads, dim, format)?;
+            let (value, v_exact) = stored(&device, &value, slots, case.kv_heads, dim, format)?;
+            let pool = AttentionPool {
+                key,
+                value,
+                format,
+                page_tokens: case.page,
+                kv_heads: case.kv_heads,
+                head_dim: dim,
+            };
+            for window in [0, 1, 7, 33, 64, 512] {
+                let expected = attention_reference(
+                    &case,
+                    &q,
+                    &k_exact,
+                    &v_exact,
+                    &gate,
+                    &table,
+                    &first,
+                    &visible,
+                    Some((window, 0.5)),
+                );
+                let actual = read(&tiled.attention_ungated(
+                    &query,
+                    &pool,
+                    &paged,
+                    (window > 0).then_some(window),
+                    0.5,
+                )?)?;
+                let error = relative_error(&actual, &expected);
+                assert!(error < 1e-5, "dim {dim} {format} window {window}: {error}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_tiled_attention_dispatch_preserves_decode_parallelism() -> Result<()> {
     let (_, kernels, _gpu) = setup()?;
     let decode = kernels.paged_kv(16, 32, &[0, 1], &[0, 1, 0, 1], &[16; 4])?;

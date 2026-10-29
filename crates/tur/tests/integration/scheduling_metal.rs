@@ -23,7 +23,7 @@ fn test_f16_packed_recompute_and_loaded_model_budget_on_metal() -> Result<()> {
     config.prefix = PrefixConfig::DISABLED;
     config.scheduler.max_batch_tokens = 24;
     config.scheduler.min_prefill_tokens = 2;
-    let probe = InferencePipeline::new(&factory, config)?;
+    let probe = InferencePipeline::new(&factory, config.clone())?;
     let usage = {
         let mut probe = probe;
         probe.memory()?
@@ -38,7 +38,7 @@ fn test_f16_packed_recompute_and_loaded_model_budget_on_metal() -> Result<()> {
             GenerationRequest::new(prompt, 24)
         })
         .collect();
-    let mut solo = InferencePipeline::new(&factory, config)?;
+    let mut solo = InferencePipeline::new(&factory, config.clone())?;
     let expected = requests
         .iter()
         .map(|request| Ok(solo.run(request, |_| {})?.generated_text))
@@ -51,8 +51,8 @@ fn test_f16_packed_recompute_and_loaded_model_budget_on_metal() -> Result<()> {
         .saturating_sub(solo.memory_plan().overhead);
     drop(solo);
     let budget = DeviceBudget::new(Some(bytes * 3));
-    let mut packed = InferencePipeline::with_budget(&factory, config, &budget)?;
-    let other = InferencePipeline::with_budget(&factory, config, &budget)?;
+    let mut packed = InferencePipeline::with_budget(&factory, config.clone(), &budget)?;
+    let other = InferencePipeline::with_budget(&factory, config.clone(), &budget)?;
     assert_eq!(
         budget.leased(),
         packed.memory_plan().resident() + other.memory_plan().resident()
@@ -121,7 +121,7 @@ fn test_device_sampling_with_penalties_is_independent_of_batch_order_on_metal() 
     let mut config = PipelineConfig::new(6, 8);
     config.scheduler.max_batch_tokens = 20;
     config.scheduler.min_prefill_tokens = 2;
-    let mut solo = InferencePipeline::new(&factory, config)?;
+    let mut solo = InferencePipeline::new(&factory, config.clone())?;
     let expected = requests
         .iter()
         .map(|request| Ok(solo.run(request, |_| {})?.generated_text))
@@ -134,7 +134,7 @@ fn test_device_sampling_with_penalties_is_independent_of_batch_order_on_metal() 
             > 3
     );
     for order in [vec![0, 1, 2, 3, 4, 5], vec![5, 3, 1, 4, 2, 0]] {
-        let mut batched = InferencePipeline::new(&factory, config)?;
+        let mut batched = InferencePipeline::new(&factory, config.clone())?;
         let ids = order
             .iter()
             .map(|&i| Ok((batched.submit_request(&requests[i])?, i)))
@@ -215,7 +215,7 @@ fn test_batched_runs_repeat_exactly_and_reproducible_mode_ignores_other_traffic(
     config.scheduler.max_batch_tokens = 24;
     config.scheduler.min_prefill_tokens = 2;
     let first = drive(
-        &mut InferencePipeline::new(&factory, config)?,
+        &mut InferencePipeline::new(&factory, config.clone())?,
         &requests,
         &arrivals,
     )?;
@@ -266,7 +266,7 @@ fn test_grammar_requests_are_sampled_on_the_device_and_batch_independently() -> 
     let mut config = PipelineConfig::new(6, 8);
     config.scheduler.max_batch_tokens = 24;
     config.scheduler.min_prefill_tokens = 2;
-    let mut solo = InferencePipeline::new(&factory, config)?;
+    let mut solo = InferencePipeline::new(&factory, config.clone())?;
     let expected = requests
         .iter()
         .map(|request| Ok(solo.run(request, |_| {})?.generated_text))

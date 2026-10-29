@@ -35,8 +35,9 @@ E2B and E4B add per-layer embeddings (PLE): token-specific layer inputs combine 
 normalized projection of the initial embedding. A gated projection injects each layer's
 PLE signal after its feed-forward update. E2B also doubles the MLP width in its K/V-sharing
 suffix. Sharing layers reuse the last non-sharing layer of the same attention kind;
-only physical K/V owners allocate pool state. Sliding layers retain their pages but mask
-keys outside the window. There is no token eviction or alternate cache owner.
+only physical K/V owners allocate pool state. Sliding owners keep only the window pages
+their later queries can read (see [State memory](memory.md)); the drafter's one extra
+key is part of their window.
 
 The 31B and 12B Unified text decoders share the dense equations without PLE. The
 26B-A4B branch adds normalized top-k experts, learned per-expert scales and separately
@@ -85,8 +86,11 @@ The Qwen parser rejects settings outside its implemented equations:
 Gemma validates its own head widths, sharing topology, PLE and expert dimensions,
 GELU activation, causal text attention, default local RoPE and proportional global RoPE.
 Attention biases, dropout, arbitrary RoPE scaling, bidirectional text attention and
-external quantization configurations are rejected. Gemma native MTP heads and offline
-prepacked artifacts are not implemented; use load-time conversion for Gemma weights.
+external quantization configurations are rejected. Gemma 4 drafts with its published
+assistant (`gemma4_assistant`), a separate checkpoint validated against its target:
+same vocabulary, head widths, K/V heads, window and rotary settings, and every layer
+sharing target K/V (see [Speculative decoding](speculation.md)). Gemma artifacts are
+written with round-to-nearest packing (see [Prepacked weights](../guide/quantization.md)).
 
 Every weight shape is derived and checked before any payload is read. SafeTensors files
 are discovered from the index, their headers validated, and payloads read without mmap.

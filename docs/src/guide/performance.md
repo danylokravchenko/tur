@@ -10,7 +10,8 @@ where later scheduling work made serving faster. Re-measure with
 **Setup for every table:**
 
 - Hardware: Apple M1 with 16 GB, macOS 26.6.2, not in low-power mode.
-- Model: Qwen3.5-0.8B (`2fc06364715b967f1860aea9cf38778875588b17`).
+- Model: Qwen3.5-0.8B (`2fc06364715b967f1860aea9cf38778875588b17`), except
+  [Gemma 4 E2B](#gemma-4-e2b).
 - Defaults unless noted: F16 K/V with 16-token pages, F32 recurrent state, 256-token
   prefill chunks.
 - Timing: every timed region ends at device completion.
@@ -218,6 +219,66 @@ Fresh process, page cache warm, through the last upload; peak RSS from
 | Q4K GPTQ artifact | 0.16 s | 425 MB | 0.71 GB |
 | Mixed 5.5-bit GPTQ artifact | 0.20 s | 521 MB | 0.80 GB |
 | Q8_0 artifact | 0.27 s | 801 MB | 1.20 GB |
+
+## Gemma 4 E2B
+
+Measured 2026-10-29 on the same M1 with `google/gemma-4-E2B-it`
+(`3e22461f65e89153144f8adb70e3b8c2cc9845a7`), Q8_0 weights and F16 K/V, through
+`just bench-gemma` and its variables. Each row alternates the earlier and current code
+in one session; ranges are the rounds. E2B does about three times the 0.8B Qwen's work
+per token, and its 262K-token LM head makes decode bandwidth-bound near 20 tokens/s.
+
+**Single model pass** (fused `q|k|v` and `gate|up`, in-place norms and rotary,
+residuals fused with the next norm, sliding splits over the window):
+
+| Case | Before | After |
+| --- | --- | --- |
+| Prefill, 512 tokens | 323 tok/s | 417 tok/s |
+| Decode, 1 seq @ 128 | 19.4–19.8 | 19.8–21.3 |
+| Decode, 4 seq @ 128 | 48.6 | 51.8 |
+| Decode, 1 seq @ 8K | 16.4–18.1 | 18.9–20.0 |
+| Decode, 4 seq @ 8K | 42.6 | 44.6 |
+| Engine latency per token | 50.7 ms | 48.0 ms |
+
+**Window K/V** (sliding owners store only their window, 8K context):
+
+| | Full pages | Window pages |
+| --- | --- | --- |
+| K/V bytes per token past the window | 18,432 | 6,144 |
+| State, 1 sequence | 151 MB | 56.8 MB |
+| State, 4 sequences | 604 MB | 227 MB |
+| Decode, 1 / 4 seq | 18.2–18.8 / 37.4–43.9 | 18.2–19.2 / 39.4–44.5 |
+| Prefill, 2,048 tokens | 301–334 | 345–354 |
+
+**Sliding-layer attention** (8 heads, one K/V head of 256, 512-key window): the tiled
+kernel takes 13.0 ms against the per-query kernel's 20.1 ms at 2,048 queries over F16,
+and loses below 256 queries, so ungated passes tile from 64 threadgroups. End-to-end
+prefill moves within noise: projections dominate E2B prefill.
+
+**Speculative decoding** (96 greedy tokens, two repeats, output tok/s):
+
+| Prompt | Seqs | Ordinary | Lookup (4 drafts) | Lookup + assistant |
+| --- | --- | --- | --- | --- |
+| Novel prose | 1 | 20.0–20.3 | 19.7–20.0 | 28.5–28.9 |
+| | 4 | 48.6–48.8 | 45.6–46.7 | 58.9–61.1 |
+| Code | 1 | 19.9–20.1 | 20.1–20.5 | 23.3–26.1 |
+| | 4 | 47.7–48.1 | 46.5–47.3 | 64.1–65.4 |
+| Repetitive | 1 | 19.4–19.6 | 64.3–65.0 | 58.7–61.2 |
+| | 4 | 43.7–45.2 | 99.4–110.3 | 111.4–113.2 |
+
+The assistant (`--draft-model google/gemma-4-E2B-it-assistant`) drafts one token per
+pass, 63–66% accepted, at about 2.9 ms each. All 36 runs reproduced ordinary decoding's
+token IDs.
+
+**Loading:**
+
+| Weights | Load time | Resident weights | Peak RSS |
+| --- | --- | --- | --- |
+| Q8_0, converted at load | 11.1–12.3 s | 7.93 GB | 2.2–2.7 GB |
+| Q8_0 artifact (`tur quantize --method rtn`) | 4.8–5.5 s | 7.12 GB | 3.2 GB |
+
+The artifact gathers embeddings from its packed LM head (`--embedding head`), which saves
+the 805 MB BF16 embedding table. 4.4 GiB of either is the BF16 per-layer embedding.
 
 ## Quality of weight formats
 

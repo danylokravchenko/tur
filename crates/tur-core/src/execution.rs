@@ -33,6 +33,9 @@ pub enum LayerStateKind {
     Attention {
         kv_heads: usize,
         head_dim: usize,
+        /// Most recent keys any later query or draft of a sequence reads. A windowed layer
+        /// stores only the pages covering them, in the pool's window space.
+        window: Option<usize>,
     },
     Recurrent {
         conv_channels: usize,
@@ -49,7 +52,8 @@ pub enum LayerStateKind {
 
 /// Version of the paged K/V memory layout. Bump when page, scale or code layouts change, so
 /// checkpoints and persisted prefixes from another layout are rejected rather than misread.
-pub const KV_LAYOUT_VERSION: u32 = 1;
+/// 2: windowed attention layers keep only their recent pages, in a separate space.
+pub const KV_LAYOUT_VERSION: u32 = 2;
 
 /// Storage format of attention keys and values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -195,10 +199,23 @@ fn state_dtype_bytes(dtype: DType) -> Result<usize> {
 }
 
 impl LayerStateKind {
+    /// Whether this is a windowed attention layer.
+    pub fn windowed(&self) -> bool {
+        matches!(
+            self,
+            Self::Attention {
+                window: Some(_),
+                ..
+            }
+        )
+    }
+
     /// K plus V bytes for one token in `format`, including scales; zero for recurrent layers.
     pub fn attention_token_bytes(&self, format: KvFormat) -> Result<usize> {
         match *self {
-            Self::Attention { kv_heads, head_dim } => format
+            Self::Attention {
+                kv_heads, head_dim, ..
+            } => format
                 .token_bytes(kv_heads, head_dim)?
                 .checked_mul(2)
                 .ok_or_else(|| invalid("K/V token size overflow")),
@@ -228,21 +245,65 @@ impl LayerStateKind {
 }
 
 impl ModelDescription {
-    /// K/V payload of one token summed over attention layers:
+    /// K/V payload of one token summed over full (unwindowed) attention layers:
     /// `2 × kv_heads × head_dim × element bytes` plus scales. Recurrent layers add nothing.
     pub fn kv_token_bytes(&self) -> Result<usize> {
-        self.layers.iter().try_fold(0usize, |total, kind| {
-            total
-                .checked_add(kind.attention_token_bytes(self.kv.format)?)
-                .ok_or_else(|| invalid("K/V token size overflow"))
-        })
+        self.token_bytes(false)
     }
 
-    /// Bytes of one page across every attention layer.
+    /// K/V payload of one token summed over windowed attention layers.
+    pub fn window_token_bytes(&self) -> Result<usize> {
+        self.token_bytes(true)
+    }
+
+    fn token_bytes(&self, windowed: bool) -> Result<usize> {
+        self.layers
+            .iter()
+            .filter(|kind| kind.windowed() == windowed)
+            .try_fold(0usize, |total, kind| {
+                total
+                    .checked_add(kind.attention_token_bytes(self.kv.format)?)
+                    .ok_or_else(|| invalid("K/V token size overflow"))
+            })
+    }
+
+    /// Bytes of one page across every full attention layer.
     pub fn page_bytes(&self) -> Result<usize> {
         self.kv_token_bytes()?
             .checked_mul(self.kv.page_tokens)
             .ok_or_else(|| invalid("page size overflow"))
+    }
+
+    /// Bytes of one window page across every windowed attention layer.
+    pub fn window_page_bytes(&self) -> Result<usize> {
+        self.window_token_bytes()?
+            .checked_mul(self.kv.page_tokens)
+            .ok_or_else(|| invalid("page size overflow"))
+    }
+
+    /// The window shared by every windowed attention layer, if any layer is windowed.
+    pub fn window(&self) -> Option<usize> {
+        self.layers.iter().find_map(|kind| match kind {
+            LayerStateKind::Attention { window, .. } => *window,
+            LayerStateKind::Recurrent { .. } => None,
+        })
+    }
+
+    /// First logical page a windowed layer still needs at `position`: later queries and
+    /// drafts read only keys from `position - window` on.
+    pub fn first_window_page(&self, position: usize) -> usize {
+        self.window().map_or(0, |window| {
+            position.saturating_sub(window) / self.kv.page_tokens.max(1)
+        })
+    }
+
+    /// Window pages a sequence at `position` holds.
+    pub fn window_pages_for(&self, position: usize) -> usize {
+        if self.window().is_some() {
+            self.pages_for(position) - self.first_window_page(position)
+        } else {
+            0
+        }
     }
 
     /// Convolution histories plus recurrent matrices of every recurrent layer at one boundary.
@@ -252,6 +313,13 @@ impl ModelDescription {
                 .checked_add(kind.recurrent_boundary_bytes()?)
                 .ok_or_else(|| invalid("recurrent slot size overflow"))
         })
+    }
+
+    /// Whether any layer keeps full (unwindowed) paged attention state.
+    pub fn has_full_attention(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|kind| matches!(kind, LayerStateKind::Attention { window: None, .. }))
     }
 
     /// Whether any layer keeps paged attention state.
@@ -277,21 +345,35 @@ impl ModelDescription {
         }
     }
 
-    /// Resident state of one sequence at a token boundary: whole pages plus one recurrent
-    /// slot, excluding allocator and grammar overhead.
+    /// Resident state of one sequence at a token boundary: whole pages, the window pages
+    /// still read, plus one recurrent slot, excluding allocator and grammar overhead.
     pub fn state_payload_bytes(&self, position: usize) -> Result<usize> {
         if position > self.max_position {
             return Err(invalid("state position exceeds model limit"));
         }
-        self.pages_for(position)
+        self.full_pages_for(position)
             .checked_mul(self.page_bytes()?)
+            .zip(
+                self.window_pages_for(position)
+                    .checked_mul(self.window_page_bytes()?),
+            )
+            .and_then(|(p, w)| p.checked_add(w))
             .and_then(|b| b.checked_add(self.recurrent_slot_bytes().ok()?))
             .ok_or_else(|| invalid("model payload overflow"))
     }
 
-    /// Pool memory one pass reserves for `tokens` new tokens after `start`: the pages it
-    /// opens plus `boundaries` recurrent slots (1 ordinarily, `tokens` for speculation).
-    /// A copy-on-write tail page, when needed, adds one page.
+    /// Full-attention pages holding `positions` tokens; zero without such layers.
+    pub fn full_pages_for(&self, positions: usize) -> usize {
+        if self.has_full_attention() {
+            self.pages_for(positions)
+        } else {
+            0
+        }
+    }
+
+    /// Pool memory one pass reserves for `tokens` new tokens after `start`: the pages and
+    /// window pages it opens plus `boundaries` recurrent slots (1 ordinarily, `tokens` for
+    /// speculation). A copy-on-write tail page, when needed, adds one page.
     pub fn state_update_bytes(
         &self,
         start: usize,
@@ -301,12 +383,15 @@ impl ModelDescription {
         let end = start
             .checked_add(tokens)
             .ok_or_else(|| invalid("position overflow"))?;
-        let pages = self.pages_for(end) - self.pages_for(start);
+        let opened = self.pages_for(end) - self.pages_for(start);
+        let pages = if self.has_full_attention() { opened } else { 0 };
+        let windows = if self.window().is_some() { opened } else { 0 };
         let slots = if self.has_recurrent() { boundaries } else { 0 };
         pages
             .checked_mul(self.page_bytes()?)
+            .zip(windows.checked_mul(self.window_page_bytes()?))
             .zip(slots.checked_mul(self.recurrent_slot_bytes()?))
-            .and_then(|(p, s)| p.checked_add(s))
+            .and_then(|((p, w), s)| p.checked_add(w)?.checked_add(s))
             .ok_or_else(|| invalid("model update overflow"))
     }
 
@@ -334,10 +419,19 @@ impl ModelDescription {
         self.vocab_size
             .checked_mul(4)
             .ok_or_else(|| invalid("logits byte size overflow"))?;
+        let window = self.window();
         for kind in &self.layers {
-            if let LayerStateKind::Attention { kv_heads, head_dim } = *kind {
+            if let LayerStateKind::Attention {
+                kv_heads,
+                head_dim,
+                window: layer_window,
+            } = *kind
+            {
                 checked_elements(&[kv_heads, head_dim])?;
                 self.kv.format.validate(head_dim)?;
+                if layer_window.is_some_and(|w| w == 0 || Some(w) != window) {
+                    return Err(invalid("windowed layers must share one non-zero window"));
+                }
             }
             kind.attention_token_bytes(self.kv.format)?;
             kind.recurrent_boundary_bytes()?;
@@ -543,7 +637,11 @@ mod tests {
     use super::*;
 
     fn attention(kv_heads: usize, head_dim: usize) -> LayerStateKind {
-        LayerStateKind::Attention { kv_heads, head_dim }
+        LayerStateKind::Attention {
+            kv_heads,
+            head_dim,
+            window: None,
+        }
     }
 
     fn recurrent() -> LayerStateKind {

@@ -143,6 +143,18 @@ struct TiledParams {
     gate_col: u32,
     gate_head_stride: u32,
     scale: f32,
+    window: u32,
+    ungated: u32,
+}
+
+/// Output and score semantics of one tiled dispatch: the gate's head layout (unread when
+/// `ungated`), the score scale and the sliding window (0 for none).
+#[derive(Clone, Copy)]
+struct TileShape {
+    gate: Heads,
+    ungated: bool,
+    scale: f32,
+    window: u32,
 }
 
 /// Query tokens per tile (8 rows per simdgroup), key block and staged dimensions of the
@@ -1336,11 +1348,19 @@ impl Kernels {
 
     /// Whether a pass with `kv` addressing and `heads` query heads runs the tiled kernel.
     pub fn attention_tiled(&self, kv: &PagedKv, heads: usize, dim: usize) -> bool {
+        self.tiles_fill(kv, heads, dim, self.tuning.attention_tiled_groups)
+    }
+
+    /// [`Self::attention_tiled`] for ungated attention, at its own crossover.
+    pub fn attention_tiled_ungated(&self, kv: &PagedKv, heads: usize, dim: usize) -> bool {
+        self.tiles_fill(kv, heads, dim, self.tuning.attention_tiled_ungated_groups)
+    }
+
+    fn tiles_fill(&self, kv: &PagedKv, heads: usize, dim: usize, groups: usize) -> bool {
         kv.tiles().is_some_and(|tiles| {
-            tiles.saturating_mul(heads) >= self.tuning.attention_tiled_groups
+            tiles.saturating_mul(heads) >= groups
                 // Sparse query tiles waste matrix work and lose split-K parallelism.
-                && (self.tuning.attention_tiled_groups == 0
-                    || kv.tokens >= tiles.saturating_mul(TILE_QUERIES / 2))
+                && (groups == 0 || kv.tokens >= tiles.saturating_mul(TILE_QUERIES / 2))
                 && matches!(dim, 64 | 128 | 256)
                 && self.capabilities().max_threads_per_threadgroup >= TILE_THREADS
                 && Self::tiled_memory_bytes() <= self.capabilities().threadgroup_memory_bytes
@@ -1579,13 +1599,26 @@ impl Kernels {
         if gv.rows != tokens || gate.col_offset + (heads - 1) * gate.head_stride + dim > gv.cols {
             return Err(invalid("attention gate exceeds its projection"));
         }
-        if output_gate.is_some() && self.attention_tiled(kv, heads, dim) {
+        let scale = scale.unwrap_or_else(|| (dim as f64).sqrt().recip()) as f32;
+        let window = to_u32(window.unwrap_or(0), "attention window")?;
+        let tiled = if output_gate.is_some() {
+            self.attention_tiled(kv, heads, dim)
+        } else {
+            self.attention_tiled_ungated(kv, heads, dim)
+        };
+        if tiled {
+            let shape = TileShape {
+                gate,
+                ungated: output_gate.is_none(),
+                scale,
+                window,
+            };
             return self.attention_tiles(
                 &qv,
                 pool,
                 kv,
                 &gv,
-                gate,
+                shape,
                 (k_data, k_scales),
                 (v_data, v_scales),
             );
@@ -1602,7 +1635,10 @@ impl Kernels {
         let visible = self.runtime.view(&kv.visible, DType::U32)?;
         // Splits fill the GPU with simdgroups, each serving `hg` heads.
         // A query reads at most `window` keys, starting at its window's first key.
-        let span = window.map_or(kv.max_visible, |w| w.min(kv.max_visible));
+        let span = match window {
+            0 => kv.max_visible,
+            w => kv.max_visible.min(w as usize),
+        };
         let split = self.attention_split(tokens, heads / hg, span);
         let params = AttentionParams {
             tokens: to_u32(tokens, "tokens")?,
@@ -1616,8 +1652,8 @@ impl Kernels {
             gate_col: to_u32(gate.col_offset, "gate column")?,
             gate_head_stride: to_u32(gate.head_stride, "gate head stride")?,
             group: to_u32(pool.format.group().unwrap_or(32), "group")?,
-            scale: scale.unwrap_or_else(|| (dim as f64).sqrt().recip()) as f32,
-            window: to_u32(window.unwrap_or(0), "attention window")?,
+            scale,
+            window,
             ungated: u32::from(output_gate.is_none()),
         };
         let items = tokens * heads;
@@ -1678,10 +1714,11 @@ impl Kernels {
         pool: &AttentionPool,
         kv: &PagedKv,
         gv: &View<'_>,
-        gate: Heads,
+        shape: TileShape,
         (k_data, k_scales): (View<'_>, Option<View<'_>>),
         (v_data, v_scales): (View<'_>, Option<View<'_>>),
     ) -> Result<Tensor> {
+        let gate = shape.gate;
         let (tiles, count) = kv
             .tiles
             .as_ref()
@@ -1696,7 +1733,9 @@ impl Kernels {
             gate_stride: to_u32(gv.row_stride, "gate stride")?,
             gate_col: to_u32(gate.col_offset, "gate column")?,
             gate_head_stride: to_u32(gate.head_stride, "gate head stride")?,
-            scale: (dim as f64).sqrt().recip() as f32,
+            scale: shape.scale,
+            window: shape.window,
+            ungated: u32::from(shape.ungated),
         };
         let pipeline = self.pipeline(&Self::kv_kernel("attention_tiled", dim, pool.format)?)?;
         if pipeline.threads(TILE_THREADS) != TILE_THREADS {

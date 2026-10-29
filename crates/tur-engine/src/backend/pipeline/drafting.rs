@@ -164,10 +164,8 @@ impl InferencePipeline {
             let mut count = count;
             while count > 0 {
                 let verify = self.engine.demand(pending.handle, count + 1, true)?;
-                let needed = Demand {
-                    pages: demand.pages - plain[index].pages + verify.pages,
-                    slots: demand.slots - plain[index].slots + verify.slots,
-                };
+                // The verified draft replaces this sequence's plain demand.
+                let needed = demand - plain[index] + verify;
                 if needed.fits(&usage) {
                     demand = needed;
                     break;

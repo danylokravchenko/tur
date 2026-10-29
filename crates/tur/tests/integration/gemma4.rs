@@ -47,6 +47,7 @@ fn pool(model: &Gemma4) -> Result<StatePool> {
         model.device(),
         PoolConfig {
             pages: 256,
+            window_pages: 256,
             recurrent_slots: 1,
         },
     )
@@ -249,6 +250,7 @@ fn test_gemma4_e2b_checkpoint_logits_match_transformers() -> Result<()> {
         model.device().clone(),
         PoolConfig {
             pages: 64,
+            window_pages: 64,
             recurrent_slots: 1,
         },
         &tokens,
@@ -327,5 +329,279 @@ fn test_gemma4_chat_template_matches_pinned_transformers_bytes() -> Result<()> {
             case["name"]
         );
     }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "metal")]
+fn test_gemma4_prepacked_artifacts_match_load_time_conversion_exactly() -> Result<()> {
+    use tur_models::models::{
+        Conversion, Manifest, Method, Packer, WeightPlan, Weights, gemma4::write_artifact,
+    };
+    let device = Device::new_metal(0)?;
+    for kind in ["dense", "moe", "unified"] {
+        let source = fixture(kind);
+        let config = Config::from_json(&std::fs::read_to_string(source.join("config.json"))?)?;
+        let golden =
+            candle_core::safetensors::load(source.join("golden.safetensors"), &Device::Cpu)?;
+        let tokens = golden
+            .get("tokens")
+            .ok_or_else(|| invalid("missing tokens"))?
+            .to_dtype(DType::U32)?
+            .flatten_all()?
+            .to_vec1::<u32>()?;
+        let requested: Vec<usize> = (0..tokens.len()).collect();
+        for format in [WeightFormat::F32, WeightFormat::Q8_0] {
+            let output = common::Checkpoint(
+                std::env::temp_dir().join(format!("tur-gemma4-{kind}-{}", uuid::Uuid::new_v4())),
+            );
+            let conversion = Conversion {
+                source: &source,
+                identity: "gemma4-fixture@0",
+                output: &output.0,
+                calibration: "",
+            };
+            let plan = WeightPlan::uniform(&config, format)?;
+            let manifest = write_artifact(&conversion, &plan, &Packer::RTN)?;
+            assert_eq!(Manifest::read(&output.0)?, manifest);
+            let converted = Gemma4::load(
+                &source,
+                &options(device.clone(), Execution::Fused, format, KvFormat::F16),
+            )?;
+            let stored = Gemma4::load(
+                &output.0,
+                &LoadOptions {
+                    weights: Weights::Prepacked(Arc::new(manifest)),
+                    ..options(device.clone(), Execution::Fused, format, KvFormat::F16)
+                },
+            )?;
+            assert_eq!(stored.weight_bytes(), converted.weight_bytes());
+            let (_, expected) = converted.trace(&tokens, &requested)?;
+            let (_, actual) = stored.trace(&tokens, &requested)?;
+            assert_eq!(rows(&actual)?, rows(&expected)?, "{kind} {format:?}");
+            // An artifact directory only loads as prepacked weights.
+            assert!(
+                Gemma4::load(
+                    &output.0,
+                    &options(device.clone(), Execution::Fused, format, KvFormat::F16)
+                )
+                .is_err()
+            );
+        }
+        let calibrated = Packer {
+            method: Method::Gptq,
+            ..Packer::RTN
+        };
+        let output = common::Checkpoint(
+            std::env::temp_dir().join(format!("tur-gemma4-{kind}-{}", uuid::Uuid::new_v4())),
+        );
+        let conversion = Conversion {
+            source: &source,
+            identity: "gemma4-fixture@0",
+            output: &output.0,
+            calibration: "",
+        };
+        let plan = WeightPlan::uniform(&config, WeightFormat::Q8_0)?;
+        assert!(write_artifact(&conversion, &plan, &calibrated).is_err());
+    }
+    Ok(())
+}
+
+/// Teacher-forced assistant drafts over the dense target: the target's final hidden state
+/// at `p` and the token at `p + 1` draft the token after, against Transformers.
+#[cfg(feature = "metal")]
+fn assistant_drafts(device: &Device, execution: Execution) -> Result<()> {
+    use tur_models::hybrid::{DraftForward, DraftSequence, PackedForward, SequenceForward};
+    use tur_models::models::DraftHead;
+    let golden = candle_core::safetensors::load(
+        fixture("assistant").join("golden.safetensors"),
+        &Device::Cpu,
+    )?;
+    let get = |name: &str| {
+        golden
+            .get(name)
+            .ok_or_else(|| invalid(format!("missing {name}")))
+    };
+    let tokens = get("tokens")?.to_dtype(DType::U32)?.to_vec1::<u32>()?;
+    let expected = rows(get("logits")?)?;
+    let model = Gemma4::load(
+        &fixture("dense"),
+        &LoadOptions {
+            mtp: Some(DraftHead {
+                vocab: None,
+                model: Some(fixture("assistant")),
+            }),
+            ..options(device.clone(), execution, WeightFormat::F32, KvFormat::F32)
+        },
+    )?;
+    let pool = pool(&model)?;
+    // Decode one token at a time and draft at each committed end, as the engine does: a
+    // committed state no longer holds window pages behind its window.
+    let mut state = ModelState::new(&pool);
+    for (p, expected) in expected.iter().enumerate() {
+        let mut reservation = state.reserve(1, Boundaries::Final)?;
+        reservation.prepare()?;
+        let binding = reservation.binding();
+        let step = model
+            .forward(&PackedForward {
+                tokens: &tokens[p..=p],
+                positions: &[p],
+                sequences: &[SequenceForward {
+                    tokens: 0..1,
+                    state: &binding,
+                    logits: &[],
+                    hidden: true,
+                }],
+                pool: &pool,
+            })?
+            .pop()
+            .ok_or_else(|| invalid("missing step"))??;
+        let hidden = step
+            .hidden
+            .ok_or_else(|| invalid("missing hidden states"))?;
+        state = reservation.commit(1)?;
+        drop(reservation);
+        let side = state.side(p, 1)?;
+        let drafted = model
+            .draft(&DraftForward {
+                tokens: &tokens[p + 1..p + 2],
+                positions: &[p],
+                sequences: &[DraftSequence {
+                    tokens: 0..1,
+                    state: &side,
+                    hidden: &hidden,
+                    logits: true,
+                }],
+                pool: &pool,
+            })?
+            .pop()
+            .ok_or_else(|| invalid("missing draft"))??
+            .ok_or_else(|| invalid("draft returned no logits"))?;
+        let actual = rows(&drafted)?;
+        let actual = actual.first().ok_or_else(|| invalid("empty draft"))?;
+        let masked = |row: &[f32]| row.iter().map(|v| v.is_finite()).collect::<Vec<_>>();
+        assert_eq!(masked(actual), masked(expected), "position {p} candidates");
+        let finite = |row: &[f32]| {
+            row.iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .collect::<Vec<_>>()
+        };
+        let error = max_relative(&[finite(actual)], &[finite(expected)]);
+        assert!(error < 1e-4, "{execution:?} position {p}: {error}");
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "metal")]
+fn test_gemma4_assistant_drafts_match_transformers_on_metal_and_cpu() -> Result<()> {
+    assistant_drafts(&Device::new_metal(0)?, Execution::Fused)?;
+    assistant_drafts(&Device::Cpu, Execution::Reference)
+}
+
+#[test]
+#[ignore = "requires pinned Gemma 4 E2B and assistant checkpoints and a Transformers golden"]
+#[cfg(feature = "metal")]
+fn test_gemma4_e2b_assistant_drafts_agree_with_transformers_past_the_window() -> Result<()> {
+    use tur_models::hybrid::{DraftForward, DraftSequence, PackedForward, SequenceForward};
+    use tur_models::models::DraftHead;
+    let required = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .ok_or_else(|| invalid(format!("set {name}")))
+    };
+    let golden =
+        candle_core::safetensors::load(required("TUR_GEMMA4_ASSISTANT_GOLDEN")?, &Device::Cpu)?;
+    let get = |name: &str| {
+        golden
+            .get(name)
+            .ok_or_else(|| invalid(format!("missing {name}")))
+    };
+    let tokens = get("tokens")?.to_dtype(DType::U32)?.to_vec1::<u32>()?;
+    let positions = get("positions")?.to_dtype(DType::U32)?.to_vec1::<u32>()?;
+    let expected = get("logits")?.argmax(1)?.to_vec1::<u32>()?;
+    let model = Gemma4::load(
+        &required("TUR_GEMMA4_E2B")?,
+        &LoadOptions {
+            mtp: Some(DraftHead {
+                vocab: None,
+                model: Some(required("TUR_GEMMA4_ASSISTANT")?),
+            }),
+            ..options(
+                Device::new_metal(0)?,
+                Execution::Fused,
+                WeightFormat::Q8_0,
+                KvFormat::F16,
+            )
+        },
+    )?;
+    let pool = pool(&model)?;
+    let mut state = ModelState::new(&pool);
+    let mut actual = Vec::with_capacity(positions.len());
+    // Prefill up to each reference position and draft at that committed end.
+    for &p in &positions {
+        let p = p as usize;
+        let piece = &tokens[state.position()..=p];
+        let mut reservation = state.reserve(piece.len(), Boundaries::Final)?;
+        reservation.prepare()?;
+        let binding = reservation.binding();
+        let packed: Vec<usize> = (state.position()..=p).collect();
+        let step = model
+            .forward(&PackedForward {
+                tokens: piece,
+                positions: &packed,
+                sequences: &[SequenceForward {
+                    tokens: 0..piece.len(),
+                    state: &binding,
+                    logits: &[],
+                    hidden: true,
+                }],
+                pool: &pool,
+            })?
+            .pop()
+            .ok_or_else(|| invalid("missing step"))??;
+        let hidden = step
+            .hidden
+            .ok_or_else(|| invalid("missing hidden states"))?;
+        state = reservation.commit(piece.len())?;
+        drop(reservation);
+        let side = state.side(p, 1)?;
+        let drafted = model
+            .draft(&DraftForward {
+                tokens: &tokens[p + 1..p + 2],
+                positions: &[p],
+                sequences: &[DraftSequence {
+                    tokens: 0..1,
+                    state: &side,
+                    hidden: &hidden.narrow(0, piece.len() - 1, 1)?,
+                    logits: true,
+                }],
+                pool: &pool,
+            })?
+            .pop()
+            .ok_or_else(|| invalid("missing draft"))??
+            .ok_or_else(|| invalid("draft returned no logits"))?;
+        actual.push(
+            drafted
+                .argmax(1)?
+                .to_device(&Device::Cpu)?
+                .to_vec1::<u32>()?[0],
+        );
+        model.device().synchronize()?;
+        pool.reclaim();
+    }
+    let agreement =
+        actual.iter().zip(&expected).filter(|(a, b)| a == b).count() as f64 / expected.len() as f64;
+    // A Q8_0 target and F32 reference differ in hidden states, so drafts are judged by
+    // agreement; the offline fixture gates the drafter's equations at 1e-4.
+    assert!(
+        agreement >= 0.9,
+        "assistant draft agreement {agreement}; actual {actual:?}; expected {expected:?}"
+    );
+    assert!(
+        state.window_count() < state.page_count(),
+        "a prompt past the window releases sliding pages"
+    );
     Ok(())
 }

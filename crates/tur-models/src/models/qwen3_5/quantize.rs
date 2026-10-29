@@ -1,56 +1,13 @@
 //! Offline weight preparation: calibrated packing, prepacked artifact writing, per-projection
 //! sensitivity and precision allocation under a byte budget. Nothing here runs while serving.
 
-use super::{
-    Qwen35,
-    artifact::{self, CalibrationInfo, Manifest, Quantizer, Writer},
-    config::Config,
-    model::streaming::calibrate_layers,
-};
-use crate::models::checkpoint::Checkpoint;
-use crate::models::{Embedding, Method, Packer, Precision, Projection, STAGING_BYTES, WeightPlan};
-use candle_core::{D, DType, Device, Tensor};
+use super::{Qwen35, config::Config, model::streaming::calibrate_layers};
+use crate::models::artifact::{self, Conversion, Manifest, Writer};
+use crate::models::{Embedding, Method, Packer, Precision, WeightPlan};
+use candle_core::{D, Device, Tensor};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 use tur_core::{Result, execution::invalid};
-
-impl Packer<'_> {
-    fn write(
-        &self,
-        checkpoint: &Checkpoint,
-        projection: &Projection,
-        precision: Precision,
-        writer: &mut Writer,
-    ) -> Result<()> {
-        let (dtype, shape) = match precision.ggml() {
-            Some(_) => (
-                safetensors::Dtype::U8,
-                vec![projection.rows, precision.bytes(1, projection.cols)?],
-            ),
-            None => (
-                safetensors::Dtype::F32,
-                vec![projection.rows, projection.cols],
-            ),
-        };
-        writer.put_stream(&projection.name, dtype, shape, |out| {
-            self.pack_chunks(checkpoint, projection, precision, |bytes| {
-                Ok(out.write_all(bytes)?)
-            })
-        })
-    }
-}
-
-/// Source and destination of one artifact conversion.
-pub struct Conversion<'a> {
-    /// Source `SafeTensors` checkpoint directory.
-    pub source: &'a Path,
-    /// Exact identity of the source checkpoint (repository and commit).
-    pub identity: &'a str,
-    /// New artifact directory.
-    pub output: &'a Path,
-    /// Free-form description of the calibration data.
-    pub calibration: &'a str,
-}
 
 /// The source config with its MTP head when the checkpoint has one, so an artifact can
 /// serve speculative decoding too.
@@ -71,18 +28,8 @@ pub fn write_artifact(
     packer: &Packer<'_>,
 ) -> Result<Manifest> {
     let config = artifact_config(conversion.source)?;
-    plan.validate(&config)?;
     let checkpoint = config.open_checkpoint(conversion.source)?;
-    let mut writer = Writer::create(conversion.source, conversion.output)?;
-    for projection in config.projections()? {
-        packer.write(
-            &checkpoint,
-            &projection,
-            plan.precision(&projection.name)?,
-            &mut writer,
-        )?;
-    }
-    finish_artifact(conversion, &config, plan, packer, &checkpoint, writer)
+    artifact::write(conversion, &config, &checkpoint, plan, packer)
 }
 
 /// Calibrate and pack one F32 layer at a time. Hidden states are spooled in temporary
@@ -143,90 +90,7 @@ pub fn write_calibrated_artifact(
         calibration: Some(&info),
         ..*packer
     };
-    finish_artifact(conversion, &config, plan, &packer, &checkpoint, writer)
-}
-
-fn finish_artifact(
-    conversion: &Conversion<'_>,
-    config: &Config,
-    plan: &WeightPlan,
-    packer: &Packer<'_>,
-    checkpoint: &Checkpoint,
-    mut writer: Writer,
-) -> Result<Manifest> {
-    let parts: std::collections::BTreeSet<_> = config
-        .projections()?
-        .into_iter()
-        .flat_map(|p| p.parts.into_iter().map(|(name, _)| name))
-        .collect();
-    let embedding = config.embedding_name();
-    if let Embedding::Table(precision) = plan.embedding {
-        let table = Projection {
-            name: embedding.clone(),
-            parts: vec![(embedding.clone(), config.vocab_size())],
-            rows: config.vocab_size(),
-            cols: config.hidden_size(),
-            experts: 1,
-        };
-        if precision == Precision::Bf16 {
-            writer.put_stream(
-                &embedding,
-                safetensors::Dtype::BF16,
-                vec![table.rows, table.cols],
-                |out| {
-                    for rows in checkpoint
-                        .take_rows(&embedding, (STAGING_BYTES / (table.cols * 4)).max(1))?
-                    {
-                        out.write_all(&bf16_bytes(&rows?.to_dtype(DType::BF16)?)?)?;
-                    }
-                    Ok(())
-                },
-            )?;
-        } else {
-            Packer::RTN.write(checkpoint, &table, precision, &mut writer)?;
-        }
-    }
-    for name in config.weight_shapes()?.into_keys() {
-        if parts.contains(&name) || name == embedding {
-            continue;
-        }
-        let (entry, bytes) = checkpoint.take_raw(&name)?;
-        writer.put(&name, entry.dtype, entry.shape, &bytes)?;
-    }
-    let manifest = Manifest {
-        format_version: artifact::FORMAT_VERSION,
-        source: conversion.identity.to_owned(),
-        config_fingerprint: artifact::source_fingerprint(conversion.source)?,
-        quantizer: Quantizer {
-            name: "tur-quantize".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
-            method: packer.method,
-            damp: packer.damp,
-        },
-        calibration: packer.calibration.map(|c| CalibrationInfo {
-            samples: c.samples,
-            tokens: c.tokens,
-            fingerprint: format!("{:016x}", c.fingerprint),
-            description: conversion.calibration.to_owned(),
-        }),
-        plan: plan.clone(),
-    };
-    writer.finish(&manifest, config)?;
-    Ok(manifest)
-}
-
-/// Little-endian BF16 bits of a BF16 tensor, via its raw host storage.
-fn bf16_bytes(tensor: &Tensor) -> Result<Vec<u8>> {
-    let tensor = tensor.to_device(&Device::Cpu)?.contiguous()?;
-    let (storage, layout) = tensor.storage_and_layout();
-    match &*storage {
-        candle_core::Storage::Cpu(candle_core::CpuStorage::BF16(values)) => Ok(values
-            [layout.start_offset()..layout.start_offset() + tensor.elem_count()]
-            .iter()
-            .flat_map(|v| v.to_bits().to_le_bytes())
-            .collect()),
-        _ => Err(invalid("expected a host BF16 tensor")),
-    }
+    artifact::finish(conversion, &config, plan, &packer, &checkpoint, writer)
 }
 
 /// Teacher-forced next-token log-probabilities of an F32 model over fixed samples.
@@ -396,6 +260,7 @@ pub fn allocate(
 )]
 mod tests {
     use super::*;
+    use crate::models::Projection;
 
     const SMALL: &str =
         include_str!("../../../../tur/tests/fixtures/checkpoints/small-config.json");

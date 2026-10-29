@@ -2,4 +2,4 @@
 mod config;
 mod model;
 pub use config::Config;
-pub use model::Gemma4;
+pub use model::{Gemma4, write_artifact};

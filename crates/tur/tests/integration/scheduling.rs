@@ -145,7 +145,7 @@ fn budgeted(
     config: PipelineConfig,
     pages: usize,
 ) -> Result<InferencePipeline> {
-    let usage = InferencePipeline::new(&fixture.factory(), config)?.memory()?;
+    let usage = InferencePipeline::new(&fixture.factory(), config.clone())?.memory()?;
     let budget =
         (2 * config.scheduler.max_running + 1) * usage.slot_bytes + pages * usage.page_bytes;
     let mut pipeline = InferencePipeline::new(
@@ -337,18 +337,18 @@ fn test_loaded_models_share_a_budget_and_failed_loads_return_reservations() -> R
     use tur::backend::memory::DeviceBudget;
     let fixture = Checkpoint::new()?;
     let mut config = PipelineConfig::new(1, 16);
-    let probe = InferencePipeline::new(&fixture.factory(), config)?;
+    let probe = InferencePipeline::new(&fixture.factory(), config.clone())?;
     config.state_bytes = Some(probe.memory_plan().state_pool);
     let budget = DeviceBudget::new(Some(probe.memory_plan().resident() * 3));
     drop(probe);
-    let first = InferencePipeline::with_budget(&fixture.factory(), config, &budget)?;
-    let second = InferencePipeline::with_budget(&fixture.factory(), config, &budget)?;
+    let first = InferencePipeline::with_budget(&fixture.factory(), config.clone(), &budget)?;
+    let second = InferencePipeline::with_budget(&fixture.factory(), config.clone(), &budget)?;
     assert_eq!(
         budget.leased(),
         first.memory_plan().resident() + second.memory_plan().resident()
     );
     assert!(matches!(
-        InferencePipeline::with_budget(&fixture.factory(), config, &budget),
+        InferencePipeline::with_budget(&fixture.factory(), config.clone(), &budget),
         Err(TurError::MemoryAllocation(_))
     ));
     drop(first);
@@ -356,7 +356,7 @@ fn test_loaded_models_share_a_budget_and_failed_loads_return_reservations() -> R
     assert_eq!(budget.leased(), 0);
     // A failed weight load releases the reservation made before touching its payload.
     std::fs::write(fixture.0.join("model.safetensors"), [])?;
-    assert!(InferencePipeline::with_budget(&fixture.factory(), config, &budget).is_err());
+    assert!(InferencePipeline::with_budget(&fixture.factory(), config.clone(), &budget).is_err());
     assert_eq!(budget.leased(), 0);
     // With no budget, memory admission must win even over the corrupt weight file.
     let empty = DeviceBudget::new(Some(0));
@@ -397,7 +397,7 @@ fn test_f16_recompute_under_pressure_preserves_sampled_continuations() -> Result
             .collect::<Result<Vec<_>>>()?
     };
     let config = tight();
-    let usage = InferencePipeline::new(&factory, config)?.memory()?;
+    let usage = InferencePipeline::new(&factory, config.clone())?.memory()?;
     let bytes = (2 * config.scheduler.max_running + 1) * usage.slot_bytes + 4 * usage.page_bytes;
     let mut pipeline = InferencePipeline::new(
         &factory,

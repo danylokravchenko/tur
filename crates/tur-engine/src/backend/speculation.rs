@@ -32,7 +32,7 @@ const INDEX_WINDOW: usize = 8192;
 pub const MTP_VOCAB: usize = 32_768;
 
 /// Speculative decoding limits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpeculationConfig {
     /// Most drafted tokens per sequence and pass. Zero disables speculation.
     pub max_draft: usize,
@@ -74,10 +74,11 @@ impl SpeculationConfig {
 
     /// [`Self::new`] plus one-token drafts from the native multi-token prediction head,
     /// over the leading [`MTP_VOCAB`] token IDs.
-    pub const fn with_mtp(max_draft: usize) -> Self {
+    pub fn with_mtp(max_draft: usize) -> Self {
         Self {
             mtp: Some(DraftHead {
                 vocab: Some(MTP_VOCAB),
+                model: None,
             }),
             ..Self::new(max_draft)
         }

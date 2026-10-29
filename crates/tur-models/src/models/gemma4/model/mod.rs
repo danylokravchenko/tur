@@ -2,10 +2,12 @@
 use super::{Config, config::LayerKind};
 use crate::{
     hybrid::{
-        Addresses, Boundaries, HybridModel, PackedForward, SequenceForward, SequenceStep, StatePool,
+        Addresses, Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward,
+        SequenceForward, SequenceStep, StatePool,
     },
     models::{
-        Execution, LoadOptions, WeightPlan, Weights,
+        Execution, LoadOptions, Packer, WeightPlan, Weights,
+        artifact::{self, Conversion, Manifest},
         checkpoint::{Checkpoint, weight_files},
         math,
         weights::{Embeddings, Tensors, WeightLayout},
@@ -18,6 +20,7 @@ use tur_core::{
     execution::{ModelDescription, checked_elements, invalid},
 };
 use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
+mod assistant;
 mod moe;
 
 struct Layer {
@@ -57,6 +60,8 @@ pub struct Gemma4 {
     norm: Tensor,
     layers: Vec<Layer>,
     ple: Option<PerLayer>,
+    /// The published drafter, when loaded for speculative decoding.
+    assistant: Option<assistant::Assistant>,
     #[cfg(feature = "metal")]
     fused: Option<Fused>,
 }
@@ -75,13 +80,19 @@ struct Fused {
     one: Tensor,
 }
 
+/// The drafter checkpoint of a Gemma draft head: Gemma 4 has no head inside the target.
+fn assistant_dir(head: &crate::models::DraftHead) -> Result<&Path> {
+    if head.vocab.is_some() {
+        return Err(invalid(
+            "Gemma 4 assistants choose candidate tokens by cluster; omit the draft vocabulary",
+        ));
+    }
+    head.model
+        .as_deref()
+        .ok_or_else(|| invalid("Gemma 4 drafting needs an assistant checkpoint (--draft-model)"))
+}
+
 fn format_plan(config: &Config, options: &LoadOptions) -> Result<WeightPlan> {
-    if options.mtp.is_some() {
-        return Err(invalid("Gemma 4 native draft heads are not implemented"));
-    }
-    if matches!(options.weights, Weights::Prepacked(_)) {
-        return Err(invalid("Gemma 4 prepacked artifacts are not implemented"));
-    }
     #[cfg(feature = "metal")]
     if options.execution == Execution::Fused
         && options.device.is_metal()
@@ -162,6 +173,42 @@ impl Config {
     fn layers(&self) -> usize {
         self.text.num_hidden_layers
     }
+    /// The last layer of `kind` that owns its K/V: what sharing layers and the assistant read.
+    pub(super) fn last_owner(&self, kind: LayerKind) -> Option<usize> {
+        (0..self.layers())
+            .rev()
+            .find(|&i| self.owners[i] == i && self.text.layer_types[i] == kind)
+    }
+}
+
+impl artifact::ArtifactLayout for Config {
+    fn tensor_shapes(&self) -> Result<std::collections::BTreeMap<String, Vec<usize>>> {
+        self.weight_shapes()
+    }
+    fn embedding_tensor(&self) -> String {
+        format!("{}.embed_tokens.weight", self.prefix)
+    }
+}
+
+/// Pack the Gemma 4 checkpoint at `conversion.source` by `plan` and write a prepacked
+/// artifact, one tensor at a time. Per-layer embedding tables and norms are copied as
+/// stored; unused sharing-layer K/V and multimodal tensors are left out. Rounding is
+/// round-to-nearest: calibrated packing is not implemented for Gemma 4.
+pub fn write_artifact(
+    conversion: &Conversion<'_>,
+    plan: &WeightPlan,
+    packer: &Packer<'_>,
+) -> Result<Manifest> {
+    if packer.calibration.is_some() || packer.method != crate::models::Method::Rtn {
+        return Err(invalid(
+            "Gemma 4 artifacts support round-to-nearest packing only (--method rtn)",
+        ));
+    }
+    let config = Config::from_json(&std::fs::read_to_string(
+        conversion.source.join("config.json"),
+    )?)?;
+    let checkpoint = checkpoint(conversion.source, &config)?;
+    artifact::write(conversion, &config, &checkpoint, plan, packer)
 }
 impl Layer {
     fn load(t: &Tensors, c: &Config, i: usize) -> Result<Self> {
@@ -231,10 +278,26 @@ impl Gemma4 {
             )?;
         }
         let plan = format_plan(&config, options)?;
-        let checkpoint = checkpoint(dir, &config)?;
+        let (checkpoint, prepacked) = match &options.weights {
+            Weights::Prepacked(manifest) => {
+                let (checkpoint, found) = artifact::open_for(dir, &config)?;
+                if found != **manifest {
+                    return Err(invalid(
+                        "prepacked artifact changed after its load was planned",
+                    ));
+                }
+                (checkpoint, true)
+            }
+            _ if artifact::is_artifact(dir) => {
+                return Err(invalid(
+                    "directory holds a prepacked artifact; load it as Weights::Prepacked",
+                ));
+            }
+            _ => (checkpoint(dir, &config)?, false),
+        };
         let t = Tensors {
             checkpoint,
-            prepacked: false,
+            prepacked,
             plan,
             projections: config
                 .projection_layout()?
@@ -264,7 +327,7 @@ impl Gemma4 {
                     config.text.vocab_size_per_layer_input,
                     config.text.hidden_size_per_layer_input,
                     config.layers(),
-                    ple_dtype(&options.weights),
+                    ple_dtype(&config, &t.plan)?,
                 )?,
                 projection: t
                     .projection(&format!("{}.per_layer_model_projection", config.prefix))?,
@@ -279,6 +342,11 @@ impl Gemma4 {
         } else {
             None
         };
+        let assistant = options
+            .mtp
+            .as_ref()
+            .map(|head| assistant::Assistant::load(assistant_dir(head)?, &config, options))
+            .transpose()?;
         let (description, _, _) = Self::memory_requirements(&config, options, 1, &[1])?;
         Self {
             config,
@@ -289,6 +357,7 @@ impl Gemma4 {
             norm,
             layers,
             ple,
+            assistant,
             #[cfg(feature = "metal")]
             fused: None,
         }
@@ -404,6 +473,10 @@ impl Gemma4 {
             }
         }
         total
+            + self
+                .assistant
+                .as_ref()
+                .map_or(0, assistant::Assistant::bytes)
     }
 
     /// Plan packed weights, per-layer embedding storage and peak activations before loading.
@@ -425,12 +498,17 @@ impl Gemma4 {
             .collect();
         accounted.insert(format!("{}.embed_tokens.weight", config.prefix));
         let mut weights = plan.bytes(config)?;
+        if let Some(head) = &options.mtp {
+            weights = assistant::Assistant::planned_bytes(assistant_dir(head)?, config, options)?
+                .checked_add(weights)
+                .ok_or_else(|| invalid("Gemma 4 weight bytes overflow"))?;
+        }
         for (name, shape) in config.weight_shapes()? {
             if accounted.contains(&name) {
                 continue;
             }
             let dtype = if name.ends_with("embed_tokens_per_layer.weight") {
-                ple_dtype(&options.weights)
+                ple_dtype(config, &plan)?
             } else {
                 DType::F32
             };
@@ -566,21 +644,22 @@ impl Gemma4 {
             })
             .collect()
     }
-    /// Gated feed-forward update of one layer from residual `x` and its pre-norm `h`.
-    fn mlp(&self, l: &Layer, x: &Tensor, h: &Tensor) -> Result<Tensor> {
-        let gate_up = self.linear(&l.gate_up, h)?;
+    /// `gelu(gate) * up` over the halves of a fused `gate | up` projection.
+    fn gelu_product(&self, gate_up: &Tensor) -> Result<Tensor> {
         let width = gate_up.dim(1)? / 2;
         let (gate, up) = (
             gate_up.narrow(1, 0, width)?,
             gate_up.narrow(1, width, width)?,
         );
         #[cfg(feature = "metal")]
-        let activated = match self.fused_kernels() {
-            Some(k) => k.gelu_mul(&gate, &up)?,
-            None => (gate.gelu()? * up)?,
-        };
-        #[cfg(not(feature = "metal"))]
-        let activated = (gate.gelu()? * up)?;
+        if let Some(k) = self.fused_kernels() {
+            return k.gelu_mul(&gate, &up);
+        }
+        Ok((gate.gelu()? * up)?)
+    }
+    /// Gated feed-forward update of one layer from residual `x` and its pre-norm `h`.
+    fn mlp(&self, l: &Layer, x: &Tensor, h: &Tensor) -> Result<Tensor> {
+        let activated = self.gelu_product(&self.linear(&l.gate_up, h)?)?;
         let dense = self.linear(&l.down, &activated)?;
         match &l.moe {
             Some(moe) => moe.forward(self, x, &dense),
@@ -650,14 +729,14 @@ impl Gemma4 {
                 config.text.rms_norm_eps,
             )?;
             let key = math::rotary(&self.rms(&raw, norm)?, &cos, &sin)?;
-            scatter(store, spans, &key, &value)?;
+            scatter(store, spans, config.windowed(index), &key, &value)?;
         }
-        let window = (config.text.layer_types[index] == LayerKind::SlidingAttention)
-            .then_some(config.text.sliding_window);
+        let window = config.windowed(index).then_some(config.text.sliding_window);
         let outputs = spans
             .iter()
             .map(|s| {
-                let (keys, values) = store.gather(&s.addresses.pages, s.past + s.len)?;
+                let pages = table(&s.addresses, config.windowed(index));
+                let (keys, values) = store.gather(pages, s.past + s.len)?;
                 math::attention(
                     &query.narrow(0, s.start, s.len)?,
                     &keys,
@@ -780,10 +859,11 @@ impl Gemma4 {
         hidden: &Tensor,
         positions: &Tensor,
         pool: &StatePool,
-        paging: &tur_metal::kernels::PagedKv,
+        paging: &Paging,
     ) -> Result<Tensor> {
         let config = &self.config;
         let k = &fused.kernels;
+        let paging = paging.layer(config.windowed(index))?;
         let eps = config.text.rms_norm_eps;
         let dim = config.dim(index);
         let heads = config.text.num_attention_heads;
@@ -842,38 +922,93 @@ impl Gemma4 {
                 paging,
             )?;
         }
-        let window = (config.text.layer_types[index] == LayerKind::SlidingAttention)
-            .then_some(config.text.sliding_window);
+        let window = config.windowed(index).then_some(config.text.sliding_window);
         k.linear(
             &layer.o,
             &k.attention_ungated(&query, store, paging, window, 1.0)?,
         )
     }
+    /// Page addressing of this pass for full and windowed layers: each sequence's tables,
+    /// and for each new token its first table entry and visible key count.
     fn paging(
         &self,
         k: &tur_metal::kernels::Kernels,
         pool: &StatePool,
         spans: &[Span<'_>],
         tokens: usize,
-    ) -> Result<tur_metal::kernels::PagedKv> {
-        let mut table = Vec::new();
+    ) -> Result<Paging> {
         let mut first = Vec::with_capacity(tokens);
         let mut visible = Vec::with_capacity(tokens);
+        let (mut full, mut windows) = (Vec::new(), Vec::new());
         for s in spans {
-            let base = u32::try_from(table.len()).map_err(|_| invalid("page table overflow"))?;
-            table.extend_from_slice(&s.addresses.pages);
+            let base = u32::try_from(full.len().max(windows.len()))
+                .map_err(|_| invalid("page table overflow"))?;
+            // Both tables index the same logical pages; pad the shorter so bases agree.
+            full.extend_from_slice(&s.addresses.pages);
+            windows.extend_from_slice(&s.addresses.windows);
+            let end = usize::try_from(base).map_err(|_| invalid("page table overflow"))?
+                + s.addresses.pages.len().max(s.addresses.windows.len());
+            full.resize(end, 0);
+            windows.resize(end, 0);
             for p in s.past..s.past + s.len {
                 first.push(base);
                 visible.push(u32::try_from(p + 1).map_err(|_| invalid("context overflow"))?);
             }
         }
-        k.paged_kv(
-            self.description.kv.page_tokens,
-            pool.attention(0)?.key.data.dim(0)?,
-            &table,
+        Paging::new(
+            k,
+            &self.description,
+            pool,
+            (&full, &windows),
             &first,
             &visible,
         )
+    }
+}
+
+/// Paged addressing of one pass, for the full and the windowed attention layers.
+#[cfg(feature = "metal")]
+pub(super) struct Paging {
+    full: Option<tur_metal::kernels::PagedKv>,
+    windowed: Option<tur_metal::kernels::PagedKv>,
+}
+
+#[cfg(feature = "metal")]
+impl Paging {
+    fn new(
+        k: &tur_metal::kernels::Kernels,
+        description: &ModelDescription,
+        pool: &StatePool,
+        (full, windows): (&[u32], &[u32]),
+        first: &[u32],
+        visible: &[u32],
+    ) -> Result<Self> {
+        let rows = |windowed: bool| -> Result<Option<usize>> {
+            description
+                .layers
+                .iter()
+                .position(|kind| {
+                    matches!(kind, tur_core::execution::LayerStateKind::Attention { .. })
+                        && kind.windowed() == windowed
+                })
+                .map(|layer| Ok(pool.attention(layer)?.key.data.dim(0)?))
+                .transpose()
+        };
+        let page = description.kv.page_tokens;
+        Ok(Self {
+            full: rows(false)?
+                .map(|slots| k.paged_kv(page, slots, full, first, visible))
+                .transpose()?,
+            windowed: rows(true)?
+                .map(|slots| k.paged_kv(page, slots, windows, first, visible))
+                .transpose()?,
+        })
+    }
+
+    fn layer(&self, windowed: bool) -> Result<&tur_metal::kernels::PagedKv> {
+        if windowed { &self.windowed } else { &self.full }
+            .as_ref()
+            .ok_or_else(|| invalid("no page addressing for this attention layer"))
     }
 }
 
@@ -914,7 +1049,10 @@ impl Gemma4 {
             ));
         }
         let addresses = sequence.state.resolve(batch.pool)?;
-        if addresses.pages.len() != self.description.pages_for(end) {
+        let pages = self.description.pages_for(end);
+        if (self.description.has_full_attention() && addresses.pages.len() != pages)
+            || (self.description.window().is_some() && addresses.windows.len() != pages)
+        {
             return Err(invalid("sequence pages do not cover new tokens"));
         }
         Ok(Span {
@@ -932,6 +1070,7 @@ impl Gemma4 {
             &self.device,
             PoolConfig {
                 pages: self.description.pages_for(tokens.len()).max(1),
+                window_pages: self.description.pages_for(tokens.len()).max(1),
                 recurrent_slots: 1,
             },
         )?;
@@ -961,6 +1100,58 @@ impl Gemma4 {
         Ok((trace, step.logits))
     }
 }
+impl Gemma4 {
+    /// The last committed position of a draft sequence: the token after it and its
+    /// hidden state, at the following position, over that sequence's pages.
+    fn draft_row(
+        &self,
+        batch: &DraftForward<'_>,
+        sequence: &DraftSequence<'_>,
+    ) -> Result<(assistant::DraftRow, Addresses)> {
+        let last = sequence
+            .tokens
+            .end
+            .checked_sub(1)
+            .filter(|&l| l >= sequence.tokens.start)
+            .ok_or_else(|| invalid("empty draft sequence"))?;
+        let token = *batch
+            .tokens
+            .get(last)
+            .ok_or_else(|| invalid("draft token out of range"))?;
+        let position = batch
+            .positions
+            .get(last)
+            .and_then(|p| p.checked_add(1))
+            .ok_or_else(|| invalid("draft position out of range"))?;
+        let rows = sequence.hidden.dim(0)?;
+        if token as usize >= self.config.vocab_size()
+            || self.config.forbidden.contains(&token)
+            || position >= self.config.max_position()
+            || rows != sequence.tokens.len()
+            || sequence.hidden.dim(1)? != self.config.hidden_size()
+        {
+            return Err(invalid(
+                "invalid Gemma 4 draft token, position or hidden state",
+            ));
+        }
+        let addresses = sequence.state.resolve(batch.pool)?;
+        let pages = self.description.pages_for(position);
+        if (self.description.has_full_attention() && addresses.pages.len() < pages)
+            || (self.description.window().is_some() && addresses.windows.len() < pages)
+        {
+            return Err(invalid("draft pages do not cover the committed keys"));
+        }
+        Ok((
+            assistant::DraftRow {
+                token,
+                hidden: sequence.hidden.narrow(0, rows - 1, 1)?,
+                position,
+            },
+            addresses,
+        ))
+    }
+}
+
 /// Addressing shared by every layer of one packed pass.
 struct Pass<'a, 'b> {
     pool: &'a StatePool,
@@ -974,15 +1165,24 @@ struct Span<'a> {
     addresses: Addresses,
     sequence: &'a SequenceForward<'a>,
 }
+/// The page table a layer's keys live in: window pages for windowed layers.
+pub(super) fn table(addresses: &Addresses, windowed: bool) -> &[u32] {
+    if windowed {
+        &addresses.windows
+    } else {
+        &addresses.pages
+    }
+}
 fn scatter(
     store: &tur_metal::pool::AttentionPool,
     spans: &[Span<'_>],
+    windowed: bool,
     key: &Tensor,
     value: &Tensor,
 ) -> Result<()> {
     for s in spans {
         store.scatter(
-            &s.addresses.pages,
+            table(&s.addresses, windowed),
             s.past,
             &key.narrow(0, s.start, s.len)?,
             &value.narrow(0, s.start, s.len)?,
@@ -990,12 +1190,16 @@ fn scatter(
     }
     Ok(())
 }
-fn ple_dtype(weights: &Weights) -> DType {
-    if matches!(weights, Weights::Uniform(crate::models::WeightFormat::F32)) {
-        DType::F32
-    } else {
-        DType::BF16
-    }
+/// Per-layer embedding tables stay F32 under an all-F32 plan, from a checkpoint or an
+/// artifact alike, and BF16 under any packed plan.
+fn ple_dtype(config: &Config, plan: &WeightPlan) -> Result<DType> {
+    Ok(
+        if *plan == WeightPlan::uniform(config, crate::models::WeightFormat::F32)? {
+            DType::F32
+        } else {
+            DType::BF16
+        },
+    )
 }
 /// Inverse rotary frequencies over `dim / 2` pairs; proportional rotation leaves the pairs past
 /// its rotated fraction at zero frequency.
@@ -1143,6 +1347,51 @@ impl HybridModel for Gemma4 {
     #[cfg(feature = "metal")]
     fn kernels(&self) -> Option<tur_metal::kernels::Kernels> {
         self.fused_kernels().cloned()
+    }
+    fn draft(&self, batch: &DraftForward<'_>) -> Result<Vec<Result<Option<Tensor>>>> {
+        let assistant = self
+            .assistant
+            .as_ref()
+            .ok_or_else(|| invalid("model has no draft head"))?;
+        if batch.pool.description() != &self.description
+            || !batch.pool.device().same_device(&self.device)
+        {
+            return Err(invalid("state pool belongs to another model or device"));
+        }
+        let mut out: Vec<Option<Result<Option<Tensor>>>> =
+            batch.sequences.iter().map(|_| None).collect();
+        let (mut rows, mut pages, mut live) = (Vec::new(), Vec::new(), Vec::new());
+        for (i, sequence) in batch.sequences.iter().enumerate() {
+            if !sequence.logits {
+                out[i] = Some(Ok(None));
+                continue;
+            }
+            match self.draft_row(batch, sequence) {
+                Ok((row, table)) => {
+                    rows.push(row);
+                    pages.push(table);
+                    live.push(i);
+                }
+                Err(e) => out[i] = Some(Err(e)),
+            }
+        }
+        if !rows.is_empty() {
+            let pass = assistant::DraftPass {
+                pool: batch.pool,
+                rows: &rows,
+                pages: &pages,
+            };
+            for (i, logits) in live
+                .into_iter()
+                .zip(self.assistant_logits(assistant, &pass)?)
+            {
+                out[i] = Some(Ok(Some(logits)));
+            }
+        }
+        Ok(out
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(invalid("sequence was not drafted"))))
+            .collect())
     }
     fn forward(&self, batch: &PackedForward<'_>) -> Result<Vec<Result<SequenceStep>>> {
         if batch.pool.description() != &self.description

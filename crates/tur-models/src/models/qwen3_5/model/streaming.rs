@@ -132,6 +132,7 @@ fn run_layer(
         x.device(),
         PoolConfig {
             pages: description.pages_for(len).max(1),
+            window_pages: description.pages_for(len).max(1),
             recurrent_slots: 1,
         },
     )?;

@@ -16,6 +16,13 @@ it raises throughput when drafts are often right, but tokens then arrive in burs
   token at `p + 2`. Tur runs the head after each pass over the newly committed positions,
   writing its own keys and values, and keeps its draft for the next pass when prompt
   lookup has no proposal or a less accepted one.
+- **The Gemma 4 assistant** (`--draft-model`). Google publishes a four-layer drafter for
+  each Gemma 4 size. It joins the target's scaled embedding of the token at `p + 1` with
+  the target's final hidden state at `p`, and attends at position `p + 1` over the
+  target's own K/V: sliding layers read the last sliding owner's last `window + 1` keys,
+  full layers the last full owner's. It writes no state. Its logits cover only the
+  tokens of its 32 best-scoring vocabulary clusters (4,096 of 262,144 on E2B), and the
+  pipeline uses it exactly like the MTP head, one draft per pass.
 
 ## Verification is exact
 
@@ -89,5 +96,13 @@ Measured on Qwen3.5-0.8B on an M1:
   reason a finer cost model was not built: it could not gain more than about 10%.
 - **No learned drafter.** No smaller Qwen3.5 checkpoint exists to serve as a draft model,
   and no EAGLE-3, DFlash or DSpark drafter targets these checkpoints.
+- **Gemma's assistant drafts one token per pass.** On E2B (Q8_0, F16 K/V, greedy,
+  96 tokens, two repeats) lookup plus the assistant against ordinary decoding: novel
+  prose 28.5–28.9 against 20.0–20.3 tokens/s at one sequence (1.42×) and 58.9–61.1
+  against 48.6–48.8 at four (1.23×); code 23.3–26.1 against 19.9–20.1 (1.17–1.30×) and
+  64.1–65.4 against 47.7–48.1 (1.35×). On repetitive prompts, where lookup alone reaches
+  3.2×, it changes lookup by −7% to +5%. 63–66% of its drafts were accepted, a draft
+  costs about 2.9 ms against a 47 ms decode, and all 36 runs reproduced ordinary
+  decoding's token IDs.
 - **Next candidate:** chained MTP drafts, estimated at about 10% at one sequence (see
   [Open work](../design/open.md)).

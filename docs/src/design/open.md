@@ -6,12 +6,11 @@
   them. Measure quality, the K/V format choice (Q8 is the likely default under 16 GB) and
   the MoE wide tier, which trails Candle by 1.2–1.5× and needs trained routing traces.
 - **Flagship MTP head** for expert checkpoints.
-- **Gemma 4 follow-through.** Execute larger checkpoints on suitable Macs; establish
-  held-out quality budgets, tune prefill, and add offline prepacking. Google's MTP
-  drafters (May 2026) share the target's K/V cache and are the largest remaining decode
-  lever. Window-sized K/V for sliding layers would cut long-context memory by about two
-  thirds on E2B, but needs a decision on eviction and prefix reuse. Tiled prefill
-  attention does not yet serve ungated or windowed heads.
+- **Gemma 4 follow-through.** Execute larger checkpoints on suitable Macs and establish
+  held-out quality budgets. Chain several assistant drafts per pass: the assistant's
+  post-projection already returns the next draft's hidden state, and Google reports up
+  to 3× from multi-token drafts. Calibrated (`imatrix`, GPTQ) Gemma artifacts need a
+  layer-streaming calibration for Gemma's PLE and shared K/V.
 - **More devices.** Every number so far is from one M1. Launch shapes and crossovers
   need per-device sweeps, and the minimum supported macOS and chip still has to be
   decided.

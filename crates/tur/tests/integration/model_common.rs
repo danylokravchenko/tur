@@ -90,6 +90,7 @@ pub(crate) fn pool(model: &Qwen35, pages: usize, slots: usize) -> Result<StatePo
         model.device(),
         PoolConfig {
             pages,
+            window_pages: pages,
             recurrent_slots: slots,
         },
     )

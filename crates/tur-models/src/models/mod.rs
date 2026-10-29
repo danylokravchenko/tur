@@ -1,8 +1,10 @@
 //! Hybrid text models.
+mod artifact;
 mod checkpoint;
 mod generation;
 mod math;
 mod options;
+pub use artifact::{ARTIFACT_FILE, CalibrationInfo, Conversion, Manifest, Quantizer, is_artifact};
 pub use generation::GenerationDefaults;
 pub(crate) use weights::STAGING_BYTES;
 pub mod weights;

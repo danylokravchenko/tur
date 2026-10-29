@@ -27,7 +27,7 @@ Candle operations only where they measurably win.
 | Recurrent decode | single-token sequences | `delta_step`, 16 key rows per simdgroup |
 | Recurrent prefill and verification | multi-token sequences | `delta_prepare` (scales only), then the transposed `delta_scan` |
 | Convolution | aligned float4 rows / otherwise | `delta_conv4` / `delta_conv` |
-| Prefill attention | ≥ 16 threadgroups and ≥ 16 queries per 32-query tile | `attention_tiled_r*`: matrix units, pages read in place |
+| Prefill attention | ≥ 16 threadgroups (64 ungated) and ≥ 16 queries per 32-query tile, head dimension ≤ 256 | `attention_tiled_r*`: matrix units, pages read in place |
 | Decode attention, Q8 pools | below the tiled crossover, even query heads per K/V head | `attention_h2_r*_q8`: two query heads share each K/V load |
 | Decode attention, F32/F16 pools | below the tiled crossover | `attention_r*`, split-K over ≥ 64-key ranges |
 | MoE experts | ≤ 3 / 4–16 / > 16 rows per expert | GEMV / matrix units / wide F16-staged tiles |
@@ -53,9 +53,10 @@ residual update with the layer scalar and the next pre-norm. The per-query atten
 path also supports ungated output, explicit score scaling, sliding-window lower bounds
 and 512-dimensional heads. These semantics apply to F32, F16 and Q8 pools, including
 split-K reduction. Split-K partitions each query's window rather than the whole
-context, so a sliding layer keeps every split busy at long contexts. Qwen retains its
-existing gated scale and tiled-prefill selection; Gemma currently uses the per-query
-path for both prefill and decode. The MoE router can
+context, so a sliding layer keeps every split busy at long contexts. The tiled
+prefill kernel also serves ungated, explicitly scaled and windowed heads: each row masks
+keys before its window, and a tile's sweep starts at its first token's window. Gemma's
+512-dimensional global heads stay on the per-query kernel. The MoE router can
 apply learned per-expert scales after top-k normalization without changing selection.
 
 ## Decisions
@@ -95,8 +96,14 @@ Measured on an M1:
 
 - **Extend shared attention for Gemma semantics.** The window, ungated output and
   512-dimensional path are checked against independent F64 scalar references across
-  K/V formats and splits, including windows spanning several splits. Gemma-specific
-  launch tuning and tiled prefill remain open.
+  K/V formats and splits, including windows spanning several splits, and the tiled
+  kernel against the same references with windows inside and across key blocks.
+- **Tile Gemma's sliding layers from 64 threadgroups.** At E2B's sliding shape (8 heads
+  over one K/V head of 256, 512-key window) the tiled kernel is 0.64–0.84× the per-query
+  kernel at 64–128 queries and 1.10–1.77× from 256 (2048 queries: 13.0 against 20.1 ms
+  over F16, 13.2 against 23.4 ms over Q8). Ungated passes tile from 32 tiles × 8 heads;
+  Qwen's gated crossover stays at 16. End-to-end E2B prefill at 512 and 2048 tokens moved
+  within run-to-run noise: attention is a small share of its prefill.
 - **Split windowed attention over the window.** Partitioning the whole context left a
   sliding layer's 512 keys in one or two splits. Over the window, E2B single-sequence
   decode at 8K tokens rose from 16.4–18.1 to 18.9–20.0 tokens/s (four clean rounds),

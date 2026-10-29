@@ -32,6 +32,7 @@ const EXACT_KV: KvLayout = KvLayout {
 /// Room for a few full contexts of the tiny model.
 const POOL: PoolConfig = PoolConfig {
     pages: 128,
+    window_pages: 128,
     recurrent_slots: 8,
 };
 
@@ -522,7 +523,10 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
                 execution,
                 kv: EXACT_KV,
                 recurrent: candle_core::DType::F32,
-                mtp: Some(DraftHead { vocab: None }),
+                mtp: Some(DraftHead {
+                    vocab: None,
+                    model: None,
+                }),
             },
         )?;
         let description = model.description();
@@ -531,6 +535,7 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
             model.device(),
             PoolConfig {
                 pages: description.pages_for(count),
+                window_pages: description.pages_for(count),
                 recurrent_slots: 2,
             },
         )?;

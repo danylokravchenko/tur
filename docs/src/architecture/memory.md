@@ -9,6 +9,10 @@ allocated once at load and never grown.
   layer's key and value tensors, so one page table addresses the whole model. Keys and
   values are stored as F32, F16 or Q8. Q8 is quantized on write, with one scale per
   `group` values (32 by default), and dequantized on read inside the attention kernels.
+- **Window pages.** Attention layers that read only a sliding window store their keys
+  and values in a separate space, indexed by the same logical page numbers. A committed
+  state keeps only the window pages its later queries and drafts can read; page 0 is a
+  never-written placeholder that released logical pages address.
 - **Recurrent slots.** Slot `s` spans every recurrent layer's convolution history and
   matrix state. Slot 0 is a permanent zero state shared by every fresh sequence and never
   written.
@@ -23,8 +27,12 @@ before proceeding, allowing Candle to reclaim device staging buffers. These are 
 fences; request execution keeps its existing completion ownership.
 
 Only Gemma layers that produce their own K/V allocate attention pool layers. Reusing
-layers address those same physical owners. Sliding-window masking limits attention,
-while page leases retain the full logical prefix for restore and speculation.
+layers address those same physical owners. Sliding owners are windowed layers whose
+window is one key beyond Gemma's (513 on E2B), because the assistant drafter's sliding
+queries read one more key than the target's. The budget gives every sequence and
+retained snapshot window pages for its window plus one pass, and the rest to full
+pages. Snapshots restore and speculation roll back within a state's own window pages,
+which no later state releases while a holder remains.
 
 ## Snapshots and leases
 
@@ -96,6 +104,14 @@ Measured on Qwen3.5-0.8B on an M1:
 - **Low-bit K/V was rejected.** Every 4-bit format missed the quality budget by 10–30×
   (see [Rejected experiments](../design/rejected.md)).
 
+- **Store only the sliding window.** Gemma's sliding owners are 12 of E2B's 15 K/V
+  owners. Keeping only their window plus the current page cut K/V from 18,432 to 6,144
+  bytes per token beyond the window: at 8K tokens one sequence leases 56.8 MB instead
+  of 151 MB, four 227 MB instead of 604 MB. Decode at 8K (18.2–19.2 against
+  18.2–18.8 tokens/s at one sequence, 39.4–44.5 against 37.4–43.9 at four) and
+  2048-token prefill (345–354 against 301–334 tokens/s) stayed within run-to-run noise.
+  A ring buffer in recurrent-style slots was not built: every pass would copy the whole
+  window, and attention would need a second key source inside each chunk.
 - **Account for Gemma PLE and shared K/V explicitly.** Resident PLE tables and activation
   peaks enter the existing memory plan. Only K/V owners allocate state. E2B checkpoint
   execution validates bounded staging; synthetic F32 fixtures validate shared-cache

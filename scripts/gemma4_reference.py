@@ -96,7 +96,8 @@ class DiskEmbedding(torch.nn.Module):
         return torch.cat(rows).reshape(*ids.shape, -1) * self.scale
 
 
-def real(directory, output):
+def streamed(directory, content):
+    """The real checkpoint, one decoder layer resident at a time, and `content` as a chat prompt."""
     raw = json.loads((directory / "config.json").read_text())
     config = Gemma4TextConfig(**raw["text_config"])
     config._attn_implementation = "eager"
@@ -125,7 +126,12 @@ def real(directory, output):
         layer.register_forward_pre_hook(load)
         layer.register_forward_hook(lambda module, _args, _output: module.to_empty(device="meta") and None)
     tokenizer = AutoTokenizer.from_pretrained(directory, local_files_only=True)
-    tokens = tokenizer.apply_chat_template([{"role": "user", "content": "What is the capital of France?"}], tokenize=True, add_generation_prompt=True, return_tensors="pt", enable_thinking=False, return_dict=True)["input_ids"]
+    tokens = tokenizer.apply_chat_template([{"role": "user", "content": content}], tokenize=True, add_generation_prompt=True, return_tensors="pt", enable_thinking=False, return_dict=True)["input_ids"]
+    return model, tokens
+
+
+def real(directory, output):
+    model, tokens = streamed(directory, "What is the capital of France?")
     trace(model, tokens, output, generate=32)
     print(f"wrote {output}: {tokens.shape[-1]} tokens", flush=True)
 

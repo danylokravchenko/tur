@@ -47,12 +47,14 @@ fn attention() -> LayerStateKind {
     LayerStateKind::Attention {
         kv_heads: 1,
         head_dim: 1,
+        window: None,
     }
 }
 
 /// Ample capacity: 8 pages of 2 tokens hold the 16-position limit; 8 recurrent slots.
 const POOL: PoolConfig = PoolConfig {
     pages: 8,
+    window_pages: 8,
     recurrent_slots: 8,
 };
 
@@ -649,6 +651,7 @@ fn test_pool_exhaustion_fails_the_pass_before_execution_and_leaves_state_unchang
         fixture(),
         PoolConfig {
             pages: 3,
+            window_pages: 3,
             recurrent_slots: 4,
         },
     )?;
@@ -685,6 +688,7 @@ fn test_released_pages_and_slots_are_reclaimed_after_completion() -> Result<()> 
         fixture(),
         PoolConfig {
             pages: 4,
+            window_pages: 4,
             recurrent_slots: 3,
         },
     )?;

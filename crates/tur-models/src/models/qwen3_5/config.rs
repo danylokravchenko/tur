@@ -329,6 +329,7 @@ impl Config {
                     LayerKind::FullAttention => LayerStateKind::Attention {
                         kv_heads: t.num_key_value_heads,
                         head_dim: t.head_dim,
+                        window: None,
                     },
                     LayerKind::LinearAttention => LayerStateKind::Recurrent {
                         conv_channels: self.conv_channels()?,
@@ -347,6 +348,7 @@ impl Config {
             layers.push(LayerStateKind::Attention {
                 kv_heads: t.num_key_value_heads,
                 head_dim: t.head_dim,
+                window: None,
             });
         }
         Ok(ModelDescription {
@@ -820,6 +822,18 @@ impl WeightLayout for Config {
     }
     fn loads_mtp(&self) -> bool {
         self.mtp()
+    }
+}
+
+impl crate::models::artifact::ArtifactLayout for Config {
+    fn tensor_shapes(&self) -> Result<BTreeMap<String, Vec<usize>>> {
+        self.weight_shapes()
+    }
+    fn embedding_tensor(&self) -> String {
+        self.embedding_name()
+    }
+    fn unloaded(&self, name: &str) -> bool {
+        name.starts_with("mtp.") && !self.mtp()
     }
 }
 

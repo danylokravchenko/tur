@@ -30,6 +30,7 @@ fn pool(entries: usize) -> Result<StatePool> {
                 LayerStateKind::Attention {
                     kv_heads: 1,
                     head_dim: 4,
+                    window: None,
                 },
                 LayerStateKind::Recurrent {
                     conv_channels: 1,
@@ -48,6 +49,7 @@ fn pool(entries: usize) -> Result<StatePool> {
         &Device::Cpu,
         PoolConfig {
             pages: entries * LONGEST / PAGE,
+            window_pages: entries * LONGEST / PAGE,
             recurrent_slots: entries + 1,
         },
     )

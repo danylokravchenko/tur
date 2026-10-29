@@ -22,7 +22,7 @@ rather than skip without it.
   | `contracts` | `HybridEngine` state, fork/restore, speculation, cancellation, failures |
   | `engine`, `fused` | Qwen3.5 through the engine: reference versus fused paths, formats, boundaries |
   | `moe` | Qwen MoE conformance against a Transformers fixture |
-  | `gemma4` | Dense PLE/sharing, MoE and Unified conformance; cache lifecycle; canonical template bytes |
+  | `gemma4` | Dense PLE/sharing, MoE and Unified conformance; cache lifecycle; canonical template bytes; prepacked artifacts; assistant drafts |
   | `quantization` | Calibration, GPTQ, budget allocation, prepacked artifacts |
   | `pipeline`, `scheduling`, `scheduling_metal` | Admission, stress, preemption, deadlines, budgets |
   | `prefix_reuse`, `speculation`, `prepacked` | Pipeline-level reuse, drafting and artifact loading |
@@ -79,10 +79,23 @@ budget. It records per-layer states, prompt logits and a greedy continuation. Q8
 uses the same 95% next-token agreement floor as Qwen, plus greedy-prefix and EOS checks;
 the offline F32 fixtures use the separate 1e-4 equation-conformance gate.
 
+The assistant drafter has its own ignored test. It drafts at 51 positions of a
+939-token prompt, past the sliding window, and requires 90% agreement with
+Transformers F32 drafts from the Q8_0 target:
+
+```sh
+export TUR_GEMMA4_ASSISTANT=/models/gemma-4-E2B-it-assistant   # 2d874ef7d29f9a30599a1e4b3c1cbc9595f005df
+export TUR_GEMMA4_ASSISTANT_GOLDEN=/tmp/gemma4-assistant.safetensors
+python -I scripts/gemma4_assistant_reference.py --model "$TUR_GEMMA4_E2B" \
+  --assistant "$TUR_GEMMA4_ASSISTANT" --golden "$TUR_GEMMA4_ASSISTANT_GOLDEN"
+just test-checkpoint -E 'test(e2b_assistant)'
+```
+
 Regenerate offline Gemma fixtures with:
 
 ```sh
 python -I scripts/gemma4_reference.py --tiny crates/tur/tests/fixtures/gemma4
+python -I scripts/gemma4_assistant_reference.py --tiny crates/tur/tests/fixtures/gemma4
 python -I scripts/gemma4_reference.py --templates crates/tur/tests/fixtures/gemma4/templates.json
 ```
 
@@ -97,6 +110,7 @@ in F32:
 | `qwen3_5_mtp_reference.py` | The MTP head assembled from Transformers modules, with next-next-token accuracy |
 | `qwen3_5_moe_reference.py` | The offline MoE oracle on deterministic weights |
 | `gemma4_reference.py` | Dense, MoE and Unified F32 fixtures; Gemma template bytes; real E2B logits and greedy continuation |
+| `gemma4_assistant_reference.py` | The assistant drafter over the dense fixture, and teacher-forced E2B assistant drafts past the sliding window |
 | `qwen3_6_reference_headers.py` | Qwen3.6 tensor headers via byte-range requests; no weights are downloaded |
 
 Run them with `python -I` and treat downloaded files as data.

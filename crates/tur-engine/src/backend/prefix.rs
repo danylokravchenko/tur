@@ -484,6 +484,7 @@ mod tests {
                     LayerStateKind::Attention {
                         kv_heads: 1,
                         head_dim: 4,
+                        window: None,
                     },
                     LayerStateKind::Recurrent {
                         conv_channels: 1,
@@ -502,6 +503,7 @@ mod tests {
             &Device::Cpu,
             PoolConfig {
                 pages: 16,
+                window_pages: 16,
                 recurrent_slots: 8,
             },
         )

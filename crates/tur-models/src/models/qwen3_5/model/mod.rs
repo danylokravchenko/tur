@@ -5,7 +5,6 @@
 //! Packed Qwen3.5/3.8 text execution over explicit hybrid state.
 
 use super::{
-    artifact,
     config::{Config, LayerKind},
     math::{self, DeltaInputs},
 };
@@ -14,7 +13,7 @@ use crate::hybrid::{
     SequenceForward, SequenceStep, StatePool,
 };
 use crate::models::weights::{Embeddings, Tensors};
-use crate::models::{Execution, LoadOptions, Weights};
+use crate::models::{Execution, LoadOptions, Weights, artifact};
 use crate::quantization::{Calibration, Recorder};
 use candle_core::{DType, Device, Tensor};
 use std::{path::Path, sync::Arc};
@@ -314,7 +313,16 @@ fn load_attention(tensors: &Tensors, a: &str, device: &Device) -> Result<Attenti
 /// Rows of a separate draft LM head: [`DraftHead::vocab`] when the head is loaded
 /// and the bound excludes part of the vocabulary.
 fn draft_vocab(config: &Config, options: &LoadOptions) -> Result<Option<usize>> {
-    match options.mtp.and_then(|head| head.vocab) {
+    if options
+        .mtp
+        .as_ref()
+        .is_some_and(|head| head.model.is_some())
+    {
+        return Err(invalid(
+            "Qwen3.5 drafts from the head inside its checkpoint, not a separate drafter",
+        ));
+    }
+    match options.mtp.as_ref().and_then(|head| head.vocab) {
         Some(0) => Err(invalid("draft vocabulary must not be empty")),
         Some(rows) if rows < config.vocab_size() => Ok(Some(rows)),
         _ => Ok(None),
@@ -634,6 +642,7 @@ impl Qwen35 {
             &self.device,
             PoolConfig {
                 pages: self.description.pages_for(tokens.len()).max(1),
+                window_pages: self.description.pages_for(tokens.len()).max(1),
                 recurrent_slots: 1,
             },
         )?;

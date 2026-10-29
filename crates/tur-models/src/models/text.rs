@@ -6,10 +6,7 @@ use super::{
 };
 use crate::hybrid::{DraftForward, HybridModel, PackedForward, SequenceStep};
 use std::path::Path;
-use tur_core::{
-    Result,
-    execution::{ModelDescription, invalid},
-};
+use tur_core::{Result, execution::ModelDescription};
 
 /// Validated model-specific settings selected from explicit checkpoint architecture fields.
 #[derive(Clone, Debug)]
@@ -52,7 +49,8 @@ impl ModelConfig {
     pub(crate) fn with_mtp(self) -> Result<Self> {
         match self {
             Self::Qwen35(c) => Ok(Self::Qwen35(c.with_mtp()?)),
-            Self::Gemma4(_) => Err(invalid("Gemma 4 native draft heads are not implemented")),
+            // The assistant is a separate checkpoint, loaded from the draft head's directory.
+            Self::Gemma4(c) => Ok(Self::Gemma4(c)),
         }
     }
     /// Reserve the selected model's exact weights and bounded scratch before loading.

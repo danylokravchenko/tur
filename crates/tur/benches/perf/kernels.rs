@@ -491,6 +491,63 @@ fn tiled_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     Ok(cases)
 }
 
+/// The same crossover at Gemma 4 E2B sliding layers: 8 ungated query heads over one K/V
+/// head of 256 dimensions, unscaled scores and a 512-key window.
+fn tiled_window_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+    const WINDOW: usize = 512;
+    let (heads, kv_heads, dim) = (8usize, 1usize, 256usize);
+    let tiled = kernels.clone().with_tuning(Tuning {
+        attention_tiled_ungated_groups: 0,
+        ..kernels.tuning()
+    })?;
+    let simd = kernels.clone().with_tuning(Tuning {
+        attention_tiled_ungated_groups: usize::MAX,
+        ..kernels.tuning()
+    })?;
+    let shapes = [
+        ("window prefill 64", 0usize, 64usize),
+        ("window prefill 128", 0, 128),
+        ("window prefill 256", 0, 256),
+        ("window prefill 512", 0, 512),
+        ("window prefill 2048", 0, 2048),
+        ("window chunk 256 after 8192", 8192, 256),
+    ];
+    let mut cases = Vec::new();
+    let shape_filter = std::env::var("TUR_BENCH_SHAPE").ok();
+    for (label, past, new) in shapes {
+        if shape_filter
+            .as_ref()
+            .is_some_and(|filter| !label.contains(filter))
+        {
+            continue;
+        }
+        let q = random(device, &[new, heads, dim], 5, 1.0)?;
+        for format in [KvFormat::F16, KvFormat::Q8] {
+            let paged = paged(device, kernels, format, 16, kv_heads, dim, past, new, 1)?;
+            let run = |k: &Kernels| {
+                time(device, || {
+                    k.attention_ungated(&q, &paged.pool, &paged.kv, Some(WINDOW), 1.0)
+                })
+            };
+            let (t, s) = (run(&tiled)?, run(&simd)?);
+            eprintln!(
+                "{label:28} {format:5}: tiled {:8.3} ms  per-query {:8.3} ms  x{:.2}",
+                t["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
+                s["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
+                speedup(&t, &s),
+            );
+            cases.push(json!({
+                "operation": "attention_tiled_window", "shape": label,
+                "kv_format": format.to_string(), "heads": heads, "kv_heads": kv_heads,
+                "head_dim": dim, "window": WINDOW, "context": past + new,
+                "tiles": paged.kv.tiles(),
+                "tiled": t, "per_query": s, "speedup": speedup(&t, &s),
+            }));
+        }
+    }
+    Ok(cases)
+}
+
 fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     // Qwen3.5-0.8B: 16 key/value heads of 128; Qwen3.8-27B: 16 key and 48 value heads.
     let mut cases = Vec::new();
@@ -852,6 +909,7 @@ pub(crate) fn run() -> Result<()> {
             "attention": if skip("paged") { json!([]) } else { json!(attention_cases(&device, &kernels)?) },
             "paged_attention": if skip("paged") { json!([]) } else { json!(paged_cases(&device, &kernels)?) },
             "tiled_attention": if skip("tiled") { json!([]) } else { json!(tiled_cases(&device, &kernels)?) },
+            "tiled_window_attention": if skip("tiled") { json!([]) } else { json!(tiled_window_cases(&device, &kernels)?) },
             "packed_linear": if skip("linear") { json!([]) } else { json!(gemv_cases(&device, &kernels)?) },
             "sampling": if skip("sample") { json!([]) } else { json!(sample_cases(&device, &kernels)?) },
             "moe": if skip("moe") { json!([]) } else { json!(moe_cases(&device, &kernels)?) },

@@ -28,8 +28,8 @@ use tur_engine::hybrid::{
     SamplingOptions, SequenceForward, StatePool,
 };
 use tur_models::models::TextModel;
-use tur_models::models::qwen3_5::{Manifest, is_artifact};
 use tur_models::models::{Execution, LoadOptions, WeightFormat, Weights, parse_recurrent_state};
+use tur_models::models::{Manifest, is_artifact};
 
 const SHORT_CONTEXT: usize = 128;
 const DECODE_STEPS: usize = 12;
@@ -74,6 +74,7 @@ fn pool(model: &TextModel, contexts: &[usize], extra: usize) -> Result<StatePool
         model.device(),
         PoolConfig {
             pages,
+            window_pages: pages,
             recurrent_slots: 2 * contexts.len() + 2,
         },
     )
@@ -228,6 +229,7 @@ fn engine_case(model: Arc<TextModel>, generated: usize) -> Result<Value> {
     let device = model.device().clone();
     let config = PoolConfig {
         pages: model.description().pages_for(SHORT_CONTEXT + generated) + 1,
+        window_pages: model.description().pages_for(SHORT_CONTEXT + generated) + 1,
         recurrent_slots: 2,
     };
     let mut engine = HybridEngine::new(model, device, config)?;

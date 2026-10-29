@@ -18,6 +18,8 @@
 //! with ordinary decoding, including acceptance counters, memory and exact token IDs, on
 //! `TUR_BENCH_SPECULATION=repeat,novel,code` prompts. `TUR_BENCH_MTP_VOCAB` sets the
 //! head's leading draft token IDs (default 32768, 0 for the whole vocabulary).
+//! `TUR_BENCH_DRAFT_MODEL=<dir>` drafts from a separate drafter checkpoint (a Gemma 4
+//! assistant) instead of the checkpoint's own head.
 
 use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, time::Instant};
@@ -926,11 +928,19 @@ fn speculation_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
             config.device_sampling = device_sampling;
             config.speculation = if with_mtp {
                 SpeculationConfig {
-                    mtp: Some(DraftHead {
-                        vocab: env_sizes("TUR_BENCH_MTP_VOCAB", "32768")?
-                            .first()
-                            .copied()
-                            .filter(|&rows| rows > 0),
+                    // A separate drafter (a Gemma 4 assistant) selects its own candidates.
+                    mtp: Some(match std::env::var_os("TUR_BENCH_DRAFT_MODEL") {
+                        Some(dir) => DraftHead {
+                            vocab: None,
+                            model: Some(dir.into()),
+                        },
+                        None => DraftHead {
+                            vocab: env_sizes("TUR_BENCH_MTP_VOCAB", "32768")?
+                                .first()
+                                .copied()
+                                .filter(|&rows| rows > 0),
+                            model: None,
+                        },
                     }),
                     ..SpeculationConfig::with_mtp(draft)
                 }

@@ -359,6 +359,8 @@ struct TiledParams {
     uint gate_col;
     uint gate_head_stride;
     float scale;
+    uint window;
+    uint ungated;
 };
 
 // Row and first column of the two elements a lane holds in an 8x8 simdgroup matrix. Lanes
@@ -424,9 +426,10 @@ static inline void tile_scores(thread simdgroup_float8x8 *s, threadgroup const f
 }
 
 // Online softmax on this lane's two elements per key tile of the block at `kb`, all in
-// one row: scores become weights, and the output and running sums are rescaled.
+// one row, whose visible keys are [lower, limit): scores become weights, and the output
+// and running sums are rescaled.
 template <uint CHUNKS>
-static inline void tile_softmax(thread simdgroup_float8x8 *s, thread simdgroup_float8x8 *o, thread float &m, thread float &l, uint kb, uint limit, ushort2 fc) {
+static inline void tile_softmax(thread simdgroup_float8x8 *s, thread simdgroup_float8x8 *o, thread float &m, thread float &l, uint kb, uint lower, uint limit, ushort2 fc) {
     float block = -FLT_MAX;
     #pragma clang loop unroll(full)
     for (uint kt = 0; kt < TK / 8; ++kt) {
@@ -434,7 +437,7 @@ static inline void tile_softmax(thread simdgroup_float8x8 *s, thread simdgroup_f
         for (uint e = 0; e < 2; ++e) {
             uint key = kb + 8 * kt + fc.y + e;
             float score = s[kt].thread_elements()[e];
-            block = key < limit ? max(block, score) : block;
+            block = key >= lower && key < limit ? max(block, score) : block;
         }
     }
     float m_new = max(m, row_max(block));
@@ -444,7 +447,7 @@ static inline void tile_softmax(thread simdgroup_float8x8 *s, thread simdgroup_f
         #pragma clang loop unroll(full)
         for (uint e = 0; e < 2; ++e) {
             uint key = kb + 8 * kt + fc.y + e;
-            float weight = key < limit ? exp(s[kt].thread_elements()[e] - m_new) : 0.0f;
+            float weight = key >= lower && key < limit ? exp(s[kt].thread_elements()[e] - m_new) : 0.0f;
             s[kt].thread_elements()[e] = weight;
             total += weight;
         }
@@ -507,8 +510,11 @@ kernel void attention_tiled(
     // Rows past the tile repeat its last token and are never written.
     uint token = t0 + min(row, n - 1);
     uint limit = row < n ? visible[token] : 0;
-    // Visible counts grow along a sequence, so the last token sees every key of the tile.
+    uint lower = p.window > 0 && limit > p.window ? limit - p.window : 0;
+    // Visible counts grow along a sequence, so the last token sees every key of the tile
+    // and the first token's window starts earliest; the sweep starts at its key block.
     uint keys = visible[t0 + n - 1];
+    uint start = p.window > 0 && visible[t0] > p.window ? (visible[t0] - p.window) / TK * TK : 0;
     uint base = first_block[t0];
 
     simdgroup_float8x8 o[8 * CHUNKS];
@@ -531,9 +537,9 @@ kernel void attention_tiled(
         uint slot[LOADS];
         uint next_slot[LOADS];
         vec<T, 4> fetched[LOADS];
-        kv_slots(slot, table, base, 0, keys, key0, p.page);
-        kv_fetch<T>(fetched, k, slot, 0, keys, key0, p.kv_heads, g, D, d0);
-        for (uint kb = 0; kb < keys; kb += TK) {
+        kv_slots(slot, table, base, start, keys, key0, p.page);
+        kv_fetch<T>(fetched, k, slot, start, keys, key0, p.kv_heads, g, D, d0);
+        for (uint kb = start; kb < keys; kb += TK) {
             kv_slots(next_slot, table, base, kb + TK, keys, key0, p.page);
             simdgroup_float8x8 s[TK / 8];
             #pragma clang loop unroll(full)
@@ -562,7 +568,7 @@ kernel void attention_tiled(
                     tile_values(o, s, stage, step - CHUNKS);
                 }
                 if (step == CHUNKS - 1) {
-                    tile_softmax<CHUNKS>(s, o, m, l, kb, limit, fc);
+                    tile_softmax<CHUNKS>(s, o, m, l, kb, lower, limit, fc);
                 }
             }
             #pragma clang loop unroll(full)
@@ -574,7 +580,7 @@ kernel void attention_tiled(
         // Q8 chunks are read, dequantized and staged in one buffer, two barriers per
         // chunk: prefetching them, with their scales, was 9-42% slower at every shape.
         threadgroup uint *slots = (threadgroup uint *)(shared + TK * TD);
-        for (uint kb = 0; kb < keys; kb += TK) {
+        for (uint kb = start; kb < keys; kb += TK) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (tid < TK) {
                 uint j = kb + tid;
@@ -599,7 +605,7 @@ kernel void attention_tiled(
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 tile_scores(s, shared, qr, c, fc, p.scale);
             }
-            tile_softmax<CHUNKS>(s, o, m, l, kb, limit, fc);
+            tile_softmax<CHUNKS>(s, o, m, l, kb, lower, limit, fc);
             #pragma clang loop unroll(full)
             for (uint c = 0; c < CHUNKS; ++c) {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -627,7 +633,7 @@ kernel void attention_tiled(
         #pragma clang loop unroll(full)
         for (uint e = 0; e < 2; ++e) {
             uint col = 8 * x + fc.y + e;
-            orow[col] = o[x].thread_elements()[e] * inv * sigmoid(gr[col]);
+            orow[col] = o[x].thread_elements()[e] * inv * (p.ungated ? 1.0f : sigmoid(gr[col]));
         }
     }
 }

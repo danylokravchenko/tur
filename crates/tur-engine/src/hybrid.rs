@@ -1632,6 +1632,7 @@ mod tests {
 
     const POOL: PoolConfig = PoolConfig {
         pages: 2,
+        window_pages: 2,
         recurrent_slots: 1,
     };
 
@@ -1646,6 +1647,7 @@ mod tests {
                 layers: vec![LayerStateKind::Attention {
                     kv_heads: 1,
                     head_dim: 1,
+                    window: None,
                 }],
                 kv: KvLayout::new(2, KvFormat::F32),
                 modalities: vec![Modality::Text],

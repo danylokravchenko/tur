@@ -34,7 +34,8 @@ workloads:
   use 8 to check the default serving capacity.
 - `reuse`: cold shared prompts, contention, agent loops, churn and no reuse;
   `TUR_BENCH_RESTORABLE_FIRST=1` admits restorable prefixes first.
-- `speculation`: prompt lookup and MTP over repetitive, novel and code prompts.
+- `speculation`: prompt lookup and MTP over repetitive, novel and code prompts;
+  `TUR_BENCH_DRAFT_MODEL=<dir>` drafts from a Gemma 4 assistant instead.
 
 Gemma 4 E2B is about three times the 0.8B Qwen's per-token work, and its default
 sweep prefills 32K tokens for one case. `just bench-gemma` runs a short profile on the

@@ -721,6 +721,7 @@ fn test_full_and_partial_prefix_forks_and_restores_continue_exactly() -> Result<
     )?);
     let config = PoolConfig {
         pages: 64,
+        window_pages: 64,
         recurrent_slots: 16,
     };
     let mut engine = HybridEngine::new(Arc::clone(&model), device, config)?;
@@ -804,6 +805,7 @@ fn test_memory_pressure_fails_new_work_without_corrupting_live_requests() -> Res
         device.clone(),
         PoolConfig {
             pages: 64,
+            window_pages: 64,
             recurrent_slots: 8,
         },
     )?;
@@ -817,6 +819,7 @@ fn test_memory_pressure_fails_new_work_without_corrupting_live_requests() -> Res
         device,
         PoolConfig {
             pages: 7,
+            window_pages: 7,
             recurrent_slots: 4,
         },
     )?;
@@ -962,6 +965,7 @@ fn generate(
     let device = model.device().clone();
     let config = PoolConfig {
         pages: 64,
+        window_pages: 64,
         recurrent_slots: 2 * batch,
     };
     let mut engine = HybridEngine::new(model, device, config)?;
@@ -1133,6 +1137,7 @@ fn test_grammar_masks_are_applied_on_the_device() -> Result<()> {
     )?);
     let config = PoolConfig {
         pages: 64,
+        window_pages: 64,
         recurrent_slots: 8,
     };
     let mut engine = HybridEngine::new(Arc::clone(&model), device, config)?;
@@ -1220,6 +1225,7 @@ fn test_cached_last_logits_sample_like_the_pass_that_produced_them() -> Result<(
     )?);
     let config = PoolConfig {
         pages: 64,
+        window_pages: 64,
         recurrent_slots: 8,
     };
     let mut engine = HybridEngine::new(Arc::clone(&model), device, config)?;

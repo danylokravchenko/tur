@@ -11,8 +11,8 @@ use tur_core::{
     Result, TurError,
     execution::{KvFormat, KvLayout},
 };
+use tur_models::models::Manifest;
 use tur_models::models::TextModel;
-use tur_models::models::qwen3_5::Manifest;
 use tur_models::models::{Execution, LoadOptions, Weights};
 
 pub(crate) fn run(args: &[String]) -> Result<()> {

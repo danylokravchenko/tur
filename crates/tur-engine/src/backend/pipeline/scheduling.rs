@@ -150,10 +150,7 @@ impl InferencePipeline {
             .ok_or_else(|| invalid("missing pipeline request"))?
             .handle;
         let tokens = oldest.pending.min(self.scheduler.config().max_chunk);
-        let headroom = Demand {
-            pages: running,
-            slots: 0,
-        };
+        let headroom = growth(self.engine.pool().description(), running);
         let mut usage = self.engine.memory()?;
         while self.prefix.stats().entries > 0 {
             let demand = self.engine.demand(handle, tokens, false)? + headroom;
@@ -164,7 +161,10 @@ impl InferencePipeline {
             let after = self.engine.memory()?;
             // Snapshots sharing pages with running requests free only their slot; stop
             // once evicting no longer helps a page shortage.
-            if demand.slots <= after.slots.free() && after.pages.free() == usage.pages.free() {
+            if demand.slots <= after.slots.free()
+                && after.pages.free() == usage.pages.free()
+                && after.windows.free() == usage.windows.free()
+            {
                 break;
             }
             usage = after;
@@ -195,10 +195,10 @@ impl InferencePipeline {
                 let needed = demand + engine.demand(request.handle, chunk.tokens, false)?;
                 // Admission keeps one page of growth per running sequence free, so new
                 // work does not immediately force running decodes out.
-                let headroom = Demand {
-                    pages: if chunk.admit { running } else { 0 },
-                    slots: 0,
-                };
+                let headroom = growth(
+                    engine.pool().description(),
+                    usize::from(chunk.admit) * running,
+                );
                 let fits = (needed + headroom).fits(&usage);
                 if fits {
                     demand = needed;
@@ -223,5 +223,22 @@ impl InferencePipeline {
                 )?,
             }
         }
+    }
+}
+
+/// One page of growth for each of `sequences`, in every page space the model uses.
+fn growth(description: &tur_core::execution::ModelDescription, sequences: usize) -> Demand {
+    Demand {
+        pages: if description.has_full_attention() {
+            sequences
+        } else {
+            0
+        },
+        windows: if description.window().is_some() {
+            sequences
+        } else {
+            0
+        },
+        slots: 0,
     }
 }

@@ -44,9 +44,15 @@ tur run --model google/gemma-4-E2B-it \
   --weight-format q8_0 --temperature 0 --thinking false --prompt 'What is the capital of France?'
 ```
 
-Input remains text-only. Gemma native `--mtp` and offline `tur quantize` are not
-implemented. Use load-time conversion; Q4K additionally requires every projection's
-input width to fit its 256-element blocks.
+Input remains text-only. Q4K requires every projection's input width to fit its
+256-element blocks. `tur quantize --method rtn` writes Gemma artifacts. Gemma drafts from
+its published assistant rather than `--mtp`:
+
+```sh
+tur run --model google/gemma-4-E2B-it --revision 3e22461f65e89153144f8adb70e3b8c2cc9845a7 \
+  --draft-model google/gemma-4-E2B-it-assistant \
+  --draft-revision 2d874ef7d29f9a30599a1e4b3c1cbc9595f005df --prompt 'Explain river deltas.'
+```
 
 ## Passes and memory (`run`, `serve`)
 
@@ -56,6 +62,8 @@ input width to fit its 256-element blocks.
 | `--state-memory-mb <n>` | derived | Memory for K/V pages and recurrent state. By default each concurrent request gets room for an 8K-token context within the device's working set |
 | `--speculative-draft <n>` | 0 | Most prompt-lookup drafts per decode; 0 disables speculation |
 | `--mtp [true\|false]` | off | Also draft with the checkpoint's multi-token-prediction head; implies at least one draft and disables prefix reuse |
+| `--draft-model <dir\|repo>` | none | Draft from a separate drafter checkpoint (a Gemma 4 assistant) at `--draft-revision`; implies at least one draft and disables prefix reuse |
+| `--draft-revision <commit>` | none | Immutable commit of a remote `--draft-model`, or an identity for a local one |
 
 Speculation needs F32 recurrent state; with `--recurrent-state f16` it is switched off
 with a warning. See [Speculative decoding](../architecture/speculation.md) for when it

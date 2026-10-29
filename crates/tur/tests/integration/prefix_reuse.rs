@@ -268,7 +268,7 @@ fn test_snapshots_yield_memory_and_concurrent_reuse_matches_cold_runs() -> Resul
     // Seven pages and four running slots: the shared prefix holds three, each request
     // needs up to five, so concurrent requests evict snapshots and still get preempted.
     let config = cached(6);
-    let usage = InferencePipeline::new(&fixture.factory(), config)?.memory()?;
+    let usage = InferencePipeline::new(&fixture.factory(), config.clone())?.memory()?;
     let slots = 2 * config.scheduler.max_running + config.prefix.entries + 1;
     let mut pipeline = InferencePipeline::new(
         &fixture.factory(),
