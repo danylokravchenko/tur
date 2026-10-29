@@ -1,57 +1,47 @@
 # Testing
 
 ```sh
-just test                       # whole offline suite, about 25 s after the first build
+just test                       # the whole offline suite, about 25 s after the first build
 just test -E 'test(prefix)'     # tests whose name contains "prefix"
 just test -E 'binary(integration) and test(/^scheduling::/)'
 ```
 
-Tests use [cargo-nextest](https://nexte.st). They need direct Metal access, and fail
-rather than skip without it.
+Tests run under [cargo-nextest](https://nexte.st). They need direct Metal access and fail, rather than skip, without it.
 
 ## Layout
 
-- **Unit tests** sit next to their code in `#[cfg(test)]` modules.
-- **Integration tests** for every crate are linked into one binary,
-  `crates/tur/tests/integration/`. `main.rs` declares one module per area:
+Unit tests sit next to their code in `#[cfg(test)]` modules.
 
-  | Module | Covers |
-  | --- | --- |
-  | `kernels` | Each Metal kernel against an independent scalar F64 reference |
-  | `reference` | Template fidelity; real-checkpoint agreement with Transformers |
-  | `contracts` | `HybridEngine` state, fork/restore, speculation, cancellation, failures |
-  | `engine`, `fused` | Qwen3.5 through the engine: reference versus fused paths, formats, boundaries |
-  | `moe` | Qwen MoE conformance against a Transformers fixture |
-  | `gemma4` | Dense PLE/sharing, MoE and Unified conformance; cache lifecycle; canonical template bytes; prepacked artifacts; assistant drafts |
-  | `quantization` | Calibration, GPTQ, budget allocation, prepacked artifacts |
-  | `pipeline`, `scheduling`, `scheduling_metal` | Admission, stress, preemption, deadlines, budgets |
-  | `prefix_reuse`, `speculation`, `prepacked` | Pipeline-level reuse, drafting and artifact loading |
-  | `serving`, `server` | The worker and the HTTP API |
+Integration tests for every crate are linked into one binary, `crates/tur/tests/integration/`, where `main.rs` declares one module per area:
 
-  `common.rs` builds tiny random checkpoints for pipeline and serving tests, and
-  `model_common.rs` holds model and engine fixtures. Add a module rather than a new test
-  target.
-- **Fixtures** live in `crates/tur/tests/fixtures/`: pinned configs, templates and tensor
-  headers of real checkpoints (`checkpoints/`), the MoE golden outputs, and rendered
-  template cases.
+| Module | Covers |
+| --- | --- |
+| `kernels` | Each Metal kernel against an independent scalar F64 reference |
+| `reference` | Template fidelity; real-checkpoint agreement with Transformers |
+| `contracts` | `HybridEngine` state, fork and restore, speculation, cancellation, failures |
+| `engine`, `fused` | Qwen3.5 through the engine: reference against fused paths, formats, boundaries |
+| `moe` | Qwen MoE conformance against a Transformers fixture |
+| `gemma4` | Dense PLE and sharing, MoE and Unified conformance; cache lifecycle; template bytes; prepacked artifacts; assistant drafts |
+| `quantization` | Calibration, GPTQ, budget allocation, prepacked artifacts |
+| `pipeline`, `scheduling`, `scheduling_metal` | Admission, stress, preemption, deadlines, budgets |
+| `prefix_reuse`, `speculation`, `prepacked` | Reuse, drafting and artifact loading through the pipeline |
+| `serving`, `server` | The worker and the HTTP API |
+
+`common.rs` builds tiny random checkpoints for pipeline and serving tests, and `model_common.rs` holds model and engine fixtures. Add a module rather than a new test target.
+
+Fixtures live in `crates/tur/tests/fixtures/`: pinned configs, templates and tensor headers of real checkpoints (`checkpoints/`), the MoE golden outputs, and rendered template cases.
 
 ## What the tests establish
 
-- **Kernels** against scalar references, on non-aligned shapes, page boundaries, every
-  K/V format and long contexts.
-- **Fused versus reference** execution on identical weights: per-layer and logit
-  agreement, chunked and incremental prefill, page sizes and formats.
-- **Stress and isolation.** Mixed lengths, reshuffled arrivals, cancellation mid-pass,
-  memory pressure and preemption, each compared with solo runs on random weights, where
-  leaked or misplaced state changes the text.
-- **Exactness.** Prefix restores and speculative acceptance reproduce fresh computation.
-  Device sampling passes chi-square tests.
-- **Bounds.** No growth across churn, bounded streaming memory, queue limits and
-  deadlines.
+- Kernels match scalar references on unaligned shapes, page boundaries, every K/V format and long contexts.
+- The fused path matches the reference on identical weights, per layer and in logits, with chunked and incremental prefill, different page sizes and formats.
+- Requests stay isolated. Mixed lengths, reshuffled arrivals, cancellation mid-pass, memory pressure and preemption are each compared with solo runs on random weights, where any leaked or misplaced state changes the text.
+- Prefix restores and speculative acceptance reproduce fresh computation exactly, and device sampling passes chi-square tests.
+- Memory doesn't grow across churn, and streaming memory, queue limits and deadlines hold.
 
 ## Real-checkpoint tests
 
-Tests that need a real checkpoint are `#[ignore]`d:
+Tests that need a real checkpoint are marked `#[ignore]` and run separately:
 
 ```sh
 export TUR_QWEN35_0_8B=~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17
@@ -62,8 +52,7 @@ python -I scripts/qwen3_5_mtp_reference.py --model "$TUR_QWEN35_0_8B" --golden "
 just test-checkpoint -E 'not test(gemma4)'
 ```
 
-The Gemma 4 E2B checkpoint is a second real-model test mule. Its test is ignored in the
-offline suite and needs the pinned local checkpoint and generated CPU reference:
+Gemma 4 E2B is the second real-model test. It needs the checkpoint (`google/gemma-4-E2B-it` at revision `3e22461f65e89153144f8adb70e3b8c2cc9845a7`) and a generated CPU reference:
 
 ```sh
 export TUR_GEMMA4_E2B=/models/gemma-4-E2B-it
@@ -72,16 +61,9 @@ python -I scripts/gemma4_reference.py --model "$TUR_GEMMA4_E2B" --golden "$TUR_G
 just test-checkpoint -E 'test(gemma4_e2b_checkpoint)'
 ```
 
-Download `google/gemma-4-E2B-it` at revision
-`3e22461f65e89153144f8adb70e3b8c2cc9845a7`. The generator streams one F32 text layer at a
-time and gathers PLE rows on demand, keeping the CPU reference within a smaller memory
-budget. It records per-layer states, prompt logits and a greedy continuation. Q8_0
-uses the same 95% next-token agreement floor as Qwen, plus greedy-prefix and EOS checks;
-the offline F32 fixtures use the separate 1e-4 equation-conformance gate.
+The generator streams one F32 layer at a time to keep the CPU reference's memory down, and records per-layer states, prompt logits and a greedy continuation. The Q8_0 test uses the same 95% next-token agreement floor as Qwen, plus greedy-prefix and end-of-sequence checks; the offline F32 fixtures use the stricter 1e-4 conformance gate.
 
-The assistant drafter has its own ignored test. It drafts at 51 positions of a
-939-token prompt, past the sliding window, and requires 90% agreement with
-Transformers F32 drafts from the Q8_0 target:
+The assistant drafter has its own ignored test. It drafts at 51 positions of a 939-token prompt, past the sliding window, and requires 90% agreement with Transformers' F32 drafts from the Q8_0 target:
 
 ```sh
 export TUR_GEMMA4_ASSISTANT=/models/gemma-4-E2B-it-assistant   # 2d874ef7d29f9a30599a1e4b3c1cbc9595f005df
@@ -91,7 +73,7 @@ python -I scripts/gemma4_assistant_reference.py --model "$TUR_GEMMA4_E2B" \
 just test-checkpoint -E 'test(e2b_assistant)'
 ```
 
-Regenerate offline Gemma fixtures with:
+To regenerate the offline Gemma fixtures:
 
 ```sh
 python -I scripts/gemma4_reference.py --tiny crates/tur/tests/fixtures/gemma4
@@ -101,8 +83,7 @@ python -I scripts/gemma4_reference.py --templates crates/tur/tests/fixtures/gemm
 
 ## Reference scripts
 
-`scripts/` regenerates golden data with pinned Transformers 5.20.2 and torch on the CPU
-in F32:
+`scripts/` regenerates golden data with pinned Transformers 5.20.2 and torch, on the CPU in F32:
 
 | Script | Produces |
 | --- | --- |
@@ -111,6 +92,6 @@ in F32:
 | `qwen3_5_moe_reference.py` | The offline MoE oracle on deterministic weights |
 | `gemma4_reference.py` | Dense, MoE and Unified F32 fixtures; Gemma template bytes; real E2B logits and greedy continuation |
 | `gemma4_assistant_reference.py` | The assistant drafter over the dense fixture, and teacher-forced E2B assistant drafts past the sliding window |
-| `qwen3_6_reference_headers.py` | Qwen3.6 tensor headers via byte-range requests; no weights are downloaded |
+| `qwen3_6_reference_headers.py` | Qwen3.6 tensor headers via byte-range requests, without downloading weights |
 
 Run them with `python -I` and treat downloaded files as data.

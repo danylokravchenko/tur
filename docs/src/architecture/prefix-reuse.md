@@ -1,96 +1,46 @@
 # Prefix reuse
 
-A hybrid model's recurrent state cannot be truncated like a key-value cache: the state
-after token `n` exists only if a pass ended exactly at `n`. Prefix reuse therefore
-stores exact boundaries. Each `PrefixCache` entry is a committed `ModelState` (page table
-plus recurrent slot) after some request's first `n` tokens.
+Many requests start with the same tokens: a shared system prompt, a long document several users ask about, or an agent conversation that grows by one step at a time. Prefix reuse computes that shared start once and lets later requests resume from it, so their first token comes sooner and the GPU spends its time on new work.
+
+In a plain transformer you can cache keys and values and cut them back to any length. A hybrid model's recurrent state doesn't work that way: the state after token `n` exists only if a pass ended exactly at `n`. So Tur stores snapshots at exact boundaries. Each `PrefixCache` entry is a committed `ModelState` (a page table plus a recurrent slot) after some request's first `n` tokens.
 
 ## Where snapshots are taken
 
-- **Every multiple of the spacing** (256 tokens). The pipeline never lets a prefill chunk
-  cross one, so these boundaries always exist.
-- **The end of each prompt**, together with the logits of its last token. An identical
-  prompt then samples its first output without running a model pass.
-- **A predicted template-divergence boundary**, for prompts containing assistant history.
-  This preserves the matching tokens before a generation opener is rewritten next turn.
-- **The last consumed token of each finished request.** A conversation's next turn can
-  resume right after the reply.
+- At every multiple of the spacing, 256 tokens by default. The scheduler never lets a prompt chunk cross one of these, so the boundaries always exist.
+- At the end of each prompt, together with the logits of its last token. An identical prompt can then sample its first output without running the model at all.
+- At the point where the chat template will rewrite the conversation, for prompts that already contain assistant replies (explained below).
+- At the last token of each finished request, so a conversation's next turn can resume right after the reply.
 
-To predict a rewrite, the pipeline renders a probe with an empty assistant reply and a
-new empty user turn, without a generation opener. Its longest token prefix shared with
-the actual prompt becomes an extra prefill pass boundary. A template that rejects the
-probe keeps the ordinary boundaries, as does a prompt with no assistant history. The
-first turn therefore takes no extra pass. A prediction never authorizes a restore:
-lookup still verifies every token of the actual next request.
+Chat templates often render the previous assistant turn differently once a new user turn follows it, for example by dropping its thinking section. The next request then matches the old one only up to that point. To find it, the pipeline renders a probe with an empty assistant reply and a new empty user turn, and takes the longest prefix it shares with the actual prompt as an extra chunk boundary. First turns, prompts without assistant history, and templates that reject the probe keep the ordinary boundaries, so they pay nothing extra. The prediction only decides where to cut; a restore still checks every token of the next request.
 
-Snapshots share leases with the request that produced them, so taking one copies
-nothing. It keeps one recurrent slot and its pages alive. A snapshot that ends inside a
-page makes its first appender copy that one tail page.
+A snapshot shares its pages and slot with the request that produced it, so taking one copies nothing. It keeps one recurrent slot and its pages alive. If a snapshot ends partway through a page, the first request to append there copies that one page.
 
 ## Lookup
 
-Keys chain a keyed hash over tokens, seeded by a namespace: the tenant, or the request's
-`cache_salt`. Equal prefixes in different namespaces never meet, and a hash hit is used
-only after comparing every token. The pool pins the model's identity and state layout,
-so entries cannot cross models, quantizations or positional settings.
+Keys are a chained hash over the tokens, seeded by a namespace: the tenant, or the request's `cache_salt`. Equal prefixes in different namespaces never meet, and a hash match is used only after comparing every token. The pool records the model's identity and state layout, so entries can't cross models, quantizations or positional settings.
 
-A lookup probes only the lengths at which entries exist, so its cost follows the number
-of entries rather than the prompt's length.
+A lookup probes only the lengths where entries exist, so its cost depends on the number of entries rather than the prompt's length.
 
 ## Waiting for a producer
 
-When several requests reach the same cold prefix together, only the oldest computes it.
-The others wait until its snapshot exists and then restore it. The set of waiters is
-rebuilt every pass, so a cancelled or finished producer stops holding them back at once.
-Waiting is bounded by the scheduler's queue-age guard.
+When several requests reach the same uncached prefix together, only the oldest computes it. The others wait until its snapshot exists and then restore it, instead of each computing their own copy. The set of waiters is rebuilt every pass, so if the producer is cancelled or finishes early, nobody stays stuck behind it. The scheduler's queue-age limit bounds the wait.
 
 ## Retention and eviction
 
-By default the cache keeps one snapshot per running request (`--prefix-snapshots`),
-capped at 1/8 of the state pool's bytes. Under memory pressure, snapshots are evicted
-before any running request is preempted.
+By default the cache keeps one snapshot per running request (`--prefix-snapshots`), using at most 1/8 of the state pool. Under memory pressure, snapshots go before any running request is preempted.
 
-Eviction removes the entry that saves the fewest tokens per retained byte. An entry's
-saving is the tokens it covers beyond the deepest retained entry it extends, times how
-often its prefix was recently computed or restored. Its cost is its recurrent slot plus
-the pages only it holds. Counts are halved periodically, so prefixes that stop recurring
-lose their protection. A new entry is always kept. Pages and slots return to the pool
-only when no request or entry holds them.
+Eviction removes the entry that saves the least compute per byte it holds. An entry's value is the number of tokens it covers beyond the deepest retained entry it extends, times how often its prefix was recently computed or restored. Its cost is its recurrent slot plus the pages only it holds. Counts are halved periodically, so prefixes that stop recurring lose their protection. A new entry is always kept at first. Pages and slots return to the pool only when no request or entry holds them.
 
 ## Decisions
 
 Measured on Qwen3.5-0.8B on an M1:
 
-- **Zero-copy, verified snapshots.** Warmed prefixes generate exactly the text of cold
-  runs. Eight users behind a 1.5K-token system prompt reached their first token 18×
-  sooner than without reuse (11.0 → 0.61 s p50), with 17× less prefill work.
-- **256-token spacing**, chosen from a 64–512 sweep and kept after re-measurement: 128
-  cached 12% more multi-turn tokens at equal last-turn TTFT.
-- **Prompt-end snapshots keep their logits.** An exact repeat needs no prefill pass.
-- **Wait for an in-flight producer.** A burst of eight users behind a cold 1.5K-token
-  prompt got its first token 5.6× sooner (9.58 → 1.72 s), with 5.7× fewer prefill tokens.
-  An agent's first step was 3.0× faster.
-- **Evict by saved compute per retained byte.** Under churn, a recurring prefix survived
-  in 3 of 5 waves, where LRU order kept it in none. An agent loop cached 83% of its prompt
-  tokens instead of 72% and finished 1.25× sooner. Low-reuse, decode-only and mixed
-  traffic were unchanged.
-- **Restorable prefixes first, opt-in.** With `engine.prefix_restorable_first`, waiting
-  requests with a restorable snapshot take free slots ahead of older cold ones until the
-  oldest waits the queue-age limit. Under warm-cold contention (16 requests, 4 slots)
-  warm TTFT fell 5.4× (4.43 → 0.82 s) while cold TTFT rose 15% and throughput fell 10%
-  (44.6 → 39.9 tok/s); the other reuse workloads were unchanged. It stays off by
-  default because it slows unrelated requests.
-- **No radix tree.** The indexed hash lookup costs 6.6 µs for a 32K-token hit, down from
-  152 µs, and under 0.1 µs for a miss.
-- **Prefix reuse and the MTP drafter are mutually exclusive.** A snapshot at boundary B
-  cannot hold the head's entry for B − 1, which depends on the token sampled after B, so
-  enabling `--mtp` disables reuse.
-- **Predict template divergence once assistant history exists.** A retained boundary
-  avoids up to 255 tokens of extra replay before a rewrite at 256-token spacing; the
-  reply after the rewrite still needs recomputing. Four conversations of six turns with
-  16 snapshots cached 68% of prompt tokens instead of 52%, cut last-turn TTFT 30% and
-  finished 11% sooner. With eight snapshots, eviction limited the gain to 2% lower
-  last-turn TTFT at unchanged total time. The cache budget is unchanged; see
-  [Measured performance](../guide/performance.md#prefix-reuse) for the repeat spread.
-  Taking these boundaries on first turns too raised cold single-request TTFT 15%, so
-  first turns retain their ordinary passes.
+- Snapshots are zero-copy and verified. Requests that restore a prefix generate exactly the text of uncached runs. Eight users behind a cached 1.5K-token system prompt got their first token about 17× sooner than without reuse (0.56 s against 9.5 s at the median).
+- Spacing is 256 tokens, chosen from a sweep of 64 to 512. A spacing of 128 cached 12% more tokens in multi-turn chats but didn't improve time to first token.
+- Prompt-end snapshots keep their logits, so an exact repeat needs no model pass.
+- Requests wait for an in-flight producer. Eight users sending the same new 1.5K-token prompt got their first token 5.6× sooner and computed 5.7× fewer prompt tokens than if each had computed it.
+- Eviction ranks by compute saved per byte. Under churn, a recurring prefix survived 3 of 5 waves where least-recently-used eviction kept it in none, and an agent loop cached 83% of its prompt tokens instead of 72%, finishing 1.25× sooner. Low-reuse, decode-only and mixed traffic were unchanged.
+- Letting cached requests jump the queue is opt-in. With `engine.prefix_restorable_first`, cached requests got their first token 5.4× sooner under contention (16 requests, 4 places), but uncached ones waited 15% longer and throughput fell 10%. It stays off by default because it slows unrelated requests.
+- Lookup uses an indexed hash, not a radix tree. A hit at 32K tokens costs 6.6 µs and a miss under 0.1 µs.
+- Prefix reuse and the MTP drafter exclude each other. The head's state for boundary B depends on the token sampled after B, which a snapshot at B can't hold, so `--mtp` turns reuse off.
+- The template-rewrite boundary is taken once a prompt has assistant history. Over four six-turn conversations with 16 snapshots, it raised the share of cached prompt tokens from 52% to 68%, cut last-turn time to first token by 30%, and finished 11% sooner. With 8 snapshots, eviction limited the gain to 2% on the last turn and nothing on total time. Taking it on first turns too made a single uncached request 15% slower to its first token, so first turns skip it.

@@ -5,7 +5,6 @@
 # Guide
 
 - [Quickstart](guide/quickstart.md)
-- [Measured performance](guide/performance.md)
 - [Requirements and checkpoints](guide/getting-started.md)
 - [Configuration](guide/configuration.md)
 - [Command line](guide/cli.md)
@@ -14,6 +13,7 @@
 - [Choosing a quantization](guide/choosing-quantization.md)
 - [Tuning](guide/tuning.md)
 - [Rust library](guide/library.md)
+- [Measured performance](guide/performance.md)
 
 # Architecture
 

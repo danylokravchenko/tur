@@ -1,7 +1,6 @@
 # AI Writing Tropes to Avoid
 
-Add this file to your AI assistant's system prompt or context to help it avoid
-common AI writing patterns. Source: [tropes.fyi](https://tropes.fyi) by [ossama.is](https://ossama.is)
+Add this file to your AI assistant's system prompt or context to help it avoid common AI writing patterns. Source: [tropes.fyi](https://tropes.fyi) by [ossama.is](https://ossama.is)
 
 ---
 
@@ -322,6 +321,4 @@ The rigid formula where AI acknowledges problems only to immediately dismiss the
 
 ---
 
-Remember: any of these patterns used once might be fine. The problem is when
-multiple tropes appear together or when a single trope is used repeatedly.
-Write like a human: varied, imperfect, specific.
+Remember: any of these patterns used once might be fine. The problem is when multiple tropes appear together or when a single trope is used repeatedly. Write like a human: varied, imperfect, specific.

@@ -1,7 +1,6 @@
 # Rust library
 
-The `tur` crate re-exports the engine for use inside your own process. The workspace is
-not published, so depend on it by path or git:
+The `tur` crate exposes the engine for use inside your own process. The workspace isn't published to crates.io, so depend on it by git or path:
 
 ```toml
 [dependencies]
@@ -41,15 +40,11 @@ fn main() -> Result<()> {
 }
 ```
 
-`InferencePipeline::new` validates the checkpoint, plans memory against the device
-budget and loads the weights. `run` requires an idle pipeline and streams decoded text
-to the callback.
+`InferencePipeline::new` validates the checkpoint, plans memory against the device and loads the weights. `run` needs an idle pipeline and streams decoded text to the callback.
 
 ## Many requests
 
-The pipeline is a single-owner state machine: submit requests, then step it. Each step
-runs one packed pass over every scheduled request and returns their new text and any
-completed outcomes. One request's failure never fails the others.
+The pipeline has a single owner: you submit requests, then step it. Each step runs one batched pass over every scheduled request and returns their new text and any finished results. One request failing never fails the others.
 
 ```rust,ignore
 use std::collections::HashMap;
@@ -79,51 +74,37 @@ fn serve_batch(pipeline: &mut InferencePipeline, prompts: Vec<String>) -> Result
 }
 ```
 
-`step_streaming` is `begin_step` followed by `finish_step`. Calling them separately
-lets you submit or cancel requests while the GPU runs the pass; this is how the HTTP
-worker overlaps intake with execution. At most one pass is in flight.
+`step_streaming` is `begin_step` followed by `finish_step`. Calling the two separately lets you submit or cancel requests while the GPU runs the pass, which is how the HTTP server overlaps new requests with execution. At most one pass is in flight.
 
 ## Requests
 
-`GenerationRequest::new(prompt, max_tokens)` makes one user turn. The fields are public:
+`GenerationRequest::new(prompt, max_tokens)` makes a single user turn. Its fields are public:
 
 | Field | Meaning |
 | --- | --- |
-| `messages` | Full conversation (`ChatMessage` with `Role::{System, User, Assistant, Tool}`) |
+| `messages` | The full conversation (`ChatMessage` with `Role::{System, User, Assistant, Tool}`) |
 | `tools` | Function definitions rendered by the template |
 | `render` | `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `add_generation_prompt` |
-| `sampling` | `SamplingOptions`; `None` fields inherit the checkpoint's defaults |
-| `seed` | Random stream of this request |
+| `sampling` | `SamplingOptions`; `None` fields use the checkpoint's defaults |
+| `seed` | Seed of this request's random stream |
 | `timeout` | Deadline measured from submission |
 | `cache_salt` | Prefix-reuse namespace |
-| `grammar` | A `TopLevelGrammar` (llguidance) the output must match; the request completes when the grammar does |
+| `grammar` | A `TopLevelGrammar` (llguidance) the output must match; the request ends when the grammar does |
 
-Completed requests return `GenerationStats`, which holds:
-
-- the generated text and any parsed `tool_calls`;
-- prompt, generated and cached token counts;
-- time to the first token and total elapsed time;
-- preemption count, and drafted and accepted token counts;
-- `finish_reason`.
+A finished request returns `GenerationStats`, with the generated text and any parsed `tool_calls`, prompt, generated and cached token counts, time to first token and total time, how often it was preempted, how many tokens were drafted and accepted, and the `finish_reason`.
 
 ## Configuration
 
-`PipelineConfig::new(max_batch_size, prefill_chunk_size)` gives the defaults the CLI
-uses. Its public fields:
+`PipelineConfig::new(max_batch_size, prefill_chunk_size)` gives the defaults the CLI uses. Its public fields are:
 
-- `scheduler` (`SchedulerConfig`): running and waiting limits, the pass token cap, the
-  prefill target and the queue-age guard.
-- `prefix` (`PrefixConfig`): snapshot spacing, count and state share;
-  `PrefixConfig::DISABLED` turns reuse off.
-- `speculation` (`SpeculationConfig::new(drafts)`, or `with_mtp(drafts)` to add the
-  head).
-- `state_bytes`: the state pool size; `None` derives it.
-- `device_sampling`: sample on the GPU (default) or the host.
+- `scheduler` (`SchedulerConfig`): running and waiting limits, the pass token cap, the pass time target and the queue-age limit.
+- `prefix` (`PrefixConfig`): snapshot spacing, count and memory share. `PrefixConfig::DISABLED` turns reuse off.
+- `speculation`: `SpeculationConfig::new(drafts)`, or `with_mtp(drafts)` to add the MTP head.
+- `state_bytes`: the state pool size, or `None` to derive it.
+- `device_sampling`: sample on the GPU (the default) or the CPU.
 
-`PipelineConfig::reproducible(chunk)` serializes requests for bit-reproducible output.
+`PipelineConfig::reproducible(chunk)` runs requests one at a time for bit-reproducible output.
 
-To run several models on one device, create one `DeviceBudget` and pass it to
-`InferencePipeline::with_budget` for each, so their plans share the device's memory.
+To run several models on one GPU, create one `DeviceBudget` and pass it to `InferencePipeline::with_budget` for each, so their memory plans share the device.
 
-Lower-level contracts (`HybridEngine`, `HybridModel`, state pools and kernels) are
-public too; see [Execution engine](../architecture/execution.md).
+The lower-level pieces (`HybridEngine`, `HybridModel`, state pools and kernels) are public too; see [Execution engine](../architecture/execution.md).

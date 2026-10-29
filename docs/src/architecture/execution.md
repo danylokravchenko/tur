@@ -1,15 +1,10 @@
 # Execution engine
 
-Two contracts separate the model from the machinery that drives it: `HybridModel`
-(`tur-models`) and `HybridEngine` (`tur-engine`).
+Two contracts separate the model from the machinery that drives it. `HybridModel` (in `tur-models`) says how to run one batched pass, and `HybridEngine` (in `tur-engine`) owns requests, memory and in-flight GPU work. A new model family only has to implement the first.
 
 ## The model contract
 
-`InferencePipeline` owns a `HybridEngine<TextModel>`. The `TextModel` enum selects Qwen
-or Gemma at load time; the engine, scheduler, pool leases, completion fences, prefix
-snapshots and sampling remain shared. Gemma declares only physical attention-cache
-owners in `ModelDescription`, so its sharing suffix consumes no duplicate K/V state.
-
+`InferencePipeline` owns a `HybridEngine<TextModel>`, where the `TextModel` enum picks Qwen or Gemma at load time. Everything else, including the scheduler, memory pools, completion tracking, prefix snapshots and sampling, is shared.
 
 ```rust,ignore
 pub trait HybridModel: Send + Sync + 'static {
@@ -19,97 +14,52 @@ pub trait HybridModel: Send + Sync + 'static {
 }
 ```
 
-`ModelDescription` declares everything the engine needs:
+`ModelDescription` tells the engine what to allocate: each layer's kind and state (attention K/V, or recurrent convolution and matrix state) with its dtype, the dimensions, vocabulary and position limit, and the input types the model accepts. Gemma declares only the layers that produce their own K/V, so its sharing layers cost no extra memory.
 
-- layer kinds and their state (attention K/V, or recurrent convolution and matrix
-  state), each with its dtype;
-- dimensions, vocabulary and position limit;
-- the input modalities the model accepts.
+`PackedForward` is one pass over many requests, without padding:
 
-`PackedForward` is one pass over many sequences, without padding:
+- `tokens` and `positions` hold every request's new tokens back to back;
+- each `SequenceForward` gives its slice of those arrays, its `SequenceState` (committed pages and recurrent slot, plus the ones reserved for this pass), the positions whose logits it needs, and whether a drafter needs its hidden states;
+- `pool` holds the persistent state of every request.
 
-- `tokens` and `positions` hold every sequence's new tokens back to back;
-- each `SequenceForward` gives its range in those arrays, its `SequenceState` (committed
-  pages and recurrent slot, plus the pages and slots reserved for this pass), the packed
-  positions whose logits are needed, and whether to return hidden states for a drafter;
-- `pool` is the persistent state of every sequence.
-
-The model returns one result per sequence: F32 logits for the requested rows. State is
-written in place into the reserved pages and slots. A model error for one sequence fails
-only that sequence. Model inputs are shared rather than copied, and outputs are copied
-once.
+The model returns one result per request: F32 logits for the rows asked for. It writes state in place into the reserved pages and slots. An error in one request fails only that request.
 
 ## The engine
 
-`HybridEngine` is the single owner of a model's requests, state pool and in-flight work.
-No locks are held during execution, and at most one batch is in flight:
+`HybridEngine` is the single owner of a model's requests, state pool and in-flight work. Because one owner does everything, no locks are held during execution. At most one batch is in flight at a time:
 
-1. **`submit(plan)`** validates a `PackedExecution` with checked arithmetic: token
-   ranges, positions, state handles, page and slot indices, non-overlapping writes,
-   requested logits and draft rows. It reserves pool memory, then encodes one pass and
-   hands its fence to a notifier thread. It returns the pass's checked payload and
-   workspace requirements.
-2. **`finish()`** waits for the fence, then samples, verifies drafts and publishes each
-   sequence independently: a `SequenceResult` with its tokens, or its own error.
+1. `submit(plan)` checks a `PackedExecution` with checked arithmetic: token ranges, positions, state handles, page and slot indices, that no two requests write the same place, requested logits and draft rows. It reserves memory, encodes the pass, and hands its completion fence to a notifier thread.
+2. `finish()` waits for the fence, then samples, verifies drafts and publishes each request independently, as a `SequenceResult` with its tokens or its own error.
 
-Between the two calls the owner can do host work: intake, tokenization, cancellation.
-The [pipeline](scheduling.md) builds `PackedExecution`s and drives these calls.
+Between the two calls, the owner is free to do CPU work such as accepting new requests, tokenizing and cancelling. The [pipeline](scheduling.md) builds each `PackedExecution` and drives these calls.
 
 ### State operations
 
-A request's state is addressed by a generation-tagged `StateHandle`. The engine offers:
+A request's state is addressed by a `StateHandle` tagged with a generation number, so a stale handle can't reach memory that has since been reused. The engine can:
 
 - `allocate` and `release_state`;
-- `checkpoint`, which takes an immutable `Checkpoint`: model state, RNG position,
-  sampled tokens and grammar status at one boundary;
-- `fork` and `restore` from a checkpoint, used by prefix reuse and preemption;
-- `adopt`, which takes over a `ModelState` (a page table plus recurrent slot);
+- `checkpoint` a request into an immutable `Checkpoint`, holding its model state, random-stream position, sampled tokens and grammar status at one token boundary;
+- `fork` or `restore` from a checkpoint, which prefix reuse and preemption use;
+- `adopt` an existing `ModelState` (a page table plus a recurrent slot);
 - `cancel`.
 
-Restoring is atomic across every layer kind.
+A restore changes every layer kind at once, or nothing.
 
 ### Speculative transactions
 
-A sequence can submit drafted tokens with logits requested at every position. The engine
-samples the target at each position and accepts drafts while they equal the target's own
-samples. On the first mismatch it publishes the target's sample. If every draft matches,
-it also publishes the last row's sample as a bonus token. Recurrent layers keep a slot at
-each candidate boundary, so rollback is just selecting the accepted boundary. Rejected
-slots and pages are released after completion, and RNG and penalty history advance only
-for published samples. See [Speculative decoding](speculation.md).
+A request can submit drafted tokens and ask for logits at every drafted position. The engine samples the model's own token at each position and accepts drafts while they match. At the first mismatch, it publishes the model's token and stops. If every draft matches, it also publishes the token after the last draft as a bonus. Recurrent layers keep a slot at each candidate position, so undoing rejected drafts means picking the right slot, with nothing to recompute. The random stream and penalty history advance only for published tokens. See [Speculative decoding](speculation.md).
 
-## Completion
+## Knowing when the GPU is done
 
-Candle commits a command buffer only every few dozen encoders, or when synchronized. If
-the owner waited on the fence itself, the tail of each pass would wait for that
-synchronization. `Notifier` instead runs the fence on its own thread: `Completion::notify`
-hands it over right after encoding, which commits the tail at once, while the owner
-keeps working until it consumes the completion event. The host copy of the pass's
-outputs is queued after the work and doubles as its fence, so results return without
-another round trip to the device.
+Candle commits a command buffer only every few dozen operations, or when something waits on it. If the engine's thread waited for a pass itself, the tail of the pass would sit uncommitted until the wait started. Instead, `Completion::notify` hands the fence to a separate `Notifier` thread right after encoding. That commits the tail at once, and the engine keeps working until it actually needs the result. The copy of the pass's outputs back to the CPU is queued last and doubles as the fence, so results come back without another trip to the GPU.
 
-Resources referenced by a pass (weights, every page and slot it touches, logits) are
-held by a `Completion` until it is fenced. A failed fence quarantines them, so they are
-never reused while possibly still referenced, and the quarantine is per engine.
+A `Completion` holds everything the pass uses (weights, every page and slot, logits) until the fence fires. If a fence fails, those resources are quarantined and never reused, because the GPU might still be touching them.
 
 ## Decisions
 
-- **One packed call per pass.** `HybridModel::forward` takes tokens, positions,
-  per-sequence ranges, committed state, requested logits and recurrent boundaries for
-  the whole batch. There is no per-request loop, so chunked prefill and batched decode
-  share one path.
-- **Independent publication.** One request's model, sampling, grammar or state error
-  never fails another request; only a failed fence fails the whole pass.
-- **Generation-tagged handles.** Stale and foreign handles fail to resolve, and state is
-  reclaimed only after every command that references it completes.
-- **Double-buffered recurrent state.** Each pass writes new recurrent slots beside the
-  committed ones. Rollback is exact, with no truncation or copying, at the cost of two
-  recurrent slots per running request.
-- **In-flight depth stays one.** The next pass cannot be selected before this pass's
-  tokens are known. Host encoding is 13–25% of a pass but already overlaps the GPU, and
-  the device idles only 28–38 µs between passes, so a deeper pipeline is bounded at about
-  1.003× (see [Rejected experiments](../design/rejected.md)).
-
-- **One engine for Qwen and Gemma.** Architecture dispatch changes the layer equations,
-  while the checked packed-execution and completion contracts stay common. Gemma's
-  numerical fixtures and F32 chunk/batch/fork tests exercise that same contract.
+- One packed call per pass. `HybridModel::forward` takes the tokens, positions, ranges, state, requested logits and recurrent boundaries for the whole batch, with no per-request loop, so prompt chunks and single-token decodes share one path.
+- Requests publish independently. A model, sampling, grammar or state error in one request never fails another; only a failed fence fails the whole pass.
+- Handles carry generations. Stale and foreign handles fail to resolve, and memory is reclaimed only after every command that uses it completes.
+- Recurrent state is double-buffered. Each pass writes new recurrent slots next to the committed ones, so rollback is exact and needs no copying, at the cost of two slots per running request.
+- One pass in flight is enough. The next pass can't be chosen before this pass's tokens are known, encoding already overlaps the GPU, and the GPU sits idle only tens of microseconds between passes, so a deeper pipeline could gain at most 0.3% (see [Rejected experiments](../design/rejected.md)).
+- Qwen and Gemma share one engine. The model changes the layer equations, while the checked execution and completion contracts stay common, and Gemma's fixtures and F32 chunking, batching and fork tests exercise the same contract.
