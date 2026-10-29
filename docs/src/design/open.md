@@ -7,7 +7,11 @@
   the MoE wide tier, which trails Candle by 1.2–1.5× and needs trained routing traces.
 - **Flagship MTP head** for expert checkpoints.
 - **Gemma 4 follow-through.** Execute larger checkpoints on suitable Macs; establish
-  held-out quality budgets, tune prefill, and add native MTP and offline prepacking.
+  held-out quality budgets, tune prefill, and add offline prepacking. Google's MTP
+  drafters (May 2026) share the target's K/V cache and are the largest remaining decode
+  lever. Window-sized K/V for sliding layers would cut long-context memory by about two
+  thirds on E2B, but needs a decision on eviction and prefix reuse. Tiled prefill
+  attention does not yet serve ungated or windowed heads.
 - **More devices.** Every number so far is from one M1. Launch shapes and crossovers
   need per-device sweeps, and the minimum supported macOS and chip still has to be
   decided.

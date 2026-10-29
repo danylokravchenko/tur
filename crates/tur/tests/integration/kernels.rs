@@ -915,7 +915,9 @@ fn test_ungated_attention_512_heads_and_sliding_windows_match_scalar_reference()
                 head_dim: dim,
             };
             let paged = kernels.paged_kv(case.page, slots, &table, &first, &visible)?;
-            for window in [0, 1, 7, 512] {
+            // Windows of 7 and 24 keys span several splits of 2 or 8 keys inside a
+            // 40-key context.
+            for window in [0, 1, 7, 24, 512] {
                 let expected = attention_reference(
                     &case,
                     &q,
@@ -927,7 +929,7 @@ fn test_ungated_attention_512_heads_and_sliding_windows_match_scalar_reference()
                     &visible,
                     Some((window, 1.0)),
                 );
-                for minimum in [8, 1024] {
+                for minimum in [2, 8, 1024] {
                     let tuned = kernels.clone().with_tuning(Tuning {
                         min_split_keys: minimum,
                         ..kernels.tuning()

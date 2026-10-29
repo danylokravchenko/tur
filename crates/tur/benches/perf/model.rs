@@ -8,6 +8,9 @@
 //! `TUR_BENCH_PREFILL=128,2048` and `TUR_BENCH_CONTEXTS=2048,8192`. `TUR_BENCH_REFERENCE=1`
 //! adds the F32 reference execution with F32 K/V. `TUR_BENCH_ONLY=prefill,decode,engine`
 //! selects cases and `TUR_BENCH_ENGINE_TOKENS=32` sets the engine case's length.
+//! `TUR_BENCH_BATCHES=1,2,4,8,16` sets the decode batches at the short context and
+//! `TUR_BENCH_CONTEXT_BATCHES=1,4` those at each of `TUR_BENCH_CONTEXTS`; larger models
+//! such as Gemma 4 E2B use fewer of both to keep a run short.
 
 use candle_core::Device;
 use serde_json::{Value, json};
@@ -287,7 +290,16 @@ fn selected(case: &str) -> bool {
     std::env::var("TUR_BENCH_ONLY").map_or(true, |only| only.split(',').any(|c| c == case))
 }
 
-fn measure(model: &TextModel, prefill: &[usize], contexts: &[usize]) -> Result<Value> {
+/// Prefill lengths, long decode contexts and the decode batches at short and long contexts.
+struct Sweep {
+    prefill: Vec<usize>,
+    contexts: Vec<usize>,
+    batches: Vec<usize>,
+    context_batches: Vec<usize>,
+}
+
+fn measure(model: &TextModel, sweep: &Sweep, contexts: &[usize]) -> Result<Value> {
+    let prefill: &[usize] = &sweep.prefill;
     let prefill = if selected("prefill") { prefill } else { &[] };
     let prefill = prefill
         .iter()
@@ -295,11 +307,11 @@ fn measure(model: &TextModel, prefill: &[usize], contexts: &[usize]) -> Result<V
         .collect::<Result<Vec<_>>>()?;
     let mut decode = Vec::new();
     if selected("decode") {
-        for batch in [1, 2, 4, 8, 16] {
+        for &batch in &sweep.batches {
             decode.push(decode_case(model, batch, SHORT_CONTEXT)?);
         }
         for &context in contexts {
-            for batch in [1, 4] {
+            for &batch in &sweep.context_batches {
                 decode.push(decode_case(model, batch, context)?);
             }
         }
@@ -320,8 +332,12 @@ pub(crate) fn run() -> Result<()> {
             .ok_or_else(|| TurError::Other("set TUR_BENCH_MODEL".into()))?,
     );
     let device = Device::new_metal(0)?;
-    let prefill = env_sizes("TUR_BENCH_PREFILL", "128,2048")?;
-    let contexts = env_sizes("TUR_BENCH_CONTEXTS", "2048,8192")?;
+    let sweep = Sweep {
+        prefill: env_sizes("TUR_BENCH_PREFILL", "128,2048")?,
+        contexts: env_sizes("TUR_BENCH_CONTEXTS", "2048,8192")?,
+        batches: env_sizes("TUR_BENCH_BATCHES", "1,2,4,8,16")?,
+        context_batches: env_sizes("TUR_BENCH_CONTEXT_BATCHES", "1,4")?,
+    };
     let pages = env_sizes("TUR_BENCH_PAGES", "16")?;
     let reference = std::env::var("TUR_BENCH_REFERENCE").is_ok_and(|v| v == "1");
     let engine_tokens = env_sizes("TUR_BENCH_ENGINE_TOKENS", "32")?
@@ -357,7 +373,7 @@ pub(crate) fn run() -> Result<()> {
                         },
                     )?;
                     let load_seconds = load_start.elapsed().as_secs_f64();
-                    let mut result = measure(&model, &prefill, &contexts)?;
+                    let mut result = measure(&model, &sweep, &sweep.contexts)?;
                     result["format"] = json!(name);
                     result["recurrent_state"] = json!(state);
                     result["execution"] = json!("Fused");
@@ -365,7 +381,7 @@ pub(crate) fn run() -> Result<()> {
                     runs.push(result);
                     if reference && kv == KvFormat::F32 {
                         let model = model.with_execution(Execution::Reference)?;
-                        let mut result = measure(&model, &prefill, &[])?;
+                        let mut result = measure(&model, &sweep, &[])?;
                         result["format"] = json!(name);
                         result["execution"] = json!("Reference");
                         runs.push(result);

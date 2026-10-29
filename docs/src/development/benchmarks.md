@@ -15,7 +15,7 @@ Qwen-specific quality studies continue to use `TUR_QWEN35_0_8B`.
 | Case | Measures | Main knobs |
 | --- | --- | --- |
 | `kernels` | Each custom kernel against Candle's path at Qwen3.5 shapes | `TUR_BENCH_ONLY=delta\|linear\|paged\|tiled\|sample\|moe`, `TUR_BENCH_LINEAR`, `TUR_BENCH_MOE`, `TUR_BENCH_SHAPE` |
-| `model` | Model-level prefill and batched decode at several contexts, per weight and K/V format; engine overhead | `TUR_BENCH_FORMATS` (formats or artifact dirs), `TUR_BENCH_KV`, `TUR_BENCH_PAGES`, `TUR_BENCH_PREFILL`, `TUR_BENCH_CONTEXTS`, `TUR_BENCH_REFERENCE=1`, `TUR_BENCH_ONLY=prefill,decode,engine` |
+| `model` | Model-level prefill and batched decode at several contexts, per weight and K/V format; engine overhead | `TUR_BENCH_FORMATS` (formats or artifact dirs), `TUR_BENCH_KV`, `TUR_BENCH_PAGES`, `TUR_BENCH_PREFILL`, `TUR_BENCH_CONTEXTS`, `TUR_BENCH_BATCHES`, `TUR_BENCH_CONTEXT_BATCHES`, `TUR_BENCH_REFERENCE=1`, `TUR_BENCH_ONLY=prefill,decode,engine` |
 | `serving` | Throughput, TTFT and inter-token latency through the pipeline | `TUR_BENCH_WORKLOADS=decode,mixed,grammar,arrivals,prefix,reuse,speculation`, `TUR_BENCH_CONCURRENCY`, `TUR_BENCH_OUTPUT`, `TUR_BENCH_SAMPLING=0.7,20,0.95` |
 | `prefix` | Host cost of prefix keys, lookups and eviction (CPU, no checkpoint) | none |
 | `kv_quality` | Teacher-forced KL, top-1 and NLL of K/V, state and weight variants against an F32 reference | `TUR_EVAL_TEXT`, `TUR_EVAL_KV`, `TUR_EVAL_STATE`, `TUR_EVAL_WEIGHTS`, `TUR_EVAL_TOKENS`, `TUR_EVAL_GENERATE` |
@@ -36,16 +36,19 @@ workloads:
   `TUR_BENCH_RESTORABLE_FIRST=1` admits restorable prefixes first.
 - `speculation`: prompt lookup and MTP over repetitive, novel and code prompts.
 
-For a bounded E2B engine measurement using the same benchmark path:
+Gemma 4 E2B is about three times the 0.8B Qwen's per-token work, and its default
+sweep prefills 32K tokens for one case. `just bench-gemma` runs a short profile on the
+local snapshot in `TUR_GEMMA4_E2B`: Q8_0 weights, F16 K/V, a 512-token prefill, decode
+at batches 1 and 4 at 128 tokens and one sequence at 4K (past the 512-token window),
+and 16 engine tokens. Any `TUR_BENCH_*` variable overrides its default:
 
 ```sh
-TUR_BENCH_MODEL="$TUR_GEMMA4_E2B" \
-TUR_BENCH_FORMATS=q8_0 TUR_BENCH_KV=f16 TUR_BENCH_PAGES=16 \
-TUR_BENCH_ONLY=engine TUR_BENCH_ENGINE_TOKENS=8 just bench model > gemma4-engine.json
+TUR_GEMMA4_E2B=<snapshot dir> just bench-gemma > gemma4.json
+TUR_BENCH_ONLY=decode TUR_BENCH_CONTEXTS=8192 just bench-gemma > gemma4-8k.json
 ```
 
 Gemma's larger PLE tables make some wide batch/context sweeps exceed a 16 GB device.
-Start with one sequence and the engine case, then size measurements to the target Mac.
+Start with the short profile, then size measurements to the target Mac.
 
 ## Methodology
 

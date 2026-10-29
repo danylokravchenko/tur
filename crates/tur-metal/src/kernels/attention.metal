@@ -207,9 +207,11 @@ kernel void attention_kv(
     uint t = rest / p.splits;
     uint g = h0 / (p.heads / p.kv_heads);
     uint keys = visible[t];
-    uint split_begin = split * p.split_keys;
-    uint begin = max(split_begin, p.window > 0 && keys > p.window ? keys - p.window : 0u);
-    uint end = min(keys, split_begin + p.split_keys);
+    // Splits partition each query's own window, so a sliding layer keeps every split busy
+    // however long the context grows.
+    uint first_key = p.window > 0 && keys > p.window ? keys - p.window : 0u;
+    uint begin = first_key + split * p.split_keys;
+    uint end = min(keys, begin + p.split_keys);
     uint base = first_block[t];
     uint groups = QUANT == 0 ? 0 : p.dim / p.group;
     uint dims[C], sidx[C];

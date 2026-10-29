@@ -67,11 +67,14 @@ impl Moe {
         let logits = (norm / (width as f64).sqrt())?.matmul(&self.router.t()?)?;
         let input = model.rms(residual, &self.pre)?;
         #[cfg(feature = "metal")]
-        if let Some(k) = &model.kernels {
+        if let Some(k) = model.fused_kernels() {
             let routes = k.route_scaled(&logits, self.top_k, &self.expert_scale)?;
             let gate_up = k.expert_linear_routed(&self.gate_up, &input, &routes)?;
             let inner = gate_up.dim(1)? / 2;
-            let act = (gate_up.narrow(1, 0, inner)?.gelu()? * gate_up.narrow(1, inner, inner)?)?;
+            let act = k.gelu_mul(
+                &gate_up.narrow(1, 0, inner)?,
+                &gate_up.narrow(1, inner, inner)?,
+            )?;
             let routed = k.expert_scatter(&k.expert_linear(&self.down, &act, &routes)?, &routes)?;
             return Ok(
                 (model.rms(dense, &self.post_dense)? + model.rms(&routed, &self.post_routed)?)?

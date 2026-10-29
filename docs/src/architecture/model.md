@@ -142,5 +142,11 @@ in packed modes and F32 in uniform F32 mode.
   per layer and in logits on CPU and Metal at 1e-4 relative error. The real E2B Q8_0
   checkpoint passes the existing 95% next-token agreement floor and greedy-prefix /
   termination checks. This is a short conformance case, not a held-out quality study.
+- **Run Gemma on Qwen's fused primitives.** One `q | k | v` and one `gate | up` matrix per
+  layer, in-place query/key/value norms and rotary from precomputed frequencies, a strided
+  GELU product and residual updates fused with the layer scalar and the next norm. On the
+  M1 (E2B, Q8_0, F16 K/V, two alternating rounds) 512-token prefill rose from 323 to
+  417 tokens/s (1.29×), decode at 128 tokens from 19.6 to 20.6 (one sequence) and 48.6
+  to 51.8 tokens/s (four), and engine latency fell from 50.7 to 48.0 ms per token.
 - **Keep PLE buffers bounded.** Store each layer's columns separately and fence streamed
   uploads before staging the next chunk; E2B's BF16 PLE table alone is 4.375 GiB.

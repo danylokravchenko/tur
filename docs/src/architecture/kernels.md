@@ -45,11 +45,17 @@ chunk into registers before multiplying the current one, with one barrier per ch
 Q8 pools stage through one buffer, reading and dequantizing each chunk in place. Head dimensions
 64, 128 and 256 are supported, with GQA and the sigmoid output gate.
 
-Gemma uses the same packed matrix and RMS kernels. The per-query attention path also
-supports ungated output, explicit score scaling, sliding-window lower bounds and
-512-dimensional heads. These semantics apply to F32, F16 and Q8 pools, including
-split-K reduction. Qwen retains its existing gated scale and tiled-prefill selection;
-Gemma currently uses the per-query path for both prefill and decode. The MoE router can
+Gemma uses the same packed matrix, RMS and query/key norm-and-rotary kernels. Owners of
+K/V project `q | k | v` in one matrix and read every head in place from it; the
+unweighted value norm runs the same kernel with a zero frequency. `gate | up` is one
+matrix whose halves feed `gelu_mul` in place. `residual_rms_norm` fuses each post-norm
+residual update with the layer scalar and the next pre-norm. The per-query attention
+path also supports ungated output, explicit score scaling, sliding-window lower bounds
+and 512-dimensional heads. These semantics apply to F32, F16 and Q8 pools, including
+split-K reduction. Split-K partitions each query's window rather than the whole
+context, so a sliding layer keeps every split busy at long contexts. Qwen retains its
+existing gated scale and tiled-prefill selection; Gemma currently uses the per-query
+path for both prefill and decode. The MoE router can
 apply learned per-expert scales after top-k normalization without changing selection.
 
 ## Decisions
@@ -89,4 +95,9 @@ Measured on an M1:
 
 - **Extend shared attention for Gemma semantics.** The window, ungated output and
   512-dimensional path are checked against independent F64 scalar references across
-  K/V formats and splits. Gemma-specific launch tuning and tiled prefill remain open.
+  K/V formats and splits, including windows spanning several splits. Gemma-specific
+  launch tuning and tiled prefill remain open.
+- **Split windowed attention over the window.** Partitioning the whole context left a
+  sliding layer's 512 keys in one or two splits. Over the window, E2B single-sequence
+  decode at 8K tokens rose from 16.4–18.1 to 18.9–20.0 tokens/s (four clean rounds),
+  and four sequences from 42.6 to 44.6 tokens/s.

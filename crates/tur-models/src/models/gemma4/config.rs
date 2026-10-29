@@ -380,70 +380,66 @@ impl WeightLayout for Config {
     fn projection_layout(&self) -> Result<Vec<Projection>> {
         let t = &self.text;
         let mut projections = Vec::new();
-        let mut add = |name: String, rows: usize, cols: usize| {
-            projections.push(Projection::new(
+        let single = |name: String, rows: usize, cols: usize| {
+            Projection::new(
                 name.trim_end_matches(".weight").into(),
                 vec![(name, rows)],
                 cols,
-            ));
+            )
         };
         for i in 0..t.num_hidden_layers {
             let p = format!("{}.layers.{i}", self.prefix);
-            add(
-                format!("{p}.self_attn.q_proj.weight"),
-                checked_elements(&[t.num_attention_heads, self.dim(i)])?,
-                t.hidden_size,
-            );
-            add(
-                format!("{p}.self_attn.o_proj.weight"),
-                t.hidden_size,
-                checked_elements(&[t.num_attention_heads, self.dim(i)])?,
-            );
+            let a = format!("{p}.self_attn");
+            let query = checked_elements(&[t.num_attention_heads, self.dim(i)])?;
+            let kv = checked_elements(&[self.kv_heads(i), self.dim(i)])?;
+            // K/V owners project `q | k | v` (or `q | k` when values reuse keys) in one
+            // matrix; sharing layers project queries only.
+            let mut parts = vec![(format!("{a}.q_proj.weight"), query)];
             if self.owners[i] == i {
-                add(
-                    format!("{p}.self_attn.k_proj.weight"),
-                    checked_elements(&[self.kv_heads(i), self.dim(i)])?,
-                    t.hidden_size,
-                );
+                parts.push((format!("{a}.k_proj.weight"), kv));
                 if !self.unified_kv(i) {
-                    add(
-                        format!("{p}.self_attn.v_proj.weight"),
-                        checked_elements(&[self.kv_heads(i), self.dim(i)])?,
-                        t.hidden_size,
-                    );
+                    parts.push((format!("{a}.v_proj.weight"), kv));
                 }
             }
-            for name in ["gate_proj", "up_proj"] {
-                add(
-                    format!("{p}.mlp.{name}.weight"),
-                    self.intermediate(i),
-                    t.hidden_size,
-                );
-            }
-            add(
+            let name = if parts.len() == 1 {
+                "q_proj"
+            } else {
+                "qkv_proj"
+            };
+            projections.push(Projection::new(format!("{a}.{name}"), parts, t.hidden_size));
+            projections.push(single(format!("{a}.o_proj.weight"), t.hidden_size, query));
+            projections.push(Projection::new(
+                format!("{p}.mlp.gate_up_proj"),
+                vec![
+                    (format!("{p}.mlp.gate_proj.weight"), self.intermediate(i)),
+                    (format!("{p}.mlp.up_proj.weight"), self.intermediate(i)),
+                ],
+                t.hidden_size,
+            ));
+            projections.push(single(
                 format!("{p}.mlp.down_proj.weight"),
                 t.hidden_size,
                 self.intermediate(i),
-            );
+            ));
             if t.hidden_size_per_layer_input > 0 {
-                add(
+                projections.push(single(
                     format!("{p}.per_layer_input_gate.weight"),
                     t.hidden_size_per_layer_input,
                     t.hidden_size,
-                );
-                add(
+                ));
+                projections.push(single(
                     format!("{p}.per_layer_projection.weight"),
                     t.hidden_size,
                     t.hidden_size_per_layer_input,
-                );
+                ));
             }
         }
         if t.hidden_size_per_layer_input > 0 {
-            add(
+            projections.push(single(
                 format!("{}.per_layer_model_projection.weight", self.prefix),
                 checked_elements(&[t.num_hidden_layers, t.hidden_size_per_layer_input])?,
                 t.hidden_size,
-            );
+            ));
         }
         let head = if t.tie_word_embeddings {
             format!("{}.embed_tokens.weight", self.prefix)

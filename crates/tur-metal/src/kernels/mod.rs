@@ -64,6 +64,24 @@ struct GluParams {
 }
 
 #[repr(C)]
+struct ResidualParams {
+    rows: u32,
+    width: u32,
+    x_stride: u32,
+    r_stride: u32,
+    emit: u32,
+    eps: f32,
+}
+
+#[repr(C)]
+struct GeluMulParams {
+    rows: u32,
+    width: u32,
+    a_stride: u32,
+    b_stride: u32,
+}
+
+#[repr(C)]
 struct GatedParams {
     rows: u32,
     dim: u32,
@@ -785,6 +803,94 @@ impl Kernels {
         self.finish(out, (gv.rows, width))
     }
 
+    /// Post-norm residual update `s = (x + rms(r) * r_weight) * scale[0]`, and with `next`
+    /// also `rms(s) * next`. `scale` holds one element. Returns `(s, normed)`.
+    pub fn residual_rms_norm(
+        &self,
+        x: &Tensor,
+        r: &Tensor,
+        r_weight: &Tensor,
+        scale: &Tensor,
+        next: Option<&Tensor>,
+        eps: f64,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let xv = self.view(x)?;
+        let rv = self.view(r)?;
+        let rw = self.view(r_weight)?;
+        let sv = self.view(scale)?;
+        // Without `next`, the residual weight binds the unused slot.
+        let wv = self.view(next.unwrap_or(r_weight))?;
+        rv.expect(xv.rows, xv.cols, "residual")?;
+        rw.expect(1, xv.cols, "residual norm weight")?;
+        sv.expect(1, 1, "residual scale")?;
+        wv.expect(1, xv.cols, "norm weight")?;
+        let params = ResidualParams {
+            rows: to_u32(xv.rows, "rows")?,
+            width: to_u32(xv.cols, "width")?,
+            x_stride: to_u32(xv.row_stride, "row stride")?,
+            r_stride: to_u32(rv.row_stride, "residual stride")?,
+            emit: u32::from(next.is_some()),
+            eps: eps as f32,
+        };
+        let pipeline = self.pipeline("residual_rms_norm_f32")?;
+        let sum = self.output(xv.rows, xv.cols)?;
+        let normed = next.map(|_| self.output(xv.rows, xv.cols)).transpose()?;
+        let threads = pipeline.threads(self.tuning.row_threads);
+        self.runtime
+            .dispatch(pipeline, "tur_residual_rms_norm", xv.rows, threads, |e| {
+                xv.bind(e, 0)?;
+                rv.bind(e, 1)?;
+                rw.bind(e, 2)?;
+                sv.bind(e, 3)?;
+                wv.bind(e, 4)?;
+                sum.bind(e, 5);
+                normed.as_ref().unwrap_or(&sum).bind(e, 6);
+                e.set_bytes(7, &params);
+                Ok(())
+            })?;
+        let shape = (xv.rows, xv.cols);
+        Ok((
+            self.finish(sum, shape)?,
+            normed.map(|n| self.finish(n, shape)).transpose()?,
+        ))
+    }
+
+    /// `gelu_tanh(a) * b` elementwise over `[rows, width]` operands, each read at its own
+    /// row stride (narrowed columns of a wider tensor are read in place).
+    pub fn gelu_mul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        let av = self.view(a)?;
+        let bv = self.view(b)?;
+        bv.expect(av.rows, av.cols, "gelu multiplier")?;
+        let params = GeluMulParams {
+            rows: to_u32(av.rows, "rows")?,
+            width: to_u32(av.cols, "width")?,
+            a_stride: to_u32(av.row_stride, "row stride")?,
+            b_stride: to_u32(bv.row_stride, "multiplier stride")?,
+        };
+        let count = av
+            .rows
+            .checked_mul(av.cols)
+            .ok_or_else(|| invalid("elements overflow"))?;
+        to_u32(count, "elements")?;
+        let pipeline = self.pipeline("gelu_mul_f32")?;
+        let out = self.output(av.rows, av.cols)?;
+        let threads = pipeline.threads(self.tuning.elementwise_threads);
+        self.runtime.dispatch(
+            pipeline,
+            "tur_gelu_mul",
+            count.div_ceil(threads),
+            threads,
+            |e| {
+                av.bind(e, 0)?;
+                bv.bind(e, 1)?;
+                out.bind(e, 2);
+                e.set_bytes(3, &params);
+                Ok(())
+            },
+        )?;
+        self.finish(out, (av.rows, av.cols))
+    }
+
     /// `rms(core) * weight * silu(z)` for contiguous `[tokens * heads, dim]` core rows; `z`
     /// head `h` of token `t` is read in place at column `z_col + h * dim` of `z` row `t`.
     /// Returns `[tokens, heads * dim]`.
@@ -1495,7 +1601,9 @@ impl Kernels {
         let first = self.runtime.view(&kv.first_block, DType::U32)?;
         let visible = self.runtime.view(&kv.visible, DType::U32)?;
         // Splits fill the GPU with simdgroups, each serving `hg` heads.
-        let split = self.attention_split(tokens, heads / hg, kv.max_visible);
+        // A query reads at most `window` keys, starting at its window's first key.
+        let span = window.map_or(kv.max_visible, |w| w.min(kv.max_visible));
+        let split = self.attention_split(tokens, heads / hg, span);
         let params = AttentionParams {
             tokens: to_u32(tokens, "tokens")?,
             heads: to_u32(heads, "heads")?,

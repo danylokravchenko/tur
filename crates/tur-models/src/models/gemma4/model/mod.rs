@@ -21,9 +21,8 @@ use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
 mod moe;
 
 struct Layer {
-    q: PackedLinear,
-    k: Option<PackedLinear>,
-    v: Option<PackedLinear>,
+    /// `q | k | v` on K/V owners (`q | k` when values reuse keys), queries alone otherwise.
+    qkv: PackedLinear,
     o: PackedLinear,
     q_norm: Tensor,
     k_norm: Option<Tensor>,
@@ -32,8 +31,7 @@ struct Layer {
     pre_ff: Tensor,
     post_ff: Tensor,
     scalar: Tensor,
-    gate: PackedLinear,
-    up: PackedLinear,
+    gate_up: PackedLinear,
     down: PackedLinear,
     ple: Option<LayerInput>,
     moe: Option<moe::Moe>,
@@ -60,7 +58,21 @@ pub struct Gemma4 {
     layers: Vec<Layer>,
     ple: Option<PerLayer>,
     #[cfg(feature = "metal")]
-    kernels: Option<tur_metal::kernels::Kernels>,
+    fused: Option<Fused>,
+}
+
+/// Compiled kernels and per-model constants of fused execution.
+#[cfg(feature = "metal")]
+struct Fused {
+    kernels: tur_metal::kernels::Kernels,
+    /// Each layer's rotary inverse frequencies, zero for unrotated pairs.
+    rope: Vec<Tensor>,
+    /// Weight of the unweighted value norm, as wide as the widest head.
+    ones: Tensor,
+    /// One zero frequency: the value norm runs the query/key norm kernel without rotation.
+    unrotated: Tensor,
+    /// Unit scale of residual updates that the layer scalar does not follow.
+    one: Tensor,
 }
 
 fn format_plan(config: &Config, options: &LoadOptions) -> Result<WeightPlan> {
@@ -176,11 +188,11 @@ impl Layer {
             } else {
                 None
             },
-            q: projection("self_attn.q_proj")?,
-            k: own.then(|| projection("self_attn.k_proj")).transpose()?,
-            v: (own && !c.unified_kv(i))
-                .then(|| projection("self_attn.v_proj"))
-                .transpose()?,
+            qkv: projection(if own {
+                "self_attn.qkv_proj"
+            } else {
+                "self_attn.q_proj"
+            })?,
             o: projection("self_attn.o_proj")?,
             q_norm: norm("self_attn.q_norm")?,
             k_norm: own.then(|| norm("self_attn.k_norm")).transpose()?,
@@ -192,8 +204,7 @@ impl Layer {
                 .take(&format!("{p}.layer_scalar"))?
                 .to_dtype(DType::F32)?
                 .to_device(&t.device)?,
-            gate: projection("mlp.gate_proj")?,
-            up: projection("mlp.up_proj")?,
+            gate_up: projection("mlp.gate_up_proj")?,
             down: projection("mlp.down_proj")?,
             ple: (c.text.hidden_size_per_layer_input > 0)
                 .then(|| -> Result<LayerInput> {
@@ -279,7 +290,7 @@ impl Gemma4 {
             layers,
             ple,
             #[cfg(feature = "metal")]
-            kernels: None,
+            fused: None,
         }
         .with_execution(options.execution)
     }
@@ -288,18 +299,40 @@ impl Gemma4 {
     pub fn with_execution(self, execution: Execution) -> Result<Self> {
         #[cfg(feature = "metal")]
         {
-            let kernels = if execution == Execution::Fused && self.device.is_metal() {
-                Some(tur_metal::kernels::Kernels::new(&self.device)?)
+            let fused = if execution == Execution::Fused && self.device.is_metal() {
+                Some(self.fused()?)
             } else {
                 None
             };
-            Ok(Self { kernels, ..self })
+            Ok(Self { fused, ..self })
         }
         #[cfg(not(feature = "metal"))]
         {
             let _ = execution;
             Ok(self)
         }
+    }
+    #[cfg(feature = "metal")]
+    fn fused(&self) -> Result<Fused> {
+        let c = &self.config;
+        let rope = (0..c.layers())
+            .map(|i| {
+                let frequencies = inverse_frequencies(c.dim(i), c.rope(i));
+                Ok(Tensor::new(frequencies.as_slice(), &self.device)?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let widest = c.text.head_dim.max(c.text.global_head_dim);
+        Ok(Fused {
+            kernels: tur_metal::kernels::Kernels::new(&self.device)?,
+            rope,
+            ones: Tensor::ones(widest, DType::F32, &self.device)?,
+            unrotated: Tensor::zeros(1, DType::F32, &self.device)?,
+            one: Tensor::ones(1, DType::F32, &self.device)?,
+        })
+    }
+    #[cfg(feature = "metal")]
+    fn fused_kernels(&self) -> Option<&tur_metal::kernels::Kernels> {
+        self.fused.as_ref().map(|f| &f.kernels)
     }
     /// Device holding the immutable weights.
     pub fn device(&self) -> &Device {
@@ -312,7 +345,7 @@ impl Gemma4 {
     /// Whether common Metal kernels or Candle reference operations execute passes.
     pub fn execution(&self) -> Execution {
         #[cfg(feature = "metal")]
-        if self.kernels.is_some() {
+        if self.fused.is_some() {
             return Execution::Fused;
         }
         Execution::Reference
@@ -325,12 +358,10 @@ impl Gemma4 {
                 .as_ref()
                 .map_or(0, |p| p.projection.resident_bytes());
         for layer in &self.layers {
-            bytes += [&layer.q, &layer.o, &layer.gate, &layer.up, &layer.down]
+            bytes += [&layer.qkv, &layer.o, &layer.gate_up, &layer.down]
                 .iter()
                 .map(|p| p.resident_bytes())
                 .sum::<usize>();
-            bytes += layer.k.as_ref().map_or(0, PackedLinear::resident_bytes)
-                + layer.v.as_ref().map_or(0, PackedLinear::resident_bytes);
             bytes += layer.ple.as_ref().map_or(0, |p| {
                 p.gate.resident_bytes() + p.projection.resident_bytes()
             });
@@ -348,12 +379,10 @@ impl Gemma4 {
                 + ple.projection.resident_bytes();
         }
         for l in &self.layers {
-            total += [&l.q, &l.o, &l.gate, &l.up, &l.down]
+            total += [&l.qkv, &l.o, &l.gate_up, &l.down]
                 .iter()
                 .map(|p| p.resident_bytes())
                 .sum::<usize>();
-            total += l.k.as_ref().map_or(0, PackedLinear::resident_bytes)
-                + l.v.as_ref().map_or(0, PackedLinear::resident_bytes);
             total += [
                 &l.q_norm,
                 &l.input_norm,
@@ -429,14 +458,14 @@ impl Gemma4 {
     }
     fn linear(&self, w: &PackedLinear, x: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "metal")]
-        if let Some(k) = &self.kernels {
+        if let Some(k) = self.fused_kernels() {
             return k.linear(w, x);
         }
         w.forward(x)
     }
     fn rms(&self, x: &Tensor, w: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "metal")]
-        if let Some(k) = &self.kernels {
+        if let Some(k) = self.fused_kernels() {
             let shape = x.shape().clone();
             let width = x.dim(candle_core::D::Minus1)?;
             return Ok(k
@@ -478,7 +507,7 @@ impl Gemma4 {
         &self,
         batch: &PackedForward<'_>,
         spans: &[Span<'_>],
-        mut trace: Option<&mut Vec<Tensor>>,
+        trace: Option<&mut Vec<Tensor>>,
     ) -> Result<Vec<SequenceStep>> {
         let mut tokens = Vec::new();
         let mut positions = Vec::new();
@@ -487,43 +516,21 @@ impl Gemma4 {
             positions.extend_from_slice(&batch.positions[s.sequence.tokens.clone()]);
         }
         let ids = Tensor::new(tokens.as_slice(), &self.device)?;
-        let mut x =
+        let x =
             (self.embedding.rows(&ids, &self.head)? * (self.config.hidden_size() as f64).sqrt())?;
         let inputs = self.inputs(&ids, &x)?;
+        let pass = Pass {
+            pool: batch.pool,
+            spans,
+            positions: &positions,
+        };
         #[cfg(feature = "metal")]
-        let paging = self.paging(batch.pool, spans, tokens.len())?;
-        for (i, l) in self.layers.iter().enumerate() {
-            let h = self.rms(&x, &l.input_norm)?;
-            let attention = self.attention(
-                l,
-                i,
-                &h,
-                &positions,
-                batch.pool,
-                spans,
-                #[cfg(feature = "metal")]
-                paging.as_ref(),
-            )?;
-            x = (x + self.rms(&attention, &l.post_attention)?)?;
-            let h = self.rms(&x, &l.pre_ff)?;
-            let gated = (self.linear(&l.gate, &h)?.gelu()? * self.linear(&l.up, &h)?)?;
-            let dense = self.linear(&l.down, &gated)?;
-            let mixed = match &l.moe {
-                Some(moe) => moe.forward(self, &x, &dense)?,
-                None => dense,
-            };
-            x = (x + self.rms(&mixed, &l.post_ff)?)?;
-            if let (Some(ple), Some(inputs)) = (&l.ple, &inputs) {
-                let gate = self.linear(&ple.gate, &x)?.gelu()?;
-                let signal = (gate * inputs.narrow(1, i, 1)?.squeeze(1)?)?;
-                x = (&x + self.rms(&self.linear(&ple.projection, &signal)?, &ple.norm)?)?;
-            }
-            x = x.broadcast_mul(&l.scalar)?;
-            if let Some(trace) = trace.as_mut() {
-                trace.push(x.clone());
-            }
-        }
-        let hidden = self.rms(&x, &self.norm)?;
+        let hidden = match &self.fused {
+            Some(fused) => self.run_fused(fused, &pass, x, inputs, trace)?,
+            None => self.run_reference(&pass, x, inputs.as_ref(), trace)?,
+        };
+        #[cfg(not(feature = "metal"))]
+        let hidden = self.run_reference(&pass, x, inputs.as_ref(), trace)?;
         spans
             .iter()
             .map(|s| {
@@ -559,37 +566,83 @@ impl Gemma4 {
             })
             .collect()
     }
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "attention combines immutable layer weights, packed rows and pool addressing"
-    )]
-    fn attention(
+    /// Gated feed-forward update of one layer from residual `x` and its pre-norm `h`.
+    fn mlp(&self, l: &Layer, x: &Tensor, h: &Tensor) -> Result<Tensor> {
+        let gate_up = self.linear(&l.gate_up, h)?;
+        let width = gate_up.dim(1)? / 2;
+        let (gate, up) = (
+            gate_up.narrow(1, 0, width)?,
+            gate_up.narrow(1, width, width)?,
+        );
+        #[cfg(feature = "metal")]
+        let activated = match self.fused_kernels() {
+            Some(k) => k.gelu_mul(&gate, &up)?,
+            None => (gate.gelu()? * up)?,
+        };
+        #[cfg(not(feature = "metal"))]
+        let activated = (gate.gelu()? * up)?;
+        let dense = self.linear(&l.down, &activated)?;
+        match &l.moe {
+            Some(moe) => moe.forward(self, x, &dense),
+            None => Ok(dense),
+        }
+    }
+    /// Reference decoder over Candle operations; returns the final-normed hidden rows.
+    fn run_reference(
+        &self,
+        pass: &Pass<'_, '_>,
+        mut x: Tensor,
+        inputs: Option<&Tensor>,
+        mut trace: Option<&mut Vec<Tensor>>,
+    ) -> Result<Tensor> {
+        for (i, l) in self.layers.iter().enumerate() {
+            let h = self.rms(&x, &l.input_norm)?;
+            let attention = self.reference_attention(l, i, &h, pass)?;
+            x = (x + self.rms(&attention, &l.post_attention)?)?;
+            let h = self.rms(&x, &l.pre_ff)?;
+            let mixed = self.mlp(l, &x, &h)?;
+            x = (x + self.rms(&mixed, &l.post_ff)?)?;
+            if let (Some(ple), Some(inputs)) = (&l.ple, inputs) {
+                let gate = self.linear(&ple.gate, &x)?.gelu()?;
+                let signal = (gate * inputs.narrow(1, i, 1)?.squeeze(1)?)?;
+                x = (&x + self.rms(&self.linear(&ple.projection, &signal)?, &ple.norm)?)?;
+            }
+            x = x.broadcast_mul(&l.scalar)?;
+            if let Some(trace) = trace.as_mut() {
+                trace.push(x.clone());
+            }
+        }
+        self.rms(&x, &self.norm)
+    }
+    fn reference_attention(
         &self,
         layer: &Layer,
         index: usize,
         hidden: &Tensor,
-        positions: &[usize],
-        pool: &StatePool,
-        spans: &[Span<'_>],
-        #[cfg(feature = "metal")] paging: Option<&tur_metal::kernels::PagedKv>,
+        pass: &Pass<'_, '_>,
     ) -> Result<Tensor> {
+        let (pool, spans) = (pass.pool, pass.spans);
         let config = &self.config;
         let tokens = hidden.dim(0)?;
         let dim = config.dim(index);
         let heads = config.text.num_attention_heads;
-        let (cos, sin) = rotary_tables(positions, dim, config.rope(index), &self.device)?;
-        let query = self
-            .linear(&layer.q, hidden)?
+        let (cos, sin) = rotary_tables(pass.positions, dim, config.rope(index), &self.device)?;
+        let projected = self.linear(&layer.qkv, hidden)?;
+        let query = projected
+            .narrow(1, 0, heads * dim)?
             .reshape((tokens, heads, dim))?;
         let query = math::rotary(&self.rms(&query, &layer.q_norm)?, &cos, &sin)?;
         let store = pool.attention(config.state_layer(index))?;
-        if let (Some(kernels), Some(norm)) = (&layer.k, &layer.k_norm) {
-            let raw =
-                self.linear(kernels, hidden)?
-                    .reshape((tokens, config.kv_heads(index), dim))?;
-            let value = match &layer.v {
-                Some(weights) => self.linear(weights, hidden)?.reshape(raw.shape())?,
-                None => raw.clone(),
+        if let Some(norm) = &layer.k_norm {
+            let width = config.kv_heads(index) * dim;
+            let shape = (tokens, config.kv_heads(index), dim);
+            let raw = projected.narrow(1, heads * dim, width)?.reshape(shape)?;
+            let value = if config.unified_kv(index) {
+                raw.clone()
+            } else {
+                projected
+                    .narrow(1, heads * dim + width, width)?
+                    .reshape(shape)?
             };
             let value = math::rms(
                 &value,
@@ -597,37 +650,10 @@ impl Gemma4 {
                 config.text.rms_norm_eps,
             )?;
             let key = math::rotary(&self.rms(&raw, norm)?, &cos, &sin)?;
-            #[cfg(feature = "metal")]
-            if let (Some(kernels), Some(paging)) = (&self.kernels, paging) {
-                let layout = tur_metal::kernels::Heads {
-                    count: config.kv_heads(index),
-                    dim,
-                    head_stride: dim,
-                    col_offset: 0,
-                };
-                kernels.kv_write(
-                    &key.reshape((tokens, config.kv_heads(index) * dim))?,
-                    layout,
-                    &value.reshape((tokens, config.kv_heads(index) * dim))?,
-                    layout,
-                    store,
-                    paging,
-                )?;
-            } else {
-                scatter(store, spans, &key, &value)?;
-            }
-            #[cfg(not(feature = "metal"))]
             scatter(store, spans, &key, &value)?;
         }
         let window = (config.text.layer_types[index] == LayerKind::SlidingAttention)
             .then_some(config.text.sliding_window);
-        #[cfg(feature = "metal")]
-        if let (Some(kernels), Some(paging)) = (&self.kernels, paging) {
-            return self.linear(
-                &layer.o,
-                &kernels.attention_ungated(&query, store, paging, window, 1.0)?,
-            );
-        }
         let outputs = spans
             .iter()
             .map(|s| {
@@ -647,16 +673,189 @@ impl Gemma4 {
             &Tensor::cat(&outputs, 0)?.reshape((tokens, heads * dim))?,
         )
     }
-    #[cfg(feature = "metal")]
+}
+#[cfg(feature = "metal")]
+impl Gemma4 {
+    /// Fused decoder: every layer runs once over the packed batch on Tur's kernels, with
+    /// residual updates fused into the following norm. Returns the final-normed rows.
+    fn run_fused(
+        &self,
+        f: &Fused,
+        pass: &Pass<'_, '_>,
+        mut x: Tensor,
+        inputs: Option<Tensor>,
+        mut trace: Option<&mut Vec<Tensor>>,
+    ) -> Result<Tensor> {
+        let k = &f.kernels;
+        let eps = self.config.text.rms_norm_eps;
+        let tokens = x.dim(0)?;
+        let paging = self.paging(k, pass.pool, pass.spans, tokens)?;
+        let positions = pass
+            .positions
+            .iter()
+            .map(|&p| u32::try_from(p).map_err(|_| invalid("position exceeds u32")))
+            .collect::<Result<Vec<_>>>()?;
+        let positions = Tensor::new(positions.as_slice(), &self.device)?;
+        // Per-layer inputs as `[tokens, layers × width]`; each layer reads its columns.
+        let inputs = inputs
+            .map(|t| {
+                t.reshape((
+                    tokens,
+                    self.config.layers() * self.config.text.hidden_size_per_layer_input,
+                ))
+            })
+            .transpose()?;
+        let first = self
+            .layers
+            .first()
+            .ok_or_else(|| invalid("model has no layers"))?;
+        let mut h = k.rms_norm(&x, &first.input_norm, eps)?;
+        for (i, l) in self.layers.iter().enumerate() {
+            let attention = self.fused_attention(f, l, i, &h, &positions, pass.pool, &paging)?;
+            let (sum, normed) = k.residual_rms_norm(
+                &x,
+                &attention,
+                &l.post_attention,
+                &f.one,
+                Some(&l.pre_ff),
+                eps,
+            )?;
+            let normed = normed.ok_or_else(|| invalid("missing feed-forward input"))?;
+            let mixed = self.mlp(l, &sum, &normed)?;
+            // The last update fuses with the final norm.
+            let next = self.layers.get(i + 1).map_or(&self.norm, |n| &n.input_norm);
+            (x, h) = self.fused_update(f, l, i, &sum, &mixed, inputs.as_ref(), next)?;
+            if let Some(trace) = trace.as_mut() {
+                trace.push(x.clone());
+            }
+        }
+        Ok(h)
+    }
+    /// Feed-forward residual, per-layer input injection and layer scalar, fused with the
+    /// next norm: returns the next residual stream and its normed rows.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per operand of the fused residual update"
+    )]
+    fn fused_update(
+        &self,
+        fused: &Fused,
+        layer: &Layer,
+        index: usize,
+        x: &Tensor,
+        mixed: &Tensor,
+        inputs: Option<&Tensor>,
+        next: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let k = &fused.kernels;
+        let eps = self.config.text.rms_norm_eps;
+        let (x, h) = match (&layer.ple, inputs) {
+            (Some(ple), Some(inputs)) => {
+                let (x, _) =
+                    k.residual_rms_norm(x, mixed, &layer.post_ff, &fused.one, None, eps)?;
+                let width = self.config.text.hidden_size_per_layer_input;
+                let column = index
+                    .checked_mul(width)
+                    .ok_or_else(|| invalid("per-layer input column overflow"))?;
+                let signal =
+                    k.gelu_mul(&k.linear(&ple.gate, &x)?, &inputs.narrow(1, column, width)?)?;
+                let injected = k.linear(&ple.projection, &signal)?;
+                k.residual_rms_norm(&x, &injected, &ple.norm, &layer.scalar, Some(next), eps)?
+            }
+            _ => k.residual_rms_norm(x, mixed, &layer.post_ff, &layer.scalar, Some(next), eps)?,
+        };
+        Ok((x, h.ok_or_else(|| invalid("missing next layer input"))?))
+    }
+    /// Projects `q | k | v` once and norms and rotates queries and keys in place from it;
+    /// K/V owners store their normed values before attending.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per input the attention dispatch binds"
+    )]
+    fn fused_attention(
+        &self,
+        fused: &Fused,
+        layer: &Layer,
+        index: usize,
+        hidden: &Tensor,
+        positions: &Tensor,
+        pool: &StatePool,
+        paging: &tur_metal::kernels::PagedKv,
+    ) -> Result<Tensor> {
+        let config = &self.config;
+        let k = &fused.kernels;
+        let eps = config.text.rms_norm_eps;
+        let dim = config.dim(index);
+        let heads = config.text.num_attention_heads;
+        let rope = fused
+            .rope
+            .get(index)
+            .ok_or_else(|| invalid("missing rotary frequencies"))?;
+        let at = |count: usize, col_offset: usize| tur_metal::kernels::Heads {
+            count,
+            dim,
+            head_stride: dim,
+            col_offset,
+        };
+        let projected = k.linear(&layer.qkv, hidden)?;
+        let query = k.qk_norm_rope(
+            &projected,
+            at(heads, 0),
+            &layer.q_norm,
+            positions,
+            rope,
+            eps,
+        )?;
+        let store = pool.attention(config.state_layer(index))?;
+        if let Some(norm) = &layer.k_norm {
+            let kv_heads = config.kv_heads(index);
+            let key_col = heads * dim;
+            // Unified K=V values are the raw key projection, read before key norm and RoPE.
+            let value_col = if config.unified_kv(index) {
+                key_col
+            } else {
+                key_col + kv_heads * dim
+            };
+            let key = k.qk_norm_rope(
+                &projected,
+                at(kv_heads, key_col),
+                norm,
+                positions,
+                rope,
+                eps,
+            )?;
+            let value = k.qk_norm_rope(
+                &projected,
+                at(kv_heads, value_col),
+                &fused.ones.narrow(0, 0, dim)?,
+                positions,
+                &fused.unrotated,
+                eps,
+            )?;
+            let width = kv_heads * dim;
+            k.kv_write(
+                &key.reshape((key.dim(0)?, width))?,
+                at(kv_heads, 0),
+                &value.reshape((value.dim(0)?, width))?,
+                at(kv_heads, 0),
+                store,
+                paging,
+            )?;
+        }
+        let window = (config.text.layer_types[index] == LayerKind::SlidingAttention)
+            .then_some(config.text.sliding_window);
+        k.linear(
+            &layer.o,
+            &k.attention_ungated(&query, store, paging, window, 1.0)?,
+        )
+    }
     fn paging(
         &self,
+        k: &tur_metal::kernels::Kernels,
         pool: &StatePool,
         spans: &[Span<'_>],
         tokens: usize,
-    ) -> Result<Option<tur_metal::kernels::PagedKv>> {
-        let Some(k) = &self.kernels else {
-            return Ok(None);
-        };
+    ) -> Result<tur_metal::kernels::PagedKv> {
         let mut table = Vec::new();
         let mut first = Vec::with_capacity(tokens);
         let mut visible = Vec::with_capacity(tokens);
@@ -668,14 +867,17 @@ impl Gemma4 {
                 visible.push(u32::try_from(p + 1).map_err(|_| invalid("context overflow"))?);
             }
         }
-        Ok(Some(k.paged_kv(
+        k.paged_kv(
             self.description.kv.page_tokens,
             pool.attention(0)?.key.data.dim(0)?,
             &table,
             &first,
             &visible,
-        )?))
+        )
     }
+}
+
+impl Gemma4 {
     fn check<'a>(
         &self,
         batch: &PackedForward<'_>,
@@ -759,6 +961,12 @@ impl Gemma4 {
         Ok((trace, step.logits))
     }
 }
+/// Addressing shared by every layer of one packed pass.
+struct Pass<'a, 'b> {
+    pool: &'a StatePool,
+    spans: &'a [Span<'b>],
+    positions: &'a [usize],
+}
 struct Span<'a> {
     start: usize,
     len: usize,
@@ -789,14 +997,11 @@ fn ple_dtype(weights: &Weights) -> DType {
         DType::BF16
     }
 }
-fn rotary_tables(
-    positions: &[usize],
-    dim: usize,
-    rope: &super::config::Rope,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
+/// Inverse rotary frequencies over `dim / 2` pairs; proportional rotation leaves the pairs past
+/// its rotated fraction at zero frequency.
+fn inverse_frequencies(dim: usize, rope: &super::config::Rope) -> Vec<f32> {
     let rotated = (dim as f64 * rope.partial_rotary_factor) as usize / 2;
-    let frequencies: Vec<f32> = (0..dim / 2)
+    (0..dim / 2)
         .map(|i| {
             if i < rotated {
                 1.0 / (rope.rope_theta as f32).powf((2 * i) as f32 / dim as f32)
@@ -804,7 +1009,15 @@ fn rotary_tables(
                 0.0
             }
         })
-        .collect();
+        .collect()
+}
+fn rotary_tables(
+    positions: &[usize],
+    dim: usize,
+    rope: &super::config::Rope,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let frequencies = inverse_frequencies(dim, rope);
     let mut cos = Vec::with_capacity(positions.len() * dim / 2);
     let mut sin = Vec::with_capacity(cos.capacity());
     for &position in positions {
@@ -914,7 +1127,7 @@ impl HybridModel for Gemma4 {
             })
             .collect::<Result<Vec<_>>>()?;
         #[cfg(feature = "metal")]
-        let attention = self.kernels.as_ref().map(|kernels| {
+        let attention = self.fused_kernels().map(|kernels| {
             attention_workspace(
                 &self.config,
                 kernels,
@@ -929,7 +1142,7 @@ impl HybridModel for Gemma4 {
     }
     #[cfg(feature = "metal")]
     fn kernels(&self) -> Option<tur_metal::kernels::Kernels> {
-        self.kernels.clone()
+        self.fused_kernels().cloned()
     }
     fn forward(&self, batch: &PackedForward<'_>) -> Result<Vec<Result<SequenceStep>>> {
         if batch.pool.description() != &self.description

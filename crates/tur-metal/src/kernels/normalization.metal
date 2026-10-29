@@ -194,3 +194,85 @@ kernel void gated_rms_f32(
     }
 }
 
+
+struct ResidualParams {
+    uint rows;
+    uint width;
+    uint x_stride;
+    uint r_stride;
+    uint emit;
+    float eps;
+};
+
+// s = (x + rms(r) * wr) * scale[0], and y = rms(s) * w when p.emit: a post-norm residual
+// update fused with the layer scalar and the next pre-norm.
+kernel void residual_rms_norm_f32(
+    device const float *x [[buffer(0)]],
+    device const float *r [[buffer(1)]],
+    device const float *wr [[buffer(2)]],
+    device const float *scale [[buffer(3)]],
+    device const float *w [[buffer(4)]],
+    device float *s [[buffer(5)]],
+    device float *y [[buffer(6)]],
+    constant ResidualParams &p [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgs [[simdgroups_per_threadgroup]]) {
+    threadgroup float scratch[SIMD];
+    if (row >= p.rows) {
+        return;
+    }
+    device const float *xr = x + ulong(row) * p.x_stride;
+    device const float *rr = r + ulong(row) * p.r_stride;
+    float acc = 0.0f;
+    for (uint i = tid; i < p.width; i += threads) {
+        float v = rr[i];
+        acc += v * v;
+    }
+    float inv_r = 1.0f / sqrt(threadgroup_sum(acc, scratch, sg, lane, sgs) / float(p.width) + p.eps);
+    float k = scale[0];
+    device float *sr = s + ulong(row) * p.width;
+    acc = 0.0f;
+    for (uint i = tid; i < p.width; i += threads) {
+        float v = (xr[i] + rr[i] * inv_r * wr[i]) * k;
+        sr[i] = v;
+        acc += v * v;
+    }
+    if (!p.emit) {
+        return;
+    }
+    // Each thread reads back only the elements of s it wrote.
+    float inv = 1.0f / sqrt(threadgroup_sum(acc, scratch, sg, lane, sgs) / float(p.width) + p.eps);
+    device float *yr = y + ulong(row) * p.width;
+    for (uint i = tid; i < p.width; i += threads) {
+        yr[i] = sr[i] * inv * w[i];
+    }
+}
+
+struct GeluMulParams {
+    uint rows;
+    uint width;
+    uint a_stride;
+    uint b_stride;
+};
+
+// out[r, i] = gelu_tanh(a[r, i]) * b[r, i]; a and b are read at their own row strides, e.g.
+// the halves of a fused gate|up projection or one layer's slice of per-layer inputs.
+kernel void gelu_mul_f32(
+    device const float *a [[buffer(0)]],
+    device const float *b [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    constant GeluMulParams &p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.rows * p.width) {
+        return;
+    }
+    uint r = gid / p.width;
+    uint c = gid % p.width;
+    float x = a[ulong(r) * p.a_stride + c];
+    float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+    out[gid] = 0.5f * x * (1.0f + precise::tanh(inner)) * b[ulong(r) * p.b_stride + c];
+}
