@@ -344,3 +344,37 @@ llama-bench -m <gguf> -p 2048,8192 -n 0 -r 3
 llama-bench -m <gguf> -p 0 -n 64 -d 128,2048,8192 -r 3
 llama-batched-bench -m <gguf> -c 4096 -b 2048 -ub 512 -npp 128 -ntg 64 -npl 1,2,4,8,16
 ```
+
+## Compared with MLX and oMLX
+
+Published community results for Qwen3.5-0.8B on an M1 (8-core GPU) with 16 GB: mlx_lm
+from [whatcani.run](https://www.whatcani.run/?device=Apple+M1:8:Apple+M1:8:16) (4,096
+prompt and 1,024 output tokens) and oMLX 0.7.3 from
+[omlx.ai](https://omlx.ai/benchmarks/performance/yw52053o) (macOS 27.0.1, 2026-10-25,
+T=0.7). Both are single submissions on another machine, not reruns on this Mac. Tur has
+no 4K-context row, so its 2K and 8K figures bracket the 4K results. MLX's OptiQ-4bit
+(620 MB) is a mixed 4-bit format, against Tur's all-Q4K GPTQ artifact (425 MB).
+
+**Single sequence** (tokens/s):
+
+| Engine, weights | Prefill | Decode | Peak memory |
+| --- | --- | --- | --- |
+| Tur Q8_0 | 1,311 at 2K, 1,031 at 8K | 56 at 2K, 50 at 8K | 1.20 GB RSS (artifact) |
+| mlx_lm 8-bit | 814 at 4K | 46.1 at 4K | 2.46 GB |
+| Tur Q4K GPTQ | 1,210 at 2K, 982 at 8K | 89 at 2K, 75 at 8K | 0.71 GB RSS |
+| mlx_lm OptiQ-4bit | 946 at 4K | 56.0 at 4K | 3.50 GB |
+| oMLX OptiQ-4bit | 1,025 at 1K, 990 at 4K | 73.7 at 1K, 68.6 at 4K | 2.17 GB footprint |
+
+**Batched decode** (4-bit, aggregate tokens/s; Tur at 128 tokens of context, oMLX's
+context unstated):
+
+| Sequences | 1 | 2 | 4 |
+| --- | --- | --- | --- |
+| Tur Q4K GPTQ | 90 | 114 | 202 |
+| oMLX OptiQ-4bit | 73.7 | 123 | 198 |
+
+At one sequence Tur decodes 1.1–1.3× faster than oMLX and 1.1–1.6× faster than mlx_lm.
+Its 4-bit prefill is level with oMLX's and ahead of mlx_lm's; at 8-bit it prefills
+1.3–1.6× faster than mlx_lm. With two to four sequences the lead
+disappears: oMLX scales 1.67× from one sequence to two against Tur's 1.27×, where
+recurrent-state traffic rather than weight bandwidth bounds Tur's decode.
