@@ -1232,7 +1232,7 @@ impl HybridModel for Qwen35 {
                 s.tokens
                     .end
                     .checked_sub(1)
-                    .filter(|_| s.logits)
+                    .filter(|_| s.drafts > 0)
                     .into_iter()
                     .collect()
             })

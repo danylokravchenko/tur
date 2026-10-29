@@ -22,7 +22,9 @@ it raises throughput when drafts are often right, but tokens then arrive in burs
   target's own K/V: sliding layers read the last sliding owner's last `window + 1` keys,
   full layers the last full owner's. It writes no state. Its logits cover only the
   tokens of its 32 best-scoring vocabulary clusters (4,096 of 262,144 on E2B), and the
-  pipeline uses it exactly like the MTP head, one draft per pass.
+  pipeline uses it like the MTP head. Its drafts chain: the next step joins the
+  embedding of its greedy draft with its own state through `post_projection`, at the
+  same position and over the same keys, as Transformers' assisted generation does.
 
 ## Verification is exact
 
@@ -60,7 +62,12 @@ For the MTP head:
 - Each draft carries the head's own probability, calibrated online against observed
   acceptance.
 - The head's logits are computed only while its acceptance is at least 0.3, for at most
-  four decoding sequences, and only while predicted to pay.
+  four decoding sequences, and only while predicted to pay. That acceptance estimate
+  counts only each verification's first head draft.
+- The assistant chains drafts only when one sequence decodes, and only while the
+  probability of reaching the next draft (the acceptance rate to the power of its depth)
+  stays at least 0.3. Verification then keeps the chain's leading drafts while their
+  calibrated acceptances multiply to at least 0.3.
 - A head skipped as unprofitable is retried after 16 passes, and the interval doubles up
   to 256 while it keeps losing.
 
@@ -96,7 +103,14 @@ Measured on Qwen3.5-0.8B on an M1:
   reason a finer cost model was not built: it could not gain more than about 10%.
 - **No learned drafter.** No smaller Qwen3.5 checkpoint exists to serve as a draft model,
   and no EAGLE-3, DFlash or DSpark drafter targets these checkpoints.
-- **Gemma's assistant drafts one token per pass.** On E2B (Q8_0, F16 K/V, greedy,
+- **Gemma's assistant chains drafts at one decoding sequence.** Against one draft per
+  pass on E2B (Q8_0, F16 K/V, greedy, 96 tokens, lookup plus the assistant, two
+  alternating rounds): novel prose 31.6–33.8 against 26.3–29.9 tokens/s (1.14×),
+  repetitive text 50.0–50.5 against 33.2–33.6 (1.50×), code 27.1–29.8 against
+  28.7–29.9 (within noise). At four sequences chains lost 6% on prose and 13% on code,
+  so above one sequence the assistant drafts one token per pass. Every run reproduced
+  the token IDs of single drafts.
+- **The assistant against ordinary decoding,** one draft per pass. On E2B (Q8_0, F16 K/V, greedy,
   96 tokens, two repeats) lookup plus the assistant against ordinary decoding: novel
   prose 28.5–28.9 against 20.0–20.3 tokens/s at one sequence (1.42×) and 58.9–61.1
   against 48.6–48.8 at four (1.23×); code 23.3–26.1 against 19.9–20.1 (1.17–1.30×) and

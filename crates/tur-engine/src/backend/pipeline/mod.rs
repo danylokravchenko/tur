@@ -87,13 +87,13 @@ struct Pending {
     greedy: bool,
     ngrams: NgramIndex,
     acceptance: Acceptance,
-    /// Positions whose draft-head keys and values are written, and the head's draft for
-    /// the token after the pending one, valid while `mtp_done == consumed`.
+    /// Positions whose draft-head keys and values are written, and the head's chained
+    /// drafts for the tokens after the pending one, valid while `mtp_done == consumed`.
     mtp_done: usize,
-    mtp_draft: Option<Draft>,
+    mtp_drafts: Vec<Draft>,
     mtp_acceptance: Acceptance,
-    /// Confidence of the head's draft in the pass in flight.
-    mtp_verifying: Option<f32>,
+    /// Confidences of the head's drafts verified by the pass in flight.
+    mtp_verifying: Vec<f32>,
     drafted: usize,
     accepted_drafts: usize,
 }

@@ -1146,6 +1146,7 @@ impl Gemma4 {
                 token,
                 hidden: sequence.hidden.narrow(0, rows - 1, 1)?,
                 position,
+                drafts: sequence.drafts,
             },
             addresses,
         ))
@@ -1362,7 +1363,7 @@ impl HybridModel for Gemma4 {
             batch.sequences.iter().map(|_| None).collect();
         let (mut rows, mut pages, mut live) = (Vec::new(), Vec::new(), Vec::new());
         for (i, sequence) in batch.sequences.iter().enumerate() {
-            if !sequence.logits {
+            if sequence.drafts == 0 {
                 out[i] = Some(Ok(None));
                 continue;
             }

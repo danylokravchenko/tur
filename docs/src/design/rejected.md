@@ -32,6 +32,7 @@ git show 99b073e:<path> > change.patch
 | TinyLFU-style admission for snapshots | Not built: it would refuse an agent's deeper next-step snapshot in favor of the one it extends | — |
 | Kernel-tier speculation cost model | Not built: bounded at about 10% by the cost of a draft at eight sequences | — |
 | Learned drafters (EAGLE-3, DFlash, DSpark), draft models | No compatible drafter or smaller Qwen3.5 exists for these checkpoints | — |
+| Gemma 4 assistant chains above one decoding sequence | E2B at four sequences against one draft per pass: −6% novel prose, −13% code, +28% repetitive text. Gated off by `CHAIN_MAX_DECODES` | — |
 
 ## Retry on different hardware
 

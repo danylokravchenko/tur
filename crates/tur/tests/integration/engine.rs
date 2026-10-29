@@ -573,7 +573,7 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
                         tokens: 0..len,
                         state: &side,
                         hidden: &hidden.narrow(0, start, len)?,
-                        logits: true,
+                        drafts: 1,
                     }],
                     pool: &pool,
                 })?

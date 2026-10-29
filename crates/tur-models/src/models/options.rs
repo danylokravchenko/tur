@@ -147,3 +147,12 @@ pub struct DraftHead {
     /// loads the head inside the target checkpoint.
     pub model: Option<std::path::PathBuf>,
 }
+
+impl DraftHead {
+    /// Whether the head chains several drafts per pass. A Gemma 4 assistant keeps no state
+    /// and redrafts from its own output; Qwen3.5's head writes its own keys and values and
+    /// drafts one token.
+    pub fn chains(&self) -> bool {
+        self.model.is_some()
+    }
+}

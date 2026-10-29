@@ -2,7 +2,9 @@
 
 The drafter attends over the target's last sliding and full K/V and joins the target's
 scaled embedding of the last seen token with its final hidden state, at that token's
-position. Each record teacher-forces one draft: target hidden at p, token at p + 1.
+position. Each record teacher-forces one draft: target hidden at p, token at p + 1, and
+chains a second one from the first's greedy token and post-projected hidden state at the
+same position, as Transformers' assisted generation does.
 Tiny fixture (offline numerical oracle over the dense target fixture):
   python -I scripts/gemma4_assistant_reference.py --tiny crates/tur/tests/fixtures/gemma4
 Real checkpoints (immutable revisions):
@@ -47,28 +49,40 @@ def tiny_config():
 
 def drafts(target, assistant, tokens, positions):
     """Teacher-forced drafts: for each p, the drafter's logits (unselected tokens at -inf)
-    from the target's final hidden state at p and the token at p + 1, over keys 0..=p."""
+    from the target's final hidden state at p and the token at p + 1, over keys 0..=p, and
+    the logits of the draft chained from it."""
     with torch.inference_mode():
         out = target(input_ids=tokens, output_hidden_states=True, return_shared_kv_states=True, use_cache=False)
         hidden = out.hidden_states[-1]
         embed = target.get_input_embeddings()
         data = {"tokens": tokens[0].to(torch.int64), "positions": torch.tensor(positions, dtype=torch.int64)}
-        logits, chained = [], []
+        logits, chained, second = [], [], []
         for p in positions:
             shared = {k: (v[0][:, :, : p + 1], v[1][:, :, : p + 1]) for k, v in out.shared_kv_states.items()}
             inputs = torch.cat([embed(tokens[:, p + 1 : p + 2]), hidden[:, p : p + 1]], dim=-1)
-            result = assistant(inputs_embeds=inputs, position_ids=torch.tensor([[p + 1]]), shared_kv_states=shared, use_cache=False)
-            row = result.logits[0, 0].float()
-            # Transformers fills unselected tokens with min - 1; Tur masks them with -inf.
-            selected = torch.zeros_like(row, dtype=torch.bool)
-            ordering = assistant.masked_embedding.token_ordering.long().view(assistant.config.num_centroids, -1)
-            top = torch.topk(assistant.masked_embedding.centroids(result_hidden(assistant, inputs, p, shared)), assistant.config.centroid_intermediate_top_k).indices
-            selected[ordering[top].reshape(-1)] = True
-            logits.append(torch.where(selected, row, torch.tensor(float("-inf"))))
-            chained.append(result.last_hidden_state[0, 0].float())
+            row, projected = step(assistant, inputs, p, shared)
+            logits.append(row)
+            chained.append(projected[0, 0])
+            # Transformers' generator chains greedily: the draft's embedding beside the
+            # drafter's post-projected state, at the same position and keys.
+            inputs = torch.cat([embed(row.argmax().view(1, 1)), projected], dim=-1)
+            second.append(step(assistant, inputs, p, shared)[0])
         data["logits"] = torch.stack(logits).contiguous()
         data["chained"] = torch.stack(chained).contiguous()
+        data["second"] = torch.stack(second).contiguous()
     return data
+
+
+def step(assistant, inputs, p, shared):
+    """One drafter step at position p + 1: masked logits and the post-projected state."""
+    result = assistant(inputs_embeds=inputs, position_ids=torch.tensor([[p + 1]]), shared_kv_states=shared, use_cache=False)
+    row = result.logits[0, 0].float()
+    # Transformers fills unselected tokens with min - 1; Tur masks them with -inf.
+    selected = torch.zeros_like(row, dtype=torch.bool)
+    ordering = assistant.masked_embedding.token_ordering.long().view(assistant.config.num_centroids, -1)
+    top = torch.topk(assistant.masked_embedding.centroids(result_hidden(assistant, inputs, p, shared)), assistant.config.centroid_intermediate_top_k).indices
+    selected[ordering[top].reshape(-1)] = True
+    return torch.where(selected, row, torch.tensor(float("-inf"))), result.last_hidden_state.float()
 
 
 def result_hidden(assistant, inputs, p, shared):

@@ -193,6 +193,158 @@ fn test_gemma4_factory_runs_through_shared_pipeline_and_accounts_weights() -> Re
     Ok(())
 }
 
+/// Chains of different lengths drafted together return each sequence's own drafts: the
+/// same as drafting it alone.
+#[test]
+fn test_gemma4_batched_assistant_chains_keep_their_rows() -> Result<()> {
+    use tur_core::execution::{PackedExecution, SequenceDescriptor};
+    use tur_engine::hybrid::{DraftRequest, HybridEngine, SamplingOptions};
+    use tur_models::models::DraftHead;
+    let model = Gemma4::load(
+        &fixture("dense"),
+        &LoadOptions {
+            mtp: Some(DraftHead {
+                vocab: None,
+                model: Some(fixture("assistant")),
+            }),
+            ..options(Device::Cpu, Execution::Reference, WeightFormat::F32, KvFormat::F32)
+        },
+    )?;
+    let mut engine = HybridEngine::new(
+        Arc::new(model),
+        Device::Cpu,
+        PoolConfig {
+            pages: 64,
+            window_pages: 64,
+            recurrent_slots: 2,
+        },
+    )?;
+    engine.enable_draft_head();
+    let prompts: [&[u32]; 2] = [&[2, 7, 5, 9, 3, 12, 7], &[4, 11, 17, 7, 12]];
+    let mut plan = PackedExecution {
+        tokens: Vec::new(),
+        positions: Vec::new(),
+        sequences: Vec::new(),
+    };
+    let mut ids = Vec::new();
+    for prompt in prompts {
+        let handle = engine.allocate(0, SamplingOptions::default(), None)?;
+        let start = plan.tokens.len();
+        plan.tokens.extend_from_slice(prompt);
+        plan.positions.extend(0..prompt.len());
+        plan.sequences.push(SequenceDescriptor {
+            state: handle,
+            tokens: start..plan.tokens.len(),
+            outputs: vec![plan.tokens.len() - 1],
+            speculative: false,
+        });
+        ids.push(handle.request);
+    }
+    engine.submit(plan)?;
+    let mut requests = Vec::new();
+    for ((result, prompt), drafts) in engine.finish()?.into_iter().zip(prompts).zip([2, 3]) {
+        let commit = result.outcome?;
+        let sampled = commit
+            .outputs
+            .first()
+            .ok_or_else(|| invalid("no output"))?
+            .token;
+        let mut tokens = prompt[1..].to_vec();
+        tokens.push(sampled);
+        requests.push(DraftRequest {
+            handle: engine.metadata(result.request)?.handle,
+            start: 0,
+            tokens,
+            hidden: result.hidden.ok_or_else(|| invalid("missing hidden states"))?,
+            drafts,
+        });
+    }
+    let together = engine.draft(&requests)?;
+    for (request, together) in requests.iter().zip(together) {
+        let alone = engine
+            .draft(std::slice::from_ref(request))?
+            .pop()
+            .ok_or_else(|| invalid("missing draft"))??;
+        let together = together?;
+        assert_eq!(together.len(), request.drafts);
+        for (a, b) in together.iter().zip(&alone) {
+            assert_eq!(a.token, b.token);
+            assert!((a.confidence - b.confidence).abs() < 1e-5);
+        }
+        assert_eq!(together.len(), alone.len());
+    }
+    Ok(())
+}
+
+/// Assistant drafts verified by the target through the pipeline: whatever the synthetic
+/// drafter predicts, outputs equal ordinary decoding, greedy and sampled, and every page
+/// and slot is returned. Its near-uniform confidences calibrate to single drafts; chains
+/// are checked against Transformers in `assistant_drafts`.
+#[test]
+fn test_gemma4_assistant_drafts_preserve_target_sampling() -> Result<()> {
+    use tur::{
+        backend::{
+            pipeline::{GenerationRequest, InferencePipeline, PipelineConfig},
+            prefix::PrefixConfig,
+            speculation::SpeculationConfig,
+        },
+        hybrid::SamplingOptions,
+    };
+    use tur_models::models::DraftHead;
+    let checkpoint = crate::common::Checkpoint::new()?;
+    for name in ["model.safetensors", "config.json"] {
+        std::fs::copy(fixture("dense").join(name), checkpoint.0.join(name))?;
+    }
+    let factory = checkpoint.factory();
+    let config = |speculation| PipelineConfig {
+        prefix: PrefixConfig::DISABLED,
+        speculation,
+        ..PipelineConfig::new(1, 16)
+    };
+    let mut plain = InferencePipeline::new(&factory, config(SpeculationConfig::DISABLED))?;
+    let mut drafted = InferencePipeline::new(
+        &factory,
+        config(SpeculationConfig {
+            // No lookup proposals: every draft comes from the assistant.
+            min_ngram: 16,
+            max_ngram: 16,
+            mtp: Some(DraftHead {
+                vocab: None,
+                model: Some(fixture("assistant")),
+            }),
+            ..SpeculationConfig::new(4)
+        }),
+    )?;
+    let prompt = "t2 t7 t5 t9 t3 t12 t7 t17 t4 t11";
+    for sampling in [
+        SamplingOptions {
+            temperature: Some(0.0),
+            ..SamplingOptions::default()
+        },
+        SamplingOptions {
+            temperature: Some(0.8),
+            top_k: Some(8),
+            ..SamplingOptions::default()
+        },
+    ] {
+        for (seed, limit) in [(0, 1), (1, 9), (2, 40)] {
+            let mut request = GenerationRequest::new(prompt.into(), limit);
+            request.sampling = sampling;
+            request.seed = seed;
+            assert_eq!(
+                drafted.run(&request, |_| {})?.generated_text,
+                plain.run(&request, |_| {})?.generated_text,
+                "seed {seed}, limit {limit}"
+            );
+        }
+    }
+    let stats = drafted.speculation_stats();
+    assert!(stats.mtp_passes > 0 && stats.mtp_drafted > 0, "{stats:?}");
+    let usage = drafted.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires pinned Gemma 4 E2B checkpoint and Transformers golden"]
 #[cfg(feature = "metal")]
@@ -408,7 +560,8 @@ fn test_gemma4_prepacked_artifacts_match_load_time_conversion_exactly() -> Resul
 }
 
 /// Teacher-forced assistant drafts over the dense target: the target's final hidden state
-/// at `p` and the token at `p + 1` draft the token after, against Transformers.
+/// at `p` and the token at `p + 1` draft the token after, and a second draft chains from
+/// it, against Transformers.
 #[cfg(feature = "metal")]
 fn assistant_drafts(device: &Device, execution: Execution) -> Result<()> {
     use tur_models::hybrid::{DraftForward, DraftSequence, PackedForward, SequenceForward};
@@ -424,6 +577,7 @@ fn assistant_drafts(device: &Device, execution: Execution) -> Result<()> {
     };
     let tokens = get("tokens")?.to_dtype(DType::U32)?.to_vec1::<u32>()?;
     let expected = rows(get("logits")?)?;
+    let second = rows(get("second")?)?;
     let model = Gemma4::load(
         &fixture("dense"),
         &LoadOptions {
@@ -438,7 +592,7 @@ fn assistant_drafts(device: &Device, execution: Execution) -> Result<()> {
     // Decode one token at a time and draft at each committed end, as the engine does: a
     // committed state no longer holds window pages behind its window.
     let mut state = ModelState::new(&pool);
-    for (p, expected) in expected.iter().enumerate() {
+    for (p, (expected, second)) in expected.iter().zip(&second).enumerate() {
         let mut reservation = state.reserve(1, Boundaries::Final)?;
         reservation.prepare()?;
         let binding = reservation.binding();
@@ -470,7 +624,7 @@ fn assistant_drafts(device: &Device, execution: Execution) -> Result<()> {
                     tokens: 0..1,
                     state: &side,
                     hidden: &hidden,
-                    logits: true,
+                    drafts: 2,
                 }],
                 pool: &pool,
             })?
@@ -478,17 +632,23 @@ fn assistant_drafts(device: &Device, execution: Execution) -> Result<()> {
             .ok_or_else(|| invalid("missing draft"))??
             .ok_or_else(|| invalid("draft returned no logits"))?;
         let actual = rows(&drafted)?;
-        let actual = actual.first().ok_or_else(|| invalid("empty draft"))?;
+        assert_eq!(actual.len(), 2, "position {p} chained drafts");
         let masked = |row: &[f32]| row.iter().map(|v| v.is_finite()).collect::<Vec<_>>();
-        assert_eq!(masked(actual), masked(expected), "position {p} candidates");
         let finite = |row: &[f32]| {
             row.iter()
                 .copied()
                 .filter(|v| v.is_finite())
                 .collect::<Vec<_>>()
         };
-        let error = max_relative(&[finite(actual)], &[finite(expected)]);
-        assert!(error < 1e-4, "{execution:?} position {p}: {error}");
+        for (depth, (actual, expected)) in actual.iter().zip([expected, second]).enumerate() {
+            assert_eq!(
+                masked(actual),
+                masked(expected),
+                "position {p} depth {depth} candidates"
+            );
+            let error = max_relative(&[finite(actual)], &[finite(expected)]);
+            assert!(error < 1e-4, "{execution:?} position {p} depth {depth}: {error}");
+        }
     }
     Ok(())
 }
@@ -575,7 +735,7 @@ fn test_gemma4_e2b_assistant_drafts_agree_with_transformers_past_the_window() ->
                     tokens: 0..1,
                     state: &side,
                     hidden: &hidden.narrow(0, piece.len() - 1, 1)?,
-                    logits: true,
+                    drafts: 1,
                 }],
                 pool: &pool,
             })?

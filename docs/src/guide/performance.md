@@ -266,9 +266,24 @@ prefill moves within noise: projections dominate E2B prefill.
 | Repetitive | 1 | 19.4–19.6 | 64.3–65.0 | 58.7–61.2 |
 | | 4 | 43.7–45.2 | 99.4–110.3 | 111.4–113.2 |
 
-The assistant (`--draft-model google/gemma-4-E2B-it-assistant`) drafts one token per
+The assistant (`--draft-model google/gemma-4-E2B-it-assistant`) drafted one token per
 pass, 63–66% accepted, at about 2.9 ms each. All 36 runs reproduced ordinary decoding's
 token IDs.
+
+**Chained assistant drafts** (lookup plus the assistant, measured on 2026-10-29 against
+one draft per pass, alternating builds over two rounds, output tok/s):
+
+| Prompt | Seqs | One draft | Chained |
+| --- | --- | --- | --- |
+| Novel prose | 1 | 26.3–29.9 | 31.6–33.8 |
+| | 4 | 59.6–62.0 | 54.8–58.3 |
+| Code | 1 | 28.7–29.9 | 27.1–29.8 |
+| | 4 | 64.9–66.3 | 56.2–58.5 |
+| Repetitive | 1 | 33.2–33.6 | 50.0–50.5 |
+| | 4 | 62.8–70.9 | 84.1–87.6 |
+
+Chains therefore run only when one sequence decodes; above that the assistant drafts one
+token per pass. Every run reproduced the single-draft token IDs.
 
 **Loading:**
 

@@ -185,23 +185,30 @@ impl InferencePipeline {
             if let (Some(&(drafted, source)), Ok(commit)) = (drafted.get(&id), &result.outcome) {
                 // Every accepted input after the decode token is an accepted draft.
                 let accepted = commit.accepted_tokens.saturating_sub(1).min(drafted);
+                // The head's estimate is of its first draft, which decides whether it runs:
+                // deeper chained drafts are accepted less often, are weighed by their own
+                // calibrated confidence, and folded in they switched the head off for
+                // requests at four E2B sequences.
+                let first = (drafted.min(1), accepted.min(1));
                 if let Some(pending) = self.pending.get_mut(&id) {
                     // A sampled request's head estimate follows its drafts' calibrated
                     // confidence instead (see `draft_head`).
                     match source {
                         DraftSource::Lookup => pending.acceptance.observe(drafted, accepted),
                         DraftSource::Mtp if pending.greedy => {
-                            pending.mtp_acceptance.observe(drafted, accepted);
+                            pending.mtp_acceptance.observe(first.0, first.1);
                         }
                         DraftSource::Mtp => {}
                     }
                     pending.drafted += drafted;
                     pending.accepted_drafts += accepted;
                 }
-                let (confidence, greedy) = self
+                let (confidences, greedy) = self
                     .pending
                     .get_mut(&id)
-                    .map_or((None, false), |p| (p.mtp_verifying.take(), p.greedy));
+                    .map_or((Vec::new(), false), |p| {
+                        (std::mem::take(&mut p.mtp_verifying), p.greedy)
+                    });
                 let stats = &mut self.speculation_stats;
                 match source {
                     DraftSource::Lookup => {
@@ -210,13 +217,18 @@ impl InferencePipeline {
                     }
                     DraftSource::Mtp => {
                         if greedy {
-                            self.mtp_acceptance.observe(drafted, accepted);
+                            self.mtp_acceptance.observe(first.0, first.1);
                         }
                         stats.mtp_drafted += drafted as u64;
                         stats.mtp_accepted += accepted as u64;
-                        if let Some(confidence) = confidence {
-                            self.calibration[usize::from(greedy)].observe(confidence, accepted > 0);
-                            stats.observe_confidence(confidence, accepted > 0);
+                        // Each draft the verification reached: those after a rejection
+                        // were never tested.
+                        for (depth, &confidence) in
+                            confidences.iter().enumerate().take(drafted).take(accepted + 1)
+                        {
+                            let hit = depth < accepted;
+                            self.calibration[usize::from(greedy)].observe(confidence, hit);
+                            stats.observe_confidence(confidence, hit);
                         }
                     }
                 }

@@ -5,7 +5,9 @@
 //! keeps no state. Its input joins the target's scaled embedding of the last seen token
 //! with the target's final hidden state before it, at the last seen token's position.
 //! Logits cover only the tokens of the top-scoring vocabulary clusters; every other
-//! token is `-inf`.
+//! token is `-inf`. Drafts chain: the next step joins the embedding of the greedy draft
+//! with the drafter's post-projected hidden state, at the same position and over the same
+//! target keys, as Transformers' assisted generation does.
 use super::{Gemma4, StatePool, inverse_frequencies, rotary_tables};
 use crate::models::{
     LoadOptions, WeightPlan, Weights,
@@ -187,6 +189,7 @@ impl WeightLayout for AssistantConfig {
         };
         let mut projections = vec![
             single("pre_projection", t.hidden_size, 2 * self.backbone),
+            single("post_projection", self.backbone, t.hidden_size),
             single("masked_embedding.centroids", self.centroids, t.hidden_size),
             // The tied head; the drafter gathers its candidate rows.
             Projection::new(
@@ -256,6 +259,8 @@ struct AssistantLayer {
 pub(super) struct Assistant {
     config: AssistantConfig,
     pre: PackedLinear,
+    /// Returns the drafter's final state to the target's width for the next chained draft.
+    post: PackedLinear,
     centroids: PackedLinear,
     head: PackedLinear,
     norm: Tensor,
@@ -342,6 +347,7 @@ impl Assistant {
         }
         Ok(Self {
             pre: t.projection("pre_projection")?,
+            post: t.projection("post_projection")?,
             centroids: t.projection("masked_embedding.centroids")?,
             head: t.projection("lm_head")?,
             norm: small("model.norm.weight")?,
@@ -355,6 +361,7 @@ impl Assistant {
     pub(super) fn bytes(&self) -> usize {
         let dense = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
         let mut total = self.pre.resident_bytes()
+            + self.post.resident_bytes()
             + self.centroids.resident_bytes()
             + self.head.resident_bytes()
             + dense(&self.norm)
@@ -395,8 +402,7 @@ impl Assistant {
             .collect();
         let mut bytes = plan.bytes(&config)?;
         for (name, shape) in config.weight_shapes()? {
-            // The post-projection feeds only chained drafts, which Tur does not run.
-            if !accounted.contains(&name) && name != "post_projection.weight" {
+            if !accounted.contains(&name) {
                 bytes = checked_elements(&shape)?
                     .checked_mul(4)
                     .and_then(|b| bytes.checked_add(b))
@@ -432,11 +438,12 @@ fn ordering(checkpoint: &Checkpoint, config: &AssistantConfig) -> Result<Vec<u32
 }
 
 /// One draft: the token at the last seen position and the target's final hidden state
-/// before it, at that token's position.
+/// before it, at that token's position, and how many chained drafts to return.
 pub(super) struct DraftRow {
     pub(super) token: u32,
     pub(super) hidden: Tensor,
     pub(super) position: usize,
+    pub(super) drafts: usize,
 }
 
 /// Target addressing of a draft pass: each row's page table; row `r` sees the first
@@ -448,12 +455,79 @@ pub(super) struct DraftPass<'a> {
 }
 
 impl Gemma4 {
-    /// Draft logits `[1, vocab]` for each row of `pass`.
+    /// Draft logits `[drafts, vocab]` for each row of `pass`, chaining greedy drafts.
     pub(super) fn assistant_logits(
         &self,
         assistant: &Assistant,
         pass: &DraftPass<'_>,
     ) -> Result<Vec<Tensor>> {
+        let mut drafted: Vec<Vec<Tensor>> = pass.rows.iter().map(|_| Vec::new()).collect();
+        // Rows still chaining, by their index in `pass`.
+        let mut live: Vec<usize> = (0..pass.rows.len())
+            .filter(|&r| pass.rows[r].drafts > 0)
+            .collect();
+        let mut step = DraftPass {
+            pool: pass.pool,
+            rows: pass.rows,
+            pages: pass.pages,
+        };
+        let (mut rows, mut pages);
+        while !live.is_empty() {
+            let (logits, tokens, normed) = self.assistant_step(assistant, &step)?;
+            for (&r, logits) in live.iter().zip(logits) {
+                drafted[r].push(logits);
+            }
+            let next: Vec<usize> = (0..live.len())
+                .filter(|&i| drafted[live[i]].len() < pass.rows[live[i]].drafts)
+                .collect();
+            if next.is_empty() {
+                break;
+            }
+            let kept = Tensor::new(
+                next.iter()
+                    .map(|&i| u32::try_from(i).map_err(|_| invalid("draft row overflow")))
+                    .collect::<Result<Vec<_>>>()?
+                    .as_slice(),
+                &self.device,
+            )?;
+            let hidden = self.linear(&assistant.post, &normed.index_select(&kept, 0)?)?;
+            rows = next
+                .iter()
+                .enumerate()
+                .map(|(j, &i)| {
+                    let row = &pass.rows[live[i]];
+                    Ok(DraftRow {
+                        token: tokens[i],
+                        hidden: hidden.narrow(0, j, 1)?,
+                        position: row.position,
+                        drafts: row.drafts,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            pages = next
+                .iter()
+                .map(|&i| pass.pages[live[i]].clone())
+                .collect::<Vec<_>>();
+            live = next.into_iter().map(|i| live[i]).collect();
+            step = DraftPass {
+                pool: pass.pool,
+                rows: &rows,
+                pages: &pages,
+            };
+        }
+        drafted
+            .into_iter()
+            .map(|rows| Ok(Tensor::cat(&rows, 0)?))
+            .collect()
+    }
+
+    /// One drafter step over every row of `pass`: each row's logits `[1, vocab]`, its
+    /// greedy draft, and the drafter's final normalized states `[rows, hidden]`.
+    fn assistant_step(
+        &self,
+        assistant: &Assistant,
+        pass: &DraftPass<'_>,
+    ) -> Result<(Vec<Tensor>, Vec<u32>, Tensor)> {
         let ids: Vec<u32> = pass.rows.iter().map(|r| r.token).collect();
         let ids = Tensor::new(ids.as_slice(), &self.device)?;
         let embedded =
@@ -482,20 +556,24 @@ impl Gemma4 {
         let scores = self
             .linear(&assistant.centroids, &normed)?
             .to_vec2::<f32>()?;
-        scores
+        let (logits, tokens) = scores
             .iter()
             .enumerate()
             .map(|(r, row)| self.cluster_logits(assistant, row, &normed.narrow(0, r, 1)?))
-            .collect()
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .unzip();
+        Ok((logits, tokens, normed))
     }
 
-    /// Logits of the tokens in the `top_k` best-scoring clusters, `-inf` elsewhere.
+    /// Logits of the tokens in the `top_k` best-scoring clusters, `-inf` elsewhere, and
+    /// their first maximum: the greedy draft the engine reads from them.
     fn cluster_logits(
         &self,
         assistant: &Assistant,
         scores: &[f32],
         normed: &Tensor,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, u32)> {
         let c = &assistant.config;
         let per = c.text.vocab_size / c.centroids;
         let mut clusters: Vec<usize> = (0..c.centroids).collect();
@@ -516,11 +594,22 @@ impl Gemma4 {
         for (&token, logit) in candidates.iter().zip(logits) {
             full[token as usize] = logit;
         }
-        Ok(Tensor::from_vec(
-            full,
-            (1, c.text.vocab_size),
-            &self.device,
-        )?)
+        let greedy = candidates
+            .iter()
+            .copied()
+            .min_by(|&a, &b| {
+                full[b as usize]
+                    .total_cmp(&full[a as usize])
+                    .then(a.cmp(&b))
+            })
+            .ok_or_else(|| invalid("assistant selected no candidate tokens"))?;
+        if !full[greedy as usize].is_finite() {
+            return Err(invalid("assistant draft logits are not finite"));
+        }
+        Ok((
+            Tensor::from_vec(full, (1, c.text.vocab_size), &self.device)?,
+            greedy,
+        ))
     }
 
     fn assistant_attention(

@@ -268,8 +268,29 @@ const COST_DECAY: f64 = 0.95;
 const MIN_DRAFT_VARIANCE: f64 = 0.1;
 /// Conditional acceptance below which a multi-token prediction draft cannot repay the
 /// head's LM-head projection: its logits are then skipped (its keys and values are still
-/// written) and the estimate recovers towards the pipeline-wide rate.
+/// written) and the estimate recovers towards the pipeline-wide rate. A chained draft is
+/// computed and verified only while the probability of reaching and accepting it stays
+/// at least this.
 pub const MTP_MIN_RATE: f64 = 0.3;
+
+/// Most decoding sequences of a pass for which a head chains drafts. On the M1 with
+/// Gemma 4 E2B, chains gained 14% on novel prose and 50% on repetitive text at one
+/// sequence, but at four lost 6% on prose and 13% on code against one draft per pass:
+/// each chained step is another drafter pass that four rows share.
+pub const CHAIN_MAX_DECODES: usize = 1;
+
+/// Chained head drafts worth computing at conditional acceptance `rate`, at most `limit`:
+/// the deepest whose cumulative acceptance `rate^depth` stays at least [`MTP_MIN_RATE`],
+/// and at least one.
+pub fn chain_depth(rate: f64, limit: usize) -> usize {
+    let rate = rate.clamp(0.0, 1.0);
+    let (mut depth, mut reach) = (1, rate);
+    while depth < limit && reach * rate >= MTP_MIN_RATE {
+        depth += 1;
+        reach *= rate;
+    }
+    depth.min(limit)
+}
 /// Most decoding sequences of a pass for which draft-head drafts are computed. On the M1
 /// with Qwen3.5-0.8B they paid at one to four sequences and did not at eight, where a
 /// verified draft costs about three quarters of a decode token's share of the pass even
@@ -476,6 +497,27 @@ impl Calibration {
         Acceptance(CONFIDENCE_PRIOR.mul_add(prior, accepted) / (drafted + CONFIDENCE_PRIOR))
     }
 
+    /// The leading drafts of a chain with these confidences worth verifying, and their
+    /// per-draft acceptance for planning: drafts are kept while their cumulative calibrated
+    /// acceptance stays at least [`MTP_MIN_RATE`] (always the first), and the geometric
+    /// mean of the kept drafts' acceptances reproduces the whole chain's.
+    pub fn chain(&self, confidences: &[f32]) -> (usize, Acceptance) {
+        let (mut kept, mut reach) = (0, 1.0);
+        for &confidence in confidences {
+            let next = reach * self.acceptance(confidence).rate();
+            if kept > 0 && next < MTP_MIN_RATE {
+                break;
+            }
+            (kept, reach) = (kept + 1, next);
+        }
+        let mean = if kept == 0 {
+            0.0
+        } else {
+            reach.powf(1.0 / kept as f64)
+        };
+        (kept, Acceptance(mean))
+    }
+
     /// Record whether a draft of `confidence` was accepted.
     pub fn observe(&mut self, confidence: f32, accepted: bool) {
         let (hits, total) = &mut self.bins[Self::bin(confidence)];
@@ -562,7 +604,8 @@ pub struct SpeculationStats {
     /// ones too), for per-position acceptance.
     pub depth_drafted: [u64; STAT_DEPTHS],
     pub depth_accepted: [u64; STAT_DEPTHS],
-    /// Draft-head drafts verified and accepted per confidence decile.
+    /// Draft-head drafts verification reached (none after a rejection), and those accepted,
+    /// per confidence decile.
     pub confidence_drafted: [u64; CONFIDENCE_BINS],
     pub confidence_accepted: [u64; CONFIDENCE_BINS],
 }
@@ -666,6 +709,25 @@ mod tests {
         }
         assert!(flat.line(1).is_none());
         Ok(())
+    }
+
+    #[test]
+    fn test_head_chains_only_while_drafts_stay_likely_to_be_reached() {
+        // 0.65² = 0.42 is worth a second draft; 0.65³ = 0.27 is not.
+        assert_eq!(chain_depth(0.65, 8), 2);
+        assert_eq!(chain_depth(0.9, 4), 4);
+        // A head below the threshold still drafts once when asked; limits cap the chain.
+        assert_eq!(chain_depth(0.1, 4), 1);
+        assert_eq!(chain_depth(0.9, 1), 1);
+        assert_eq!(chain_depth(0.9, 0), 0);
+        let calibration = Calibration::default();
+        // Unobserved bins expect their confidence: 0.95 · 0.85 = 0.81, then · 0.25 < 0.3.
+        let (kept, rate) = calibration.chain(&[0.95, 0.85, 0.25, 0.95]);
+        assert_eq!(kept, 2);
+        assert!((rate.rate() - (0.95f64 * 0.85).sqrt()).abs() < 1e-12);
+        // The first draft is always kept, even when unlikely.
+        assert_eq!(calibration.chain(&[0.05, 0.95]).0, 1);
+        assert_eq!(calibration.chain(&[]).0, 0);
     }
 
     #[test]
