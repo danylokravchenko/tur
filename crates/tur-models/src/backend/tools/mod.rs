@@ -1,3 +1,4 @@
+mod gemma;
 use serde::{Deserialize, Serialize};
 
 /// Definition of a callable tool (function) that the model can invoke.
@@ -38,24 +39,39 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
-    /// Parse complete Qwen hybrid XML calls, using the tool schema to preserve string
+    /// Parse complete Gemma calls and Qwen hybrid XML calls, using the tool schema to preserve string
     /// parameters and decode structured values. JSON call envelopes are also accepted.
     /// Malformed or incomplete blocks are ignored.
     pub fn parse_from_output(text: &str, tools: &[ToolDefinition]) -> Vec<Self> {
-        const OPEN: &str = "<tool_call>";
-        const CLOSE: &str = "</tool_call>";
-
         let mut calls = Vec::new();
         let mut remaining = text;
-
-        while let Some((_, after_open)) = remaining.split_once(OPEN) {
-            let Some((body, rest)) = after_open.split_once(CLOSE) else {
+        loop {
+            let markers = [
+                ("<tool_call>", "</tool_call>"),
+                ("<|tool_call>", "<tool_call|>"),
+            ];
+            let Some((at, open, close)) = markers
+                .iter()
+                .filter_map(|&(open, close)| remaining.find(open).map(|at| (at, open, close)))
+                .min_by_key(|(at, _, _)| *at)
+            else {
                 break;
             };
-            if let Some(call) = serde_json::from_str::<Self>(body.trim())
-                .ok()
-                .or_else(|| parse_xml_call(body.trim(), tools))
-            {
+            let Some(after) = remaining.get(at + open.len()..) else {
+                break;
+            };
+            let Some((body, rest)) = after.split_once(close) else {
+                break;
+            };
+            let body = body.trim();
+            let call = if open == "<|tool_call>" {
+                gemma::parse(body, tools)
+            } else {
+                serde_json::from_str::<Self>(body)
+                    .ok()
+                    .or_else(|| parse_xml_call(body, tools))
+            };
+            if let Some(call) = call {
                 calls.push(call);
             }
             remaining = rest;

@@ -1,51 +1,31 @@
 # Scheduling
 
-`InferencePipeline` (`tur-engine`) turns requests into packed passes. Its `Scheduler` is
-a pure policy over request descriptors. The pipeline supplies a callback that checks
-whether each candidate chunk fits the state pool, so the policy is unit-tested without a
-model.
+Every pass, the scheduler decides which requests get to run and how much of each. It has to balance two kinds of work. Requests that are already replying want one token each, quickly and steadily. New prompts want large chunks processed so their first token arrives soon. Give prompts too much of a pass and every streaming reply stutters; give them too little and new users wait.
+
+`InferencePipeline` (in `tur-engine`) turns requests into packed passes. Its `Scheduler` is a pure policy over request descriptions. The pipeline passes it a callback that checks whether a chunk fits the state pool, so the policy is unit-tested without a model.
 
 ## One iteration
 
-`begin_step` runs these steps, then submits the pass without waiting for it:
+`begin_step` runs these steps and then submits the pass without waiting for it:
 
-1. **Expire deadlines.** A request's deadline counts from submission, including time
-   waiting for worker intake. Requests past their deadline fail before execution, and
-   again before publication: work that finishes late fails, and its state is released.
-   A pass already on the GPU is fenced, not interrupted.
-2. **Restore prefixes.** Waiting requests whose prompts start with a retained snapshot
-   adopt it and skip that part of prefill (see [Prefix reuse](prefix-reuse.md)), oldest
-   first. With `engine.prefix_restorable_first`, restorable requests take free slots
-   ahead of older cold ones until the oldest waits `max_queue_wait`.
-3. **Decodes first.** Every running decode gets one token, in strict rotation by when it
-   last ran, so a decode skipped for lack of budget runs first next time. While prefill
-   work exists, `min_prefill_tokens` of the pass is held back for it.
-4. **Prefill.** Chunks of waiting and partially prefilled requests follow in arrival
-   order, admitting new requests while fewer than `max_running` hold state. The prefill
-   budget is the largest power-of-two token count whose estimated pass time meets the
-   target `max(target_pass, 2 × decode-only estimate)`, so prefill can at most double a
-   pass's decode cost.
-   - **Without decodes,** prefill takes the whole pass.
-   - **Damping.** The budget moves at most a factor of two per pass and never drops
-     below the minimum, so one noisy timing cannot starve prefill.
-   - **Queue-age guard.** The oldest prefill waiting longer than `max_queue_wait`
-     ignores the cost target, within the pass's token cap. If younger requests hold the
-     memory or running slots it needs, the newest of them is preempted.
-   - **Chunk boundaries.** Chunks stop at aligned and predicted template-divergence
-     snapshot positions, so recurrent state exists at each exact boundary.
-5. **Memory.** A chunk that admits a request must leave one page of growth for every
-   running sequence. A decode that does not fit preempts the newest running request.
+1. Expire deadlines. A deadline counts from submission, including time spent waiting to be accepted. Requests past their deadline fail before execution and again before their results are published, and their memory is released. A pass already on the GPU is allowed to finish.
+2. Restore prefixes. Waiting requests whose prompts start with a cached snapshot take it over and skip that part of their prompt (see [Prefix reuse](prefix-reuse.md)), oldest first. With `engine.prefix_restorable_first`, such requests take free places ahead of older uncached ones, until the oldest has waited `max_queue_wait`.
+3. Decodes go first. Every replying request gets one token, in strict rotation by when it last ran, so a decode skipped for lack of room runs first next time. While prompts are waiting, `min_prefill_tokens` of the pass is held back for them.
+4. Prompts fill the rest, in arrival order, admitting new requests while fewer than `max_running` hold state. The prompt share is sized from measured costs (see below).
+5. Memory is checked last. A chunk that admits a new request must leave one page of growth for every running request. If a decode doesn't fit, the newest running request is preempted.
 
-Pass costs are measured per shape and context bucket, from completed device time, and
-feed the next iteration's estimates.
+### Sizing the prompt share
+
+The scheduler measures how long each pass took on the GPU, by shape and context length, and uses that to predict the next one. It gives prompts the largest power-of-two token count whose predicted pass time stays within `max(target_pass, 2 × the decode-only time)`. In other words, prompt work can at most double the time replying users wait for their next token, and short passes are allowed to grow to the target.
+
+- When nobody is decoding, prompts take the whole pass.
+- The share changes by at most a factor of two per pass and never drops below the minimum, so one noisy timing can't starve prompts.
+- If the oldest waiting prompt has waited longer than `max_queue_wait`, it ignores the time target, within the pass's token cap. If younger requests hold the memory or places it needs, the newest of them is preempted.
+- Chunks stop at prefix snapshot positions, so recurrent state exists at each exact boundary.
 
 ## Preemption
 
-Under memory pressure, the newest running request releases its state and goes back to
-waiting. When it runs again it recomputes its prompt and generated tokens with its RNG
-stream and grammar state intact, and with its original chunk boundaries, so recurrent
-rounding matches the first run. Older work is never evicted to admit newer work.
-Retained prefix snapshots are evicted before any running request is preempted.
+When memory runs out, the newest running request gives up its state and goes back to waiting. When it runs again, it recomputes its prompt and the tokens it already generated, with its random stream and grammar state intact and its original chunk boundaries, so its output matches what it would have produced uninterrupted. Older work is never evicted to make room for newer work, and cached prefix snapshots are evicted before any running request is preempted.
 
 ## Limits
 
@@ -62,29 +42,13 @@ Retained prefix snapshots are evicted before any running request is preempted.
 
 Flag-backed settings also have [TOML equivalents](../guide/configuration.md).
 
-Submissions beyond `max_waiting` or `max_waiting_tokens` are rejected immediately
-(`QueueFull`, HTTP 429). A positive output limit that cannot fit the model's context,
-and a request that cannot fit the state pool even alone, are rejected at submission.
+Submissions beyond `max_waiting` or `max_waiting_tokens` are rejected immediately (`QueueFull`, HTTP 429). A request whose output limit can't fit the model's context, or that can't fit the state pool even on its own, is rejected at submission.
 
 ## Decisions
 
-- **Operational bounds can persist in TOML.** Scheduler timing and waiting-token limits
-  are file settings; the measured defaults and adaptive policy are unchanged.
-
-- **Decode priority with bounded, adaptive prefill.** On a mixed 128/2K-token workload,
-  this cut p95 decoded-text intervals 3.7× against the earlier unscheduled loop. Throughput
-  fell 7% and first-text latency p95 rose 14%; decode-only serving is unchanged.
-- **Recompute, not swap.** Preemption recomputes rather than copying state out of the
-  pool, and preserves rounding boundaries and RNG, so a preempted request produces what
-  it would have produced uninterrupted (barring batch-shape effects, see below).
-- **Batch shape can change the last bits.** Kernels reduce in different orders at
-  different shapes. Stress tests compare mixed lengths, reshuffled arrivals, cancellation
-  and pool exhaustion against solo runs on random weights. `PipelineConfig::reproducible`
-  serializes requests when exact reproducibility matters. Concurrent batch invariance was
-  built and rejected on cost.
-- **One shared device budget.** Several models on one device lease from one budget
-  instead of each assuming the whole device. Arbitration is tested with two loaded tiny
-  models; the server loads one.
-- **Admitting restorable prefixes first is opt-in.** Under warm-cold contention it lowered
-  warm TTFT 5.4× but raised cold TTFT 15% and cut throughput 10%, so arrival order stays
-  the default (see [Prefix reuse](prefix-reuse.md)).
+- Decodes get priority, and prompts get a bounded, adaptive share. On a mixed workload of 128- and 2K-token prompts, this made the slowest 5% of gaps between streamed tokens 3.7× shorter than running prompts unchecked. Throughput fell 7% and the slowest first-token times rose 14%; decode-only serving is unchanged.
+- Preemption recomputes rather than copying state out. It preserves chunk boundaries and the random stream, so a preempted request produces what it would have produced uninterrupted, apart from batch-shape effects.
+- Batch shape can change the last bits of a result, because kernels add numbers in different orders at different shapes. Stress tests compare mixed lengths, reshuffled arrivals, cancellation and memory exhaustion against solo runs on random weights. `PipelineConfig::reproducible` runs requests one at a time when exact reproducibility matters; bit-exact batching was built and rejected because of its cost.
+- Several models on one GPU share one budget instead of each assuming the whole device. This is tested with two small models loaded at once; the server loads one.
+- Letting cached prefixes jump the queue is opt-in. Under contention it got cached requests their first token 5× sooner, but uncached requests waited 15% longer and throughput fell 10%, so arrival order stays the default (see [Prefix reuse](prefix-reuse.md)).
+- Operational limits can live in TOML. Scheduler timing and waiting-token limits are file settings, and the measured defaults are unchanged.

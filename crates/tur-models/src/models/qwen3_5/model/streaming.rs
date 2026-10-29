@@ -2,10 +2,10 @@
 //! live in memory; hidden states between layers are spooled beside the output.
 
 use super::{
-    Arc, Boundaries, Config, DEFAULT_RECURRENT_STATE, Dims, Layer, Mixer, Mlp, ModelDescription,
-    ModelState, Pass, PoolConfig, SequenceForward, Span, StatePool, Tensor, Tensors, WeightFormat,
-    centred, math, plan,
+    Arc, Boundaries, Config, Dims, Layer, Mixer, Mlp, ModelDescription, ModelState, Pass,
+    PoolConfig, SequenceForward, Span, StatePool, Tensor, Tensors, centred, math,
 };
+use crate::models::{DEFAULT_RECURRENT_STATE, WeightFormat};
 use crate::quantization::{self, LayerCalibration};
 use crate::quantization::{Calibration, Recorder};
 use candle_core::Device;
@@ -37,7 +37,7 @@ pub(in crate::models::qwen3_5) fn calibrate_layers(
     let info = Calibration {
         samples: samples.len(),
         tokens: samples.iter().map(Vec::len).sum(),
-        fingerprint: plan::fnv1a(&ids),
+        fingerprint: crate::models::weights::fnv1a(&ids),
         ..Calibration::default()
     };
     let description = config.description(
@@ -132,6 +132,7 @@ fn run_layer(
         x.device(),
         PoolConfig {
             pages: description.pages_for(len).max(1),
+            window_pages: description.pages_for(len).max(1),
             recurrent_slots: 1,
         },
     )?;

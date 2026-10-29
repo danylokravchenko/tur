@@ -11,7 +11,7 @@ use tur::{
     },
     core::execution::invalid,
     hybrid::SamplingOptions,
-    models::qwen3_5::DraftHead,
+    models::DraftHead,
 };
 
 fn config(drafts: usize, batch: usize) -> PipelineConfig {
@@ -147,7 +147,7 @@ fn test_draft_reservation_does_not_overcommit_an_explicit_state_budget() -> Resu
     drop(plain);
     let mut cfg = config(8, 1);
     cfg.state_bytes = Some(1);
-    assert!(InferencePipeline::new(&fixture.factory(), cfg).is_err());
+    assert!(InferencePipeline::new(&fixture.factory(), cfg.clone()).is_err());
     cfg.state_bytes = Some(bytes);
     let mut pipeline = InferencePipeline::new(&fixture.factory(), cfg)?;
     let stats = pipeline.run(&GenerationRequest::new("t5 t5 t5 t5".into(), 24), |_| {})?;
@@ -177,7 +177,7 @@ fn test_speculative_device_sampling_preserves_seeded_penalties_and_outputs() -> 
     let fixture = Checkpoint::fused()?;
     let mut factory = fixture.factory();
     factory.device = candle_core::Device::new_metal(0)?;
-    factory.format = Some(tur::models::qwen3_5::WeightFormat::Q8_0);
+    factory.format = Some(tur::models::WeightFormat::Q8_0);
     let mut plain = InferencePipeline::new(&factory, config(0, 1))?;
     let mut speculative = InferencePipeline::new(&factory, config(3, 1))?;
     let mut request = GenerationRequest::new(
@@ -219,7 +219,7 @@ fn test_preempted_drafting_requests_rebuild_their_lookup_and_match_plain_decodin
     // Two K/V pages beside every recurrent slot (two per sequence plus the drafts'): both
     // requests start, each needs a second page at position 16, and the newer is preempted.
     let mut cfg = config(4, 2);
-    let usage = InferencePipeline::new(&fixture.factory(), cfg)?.memory()?;
+    let usage = InferencePipeline::new(&fixture.factory(), cfg.clone())?.memory()?;
     cfg.state_bytes = Some((usage.slots.capacity + 1) * usage.slot_bytes + 2 * usage.page_bytes);
     let mut pipeline = InferencePipeline::new(&fixture.factory(), cfg)?;
     for _ in 0..2 {
@@ -333,7 +333,7 @@ fn mtp_config(drafts: usize, batch: usize) -> PipelineConfig {
 fn assert_mtp_preserves_outputs(factory: &tur::ModelFactory) -> Result<()> {
     for vocab in [None, Some(40)] {
         let mut config = mtp_config(4, 1);
-        config.speculation.mtp = Some(DraftHead { vocab });
+        config.speculation.mtp = Some(DraftHead { vocab, model: None });
         assert_mtp_preserves_outputs_with(factory, config)?;
     }
     Ok(())
@@ -396,7 +396,7 @@ fn test_fused_mtp_drafts_preserve_target_sampling() -> Result<()> {
     let fixture = Checkpoint::fused_mtp()?;
     let mut factory = fixture.factory();
     factory.device = candle_core::Device::new_metal(0)?;
-    factory.format = Some(tur::models::qwen3_5::WeightFormat::Q8_0);
+    factory.format = Some(tur::models::WeightFormat::Q8_0);
     assert_mtp_preserves_outputs(&factory)
 }
 
@@ -420,14 +420,20 @@ fn test_mtp_needs_a_head_and_disables_prefix_reuse() -> Result<()> {
     // A reduced draft vocabulary is a copy of that many F32 LM-head rows of 64 values; the
     // pipeline checks the plan against the loaded weights.
     let mut reduced = mtp_config(4, 1);
-    reduced.speculation.mtp = Some(DraftHead { vocab: Some(40) });
+    reduced.speculation.mtp = Some(DraftHead {
+        vocab: Some(40),
+        model: None,
+    });
     let reduced = InferencePipeline::new(&with_head.factory(), reduced)?;
     assert_eq!(
         reduced.memory_plan().weights - drafted.memory_plan().weights,
         40 * 64 * 4
     );
     let mut empty = mtp_config(4, 1);
-    empty.speculation.mtp = Some(DraftHead { vocab: Some(0) });
+    empty.speculation.mtp = Some(DraftHead {
+        vocab: Some(0),
+        model: None,
+    });
     assert!(InferencePipeline::new(&with_head.factory(), empty).is_err());
     Ok(())
 }
@@ -440,7 +446,7 @@ fn test_preempted_mtp_requests_recompute_the_head_and_match_plain_decoding() -> 
         .run(&request, |_| {})?
         .generated_text;
     let mut cfg = mtp_config(4, 2);
-    let usage = InferencePipeline::new(&fixture.factory(), cfg)?.memory()?;
+    let usage = InferencePipeline::new(&fixture.factory(), cfg.clone())?.memory()?;
     cfg.state_bytes = Some((usage.slots.capacity + 1) * usage.slot_bytes + 2 * usage.page_bytes);
     let mut pipeline = InferencePipeline::new(&fixture.factory(), cfg)?;
     for _ in 0..2 {

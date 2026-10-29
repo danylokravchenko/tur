@@ -29,7 +29,7 @@ fmt-check:
 test *args:
     cargo nextest run --workspace "$@"
 
-# Checkpoint-dependent tests; needs TUR_QWEN35_0_8B and the golden files.
+# Checkpoint-dependent tests; set the selected model and golden environment variables.
 test-checkpoint *args:
     cargo nextest run --workspace --run-ignored only "$@"
 
@@ -58,6 +58,15 @@ quantize dir output *args:
 # Benchmarks: `just bench kernels`, `just bench serving`; no case lists them.
 bench *args:
     cargo bench --offline -p tur --bench perf -- "$@"
+
+# Short Gemma 4 model benchmark (Q8_0, F16 K/V, 512-token prefill, one 4K context); knobs override.
+bench-gemma *args:
+    TUR_BENCH_MODEL="${TUR_BENCH_MODEL:-${TUR_GEMMA4_E2B:?set TUR_GEMMA4_E2B}}" \
+    TUR_BENCH_FORMATS="${TUR_BENCH_FORMATS:-q8_0}" TUR_BENCH_KV="${TUR_BENCH_KV:-f16}" \
+    TUR_BENCH_PREFILL="${TUR_BENCH_PREFILL:-512}" TUR_BENCH_CONTEXTS="${TUR_BENCH_CONTEXTS:-4096}" \
+    TUR_BENCH_BATCHES="${TUR_BENCH_BATCHES:-1,4}" TUR_BENCH_CONTEXT_BATCHES="${TUR_BENCH_CONTEXT_BATCHES:-1}" \
+    TUR_BENCH_ENGINE_TOKENS="${TUR_BENCH_ENGINE_TOKENS:-16}" \
+    cargo bench --offline -p tur --bench perf -- model "$@"
 
 # Serve the book at http://localhost:3000 with live reload.
 docs:

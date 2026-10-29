@@ -1,77 +1,56 @@
 # Overview
 
+This part of the book follows a request from the HTTP server to the GPU and back. This page gives the map: how the crates fit together, what happens to a request, and the few principles that every chapter relies on.
+
 ## Crates
 
 ```text
-tur-core     shared errors (TurError, Result) and checked packed-execution descriptors
-   ↑
-tur-metal    state pools, completion fences, Metal runtime and kernels, packed weights, sampler
-   ↑
-tur-models   checkpoint validation and loading, the Qwen3.5 model, chat templates, tool parsing
-   ↑
-tur-engine   HybridEngine, scheduler, prefix cache, speculation, InferencePipeline, memory plan
-   ↑
-tur          facade re-exports, HTTP server library; all integration tests and benchmarks
-   ↑
 tur-cli      the `tur` binary: run, serve, quantize
+   |
+tur          facade re-exports and HTTP server library; all integration tests and benchmarks
+   |
+tur-engine   HybridEngine, scheduler, prefix cache, speculation, InferencePipeline, memory plan
+   |
+tur-models   checkpoint validation and loading, Qwen and Gemma text models, chat templates, tool parsing
+   |
+tur-metal    state pools, completion fences, Metal runtime and kernels, packed weights, sampler
+   |
+tur-core     shared errors (TurError, Result) and checked packed-execution descriptors
 ```
 
-Dependencies only point down. There is one error type, `TurError` in `tur-core`, and no
-universal configuration struct: model-specific configuration stays with its model, and
-each component owns its own config (`SchedulerConfig`, `PrefixConfig`,
-`SpeculationConfig` and so on).
-
-Loading and speculation share one model-owned `Option<DraftHead>`. `None` means the
-native drafting head is not loaded; a present head owns its optional vocabulary bound.
-There is no separate enable flag that could disagree with it.
+Each crate depends only on the ones below it. There is one error type, `TurError`, and no global configuration struct: model-specific settings stay with their model, and each component owns its own config (`SchedulerConfig`, `PrefixConfig`, `SpeculationConfig` and so on).
 
 ## Life of a request
 
 ```text
-HTTP handler ──WorkerMsg──▶ PipelineWorker (one thread, owns everything below)
-                              │
-                              ▼
+HTTP handler --WorkerMsg--> PipelineWorker (one thread, owns everything below)
+                              |
+                              v
                        InferencePipeline
-   submit: render chat template → tokenize → validate limits → restore prefix snapshot
-   begin_step: expire deadlines → Scheduler picks decodes + prefill chunks
-               → reserve pages/slots → pack one PackedExecution → HybridEngine::submit
-                              │
-                              ▼
+   submit:     render chat template, tokenize, check limits, restore a prefix snapshot
+   begin_step: expire deadlines, pick decodes and prefill chunks,
+               reserve pages and slots, pack one PackedExecution, HybridEngine::submit
+                              |
+                              v
                  HybridModel::forward (fused Metal kernels)
-       reads committed pages/slots in place, writes into reserved ones,
-       samples on the device; a notifier thread fences the pass
-                              │
-                              ▼
-   finish_step: HybridEngine::finish → per-request sample/verify → commit boundary
-               → detokenize → snapshot prefixes → publish text and outcomes
-                              │
-                              ▼
-            bounded stream channel / oneshot result ──▶ HTTP response
+       reads committed pages and slots in place, writes into reserved ones,
+       samples on the GPU; a notifier thread waits for the pass to finish
+                              |
+                              v
+   finish_step: HybridEngine::finish, sample or verify per request, commit,
+                detokenize, take prefix snapshots, publish text and results
+                              |
+                              v
+            bounded stream channel or one-shot result --> HTTP response
 ```
 
-A request's text is rendered by the checkpoint's own chat template, and the template's
-token IDs feed the pipeline. Each pass packs every scheduled sequence into one call
-of the model. Some sequences are decoding one token; others contribute a prefill chunk
-of up to `--prefill-chunk-size` tokens. The model reads the committed state of every
-sequence where it lives, writes new keys, values and recurrent states into freshly
-reserved pages and slots, and returns logits only for the rows that need sampling.
+The checkpoint's own chat template turns the request into tokens. Each pass then packs every scheduled request into a single call of the model: some contribute one new token, others a chunk of their prompt. The model reads each request's state where it already lives, writes the new keys, values and recurrent state into freshly reserved space, and returns logits only for the rows that need a token sampled.
 
-After the device completes, the engine samples or verifies each sequence independently
-and commits its new boundary, so one request's failure never affects the others. The
-pipeline decodes text, records prefix snapshots and publishes results.
+Once the GPU finishes, the engine handles each request on its own: it samples or verifies the next tokens and commits the new state. A failure in one request never touches the others. The pipeline then decodes text, takes prefix snapshots and sends results back.
 
 ## Principles
 
-- **Explicit state.** Every layer declares its state: paged attention K/V, or recurrent
-  convolution and matrix state. A request owns its state; weights are shared and
-  immutable.
-- **Nothing published before the fence.** Results are read only after the GPU work that
-  produced them completes, and state is reclaimed only when no unfinished work can
-  reference it.
-- **No copies on the hot path.** Kernels read committed state in place, snapshots share
-  state rather than copying it, and logits are copied to the host once per pass, if at
-  all.
-- **Measured defaults.** Every default and every custom kernel was chosen by measurement,
-  and losing variants were deleted. The "Decisions" section of each chapter records
-  the evidence, and [Rejected experiments](../design/rejected.md) lists what was tried
-  and dropped.
+- Every layer declares its state explicitly: attention keys and values in pages, or recurrent state in slots. A request owns its state, and weights are shared and read-only.
+- Nothing is read before the GPU finishes. Results are read only after the work that produced them completes, and memory is reused only when no unfinished work can still touch it.
+- The hot path makes no copies. Kernels read state in place, snapshots share state instead of copying it, and logits come back to the CPU at most once per pass.
+- Defaults come from measurements. Every default and every custom kernel won a measurement on the M1, and the variants that lost were deleted. Each chapter's "Decisions" section records the evidence, and [Rejected experiments](../design/rejected.md) lists what lost.

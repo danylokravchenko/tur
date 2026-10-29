@@ -1,22 +1,15 @@
 # Metal kernels
 
-Tur's GPU code lives in `tur-metal`: MSL kernels compiled at runtime, a dispatch layer
-and the packed weight types. Candle remains the tensor library. Custom kernels replace
-Candle operations only where they measurably win.
+Tur's GPU code lives in `tur-metal`: MSL kernels compiled at runtime, a dispatch layer and the packed weight types. Candle stays the tensor library, and Tur replaces a Candle operation with a custom kernel only where the custom one measurably wins.
+
+Custom kernels pay off in three places. Fusing small steps such as norms, gates and residual additions into their neighbours saves a trip through memory for each step. Reading attention and recurrent state in the layout Tur's pools use avoids copying it into the layout a generic kernel wants. And small batches, which generic matrix kernels handle poorly, can still use the GPU's matrix units.
 
 ## Runtime
 
-- **Same queue as Candle.** Every dispatch goes through Candle's command encoder for the
-  device. Custom kernels share Candle's command ordering, hazard barriers, buffer-reuse
-  rules and the completion fence, and there is no second queue or synchronization.
-- **No unsafe code.** Kernels are compiled and dispatched through safe bindings. Before
-  encoding, every input is validated: dtype, device, strides, extents and index ranges.
-  Nothing falls back to the CPU silently.
-- **Capabilities and caching.** Pipelines are compiled once and cached. Launch shapes
-  (simdgroups per threadgroup, crossover points) come from a per-device tuning table.
-  Compiling the whole library from cold takes about 0.85 s, and warm loads are fast.
-- **Scratch planning.** Each pass's workspace is planned from its shape before
-  submission and charged to the [memory plan](memory.md).
+- Custom kernels go through Candle's command encoder for the device, so they share Candle's command ordering, hazard barriers, buffer reuse and completion fence. There is no second queue to synchronize.
+- Kernels are compiled and dispatched through safe bindings, with no `unsafe`. Every input is checked before encoding: dtype, device, strides, extents and index ranges. Nothing falls back to the CPU silently.
+- Pipelines are compiled once and cached. Launch shapes, such as simdgroups per threadgroup and the points where one kernel overtakes another, come from a per-device tuning table. Compiling the whole library from cold takes under a second.
+- Each pass's scratch space is planned from its shape before submission and charged to the [memory plan](memory.md).
 
 ## What runs where
 
@@ -24,58 +17,36 @@ Candle operations only where they measurably win.
 | --- | --- | --- |
 | Q8_0 projection | 1 / 2–3 / 4–16 / >16 rows | Candle `mul_mv` / `qmv_q8_0` / `qmm_q8_0` / Candle F16 tiles |
 | Q4K projection | 1 / 2–16 / >16 rows | Candle `mul_mv` / `qmm_q4k` / Candle F16 tiles |
-| Recurrent decode | single-token sequences | `delta_step`, 16 key rows per simdgroup |
+| Recurrent decode | one-token sequences | `delta_step`, 16 key rows per simdgroup |
 | Recurrent prefill and verification | multi-token sequences | `delta_prepare` (scales only), then the transposed `delta_scan` |
-| Convolution | aligned float4 rows / otherwise | `delta_conv4` / `delta_conv` |
-| Prefill attention | ≥ 16 threadgroups and ≥ 16 queries per 32-query tile | `attention_tiled_r*`: matrix units, pages read in place |
+| Convolution | rows aligned to float4 / otherwise | `delta_conv4` / `delta_conv` |
+| Prefill attention | at least 16 threadgroups (64 for ungated heads) and 16 queries per 32-query tile, head dimension up to 256 | `attention_tiled_r*`: matrix units, pages read in place |
 | Decode attention, Q8 pools | below the tiled crossover, even query heads per K/V head | `attention_h2_r*_q8`: two query heads share each K/V load |
-| Decode attention, F32/F16 pools | below the tiled crossover | `attention_r*`, split-K over ≥ 64-key ranges |
+| Decode attention, F32/F16 pools | below the tiled crossover | `attention_r*`, split over ranges of at least 64 keys |
 | MoE experts | ≤ 3 / 4–16 / > 16 rows per expert | GEMV / matrix units / wide F16-staged tiles |
-| Sampling | device sampling enabled | `penalize_f32`, `sample_f32` (see [Sampling](sampling.md)) |
+| Sampling | device sampling on | `penalize_f32`, `sample_f32` (see [Sampling](sampling.md)) |
 
-Norms, residual additions, rotary embeddings, activations and gates are fused into the
-neighbouring kernels where profiling justified it. Attention never materializes the
-attention matrix. Online softmax and every accumulator stay in F32, and Q8 keys and
-values are dequantized once per staged tile.
+Norms, residual additions, rotary embeddings, activations and gates are fused into neighbouring kernels where profiling showed a gain. Attention never builds the full attention matrix. Softmax runs online and every accumulator stays F32, and Q8 keys and values are dequantized once per staged tile.
 
-The tiled prefill kernel handles 32 queries of one head per 128-thread threadgroup. It
-sweeps keys in 32-row blocks, staging K and V in 64-dimension chunks. Over F32 and F16
-pools, chunks alternate between two staging buffers and each thread reads the next
-chunk into registers before multiplying the current one, with one barrier per chunk.
-Q8 pools stage through one buffer, reading and dequantizing each chunk in place. Head dimensions
-64, 128 and 256 are supported, with GQA and the sigmoid output gate.
+The tiled prefill kernel handles 32 queries of one head per 128-thread threadgroup. It walks the keys in blocks of 32 rows, staging K and V in 64-dimension chunks. Over F32 and F16 pools it alternates between two staging buffers, loading the next chunk into registers while it multiplies the current one, with one barrier per chunk. Q8 pools stage through one buffer and dequantize each chunk in place. It supports head dimensions 64, 128 and 256, grouped-query attention, and the sigmoid output gate.
+
+Gemma reuses the same matrix, norm and rotary kernels. Each K/V-producing layer projects `q | k | v` with one matrix and reads every head in place from the result, and its value norm runs on the same kernel with a zero rotation. `gate | up` is one matrix whose halves feed `gelu_mul` in place, and `residual_rms_norm` fuses each residual update with the layer scale and the next norm. The per-query attention kernel also handles ungated output, explicit score scaling, sliding windows and 512-dimensional heads, over F32, F16 and Q8 pools. It splits each query's window rather than the whole context, so a sliding layer keeps every split busy at long contexts. The tiled kernel handles windowed heads too, starting each tile's sweep at its first token's window. Gemma's 512-dimensional global heads use the per-query kernel. The MoE router can apply learned per-expert scales after top-k normalization without changing which experts are picked.
 
 ## Decisions
 
 Measured on an M1:
 
-- **Retain Candle where it wins.** Candle's one-row GEMV is equal or faster at one row.
-  Prefill projections keep Candle's tiled GEMM, which runs at about 2 TFLOPS on 2K
-  tokens, near the M1's F32 peak, so a custom tiled GEMM was not written.
-- **Small-batch matrix-unit kernels.** Q8_0 at 4–16 rows and Q4K at 2–16 rows run on the
-  matrix units in F32, so small batches and verification windows compute what
-  single-token decoding does. Q4K at 2–8 rows is 2.4–2.6× faster than Candle's F16 tiles.
-- **Coalesced recurrent decode.** The batch-8 model pass fell from 43.4 to 28.6 ms, and
-  greedy serving output at 8 and 16 requests rose 1.72× and 1.66×. F32 recurrent-state
-  bandwidth is now the main per-sequence decode cost.
-- **Transposed DeltaNet scan.** 2.0–2.7× faster than the original token-serial scan; it
-  is about 12% of 2K-token prefill.
-- **The prepare pass writes scales instead of normalized copies.** Scratch fell 98%, with
-  no model-level speed change.
-- **Two heads per simdgroup for Q8 decode attention.** 1.06–1.25× faster attention and up
-  to 1.09× model decode at 8K context. It was not adopted for F32/F16 pools, where it
-  ties or loses, and four heads lose everywhere.
-- **Prefetched staging for F32 and F16 pools.** One 8K-token prefill pass's attention
-  fell from 408 to 379 ms per layer (F16), chunks after a long context are 3–20% faster,
-  and whole 8K prefill is 2% faster; 2K prefill and short prompts are unchanged. Removing
-  the K/V reads entirely would have cut it to 256 ms, so read latency is only partly
-  hidden. Q8 pools keep single-buffered staging (see
-  [Rejected experiments](../design/rejected.md)).
-- **F32 activations.** F16/BF16 activations would be faster at 9–16 rows, but are
-  deferred until held-out quality budgets exist.
-- **Launch shapes are M1 tuning,** not constants for every device. The DeltaNet scan's
-  simdgroup sweep was flat within 5%.
-- **Rejected:** chunked (WY/UT) DeltaNet prefill, TensorOps GEMM, and seven kernel
-  variants (see [Rejected experiments](../design/rejected.md)).
-- **Open:** the MoE wide tier (more than 16 rows per expert) trails Candle by 1.2–1.5×;
-  tiled prefill attention runs at about 28% of the matrix units' F32 peak.
+- Candle stays where it wins. Its one-row GEMV is as fast or faster at one row. For prefill projections, Candle's tiled GEMM runs near the M1's F32 peak on 2K tokens, so Tur has no custom tiled GEMM.
+- Small batches use the matrix units. Q8_0 at 4 to 16 rows and Q4K at 2 to 16 rows run on the matrix units in F32, so a small batch or a verification window computes exactly what single-token decoding does. Q4K at 2 to 8 rows is 2.5× faster than Candle's F16 tiles.
+- Recurrent decode reads memory in coalesced order. This cut an eight-sequence model pass by a third, and serving throughput at 8 and 16 requests rose about 1.7×. Reading F32 recurrent state is now the main per-sequence cost of decoding.
+- The DeltaNet prefill scan is transposed. It runs 2 to 2.7× faster than the original token-by-token scan and is about 12% of 2K-token prefill.
+- The prepare pass writes scales instead of normalized copies. That cut its scratch memory by 98% with no change in model speed.
+- Q8 decode attention processes two heads per simdgroup. It is up to 1.25× faster in attention and 1.09× in model decode at 8K tokens. F32 and F16 pools don't use it because it ties or loses there, and four heads lose everywhere.
+- Tiled attention over F32 and F16 pools prefetches the next chunk. It makes chunks after a long context 3 to 20% faster and 8K prefill 2% faster, with short prompts unchanged. Removing the K/V reads entirely would be much faster still, so read latency is only partly hidden. Q8 pools keep single-buffered staging (see [Rejected experiments](../design/rejected.md)).
+- Activations stay F32. F16 or BF16 activations would be faster at 9 to 16 rows, but wait until there are held-out quality budgets to check them against.
+- Launch shapes are M1 tuning, not constants for every Mac.
+- Rejected: chunked (WY/UT) DeltaNet prefill, TensorOps GEMM and seven kernel variants (see [Rejected experiments](../design/rejected.md)).
+- Still open: the wide MoE tier (more than 16 rows per expert) trails Candle by 1.2 to 1.5×, and tiled prefill attention reaches about 28% of the matrix units' F32 peak.
+- Shared attention gained Gemma's semantics. Windows, ungated output and 512-dimensional heads are checked against independent F64 scalar references across K/V formats and splits, including windows that span several splits or key blocks.
+- Gemma's sliding layers use the tiled kernel from 64 threadgroups. At E2B's shape it loses below 256 queries and wins by up to 1.8× above. End-to-end E2B prefill didn't change beyond noise, because attention is a small part of it.
+- Windowed attention splits over the window. Splitting the whole context left a sliding layer's 512 keys in one or two splits. Splitting the window raised E2B decode at 8K tokens about 10% with one sequence and 5% with four.

@@ -9,6 +9,7 @@ mod common;
 mod contracts;
 mod engine;
 mod fused;
+mod gemma4;
 mod kernels;
 mod model_common;
 mod moe;

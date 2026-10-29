@@ -511,8 +511,9 @@ pub struct DraftRequest {
     pub tokens: Vec<u32>,
     /// F32 `[tokens, hidden]` final hidden states of the positions.
     pub hidden: Tensor,
-    /// Return the head's greedy draft for the token after the newest one.
-    pub draft: bool,
+    /// Greedy drafts to return after the newest token, chained where the head can (a
+    /// Gemma 4 assistant); a head that cannot returns at most one.
+    pub drafts: usize,
 }
 
 /// The draft head's greedy draft.
@@ -1158,14 +1159,15 @@ impl<M: HybridModel> HybridEngine<M> {
     }
 
     /// Run the model's draft head between passes over each request's newest committed
-    /// positions, writing the head's own state layer, and return its greedy draft where
-    /// requested. Requests fail independently; the pages a request's positions occupy
-    /// must not be shared with a snapshot. Waits for the device only to read drafts.
-    pub fn draft(&mut self, requests: &[DraftRequest]) -> Result<Vec<Result<Option<Draft>>>> {
+    /// positions, writing the head's own state layer, and return its chained greedy drafts
+    /// where requested (empty otherwise). Requests fail independently; the pages a
+    /// request's positions occupy must not be shared with a snapshot. Waits for the device
+    /// only to read drafts.
+    pub fn draft(&mut self, requests: &[DraftRequest]) -> Result<Vec<Result<Vec<Draft>>>> {
         if self.pending.is_some() {
             return Err(invalid("the draft head runs between passes"));
         }
-        let mut results: Vec<Option<Result<Option<Draft>>>> =
+        let mut results: Vec<Option<Result<Vec<Draft>>>> =
             requests.iter().map(|_| None).collect();
         let (mut tokens, mut positions, mut live, mut states) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -1198,7 +1200,7 @@ impl<M: HybridModel> HybridEngine<M> {
                     tokens: range.clone(),
                     state,
                     hidden: &requests[*index].hidden,
-                    logits: requests[*index].draft,
+                    drafts: requests[*index].drafts,
                 })
                 .collect();
             let outputs = self.model.draft(&DraftForward {
@@ -1210,15 +1212,21 @@ impl<M: HybridModel> HybridEngine<M> {
             if outputs.len() != live.len() {
                 return Err(invalid("draft head returned wrong number of sequences"));
             }
-            let mut rows = Vec::new();
+            // Logit tensors, and how many rows they hold: a chain returns several.
+            let (mut rows, mut total) = (Vec::new(), 0);
             let mut wanted = Vec::with_capacity(live.len());
             for ((index, _), output) in live.iter().zip(outputs) {
                 match output {
                     Ok(Some(logits)) => {
-                        wanted.push((*index, Some(rows.len())));
+                        let count = logits.dim(0)?;
+                        if count > requests[*index].drafts {
+                            return Err(invalid("draft head returned too many drafts"));
+                        }
+                        wanted.push((*index, total..total + count));
+                        total += count;
                         rows.push(logits);
                     }
-                    Ok(None) => wanted.push((*index, None)),
+                    Ok(None) => wanted.push((*index, 0..0)),
                     Err(error) => results[*index] = Some(Err(error)),
                 }
             }
@@ -1236,16 +1244,17 @@ impl<M: HybridModel> HybridEngine<M> {
                 let drafts = self.argmax(&rows)?;
                 (drafts, mass.flatten_all()?.to_vec1::<f32>()?)
             };
-            for (index, row) in wanted {
+            for (index, range) in wanted {
                 results[index] = Some(
-                    row.map(|row| match (drafts.get(row), mass.get(row)) {
-                        (Some(&token), Some(&mass)) => Ok(Draft {
-                            token,
-                            confidence: mass.recip(),
-                        }),
-                        _ => Err(invalid("missing draft row")),
-                    })
-                    .transpose(),
+                    range
+                        .map(|row| match (drafts.get(row), mass.get(row)) {
+                            (Some(&token), Some(&mass)) => Ok(Draft {
+                                token,
+                                confidence: mass.recip(),
+                            }),
+                            _ => Err(invalid("missing draft row")),
+                        })
+                        .collect(),
                 );
             }
         }
@@ -1632,6 +1641,7 @@ mod tests {
 
     const POOL: PoolConfig = PoolConfig {
         pages: 2,
+        window_pages: 2,
         recurrent_slots: 1,
     };
 
@@ -1646,6 +1656,7 @@ mod tests {
                 layers: vec![LayerStateKind::Attention {
                     kv_heads: 1,
                     head_dim: 1,
+                    window: None,
                 }],
                 kv: KvLayout::new(2, KvFormat::F32),
                 modalities: vec![Modality::Text],

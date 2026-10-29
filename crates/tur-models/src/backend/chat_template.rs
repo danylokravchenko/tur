@@ -7,6 +7,7 @@ use crate::{Result, TurError};
 /// Renders a checkpoint's own Hugging Face-compatible Jinja2 chat template.
 pub struct ChatTemplate {
     source: String,
+    tokens: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Message author for [`ChatTemplate::render`].
@@ -89,7 +90,7 @@ impl ChatTemplate {
                 )
             })?
             .to_string();
-        Self::from_template(template_str)
+        Self::from_template(template_str)?.with_tokens(&config)
     }
 
     /// Build a `ChatTemplate` from a raw Jinja2 template string.
@@ -101,16 +102,36 @@ impl ChatTemplate {
         faithful_environment()
             .add_template("chat", &source)
             .map_err(|e| TurError::Other(format!("invalid chat template syntax: {e}")))?;
-        Ok(Self { source })
+        Ok(Self {
+            source,
+            tokens: serde_json::Map::new(),
+        })
     }
 
     /// Load a standalone `chat_template.jinja`, falling back to `tokenizer_config.json`.
     pub fn from_model_dir(dir: &Path) -> Result<Self> {
         let jinja = dir.join("chat_template.jinja");
         if jinja.exists() {
-            return Self::from_template(std::fs::read_to_string(jinja)?);
+            let config: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("tokenizer_config.json"))?)?;
+            return Self::from_template(std::fs::read_to_string(jinja)?)?.with_tokens(&config);
         }
         Self::from_tokenizer_config(&dir.join("tokenizer_config.json"))
+    }
+
+    fn with_tokens(mut self, config: &serde_json::Value) -> Result<Self> {
+        for (name, value) in config.as_object().into_iter().flatten() {
+            // Tokenizer insertion policies are not special-token template variables.
+            if !name.ends_with("_token") || name.starts_with("add_") || value.is_null() {
+                continue;
+            }
+            let token = value
+                .as_str()
+                .or_else(|| value.get("content").and_then(serde_json::Value::as_str))
+                .ok_or_else(|| TurError::Tokenizer(format!("invalid {name}")))?;
+            self.tokens.insert(name.clone(), token.into());
+        }
+        Ok(self)
     }
 
     /// Render exactly as Hugging Face `apply_chat_template` does: Jinja2 `trim_blocks` and
@@ -125,7 +146,7 @@ impl ChatTemplate {
         let mut env = faithful_environment();
         env.add_template("chat", &self.source)
             .map_err(|e| TurError::Other(format!("chat template compile error: {e}")))?;
-        let mut ctx = serde_json::Map::new();
+        let mut ctx = self.tokens.clone();
         ctx.insert("messages".into(), serde_json::to_value(messages)?);
         ctx.insert(
             "add_generation_prompt".into(),
@@ -190,13 +211,22 @@ fn template_error(message: impl Into<String>) -> minijinja::Error {
     minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, message.into())
 }
 
-/// Python `str` methods used by chat templates, with Python semantics.
+/// Python string and mapping methods used by checkpoint templates.
 fn python_method(
     _: &minijinja::State<'_, '_>,
     value: &minijinja::Value,
     method: &str,
     args: &[minijinja::Value],
 ) -> std::result::Result<minijinja::Value, minijinja::Error> {
+    if value.kind() == minijinja::value::ValueKind::Map && method == "get" {
+        let (key, default) = match args {
+            [key] => (key, minijinja::Value::from(())),
+            [key, default] => (key, default.clone()),
+            _ => return Err(template_error("get needs a key and an optional default")),
+        };
+        let item = value.get_item(key)?;
+        return Ok(if item.is_undefined() { default } else { item });
+    }
     let Some(text) = value.as_str() else {
         return Err(minijinja::Error::from(minijinja::ErrorKind::UnknownMethod));
     };
@@ -317,6 +347,24 @@ mod tests {
                 }
             )?,
             "no"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_special_token_context_ignores_tokenizer_flags() -> Result<()> {
+        let template = ChatTemplate::from_template(
+            "{{ bos_token }}{{ eos_token }}{% if add_bos_token is defined %}flag{% endif %}",
+        )?
+        .with_tokens(&serde_json::json!({
+            "bos_token": "<bos>",
+            "eos_token": {"content": "<eos>"},
+            "add_bos_token": false,
+            "add_eos_token": true
+        }))?;
+        assert_eq!(
+            template.render(&[], &[], &RenderOptions::default())?,
+            "<bos><eos>"
         );
         Ok(())
     }

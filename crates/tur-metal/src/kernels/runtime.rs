@@ -18,7 +18,9 @@ use tur_core::{Result, TurError, execution::invalid};
 /// Version of the buffer layouts the kernels assume. Bump when any binding layout changes.
 /// 2: paged K/V pools in F32/F16/Q8 and slot-addressed recurrent state.
 /// 3: tiled prefill attention over query tiles.
-pub const LAYOUT_VERSION: u32 = 3;
+/// 4: windowed ungated attention and learned expert route scales.
+/// 5: windowed ungated tiled attention.
+pub const LAYOUT_VERSION: u32 = 5;
 
 // Runtime Metal compilation has no local include search path, so embed the families as
 // one source string with shared helpers first.
@@ -61,6 +63,8 @@ const FUNCTIONS: &[&str] = &[
     "add_rms_norm_f32",
     "qk_norm_rope_f32",
     "swiglu_f32",
+    "residual_rms_norm_f32",
+    "gelu_mul_f32",
     "gated_rms_f32",
     "delta_conv_f32",
     "delta_conv4_f32",
@@ -103,6 +107,19 @@ const FUNCTIONS: &[&str] = &[
     "attention_reduce_r2_f32",
     "attention_reduce_r4_f32",
     "attention_reduce_r8_f32",
+    "kv_write_r16_f32",
+    "kv_write_r16_f16",
+    "kv_write_r16_q8",
+    "attention_r16_f32",
+    "attention_r16_f16",
+    "attention_r16_q8",
+    "attention_h2_r16_f32",
+    "attention_h2_r16_f16",
+    "attention_h2_r16_q8",
+    "attention_tiled_r16_f32",
+    "attention_tiled_r16_f16",
+    "attention_tiled_r16_q8",
+    "attention_reduce_r16_f32",
     "qmv_q8_0_b1_f32",
     "qmv_q8_0_b2_f32",
     "qmv_q8_0_b3_f32",
@@ -229,6 +246,9 @@ pub struct Tuning {
     /// the per-query kernel when tiles average at least 16 query rows; below it, splitting
     /// keys fills the GPU better. 0 always tiles eligible passes; `usize::MAX` never tiles.
     pub attention_tiled_groups: usize,
+    /// The same crossover for ungated attention (Gemma), whose per-query kernel stays
+    /// faster up to longer prompts.
+    pub attention_tiled_ungated_groups: usize,
     /// Inclusive row counts served by the packed `Q8_0` and Q4K GEMVs; other counts use
     /// Candle's one-row GEMV or tiled GEMM.
     pub gemv_q8_0_rows: (usize, usize),
@@ -260,6 +280,10 @@ impl Tuning {
             min_split_keys: 64,
             // The M1 attention sweep crosses over at 64 queries × 8 heads (16 tiles).
             attention_tiled_groups: 16,
+            // Gemma E2B sliding layers (8 heads over one K/V head of 256, 512-key window)
+            // cross over at 256 queries over F16 pools (128 over Q8): 32 tiles × 8 heads.
+            // Tiled is 0.64–0.84× at 64–128 queries and 1.10–1.77× from 256.
+            attention_tiled_ungated_groups: 64,
             // Measured crossovers on M1: Candle's one-row GEMV
             // wins at one row. For Q8_0 the custom GEMV wins at 2–3 rows and the
             // matrix-unit kernel from 4 (1.3–2.6× at 5–8 rows, F32 parity with Candle's

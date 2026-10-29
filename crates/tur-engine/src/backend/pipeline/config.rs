@@ -15,10 +15,10 @@ use std::{
     sync::Arc,
 };
 use tur_core::execution::invalid;
-use tur_models::{backend::factory::ModelFactory, models::qwen3_5::Qwen35};
+use tur_models::backend::factory::ModelFactory;
 
 /// Scheduling limits and the state memory budget of one pipeline.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PipelineConfig {
     pub scheduler: SchedulerConfig,
     /// Prefix snapshots: spacing and how many are retained beside running requests.
@@ -109,6 +109,7 @@ impl InferencePipeline {
         let draft = config
             .speculation
             .mtp
+            .clone()
             .filter(|_| config.speculation.enabled());
         let limits = config.scheduler;
         let draft_rows = config
@@ -125,8 +126,7 @@ impl InferencePipeline {
             .create_model_with(draft, |architecture, options| {
                 let tokens = limits.max_batch_tokens;
                 let sequences = limits.max_running.min(tokens);
-                let (description, weights, scratch_peak) = Qwen35::memory_requirements(
-                    architecture,
+                let (description, weights, scratch_peak) = architecture.memory_requirements(
                     options,
                     tokens,
                     &vec![architecture.max_position(); sequences],
@@ -167,6 +167,9 @@ impl InferencePipeline {
                         retained: config.prefix.entries,
                         retained_share: config.prefix.state_share,
                         draft_slots: draft_rows,
+                        pass_tokens: limits
+                            .max_chunk
+                            .max(config.speculation.max_draft.saturating_add(1)),
                         state_bytes: config.state_bytes,
                         limit: budget.limit(),
                         reserved: budget.leased(),
@@ -175,7 +178,7 @@ impl InferencePipeline {
                 let lease = budget.lease(plan.resident())?;
                 Ok((plan, pool, lease))
             })?;
-        let max_position = model.config().max_position();
+        let max_position = model.max_position();
         if model.weight_bytes() != plan.weights {
             return Err(invalid(
                 "loaded weights disagree with the pre-load memory plan",

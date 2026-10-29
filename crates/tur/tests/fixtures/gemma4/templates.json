@@ -1,0 +1,185 @@
+[
+  {
+    "name": "default",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi there!"
+      }
+    ],
+    "options": {},
+    "add_generation_prompt": true,
+    "text": "<bos><|turn>user\nHi there!<turn|>\n<|turn>model\n"
+  },
+  {
+    "name": "thinking_on",
+    "messages": [
+      {
+        "role": "user",
+        "content": "2+2?"
+      }
+    ],
+    "options": {
+      "enable_thinking": true
+    },
+    "add_generation_prompt": true,
+    "text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\n2+2?<turn|>\n<|turn>model\n"
+  },
+  {
+    "name": "thinking_off",
+    "messages": [
+      {
+        "role": "user",
+        "content": "2+2?"
+      }
+    ],
+    "options": {
+      "enable_thinking": false
+    },
+    "add_generation_prompt": true,
+    "text": "<bos><|turn>user\n2+2?<turn|>\n<|turn>model\n"
+  },
+  {
+    "name": "system_history",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be terse."
+      },
+      {
+        "role": "user",
+        "content": "Hi"
+      },
+      {
+        "role": "assistant",
+        "content": "Hello"
+      },
+      {
+        "role": "user",
+        "content": "Kyiv — ✓"
+      }
+    ],
+    "options": {},
+    "add_generation_prompt": true,
+    "text": "<bos><|turn>system\nBe terse.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\nHello<turn|>\n<|turn>user\nKyiv — ✓<turn|>\n<|turn>model\n"
+  },
+  {
+    "name": "reasoning",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Count"
+      },
+      {
+        "role": "assistant",
+        "content": "1, 2",
+        "reasoning_content": "Simple."
+      }
+    ],
+    "options": {
+      "add_generation_prompt": false
+    },
+    "add_generation_prompt": false,
+    "text": "<bos><|turn>user\nCount<turn|>\n<|turn>model\n<|channel>thought\nSimple.\n<channel|>1, 2<turn|>\n"
+  },
+  {
+    "name": "tools",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather in Kyiv?"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Weather — °C",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "days": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "options": {},
+    "add_generation_prompt": true,
+    "text": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Weather — °C<|\"|>,parameters:{properties:{city:{type:<|\"|>STRING<|\"|>},days:{type:<|\"|>INTEGER<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Kyiv?<turn|>\n<|turn>model\n"
+  },
+  {
+    "name": "tool_history",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather?"
+      },
+      {
+        "role": "assistant",
+        "content": "Checking.",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": {
+                "city": "Kyiv",
+                "days": 2
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "12 °C"
+      },
+      {
+        "role": "assistant",
+        "content": "12 °C"
+      },
+      {
+        "role": "user",
+        "content": "Thanks"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Weather — °C",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "days": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "options": {
+      "enable_thinking": false
+    },
+    "add_generation_prompt": true,
+    "text": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Weather — °C<|\"|>,parameters:{properties:{city:{type:<|\"|>STRING<|\"|>},days:{type:<|\"|>INTEGER<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Kyiv<|\"|>,days:2}<tool_call|><|tool_response>response:get_weather{value:<|\"|>12 °C<|\"|>}<tool_response|>Checking.12 °C<turn|>\n<|turn>user\nThanks<turn|>\n<|turn>model\n"
+  }
+]

@@ -1,13 +1,12 @@
 //! Prepacked weight artifacts: one `SafeTensors` file whose projections hold the exact
 //! GGML blocks the kernels read, beside copies of the source's config, tokenizer and
 //! template. Loading uploads each tensor as stored; nothing is converted or expanded.
+//! Every model family writes and opens artifacts through [`ArtifactLayout`].
 
-use super::{
-    config::Config,
-    plan::{Embedding, Precision, WeightPlan, fnv1a},
-    quantize::Method,
-    weights::Checkpoint,
-};
+use crate::models::checkpoint::Checkpoint;
+use crate::models::weights::{WeightLayout, fnv1a};
+use crate::models::{Embedding, Method, Packer, Precision, Projection, STAGING_BYTES, WeightPlan};
+use candle_core::{DType, Device, Tensor};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -19,7 +18,7 @@ use tur_core::{Result, execution::invalid};
 /// File name of the weights inside an artifact directory.
 pub const ARTIFACT_FILE: &str = "tur-weights.safetensors";
 /// Layout version of [`ARTIFACT_FILE`]; readers reject any other.
-pub(super) const FORMAT_VERSION: u32 = 1;
+pub(crate) const FORMAT_VERSION: u32 = 1;
 /// Serving files copied from the source checkpoint when present.
 const COPIED: [&str; 6] = [
     "config.json",
@@ -29,6 +28,17 @@ const COPIED: [&str; 6] = [
     "chat_template.jinja",
     "LICENSE",
 ];
+
+/// What an artifact stores beyond the loaded projections: every checkpoint tensor's
+/// shape, the embedding table's name, and tensors of optional parts left unloaded.
+pub(crate) trait ArtifactLayout: WeightLayout {
+    fn tensor_shapes(&self) -> Result<BTreeMap<String, Vec<usize>>>;
+    fn embedding_tensor(&self) -> String;
+    /// Whether an artifact tensor belongs to an optional part this layout does not load.
+    fn unloaded(&self, _name: &str) -> bool {
+        false
+    }
+}
 
 /// Identity and contents of a prepacked artifact, stored in its header.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -115,8 +125,8 @@ fn open(dir: &Path) -> Result<(Checkpoint, Manifest)> {
 }
 
 /// Stored layout of every tensor an artifact holds for `config` under `plan`.
-fn expected(config: &Config, plan: &WeightPlan) -> Result<BTreeMap<String, Stored>> {
-    let projections = config.projections()?;
+fn expected(config: &impl ArtifactLayout, plan: &WeightPlan) -> Result<BTreeMap<String, Stored>> {
+    let projections = config.projection_layout()?;
     let mut stored = BTreeMap::new();
     let mut parts = std::collections::BTreeSet::new();
     for p in &projections {
@@ -126,14 +136,14 @@ fn expected(config: &Config, plan: &WeightPlan) -> Result<BTreeMap<String, Store
             Stored::matrix(plan.precision(&p.name)?, p.rows, p.cols)?,
         );
     }
-    let embedding = config.embedding_name();
+    let embedding = config.embedding_tensor();
     if let Embedding::Table(precision) = plan.embedding {
         stored.insert(
             embedding.clone(),
-            Stored::matrix(precision, config.vocab_size(), config.hidden_size())?,
+            Stored::matrix(precision, config.vocabulary(), config.residual_width())?,
         );
     }
-    for (name, shape) in config.weight_shapes()? {
+    for (name, shape) in config.tensor_shapes()? {
         if !parts.contains(&name) && name != embedding {
             stored.insert(name, Stored::Float(shape));
         }
@@ -161,14 +171,14 @@ impl Stored {
 }
 
 /// Open the artifact in `dir` for `config`, checking every header entry against the plan
-/// before any payload is read. Tensors of an unloaded MTP head are ignored.
-pub(super) fn open_for(dir: &Path, config: &Config) -> Result<(Checkpoint, Manifest)> {
+/// before any payload is read. Tensors of unloaded optional parts are ignored.
+pub(crate) fn open_for(dir: &Path, config: &impl ArtifactLayout) -> Result<(Checkpoint, Manifest)> {
     let (checkpoint, manifest) = open(dir)?;
     manifest.plan.validate(config)?;
     let expected = expected(config, &manifest.plan)?;
     for (name, entry) in checkpoint.entries() {
         let Some(stored) = expected.get(name) else {
-            if name.starts_with("mtp.") && !config.mtp() {
+            if config.unloaded(name) {
                 continue;
             }
             return Err(invalid(format!("unexpected artifact tensor {name}")));
@@ -203,7 +213,7 @@ pub(super) fn open_for(dir: &Path, config: &Config) -> Result<(Checkpoint, Manif
 
 /// Streams tensors to a temporary payload file, then writes the header and payload as
 /// one `SafeTensors` file: host memory holds one tensor at a time.
-pub(super) struct Writer {
+pub(crate) struct Writer {
     dir: PathBuf,
     payload: PathBuf,
     data: BufWriter<std::fs::File>,
@@ -213,7 +223,7 @@ pub(super) struct Writer {
 
 impl Writer {
     /// Start an artifact in `dir`, creating it, and copy the source's serving files.
-    pub(super) fn create(source: &Path, dir: &Path) -> Result<Self> {
+    pub(crate) fn create(source: &Path, dir: &Path) -> Result<Self> {
         if is_artifact(dir) {
             return Err(invalid(format!(
                 "{} already holds an artifact",
@@ -237,7 +247,7 @@ impl Writer {
         })
     }
 
-    pub(super) fn put(
+    pub(crate) fn put(
         &mut self,
         name: &str,
         dtype: safetensors::Dtype,
@@ -248,7 +258,7 @@ impl Writer {
     }
 
     /// Write a tensor in bounded chunks without retaining its complete payload.
-    pub(super) fn put_stream(
+    pub(crate) fn put_stream(
         &mut self,
         name: &str,
         dtype: safetensors::Dtype,
@@ -275,7 +285,11 @@ impl Writer {
     }
 
     /// Write the header carrying `manifest`, then the payload, and validate the result.
-    pub(super) fn finish(mut self, manifest: &Manifest, config: &Config) -> Result<()> {
+    pub(crate) fn finish(
+        mut self,
+        manifest: &Manifest,
+        config: &impl ArtifactLayout,
+    ) -> Result<()> {
         self.data.flush()?;
         drop(self.data);
         let mut header = serde_json::Map::new();
@@ -313,7 +327,173 @@ impl Writer {
     }
 }
 
-/// The fingerprint of `dir`'s `config.json`, recorded when an artifact is packed from it.
-pub(super) fn source_fingerprint(dir: &Path) -> Result<String> {
-    config_fingerprint(dir)
+/// Source and destination of one artifact conversion.
+pub struct Conversion<'a> {
+    /// Source `SafeTensors` checkpoint directory.
+    pub source: &'a Path,
+    /// Exact identity of the source checkpoint (repository and commit).
+    pub identity: &'a str,
+    /// New artifact directory.
+    pub output: &'a Path,
+    /// Free-form description of the calibration data.
+    pub calibration: &'a str,
+}
+
+impl Packer<'_> {
+    /// Pack `projection` from `checkpoint` in `precision` and stream it into `writer`.
+    pub(crate) fn write(
+        &self,
+        checkpoint: &Checkpoint,
+        projection: &Projection,
+        precision: Precision,
+        writer: &mut Writer,
+    ) -> Result<()> {
+        let (dtype, shape) = match precision.ggml() {
+            Some(_) => (
+                safetensors::Dtype::U8,
+                vec![projection.rows, precision.bytes(1, projection.cols)?],
+            ),
+            None => (
+                safetensors::Dtype::F32,
+                vec![projection.rows, projection.cols],
+            ),
+        };
+        writer.put_stream(&projection.name, dtype, shape, |out| {
+            self.pack_chunks(checkpoint, projection, precision, |bytes| {
+                Ok(out.write_all(bytes)?)
+            })
+        })
+    }
+}
+
+/// Pack every projection of `checkpoint` by `plan` without calibration statistics and
+/// write a complete artifact, one tensor at a time.
+pub(crate) fn write(
+    conversion: &Conversion<'_>,
+    config: &impl ArtifactLayout,
+    checkpoint: &Checkpoint,
+    plan: &WeightPlan,
+    packer: &Packer<'_>,
+) -> Result<Manifest> {
+    plan.validate(config)?;
+    let mut writer = Writer::create(conversion.source, conversion.output)?;
+    for projection in config.projection_layout()? {
+        packer.write(
+            checkpoint,
+            &projection,
+            plan.precision(&projection.name)?,
+            &mut writer,
+        )?;
+    }
+    finish(conversion, config, plan, packer, checkpoint, writer)
+}
+
+/// Write the embedding table and every remaining checkpoint tensor verbatim, then the
+/// manifest; `writer` already holds the packed projections.
+pub(crate) fn finish(
+    conversion: &Conversion<'_>,
+    config: &impl ArtifactLayout,
+    plan: &WeightPlan,
+    packer: &Packer<'_>,
+    checkpoint: &Checkpoint,
+    mut writer: Writer,
+) -> Result<Manifest> {
+    let parts: std::collections::BTreeSet<_> = config
+        .projection_layout()?
+        .into_iter()
+        .flat_map(|p| p.parts.into_iter().map(|(name, _)| name))
+        .collect();
+    let embedding = config.embedding_tensor();
+    if let Embedding::Table(precision) = plan.embedding {
+        let table = Projection {
+            name: embedding.clone(),
+            parts: vec![(embedding.clone(), config.vocabulary())],
+            rows: config.vocabulary(),
+            cols: config.residual_width(),
+            experts: 1,
+        };
+        if precision == Precision::Bf16 {
+            put_bf16(
+                &mut writer,
+                checkpoint,
+                &embedding,
+                vec![table.rows, table.cols],
+            )?;
+        } else {
+            Packer::RTN.write(checkpoint, &table, precision, &mut writer)?;
+        }
+    }
+    for (name, shape) in config.tensor_shapes()? {
+        if parts.contains(&name) || name == embedding {
+            continue;
+        }
+        let bytes = checked_bytes(&shape)?;
+        let entry = checkpoint
+            .entries()
+            .get(&name)
+            .ok_or_else(|| invalid(format!("missing tensor {name}")))?;
+        // Multi-gigabyte BF16 tables (Gemma's per-layer embeddings) stream by rows.
+        if entry.dtype == safetensors::Dtype::BF16 && bytes > STAGING_BYTES && shape.len() == 2 {
+            put_bf16(&mut writer, checkpoint, &name, shape)?;
+        } else {
+            let (entry, bytes) = checkpoint.take_raw(&name)?;
+            writer.put(&name, entry.dtype, entry.shape, &bytes)?;
+        }
+    }
+    let manifest = Manifest {
+        format_version: FORMAT_VERSION,
+        source: conversion.identity.to_owned(),
+        config_fingerprint: config_fingerprint(conversion.source)?,
+        quantizer: Quantizer {
+            name: "tur-quantize".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            method: packer.method,
+            damp: packer.damp,
+        },
+        calibration: packer.calibration.map(|c| CalibrationInfo {
+            samples: c.samples,
+            tokens: c.tokens,
+            fingerprint: format!("{:016x}", c.fingerprint),
+            description: conversion.calibration.to_owned(),
+        }),
+        plan: plan.clone(),
+    };
+    writer.finish(&manifest, config)?;
+    Ok(manifest)
+}
+
+fn checked_bytes(shape: &[usize]) -> Result<usize> {
+    tur_core::execution::checked_elements(shape)?
+        .checked_mul(2)
+        .ok_or_else(|| invalid("artifact tensor size overflow"))
+}
+
+/// Stream the 2-D tensor `name` into `writer` as BF16, a staging chunk of rows at a time.
+fn put_bf16(
+    writer: &mut Writer,
+    checkpoint: &Checkpoint,
+    name: &str,
+    shape: Vec<usize>,
+) -> Result<()> {
+    let cols = shape.get(1).copied().unwrap_or(1).max(1);
+    writer.put_stream(name, safetensors::Dtype::BF16, shape, |out| {
+        for rows in checkpoint.take_rows(name, (STAGING_BYTES / (cols * 4)).max(1))? {
+            out.write_all(&bf16_bytes(&rows?.to_dtype(DType::BF16)?)?)?;
+        }
+        Ok(())
+    })
+}
+
+/// Little-endian BF16 bits of a BF16 tensor, via its raw host storage.
+fn bf16_bytes(tensor: &Tensor) -> Result<Vec<u8>> {
+    let tensor = tensor.to_device(&Device::Cpu)?.contiguous()?;
+    let (storage, layout) = tensor.storage_and_layout();
+    match &*storage {
+        candle_core::Storage::Cpu(candle_core::CpuStorage::BF16(values)) => Ok(values
+            [layout.start_offset()..layout.start_offset() + tensor.elem_count()]
+            .iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .collect()),
+        _ => Err(invalid("expected a host BF16 tensor")),
+    }
 }

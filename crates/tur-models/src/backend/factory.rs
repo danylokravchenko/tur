@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! Revision-pinned checkpoint loading for the hybrid text model.
 
+use crate::models::GenerationDefaults;
+use crate::models::{DraftHead, Execution, LoadOptions, WeightFormat, Weights};
 use std::{
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -14,10 +16,7 @@ use tur_core::execution::KvLayout;
 use crate::{
     Result, TurError,
     backend::chat_template::ChatTemplate,
-    models::qwen3_5::{
-        Config, DraftHead, Execution, GenerationDefaults, LoadOptions, Manifest, Qwen35,
-        WeightFormat, Weights, is_artifact,
-    },
+    models::{Manifest, ModelConfig, TextModel, is_artifact},
 };
 
 /// A local `SafeTensors` directory or a fully qualified Hugging Face repository.
@@ -58,65 +57,19 @@ fn checkpoint_file(name: &str) -> Result<()> {
 impl ModelFactory {
     /// Resolve the source, rejecting unsupported architectures before downloading weights.
     pub fn resolve(&self) -> Result<PathBuf> {
-        if self.revision.trim().is_empty() {
-            return Err(hub_error("checkpoint revision must not be empty"));
-        }
-        let id = match &self.source {
-            ModelSource::LocalPath(path) => return Ok(path.clone()),
-            ModelSource::HuggingFace(id) => id,
-        };
-        if self.revision.len() != 40 || !self.revision.bytes().all(|c| c.is_ascii_hexdigit()) {
-            return Err(hub_error(
-                "remote --revision must be an immutable 40-character commit",
-            ));
-        }
-        if id.split('/').count() != 2 || id.split('/').any(str::is_empty) {
-            return Err(hub_error(
-                "use a fully qualified Hugging Face repository (organization/model)",
-            ));
-        }
-        let api = ApiBuilder::from_env().build().map_err(hub_error)?;
-        let repo = api.repo(Repo::with_revision(
-            id.clone(),
-            RepoType::Model,
-            self.revision.clone(),
-        ));
-        let config_path = repo.get("config.json").map_err(hub_error)?;
-        Config::from_json(&std::fs::read_to_string(&config_path)?)?;
-        let info = repo.info().map_err(hub_error)?;
-        if info.sha != self.revision {
-            return Err(hub_error(
-                "repository returned a different checkpoint revision",
-            ));
-        }
-        for required in ["tokenizer.json", "tokenizer_config.json"] {
-            repo.get(required).map_err(hub_error)?;
-        }
-        for file in &info.siblings {
-            let name = file.rfilename.as_str();
-            if name.ends_with(".safetensors")
-                || matches!(
-                    name,
-                    "model.safetensors.index.json"
-                        | "generation_config.json"
-                        | "chat_template.jinja"
-                )
-            {
-                checkpoint_file(name)?;
-                repo.get(name).map_err(hub_error)?;
-            }
-        }
-        config_path
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| hub_error("checkpoint has no directory"))
+        resolve(
+            &self.source,
+            &self.revision,
+            |json| ModelConfig::from_json(json).map(drop),
+            &["tokenizer.json", "tokenizer_config.json"],
+        )
     }
 
     /// Load the text model and serving metadata. Missing or invalid templates are errors.
     /// `Q8_0/Q4K` explicitly convert `SafeTensors` matrices into packed resident weights;
     /// a prepacked artifact is uploaded as stored. Legacy ordinary-attention GGUF
     /// checkpoints are unsupported.
-    pub fn create_model(&self) -> Result<(Qwen35, Tokenizer, ChatTemplate, GenerationDefaults)> {
+    pub fn create_model(&self) -> Result<(TextModel, Tokenizer, ChatTemplate, GenerationDefaults)> {
         let (model, tokenizer, template, defaults, ()) =
             self.create_model_with(None, |_, _| Ok(()))?;
         Ok((model, tokenizer, template, defaults))
@@ -128,10 +81,10 @@ impl ModelFactory {
     pub fn create_model_with<R>(
         &self,
         draft: Option<DraftHead>,
-        reserve: impl FnOnce(&Config, &LoadOptions) -> Result<R>,
-    ) -> Result<(Qwen35, Tokenizer, ChatTemplate, GenerationDefaults, R)> {
+        reserve: impl FnOnce(&ModelConfig, &LoadOptions) -> Result<R>,
+    ) -> Result<(TextModel, Tokenizer, ChatTemplate, GenerationDefaults, R)> {
         let dir = self.resolve()?;
-        let config = Config::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?;
+        let config = ModelConfig::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?;
         let generation = match std::fs::read_to_string(dir.join("generation_config.json")) {
             Ok(json) => Some(json),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -191,15 +144,94 @@ impl ModelFactory {
             recurrent: self.recurrent,
             mtp: draft,
         };
-        let config = if draft.is_some() {
+        let config = if options.mtp.is_some() {
             config.with_mtp()?
         } else {
             config
         };
         let reservation = reserve(&config, &options)?;
-        let model = Qwen35::load(&dir, &options)?;
+        let model = config.load(&dir, &options)?;
         Ok((model, tokenizer, template, defaults, reservation))
     }
+}
+
+/// Resolve a drafter checkpoint for `--draft-model`: a local directory, or a repository
+/// at an immutable commit whose config names a Gemma 4 assistant. The target validates
+/// the drafter against itself when it loads it.
+pub fn resolve_drafter(source: &ModelSource, revision: &str) -> Result<PathBuf> {
+    resolve(
+        source,
+        revision,
+        |json| {
+            let raw: serde_json::Value = serde_json::from_str(json)?;
+            if raw["model_type"].as_str() == Some("gemma4_assistant") {
+                Ok(())
+            } else {
+                Err(hub_error("draft model is not a Gemma 4 assistant"))
+            }
+        },
+        &[],
+    )
+}
+
+/// Snapshot directory of `source`: validate `config.json` with `validate` before any
+/// weight file downloads, and require the repository to report exactly `revision`.
+fn resolve(
+    source: &ModelSource,
+    revision: &str,
+    validate: impl Fn(&str) -> Result<()>,
+    required: &[&str],
+) -> Result<PathBuf> {
+    if revision.trim().is_empty() {
+        return Err(hub_error("checkpoint revision must not be empty"));
+    }
+    let id = match source {
+        ModelSource::LocalPath(path) => return Ok(path.clone()),
+        ModelSource::HuggingFace(id) => id,
+    };
+    if revision.len() != 40 || !revision.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(hub_error(
+            "remote --revision must be an immutable 40-character commit",
+        ));
+    }
+    if id.split('/').count() != 2 || id.split('/').any(str::is_empty) {
+        return Err(hub_error(
+            "use a fully qualified Hugging Face repository (organization/model)",
+        ));
+    }
+    let api = ApiBuilder::from_env().build().map_err(hub_error)?;
+    let repo = api.repo(Repo::with_revision(
+        id.clone(),
+        RepoType::Model,
+        revision.to_owned(),
+    ));
+    let config_path = repo.get("config.json").map_err(hub_error)?;
+    validate(&std::fs::read_to_string(&config_path)?)?;
+    let info = repo.info().map_err(hub_error)?;
+    if info.sha != revision {
+        return Err(hub_error(
+            "repository returned a different checkpoint revision",
+        ));
+    }
+    for name in required {
+        repo.get(name).map_err(hub_error)?;
+    }
+    for file in &info.siblings {
+        let name = file.rfilename.as_str();
+        if name.ends_with(".safetensors")
+            || matches!(
+                name,
+                "model.safetensors.index.json" | "generation_config.json" | "chat_template.jinja"
+            )
+        {
+            checkpoint_file(name)?;
+            repo.get(name).map_err(hub_error)?;
+        }
+    }
+    config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| hub_error("checkpoint has no directory"))
 }
 
 #[cfg(test)]
@@ -231,8 +263,8 @@ mod tests {
             revision: "main".into(),
             format: Some(WeightFormat::F32),
             device: Device::Cpu,
-            kv: crate::models::qwen3_5::DEFAULT_KV_LAYOUT,
-            recurrent: crate::models::qwen3_5::DEFAULT_RECURRENT_STATE,
+            kv: crate::models::DEFAULT_KV_LAYOUT,
+            recurrent: crate::models::DEFAULT_RECURRENT_STATE,
         };
         let error = factory
             .resolve()

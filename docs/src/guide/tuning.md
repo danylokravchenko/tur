@@ -1,13 +1,10 @@
 # Tuning
 
-The defaults favor one resident model and interactive latency. This page explains what
-each knob trades, gives recipes for common situations, and shows how to measure the
-result. The [Architecture](../architecture/overview.md) chapters explain the mechanisms.
+The defaults suit one model serving interactive users. This page explains what each setting trades, gives recipes for common situations, and shows how to measure the result. The [Architecture](../architecture/overview.md) chapters explain the mechanisms behind them.
 
-## Persist tuning settings
+## Keep settings in a file
 
-Store reusable settings in [`tur.toml`](configuration.md) instead of repeating flags.
-For example:
+Put the settings you reuse in [`tur.toml`](configuration.md) instead of repeating flags:
 
 ```toml
 [engine]
@@ -18,54 +15,40 @@ max_batch_size = 2
 request_timeout_secs = 120
 ```
 
-`tur serve --max-batch-size 4` overrides just that setting for one start. Advanced
-scheduler timing, waiting-token and streaming limits are configurable in the file
-without adding more command-line flags.
+`tur serve --max-batch-size 4` then overrides just that one setting for one start.
 
 ## Read the memory plan first
 
-Every start logs the plan:
+Every start logs a plan like this:
 
 ```text
 Memory plan resident_bytes=3017015772 weights=1309441280 state_pool=181469184 scratch_peak=251789312
 ```
 
-```text
-resident = weights + state pool (K/V pages, recurrent slots, snapshots, drafts)
-         + scratch peak + in-flight outputs + overhead (a tenth of the working set)
-```
+The total is the weights, plus the state pool (K/V pages, recurrent state, prefix snapshots and speculative drafts), plus kernel scratch space and in-flight outputs, plus a reserve of a tenth of the GPU's working set. Tur reserves all of it before reading any weight and refuses to start if it doesn't fit, so macOS never ends up swapping model memory. If a start fails for lack of memory, shrink one of these:
 
-Tur leases this plan before reading any weight. It refuses a plan beyond the device's
-recommended working set rather than letting macOS swap. If a start fails with a memory
-error, shrink one of the terms using the table below.
-
-| Term | Knob | Effect |
+| Part | Setting | Effect |
 | --- | --- | --- |
-| Weights | `--weight-format q4k`, or a [prepacked](quantization.md) artifact | Q4K: about 70% of Q8_0's bytes at load time, about a third as a tied-model artifact |
-| K/V pages | `--kv-format q8` | Half of F16's K/V bytes, within 1e-4 nats of F32; slower prefill |
-| Recurrent slots | `--recurrent-state f16` | Half the recurrent bytes, 6–7% faster batched decode; error grows with decode length, and speculation turns off |
-| State pool | `--state-memory-mb` | Default: an 8K-token context per concurrent request |
-| Snapshots | `--prefix-snapshots N` | Default: one per running request, capped at 1/8 of the pool |
-| Concurrency | `--max-batch-size` | Each running request holds two recurrent slots |
+| Weights | `--weight-format q4k`, or a [prepacked](quantization.md) artifact | Q4K takes about 70% of Q8_0's memory at load time, and about a third as an artifact on models with shared embeddings |
+| K/V pages | `--kv-format q8` | Half of F16's K/V memory, almost no quality change, slower prefill |
+| Recurrent state | `--recurrent-state f16` | Half the recurrent memory and slightly faster batched decode; error grows on long outputs, and speculation turns off |
+| State pool | `--state-memory-mb` | By default, room for an 8K-token context per concurrent request |
+| Snapshots | `--prefix-snapshots N` | By default, one per running request, using at most 1/8 of the pool |
+| Concurrency | `--max-batch-size` | Each running request holds recurrent state and its own K/V pages |
 
-Measured state pool on Qwen3.5-0.8B, for one request and 8K tokens: 181 MB with the
-defaults, 134 MB with `--kv-format q8`, 144 MB with `--recurrent-state f16`.
+## What each setting trades
 
-## Knobs and their trade-offs
-
-| Knob | Raise it to | Lower it to | Default |
+| Setting | Raise it to | Lower it to | Default |
 | --- | --- | --- | --- |
-| `--max-batch-size` | Serve more users at once; more aggregate tokens/s | Cut per-request latency and memory | 8 |
-| `--prefill-chunk-size` | Finish long prompts sooner (better TTFT for them) | Interleave prompts more finely with decodes (smoother streaming) | 256 |
-| `--max-batch-tokens` | Allow bigger prefill passes | Bound pass duration | 2048+ |
-| `--max-waiting` | Absorb bursts | Shed load early with 429s | 256 |
-| `--state-memory-mb` | Longer contexts, more snapshots | Free memory for weights or other processes | derived |
-| `--prefix-snapshots` | Keep more shared prefixes warm | Free pool memory | per running request |
+| `--max-batch-size` | Serve more users at once, with more total tokens/s | Cut per-request latency and memory | 8 |
+| `--prefill-chunk-size` | Finish long prompts sooner | Interleave prompts more finely with streaming replies | 256 |
+| `--max-batch-tokens` | Allow bigger prefill passes | Keep passes short | 2048 or more |
+| `--max-waiting` | Absorb bursts | Turn overload into fast 429s | 256 |
+| `--state-memory-mb` | Longer contexts, more snapshots | Free memory for weights or other apps | derived |
+| `--prefix-snapshots` | Keep more shared prompts warm | Free pool memory | one per running request |
 | `--speculative-draft` | More tokens per pass on repetitive output | Steadier token timing | 0 |
 
-The scheduler already adapts the prefill budget every pass, targeting about 60 ms or
-twice the decode-only cost. These knobs set the bounds it works within (see
-[Scheduling](../architecture/scheduling.md)).
+You don't need to balance prompts against replies by hand. The scheduler resizes the prompt share of every pass to keep each pass near 60 ms, or twice the cost of the replies alone if that's longer. These settings only set the limits it works within (see [Scheduling](../architecture/scheduling.md)).
 
 ## Recipes
 
@@ -75,23 +58,15 @@ twice the decode-only cost. These knobs set the bounds it works within (see
 tur serve --max-batch-size 2 --prefill-chunk-size 512
 ```
 
-- A small batch keeps every pass short.
-- Larger prefill chunks get a long first prompt done in fewer passes.
-- Add `--mtp` for 1.12–1.38× faster generation on novel text at one to four sequences.
-  Output is identical, but tokens arrive in bursts, and prefix reuse turns off.
+A small batch keeps every pass short, and bigger prompt chunks finish a long first prompt in fewer passes. Add `--mtp` to generate new text 1.1 to 1.4× faster with one to four users. Output is identical, but tokens arrive in small bursts, and prefix reuse turns off.
 
-### A chat service: many concurrent users
+### A chat service: many users at once
 
 ```sh
 tur serve --max-batch-size 16 --max-waiting 512 --request-timeout-secs 120 --kv-format q8
 ```
 
-- A larger batch gives more aggregate throughput. Batched decode is bound by
-  recurrent-state bandwidth, so per-user speed drops as the batch grows.
-- `--kv-format q8` halves K/V memory, leaving room for the extra contexts.
-- The timeout fails stuck requests with HTTP 504; the queue bound turns overload into
-  fast 429s rather than unbounded waits.
-- Keep prefix reuse on: every user's system prompt is shared.
+A bigger batch raises total throughput, though each user's tokens arrive a little slower as it grows. Q8 K/V halves the memory for keys and values, which leaves room for the extra conversations. The timeout fails stuck requests with HTTP 504, and the queue limit turns overload into quick 429s instead of endless waits. Leave prefix reuse on, since every user shares the system prompt.
 
 ### Agents and shared system prompts
 
@@ -99,36 +74,26 @@ tur serve --max-batch-size 16 --max-waiting 512 --request-timeout-secs 120 --kv-
 tur serve --max-batch-size 8 --prefix-snapshots 16
 ```
 
-- Agent loops resend a growing conversation, and reuse caches most of it. On the 0.8B, an
-  agent loop cached 83% of its prompt tokens.
-- Users who reach a cold shared prompt at the same time wait for the first one to
-  compute it, so they don't compute it eight times.
-- Leave `--mtp` off: it disables prefix reuse.
-- When most requests share a warm prompt and their first token matters more than
-  throughput, let restorable requests pass older cold ones:
+Agent loops resend a growing conversation each step, and prefix reuse skips the part already computed; in one agent benchmark, 83% of prompt tokens came from the cache. When several users hit the same new prompt at once, one computes it and the others wait for it rather than each computing their own copy. Leave `--mtp` off, because it disables prefix reuse.
 
-  ```toml
-  [engine]
-  prefix_restorable_first = true
-  ```
+If most requests share a cached prompt and their first token matters more than total throughput, let them start ahead of older uncached requests:
 
-  On the 0.8B, warm requests queued behind cold ones got their first token 5.4× sooner
-  (4.43 → 0.82 s), while cold requests waited 15% longer and throughput fell 10%. The
-  queue-age limit (`max_queue_wait_ms`, 2 s) still bounds how long a cold request is
-  passed over.
-- Separate tenants with the `cache_salt` request field.
-- Check `usage.prompt_tokens_details.cached_tokens` in responses to see what was reused.
+```toml
+[engine]
+prefix_restorable_first = true
+```
 
-### Code editing, extraction, structured output
+In the benchmark, cached requests stuck behind uncached ones got their first token 5× sooner, while uncached requests waited 15% longer and throughput fell 10%. An uncached request is never passed over for more than `max_queue_wait_ms` (2 s by default).
+
+Use the `cache_salt` request field to keep tenants' caches apart, and check `usage.prompt_tokens_details.cached_tokens` in responses to see what was reused.
+
+### Code editing, extraction and structured output
 
 ```sh
 tur serve --speculative-draft 4
 ```
 
-Prompt lookup drafts tokens copied from the request's own history: quoted code,
-repeated keys, echoed text. On repetitive output a single request ran 3.25× faster.
-Drafting adapts itself and switches off when it stops paying, for example at high
-concurrency.
+Prompt lookup drafts tokens by copying from the request's own text, which works well when the output quotes code, repeats keys or echoes the input. On repetitive output a single request ran about 3× faster. Drafting watches its own hit rate and cost, and stops when it no longer pays, for example when many requests are running.
 
 ### Long contexts on a 16 GB Mac
 
@@ -136,12 +101,7 @@ concurrency.
 tur serve --max-batch-size 2 --kv-format q8 --state-memory-mb 3072
 ```
 
-- K/V grows with context, and recurrent state does not, so long contexts are mostly a
-  K/V cost.
-- Q8 K/V roughly halves it.
-- An explicit pool size gives the few running requests more room than the 8K-per-request
-  default.
-- Requests that can never fit fail immediately with an out-of-memory error.
+K/V memory grows with context while recurrent state doesn't, so long contexts are mostly a K/V cost and Q8 K/V roughly halves it. An explicit pool size gives the few running requests more room than the default 8K tokens each. A request that could never fit fails immediately with an out-of-memory error.
 
 ### The smallest footprint
 
@@ -150,32 +110,23 @@ tur quantize --model ~/models/m --revision m1 --output ~/models/m-q4k --calibrat
 tur serve --model ~/models/m-q4k --revision m1-q4k --kv-format q8 --recurrent-state f16 --max-batch-size 2
 ```
 
-Every term of the plan shrinks. F16 recurrent state costs some accuracy on long
-generations and disables speculation; check quality on your own text first (see
-[Choosing a quantization](choosing-quantization.md#check-quality-on-your-own-text)).
+This shrinks every part of the plan. F16 recurrent state costs some accuracy on long outputs and disables speculation, so [check quality on your own text](choosing-quantization.md#check-quality-on-your-own-text) first.
 
 ### Reproducible output
 
-Batched passes can change logits in their last bits, because kernels reduce in different
-orders at different batch shapes. Same seed, different neighbours can therefore mean a
-different sampled token. Use the library's `PipelineConfig::reproducible`, which runs one
-request at a time in fixed chunks, without reuse or speculation. Concurrent bit-exact
-batching was measured and rejected as 0.52–0.87× slower.
+Batching can change logits in their last bits, because kernels add numbers in a different order at different batch shapes. The same seed with different neighbours can therefore pick a different token now and then. For bit-for-bit reproducible output, use the library's `PipelineConfig::reproducible`, which runs one request at a time in fixed chunks, without prefix reuse or speculation. Making concurrent batches bit-exact was tried and cost up to half the speed (see [Rejected experiments](../design/rejected.md)).
 
 ## Measure the result
 
-- **Per request:** `GenerationStats` and the HTTP `usage` block report prompt, cached and
-  generated tokens. The CLI logs elapsed time and finish reason.
-- **Under load:** the serving benchmark reports throughput, TTFT and inter-token latency
-  percentiles for your configuration:
+For a single request, the HTTP `usage` block and the library's `GenerationStats` report prompt, cached and generated tokens, and the CLI logs elapsed time and finish reason.
 
-  ```sh
-  TUR_QWEN35_0_8B=$HOME/models/qwen3.5-0.8b TUR_BENCH_WORKLOADS=decode,mixed \
-  TUR_BENCH_CONCURRENCY=1,4,8,16 just bench serving > serving.json
-  ```
+Under load, the serving benchmark reports throughput, time to first token and time between tokens for your settings:
 
-- **Quality:** run `kv_quality` before adopting any K/V, state or weight format (see
-  [Benchmarks](../development/benchmarks.md)).
+```sh
+TUR_QWEN35_0_8B=$HOME/models/qwen3.5-0.8b TUR_BENCH_WORKLOADS=decode,mixed \
+TUR_BENCH_CONCURRENCY=1,4,8,16 just bench serving > serving.json
+```
 
-Change one knob at a time, repeat each run at least three times, and compare on the same
-Mac in the same power mode.
+Before adopting a different K/V, state or weight format, run `kv_quality` (see [Benchmarks](../development/benchmarks.md)).
+
+Change one setting at a time, repeat each run at least three times, and compare on the same Mac in the same power mode.

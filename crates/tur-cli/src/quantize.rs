@@ -2,13 +2,19 @@
 //! precision under a byte budget from measured sensitivities, and write a prepacked
 //! artifact that `run` and `serve` load as stored.
 use std::{io::Write, path::PathBuf, time::Instant};
+use tur::models::{
+    DEFAULT_RECURRENT_STATE, Embedding, Execution, LoadOptions, Method, ModelConfig, Packer,
+    Precision, WeightFormat, WeightPlan,
+};
 use tur::{
     Result, TurError,
     core::execution::{KvFormat, KvLayout},
-    models::qwen3_5::{
-        Config, Conversion, DEFAULT_RECURRENT_STATE, Embedding, Execution, LoadOptions, Method,
-        Packer, Precision, Qwen35, Reference, WeightFormat, WeightPlan, allocate, artifact_config,
-        sensitivities, write_artifact, write_calibrated_artifact,
+    models::{
+        Conversion, gemma4,
+        qwen3_5::{
+            Config, Qwen35, Reference, allocate, artifact_config, sensitivities, write_artifact,
+            write_calibrated_artifact,
+        },
     },
     quantization::Calibration,
 };
@@ -81,6 +87,11 @@ fn samples(args: &Args) -> Result<Vec<Vec<u32>>> {
 }
 
 pub(crate) fn quantize(args: &Args) -> Result<()> {
+    if let ModelConfig::Gemma4(config) =
+        ModelConfig::from_json(&std::fs::read_to_string(args.model.join("config.json"))?)?
+    {
+        return quantize_gemma(args, &config);
+    }
     let config = artifact_config(&args.model)?;
     let embedding = match args.embedding.as_deref() {
         None if config.tied_embeddings() => Embedding::Head,
@@ -142,6 +153,50 @@ pub(crate) fn quantize(args: &Args) -> Result<()> {
     report["packing_seconds"] = packing.elapsed().as_secs_f64().into();
     report["total_seconds"] = started.elapsed().as_secs_f64().into();
     report["manifest"] = serde_json::to_value(&manifest)?;
+    let text = serde_json::to_string_pretty(&report)?;
+    match &args.report {
+        Some(path) => std::fs::write(path, text)?,
+        None => writeln!(std::io::stdout(), "{text}")?,
+    }
+    Ok(())
+}
+
+/// Round-to-nearest Gemma 4 artifact; calibrated rounding and byte budgets need the
+/// Qwen-only layer-streaming calibration.
+fn quantize_gemma(args: &Args, config: &gemma4::Config) -> Result<()> {
+    if args.method != Method::Rtn || args.budget_bits.is_some() || !args.calibration.is_empty() {
+        return Err(TurError::Other(
+            "Gemma 4 artifacts support --method rtn without --budget-bits or --calibration".into(),
+        ));
+    }
+    let embedding = match args.embedding.as_deref() {
+        None | Some("head") if tur::models::weights::WeightLayout::embeddings_tied(config) => {
+            Embedding::Head
+        }
+        None => Embedding::Table(Precision::Bf16),
+        Some(name) => Embedding::Table(name.parse().map_err(TurError::Other)?),
+    };
+    let plan = WeightPlan {
+        embedding,
+        ..WeightPlan::uniform(config, args.weight_format)?
+    };
+    let started = Instant::now();
+    let manifest = gemma4::write_artifact(
+        &Conversion {
+            source: &args.model,
+            identity: &args.revision,
+            output: &args.output,
+            calibration: "",
+        },
+        &plan,
+        &Packer::RTN,
+    )?;
+    let report = serde_json::json!({
+        "source": args.revision, "method": args.method,
+        "plan_bytes": plan.bytes(config)?,
+        "total_seconds": started.elapsed().as_secs_f64(),
+        "manifest": manifest,
+    });
     let text = serde_json::to_string_pretty(&report)?;
     match &args.report {
         Some(path) => std::fs::write(path, text)?,

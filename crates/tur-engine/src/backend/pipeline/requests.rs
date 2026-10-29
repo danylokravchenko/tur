@@ -21,7 +21,7 @@ use tur_models::{
         chat_template::{ChatMessage, RenderOptions, Role},
         tools::{ToolCall, ToolDefinition},
     },
-    models::qwen3_5::GenerationDefaults,
+    models::GenerationDefaults,
 };
 use uuid::Uuid;
 
@@ -288,9 +288,9 @@ impl InferencePipeline {
                 ngrams: NgramIndex::default(),
                 acceptance: self.acceptance,
                 mtp_done: 0,
-                mtp_draft: None,
+                mtp_drafts: Vec::new(),
                 mtp_acceptance: self.mtp_acceptance,
-                mtp_verifying: None,
+                mtp_verifying: Vec::new(),
                 drafted: 0,
                 accepted_drafts: 0,
             },
@@ -334,7 +334,8 @@ impl InferencePipeline {
         pending.consumed = 0;
         pending.running = false;
         pending.ngrams = NgramIndex::default();
-        (pending.mtp_done, pending.mtp_draft) = (0, None);
+        pending.mtp_done = 0;
+        pending.mtp_drafts.clear();
         pending.preemptions += 1;
         tracing::debug!(request = %id, tokens = pending.tokens.len(), "preempted for recompute");
         Ok(())
@@ -421,7 +422,7 @@ impl InferencePipeline {
         let tool_calls = if pending.tools.is_empty() {
             Vec::new()
         } else {
-            ToolCall::parse_from_output(&generated_text, &pending.tools)
+            ToolCall::parse_from_output(&pending.stream.decode_raw()?, &pending.tools)
         };
         let elapsed = pending.arrival.elapsed();
         if pending

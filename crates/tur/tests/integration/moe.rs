@@ -9,7 +9,8 @@ use tur_core::{
 };
 #[cfg(feature = "metal")]
 use tur_engine::hybrid::{Boundaries, ModelState};
-use tur_models::models::qwen3_5::{Config, Execution, LoadOptions, Qwen35, WeightFormat};
+use tur_models::models::qwen3_5::{Config, Qwen35};
+use tur_models::models::{Execution, LoadOptions, WeightFormat};
 
 const CONFIG: &str = include_str!("../fixtures/qwen3_5_moe_config.json");
 const GOLDEN: &str = concat!(

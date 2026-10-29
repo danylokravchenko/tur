@@ -1,17 +1,12 @@
 # Requirements and checkpoints
 
-This page is the reference for what Tur needs. For a guided first run, follow the
-[Quickstart](quickstart.md).
+This page is the reference for what Tur needs. For a guided first run, follow the [Quickstart](quickstart.md).
 
 ## Requirements
 
-- A Mac with Apple Silicon and direct access to its Metal device. Virtual machines and
-  sandboxes without GPU access fail at startup with "no accessible Metal device".
-- Rust installed through rustup. The checkout's `rust-toolchain.toml` selects Rust
-  1.99.0 (edition 2024), rustfmt and Clippy. The minimum supported Rust version is 1.99.
-- Optional: [`just`](https://github.com/casey/just) for the task recipes,
-  [`cargo-nextest`](https://nexte.st) for tests, and
-  [`mdbook`](https://rust-lang.github.io/mdBook/) for this book.
+- A Mac with Apple Silicon and direct access to its Metal device. Virtual machines and sandboxes without GPU access fail at startup with "no accessible Metal device".
+- Rust installed through rustup. The checkout's `rust-toolchain.toml` selects Rust 1.99 (edition 2024) with rustfmt and Clippy.
+- Optionally, [`just`](https://github.com/casey/just) for the task recipes, [`cargo-nextest`](https://nexte.st) for tests, and [`mdbook`](https://rust-lang.github.io/mdBook/) for this book.
 
 ## Build
 
@@ -22,10 +17,7 @@ Install the release binary from the checkout:
 ./install.sh --root "$HOME/.local"   # installs into ~/.local/bin
 ```
 
-The default destination is `~/.cargo/bin`; Cargo's `CARGO_INSTALL_ROOT`,
-`CARGO_HOME` and install configuration overrides are respected. Add the destination's
-`bin` directory to `PATH`. The script uses `Cargo.lock`, replaces an existing `tur`
-installation, and forwards its arguments to `cargo install`.
+The default destination is `~/.cargo/bin`, and the script respects Cargo's own `CARGO_INSTALL_ROOT`, `CARGO_HOME` and install settings. It builds from `Cargo.lock`, replaces an existing `tur`, and passes its arguments to `cargo install`. Add the destination's `bin` directory to `PATH`.
 
 To build without installing:
 
@@ -33,33 +25,24 @@ To build without installing:
 cargo build --release --bin tur      # or: just build
 ```
 
-The binary is `target/release/tur`. Metal support is a default feature;
-`--no-default-features` builds only the CPU reference, which exists for numerical tests,
-not for serving.
+The binary is `target/release/tur`. Metal support is on by default. `--no-default-features` builds only the CPU reference, which exists for numerical tests and is far too slow to serve.
 
 ## Get a checkpoint
 
-Tur loads SafeTensors checkpoints, either from a local directory or from Hugging Face.
-A checkpoint directory contains:
+Tur loads SafeTensors checkpoints from a local directory or from Hugging Face. A checkpoint directory contains:
 
 | File | Required | Purpose |
 | --- | --- | --- |
 | `config.json` | yes | Architecture and dimensions; decides whether Tur supports the model |
 | `tokenizer.json` | yes | Hugging Face tokenizer |
 | `tokenizer_config.json` | yes | Special tokens, EOS and the chat template |
-| `model.safetensors` or `model.safetensors.index.json` plus shards | yes | Weights |
+| `model.safetensors`, or `model.safetensors.index.json` plus shards | yes | Weights |
 | `chat_template.jinja` | no | Overrides the template in `tokenizer_config.json` |
 | `generation_config.json` | no | Default temperature, top-k, top-p and EOS tokens |
 
-The architecture comes from the config's `model_type` and `architectures` fields, never
-from the model's name. Unsupported architectures, settings or tensor layouts fail before
-any weight is read.
+Tur identifies the architecture from the config's `model_type` and `architectures` fields, never from the model's name. An unsupported architecture, setting or tensor layout fails before any weight is read.
 
-For a remote checkpoint, give the repository as `organization/name` and pin an
-immutable 40-character commit; branch names are rejected. Downloads use the standard
-Hugging Face cache and honor `HF_HOME` and `HF_TOKEN`. For a local directory, the
-revision is an identity you choose. It is recorded with prefix-cache entries and
-prepacked artifacts.
+For a remote checkpoint, give the repository as `organization/name` and pin a 40-character commit. Branch names are rejected because they can move. Downloads use the standard Hugging Face cache and honor `HF_HOME` and `HF_TOKEN`. For a local directory, the revision is a name you choose; Tur records it with prefix-cache entries and prepacked artifacts so they never mix with another model's.
 
 ## First generation
 
@@ -71,11 +54,9 @@ tur run \
   --temperature 0 --max-tokens 64
 ```
 
-Text streams to stdout. Logs, including the memory plan and timing, go to stderr. Set
-`RUST_LOG=debug` for more detail.
+Text streams to stdout. Logs, including the memory plan and timing, go to stderr; set `RUST_LOG=debug` for more.
 
-The `justfile` pins that checkpoint, so `just run --prompt 'Hello' -n 32` does the same.
-Override it with `TUR_MODEL` and `TUR_REVISION`.
+The `justfile` pins the same checkpoint, so `just run --prompt 'Hello' -n 32` does the same thing. `TUR_MODEL` and `TUR_REVISION` override it.
 
 ## First server
 
@@ -87,12 +68,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
 
-The server loads and validates the model before it binds the listener, so a listening
-server is ready to answer. See [HTTP API](http-api.md) for the request format.
+The server loads and validates the model before it opens the port, so once it is listening it can answer. See [HTTP API](http-api.md) for the request format.
 
 ## Decisions
 
-- Pin Rust 1.99.0 with rustfmt and Clippy: it matches the workspace's minimum Rust
-  version and supplies the tools used by `just ci`.
-- Install through Cargo with `--locked`: the CLI uses the checked-in dependency graph
-  and Cargo's existing destination options.
+- The toolchain is pinned to Rust 1.99 with rustfmt and Clippy. That matches the workspace's minimum Rust version and supplies every tool `just ci` uses.
+- Installation goes through `cargo install --locked`, so the CLI builds from the checked-in dependency graph and honors Cargo's usual destination options.

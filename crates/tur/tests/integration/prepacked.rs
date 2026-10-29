@@ -8,10 +8,12 @@ use tur::{
         prefix::PrefixConfig,
         speculation::SpeculationConfig,
     },
-    models::qwen3_5::{
-        Conversion, Packer, WeightFormat, WeightPlan, artifact_config, write_artifact,
+    models::{
+        Conversion,
+        qwen3_5::{artifact_config, write_artifact},
     },
 };
+use tur_models::models::{Packer, WeightFormat, WeightPlan};
 
 #[test]
 fn test_factory_serves_artifacts_exactly_like_load_time_conversion() -> Result<()> {
@@ -49,7 +51,7 @@ fn test_factory_serves_artifacts_exactly_like_load_time_conversion() -> Result<(
         ..PipelineConfig::new(1, 256)
     };
     for config in [PipelineConfig::new(1, 256), mtp] {
-        let expected = InferencePipeline::new(&converted, config)?.run(&request, |_| {})?;
+        let expected = InferencePipeline::new(&converted, config.clone())?.run(&request, |_| {})?;
         let actual = InferencePipeline::new(&prepacked, config)?.run(&request, |_| {})?;
         assert_eq!(actual.generated_text, expected.generated_text);
         assert_eq!(actual.generated_tokens, 24);

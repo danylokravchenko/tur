@@ -7,6 +7,7 @@
 //! generation (`#[ignore]`; needs `TUR_QWEN35_0_8B` and `TUR_QWEN35_GOLDEN`).
 
 use crate::model_common as common;
+use tur_models::models::{DraftHead, Execution, LoadOptions, WeightFormat};
 
 use crate::model_common::{Checkpoint, max_relative};
 use candle_core::{Device, Tensor};
@@ -19,7 +20,7 @@ use tur_core::{
     execution::{KvFormat, KvLayout, PackedExecution, SequenceDescriptor, StateHandle, invalid},
 };
 use tur_engine::hybrid::{HybridEngine, HybridModel, ModelState, PoolConfig, SamplingOptions};
-use tur_models::models::qwen3_5::{DraftHead, Execution, LoadOptions, Qwen35, WeightFormat};
+use tur_models::models::qwen3_5::Qwen35;
 
 /// Exact K/V storage: these tests compare chunking, batching and Transformers outputs.
 const EXACT_KV: KvLayout = KvLayout {
@@ -31,6 +32,7 @@ const EXACT_KV: KvLayout = KvLayout {
 /// Room for a few full contexts of the tiny model.
 const POOL: PoolConfig = PoolConfig {
     pages: 128,
+    window_pages: 128,
     recurrent_slots: 8,
 };
 
@@ -407,48 +409,6 @@ fn until_stop(tokens: &[u32], stops: &[u32]) -> Vec<u32> {
     tokens[..end].to_vec()
 }
 
-fn engine_generate(
-    model: Arc<Qwen35>,
-    prompt: &[u32],
-    stops: &[u32],
-    limit: usize,
-) -> Result<Vec<u32>> {
-    let device = model.device().clone();
-    let mut engine = HybridEngine::new(model, device, POOL)?;
-    let h = engine.allocate(0, SamplingOptions::default(), None)?;
-    let mut out = Vec::new();
-    let mut next = prompt.to_vec();
-    while out.len() < limit {
-        let meta = engine.metadata(h.request)?;
-        let n = next.len();
-        engine.submit(PackedExecution {
-            positions: (0..n).map(|i| meta.position + i).collect(),
-            tokens: std::mem::take(&mut next),
-            sequences: vec![SequenceDescriptor {
-                state: meta.handle,
-                tokens: 0..n,
-                outputs: vec![n - 1],
-                speculative: false,
-            }],
-        })?;
-        let token = engine
-            .finish()?
-            .pop()
-            .ok_or_else(|| invalid("missing result"))?
-            .outcome?
-            .outputs
-            .first()
-            .map(|o| o.token)
-            .ok_or_else(|| invalid("no output"))?;
-        out.push(token);
-        if stops.contains(&token) {
-            break;
-        }
-        next = vec![token];
-    }
-    Ok(out)
-}
-
 #[test]
 #[ignore = "needs TUR_QWEN35_0_8B and TUR_QWEN35_GOLDEN"]
 fn test_f32_greedy_generation_matches_transformers() -> Result<()> {
@@ -460,7 +420,14 @@ fn test_f32_greedy_generation_matches_transformers() -> Result<()> {
         ..
     } = real(WeightFormat::F32)?;
     let expected = until_stop(&greedy, &stops);
-    let actual = engine_generate(model, &prompt, &stops, expected.len())?;
+    let actual = common::generate(
+        Arc::clone(&model),
+        model.device().clone(),
+        POOL,
+        &prompt,
+        &stops,
+        expected.len(),
+    )?;
     assert_eq!(actual, expected);
     Ok(())
 }
@@ -491,7 +458,14 @@ fn test_quantized_generation_is_coherent() -> Result<()> {
         let agree =
             top.iter().zip(&argmax).filter(|(a, b)| a == b).count() as f64 / argmax.len() as f64;
         let expected = until_stop(&greedy, &stops);
-        let output = engine_generate(model, &prompt, &stops, 64)?;
+        let output = common::generate(
+            Arc::clone(&model),
+            model.device().clone(),
+            POOL,
+            &prompt,
+            &stops,
+            64,
+        )?;
         let prefix = output
             .iter()
             .zip(&expected)
@@ -549,7 +523,10 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
                 execution,
                 kv: EXACT_KV,
                 recurrent: candle_core::DType::F32,
-                mtp: Some(DraftHead { vocab: None }),
+                mtp: Some(DraftHead {
+                    vocab: None,
+                    model: None,
+                }),
             },
         )?;
         let description = model.description();
@@ -558,6 +535,7 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
             model.device(),
             PoolConfig {
                 pages: description.pages_for(count),
+                window_pages: description.pages_for(count),
                 recurrent_slots: 2,
             },
         )?;
@@ -595,7 +573,7 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
                         tokens: 0..len,
                         state: &side,
                         hidden: &hidden.narrow(0, start, len)?,
-                        logits: true,
+                        drafts: 1,
                     }],
                     pool: &pool,
                 })?

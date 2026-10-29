@@ -22,23 +22,27 @@ use tur_core::{
     execution::{KvFormat, LayerStateKind, ModelDescription, invalid},
 };
 
-/// Pool capacities: K/V pages and usable recurrent slots (the zero slot is extra).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Pool capacities: K/V pages of full attention layers, window pages of windowed ones
+/// (the placeholder page is extra) and usable recurrent slots (the zero slot is extra).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PoolConfig {
     pub pages: usize,
+    pub window_pages: usize,
     pub recurrent_slots: usize,
 }
 
 impl PoolConfig {
     /// Fit `bytes`: two recurrent slots per concurrent sequence (its committed state and one
     /// in-flight state), `retained` slots for snapshots kept beyond live sequences (prefix
-    /// reuse) and the permanent zero slot, then as many K/V pages as remain. Fails if
-    /// either kind of state the model needs gets no capacity.
+    /// reuse) and the permanent zero slot; then window pages for every sequence and
+    /// retained snapshot to hold its window plus a pass of `pass_tokens`; then as many
+    /// K/V pages as remain. Fails if any kind of state the model needs gets no capacity.
     pub fn for_budget(
         description: &ModelDescription,
         bytes: usize,
         sequences: usize,
         retained: usize,
+        pass_tokens: usize,
     ) -> Result<Self> {
         let recurrent_slots = if description.has_recurrent() {
             sequences
@@ -60,13 +64,35 @@ impl PoolConfig {
                  state ({slot_bytes} bytes)"
             ))
         })?;
-        let pages = if description.has_attention() {
+        let window_pages = match description.window() {
+            Some(window) => sequences
+                .checked_add(retained)
+                .and_then(|holders| {
+                    let held = window.checked_add(pass_tokens)?;
+                    holders.checked_mul(description.pages_for(held).checked_add(1)?)
+                })
+                .ok_or_else(|| invalid("window page count overflow"))?,
+            None => 0,
+        };
+        // The placeholder page that released window pages address is allocated too.
+        let window_bytes = window_pages
+            .checked_add(usize::from(description.window().is_some()))
+            .and_then(|pages| pages.checked_mul(description.window_page_bytes().ok()?))
+            .ok_or_else(|| invalid("window pool size overflow"))?;
+        let remaining = remaining.checked_sub(window_bytes).ok_or_else(|| {
+            TurError::MemoryAllocation(format!(
+                "state budget cannot hold {sequences} sequences' attention windows \
+                 ({window_bytes} bytes)"
+            ))
+        })?;
+        let pages = if description.has_full_attention() {
             remaining / description.page_bytes()?.max(1)
         } else {
             0
         };
         let config = Self {
             pages,
+            window_pages,
             recurrent_slots,
         };
         config.validate(description)?;
@@ -82,19 +108,37 @@ impl PoolConfig {
         } else {
             0
         };
+        let windows = if description.window().is_some() {
+            self.window_pages
+                .checked_add(1)
+                .ok_or_else(|| invalid("window page count overflow"))?
+        } else {
+            0
+        };
         self.pages
             .checked_mul(description.page_bytes()?)
             .zip(slots.checked_mul(description.recurrent_slot_bytes()?))
-            .and_then(|(p, s)| p.checked_add(s))
+            .zip(windows.checked_mul(description.window_page_bytes()?))
+            .and_then(|((p, s), w)| p.checked_add(s)?.checked_add(w))
             .ok_or_else(|| invalid("pool size overflow"))
     }
 
     fn validate(&self, description: &ModelDescription) -> Result<()> {
-        if description.has_attention() && self.pages == 0 {
+        if description.has_full_attention() && self.pages == 0 {
             return Err(TurError::MemoryAllocation(
                 "state budget leaves no K/V pages".into(),
             ));
         }
+        if description.window().is_some() && self.window_pages == 0 {
+            return Err(TurError::MemoryAllocation(
+                "state budget leaves no window pages".into(),
+            ));
+        }
+        self.window_pages
+            .checked_add(1)
+            .and_then(|pages| pages.checked_mul(description.kv.page_tokens))
+            .and_then(|slots| u32::try_from(slots).ok())
+            .ok_or_else(|| invalid("window pool exceeds u32 slot indices"))?;
         if description.has_recurrent() && self.recurrent_slots == 0 {
             return Err(TurError::MemoryAllocation(
                 "state budget leaves no recurrent slots".into(),
@@ -134,12 +178,14 @@ impl Usage {
     }
 }
 
-/// Occupancy and unit sizes of both pools.
+/// Occupancy and unit sizes of every id space.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PoolUsage {
     pub pages: Usage,
+    pub windows: Usage,
     pub slots: Usage,
     pub page_bytes: usize,
+    pub window_bytes: usize,
     pub slot_bytes: usize,
 }
 
@@ -151,18 +197,28 @@ impl PoolUsage {
         } else {
             0
         };
-        self.pages.capacity * self.page_bytes + slots * self.slot_bytes
+        let windows = if self.window_bytes > 0 {
+            self.windows.capacity + 1
+        } else {
+            0
+        };
+        self.pages.capacity * self.page_bytes
+            + windows * self.window_bytes
+            + slots * self.slot_bytes
     }
 
     /// Bytes held by leases.
     pub fn leased_bytes(&self) -> usize {
-        self.pages.leased * self.page_bytes + self.slots.leased * self.slot_bytes
+        self.pages.leased * self.page_bytes
+            + self.windows.leased * self.window_bytes
+            + self.slots.leased * self.slot_bytes
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Space {
     Pages,
+    Windows,
     Slots,
 }
 
@@ -319,6 +375,7 @@ struct Shared {
     device: Device,
     layers: Vec<LayerPool>,
     pages: Mutex<Allocator>,
+    windows: Mutex<Allocator>,
     slots: Mutex<Allocator>,
 }
 
@@ -326,6 +383,7 @@ impl Shared {
     fn allocator(&self, space: Space) -> &Mutex<Allocator> {
         match space {
             Space::Pages => &self.pages,
+            Space::Windows => &self.windows,
             Space::Slots => &self.slots,
         }
     }
@@ -357,12 +415,20 @@ impl StatePool {
         description.validate()?;
         config.validate(&description)?;
         let kv = description.kv;
-        let slots = config.pages * kv.page_tokens;
         let recurrent_slots = config.recurrent_slots + 1;
         let mut layers = Vec::with_capacity(description.layers.len());
         for kind in &description.layers {
             layers.push(match *kind {
-                LayerStateKind::Attention { kv_heads, head_dim } => {
+                LayerStateKind::Attention {
+                    kv_heads,
+                    head_dim,
+                    window,
+                } => {
+                    // Window page 0 is a never-written placeholder for released pages.
+                    let slots = match window {
+                        Some(_) => (config.window_pages + 1) * kv.page_tokens,
+                        None => config.pages * kv.page_tokens,
+                    };
                     let store = || -> Result<KvPool> {
                         Ok(KvPool {
                             data: Tensor::zeros(
@@ -418,12 +484,18 @@ impl StatePool {
         } else {
             0
         };
+        let window_capacity = if description.window().is_some() {
+            config.window_pages
+        } else {
+            0
+        };
         Ok(Self(Arc::new(Shared {
             id: POOL_IDS.fetch_add(1, Ordering::Relaxed),
             description,
             device: device.clone(),
             layers,
             pages: Mutex::new(Allocator::new(config.pages, 0)),
+            windows: Mutex::new(Allocator::new(window_capacity, 1)),
             slots: Mutex::new(Allocator::new(slot_capacity, 1)),
         })))
     }
@@ -447,8 +519,10 @@ impl StatePool {
     pub fn usage(&self) -> Result<PoolUsage> {
         Ok(PoolUsage {
             pages: self.0.pages.lock().usage(),
+            windows: self.0.windows.lock().usage(),
             slots: self.0.slots.lock().usage(),
             page_bytes: self.0.description.page_bytes()?,
+            window_bytes: self.0.description.window_page_bytes()?,
             slot_bytes: if self.0.description.has_recurrent() {
                 self.0.description.recurrent_slot_bytes()?
             } else {
@@ -460,7 +534,9 @@ impl StatePool {
     /// Return retired ids to the free lists and bump their generations. Call only when no
     /// unfenced device work can reference them; returns the number reclaimed.
     pub fn reclaim(&self) -> usize {
-        self.0.pages.lock().reclaim() + self.0.slots.lock().reclaim()
+        self.0.pages.lock().reclaim()
+            + self.0.windows.lock().reclaim()
+            + self.0.slots.lock().reclaim()
     }
 
     /// Storage of attention layer `layer`.
@@ -487,6 +563,7 @@ impl StatePool {
         let id = self.0.allocator(space).lock().lease().ok_or_else(|| {
             TurError::MemoryAllocation(match space {
                 Space::Pages => "K/V page pool exhausted".into(),
+                Space::Windows => "K/V window pool exhausted".into(),
                 Space::Slots => "recurrent state pool exhausted".into(),
             })
         })?;
@@ -501,8 +578,27 @@ impl StatePool {
         self.lease(Space::Pages)
     }
 
+    pub(crate) fn lease_window(&self) -> Result<Arc<Lease>> {
+        self.lease(Space::Windows)
+    }
+
     pub(crate) fn lease_slot(&self) -> Result<Arc<Lease>> {
         self.lease(Space::Slots)
+    }
+
+    /// Resolve window page ids; a released page (`None`) resolves to the placeholder 0.
+    pub(crate) fn resolve_windows(&self, ids: &[Option<Id>]) -> Result<Vec<u32>> {
+        let allocator = self.0.windows.lock();
+        ids.iter()
+            .map(|id| match id {
+                None => Ok(0),
+                Some(id) if allocator.live(*id) => Ok(id.index),
+                Some(id) => Err(invalid(format!(
+                    "stale window page {} (generation {})",
+                    id.index, id.generation
+                ))),
+            })
+            .collect()
     }
 
     /// Resolve page ids to indices, failing if any was released and reclaimed.
@@ -721,6 +817,7 @@ mod tests {
                 LayerStateKind::Attention {
                     kv_heads: 2,
                     head_dim: 64,
+                    window: None,
                 },
                 LayerStateKind::Recurrent {
                     conv_channels: 3,
@@ -738,6 +835,40 @@ mod tests {
         })
     }
 
+    #[test]
+    fn test_budget_reserves_each_holders_window_before_full_pages() -> Result<()> {
+        let mut model = (*description(2, KvFormat::F32)).clone();
+        model.layers.push(LayerStateKind::Attention {
+            kv_heads: 1,
+            head_dim: 64,
+            window: Some(3),
+        });
+        let (page, window, slot) = (
+            model.page_bytes()?,
+            model.window_page_bytes()?,
+            model.recurrent_slot_bytes()?,
+        );
+        // Two sequences and one snapshot, each holding a 3-key window plus a 4-token pass:
+        // pages_for(7) + 1 = 5 window pages apiece.
+        let fixed = 6 * slot + 16 * window;
+        let config = PoolConfig::for_budget(&model, fixed + 4 * page + 1, 2, 1, 4)?;
+        assert_eq!(
+            config,
+            PoolConfig {
+                pages: 4,
+                window_pages: 15,
+                recurrent_slots: 5
+            }
+        );
+        // The placeholder window page is allocated beside them.
+        assert_eq!(config.bytes(&model)?, 4 * page + 16 * window + 6 * slot);
+        assert!(PoolConfig::for_budget(&model, fixed - 1, 2, 1, 4).is_err());
+        let pool = StatePool::new(Arc::new(model), &Device::Cpu, config)?;
+        assert_eq!(pool.attention(2)?.key.data.dim(0)?, 16 * 2);
+        assert_eq!(pool.usage()?.windows.capacity, 15);
+        Ok(())
+    }
+
     fn rows(n: usize, seed: u64) -> Result<Tensor> {
         let values: Vec<f32> = (0..n * 128)
             .map(|i| (((i as u64 * 2_654_435_761 + seed * 97) % 2001) as f32 / 1000.0 - 1.0) * 3.0)
@@ -751,19 +882,20 @@ mod tests {
         let page = model.page_bytes()?;
         let slot = model.recurrent_slot_bytes()?;
         let budget = 3 * page + 5 * slot + 7;
-        let config = PoolConfig::for_budget(&model, budget, 2, 0)?;
+        let config = PoolConfig::for_budget(&model, budget, 2, 0, 0)?;
         assert_eq!(
             config,
             PoolConfig {
                 pages: 3,
+                window_pages: 0,
                 recurrent_slots: 4
             }
         );
         assert_eq!(config.bytes(&model)?, 3 * page + 5 * slot);
         assert!(config.bytes(&model)? <= budget);
-        assert!(PoolConfig::for_budget(&model, 4 * slot, 2, 0).is_err());
+        assert!(PoolConfig::for_budget(&model, 4 * slot, 2, 0, 0).is_err());
         assert!(matches!(
-            PoolConfig::for_budget(&model, slot, 2, 0),
+            PoolConfig::for_budget(&model, slot, 2, 0, 0),
             Err(TurError::MemoryAllocation(_))
         ));
         Ok(())
@@ -775,9 +907,9 @@ mod tests {
         let page = model.page_bytes()?;
         let slot = model.recurrent_slot_bytes()?;
         let minimum = page + 3 * slot;
-        assert!(PoolConfig::for_budget(&model, minimum - 1, 1, 0).is_err());
+        assert!(PoolConfig::for_budget(&model, minimum - 1, 1, 0, 0).is_err());
         for budget in [minimum, minimum + page - 1, minimum + page] {
-            let config = PoolConfig::for_budget(&model, budget, 1, 0)?;
+            let config = PoolConfig::for_budget(&model, budget, 1, 0, 0)?;
             assert_eq!(config.pages, (budget - 3 * slot) / page);
             assert!(config.bytes(&model)? <= budget);
         }
@@ -785,21 +917,22 @@ mod tests {
         recurrent
             .layers
             .retain(|kind| matches!(kind, LayerStateKind::Recurrent { .. }));
-        assert!(PoolConfig::for_budget(&recurrent, 3 * slot - 1, 1, 0).is_err());
-        let config = PoolConfig::for_budget(&recurrent, 3 * slot, 1, 0)?;
+        assert!(PoolConfig::for_budget(&recurrent, 3 * slot - 1, 1, 0, 0).is_err());
+        let config = PoolConfig::for_budget(&recurrent, 3 * slot, 1, 0, 0)?;
         assert_eq!(config.bytes(&recurrent)?, 3 * slot);
 
         let mut attention = (*model).clone();
         attention
             .layers
             .retain(|kind| matches!(kind, LayerStateKind::Attention { .. }));
-        let config = PoolConfig::for_budget(&attention, page, 1, 0)?;
+        let config = PoolConfig::for_budget(&attention, page, 1, 0, 0)?;
         assert_eq!(config.bytes(&attention)?, page);
         assert_eq!(config.recurrent_slots, 0);
-        assert!(PoolConfig::for_budget(&model, usize::MAX, usize::MAX, 0).is_err());
+        assert!(PoolConfig::for_budget(&model, usize::MAX, usize::MAX, 0, 0).is_err());
         assert!(
             PoolConfig {
                 pages: 1,
+                window_pages: 1,
                 recurrent_slots: usize::MAX
             }
             .bytes(&model)
@@ -815,6 +948,7 @@ mod tests {
             &Device::Cpu,
             PoolConfig {
                 pages: 2,
+                window_pages: 2,
                 recurrent_slots: 1,
             },
         )?;
@@ -910,6 +1044,7 @@ mod tests {
                 &Device::Cpu,
                 PoolConfig {
                     pages: 5,
+                    window_pages: 5,
                     recurrent_slots: 1,
                 },
             )?;

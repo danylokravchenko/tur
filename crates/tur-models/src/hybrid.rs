@@ -53,8 +53,10 @@ pub struct DraftSequence<'a> {
     pub state: &'a SequenceState,
     /// F32 `[tokens, hidden]` final normalized hidden states at the positions.
     pub hidden: &'a Tensor,
-    /// Return logits of the last position: the draft for the token after the next.
-    pub logits: bool,
+    /// Chained drafts to return logits for after the last position: row `i` drafts the
+    /// token `i + 2` positions after it, each row conditioned on the greedy drafts before
+    /// it. Zero returns none. A head that cannot chain returns at most one row.
+    pub drafts: usize,
 }
 
 /// A packed draft-head pass. It writes only the head's own state layers.
@@ -93,8 +95,8 @@ pub trait HybridModel: Send + Sync + 'static {
     fn forward(&self, batch: &PackedForward<'_>) -> Result<Vec<Result<SequenceStep>>>;
 
     /// Encode a draft-head pass (native multi-token prediction): per sequence, the F32
-    /// `[1, vocab]` logits of its last position when requested. Models without a head
-    /// reject it.
+    /// `[n, vocab]` logits of up to [`DraftSequence::drafts`] chained drafts after its last
+    /// position, or `None` when none were requested. Models without a head reject it.
     fn draft(&self, _batch: &DraftForward<'_>) -> Result<Vec<Result<Option<Tensor>>>> {
         Err(invalid("model has no draft head"))
     }

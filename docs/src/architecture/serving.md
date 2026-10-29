@@ -1,55 +1,32 @@
 # Serving
 
-The HTTP server is an axum application (`tur::server`) in front of a `PipelineWorker`.
+The HTTP server is an axum application (`tur::server`) in front of a `PipelineWorker`. Its job is to keep the GPU busy while staying responsive to many clients, and to make sure no single client, slow or broken, can hold up the rest.
 
 ## The worker
 
-`PipelineWorker` owns one `InferencePipeline` on a dedicated thread, because the engine
-is a single owner and model work must never block async handlers.
+`PipelineWorker` owns one `InferencePipeline` on a dedicated thread. The engine has a single owner, and model work must never block the async handlers.
 
-- **Startup.** `PipelineWorker::spawn` loads and validates the checkpoint, plans memory
-  and leases it before returning. The CLI binds the listener only afterwards, so a bound
-  port means a usable model.
-- **Intake.** Handlers send a `WorkerMsg` (request, optional stream sender, result
-  sender) over a bounded channel. The worker drains intake between passes, and also while
-  the GPU runs one, so tokenization and admission overlap device work.
-- **Loop.** Each iteration runs `begin_step`, handles intake and disconnects while the
-  pass is in flight, then runs `finish_step`, publishes text to streams and completes
-  finished requests.
-- **Isolation.** A request's error goes only to that request. If a pass fails as a
-  whole, every pending request receives the error, and the worker stops and reports it.
+- `PipelineWorker::spawn` loads and validates the checkpoint and reserves its memory before returning. The CLI opens the port only afterwards, so a listening server can answer.
+- Handlers send each request to the worker as a `WorkerMsg` (the request, an optional stream sender and a result sender) over a bounded channel. The worker accepts new requests between passes and also while the GPU is running one, so tokenizing and admitting requests overlaps GPU work.
+- Each loop iteration runs `begin_step`, handles new requests and disconnects while the pass is in flight, then runs `finish_step`, sends text to streams and completes finished requests.
+- A request's error goes only to that request. If a whole pass fails, every pending request gets the error, and the worker stops and reports it.
 
 ## Streaming
 
-Each streaming request has a bounded channel (64 messages) and a coalescing buffer.
+Each streaming request has a bounded channel of 64 messages and a buffer behind it.
 
-- **Coalescing.** Each pass sends at most one message per request. Text the channel
-  cannot take waits in the buffer.
-- **Slow clients.** If the buffer exceeds 16 KiB, the request is cancelled with
-  `slow_client` (HTTP 408, or an SSE error event) and its state is released. A stalled
-  client therefore holds at most 65 messages of bounded size.
-- **Completion never waits.** The final text is sent with the result, and the SSE adapter
-  emits whatever the channel could not take.
-- **Disconnects** are detected every pass, while the device runs, and release the
-  request's state.
+- Each pass sends at most one message per request, and text the channel can't take waits in the buffer.
+- If a client falls more than 16 KiB behind, its request is cancelled with `slow_client` (HTTP 408, or an error event in the stream) and its memory is released. A stalled client can therefore hold only a small, fixed amount of memory.
+- Finishing never waits on a client. The final text travels with the result, and the stream adapter sends whatever the channel couldn't take.
+- Disconnects are checked every pass, while the GPU runs, and free the request's state.
 
-The listener, model ID, admission and deadline settings, prefix retention and streaming
-bounds can be set in [`tur.toml`](../guide/configuration.md). CLI flags override file
-values. Streaming limits are file-only controls, checked before loading the model.
+The listener, model ID, admission and deadline settings, prefix retention and streaming limits can all go in [`tur.toml`](../guide/configuration.md), and flags override the file. Streaming limits are file-only and are checked before the model loads.
 
 ## Decisions
 
-- **Persist deployment settings in TOML.** Stream channel and pending-text bounds join
-  the existing server limits without adding more flags. HTTP generation settings remain
-  per request.
-- **One resident model per server.** Multi-model arbitration exists in the library (one
-  `DeviceBudget` shared by several pipelines), but the server loads one model.
-- **Overlap intake with execution.** Under streaming Poisson arrivals, TTFT p50 fell
-  13–14%, and device idle fell from 9.5% to 5% of wall time. The device idles at most
-  0.06–0.31 ms between passes (a lower bound).
-- **Bounded everything.** Intake, waiting requests, waiting tokens, stream messages and
-  stream buffers are all bounded, and every bound has an explicit error.
-- **Errors are typed.** Queue overflow, deadlines, memory and slow clients map to distinct
-  HTTP statuses (see [HTTP API](../guide/http-api.md#errors)).
-- **Not yet production-hardened:** there are no health or readiness endpoints, metrics,
-  graceful shutdown or stop sequences (see [Open work](../design/open.md)).
+- One model per server. The library can share one GPU budget among several pipelines, but the server loads one model.
+- New requests are accepted while the GPU runs. With requests arriving at random, this cut the median time to first token by 13 to 14% and halved the time the GPU sat idle, to about 5%.
+- Everything is bounded: intake, waiting requests, waiting tokens, stream messages and stream buffers, each with its own error.
+- Errors are typed. A full queue, a missed deadline, lack of memory and a slow client each map to a distinct HTTP status (see [HTTP API](../guide/http-api.md#errors)).
+- Deployment settings can live in TOML. Stream limits join the other server limits without more flags, and generation settings stay per request.
+- The server isn't production-hardened yet. It has no health or readiness endpoints, metrics, graceful shutdown or stop sequences (see [Open work](../design/open.md)).

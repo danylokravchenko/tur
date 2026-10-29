@@ -768,6 +768,7 @@ fn attention_reference(
     table: &[u32],
     first: &[u32],
     visible: &[u32],
+    semantics: Option<(usize, f64)>,
 ) -> Vec<f64> {
     let (heads, dim) = (case.heads, case.dim);
     let groups = heads / case.kv_heads;
@@ -777,7 +778,12 @@ fn attention_reference(
         for h in 0..heads {
             let g = h / groups;
             let qh = &q[(t * heads + h) * dim..][..dim];
-            let slots: Vec<usize> = (0..visible[t] as usize)
+            let minimum = semantics
+                .filter(|(window, _)| *window > 0)
+                .map_or(0, |(window, _)| {
+                    (visible[t] as usize).saturating_sub(window)
+                });
+            let slots: Vec<usize> = (minimum..visible[t] as usize)
                 .map(|j| {
                     table[first[t] as usize + j / case.page] as usize * case.page + j % case.page
                 })
@@ -790,7 +796,7 @@ fn attention_reference(
                         .zip(kr)
                         .map(|(a, b)| f64::from(*a) * f64::from(*b))
                         .sum::<f64>()
-                        / (dim as f64).sqrt()
+                        * semantics.map_or_else(|| (dim as f64).sqrt().recip(), |(_, scale)| scale)
                 })
                 .collect();
             let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -803,7 +809,14 @@ fn attention_reference(
                     .map(|(s, w)| w * f64::from(v[s * row + g * dim + i]))
                     .sum();
                 let gi = f64::from(gate[t * heads * 2 * dim + h * 2 * dim + dim + i]);
-                out.push(value / total * sigmoid(gi));
+                out.push(
+                    value / total
+                        * if semantics.is_some() {
+                            1.0
+                        } else {
+                            sigmoid(gi)
+                        },
+                );
             }
         }
     }
@@ -842,7 +855,7 @@ fn run_attention(
         head_dim: case.dim,
     };
     let expected = attention_reference(
-        case, &q, &k_exact, &v_exact, &gate, &table, &first, &visible,
+        case, &q, &k_exact, &v_exact, &gate, &table, &first, &visible, None,
     );
     let paged = kernels.paged_kv(case.page, slots, &table, &first, &visible)?;
     let out = kernels.attention(
@@ -870,6 +883,72 @@ fn check_attention(kernels: &Kernels, device: &Device, case: &AttentionCase) -> 
         let (actual, expected) = run_attention(kernels, device, case, format)?;
         let error = relative_error(&actual, &expected);
         assert!(error < 1e-5, "{format} dim {}: {error}", case.dim);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_ungated_attention_512_heads_and_sliding_windows_match_scalar_reference() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    for dim in [64, 256, 512] {
+        let case = AttentionCase {
+            heads: 4,
+            kv_heads: 1,
+            dim,
+            page: 4,
+            sequences: vec![(37, 3), (0, 9)],
+        };
+        let (key, value, slots, table, first, visible) = paged_pool(&case, 30);
+        let tokens = visible.len();
+        let q = values(tokens * case.heads * dim, 20, 0.1);
+        let query = upload(&device, &q, &[tokens, case.heads, dim])?;
+        let gate = vec![0.0; tokens * case.heads * 2 * dim];
+        for format in [KvFormat::F32, KvFormat::F16, KvFormat::Q8] {
+            let (key, k_exact) = stored(&device, &key, slots, case.kv_heads, dim, format)?;
+            let (value, v_exact) = stored(&device, &value, slots, case.kv_heads, dim, format)?;
+            let pool = AttentionPool {
+                key,
+                value,
+                format,
+                page_tokens: case.page,
+                kv_heads: case.kv_heads,
+                head_dim: dim,
+            };
+            let paged = kernels.paged_kv(case.page, slots, &table, &first, &visible)?;
+            // Windows of 7 and 24 keys span several splits of 2 or 8 keys inside a
+            // 40-key context.
+            for window in [0, 1, 7, 24, 512] {
+                let expected = attention_reference(
+                    &case,
+                    &q,
+                    &k_exact,
+                    &v_exact,
+                    &gate,
+                    &table,
+                    &first,
+                    &visible,
+                    Some((window, 1.0)),
+                );
+                for minimum in [2, 8, 1024] {
+                    let tuned = kernels.clone().with_tuning(Tuning {
+                        min_split_keys: minimum,
+                        ..kernels.tuning()
+                    })?;
+                    let actual = read(&tuned.attention_ungated(
+                        &query,
+                        &pool,
+                        &paged,
+                        (window > 0).then_some(window),
+                        1.0,
+                    )?)?;
+                    let error = relative_error(&actual, &expected);
+                    assert!(
+                        error < 1e-5,
+                        "dim {dim} {format} window {window} split {minimum}: {error}"
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1007,6 +1086,69 @@ fn test_tiled_attention_matches_reference_for_every_format_and_tile_shape() -> R
 }
 
 #[test]
+fn test_tiled_ungated_windowed_attention_matches_scalar_reference() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    let tiled = kernels.clone().with_tuning(Tuning {
+        attention_tiled_ungated_groups: 0,
+        ..kernels.tuning()
+    })?;
+    for dim in [64, 128, 256] {
+        // Tiles crossing pages and key blocks, a long prefill continuing committed keys,
+        // and windows shorter than, across and longer than one 32-key block.
+        let case = AttentionCase {
+            heads: 4,
+            kv_heads: 1,
+            dim,
+            page: 16,
+            sequences: vec![(37, 70), (0, 33), (90, 5)],
+        };
+        let (key, value, slots, table, first, visible) = paged_pool(&case, 31);
+        let tokens = visible.len();
+        let q = values(tokens * case.heads * dim, 21, 0.1);
+        let query = upload(&device, &q, &[tokens, case.heads, dim])?;
+        let gate = vec![0.0; tokens * case.heads * 2 * dim];
+        let paged = tiled.paged_kv(case.page, slots, &table, &first, &visible)?;
+        assert!(tiled.attention_tiled_ungated(&paged, case.heads, dim));
+        assert!(!kernels.attention_tiled_ungated(&paged, case.heads, dim));
+        for format in [KvFormat::F32, KvFormat::F16, KvFormat::Q8] {
+            let (key, k_exact) = stored(&device, &key, slots, case.kv_heads, dim, format)?;
+            let (value, v_exact) = stored(&device, &value, slots, case.kv_heads, dim, format)?;
+            let pool = AttentionPool {
+                key,
+                value,
+                format,
+                page_tokens: case.page,
+                kv_heads: case.kv_heads,
+                head_dim: dim,
+            };
+            for window in [0, 1, 7, 33, 64, 512] {
+                let expected = attention_reference(
+                    &case,
+                    &q,
+                    &k_exact,
+                    &v_exact,
+                    &gate,
+                    &table,
+                    &first,
+                    &visible,
+                    Some((window, 0.5)),
+                );
+                let actual = read(&tiled.attention_ungated(
+                    &query,
+                    &pool,
+                    &paged,
+                    (window > 0).then_some(window),
+                    0.5,
+                )?)?;
+                let error = relative_error(&actual, &expected);
+                assert!(error < 1e-5, "dim {dim} {format} window {window}: {error}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_tiled_attention_dispatch_preserves_decode_parallelism() -> Result<()> {
     let (_, kernels, _gpu) = setup()?;
     let decode = kernels.paged_kv(16, 32, &[0, 1], &[0, 1, 0, 1], &[16; 4])?;
@@ -1063,13 +1205,11 @@ fn test_quantized_kv_attention_stays_close_to_f32_attention() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<()> {
-    let (device, kernels, _gpu) = setup()?;
+fn check_kv_write(kernels: &Kernels, device: &Device, dim: usize) -> Result<()> {
     let case = AttentionCase {
         heads: 4,
         kv_heads: 2,
-        dim: 128,
+        dim,
         page: 16,
         sequences: vec![(37, 3), (0, 20), (15, 1)],
     };
@@ -1090,8 +1230,8 @@ fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<
         KvFormat::Q8 { group: 128 },
     ] {
         let poison = vec![f32::NAN; slots * width];
-        let (key_pool, _) = stored(&device, &poison, slots, case.kv_heads, case.dim, format)?;
-        let (value_pool, _) = stored(&device, &poison, slots, case.kv_heads, case.dim, format)?;
+        let (key_pool, _) = stored(device, &poison, slots, case.kv_heads, case.dim, format)?;
+        let (value_pool, _) = stored(device, &poison, slots, case.kv_heads, case.dim, format)?;
         let pool = AttentionPool {
             key: key_pool,
             value: value_pool,
@@ -1101,14 +1241,14 @@ fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<
             head_dim: case.dim,
         };
         kernels.kv_write(
-            &upload(&device, &key, &[tokens, case.kv_heads, case.dim])?,
+            &upload(device, &key, &[tokens, case.kv_heads, case.dim])?,
             Heads {
                 count: case.kv_heads,
                 dim: case.dim,
                 head_stride: case.dim,
                 col_offset: 0,
             },
-            &upload(&device, &projection, &[tokens, 2 * width + 5])?,
+            &upload(device, &projection, &[tokens, 2 * width + 5])?,
             Heads {
                 count: case.kv_heads,
                 dim: case.dim,
@@ -1172,6 +1312,15 @@ fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<
                 }
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    for dim in [128, 512] {
+        check_kv_write(&kernels, &device, dim)?;
     }
     Ok(())
 }

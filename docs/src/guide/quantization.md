@@ -1,15 +1,15 @@
 # Prepacked weights
 
-Tur keeps projection weights packed in GGML block formats, and its kernels read those
-blocks directly. A SafeTensors checkpoint can be packed in two ways:
+Tur stores projection weights in packed block formats (8-bit Q8_0 and 4-bit Q4K, from GGML), and its kernels read those blocks directly. Fewer bytes per weight means less memory and, when one conversation is decoding, more tokens per second, because that work is limited by how fast the GPU can read weights.
 
-- **At load time:** `--weight-format f32|q8_0|q4k` on `run` or `serve` (default `q8_0`).
-  This is plain round-to-nearest packing, repeated on every start.
-- **Offline:** `tur quantize` writes a prepacked artifact. It can use calibrated
-  rounding and per-projection precision, and it loads as stored.
+You can pack a SafeTensors checkpoint in two ways:
 
-These are not GGUF imports, and `q4k` is Q4_K packing rather than a promise of
-llama.cpp's Q4_K_M recipe.
+- At load time, with `--weight-format f32|q8_0|q4k` on `run` or `serve` (the default is `q8_0`). This uses plain rounding and repeats the work on every start.
+- Offline, with `tur quantize`, which writes a prepacked artifact. It can calibrate the rounding on your text, give sensitive projections more bits, and it loads as stored in a fraction of a second.
+
+These are not GGUF files, and `q4k` means Q4_K blocks for every projection, not llama.cpp's Q4_K_M mix.
+
+Calibration (`imatrix`, `gptq` and `--budget-bits`) is available for the Qwen family. Gemma 4 artifacts use plain rounding: `tur quantize --method rtn --weight-format q8_0`. An E2B Q8_0 artifact loads in about 5 s, against about 12 s for converting at load time.
 
 ## Writing an artifact
 
@@ -21,90 +21,49 @@ tur quantize \
   --report /models/qwen3.5-0.8b-q4k-gptq.json
 ```
 
-Then load it without `--weight-format`:
+Then load it without `--weight-format`, which is an error with an artifact:
 
 ```sh
 tur serve --model /models/qwen3.5-0.8b-q4k-gptq --revision q4k-gptq-v1
 ```
 
-Passing `--weight-format` with an artifact is an error. The artifact is one
-`tur-weights.safetensors` file whose header carries a manifest, next to verbatim copies
-of the source's config, tokenizer, template and generation defaults. The manifest
-records:
-
-- the format version (readers reject any other);
-- the source checkpoint identity, and a fingerprint of its `config.json`;
-- the quantizer, its version, method and damping;
-- the calibration sample count, token count and fingerprint;
-- the per-projection weight plan.
-
-All of it is validated before any payload is read. The file is written to a `.partial`
-path and renamed into place, so a failed run leaves no half-written artifact.
+The artifact is one `tur-weights.safetensors` file next to copies of the source's config, tokenizer, template and generation defaults. Its header holds a manifest with the format version, the source checkpoint's identity and a fingerprint of its `config.json`, the quantizer settings, a fingerprint of the calibration data, and the format chosen for each projection. Tur checks all of it before reading any weights, so an artifact can't be loaded against the wrong config. The file is written under a temporary name and renamed when complete, so a failed run never leaves a half-written artifact.
 
 ## Choosing a method
 
 | Method | Needs calibration | What it does |
 | --- | --- | --- |
-| `rtn` | no | Round-to-nearest; identical to load-time conversion |
-| `imatrix` | yes | Importance-weighted K-quant scale search from input statistics |
-| `gptq` (default) | yes | GPTQ error compensation onto the same block grids |
+| `rtn` | no | Rounds each weight to the nearest value; the same result as load-time conversion |
+| `imatrix` | yes | Chooses block scales that protect the weights your text uses most |
+| `gptq` (default) | yes | Rounds column by column and corrects the remaining columns for the error so far |
 
-Every method emits ordinary GGML blocks, so the same kernels execute the result, and
-decode speed is unchanged at equal formats.
+Every method produces ordinary blocks, so the same kernels run the result and speed is the same at equal formats. Only quality differs: on held-out text GPTQ roughly halves the error of plain 4-bit rounding.
 
-Calibration text must never overlap the text you evaluate quality on. Without
-`--budget-bits`, GPTQ and imatrix load one F32 layer, run the calibration samples through
-it, release it, and pack its projections before loading the next layer. Later layers
-receive the unquantized reference activations, preserving resident calibration's
-statistics. Embeddings are gathered directly from the checkpoint; calibrating the LM
-head does not load its weights. Artifact payloads are written in chunks, including
-embedding tables.
+Keep calibration text separate from the text you judge quality on, or the measurement will flatter the result.
 
-Peak memory depends on the largest F32 layer, its input statistics and one sample's
-execution workspace. GPTQ also needs that layer's Hessians and one projection's
-factorization workspace. These still need to fit; a large MoE layer can remain limiting.
-Use `imatrix` to avoid Hessians, or `rtn` to avoid calibration entirely. Reducing
-`--sample-tokens` reduces activation workspace.
+### Memory and disk
 
-Hidden states are spooled to two temporary files under the output directory, requiring
-up to `2 × calibration_tokens × hidden_size × 4` additional disk bytes. They are removed
-on success and ordinary errors. A forcibly terminated process can leave a
-`.tur-calibration-*` directory that can be deleted before retrying. Artifact publication
-also needs space for both the temporary payload and the completed weights file.
+GPTQ and imatrix calibrate one layer at a time. Tur loads a layer in F32, runs the calibration samples through it, packs its projections, frees it, and moves on. Each layer sees the activations the unquantized model would produce, so errors don't compound from one layer to the next, and the whole F32 model never has to fit in memory.
+
+Peak memory is set by the largest F32 layer, its input statistics and one sample's workspace. GPTQ also holds that layer's Hessians. A large MoE layer can still be the limit; `imatrix` avoids the Hessians, `rtn` avoids calibration entirely, and a smaller `--sample-tokens` shrinks the workspace.
+
+Between layers, hidden states go to two temporary files in the output directory, up to `2 × calibration_tokens × hidden_size × 4` bytes. They are removed when the run ends normally. A killed process can leave a `.tur-calibration-*` directory, which you can delete before retrying. Writing the artifact also needs room for a temporary copy of the weights file.
 
 ## Mixed precision
 
-`--budget-bits 5.5` measures each projection's sensitivity: the mean KL divergence from
-F32 on the calibration samples when only that projection is quantized. It then upgrades
-projections from `--weight-format` to `q8_0`, applying the largest divergence reduction
-per added byte first, until the budget is spent. The allocation assumes divergences add,
-which the measurements show is only approximately true. Q5K and Q6K are
-available only for embedding tables, because Tur has no small-batch kernels for them.
-This whole-model sensitivity measurement still keeps the complete F32 model and all
-calibration statistics in memory; `--budget-bits` does not use layer-wise calibration.
+`--budget-bits 5.5` gives some projections 8 bits and the rest the base format, within an average of 5.5 bits per weight. Tur first measures how much each projection hurts on its own: the KL divergence from F32 on the calibration text when only that projection is quantized. It then upgrades projections to `q8_0` in order of quality gained per extra byte until the budget is spent. This assumes the errors add up, which is only roughly true.
+
+Mixed precision measures the whole model at once, so it needs the full F32 model and its calibration statistics in memory.
 
 ## Decisions
 
 Measured on Qwen3.5-0.8B on an M1:
 
-- **Load-time `q8_0` stays the default** for SafeTensors checkpoints. It needs no
-  calibration data and is the most accurate packed format.
-- **GPTQ is the default artifact method.** At equal bytes it cuts Q4K's KL divergence
-  from F32 by 49–59% on held-out prose, code and retrieval text, and by 12% on tool/JSON
-  text, where it ties with `imatrix`.
-- **Uniform calibrated conversion streams layers.** Shared calibration infrastructure
-  owns disk-backed activations and layer/statistics lifetimes; model adapters supply
-  loading and reference execution. Dense, tied and MoE fixture payloads match resident
-  calibration on CPU and Metal for GPTQ and imatrix. This removes the whole-model F32
-  requirement without calibrating against already quantized layers. Large-checkpoint
-  peak memory has not yet been measured.
-- **Mixed precision is opt-in.** At 5.5 bits per weight, KL falls another 34–58% for 23%
-  more resident bytes, at 0.86× single-sequence decode speed.
-- **Tied checkpoints gather embeddings from the packed LM head** (`--embedding head`, the
-  artifact default). This cuts Q4K resident weights from 933 to 425 MB at unchanged
-  quality, and Q8_0 from 1,309 to 801 MB.
-- **Prepacked artifacts load directly.** They load byte-identical to load-time
-  conversion: Q4K in 0.2 s instead of 9 s, with half the peak memory.
-- **Projections are F32, Q8_0 or Q4K only.** Candle's Q5K/Q6K kernels at 2–16 rows are
-  2.5–3.5× slower than Tur's Q8_0/Q4K kernels.
-- **AWQ-style rescaling and DWQ are not implemented.**
+- Load-time `q8_0` stays the default for SafeTensors checkpoints. It needs no calibration data and is the most accurate packed format.
+- GPTQ is the default artifact method. At equal size it cuts Q4K's KL divergence from F32 by about half on held-out prose, code and retrieval text, and by 12% on tool calls and JSON, where it ties with `imatrix`.
+- Calibration streams one layer at a time. Dense, tied and MoE fixtures produce the same weights as calibrating the whole model at once, on CPU and Metal. Peak memory on large checkpoints hasn't been measured yet.
+- Mixed precision is opt-in. At 5.5 bits per weight it cuts KL by another third to half, but costs 23% more memory and 14% of single-sequence decode speed.
+- Tied checkpoints read embeddings from the packed output layer (`--embedding head`, the artifact default). That drops the separate embedding table at unchanged quality: a Q4K artifact of the 0.8B holds 425 MB of weights instead of 933 MB.
+- Prepacked artifacts load directly, byte-identical to load-time conversion. The 0.8B Q4K artifact loads in 0.2 s instead of 9 s, with half the peak memory.
+- Projections are F32, Q8_0 or Q4K only. Candle's Q5K and Q6K kernels at 2 to 16 rows are 2.5 to 3.5× slower than Tur's Q8_0 and Q4K kernels, so those formats are offered only for embedding tables.
+- AWQ-style rescaling and DWQ are not implemented.

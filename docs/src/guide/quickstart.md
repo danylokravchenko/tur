@@ -1,8 +1,6 @@
-# Quickstart: from zero to a quantized server
+# Quickstart
 
-This walkthrough installs Tur, downloads a model, chats with it, serves it, and then
-quantizes it and serves the smaller artifact. It uses Qwen3.5-0.8B, which runs on any
-Apple Silicon Mac.
+This walkthrough installs Tur, downloads a model, chats with it and serves it. Then it quantizes the model and serves the smaller version. It uses Qwen3.5-0.8B, which runs on any Apple Silicon Mac.
 
 ## 1. Install
 
@@ -12,16 +10,11 @@ git clone https://github.com/danylokravchenko/tur && cd tur
 tur --help
 ```
 
-Install Rust through rustup first; the checkout selects Rust 1.99.0 automatically.
-Building takes a few minutes the first time. The script also replaces an existing
-installation. Use `./install.sh --root "$HOME/.local"` for `~/.local/bin`, and ensure
-the destination's `bin` directory is on your `PATH`. `cargo build --release --bin tur`
-works too; the binary is then `target/release/tur`.
+Install Rust through rustup first; the checkout selects the right toolchain for you. The first build takes a few minutes. Running the script again replaces an existing installation. Use `./install.sh --root "$HOME/.local"` to install into `~/.local/bin`, and make sure the destination's `bin` directory is on your `PATH`. If you'd rather not install, `cargo build --release --bin tur` leaves the binary at `target/release/tur`.
 
 ## 2. Pick and pin a model
 
-Tur needs an exact revision for every model, so the same command always loads the same
-weights. Look up the current commit of a Hugging Face repository:
+Tur asks for an exact revision of every model, so the same command always loads the same weights. To look up the current commit of a Hugging Face repository:
 
 ```sh
 curl -s https://huggingface.co/api/models/Qwen/Qwen3.5-0.8B | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
@@ -34,34 +27,30 @@ export TUR_MODEL=Qwen/Qwen3.5-0.8B
 export TUR_REVISION=2fc06364715b967f1860aea9cf38778875588b17
 ```
 
-`tur` reads both variables, so later commands can omit `--model` and `--revision`.
+`tur` reads both variables, so later commands can leave out `--model` and `--revision`.
 
 ## 3. Download
 
-You have two options.
-
-**Let Tur download.** Give the repository name; files go to the Hugging Face cache
-(`~/.cache/huggingface`, or `HF_HOME`). Gated models need `HF_TOKEN`.
+The simplest option is to let Tur download. Give it the repository name, and the files go to the Hugging Face cache (`~/.cache/huggingface`, or `HF_HOME`). Gated models need `HF_TOKEN`.
 
 ```sh
 tur run --prompt 'Hello'      # downloads on first use
 ```
 
-**Download to a directory.** This is better for offline use, quantization and serving.
-It needs the Hugging Face CLI (`pip install -U huggingface_hub`):
+For offline use and for quantization, download into a directory instead. This needs the Hugging Face CLI (`pip install -U huggingface_hub`):
 
 ```sh
 hf download Qwen/Qwen3.5-0.8B --revision "$TUR_REVISION" --local-dir ~/models/qwen3.5-0.8b
-export TUR_MODEL=~/models/qwen3.5-0.8b    # a directory: loads locally
-export TUR_REVISION=qwen3.5-0.8b@2fc0636  # for local dirs, any stable identity
+export TUR_MODEL=~/models/qwen3.5-0.8b    # a directory loads locally
+export TUR_REVISION=qwen3.5-0.8b@2fc0636  # for a local directory, any stable name you choose
 ```
 
-Older `huggingface_hub` versions spell the command `huggingface-cli download`.
+Older versions of `huggingface_hub` call the command `huggingface-cli download`.
 
 ## 4. Generate
 
 ```sh
-# Greedy and short; thinking off for a direct answer.
+# Greedy and short, with thinking off for a direct answer.
 tur run --prompt 'Write one sentence about the Moon.' --temperature 0 -n 64 --thinking false
 
 # Sampled with the checkpoint's own defaults, thinking on (the template's default).
@@ -75,7 +64,7 @@ EOF
 tur run --prompt 'What is the weather in Kyiv?' --tools tools.json --thinking false
 ```
 
-The memory plan and timing are logged to stderr:
+Text goes to stdout. The memory plan and timing go to stderr:
 
 ```text
 INFO tur::run: Memory plan resident_bytes=3017015772 weights=1309441280 state_pool=181469184 scratch_peak=251789312
@@ -88,10 +77,10 @@ INFO tur::run: Generation complete prompt_tokens=19 generated_tokens=26 elapsed=
 tur serve --served-model-name qwen --max-batch-size 8
 ```
 
-Once it prints `Listening on http://127.0.0.1:8080`, it is ready.
+When it prints `Listening on http://127.0.0.1:8080`, the model is loaded and ready.
 
 ```sh
-# One-shot.
+# One response.
 curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"qwen","messages":[{"role":"user","content":"Say hi"}],"max_tokens":32,"thinking":false}'
 
@@ -117,9 +106,7 @@ print(reply.choices[0].message.content)
 
 ## 6. Quantize
 
-A prepacked artifact loads faster and can be smaller and more accurate than load-time
-conversion. GPTQ needs calibration text that resembles your traffic, roughly 16K tokens
-(about 60 KB of English). Mix the kinds of text you serve:
+`tur quantize` writes a prepacked copy of the model. It loads almost instantly, and with calibration its 4-bit weights lose about half as much quality as plain rounding on most text. Calibration needs text that resembles your traffic, roughly 16K tokens (about 60 KB of English), so mix the kinds of text you serve:
 
 ```sh
 cat my-docs/*.md my-code/*.rs > calib.txt
@@ -128,21 +115,18 @@ tur quantize --model ~/models/qwen3.5-0.8b --revision "$TUR_REVISION" \
   --report ~/models/qwen3.5-0.8b-q4k-gptq.json
 ```
 
-No calibration text at hand? `--method rtn` packs without it. The result is the same as
-load-time conversion, but loads in a fraction of the time.
+Without calibration text, `--method rtn` uses plain rounding. You still get the fast load.
 
-## 7. Serve the artifact
+## 7. Serve the quantized model
 
 ```sh
 tur serve --model ~/models/qwen3.5-0.8b-q4k-gptq --revision q4k-gptq-v1 --served-model-name qwen
 ```
 
-Do not pass `--weight-format`; the artifact loads as stored. The memory plan should show
-resident weights of about 425 MB, against 1,309 MB for load-time Q8_0.
+Leave out `--weight-format`, because the artifact loads exactly as stored. The memory plan should now show about 425 MB of weights, a third of the default 8-bit load.
 
 ## Next
 
-- [Choosing a quantization](choosing-quantization.md): which format for which Mac and
-  model.
-- [Tuning](tuning.md): recipes for latency, throughput, memory and agents.
-- [HTTP API](http-api.md): every request field and error.
+- [Choosing a quantization](choosing-quantization.md) helps you pick a format for your Mac and model.
+- [Tuning](tuning.md) has recipes for latency, throughput, memory and agents.
+- [HTTP API](http-api.md) documents every request field and error.

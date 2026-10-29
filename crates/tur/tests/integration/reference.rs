@@ -11,12 +11,13 @@
 use candle_core::{Device, Tensor};
 use std::path::PathBuf;
 use tur_core::{Result, TurError, execution::invalid};
+use tur_models::models::{Execution, LoadOptions, WeightFormat};
 use tur_models::{
     backend::{
         chat_template::{ChatMessage, ChatTemplate, RenderOptions, Role, ToolCall},
         tools::ToolDefinition,
     },
-    models::qwen3_5::{Execution, LoadOptions, Qwen35, WeightFormat},
+    models::qwen3_5::Qwen35,
 };
 
 const FIXTURES: &str = include_str!("../fixtures/qwen3_5_templates.json");
@@ -33,7 +34,7 @@ fn templates(name: &str) -> Result<ChatTemplate> {
     ChatTemplate::from_template(std::fs::read_to_string(path)?)
 }
 
-fn message(raw: &serde_json::Value) -> Result<ChatMessage> {
+pub(super) fn message(raw: &serde_json::Value) -> Result<ChatMessage> {
     let role = match raw["role"].as_str() {
         Some("system") => Role::System,
         Some("user") => Role::User,
@@ -56,7 +57,7 @@ fn message(raw: &serde_json::Value) -> Result<ChatMessage> {
     Ok(message)
 }
 
-fn tools(raw: &serde_json::Value) -> Vec<ToolDefinition> {
+pub(super) fn tools(raw: &serde_json::Value) -> Vec<ToolDefinition> {
     raw.as_array()
         .into_iter()
         .flatten()
@@ -71,7 +72,7 @@ fn tools(raw: &serde_json::Value) -> Vec<ToolDefinition> {
         .collect()
 }
 
-fn options(case: &serde_json::Value) -> RenderOptions {
+pub(super) fn options(case: &serde_json::Value) -> RenderOptions {
     let o = &case["options"];
     RenderOptions {
         add_generation_prompt: case["add_generation_prompt"].as_bool().unwrap_or(true),

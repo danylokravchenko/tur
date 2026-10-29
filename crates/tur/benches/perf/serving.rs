@@ -3,7 +3,7 @@
 //! inter-token latency and pass counts. Every pass ends at device completion, so a step's
 //! wall time includes its GPU work. Prints one JSON document.
 //!
-//! `TUR_QWEN35_0_8B=<snapshot> cargo bench --offline -p tur --bench perf -- serving > out.json`
+//! `TUR_BENCH_MODEL=<snapshot> cargo bench --offline -p tur --bench perf -- serving > out.json`
 //! narrows with `TUR_BENCH_CONCURRENCY=1,8` and `TUR_BENCH_OUTPUT=64`.
 //! `TUR_BENCH_SAMPLING=0.7,20,0.95` samples instead of greedy decoding,
 //! `TUR_BENCH_DEVICE_SAMPLING=0` samples on the host, and
@@ -18,6 +18,8 @@
 //! with ordinary decoding, including acceptance counters, memory and exact token IDs, on
 //! `TUR_BENCH_SPECULATION=repeat,novel,code` prompts. `TUR_BENCH_MTP_VOCAB` sets the
 //! head's leading draft token IDs (default 32768, 0 for the whole vocabulary).
+//! `TUR_BENCH_DRAFT_MODEL=<dir>` drafts from a separate drafter checkpoint (a Gemma 4
+//! assistant) instead of the checkpoint's own head.
 
 use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, time::Instant};
@@ -34,7 +36,7 @@ use tur_engine::{
     },
     hybrid::SamplingOptions,
 };
-use tur_models::models::qwen3_5::{
+use tur_models::models::{
     DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, DraftHead, WeightFormat, parse_recurrent_state,
 };
 
@@ -926,11 +928,19 @@ fn speculation_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
             config.device_sampling = device_sampling;
             config.speculation = if with_mtp {
                 SpeculationConfig {
-                    mtp: Some(DraftHead {
-                        vocab: env_sizes("TUR_BENCH_MTP_VOCAB", "32768")?
-                            .first()
-                            .copied()
-                            .filter(|&rows| rows > 0),
+                    // A separate drafter (a Gemma 4 assistant) selects its own candidates.
+                    mtp: Some(match std::env::var_os("TUR_BENCH_DRAFT_MODEL") {
+                        Some(dir) => DraftHead {
+                            vocab: None,
+                            model: Some(dir.into()),
+                        },
+                        None => DraftHead {
+                            vocab: env_sizes("TUR_BENCH_MTP_VOCAB", "32768")?
+                                .first()
+                                .copied()
+                                .filter(|&rows| rows > 0),
+                            model: None,
+                        },
                     }),
                     ..SpeculationConfig::with_mtp(draft)
                 }
@@ -977,9 +987,9 @@ fn speculation_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
 }
 
 pub(crate) fn run() -> Result<()> {
-    let dir = std::env::var("TUR_QWEN35_0_8B")
+    let dir = std::env::var("TUR_BENCH_MODEL")
         .map(PathBuf::from)
-        .map_err(|_| invalid("set TUR_QWEN35_0_8B to a Qwen3.5-0.8B snapshot"))?;
+        .map_err(|_| invalid("set TUR_BENCH_MODEL to a validated text checkpoint"))?;
     let concurrency = env_sizes("TUR_BENCH_CONCURRENCY", "1,2,4,8,16")?;
     let output = env_sizes("TUR_BENCH_OUTPUT", "64")?
         .first()

@@ -11,6 +11,7 @@
 //! `TUR_QWEN35_0_8B`; the reference itself is validated against Transformers.
 
 use crate::model_common as common;
+use tur_models::models::{Execution, LoadOptions, WeightFormat};
 
 use crate::model_common::{Checkpoint, forward, max_relative, prefill, rows};
 use candle_core::{DType, Device, Tensor};
@@ -24,7 +25,7 @@ use tur_engine::hybrid::{
     SequenceForward, StatePool,
 };
 use tur_metal::state::LayerSnapshot;
-use tur_models::models::qwen3_5::{Execution, LoadOptions, Qwen35, WeightFormat};
+use tur_models::models::qwen3_5::Qwen35;
 
 /// Kernel-supported head sizes, two attention layers and projection widths that are
 /// multiples of 256 so Q4K applies everywhere. No modality placeholder: engine tests feed
@@ -720,6 +721,7 @@ fn test_full_and_partial_prefix_forks_and_restores_continue_exactly() -> Result<
     )?);
     let config = PoolConfig {
         pages: 64,
+        window_pages: 64,
         recurrent_slots: 16,
     };
     let mut engine = HybridEngine::new(Arc::clone(&model), device, config)?;
@@ -803,6 +805,7 @@ fn test_memory_pressure_fails_new_work_without_corrupting_live_requests() -> Res
         device.clone(),
         PoolConfig {
             pages: 64,
+            window_pages: 64,
             recurrent_slots: 8,
         },
     )?;
@@ -816,6 +819,7 @@ fn test_memory_pressure_fails_new_work_without_corrupting_live_requests() -> Res
         device,
         PoolConfig {
             pages: 7,
+            window_pages: 7,
             recurrent_slots: 4,
         },
     )?;
@@ -961,6 +965,7 @@ fn generate(
     let device = model.device().clone();
     let config = PoolConfig {
         pages: 64,
+        window_pages: 64,
         recurrent_slots: 2 * batch,
     };
     let mut engine = HybridEngine::new(model, device, config)?;
@@ -1132,6 +1137,7 @@ fn test_grammar_masks_are_applied_on_the_device() -> Result<()> {
     )?);
     let config = PoolConfig {
         pages: 64,
+        window_pages: 64,
         recurrent_slots: 8,
     };
     let mut engine = HybridEngine::new(Arc::clone(&model), device, config)?;
@@ -1219,6 +1225,7 @@ fn test_cached_last_logits_sample_like_the_pass_that_produced_them() -> Result<(
     )?);
     let config = PoolConfig {
         pages: 64,
+        window_pages: 64,
         recurrent_slots: 8,
     };
     let mut engine = HybridEngine::new(Arc::clone(&model), device, config)?;

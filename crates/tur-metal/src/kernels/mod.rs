@@ -64,6 +64,24 @@ struct GluParams {
 }
 
 #[repr(C)]
+struct ResidualParams {
+    rows: u32,
+    width: u32,
+    x_stride: u32,
+    r_stride: u32,
+    emit: u32,
+    eps: f32,
+}
+
+#[repr(C)]
+struct GeluMulParams {
+    rows: u32,
+    width: u32,
+    a_stride: u32,
+    b_stride: u32,
+}
+
+#[repr(C)]
 struct GatedParams {
     rows: u32,
     dim: u32,
@@ -110,6 +128,8 @@ struct AttentionParams {
     gate_head_stride: u32,
     group: u32,
     scale: f32,
+    window: u32,
+    ungated: u32,
 }
 
 #[repr(C)]
@@ -123,6 +143,18 @@ struct TiledParams {
     gate_col: u32,
     gate_head_stride: u32,
     scale: f32,
+    window: u32,
+    ungated: u32,
+}
+
+/// Output and score semantics of one tiled dispatch: the gate's head layout (unread when
+/// `ungated`), the score scale and the sliding window (0 for none).
+#[derive(Clone, Copy)]
+struct TileShape {
+    gate: Heads,
+    ungated: bool,
+    scale: f32,
+    window: u32,
 }
 
 /// Query tokens per tile (8 rows per simdgroup), key block and staged dimensions of the
@@ -783,6 +815,94 @@ impl Kernels {
         self.finish(out, (gv.rows, width))
     }
 
+    /// Post-norm residual update `s = (x + rms(r) * r_weight) * scale[0]`, and with `next`
+    /// also `rms(s) * next`. `scale` holds one element. Returns `(s, normed)`.
+    pub fn residual_rms_norm(
+        &self,
+        x: &Tensor,
+        r: &Tensor,
+        r_weight: &Tensor,
+        scale: &Tensor,
+        next: Option<&Tensor>,
+        eps: f64,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let xv = self.view(x)?;
+        let rv = self.view(r)?;
+        let rw = self.view(r_weight)?;
+        let sv = self.view(scale)?;
+        // Without `next`, the residual weight binds the unused slot.
+        let wv = self.view(next.unwrap_or(r_weight))?;
+        rv.expect(xv.rows, xv.cols, "residual")?;
+        rw.expect(1, xv.cols, "residual norm weight")?;
+        sv.expect(1, 1, "residual scale")?;
+        wv.expect(1, xv.cols, "norm weight")?;
+        let params = ResidualParams {
+            rows: to_u32(xv.rows, "rows")?,
+            width: to_u32(xv.cols, "width")?,
+            x_stride: to_u32(xv.row_stride, "row stride")?,
+            r_stride: to_u32(rv.row_stride, "residual stride")?,
+            emit: u32::from(next.is_some()),
+            eps: eps as f32,
+        };
+        let pipeline = self.pipeline("residual_rms_norm_f32")?;
+        let sum = self.output(xv.rows, xv.cols)?;
+        let normed = next.map(|_| self.output(xv.rows, xv.cols)).transpose()?;
+        let threads = pipeline.threads(self.tuning.row_threads);
+        self.runtime
+            .dispatch(pipeline, "tur_residual_rms_norm", xv.rows, threads, |e| {
+                xv.bind(e, 0)?;
+                rv.bind(e, 1)?;
+                rw.bind(e, 2)?;
+                sv.bind(e, 3)?;
+                wv.bind(e, 4)?;
+                sum.bind(e, 5);
+                normed.as_ref().unwrap_or(&sum).bind(e, 6);
+                e.set_bytes(7, &params);
+                Ok(())
+            })?;
+        let shape = (xv.rows, xv.cols);
+        Ok((
+            self.finish(sum, shape)?,
+            normed.map(|n| self.finish(n, shape)).transpose()?,
+        ))
+    }
+
+    /// `gelu_tanh(a) * b` elementwise over `[rows, width]` operands, each read at its own
+    /// row stride (narrowed columns of a wider tensor are read in place).
+    pub fn gelu_mul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        let av = self.view(a)?;
+        let bv = self.view(b)?;
+        bv.expect(av.rows, av.cols, "gelu multiplier")?;
+        let params = GeluMulParams {
+            rows: to_u32(av.rows, "rows")?,
+            width: to_u32(av.cols, "width")?,
+            a_stride: to_u32(av.row_stride, "row stride")?,
+            b_stride: to_u32(bv.row_stride, "multiplier stride")?,
+        };
+        let count = av
+            .rows
+            .checked_mul(av.cols)
+            .ok_or_else(|| invalid("elements overflow"))?;
+        to_u32(count, "elements")?;
+        let pipeline = self.pipeline("gelu_mul_f32")?;
+        let out = self.output(av.rows, av.cols)?;
+        let threads = pipeline.threads(self.tuning.elementwise_threads);
+        self.runtime.dispatch(
+            pipeline,
+            "tur_gelu_mul",
+            count.div_ceil(threads),
+            threads,
+            |e| {
+                av.bind(e, 0)?;
+                bv.bind(e, 1)?;
+                out.bind(e, 2);
+                e.set_bytes(3, &params);
+                Ok(())
+            },
+        )?;
+        self.finish(out, (av.rows, av.cols))
+    }
+
     /// `rms(core) * weight * silu(z)` for contiguous `[tokens * heads, dim]` core rows; `z`
     /// head `h` of token `t` is read in place at column `z_col + h * dim` of `z` row `t`.
     /// Returns `[tokens, heads * dim]`.
@@ -1228,11 +1348,19 @@ impl Kernels {
 
     /// Whether a pass with `kv` addressing and `heads` query heads runs the tiled kernel.
     pub fn attention_tiled(&self, kv: &PagedKv, heads: usize, dim: usize) -> bool {
+        self.tiles_fill(kv, heads, dim, self.tuning.attention_tiled_groups)
+    }
+
+    /// [`Self::attention_tiled`] for ungated attention, at its own crossover.
+    pub fn attention_tiled_ungated(&self, kv: &PagedKv, heads: usize, dim: usize) -> bool {
+        self.tiles_fill(kv, heads, dim, self.tuning.attention_tiled_ungated_groups)
+    }
+
+    fn tiles_fill(&self, kv: &PagedKv, heads: usize, dim: usize, groups: usize) -> bool {
         kv.tiles().is_some_and(|tiles| {
-            tiles.saturating_mul(heads) >= self.tuning.attention_tiled_groups
+            tiles.saturating_mul(heads) >= groups
                 // Sparse query tiles waste matrix work and lose split-K parallelism.
-                && (self.tuning.attention_tiled_groups == 0
-                    || kv.tokens >= tiles.saturating_mul(TILE_QUERIES / 2))
+                && (groups == 0 || kv.tokens >= tiles.saturating_mul(TILE_QUERIES / 2))
                 && matches!(dim, 64 | 128 | 256)
                 && self.capabilities().max_threads_per_threadgroup >= TILE_THREADS
                 && Self::tiled_memory_bytes() <= self.capabilities().threadgroup_memory_bytes
@@ -1311,6 +1439,7 @@ impl Kernels {
             64 => 2,
             128 => 4,
             256 => 8,
+            512 => 16,
             _ => return Err(invalid(format!("no {prefix} kernel for head dim {dim}"))),
         };
         let suffix = match format {
@@ -1404,8 +1533,46 @@ impl Kernels {
         gate_source: &Tensor,
         gate: Heads,
     ) -> Result<Tensor> {
+        self.attend(q, pool, kv, Some((gate_source, gate)), None, None)
+    }
+
+    /// Causal paged attention with an optional sliding window, explicit score scale and
+    /// no output gate. Window bounds count tokens including the current position.
+    pub fn attention_ungated(
+        &self,
+        q: &Tensor,
+        pool: &AttentionPool,
+        kv: &PagedKv,
+        window: Option<usize>,
+        scale: f64,
+    ) -> Result<Tensor> {
+        if window == Some(0) || !scale.is_finite() || scale <= 0.0 {
+            return Err(invalid("invalid attention window or scale"));
+        }
+        self.attend(q, pool, kv, None, window, Some(scale))
+    }
+
+    fn attend(
+        &self,
+        q: &Tensor,
+        pool: &AttentionPool,
+        kv: &PagedKv,
+        output_gate: Option<(&Tensor, Heads)>,
+        window: Option<usize>,
+        scale: Option<f64>,
+    ) -> Result<Tensor> {
         let (tokens, heads, dim) = q.dims3()?;
         let kv_heads = pool.kv_heads;
+        let fallback = q.reshape((tokens, heads * dim))?;
+        let (gate_source, gate) = output_gate.unwrap_or((
+            &fallback,
+            Heads {
+                count: heads,
+                dim,
+                head_stride: dim,
+                col_offset: 0,
+            },
+        ));
         if kv_heads == 0
             || !heads.is_multiple_of(kv_heads)
             || pool.head_dim != dim
@@ -1432,13 +1599,26 @@ impl Kernels {
         if gv.rows != tokens || gate.col_offset + (heads - 1) * gate.head_stride + dim > gv.cols {
             return Err(invalid("attention gate exceeds its projection"));
         }
-        if self.attention_tiled(kv, heads, dim) {
+        let scale = scale.unwrap_or_else(|| (dim as f64).sqrt().recip()) as f32;
+        let window = to_u32(window.unwrap_or(0), "attention window")?;
+        let tiled = if output_gate.is_some() {
+            self.attention_tiled(kv, heads, dim)
+        } else {
+            self.attention_tiled_ungated(kv, heads, dim)
+        };
+        if tiled {
+            let shape = TileShape {
+                gate,
+                ungated: output_gate.is_none(),
+                scale,
+                window,
+            };
             return self.attention_tiles(
                 &qv,
                 pool,
                 kv,
                 &gv,
-                gate,
+                shape,
                 (k_data, k_scales),
                 (v_data, v_scales),
             );
@@ -1454,7 +1634,12 @@ impl Kernels {
         let first = self.runtime.view(&kv.first_block, DType::U32)?;
         let visible = self.runtime.view(&kv.visible, DType::U32)?;
         // Splits fill the GPU with simdgroups, each serving `hg` heads.
-        let split = self.attention_split(tokens, heads / hg, kv.max_visible);
+        // A query reads at most `window` keys, starting at its window's first key.
+        let span = match window {
+            0 => kv.max_visible,
+            w => kv.max_visible.min(w as usize),
+        };
+        let split = self.attention_split(tokens, heads / hg, span);
         let params = AttentionParams {
             tokens: to_u32(tokens, "tokens")?,
             heads: to_u32(heads, "heads")?,
@@ -1467,7 +1652,9 @@ impl Kernels {
             gate_col: to_u32(gate.col_offset, "gate column")?,
             gate_head_stride: to_u32(gate.head_stride, "gate head stride")?,
             group: to_u32(pool.format.group().unwrap_or(32), "group")?,
-            scale: (dim as f64).sqrt().recip() as f32,
+            scale,
+            window,
+            ungated: u32::from(output_gate.is_none()),
         };
         let items = tokens * heads;
         let out = self.output(items, dim)?;
@@ -1527,10 +1714,11 @@ impl Kernels {
         pool: &AttentionPool,
         kv: &PagedKv,
         gv: &View<'_>,
-        gate: Heads,
+        shape: TileShape,
         (k_data, k_scales): (View<'_>, Option<View<'_>>),
         (v_data, v_scales): (View<'_>, Option<View<'_>>),
     ) -> Result<Tensor> {
+        let gate = shape.gate;
         let (tiles, count) = kv
             .tiles
             .as_ref()
@@ -1545,7 +1733,9 @@ impl Kernels {
             gate_stride: to_u32(gv.row_stride, "gate stride")?,
             gate_col: to_u32(gate.col_offset, "gate column")?,
             gate_head_stride: to_u32(gate.head_stride, "gate head stride")?,
-            scale: (dim as f64).sqrt().recip() as f32,
+            scale: shape.scale,
+            window: shape.window,
+            ungated: u32::from(shape.ungated),
         };
         let pipeline = self.pipeline(&Self::kv_kernel("attention_tiled", dim, pool.format)?)?;
         if pipeline.threads(TILE_THREADS) != TILE_THREADS {

@@ -33,10 +33,9 @@ use tur_core::{
 use tur_engine::hybrid::{
     Boundaries, HybridModel, ModelState, PackedForward, PoolConfig, SequenceForward, StatePool,
 };
-use tur_models::models::qwen3_5::{
-    Execution, LoadOptions, Manifest, Qwen35, WeightFormat, Weights, is_artifact,
-    parse_recurrent_state,
-};
+use tur_models::models::qwen3_5::Qwen35;
+use tur_models::models::{Execution, LoadOptions, WeightFormat, Weights, parse_recurrent_state};
+use tur_models::models::{Manifest, is_artifact};
 
 const BUCKETS: [usize; 5] = [0, 1024, 2048, 4096, 8192];
 /// Contexts whose states seed generated continuations.
@@ -87,6 +86,7 @@ impl Runner {
             // Room for the snapshots and one continuation forked from each.
             PoolConfig {
                 pages: model.description().pages_for(tokens) + 1 + SNAPSHOTS.len() * 16,
+                window_pages: model.description().pages_for(tokens) + 1 + SNAPSHOTS.len() * 16,
                 recurrent_slots: 4 + 2 * SNAPSHOTS.len(),
             },
         )?;

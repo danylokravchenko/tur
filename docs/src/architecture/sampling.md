@@ -1,62 +1,30 @@
 # Sampling
 
-Sampling turns each sequence's logit row into a token. By default it runs on the GPU,
-immediately after the model pass and inside the same fenced batch, so only the chosen
-token and a status word return to the host.
+Sampling turns each request's logits into its next token. A model's vocabulary has hundreds of thousands of entries, and copying every request's row back to the CPU each step costs time that grows with the batch. Tur samples on the GPU instead, right after the model pass and inside the same batch, so only the chosen token and a status word come back.
 
 ## The algorithm
 
-One algorithm is implemented twice: once as the `penalize_f32`/`sample_f32` kernels and
-once as a host reference in `tur-metal`'s `sampling` module. A request therefore draws
-from the same distribution on either path.
+The same algorithm exists twice: as the `penalize_f32` and `sample_f32` kernels, and as a CPU reference in `tur-metal`'s `sampling` module. A request draws from the same distribution on either path.
 
-1. **Penalties.** The repetition penalty divides positive logits (and multiplies
-   negative ones) of every prompt or generated token. The presence penalty is subtracted
-   once per generated token, and the frequency penalty once per occurrence.
-2. **Weights.** `w = exp((logit − max) / temperature)`. A temperature of 0 is greedy
-   argmax.
-3. **Truncation.** Token `j` survives when fewer than `top_k` tokens have a strictly
-   larger weight, and their mass is below `top_p` of the total. That is top-k, then top-p
-   measured on the whole distribution, as Candle's sampler does.
-4. **Draw without sorting.** Each round inverts the CDF of the weights above a pivot,
-   with a uniform `u(seed, draw, round)`. An accepted token is returned. A rejected token
-   lies outside the truncated set, and so does every token no more probable than it, so
-   the pivot rises to its weight and the next round resamples from the strictly heavier
-   rest. This is exact rejection sampling from the renormalized truncated distribution.
-   The heaviest token is always accepted, so rounds terminate. After 64 rounds the
-   device reports the row unconverged and the host samples it explicitly.
+1. Penalties. The repetition penalty divides the positive logits (and multiplies the negative ones) of every token already in the prompt or output. The presence penalty is subtracted once per generated token, and the frequency penalty once per occurrence.
+2. Weights. `w = exp((logit - max) / temperature)`. A temperature of 0 means greedy argmax.
+3. Truncation. Token `j` survives if fewer than `top_k` tokens have a strictly larger weight and those tokens hold less than `top_p` of the total. That is top-k followed by top-p measured on the whole distribution, as Candle's sampler does it.
+4. Drawing without sorting. Sorting a large vocabulary on the GPU is expensive, so Tur uses rejection sampling instead. Each round inverts the cumulative distribution of the weights above a pivot with a uniform random number. If the token it lands on survives truncation, that's the answer. If not, every token no more likely than it is also outside the truncated set, so the pivot rises to its weight and the next round samples only from the heavier tokens. The result is exactly a sample from the renormalized truncated distribution. The heaviest token always survives, so the rounds end; after 64 rounds the GPU marks the row unfinished and the CPU samples it.
 
-Uniforms come from a counter-based generator keyed by the request's seed and its draw
-counter. A request's draws never depend on which other requests share its batch, or on
-their order.
+The random numbers come from a counter-based generator keyed by the request's seed and its draw count. A request's draws never depend on which other requests share its batch or in what order.
 
 ## Grammar-constrained requests
 
-A request with a `grammar` (an llguidance `TopLevelGrammar`) gets a token mask before
-every sample, and the grammar state commits after it. The mask is applied on the device,
-so constrained requests sample in the same pass as unconstrained ones. A request
-completes when its grammar terminates. Constrained requests never draft (see
-[Speculative decoding](speculation.md)).
+A request with a `grammar` (an llguidance `TopLevelGrammar`) gets a mask of allowed tokens before every sample, and its grammar state advances after it. The mask is applied on the GPU, so constrained requests sample in the same pass as unconstrained ones. A request ends when its grammar is complete. Constrained requests never draft (see [Speculative decoding](speculation.md)).
 
-## When the host samples
+## When the CPU samples
 
-Rows go to the host sampler when device sampling is disabled
-(`PipelineConfig::device_sampling = false`), when the model runs on the CPU reference,
-for speculative or multi-output grammar sequences, and for rows the device could not
-settle. All host rows are concatenated before the fence and copied once.
+The CPU sampler handles rows when device sampling is off (`PipelineConfig::device_sampling = false`), when the model runs on the CPU reference, for speculative requests and grammar requests with several output rows, and for rows the GPU couldn't settle. All such rows are gathered before the pass finishes and copied back once.
 
 ## Decisions
 
-- **Sample on the GPU.** With temperature 0.7, top-k 20 and top-p 0.95, inter-token
-  latency p50 at 8 and 16 concurrent requests fell 1.4× compared with copying rows to
-  the host (39.9 → 28.5 ms and 72.6 → 50.5 ms). Sampled serving runs within about 1 ms of
-  greedy serving.
-- **No sort.** Rejection sampling against a rising pivot keeps the kernel a few coalesced
-  passes over the row.
-- **Per-request RNG, independent of batch order.** Device sampling passes chi-square tests
-  against exact truncated distributions, and run-to-run determinism is tested on Metal.
-- **Device masks for grammars.** Constrained passes cost the same as unconstrained ones.
-- **Known differences.** The host and device paths sample the same distribution, but the
-  same uniform can pick different tokens, because the device inverts in a fixed
-  permutation of token order. Uniforms have 24 bits, so tokens below about 2⁻²⁴ of the
-  remaining mass are effectively never drawn.
+- Sampling runs on the GPU. With temperature 0.7, top-k 20 and top-p 0.95, the median gap between tokens at 8 and 16 concurrent requests fell 1.4× compared with copying rows to the CPU. Sampled serving now runs within about a millisecond per token of greedy serving.
+- There is no sort. Rejection sampling against a rising pivot keeps the kernel to a few passes over the row.
+- Each request has its own random stream, independent of batch order. Device sampling passes chi-square tests against the exact truncated distributions, and repeated runs on Metal produce the same tokens.
+- Grammar masks are applied on the GPU, so constrained passes cost the same as unconstrained ones.
+- The two paths sample the same distribution, but the same random number can pick different tokens, because the GPU walks tokens in a fixed permuted order. Random numbers have 24 bits, so a token with less than about 2⁻²⁴ of the remaining probability is effectively never drawn.

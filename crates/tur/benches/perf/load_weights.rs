@@ -11,7 +11,9 @@ use tur_core::{
     Result, TurError,
     execution::{KvFormat, KvLayout},
 };
-use tur_models::models::qwen3_5::{Execution, LoadOptions, Manifest, Qwen35, Weights};
+use tur_models::models::Manifest;
+use tur_models::models::TextModel;
+use tur_models::models::{Execution, LoadOptions, Weights};
 
 pub(crate) fn run(args: &[String]) -> Result<()> {
     let mut args = args.iter();
@@ -29,11 +31,11 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let weights = match variant.as_str() {
         "prepacked" => Weights::Prepacked(Arc::new(Manifest::read(&dir)?)),
         format => format
-            .parse::<tur_models::models::qwen3_5::WeightFormat>()
+            .parse::<tur_models::models::WeightFormat>()
             .map_err(TurError::Other)?
             .into(),
     };
-    let model = Qwen35::load(
+    let model = TextModel::load(
         &dir,
         &LoadOptions {
             revision: "load-measurement".into(),

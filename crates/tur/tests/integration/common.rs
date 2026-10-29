@@ -5,8 +5,9 @@ use tokenizers::{Tokenizer, models::wordlevel::WordLevel, pre_tokenizers::whites
 use tur::{
     ModelFactory, ModelSource, Result, TurError,
     core::execution::{KvFormat, KvLayout},
-    models::qwen3_5::{Config, WeightFormat},
+    models::qwen3_5::Config,
 };
+use tur_models::models::WeightFormat;
 
 const TINY: &str = r#"{
   "architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5_text",

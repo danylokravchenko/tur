@@ -2,7 +2,7 @@
 use std::{fmt::Display, io::ErrorKind, path::Path, str::FromStr};
 
 use serde::{Deserialize, Deserializer, de::Error as _};
-use tur::{Result, TurError, models::qwen3_5::parse_recurrent_state};
+use tur::{Result, TurError, models::parse_recurrent_state};
 
 use crate::{
     args::{ModelArgs, PipelineArgs},
