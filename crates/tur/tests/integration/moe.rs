@@ -218,3 +218,107 @@ fn test_verification_windows_bound_drift_from_sequential_decoding() -> Result<()
     }
     Ok(())
 }
+
+/// Expert banks behind a cache read the artifact's own blocks: under eviction, between and
+/// within passes, every logit is bit-identical to keeping all of them resident.
+#[cfg(feature = "metal")]
+#[test]
+fn test_expert_cache_over_artifacts_is_bit_identical_to_resident() -> Result<()> {
+    use tur_models::models::{
+        Conversion, Manifest, Packer, WeightPlan, Weights,
+        qwen3_5::{artifact_config, write_artifact},
+    };
+    let fixture = checkpoint(CONFIG, 0.03, 0.1)?;
+    let device = Device::new_metal(0)?;
+    let (ids, _, _) = golden()?;
+    let rows: Vec<usize> = (0..ids.len()).collect();
+    let raw: serde_json::Value = serde_json::from_str(CONFIG)?;
+    let number = |key: &str| -> Result<usize> {
+        raw[key]
+            .as_u64()
+            .map(|v| v as usize)
+            .ok_or_else(|| invalid(format!("fixture has no {key}")))
+    };
+    let (experts, inner, hidden) = (
+        number("num_experts")?,
+        number("moe_intermediate_size")?,
+        number("hidden_size")?,
+    );
+    for format in [WeightFormat::Q8_0, WeightFormat::Q4K] {
+        let output = fixture.0.with_extension(format!("{format:?}"));
+        write_artifact(
+            &Conversion {
+                source: &fixture.0,
+                identity: "moe-fixture-v1",
+                output: &output,
+                calibration: "",
+            },
+            &WeightPlan::uniform(&artifact_config(&fixture.0)?, format)?,
+            &Packer::RTN,
+        )?;
+        let result = (|| -> Result<()> {
+            let manifest = std::sync::Arc::new(Manifest::read(&output)?);
+            let options = |expert_cache: Option<usize>| LoadOptions {
+                revision: "moe-fixture-v1".into(),
+                weights: Weights::Prepacked(std::sync::Arc::clone(&manifest)),
+                device: device.clone(),
+                execution: Execution::Fused,
+                kv: KvLayout::new(16, KvFormat::F32),
+                recurrent: DType::F32,
+                mtp: None,
+                audio: false,
+                expert_cache,
+            };
+            let resident = Qwen35::load(&output, &options(None))?;
+            let expected = resident.trace(&ids, &rows)?.1.to_vec2::<f32>()?;
+            let bytes = |rows: usize, cols: usize| -> Result<usize> {
+                tur_models::models::Precision::from(format).bytes(rows, cols)
+            };
+            let expert = bytes(2 * inner, hidden)? + bytes(hidden, inner)?;
+            assert!(Qwen35::load(&output, &options(Some((experts - 1) * expert))).is_err());
+            for slots in [experts, experts + 3] {
+                let opts = options(Some(slots * expert));
+                let model = Qwen35::load(&output, &opts)?;
+                for pass in 0..2 {
+                    let actual = model.trace(&ids, &rows)?.1.to_vec2::<f32>()?;
+                    for (a, e) in actual.iter().flatten().zip(expected.iter().flatten()) {
+                        assert_eq!(a.to_bits(), e.to_bits(), "{format:?} {slots} {pass}");
+                    }
+                }
+                let stats = model
+                    .expert_stats()
+                    .ok_or_else(|| invalid("missing expert stats"))?;
+                assert!(
+                    stats.misses > 0 && stats.evictions > 0,
+                    "{format:?} {slots}"
+                );
+                let (_, planned, _) =
+                    Qwen35::memory_requirements(model.config(), &opts, 32, &[32])?;
+                assert_eq!(planned, model.weight_bytes(), "{format:?}");
+                assert!(model.weight_bytes() < resident.weight_bytes());
+            }
+            Ok(())
+        })();
+        drop(std::fs::remove_dir_all(&output));
+        result?;
+    }
+    // Banks converted at load time are not on disk in the form the kernels read.
+    assert!(
+        Qwen35::load(
+            &fixture.0,
+            &LoadOptions {
+                revision: "moe-fixture-v1".into(),
+                weights: WeightFormat::Q8_0.into(),
+                device,
+                execution: Execution::Fused,
+                kv: KvLayout::new(16, KvFormat::F32),
+                recurrent: DType::F32,
+                mtp: None,
+                audio: false,
+                expert_cache: Some(1 << 20),
+            },
+        )
+        .is_err()
+    );
+    Ok(())
+}

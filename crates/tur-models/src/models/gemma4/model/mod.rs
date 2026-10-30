@@ -338,6 +338,8 @@ impl Gemma4 {
             _ => (checkpoint(dir, &config)?, false),
         };
         let t = Tensors {
+            #[cfg(feature = "metal")]
+            expert_cache: None,
             checkpoint,
             prepacked,
             plan,
@@ -631,7 +633,7 @@ impl Gemma4 {
         contexts: &[usize],
     ) -> Result<(ModelDescription, usize, usize)> {
         if options.expert_cache.is_some() {
-            return Err(invalid("the expert cache reads MXFP4 banks (gpt-oss) only"));
+            return Err(invalid("Gemma 4 has no expert cache"));
         }
         let plan = format_plan(config, options)?;
         let audio = audio_precision(config, options);

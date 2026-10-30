@@ -2,7 +2,7 @@
 
 ## Models and hardware
 
-- Extend the expert cache: cover Qwen's Q4K banks, and measure concurrent requests, prefill mixes and cancellation.
+- Run a real Qwen MoE checkpoint through the expert cache, and make the check for spare memory continue after load, since concurrent serving can still swap.
 - Search pruned experts on KL directly. Ranking by routing mass damages the model too much to use.
 - Split gpt-oss's Harmony channels in `run` and `serve`, which currently print reasoning and answer together.
 - Run the larger models. Qwen3.8-27B and the Qwen3.6-35B MoE need Macs that fit them, and then measurements of quality, the K/V format choice (Q8 is the likely default under 16 GB), and the wide MoE tier, which trails Candle by 1.2 to 1.5× and needs real routing traces.

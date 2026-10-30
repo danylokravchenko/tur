@@ -150,7 +150,13 @@ impl Qwen35 {
                 Mlp::Dense(mlp) => {
                     k.linear(&mlp.down, &k.swiglu(&k.linear(&mlp.gate_up, &normed)?)?)?
                 }
-                Mlp::Moe(moe) => moe.fused(k, &normed)?,
+                Mlp::Moe(moe) => {
+                    let next = self.layers.get(index + 1).and_then(|l| match &l.mlp {
+                        Mlp::Moe(next) => Some(next.as_ref()),
+                        Mlp::Dense(_) => None,
+                    });
+                    moe.fused(k, &normed, next)?
+                }
             };
             // The residual add fuses with the next layer's input norm, or the final norm.
             let next = self

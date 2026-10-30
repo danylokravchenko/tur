@@ -137,7 +137,8 @@ pub struct LoadOptions {
     /// hold the text tower only and load without it.
     pub audio: bool,
     /// Device bytes of a bounded expert cache: routed experts stay on disk and are read on
-    /// demand into this many bytes of slots. `None` keeps every expert resident.
+    /// demand into this many bytes of slots. Serves gpt-oss checkpoints and Qwen `MoE`
+    /// artifacts. `None` keeps every expert resident.
     pub expert_cache: Option<usize>,
 }
 

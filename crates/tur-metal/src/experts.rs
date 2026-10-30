@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
-//! Bounded SSD-backed residency for MXFP4 expert banks.
+//! Bounded SSD-backed residency for expert banks stored as the kernels read them: MXFP4
+//! checkpoints as published, or GGML blocks from a prepacked artifact.
 //!
 //! Experts live in a fixed arena of slots; a routed expert absent from it is read from the
 //! checkpoint into a slot chosen by the policy in [`ExpertCache::route`]. Nothing is ever written
@@ -14,9 +15,9 @@
 use crate::{
     kernels::{ExpertRoutes, Kernels},
     packed::PackedLinear,
-    quantize::{MXFP4_BLOCK_BYTES, MXFP4_BLOCK_VALUES},
+    quantize::{MXFP4_BLOCK_BYTES, MXFP4_BLOCK_VALUES, packed_bytes},
 };
-use candle_core::{DType, Device, MetalDevice, Tensor};
+use candle_core::{DType, Device, MetalDevice, Tensor, quantized::GgmlDType};
 use candle_metal_kernels::metal::Buffer;
 use parking_lot::Mutex;
 use std::{
@@ -45,28 +46,44 @@ const NEGLIGIBLE_BYTES: usize = 256 << 20;
 /// Marks an expert that holds no slot.
 const ABSENT: u32 = u32::MAX;
 
-/// Rows of one expert and input columns of one bank; columns are whole MXFP4 blocks.
+/// How a bank is stored on disk and in its arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BankFormat {
+    /// 16-byte blocks of 32 values, with one scale byte per block stored apart.
+    Mxfp4,
+    /// GGML blocks, scales inside them.
+    Packed(GgmlDType),
+}
+
+/// Rows of one expert, input columns and storage of one bank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BankShape {
     pub rows: usize,
     pub cols: usize,
+    pub format: BankFormat,
 }
 
 impl BankShape {
-    fn blocks(self) -> Result<usize> {
+    fn mxfp4_blocks(self) -> Result<usize> {
         if self.rows == 0 || self.cols == 0 || !self.cols.is_multiple_of(MXFP4_BLOCK_VALUES) {
             return Err(invalid("expert banks need rows and whole MXFP4 blocks"));
         }
         checked_elements(&[self.rows, self.cols / MXFP4_BLOCK_VALUES])
     }
 
-    /// Scale bytes of one expert, which is also its block count.
+    /// Scale bytes one expert stores apart from its blocks.
     fn scale_bytes(self) -> Result<usize> {
-        self.blocks()
+        match self.format {
+            BankFormat::Mxfp4 => self.mxfp4_blocks(),
+            BankFormat::Packed(_) => Ok(0),
+        }
     }
 
     fn block_bytes(self) -> Result<usize> {
-        checked_elements(&[self.blocks()?, MXFP4_BLOCK_BYTES])
+        match self.format {
+            BankFormat::Mxfp4 => checked_elements(&[self.mxfp4_blocks()?, MXFP4_BLOCK_BYTES]),
+            BankFormat::Packed(format) => packed_bytes(format, self.rows, self.cols),
+        }
     }
 
     fn expert_bytes(self) -> Result<usize> {
@@ -76,7 +93,7 @@ impl BankShape {
     }
 }
 
-/// Where one layer's bank is stored: byte offsets of expert 0's blocks and scales.
+/// Where one layer's bank is stored: byte offsets of expert 0's blocks and, in MXFP4, scales.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BankSource {
     pub file: PathBuf,
@@ -124,7 +141,7 @@ pub struct ExpertStats {
 struct Staged {
     layer: usize,
     expert: usize,
-    /// `[gate_up blocks, gate_up scales, down blocks, down scales]`.
+    /// Each bank's blocks then, where stored apart, its scales.
     parts: Vec<Arc<Buffer>>,
 }
 
@@ -174,7 +191,14 @@ impl Arena {
         let buffer = metal.new_private_buffer(total, DType::U8, "tur_expert_arena")?;
         let rows = checked_elements(&[slots, shape.rows])?;
         Ok(Self {
-            weights: PackedLinear::mxfp4_arena(Arc::clone(&buffer), blocks, (rows, shape.cols))?,
+            weights: match shape.format {
+                BankFormat::Mxfp4 => {
+                    PackedLinear::mxfp4_arena(Arc::clone(&buffer), blocks, (rows, shape.cols))?
+                }
+                BankFormat::Packed(format) => {
+                    PackedLinear::packed_arena(Arc::clone(&buffer), format, (rows, shape.cols))?
+                }
+            },
             buffer,
             scales: blocks,
             shape,
@@ -292,16 +316,25 @@ impl ExpertCache {
     }
 
     /// Allocate the arena and open every source file.
-    pub fn new(sources: &ExpertSources, budget: usize, device: &Device) -> Result<Self> {
+    ///
+    /// `unloaded` is what the model's other weights will still take, since the spare-memory
+    /// check can only see what is already resident.
+    pub fn new(
+        sources: &ExpertSources,
+        budget: usize,
+        unloaded: usize,
+        device: &Device,
+    ) -> Result<Self> {
         let Device::Metal(metal) = device else {
             return Err(invalid("the expert cache runs on a Metal device"));
         };
         let (gate_up, down) = (sources.gate_up, sources.down);
         let slots = Self::planned_slots(budget, sources.experts, gate_up, down)?;
-        check_spare_memory(checked_elements(&[
-            slots,
-            Self::expert_bytes(gate_up, down)?,
-        ])?)?;
+        check_spare_memory(
+            checked_elements(&[slots, Self::expert_bytes(gate_up, down)?])?
+                .checked_add(unloaded)
+                .ok_or_else(|| invalid("expert cache size overflow"))?,
+        )?;
         if u32::try_from(slots).is_err() {
             return Err(invalid("too many expert slots"));
         }
@@ -358,6 +391,14 @@ impl ExpertCache {
     /// The down arena, addressed by the slots of routes from [`Self::route`].
     pub fn down(&self) -> &PackedLinear {
         &self.down.weights
+    }
+
+    /// Handles to the arenas for a layer to read: `[gate_up, down]`.
+    pub fn arena_handles(&self) -> Result<[PackedLinear; 2]> {
+        Ok([
+            self.gate_up.weights.arena_handle()?,
+            self.down.weights.arena_handle()?,
+        ])
     }
 
     /// Device bytes the arenas hold.
@@ -595,23 +636,25 @@ impl ExpertCache {
         parts: &[Arc<Buffer>],
         slot: usize,
     ) -> Result<()> {
-        let [gate_blocks, gate_scales, down_blocks, down_scales] = parts else {
-            return Err(invalid("staged expert has the wrong parts"));
+        let mut parts = parts.iter();
+        let mut next = || {
+            parts
+                .next()
+                .ok_or_else(|| invalid("staged expert lacks a part"))
         };
-        for (arena, blocks, scales) in [
-            (&self.gate_up, gate_blocks, gate_scales),
-            (&self.down, down_blocks, down_scales),
-        ] {
+        for arena in [&self.gate_up, &self.down] {
             let block_bytes = arena.shape.block_bytes()?;
             let scale_bytes = arena.shape.scale_bytes()?;
-            blit.copy_from_buffer(blocks, 0, &arena.buffer, slot * block_bytes, block_bytes);
-            blit.copy_from_buffer(
-                scales,
-                0,
-                &arena.buffer,
-                arena.scales + slot * scale_bytes,
-                scale_bytes,
-            );
+            blit.copy_from_buffer(next()?, 0, &arena.buffer, slot * block_bytes, block_bytes);
+            if scale_bytes > 0 {
+                blit.copy_from_buffer(
+                    next()?,
+                    0,
+                    &arena.buffer,
+                    arena.scales + slot * scale_bytes,
+                    scale_bytes,
+                );
+            }
         }
         Ok(())
     }
@@ -641,6 +684,11 @@ impl Source {
             .get(layer)
             .ok_or_else(|| invalid("expert cache has no such layer"))?;
         let mut parts = Vec::with_capacity(4 * experts.len());
+        let per_expert = self
+            .shapes
+            .iter()
+            .map(|shape| Ok(1 + usize::from(shape.scale_bytes()? > 0)))
+            .sum::<Result<usize>>()?;
         for (index, &expert) in experts.iter().enumerate() {
             for (shape, &(file, blocks, scales)) in self.shapes.iter().zip(banks) {
                 let block_bytes = shape.block_bytes()?;
@@ -651,12 +699,14 @@ impl Source {
                     part_offset(blocks, expert, block_bytes)?,
                     block_bytes,
                 ));
-                parts.push((
-                    index,
-                    file,
-                    part_offset(scales, expert, scale_bytes)?,
-                    scale_bytes,
-                ));
+                if scale_bytes > 0 {
+                    parts.push((
+                        index,
+                        file,
+                        part_offset(scales, expert, scale_bytes)?,
+                        scale_bytes,
+                    ));
+                }
             }
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -683,7 +733,7 @@ impl Source {
             .map(|&expert| {
                 let parts = slots
                     .by_ref()
-                    .take(4)
+                    .take(per_expert)
                     .map(|part| part.ok_or_else(|| invalid("expert part was not read")))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Staged {
@@ -783,12 +833,30 @@ mod tests {
 
     #[test]
     fn test_budgets_below_one_layer_of_experts_are_rejected() -> Result<()> {
-        let bank = BankShape { rows: 2, cols: 32 };
+        let bank = BankShape {
+            rows: 2,
+            cols: 32,
+            format: BankFormat::Mxfp4,
+        };
         let expert = ExpertCache::expert_bytes(bank, bank)?;
         assert_eq!(expert, 68);
         assert_eq!(ExpertCache::planned_slots(68 * 5 + 1, 4, bank, bank)?, 5);
         assert!(ExpertCache::planned_slots(68 * 3, 4, bank, bank).is_err());
-        assert!(BankShape { rows: 2, cols: 31 }.blocks().is_err());
+        assert!(
+            BankShape {
+                rows: 2,
+                cols: 31,
+                format: BankFormat::Mxfp4
+            }
+            .block_bytes()
+            .is_err()
+        );
+        let q4k = BankShape {
+            rows: 2,
+            cols: 256,
+            format: BankFormat::Packed(GgmlDType::Q4K),
+        };
+        assert_eq!((q4k.block_bytes()?, q4k.scale_bytes()?), (288, 0));
         Ok(())
     }
 }

@@ -269,17 +269,19 @@ impl Config {
         tur_metal::experts::BankShape,
         tur_metal::experts::BankShape,
     ) {
-        use tur_metal::experts::BankShape;
+        use tur_metal::experts::{BankFormat, BankShape};
         let t = &self.text;
         (
             t.num_local_experts,
             BankShape {
                 rows: 2 * t.intermediate_size,
                 cols: t.hidden_size,
+                format: BankFormat::Mxfp4,
             },
             BankShape {
                 rows: t.hidden_size,
                 cols: t.intermediate_size,
+                format: BankFormat::Mxfp4,
             },
         )
     }

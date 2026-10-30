@@ -304,6 +304,8 @@ impl Assistant {
             }
         }
         let t = Tensors {
+            #[cfg(feature = "metal")]
+            expert_cache: None,
             checkpoint,
             prepacked: false,
             plan,

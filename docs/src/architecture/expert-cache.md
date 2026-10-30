@@ -7,7 +7,7 @@ tur run --model openai/gpt-oss-20b --revision 6cee5e81ee83917806bbde320786a8fb61
   --expert-cache-mb 2048 --prompt 'Hello'
 ```
 
-The cache reads gpt-oss's MXFP4 banks only. Other models reject the flag.
+The cache also serves Qwen3.5-family MoE checkpoints, from a prepacked artifact: the banks have to be on disk exactly as the kernels read them, so write one with `tur quantize` first. Its banks can be Q8_0 or Q4K, with one format per projection across layers. Dense models and Gemma 4 reject the flag, and so do Qwen checkpoints converted at load time or loaded with a draft head.
 
 ## How it works
 
@@ -36,6 +36,20 @@ These are single-request numbers: concurrent requests touch more experts. Larger
 
 Long prompts behave differently. Each pass reads at most the whole expert set however many tokens it holds, so fewer, larger passes read far less. With a cache, prefill chunks and prefix snapshots default to every 1,024 tokens, and a 2,037-token prompt takes 18 s instead of 32 s at the usual 256. A repeat of that prompt with a different ending takes 10 s, because prefix reuse skips its first 1,024 tokens.
 
+## Serving several requests
+
+A cache shares its slots between requests, so more of them mean more misses per token. Total throughput still rises slightly while each request slows down. Through `tur serve` with a 1 GiB cache on gpt-oss-20b:
+
+| Concurrent requests | Total tokens/s | Each request, tokens/s | Median gap between tokens |
+| ---: | ---: | ---: | ---: |
+| 1 | 2.1 | 2.6 | 0.32 s |
+| 2 | 2.5 | 1.4 | 0.64 s |
+| 4 | 2.7 | 0.7 | 1.1 s |
+
+A long prompt can arrive while another request is streaming. In that case the stream kept going at 1.6 tokens/s, with a 1.1 s 95th-percentile gap, while the 2,000-token prompt reached its first token in 21 s.
+
+A cancelled request needs no special handling, because reads and copies finish inside the pass that started them and never outlive it. Disconnecting a client during decode, during prefill, or three at once left the server running, and the next request's answer was identical to one from an untouched server.
+
 ## Pruning experts
 
 `tur prune` writes a smaller checkpoint that keeps the same number of experts in every layer, copying their bytes unchanged and dropping the others' router rows. It keeps the experts that calibration text routes to most. That ranking is not good enough yet. Keeping 16 of 32 experts saves 4.7 GiB, but on held-out text the top token matches the full model only 78% of the time on code and documentation and 55% on prose, with KL divergences of 0.21 and 1.41 nats, and greedy generation falls into repetition. Treat it as an experiment.
@@ -49,6 +63,8 @@ Measured on gpt-oss-20b on an M1 with 16 GB:
 - A miss cost more in our own pipeline than expected: for 160 tokens, 33 s of reads at about 4 GB/s, 24 s of staging uploads and 7 s of copies. Uploading inside the read threads plus reading ahead cut 83 s to 55 s at 1 GiB, with the same hit rate and logits.
 - Eviction stays as it is. Replaying a real trace reproduced the live hit rates, and LFU and LRU-2 gained at most two points. Only foreknowledge does better (55% at 81 slots, 89% at 324), which is why reading ahead pays off.
 - The MXFP4 kernels stay on a lookup table. It is as fast as Q8_0 at the bank's shape, and an arithmetic decode is 1.3 to 2.1× slower. A GPU round trip costs about 0.2 ms, so the wait at each of 24 layers isn't worth removing.
+- A Qwen artifact through the cache gives bit-identical logits to keeping its banks resident, in Q8_0 and Q4K under eviction. This is checked on a small fixture; no real Qwen MoE checkpoint has run through the cache yet.
+- Serving four concurrent requests on a 5.9 GiB plan swapped out 251 MiB over a run of several minutes, where single requests swapped nothing. The spare-memory check sees the machine at load time only, so keep `--max-batch-size` small on a tight machine.
 - Below one token's experts (96 on gpt-oss-20b), eviction takes the expert needed furthest ahead, since passes visit layers in order. At or above it, eviction is LRU, which keeps what routing repeats.
 - The arena sits outside Candle's buffer pool, which rounds sizes up to a power of two.
 - Pruning by routing mass isn't recommended, for the reasons above. Published results for this kind of pruning (RCO) search on KL divergence directly, which Tur doesn't do.

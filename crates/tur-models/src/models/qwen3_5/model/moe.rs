@@ -14,6 +14,9 @@ pub(super) struct Moe {
     pub(super) gate_up: PackedLinear,
     pub(super) down: PackedLinear,
     settings: MoeConfig,
+    /// The cache `gate_up` and `down` are handles into, and this block's layer in it.
+    #[cfg(feature = "metal")]
+    cache: Option<(std::sync::Arc<tur_metal::experts::ExpertCache>, usize)>,
 }
 
 impl Moe {
@@ -21,13 +24,34 @@ impl Moe {
     /// full-precision bank.
     pub(super) fn load(
         tensors: &Tensors,
+        index: usize,
         prefix: &str,
         settings: MoeConfig,
         device: &Device,
     ) -> Result<Self> {
+        #[cfg(feature = "metal")]
+        let cache = tensors.expert_cache.clone().map(|cache| (cache, index));
+        #[cfg(not(feature = "metal"))]
+        let _ = index;
+        #[cfg(feature = "metal")]
+        let cached = cache
+            .as_ref()
+            .map(|(cache, _)| cache.arena_handles())
+            .transpose()?;
+        #[cfg(not(feature = "metal"))]
+        let cached: Option<[PackedLinear; 2]> = None;
+        let [gate_up, down] = match cached {
+            Some(handles) => handles,
+            None => [
+                tensors.projection(&format!("{prefix}.experts.gate_up_proj"))?,
+                tensors.projection(&format!("{prefix}.experts.down_proj"))?,
+            ],
+        };
         Ok(Self {
-            gate_up: tensors.projection(&format!("{prefix}.experts.gate_up_proj"))?,
-            down: tensors.projection(&format!("{prefix}.experts.down_proj"))?,
+            gate_up,
+            down,
+            #[cfg(feature = "metal")]
+            cache,
             router: f32_on(&tensors.take(&format!("{prefix}.gate.weight"))?, device)?,
             shared_gate: f32_on(
                 &tensors.take(&format!("{prefix}.shared_expert_gate.weight"))?,
@@ -39,6 +63,11 @@ impl Moe {
     }
 
     pub(super) fn projection_bytes(&self) -> usize {
+        // The model counts a cache's arenas once, however many layers read them.
+        #[cfg(feature = "metal")]
+        if self.cache.is_some() {
+            return self.shared.bytes();
+        }
         self.shared.bytes() + self.gate_up.resident_bytes() + self.down.resident_bytes()
     }
 
@@ -100,12 +129,26 @@ impl Moe {
 
     /// Device routing; gate/up reads each token through the routing permutation, and the
     /// weighted scatter adds the gated shared expert in the same pass.
+    /// `next` is the following layer's block, whose router predicts what to read ahead.
     #[cfg(feature = "metal")]
-    pub(super) fn fused(&self, k: &tur_metal::kernels::Kernels, h: &Tensor) -> Result<Tensor> {
+    pub(super) fn fused(
+        &self,
+        k: &tur_metal::kernels::Kernels,
+        h: &Tensor,
+        next: Option<&Self>,
+    ) -> Result<Tensor> {
         let routes = k.route(
             &h.matmul(&self.router.t()?)?,
             self.settings.num_experts_per_tok,
         )?;
+        let routes = match &self.cache {
+            Some((cache, index)) => {
+                // Encoded before the routes are read, so reading them waits for this too.
+                let predicted = next.map(|next| h.matmul(&next.router.t()?)).transpose()?;
+                cache.route(k, *index, routes, predicted.as_ref())?
+            }
+            None => routes,
+        };
         let act = k.swiglu(&k.expert_linear_routed(&self.gate_up, h, &routes)?)?;
         let routed = k.expert_linear(&self.down, &act, &routes)?;
         let shared = k.linear(

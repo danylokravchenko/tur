@@ -131,6 +131,7 @@ impl Layer {
         let mlp = match config.moe {
             Some(settings) => Mlp::Moe(Box::new(moe::Moe::load(
                 tensors,
+                i,
                 &format!("{p}.mlp"),
                 settings,
                 device,
@@ -267,6 +268,9 @@ pub struct Qwen35 {
     mtp: Option<MtpHead>,
     #[cfg(feature = "metal")]
     fused: Option<fused::Fused>,
+    /// Bounded expert storage the layers' banks read, when this load has one.
+    #[cfg(feature = "metal")]
+    cache: Option<Arc<tur_metal::experts::ExpertCache>>,
 }
 
 /// Native multi-token prediction head: `fc` joins the normalized embedding of the next
@@ -338,6 +342,146 @@ fn centred(tensor: &Tensor, device: &Device) -> Result<Tensor> {
     Ok((tensor.to_dtype(DType::F32)? + 1.0)?.to_device(device)?)
 }
 
+/// Experts per layer and the bank shapes of a checkpoint whose experts a cache can serve: a
+/// prepacked artifact on the Metal kernels, whose banks are on disk as the kernels read them.
+#[cfg(feature = "metal")]
+fn cache_banks(
+    config: &Config,
+    plan: &crate::models::WeightPlan,
+    options: &LoadOptions,
+) -> Result<(
+    usize,
+    tur_metal::experts::BankShape,
+    tur_metal::experts::BankShape,
+)> {
+    use tur_metal::experts::{BankFormat, BankShape};
+    let moe = config
+        .moe
+        .ok_or_else(|| invalid("the expert cache needs a checkpoint with experts"))?;
+    if !matches!(options.weights, Weights::Prepacked(_))
+        || options.execution != Execution::Fused
+        || !options.device.is_metal()
+        || options.mtp.is_some()
+    {
+        return Err(invalid(
+            "the Qwen expert cache reads a prepacked artifact on the Metal kernels, without \
+             a draft head",
+        ));
+    }
+    let banks: Vec<_> = config
+        .projections()?
+        .into_iter()
+        .filter(|p| p.experts > 1)
+        .collect();
+    let format = |suffix: &str| -> Result<(BankFormat, usize, usize)> {
+        let mut shape = None;
+        for bank in banks.iter().filter(|p| p.name.ends_with(suffix)) {
+            let ggml = plan
+                .precision(&bank.name)?
+                .ggml()
+                .ok_or_else(|| invalid("the expert cache needs packed expert banks"))?;
+            let found = (
+                BankFormat::Packed(ggml),
+                bank.rows / bank.experts,
+                bank.cols,
+            );
+            if *shape.get_or_insert(found) != found {
+                return Err(invalid(
+                    "the expert cache needs one bank format per projection",
+                ));
+            }
+        }
+        shape.ok_or_else(|| invalid("checkpoint has no expert banks"))
+    };
+    let bank = |(format, rows, cols)| BankShape { rows, cols, format };
+    Ok((
+        moe.num_experts,
+        bank(format("gate_up_proj")?),
+        bank(format("down_proj")?),
+    ))
+}
+
+/// `weights` with the expert banks replaced by a cache of `budget` bytes.
+fn cached_weights(
+    config: &Config,
+    plan: &crate::models::WeightPlan,
+    weights: usize,
+    budget: usize,
+    options: &LoadOptions,
+) -> Result<usize> {
+    #[cfg(feature = "metal")]
+    {
+        use tur_metal::experts::ExpertCache;
+        let (experts, gate_up, down) = cache_banks(config, plan, options)?;
+        let slots = ExpertCache::planned_slots(budget, experts, gate_up, down)?;
+        let arena = checked_elements(&[slots, ExpertCache::expert_bytes(gate_up, down)?])?;
+        let mut total = weights;
+        for bank in config.projections()?.iter().filter(|p| p.experts > 1) {
+            total = total
+                .checked_sub(plan.precision(&bank.name)?.bytes(bank.rows, bank.cols)?)
+                .ok_or_else(|| invalid("expert banks exceed the planned weights"))?;
+        }
+        total
+            .checked_add(arena)
+            .ok_or_else(|| invalid("weight total overflow"))
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (config, plan, weights, budget, options);
+        Err(invalid("the expert cache needs Metal"))
+    }
+}
+
+/// A cache over the expert banks of the open artifact behind `tensors`.
+#[cfg(feature = "metal")]
+fn open_cache(
+    tensors: &Tensors,
+    config: &Config,
+    budget: usize,
+    options: &LoadOptions,
+) -> Result<Arc<tur_metal::experts::ExpertCache>> {
+    use tur_metal::experts::{BankSource, ExpertCache, ExpertSources};
+    let (experts, gate_up, down) = cache_banks(config, &tensors.plan, options)?;
+    let moe = config
+        .moe
+        .ok_or_else(|| invalid("the expert cache needs a checkpoint with experts"))?;
+    let bank = |layer: usize, name: &str| -> Result<BankSource> {
+        let (file, blocks) = tensors.checkpoint.location(&format!(
+            "{}.layers.{layer}.mlp.experts.{name}",
+            config.text_prefix()
+        ))?;
+        Ok(BankSource {
+            file: file.to_path_buf(),
+            blocks,
+            scales: 0,
+        })
+    };
+    let sources = ExpertSources {
+        experts,
+        top_k: moe.num_experts_per_tok,
+        gate_up,
+        down,
+        layers: (0..config.layer_kinds().len())
+            .map(|i| Ok([bank(i, "gate_up_proj")?, bank(i, "down_proj")?]))
+            .collect::<Result<_>>()?,
+    };
+    // Weights besides the arena, which the budget bounds from above.
+    let unloaded = cached_weights(
+        config,
+        &tensors.plan,
+        tensors.plan.bytes(config)?,
+        budget,
+        options,
+    )?
+    .saturating_sub(budget);
+    Ok(Arc::new(ExpertCache::new(
+        &sources,
+        budget,
+        unloaded,
+        &options.device,
+    )?))
+}
+
 impl Tensors {
     fn open(dir: &Path, config: &Config, weights: &Weights, device: &Device) -> Result<Self> {
         let (checkpoint, plan, prepacked) = match weights {
@@ -362,6 +506,8 @@ impl Tensors {
             }
         };
         Ok(Self {
+            #[cfg(feature = "metal")]
+            expert_cache: None,
             checkpoint,
             prepacked,
             plan,
@@ -385,9 +531,6 @@ impl Qwen35 {
         tokens: usize,
         contexts: &[usize],
     ) -> Result<(ModelDescription, usize, usize)> {
-        if options.expert_cache.is_some() {
-            return Err(invalid("the expert cache reads MXFP4 banks (gpt-oss) only"));
-        }
         let with_mtp;
         let config = if options.mtp.is_some() && !config.mtp() {
             with_mtp = config.clone().with_mtp()?;
@@ -404,6 +547,9 @@ impl Qwen35 {
         let plan = options.weights.plan(config)?;
         plan.validate(config)?;
         let mut weights = plan.bytes(config)?;
+        if let Some(budget) = options.expert_cache {
+            weights = cached_weights(config, &plan, weights, budget, options)?;
+        }
         if let Some(rows) = draft_vocab(config, options)? {
             weights = plan
                 .precision("lm_head")?
@@ -461,7 +607,24 @@ impl Qwen35 {
             )?;
         }
         let device = &options.device;
-        let tensors = Tensors::open(dir, &config, &options.weights, device)?;
+        #[cfg_attr(
+            not(feature = "metal"),
+            allow(unused_mut, reason = "only Metal caches")
+        )]
+        let mut tensors = Tensors::open(dir, &config, &options.weights, device)?;
+        #[cfg(feature = "metal")]
+        let cache = options
+            .expert_cache
+            .map(|budget| open_cache(&tensors, &config, budget, options))
+            .transpose()?;
+        #[cfg(feature = "metal")]
+        {
+            tensors.expert_cache.clone_from(&cache);
+        }
+        #[cfg(not(feature = "metal"))]
+        if options.expert_cache.is_some() {
+            return Err(invalid("the expert cache needs Metal"));
+        }
         let dims = Dims::new(&config)?;
         let prefix = config.text_prefix().to_string();
         let mut layers = Vec::with_capacity(config.layer_kinds().len());
@@ -526,6 +689,8 @@ impl Qwen35 {
             mtp,
             #[cfg(feature = "metal")]
             fused: None,
+            #[cfg(feature = "metal")]
+            cache,
         }
         .with_execution(options.execution)
     }
@@ -596,9 +761,23 @@ impl Qwen35 {
         Ok(0)
     }
 
+    /// What the expert cache has done, when this load has one.
+    #[cfg(feature = "metal")]
+    pub fn expert_stats(&self) -> Option<tur_metal::experts::ExpertStats> {
+        self.cache.as_ref().map(|cache| cache.stats())
+    }
+
     /// Device bytes held by projection weights, all in their packed storage format.
     pub fn projection_bytes(&self) -> usize {
-        let mut total = self.lm_head.resident_bytes()
+        #[cfg(feature = "metal")]
+        let cache = self
+            .cache
+            .as_ref()
+            .map_or(0, |cache| cache.resident_bytes());
+        #[cfg(not(feature = "metal"))]
+        let cache = 0;
+        let mut total = cache
+            + self.lm_head.resident_bytes()
             + self.mtp.as_ref().map_or(0, |mtp| {
                 mtp.fc.resident_bytes() + mtp.head.as_ref().map_or(0, PackedLinear::resident_bytes)
             });

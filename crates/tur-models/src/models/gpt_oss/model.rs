@@ -411,6 +411,8 @@ impl GptOss {
         let placement = Placement::of(&plan, options)?;
         let device = &options.device;
         let tensors = Tensors {
+            #[cfg(feature = "metal")]
+            expert_cache: None,
             checkpoint: checkpoint(dir, &config)?,
             prepacked: false,
             plan,
@@ -431,6 +433,7 @@ impl GptOss {
                 tur_metal::experts::ExpertCache::new(
                     &config.expert_sources(&tensors.checkpoint)?,
                     cache,
+                    0,
                     device,
                 )
             })

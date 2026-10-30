@@ -3,6 +3,8 @@ use super::{Embedding, Packer, Precision, Projection, STAGING_BYTES, WeightPlan}
 use crate::models::checkpoint::Checkpoint;
 use candle_core::{DType, Device, Tensor};
 use std::collections::BTreeMap;
+#[cfg(feature = "metal")]
+use std::sync::Arc;
 use tur_core::{Result, execution::invalid};
 use tur_metal::packed::PackedLinear;
 
@@ -40,6 +42,9 @@ pub(crate) struct Tensors {
     pub(crate) plan: WeightPlan,
     pub(crate) projections: BTreeMap<String, Projection>,
     pub(crate) device: Device,
+    /// Bounded expert storage that expert banks read instead of being uploaded.
+    #[cfg(feature = "metal")]
+    pub(crate) expert_cache: Option<Arc<tur_metal::experts::ExpertCache>>,
 }
 
 impl Tensors {

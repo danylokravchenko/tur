@@ -27,6 +27,12 @@ enum Weights {
         buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
         scales: usize,
     },
+    /// GGML blocks in an arena the expert cache fills; the expert kernels read them in place.
+    #[cfg(feature = "metal")]
+    Arena {
+        buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
+        format: GgmlDType,
+    },
 }
 
 /// A `[out, in]` projection whose weights stay packed on the device; never expanded.
@@ -156,6 +162,48 @@ impl PackedLinear {
         })
     }
 
+    /// GGML-block weights over an arena the expert cache fills after this returns.
+    #[cfg(feature = "metal")]
+    pub(crate) fn packed_arena(
+        buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
+        format: GgmlDType,
+        (rows, cols): (usize, usize),
+    ) -> Result<Self> {
+        let resident_bytes = crate::quantize::packed_bytes(format, rows, cols)?;
+        if rows == 0 || buffer.length() < resident_bytes {
+            return Err(invalid("expert arena is smaller than its projection"));
+        }
+        Ok(Self {
+            weights: Weights::Arena { buffer, format },
+            out_features: rows,
+            in_features: cols,
+            resident_bytes,
+        })
+    }
+
+    /// Another handle to the same arena, for each layer that reads it. Other weights have
+    /// no shared storage to hand out.
+    #[cfg(feature = "metal")]
+    pub(crate) fn arena_handle(&self) -> Result<Self> {
+        let weights = match &self.weights {
+            Weights::Arena { buffer, format } => Weights::Arena {
+                buffer: std::sync::Arc::clone(buffer),
+                format: *format,
+            },
+            Weights::Mxfp4 { buffer, scales } => Weights::Mxfp4 {
+                buffer: std::sync::Arc::clone(buffer),
+                scales: *scales,
+            },
+            _ => return Err(invalid("only arena weights can be shared")),
+        };
+        Ok(Self {
+            weights,
+            out_features: self.out_features,
+            in_features: self.in_features,
+            resident_bytes: self.resident_bytes,
+        })
+    }
+
     /// Stack `[rows, in]` parts into one `[Σ rows, in]` projection, converting and
     /// quantizing one part at a time so the host never holds more than one full-precision
     /// part. GGML blocks never span rows, so the packed bytes equal quantizing the whole
@@ -241,6 +289,8 @@ impl PackedLinear {
     pub fn format(&self) -> Option<GgmlDType> {
         match &self.weights {
             Weights::Packed { format, .. } => Some(*format),
+            #[cfg(feature = "metal")]
+            Weights::Arena { format, .. } => Some(*format),
             _ => None,
         }
     }
@@ -251,7 +301,7 @@ impl PackedLinear {
             Weights::Dense(weight) => x.matmul(&weight.t()?)?,
             Weights::Packed { matmul, .. } => matmul.forward(x)?,
             #[cfg(feature = "metal")]
-            Weights::Mxfp4 { .. } => return Err(host_read()),
+            Weights::Mxfp4 { .. } | Weights::Arena { .. } => return Err(host_read()),
         })
     }
 
@@ -285,7 +335,7 @@ impl PackedLinear {
             }
             Weights::Packed { matmul, .. } => matmul.forward(x)?.narrow(1, start, rows)?,
             #[cfg(feature = "metal")]
-            Weights::Mxfp4 { .. } => return Err(host_read()),
+            Weights::Mxfp4 { .. } | Weights::Arena { .. } => return Err(host_read()),
         })
     }
 
@@ -345,6 +395,7 @@ impl PackedLinear {
                 format,
                 ..
             } => Some((buffer, *format)),
+            Weights::Arena { buffer, format } => Some((buffer.as_ref(), *format)),
             _ => None,
         }
     }

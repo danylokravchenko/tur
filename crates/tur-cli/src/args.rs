@@ -55,8 +55,8 @@ pub(crate) struct ModelArgs {
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     audio_encoder: Option<bool>,
     /// Keep routed experts on disk and read them on demand into this many MiB of device
-    /// memory, for gpt-oss checkpoints larger than the GPU's working set. Reads only: the
-    /// cache never writes to disk (default: every expert resident).
+    /// memory, for gpt-oss checkpoints or Qwen `MoE` artifacts larger than the GPU's working
+    /// set. Reads only: the cache never writes to disk (default: every expert resident).
     #[arg(long)]
     expert_cache_mb: Option<usize>,
     /// Use the CPU numerical reference for development checks.
