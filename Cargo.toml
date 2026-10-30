@@ -47,6 +47,7 @@ async-stream = "0.3.6"
 tikv-jemallocator = "0.6.1"
 
 safetensors = "0.8.0"
+flate2 = "1.1.9"
 tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1.3"
 candle-metal-kernels = "=0.11.0"

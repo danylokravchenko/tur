@@ -11,12 +11,13 @@ use crate::{
     TurError,
     audio::Audio,
     core::execution::invalid,
-    models::whisper::{Task, TranscribeOptions, Transcription},
+    models::whisper::{Fallback, Task, TranscribeOptions, Transcription},
     server::{
         AppState, media,
         routes::chat::execution_error,
         types::{
-            ApiErrorResponse, TranscriptionResponse, TranscriptionSegment, VerboseTranscription,
+            ApiErrorResponse, TranscriptionResponse, TranscriptionSegment, TranscriptionWord,
+            VerboseTranscription,
         },
     },
 };
@@ -56,6 +57,10 @@ struct Form {
     model: String,
     language: Option<String>,
     format: Format,
+    prompt: Option<String>,
+    temperature: f32,
+    words: bool,
+    condition_on_previous_text: bool,
 }
 
 fn bad_request(message: impl Into<String>) -> Response {
@@ -75,6 +80,7 @@ fn text(data: &[u8], name: &str) -> crate::Result<String> {
 fn parse(content_type: &str, body: &[u8]) -> crate::Result<Form> {
     let boundary = media::boundary(content_type)?;
     let (mut audio, mut model, mut language, mut format) = (None, String::new(), None, None);
+    let (mut prompt, mut temperature, mut words, mut condition) = (None, 0.0, false, false);
     for field in media::multipart(body, &boundary)? {
         match field.name.as_str() {
             "file" => {
@@ -95,31 +101,44 @@ fn parse(content_type: &str, body: &[u8]) -> crate::Result<Form> {
             "language" => language = Some(text(field.data, "language")?).filter(|l| !l.is_empty()),
             "response_format" => format = Some(text(field.data, "response_format")?),
             "temperature" => {
-                let value: f64 = text(field.data, "temperature")?
+                temperature = text(field.data, "temperature")?
                     .trim()
                     .parse()
                     .map_err(|_| invalid("temperature must be a number"))?;
-                if value != 0.0 {
-                    return Err(invalid("only greedy decoding (temperature 0) is supported"));
+                if !(0.0..=1.0).contains(&temperature) {
+                    return Err(invalid("temperature must be between 0 and 1"));
                 }
             }
-            "prompt" if field.data.is_empty() => {}
-            "prompt" => return Err(invalid("prompt is not supported")),
-            "timestamp_granularities[]" | "timestamp_granularities"
-                if text(field.data, &field.name)? != "segment" =>
-            {
-                return Err(invalid("only segment timestamps are supported"));
+            "prompt" => prompt = Some(text(field.data, "prompt")?).filter(|p| !p.is_empty()),
+            "condition_on_previous_text" => {
+                condition = text(field.data, "condition_on_previous_text")? == "true";
+            }
+            "timestamp_granularities[]" | "timestamp_granularities" => {
+                match text(field.data, &field.name)?.as_str() {
+                    "word" => words = true,
+                    "segment" => {}
+                    other => {
+                        return Err(invalid(format!("unknown timestamp granularity '{other}'")));
+                    }
+                }
             }
             // Unknown fields are ignored, as `OpenAI` adds optional ones over time.
             _ => {}
         }
     }
     let format = Format::parse(format.as_deref())?;
+    if words && format != Format::VerboseJson {
+        return Err(invalid("word timestamps need response_format verbose_json"));
+    }
     Ok(Form {
         audio: audio.ok_or_else(|| invalid("the form needs a file field"))?,
         model,
         language,
         format,
+        prompt,
+        temperature,
+        words,
+        condition_on_previous_text: condition,
     })
 }
 
@@ -140,6 +159,16 @@ fn respond(result: Transcription, format: Format, task: Task, duration: f64) -> 
             language: result.language,
             duration,
             text: result.text,
+            words: result
+                .segments
+                .iter()
+                .flat_map(|segment| &segment.words)
+                .map(|word| TranscriptionWord {
+                    word: word.word.clone(),
+                    start: word.start,
+                    end: word.end,
+                })
+                .collect(),
             segments: result
                 .segments
                 .into_iter()
@@ -196,6 +225,15 @@ async fn speech(state: AppState, headers: HeaderMap, body: Bytes, task: Task) ->
         language: form.language,
         task,
         timestamps: form.format.timed(),
+        word_timestamps: form.words,
+        prompt: form.prompt,
+        condition_on_previous_text: form.condition_on_previous_text,
+        // As `OpenAI`'s API reads it: 0 retries doubtful windows, anything else is fixed.
+        fallback: Some(if form.temperature > 0.0 {
+            Fallback::fixed(form.temperature)
+        } else {
+            Fallback::default()
+        }),
     };
     let duration = form.audio.duration().as_secs_f64();
     match worker.transcribe(form.audio, options).await {

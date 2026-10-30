@@ -99,11 +99,11 @@ fn assistant_dir(head: &crate::models::DraftHead) -> Result<&Path> {
 }
 
 /// Storage of the audio encoder's projections when this load includes it: requested,
-/// declared by the checkpoint, and converted from `SafeTensors` (prepacked artifacts
-/// carry the text tower only).
+/// declared by the checkpoint and, for a prepacked artifact, packed into it.
 fn audio_precision(config: &Config, options: &LoadOptions) -> Option<crate::models::Precision> {
     let text_f32 = match &options.weights {
-        Weights::Prepacked(_) => return None,
+        Weights::Prepacked(manifest) if !manifest.audio => return None,
+        Weights::Prepacked(manifest) => plan_is_f32(&manifest.plan),
         Weights::Uniform(format) => *format == crate::models::WeightFormat::F32,
         Weights::Plan(_) => false,
     };
@@ -206,11 +206,33 @@ impl artifact::ArtifactLayout for Config {
     fn embedding_tensor(&self) -> String {
         format!("{}.embed_tokens.weight", self.prefix)
     }
+    fn companions(
+        &self,
+        plan: &WeightPlan,
+    ) -> Result<std::collections::BTreeMap<String, artifact::Companion>> {
+        let Some(settings) = &self.audio else {
+            return Ok(std::collections::BTreeMap::new());
+        };
+        let precision = audio::precision(plan_is_f32(plan));
+        Ok(audio::stored_tensors(
+            settings,
+            self.hidden_size(),
+            precision,
+        ))
+    }
+}
+
+/// Whether every projection of `plan` stays F32, so the audio encoder does too.
+fn plan_is_f32(plan: &WeightPlan) -> bool {
+    plan.projections
+        .values()
+        .all(|&precision| precision == crate::models::Precision::F32)
 }
 
 /// Pack the Gemma 4 checkpoint at `conversion.source` by `plan` and write a prepacked
 /// artifact, one tensor at a time. Per-layer embedding tables and norms are copied as
-/// stored; unused sharing-layer K/V and multimodal tensors are left out. Rounding is
+/// stored, the audio encoder is packed beside the text tower, and unused sharing-layer K/V
+/// and vision tensors are left out. Rounding is
 /// round-to-nearest: calibrated packing is not implemented for Gemma 4.
 pub fn write_artifact(
     conversion: &Conversion<'_>,

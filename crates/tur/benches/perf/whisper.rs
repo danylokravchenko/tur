@@ -27,7 +27,7 @@ use tur_models::{
     models::{
         Execution, LoadOptions, WeightFormat,
         gemma4::Gemma4,
-        whisper::{TranscribeOptions, Transcriber},
+        whisper::{TranscribeOptions, Transcriber, Whisper},
     },
 };
 
@@ -237,6 +237,41 @@ fn gemma_contention(dir: &Path, wav: &Path) -> Result<()> {
     Ok(())
 }
 
+/// One decoder over a fixed token stream: building it, the host time to encode a step and
+/// the whole step with its logits read back, at short and long decoded lengths.
+fn decoding(device: &Device, model: &Whisper, features: &Tensor) -> Result<()> {
+    let encoded = model.encode(features)?;
+    device.synchronize()?;
+    let started = Instant::now();
+    let mut decoder = model.decoder(&encoded)?;
+    device.synchronize()?;
+    let setup = started.elapsed().as_secs_f64();
+    let last = |logits: &Tensor| -> Result<Vec<f32>> {
+        Ok(logits.get(logits.dim(0)? - 1)?.to_vec1::<f32>()?)
+    };
+    drop(last(&decoder.step(&[50258, 50259, 50360, 50364])?)?);
+    let (mut encoding, mut whole) = (Vec::new(), Vec::new());
+    for i in 0..300u32 {
+        let started = Instant::now();
+        let logits = decoder.step(&[440 + i])?;
+        encoding.push(started.elapsed().as_secs_f64());
+        drop(last(&logits)?);
+        whole.push(started.elapsed().as_secs_f64());
+    }
+    let median = |samples: &[f64]| {
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        sorted[sorted.len() / 2]
+    };
+    println!(
+        "{}",
+        json!({"op": "decoder", "setup_seconds": setup,
+               "step_at_30": median(&whole[..60]), "step_at_270": median(&whole[240..]),
+               "encode_at_30": median(&encoding[..60]), "encode_at_270": median(&encoding[240..])})
+    );
+    Ok(())
+}
+
 /// One window's features, encoder and decoder on the real checkpoint, then the whole clip.
 fn checkpoint(device: &Device, dir: &Path, wav: &Path) -> Result<()> {
     let clip = Audio::from_wav(&std::fs::read(wav)?)?;
@@ -248,6 +283,7 @@ fn checkpoint(device: &Device, dir: &Path, wav: &Path) -> Result<()> {
         let features = model.features(window)?;
         let features_seconds = started.elapsed().as_secs_f64();
         let encode = seconds(device, || model.encode(&features))?;
+        decoding(device, model, &features)?;
         let started = Instant::now();
         let result = transcriber.transcribe(&clip, &TranscribeOptions::default())?;
         println!(

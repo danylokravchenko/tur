@@ -4,7 +4,7 @@ use std::{io::Write, path::PathBuf};
 use tur::{
     Result, TurError,
     audio::Audio,
-    models::whisper::{Task, TranscribeOptions},
+    models::whisper::{Fallback, Task, TranscribeOptions},
 };
 
 use crate::args::WhisperArgs;
@@ -16,6 +16,8 @@ enum Format {
     Text,
     Srt,
     Vtt,
+    /// One `start<TAB>end<TAB>word` line per word.
+    Words,
 }
 
 #[derive(Debug, Default, clap::Args)]
@@ -33,6 +35,15 @@ pub(crate) struct Args {
     /// Output format; `srt` and `vtt` carry timestamps.
     #[arg(long, value_enum, default_value_t)]
     format: Format,
+    /// Text the decoder reads before every window, for names and style.
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Also read the text decoded so far; follows context better, repeats errors more easily.
+    #[arg(long)]
+    condition_on_previous_text: bool,
+    /// Sample at this fixed temperature; by default, doubtful windows retry at rising ones.
+    #[arg(long)]
+    temperature: Option<f32>,
     /// Use the CPU numerical reference for development checks.
     #[arg(long)]
     cpu_reference: bool,
@@ -63,6 +74,13 @@ pub(crate) fn transcribe(args: &Args) -> Result<()> {
                 Task::Transcribe
             },
             timestamps: !matches!(args.format, Format::Text),
+            word_timestamps: matches!(args.format, Format::Words),
+            prompt: args.prompt.clone(),
+            condition_on_previous_text: args.condition_on_previous_text,
+            fallback: Some(
+                args.temperature
+                    .map_or_else(Fallback::default, Fallback::fixed),
+            ),
         },
     )?;
     let mut stdout = std::io::stdout().lock();
@@ -70,6 +88,17 @@ pub(crate) fn transcribe(args: &Args) -> Result<()> {
         Format::Text => writeln!(stdout, "{}", result.text)?,
         Format::Srt => write!(stdout, "{}", result.srt())?,
         Format::Vtt => write!(stdout, "{}", result.vtt())?,
+        Format::Words => {
+            for word in result.segments.iter().flat_map(|segment| &segment.words) {
+                writeln!(
+                    stdout,
+                    "{:.2}\t{:.2}\t{}",
+                    word.start,
+                    word.end,
+                    word.word.trim()
+                )?;
+            }
+        }
     }
     let elapsed = started.elapsed();
     tracing::info!(

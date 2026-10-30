@@ -237,6 +237,17 @@ pub struct VerboseTranscription {
     pub duration: f64,
     pub text: String,
     pub segments: Vec<TranscriptionSegment>,
+    /// Empty unless `timestamp_granularities[]=word` was requested.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<TranscriptionWord>,
+}
+
+/// One timed word of a [`VerboseTranscription`].
+#[derive(Debug, Serialize)]
+pub struct TranscriptionWord {
+    pub word: String,
+    pub start: f64,
+    pub end: f64,
 }
 
 /// One timed stretch of a [`VerboseTranscription`].

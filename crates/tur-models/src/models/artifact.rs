@@ -20,8 +20,10 @@ pub const ARTIFACT_FILE: &str = "tur-weights.safetensors";
 /// Layout version of [`ARTIFACT_FILE`]; readers reject any other.
 pub(crate) const FORMAT_VERSION: u32 = 1;
 /// Serving files copied from the source checkpoint when present.
-const COPIED: [&str; 6] = [
+const COPIED: [&str; 8] = [
     "config.json",
+    "processor_config.json",
+    "preprocessor_config.json",
     "generation_config.json",
     "tokenizer.json",
     "tokenizer_config.json",
@@ -38,6 +40,28 @@ pub(crate) trait ArtifactLayout: WeightLayout {
     fn unloaded(&self, _name: &str) -> bool {
         false
     }
+    /// Tensors of an optional part stored beside the rest, each with the precision of a
+    /// packed matrix or `None` to copy it as it is. An artifact holds all of them or none.
+    fn companions(&self, _plan: &WeightPlan) -> Result<BTreeMap<String, Companion>> {
+        Ok(BTreeMap::new())
+    }
+}
+
+/// One tensor of an artifact's optional part.
+#[derive(Clone, Debug)]
+pub(crate) struct Companion {
+    pub(crate) shape: Vec<usize>,
+    /// Stored packed in this precision; `None` copies the checkpoint's tensor.
+    pub(crate) packed: Option<Precision>,
+}
+
+impl Companion {
+    fn stored(&self) -> Result<Stored> {
+        match (self.packed, self.shape.as_slice()) {
+            (Some(precision), &[rows, cols]) => Stored::matrix(precision, rows, cols),
+            _ => Ok(Stored::Float(self.shape.clone())),
+        }
+    }
 }
 
 /// Identity and contents of a prepacked artifact, stored in its header.
@@ -51,6 +75,9 @@ pub struct Manifest {
     pub quantizer: Quantizer,
     pub calibration: Option<CalibrationInfo>,
     pub plan: WeightPlan,
+    /// Whether the artifact holds its model's optional audio encoder.
+    #[serde(default)]
+    pub audio: bool,
 }
 
 /// The conversion that produced an artifact.
@@ -175,7 +202,12 @@ impl Stored {
 pub(crate) fn open_for(dir: &Path, config: &impl ArtifactLayout) -> Result<(Checkpoint, Manifest)> {
     let (checkpoint, manifest) = open(dir)?;
     manifest.plan.validate(config)?;
-    let expected = expected(config, &manifest.plan)?;
+    let mut expected = expected(config, &manifest.plan)?;
+    if manifest.audio {
+        for (name, companion) in config.companions(&manifest.plan)? {
+            expected.insert(name, companion.stored()?);
+        }
+    }
     for (name, entry) in checkpoint.entries() {
         let Some(stored) = expected.get(name) else {
             if config.unloaded(name) {
@@ -440,6 +472,16 @@ pub(crate) fn finish(
             writer.put(&name, entry.dtype, entry.shape, &bytes)?;
         }
     }
+    let companions = config.companions(plan)?;
+    for (name, companion) in &companions {
+        if let (Some(precision), &[rows, cols]) = (companion.packed, companion.shape.as_slice()) {
+            let projection = Projection::new(name.clone(), vec![(name.clone(), rows)], cols);
+            Packer::RTN.write(checkpoint, &projection, precision, &mut writer)?;
+        } else {
+            let (entry, bytes) = checkpoint.take_raw(name)?;
+            writer.put(name, entry.dtype, entry.shape, &bytes)?;
+        }
+    }
     let manifest = Manifest {
         format_version: FORMAT_VERSION,
         source: conversion.identity.to_owned(),
@@ -457,6 +499,7 @@ pub(crate) fn finish(
             description: conversion.calibration.to_owned(),
         }),
         plan: plan.clone(),
+        audio: !companions.is_empty(),
     };
     writer.finish(&manifest, config)?;
     Ok(manifest)

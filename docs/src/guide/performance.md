@@ -197,6 +197,38 @@ With one sequence, the assistant now chains several drafts per pass, which measu
 
 The artifact reads embeddings from its packed output layer, which saves the 805 MB embedding table. Of either total, 4.4 GiB is Gemma's per-layer embedding table.
 
+## Whisper large-v3-turbo
+
+`openai/whisper-large-v3-turbo` at revision `41f01f3fe87f28c78e2fbf8b568835947dd65ed9`, on clips spoken by macOS `say`, measured with `just bench whisper`. Language is detected from the first window unless a row says otherwise, and every time excludes loading the checkpoint.
+
+The encoder always reads a full 30-second window, so a short clip costs almost as much as a long window: most of a transcription's time is one encoder pass per window. A window with no audible frame skips that pass, so silence costs almost nothing.
+
+| Case | Q8_0 | F32 |
+| --- | --- | --- |
+| Log-mel features, one window | 0.12 s | 0.12 s |
+| Encoder, one window | 2.01 s | 2.17 s |
+| Decoder step at 30 tokens | 4.6 ms, about 215 tokens/s | 14.7 ms |
+| Decoder step at 270 tokens | 5.5 to 6.1 ms | 14.2 to 14.8 ms |
+| Transcribing a 2.66 s clip | 2.31 s | 2.59 s |
+| Transcribing an 80 s clip (3 windows, 287 tokens) | 8.5 s, 9.4× real time | 11.9 s, 6.7× real time |
+| Transcribing a 45 s silent clip | 0.12 s | not measured |
+| Loading the checkpoint | about 2.9 s | not measured |
+| Weight memory | about 0.85 GB | 3.2 GB |
+
+One encoder layer spends about 13 ms on attention and about 40 ms on projections, which run on Candle's GEMM at 1.2 to 1.6 TFLOP/s. A decoder step is mostly the output head and cross-attention, both limited by how fast the GPU can read memory, so Tur reads fewer bytes there: a Q4K head and F16 cross-attention keys and values. Word timestamps added about 1.7 s to the 80 s clip through the CLI.
+
+## Gemma 4 audio
+
+E2B with Q8_0 weights encoding clips on their own queue, while a 400-token greedy request decodes (`just bench whisper` with `TUR_GEMMA4_E2B`):
+
+| Case | Result |
+| --- | --- |
+| Encoding a 5 s clip, alone | 0.21 s |
+| Encoding a 30 s clip, alone | 1.45 s |
+| Encoding a 30 s clip beside a decoding request | 2.70 s |
+| Text pass, alone: median, slowest | 47 ms, 109 ms |
+| Text pass beside that clip: median, slowest | 48 ms, 165 ms |
+
 ## Compared with llama.cpp
 
 llama.cpp 0.7.0 (build 11669, Homebrew) on the same Mac, with unsloth's Qwen3.5-0.8B GGUF files (revision `6ab461498e2023f6e3c1baea90a8f0fe38ab64d0`) and its defaults: Metal and F16 K/V. Its figures are the best of three runs. Q8_0 is the like-for-like format. GGUF's Q4_K_M mixes Q4_K and Q6_K blocks (497 MiB), while Tur's Q4K uses Q4_K for every projection.

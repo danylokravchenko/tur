@@ -22,6 +22,13 @@ pub struct Config {
     #[serde(default)]
     pub scale_embedding: bool,
     pub decoder_start_token_id: u32,
+    /// Width of the filter smoothing cross-attention for word timings.
+    #[serde(default = "default_median_filter_width")]
+    pub median_filter_width: usize,
+}
+
+fn default_median_filter_width() -> usize {
+    7
 }
 
 impl Config {
@@ -50,6 +57,7 @@ impl Config {
             || config.max_source_positions * 2 != WHISPER_FRAMES
             || config.max_target_positions < 8
             || config.decoder_start_token_id as usize >= config.vocab_size
+            || config.median_filter_width.is_multiple_of(2)
         {
             return Err(invalid("unsupported Whisper configuration"));
         }
@@ -147,6 +155,12 @@ pub struct Generation {
     /// Latest timestamp step a window may open with.
     #[serde(default)]
     pub max_initial_timestamp_index: Option<u32>,
+    /// `<|startofprev|>`, which opens the text a decoder is conditioned on.
+    #[serde(default)]
+    pub prev_sot_token_id: Option<u32>,
+    /// `[decoder layer, head]` pairs whose cross-attention tracks the audio.
+    #[serde(default)]
+    pub alignment_heads: Vec<[usize; 2]>,
 }
 
 impl Generation {
@@ -164,11 +178,15 @@ impl Generation {
             .chain(&generation.suppress_tokens)
             .chain(&generation.begin_suppress_tokens)
             .chain(generation.eos_token_id.iter())
-            .chain(generation.no_timestamps_token_id.iter());
+            .chain(generation.no_timestamps_token_id.iter())
+            .chain(generation.prev_sot_token_id.iter());
         if generation.eos_token_id.is_none()
             || generation.no_timestamps_token_id.is_none()
             || !generation.task_to_id.contains_key("transcribe")
             || ids.into_iter().any(|&id| id as usize >= vocab)
+            || generation.alignment_heads.iter().any(|&[layer, head]| {
+                layer >= config.decoder_layers || head >= config.decoder_attention_heads
+            })
         {
             return Err(invalid("incomplete Whisper generation config"));
         }

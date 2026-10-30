@@ -99,7 +99,10 @@ Sampling settings you leave out come from the checkpoint's `generation_config.js
 | `--whisper-weight-format f32\|q8_0\|q4k` | `q8_0` | Storage for Whisper's projections |
 | `--language <code>` | detected | `transcribe` only: spoken language, such as `en` |
 | `--translate` | off | `transcribe` only: write English text instead of a transcript |
-| `--format text\|srt\|vtt` | `text` | `transcribe` only: plain text or timed subtitles |
+| `--format text\|srt\|vtt\|words` | `text` | `transcribe` only: plain text, timed subtitles, or one `start`, `end`, `word` line per word |
+| `--prompt <text>` | none | `transcribe` only: text the decoder reads before every window |
+| `--condition-on-previous-text` | off | `transcribe` only: also read the text decoded so far |
+| `--temperature <t>` | retries | `transcribe` only: sample at this temperature instead of retrying doubtful windows |
 
 ```sh
 tur transcribe --whisper openai/whisper-large-v3-turbo \

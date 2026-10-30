@@ -9,9 +9,9 @@
 
 ## Audio
 
-- Gemma 4 audio from prepacked artifacts, which store the text tower only, and an E4B checkpoint run.
+- An E4B checkpoint run.
 - A faster Whisper encoder. Attention now runs on Tur's tiled kernel, and the projections take most of the remaining 2 s per window on the M1. They run on Candle's GEMM at about 1.5 TFLOP/s, which a matrix-unit kernel did not beat (see [Rejected experiments](rejected.md)), so the next step is hardware with faster matrix units.
-- Word-level timestamps, and `prompt` with previous-text conditioning. Whisper's temperature fallback is also missing, so a window that loops on repeated text decodes until the length limit.
+- Finer silence handling in Whisper. The energy gate works on whole windows, so a segment after a long silence starts at its window's opening, and text can still be invented in a quiet stretch inside a window with speech. Voice activity detection would address both.
 
 ## Performance
 

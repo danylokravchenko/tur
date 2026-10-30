@@ -19,6 +19,8 @@ git show 99b073e:<path> > change.patch
 | Prefetching tiled-attention chunks two steps ahead | Slower than one step at 8K, because of the extra registers | none |
 | Overlapping the next pass, submission depth 2, command reuse | Not built: encoding already overlaps the GPU and the GPU idles only tens of microseconds per pass, so the gain is at most 0.3% | none |
 | Matrix-unit GEMM for Whisper's projections | At Whisper's shapes (1500 rows, 1280 and 5120 wide), Q8_0 tiles reached 0.4 to 1.0 TFLOP/s and F32 tiles 0.2 to 0.8, against Candle's 1.2 to 1.6, across five tile shapes and two to eight simdgroups | none |
+| Fused `layer_norm` kernel for Whisper | Slowed the encoder by about 9% at 1500 rows (2.02 s to 2.20 s per window), and showed no gain beyond noise on the decoder's single row | none |
+| Q8 cross-attention keys and values in Whisper's decoder | Beside a Q4K head, an 80 s clip took 8.99 and 8.50 s against 8.98 and 8.57 s without them, within noise, for more code than F16 | none |
 | Metal TensorOps for projections | Available on the M1 without unsafe bindings, but F32 GEMM ran at only 0.86 to 1.08× Candle | none |
 | Q4K GEMV unpacking each block before the batch loop | 1.6 to 1.8× slower, because the unpacked values cut occupancy | none |
 | Dense Q4K GEMV in ggml's layout | About 1.2× Candle's one-row GEMV on small 0.8B matrices that stay in cache, but tied on the output layer and lost on 27B shapes. In real single-sequence decode, which streams weights from memory, it made no difference beyond noise, and it was 2.5 to 3× slower at 2 to 6 rows | none |

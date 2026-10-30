@@ -113,6 +113,65 @@ fn test_gemma4_audio_metal_matches_transformers() -> Result<()> {
 }
 
 #[test]
+fn test_gemma4_artifacts_carry_the_audio_encoder_packed() -> Result<()> {
+    use std::sync::Arc;
+    use tur_models::models::{Conversion, Packer, WeightPlan, Weights, gemma4::write_artifact};
+    let source = fixture("gemma4");
+    let config = tur_models::models::gemma4::Config::from_json(&std::fs::read_to_string(
+        source.join("config.json"),
+    )?)?;
+    let device = Device::Cpu;
+    let clip = tone()?;
+    for format in [WeightFormat::F32, WeightFormat::Q8_0] {
+        let output = crate::common::Checkpoint(
+            std::env::temp_dir().join(format!("tur-gemma4-audio-{}", uuid::Uuid::new_v4())),
+        );
+        let manifest = write_artifact(
+            &Conversion {
+                source: &source,
+                identity: "gemma4-audio-fixture@0",
+                output: &output.0,
+                calibration: "",
+            },
+            &WeightPlan::uniform(&config, format)?,
+            &Packer::RTN,
+        )?;
+        assert!(manifest.audio);
+        let options = |audio| LoadOptions {
+            revision: "gemma4-audio-artifact".into(),
+            weights: format.into(),
+            device: device.clone(),
+            execution: Execution::Reference,
+            kv: KvLayout::new(4, KvFormat::F32),
+            recurrent: DType::F32,
+            mtp: None,
+            audio,
+        };
+        let converted = Gemma4::load(&source, &options(true))?;
+        let prepacked = |audio| LoadOptions {
+            weights: Weights::Prepacked(Arc::new(manifest.clone())),
+            ..options(audio)
+        };
+        let stored = Gemma4::load(&output.0, &prepacked(true))?;
+        assert_eq!(
+            rows(&stored.encode_audio(&clip)?)?,
+            rows(&converted.encode_audio(&clip)?)?,
+            "{format:?}"
+        );
+        assert_eq!(stored.weight_bytes(), converted.weight_bytes());
+        assert_eq!(
+            stored.weight_bytes(),
+            Gemma4::memory_requirements(&config, &prepacked(true), 1, &[1])?.1
+        );
+        // The encoder is optional at load, and its tensors do not get in the way.
+        let text = Gemma4::load(&output.0, &prepacked(false))?;
+        assert!(text.audio_prompt().is_none());
+        assert!(text.encode_audio(&clip).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn test_gemma4_audio_is_optional_and_bounded() -> Result<()> {
     let text = gemma(&Device::Cpu, Execution::Reference, false)?;
     assert!(text.audio_prompt().is_none());
@@ -449,6 +508,60 @@ fn test_whisper_metal_matches_transformers() -> Result<()> {
     whisper_conformance(&Device::new_metal(0)?, WeightFormat::F32, 1e-4)
 }
 
+/// Candle on the CPU is the reference for the kernels the fixture's head width can't reach:
+/// the encoder's norm and attention, and the decoder's pools, through a cached decode.
+#[test]
+#[cfg(feature = "metal")]
+fn test_whisper_fused_execution_matches_the_candle_reference() -> Result<()> {
+    use tur_models::models::whisper::{Config, Whisper};
+    let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        fixture("whisper").join("config.json"),
+    )?)?;
+    let mut raw = raw;
+    raw["d_model"] = 128.into();
+    raw["encoder_attention_heads"] = 2.into();
+    raw["decoder_attention_heads"] = 2.into();
+    raw["encoder_ffn_dim"] = 64.into();
+    raw["decoder_ffn_dim"] = 64.into();
+    let json = raw.to_string();
+    let config = Config::from_json(&json)?;
+    let dir = crate::common::Checkpoint(
+        std::env::temp_dir().join(format!("tur-whisper-fused-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir_all(&dir.0)?;
+    std::fs::write(dir.0.join("config.json"), &json)?;
+    let mut weights = HashMap::new();
+    for (index, (name, shape)) in config.weight_shapes().into_iter().enumerate() {
+        let count: usize = shape.iter().product();
+        let fan = shape.last().copied().unwrap_or(1) as f32;
+        let values: Vec<f32> = (0..count)
+            .map(|i| {
+                let unit = ((i as f32).mul_add(0.37, index as f32 * 1.7)).sin();
+                if name.contains("norm") {
+                    0.05f32.mul_add(unit, 1.0)
+                } else {
+                    unit / fan.sqrt()
+                }
+            })
+            .collect();
+        weights.insert(name, Tensor::from_vec(values, shape, &Device::Cpu)?);
+    }
+    candle_core::safetensors::save(&weights, dir.0.join("model.safetensors"))?;
+    let run = |device: &Device| -> Result<Vec<Vec<f32>>> {
+        let model = Whisper::load(&dir.0, WeightFormat::F32, device)?;
+        let encoded = model.encode(&model.features(tone()?.samples())?)?;
+        let mut decoder = model.decoder(&encoded)?;
+        let mut rows_out = rows(&encoded.narrow(0, 0, 8)?)?;
+        for tokens in [&[3u32, 5, 7][..], &[9], &[11, 13], &[15]] {
+            rows_out.extend(rows(&decoder.step(tokens)?)?);
+        }
+        Ok(rows_out)
+    };
+    let error = max_relative(&run(&Device::new_metal(0)?)?, &run(&Device::Cpu)?);
+    assert!(error < 1e-3, "{error}");
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires the pinned Whisper large-v3-turbo checkpoint, a speech WAV and its Transformers golden"]
 #[cfg(feature = "metal")]
@@ -509,10 +622,19 @@ fn test_whisper_turbo_long_form_matches_transformers() -> Result<()> {
         offset = end;
     }
     assert_eq!(offset, tokens.len());
+    whisper_conditioning_matches_transformers(&transcriber, &clip, &golden)?;
+    whisper_token_times_match_transformers(&transcriber, &clip, &golden)?;
     // Q8_0 weights move close decisions, so segment breaks may differ. Measured on a spoken
     // 80 s clip: one word in 239 differs in punctuation.
     let reference = result.text;
     let transcriber = Transcriber::load(&dir, WeightFormat::Q8_0, &Device::new_metal(0)?)?;
+    assert_eq!(
+        transcriber.model().weight_bytes(),
+        tur_models::models::whisper::Whisper::planned_bytes(
+            transcriber.model().config(),
+            WeightFormat::Q8_0
+        )?
+    );
     let packed = transcriber.transcribe(&clip, &options)?.text;
     let (expected, actual): (Vec<_>, Vec<_>) = (
         reference.split_whitespace().collect(),
@@ -522,6 +644,163 @@ fn test_whisper_turbo_long_form_matches_transformers() -> Result<()> {
     assert!(
         distance * 50 <= expected.len(),
         "{distance} words differ: {packed}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the pinned Whisper large-v3-turbo checkpoint, a WAV with a long silence and its Transformers golden"]
+#[cfg(feature = "metal")]
+fn test_whisper_turbo_skips_silence_as_transformers_does() -> Result<()> {
+    use tur_models::models::whisper::{Fallback, TranscribeOptions, Transcriber};
+    let golden = candle_core::safetensors::load(required("TUR_WHISPER_GAP_GOLDEN")?, &Device::Cpu)?;
+    let clip = Audio::from_wav(&std::fs::read(required("TUR_AUDIO_GAP")?)?)?;
+    let transcriber = Transcriber::load(
+        &required("TUR_WHISPER")?,
+        WeightFormat::F32,
+        &Device::new_metal(0)?,
+    )?;
+    let run = |fallback| -> Result<Vec<u32>> {
+        let result = transcriber.transcribe(
+            &clip,
+            &TranscribeOptions {
+                language: Some("en".into()),
+                fallback,
+                ..Default::default()
+            },
+        )?;
+        Ok(result
+            .segments
+            .iter()
+            .flat_map(|segment| segment.tokens.iter().copied())
+            .collect())
+    };
+    let expected =
+        |name| -> Result<Vec<u32>> { Ok(tensor(&golden, name)?.to_dtype(DType::U32)?.to_vec1()?) };
+    assert_eq!(run(None)?, expected("plain")?);
+    let skipping = Fallback {
+        temperatures: vec![0.0],
+        max_compression_ratio: f64::INFINITY,
+        silence_rms: None,
+        ..Fallback::default()
+    };
+    assert_eq!(run(Some(skipping))?, expected("skipping")?);
+    // The reference invents text in a confident silence; the energy gate must not.
+    let gated = transcriber.transcribe(
+        &clip,
+        &TranscribeOptions {
+            language: Some("en".into()),
+            fallback: Some(Fallback::default()),
+            ..Default::default()
+        },
+    )?;
+    // The silence runs from 25 s to 95 s, and the window holding the speech after it opens
+    // at 90 s, where its first segment starts.
+    let quiet = 25.5..90.0;
+    let invented: Vec<&str> = gated
+        .segments
+        .iter()
+        .filter(|segment| quiet.contains(&segment.start))
+        .map(|segment| segment.text.as_str())
+        .collect();
+    assert!(invented.is_empty(), "{invented:?}");
+    assert!(gated.text.contains("The weather in the mountains"));
+    Ok(())
+}
+
+/// The prompt on every window, and windows reading what came before, token for token.
+#[cfg(feature = "metal")]
+fn whisper_conditioning_matches_transformers(
+    transcriber: &tur_models::models::whisper::Transcriber,
+    clip: &Audio,
+    golden: &HashMap<String, Tensor>,
+) -> Result<()> {
+    use tur_models::models::whisper::TranscribeOptions;
+    for (name, prompt, condition) in [
+        ("prompted", true, false),
+        ("conditioned", false, true),
+        ("prompted_conditioned", true, true),
+    ] {
+        let expected: Vec<u32> = tensor(golden, name)?.to_dtype(DType::U32)?.to_vec1()?;
+        let result = transcriber.transcribe(
+            clip,
+            &TranscribeOptions {
+                language: Some("en".into()),
+                prompt: prompt.then(|| "Tur, Metal kernels, MLX.".to_owned()),
+                condition_on_previous_text: condition,
+                ..Default::default()
+            },
+        )?;
+        let actual: Vec<u32> = result
+            .segments
+            .iter()
+            .flat_map(|segment| segment.tokens.iter().copied())
+            .collect();
+        assert_eq!(actual, expected, "{name}");
+    }
+    Ok(())
+}
+
+/// Word timings come from token times, which follow the reference's attention path. Rounding
+/// may move a path by a state, so agreement is within one state (20 ms) for most tokens.
+#[cfg(feature = "metal")]
+fn whisper_token_times_match_transformers(
+    transcriber: &tur_models::models::whisper::Transcriber,
+    clip: &Audio,
+    golden: &HashMap<String, Tensor>,
+) -> Result<()> {
+    use tur_models::models::whisper::TranscribeOptions;
+    let tokens: Vec<u32> = tensor(golden, "word_tokens")?
+        .to_dtype(DType::U32)?
+        .to_vec1()?;
+    let times: Vec<f32> = tensor(golden, "token_times")?.to_vec1()?;
+    let result = transcriber.transcribe(
+        clip,
+        &TranscribeOptions {
+            language: Some("en".into()),
+            word_timestamps: true,
+            ..Default::default()
+        },
+    )?;
+    let actual: Vec<u32> = result
+        .segments
+        .iter()
+        .flat_map(|segment| segment.tokens.iter().copied())
+        .collect();
+    assert_eq!(actual, tokens);
+    let words: Vec<_> = result.segments.iter().flat_map(|s| &s.words).collect();
+    assert!(words.len() > 200, "{} words", words.len());
+    let starts: Vec<f64> = words.iter().map(|word| word.start).collect();
+    assert!(starts.is_sorted(), "{starts:?}");
+    // Each word starts at its first text token's time in the reference.
+    let mut reference = Vec::new();
+    let mut index = 0;
+    let rejoined: String = words.iter().map(|word| word.word.as_str()).collect();
+    assert_eq!(rejoined.trim(), result.text);
+    for segment in &result.segments {
+        for &token in &segment.tokens {
+            if token < 50257 {
+                reference.push(f64::from(times[index]));
+            }
+            index += 1;
+        }
+    }
+    // Walk both in order: each word's start must match a token time just after the last match.
+    let (mut close, mut at) = (0, 0);
+    for word in &words {
+        let found = reference[at..]
+            .iter()
+            .take(8)
+            .position(|time| (time - word.start).abs() <= 0.021);
+        if let Some(offset) = found {
+            close += 1;
+            at += offset + 1;
+        }
+    }
+    assert!(
+        close * 100 >= words.len() * 95,
+        "{close} of {} words",
+        words.len()
     );
     Ok(())
 }
@@ -551,7 +830,7 @@ mod http {
     use tur::{
         TurError,
         backend::pipeline::GenerationStats,
-        models::whisper::{Segment, Task, Transcription},
+        models::whisper::{Segment, Task, Transcription, Word},
         server::{
             AppState, build_router,
             transcription::{TranscriptionJob, TranscriptionWorker},
@@ -614,12 +893,23 @@ mod http {
         let (tx, mut rx) = mpsc::channel::<TranscriptionJob>(4);
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
-                let text = format!(
+                let mut text = format!(
                     "{:?} {} {}",
                     job.options.task,
                     job.options.language.as_deref().unwrap_or("auto"),
                     job.audio.duration().as_millis()
                 );
+                if let Some(prompt) = &job.options.prompt {
+                    text.push_str(" prompt=");
+                    text.push_str(prompt);
+                }
+                if job.options.condition_on_previous_text {
+                    text.push_str(" conditioned");
+                }
+                if let Some(fallback) = &job.options.fallback {
+                    text.push_str(" t=");
+                    text.push_str(&fallback.temperatures.len().to_string());
+                }
                 let segments = if job.options.timestamps {
                     vec![Segment {
                         start: 61.5,
@@ -627,6 +917,15 @@ mod http {
                         text: format!(" {text}"),
                         seek: 6150,
                         tokens: vec![7, 8],
+                        words: if job.options.word_timestamps {
+                            vec![Word {
+                                word: " hello".into(),
+                                start: 61.5,
+                                end: 61.75,
+                            }]
+                        } else {
+                            vec![]
+                        },
                     }]
                 } else {
                     vec![]
@@ -733,7 +1032,7 @@ Content-Type: audio/wav\r\n\r\n",
         let (status, body) = send(form(&[("model", "whisper-1")], Some(&wav))?).await?;
         assert_eq!(
             (status, body.as_str()),
-            (200, r#"{"text":"Transcribe auto 1234"}"#)
+            (200, r#"{"text":"Transcribe auto 1234 t=6"}"#)
         );
         let (status, body) = send(form(
             &[
@@ -744,13 +1043,13 @@ Content-Type: audio/wav\r\n\r\n",
             Some(&wav),
         )?)
         .await?;
-        assert_eq!((status, body.as_str()), (200, "Transcribe uk 1234"));
+        assert_eq!((status, body.as_str()), (200, "Transcribe uk 1234 t=6"));
         let (status, body) = send(form(&[("response_format", "srt")], Some(&wav))?).await?;
         assert_eq!(
             (status, body.as_str()),
             (
                 200,
-                "1\n00:01:01,500 --> 01:02:03,250\nTranscribe auto 1234\n\n"
+                "1\n00:01:01,500 --> 01:02:03,250\nTranscribe auto 1234 t=6\n\n"
             )
         );
         let (status, body) = send(form(&[("response_format", "vtt")], Some(&wav))?).await?;
@@ -758,7 +1057,7 @@ Content-Type: audio/wav\r\n\r\n",
             (status, body.as_str()),
             (
                 200,
-                "WEBVTT\n\n00:01:01.500 --> 01:02:03.250\nTranscribe auto 1234\n\n"
+                "WEBVTT\n\n00:01:01.500 --> 01:02:03.250\nTranscribe auto 1234 t=6\n\n"
             )
         );
         let (status, body) = send(form(
@@ -774,11 +1073,41 @@ Content-Type: audio/wav\r\n\r\n",
         assert_eq!(verbose["task"], "transcribe");
         assert_eq!(verbose["language"], "en");
         assert_eq!(verbose["duration"], 1.234);
-        assert_eq!(verbose["text"], "Transcribe auto 1234");
+        assert_eq!(verbose["text"], "Transcribe auto 1234 t=6");
         assert_eq!(
             verbose["segments"],
             serde_json::json!([{"id": 0, "seek": 6150, "start": 61.5, "end": 3723.25,
-                "text": " Transcribe auto 1234", "tokens": [7, 8]}])
+                "text": " Transcribe auto 1234 t=6", "tokens": [7, 8]}])
+        );
+        let (status, body) = send(form(
+            &[
+                ("prompt", "Tur"),
+                ("temperature", "0.4"),
+                ("condition_on_previous_text", "true"),
+            ],
+            Some(&wav),
+        )?)
+        .await?;
+        assert_eq!(
+            (status, body.as_str()),
+            (
+                200,
+                r#"{"text":"Transcribe auto 1234 prompt=Tur conditioned t=1"}"#
+            )
+        );
+        let (status, body) = send(form(
+            &[
+                ("response_format", "verbose_json"),
+                ("timestamp_granularities[]", "word"),
+            ],
+            Some(&wav),
+        )?)
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        let verbose: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(
+            verbose["words"],
+            serde_json::json!([{"word": " hello", "start": 61.5, "end": 61.75}])
         );
         let mut translation = form(&[], Some(&wav))?;
         *translation.uri_mut() = "/v1/audio/translations"
@@ -792,14 +1121,18 @@ Content-Type: audio/wav\r\n\r\n",
         );
         for (fields, file, status) in [
             (vec![], None, 400),
-            (vec![("temperature", "0.4")], Some(&wav[..]), 400),
+            (vec![("temperature", "3")], Some(&wav[..]), 400),
             (vec![("response_format", "ass")], Some(&wav[..]), 400),
             (
                 vec![("timestamp_granularities[]", "word")],
                 Some(&wav[..]),
                 400,
             ),
-            (vec![("prompt", "earlier words")], Some(&wav[..]), 400),
+            (
+                vec![("timestamp_granularities[]", "phoneme")],
+                Some(&wav[..]),
+                400,
+            ),
             (vec![], Some(&b"OggS"[..]), 400),
             (vec![("model", "whisper-2")], Some(&wav[..]), 404),
         ] {

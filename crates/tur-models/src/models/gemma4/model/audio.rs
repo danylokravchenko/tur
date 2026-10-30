@@ -16,13 +16,14 @@ use crate::{
     audio::{self, GemmaFeatures, gemma_frames},
     models::{
         Precision,
+        artifact::Companion,
         checkpoint::Checkpoint,
         weights::{tiled, upload_projection},
     },
 };
 use candle_core::{D, DType, Device, Tensor};
 use candle_nn::ops::{sigmoid, softmax_last_dim};
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 use tur_core::{Result, execution::invalid};
 use tur_metal::packed::PackedLinear;
 
@@ -111,6 +112,30 @@ pub(super) fn precision(text_f32: bool) -> Precision {
     }
 }
 
+/// The encoder's tensors as an artifact stores them: wide projections packed in `precision`
+/// and the rest as the checkpoint has them. Relative keys are folded at load, so stay exact.
+pub(super) fn stored_tensors(
+    audio: &Audio,
+    text_hidden: usize,
+    precision: Precision,
+) -> BTreeMap<String, Companion> {
+    audio
+        .weight_shapes(text_hidden)
+        .into_iter()
+        .map(|(name, shape)| {
+            let packed = match shape.as_slice() {
+                &[_, cols]
+                    if name.ends_with(".weight") && !name.ends_with("relative_k_proj.weight") =>
+                {
+                    Some(tiled(precision, cols)).filter(|p| p.ggml().is_some())
+                }
+                _ => None,
+            };
+            (name, Companion { shape, packed })
+        })
+        .collect()
+}
+
 /// Resident bytes of the encoder in `precision`: projections packed, the rest F32.
 /// Relative-key projections are folded into `[context_left, hidden]` tables at load.
 pub(super) fn planned_bytes(
@@ -184,6 +209,8 @@ struct Loader<'a> {
     device: &'a Device,
     precision: Precision,
     bytes: usize,
+    /// Input width of each projection, which packed bytes alone do not say.
+    packed_cols: BTreeMap<String, usize>,
 }
 
 impl Loader<'_> {
@@ -197,7 +224,25 @@ impl Loader<'_> {
         Ok(tensor)
     }
     fn linear(&mut self, name: &str) -> Result<PackedLinear> {
-        let linear = upload_projection(&self.checkpoint.take(name)?, self.precision, self.device)?;
+        let entry = self
+            .checkpoint
+            .entries()
+            .get(name)
+            .ok_or_else(|| invalid(format!("missing tensor {name}")))?;
+        let linear = if entry.dtype == safetensors::Dtype::U8 {
+            // A prepacked artifact's blocks, uploaded as stored.
+            let (entry, bytes) = self.checkpoint.take_raw(name)?;
+            let (&[rows, _], Some(format), Some(cols)) = (
+                entry.shape.as_slice(),
+                self.precision.ggml(),
+                self.packed_cols.get(name),
+            ) else {
+                return Err(invalid(format!("{name} is not a packed matrix")));
+            };
+            PackedLinear::from_blocks(&bytes, format, (rows, *cols), self.device)?
+        } else {
+            upload_projection(&self.checkpoint.take(name)?, self.precision, self.device)?
+        };
         self.bytes += linear.resident_bytes();
         Ok(linear)
     }
@@ -266,12 +311,16 @@ impl AudioTower {
         device: &Device,
     ) -> Result<Self> {
         validate_processor(dir)?;
+        let mut packed_cols = BTreeMap::new();
         for (name, shape) in audio.weight_shapes(text_hidden) {
             let entry = checkpoint
                 .entries()
                 .get(&name)
                 .ok_or_else(|| invalid(format!("missing tensor {name}")))?;
-            if entry.shape != shape {
+            if let (safetensors::Dtype::U8, &[_, cols]) = (entry.dtype, shape.as_slice()) {
+                // Open-time validation checked the packed shape.
+                packed_cols.insert(name, cols);
+            } else if entry.shape != shape {
                 return Err(invalid(format!(
                     "{name} has shape {:?}, expected {shape:?}",
                     entry.shape
@@ -284,6 +333,7 @@ impl AudioTower {
             device,
             precision,
             bytes: 0,
+            packed_cols,
         };
         let tower = "model.audio_tower";
         let sub = format!("{tower}.subsample_conv_projection");

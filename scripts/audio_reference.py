@@ -7,6 +7,8 @@ Real checkpoints (immutable revisions), on a WAV file such as one written by `sa
   python -I scripts/audio_reference.py --gemma <dir> --wav speech.wav --golden /tmp/gemma4-audio.safetensors
 Whisper's long-form decoding of a clip beyond 30 s:
   python -I scripts/audio_reference.py --whisper-long <dir> --wav long.wav --golden /tmp/whisper-long.safetensors
+Skipping the silent windows of a clip with a long silence:
+  python -I scripts/audio_reference.py --whisper-gap <dir> --wav gap.wav --golden /tmp/whisper-gap.safetensors
 """
 import argparse
 import json
@@ -24,6 +26,8 @@ from transformers import (
 GEMMA_REVISION = "3e22461f65e89153144f8adb70e3b8c2cc9845a7"
 WHISPER_REVISION = "41f01f3fe87f28c78e2fbf8b568835947dd65ed9"
 RATE = 16000
+# Decoder prompt of the long-form golden; the Tur test passes the same text.
+PROMPT = "Tur, Metal kernels, MLX."
 
 
 def tone():
@@ -222,9 +226,44 @@ def real_whisper_long(directory, wav, output):
     lengths = torch.tensor([segment["tokens"].numel() for segment in segments], dtype=torch.int64)
     times = torch.tensor([[float(segment["start"]), float(segment["end"])] for segment in segments], dtype=torch.float32)
     text = processor.batch_decode(result["sequences"], skip_special_tokens=True)[0]
-    save_file({"tokens": tokens, "lengths": lengths, "times": times, "features": inputs.input_features[0].contiguous()}, output,
+    data = {"tokens": tokens, "lengths": lengths, "times": times, "features": inputs.input_features[0].contiguous()}
+    def generate(**options):
+        with torch.inference_mode():
+            result = model.generate(inputs.input_features, attention_mask=inputs.attention_mask, language="en", task="transcribe",
+                                    return_timestamps=True, return_segments=True, do_sample=False, num_beams=1, **options)
+        return result["segments"][0]
+    timed = generate(return_token_timestamps=True)
+    data["word_tokens"] = torch.cat([segment["tokens"] for segment in timed]).to(torch.int64).contiguous()
+    # The segment's slice of its window's timestamps, one per token.
+    data["token_times"] = torch.cat([segment["token_timestamps"][:segment["tokens"].numel()] for segment in timed]).float().contiguous()
+    prompt = torch.from_numpy(processor.get_prompt_ids(PROMPT)).to(torch.int64)
+    data["prompt_ids"] = prompt.contiguous()
+    data["prompted"] = torch.cat([segment["tokens"] for segment in generate(prompt_ids=prompt)]).to(torch.int64).contiguous()
+    data["conditioned"] = torch.cat([segment["tokens"] for segment in generate(condition_on_prev_tokens=True)]).to(torch.int64).contiguous()
+    data["prompted_conditioned"] = torch.cat([segment["tokens"] for segment in generate(prompt_ids=prompt, condition_on_prev_tokens=True)]).to(torch.int64).contiguous()
+    save_file(data, output,
               metadata={"transformers": transformers.__version__, "torch": torch.__version__, "revision": WHISPER_REVISION, "text": text})
     print(f"wrote {output}: {len(segments)} segments, {text!r}", flush=True)
+
+
+def real_whisper_gap(directory, wav, output):
+    """Long-form decoding that skips silent windows, with OpenAI's thresholds."""
+    from transformers import WhisperProcessor
+    processor = WhisperProcessor.from_pretrained(directory, local_files_only=True)
+    model = WhisperForConditionalGeneration.from_pretrained(directory, local_files_only=True, dtype=torch.float32).eval()
+    inputs = processor(read_wav(wav), sampling_rate=RATE, return_tensors="pt", truncation=False, padding="longest", return_attention_mask=True)
+    def decode(**options):
+        with torch.inference_mode():
+            result = model.generate(inputs.input_features, attention_mask=inputs.attention_mask, language="en", task="transcribe",
+                                    return_timestamps=True, return_segments=True, do_sample=False, num_beams=1, **options)
+        return result["segments"][0]
+    plain = decode()
+    skipping = decode(no_speech_threshold=0.6, logprob_threshold=-1.0, temperature=0.0)
+    tokens = lambda segments: torch.cat([s["tokens"] for s in segments]).to(torch.int64).contiguous() if segments else torch.zeros(0, dtype=torch.int64)
+    save_file({"plain": tokens(plain), "skipping": tokens(skipping)}, output,
+              metadata={"transformers": transformers.__version__, "torch": torch.__version__, "revision": WHISPER_REVISION})
+    text = lambda segments: processor.decode([t for s in segments for t in s["tokens"].tolist()], skip_special_tokens=True)
+    print(f"wrote {output}\nplain: {text(plain)!r}\nskipping: {text(skipping)!r}", flush=True)
 
 
 def real_gemma(directory, wav, output):
@@ -259,6 +298,7 @@ def main():
     args.add_argument("--tiny", type=Path)
     args.add_argument("--whisper", type=Path)
     args.add_argument("--whisper-long", type=Path)
+    args.add_argument("--whisper-gap", type=Path)
     args.add_argument("--gemma", type=Path)
     args.add_argument("--wav", type=Path)
     args.add_argument("--golden", type=Path)
@@ -269,6 +309,8 @@ def main():
         real_whisper(options.whisper, options.wav, options.golden)
     elif options.whisper_long and options.wav and options.golden:
         real_whisper_long(options.whisper_long, options.wav, options.golden)
+    elif options.whisper_gap and options.wav and options.golden:
+        real_whisper_gap(options.whisper_gap, options.wav, options.golden)
     elif options.gemma and options.wav and options.golden:
         real_gemma(options.gemma, options.wav, options.golden)
     else:

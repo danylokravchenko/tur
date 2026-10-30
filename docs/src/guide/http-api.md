@@ -117,8 +117,10 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
 | `model` | the transcription model | Must equal `--transcription-model-name` (otherwise 404) |
 | `language` | detected | ISO 639-1 code such as `en` |
 | `response_format` | `json` | `json`, `text`, `verbose_json`, `srt` or `vtt` |
-| `timestamp_granularities[]` | `segment` | Only `segment` |
-| `temperature` | 0 | Only 0: decoding is greedy |
+| `timestamp_granularities[]` | `segment` | `segment` or `word`; `word` needs `verbose_json` and adds a `words` list |
+| `prompt` | none | Text the decoder reads before every window, for names and style |
+| `condition_on_previous_text` | `false` | `true` also reads the text decoded so far (a Tur extension) |
+| `temperature` | 0 | 0 decodes greedily and retries doubtful windows at rising temperatures; up to 1 samples at that temperature, without retries |
 
 `verbose_json` adds the task, language, duration in seconds and timed segments:
 
@@ -127,7 +129,7 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
  "segments": [{"id": 0, "seek": 0, "start": 0.0, "end": 2.66, "text": " The quick brown fox jumps over the lazy dog.", "tokens": [50365, 440, 1702]}]}
 ```
 
-`prompt` and word timestamps are rejected with 400. Clips longer than 30 s are transcribed window by window, each resuming where the last complete segment of the one before it ended, so no word is cut between them. The 64 MiB request limit bounds a clip's length. A full transcription queue answers 429.
+Silent windows produce no text. Clips longer than 30 s are transcribed window by window, each resuming where the last complete segment of the one before it ended, so no word is cut between them. The 64 MiB request limit bounds a clip's length. A full transcription queue answers 429.
 
 ## `POST /v1/audio/translations`
 
