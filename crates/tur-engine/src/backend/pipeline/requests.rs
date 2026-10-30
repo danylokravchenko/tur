@@ -2,6 +2,7 @@
 
 use super::super::{
     guidance::{GuidanceControl, TopLevelGrammar, build_llg_factory},
+    harmony::{Fragment, Harmony},
     speculation::NgramIndex,
     tokenizer::TokenOutputStream,
 };
@@ -96,14 +97,28 @@ pub struct GenerationStats {
     pub accepted_draft_tokens: usize,
     pub tool_calls: Vec<ToolCall>,
     pub generated_text: String,
+    /// Reasoning the model separates from its answer; empty for models that don't.
+    pub reasoning_text: String,
     /// `stop` for EOS, `length` for the request limit.
     pub finish_reason: &'static str,
+}
+
+/// Hand one request's newly decoded text to its audiences.
+fn publish(output: &mut BatchStepOutput, id: Uuid, fragment: Fragment) {
+    if let Some(text) = fragment.reasoning {
+        output.new_reasoning.push((id, text));
+    }
+    if let Some(text) = fragment.content {
+        output.new_tokens.push((id, text));
+    }
 }
 
 /// Incremental text and independent request outcomes from one packed model invocation.
 #[derive(Default)]
 pub struct BatchStepOutput {
     pub new_tokens: Vec<(Uuid, String)>,
+    /// Text of the reasoning channel, for models that separate it from their answer.
+    pub new_reasoning: Vec<(Uuid, String)>,
     /// Sampled token IDs (including EOS) and publication times, independent of text
     /// decoding, which can buffer several tokens into one fragment.
     pub sampled_tokens: Vec<(Uuid, u32, Instant)>,
@@ -297,6 +312,11 @@ impl InferencePipeline {
                 prefix_checked: None,
                 running: false,
                 stream: TokenOutputStream::new(self.tokenizer.clone()),
+                harmony: self
+                    .model
+                    .speaks_harmony()
+                    .then(|| Harmony::new(&self.tokenizer))
+                    .flatten(),
                 max_tokens: request.max_tokens,
                 arrival,
                 deadline,
@@ -338,6 +358,7 @@ impl InferencePipeline {
     ) -> Result<()> {
         self.cancel(id)?;
         output.new_tokens.retain(|(request, _)| *request != id);
+        output.new_reasoning.retain(|(request, _)| *request != id);
         output
             .sampled_tokens
             .retain(|(request, _, _)| *request != id);
@@ -409,8 +430,12 @@ impl InferencePipeline {
                 .first_token
                 .get_or_insert_with(|| sampled_at.saturating_duration_since(pending.arrival));
             let eos = self.defaults.eos_tokens.contains(&token.token);
-            if !eos && let Some(text) = pending.stream.next_token(token.token)? {
-                output.new_tokens.push((id, text));
+            if !eos {
+                if let Some(harmony) = &mut pending.harmony {
+                    publish(output, id, harmony.push(token.token)?);
+                } else if let Some(text) = pending.stream.next_token(token.token)? {
+                    output.new_tokens.push((id, text));
+                }
             }
             if eos || pending.generated() >= pending.max_tokens {
                 finished = true;
@@ -436,15 +461,25 @@ impl InferencePipeline {
         if !finished {
             return Ok(());
         }
-        if let Some(text) = pending.stream.decode_rest()? {
-            output.new_tokens.push((id, text));
-        }
-        let generated_text = pending.stream.decode_all()?;
-        let tool_calls = if pending.tools.is_empty() {
-            Vec::new()
-        } else {
-            ToolCall::parse_from_output(&pending.stream.decode_raw()?, &pending.tools)
-        };
+        let (generated_text, reasoning_text, tool_calls) =
+            if let Some(harmony) = &mut pending.harmony {
+                publish(output, id, harmony.finish()?);
+                (
+                    harmony.content()?,
+                    harmony.reasoning()?,
+                    harmony.tool_calls(&pending.tools)?,
+                )
+            } else {
+                if let Some(text) = pending.stream.decode_rest()? {
+                    output.new_tokens.push((id, text));
+                }
+                let tool_calls = if pending.tools.is_empty() {
+                    Vec::new()
+                } else {
+                    ToolCall::parse_from_output(&pending.stream.decode_raw()?, &pending.tools)
+                };
+                (pending.stream.decode_all()?, String::new(), tool_calls)
+            };
         let elapsed = pending.arrival.elapsed();
         if pending
             .deadline
@@ -462,6 +497,7 @@ impl InferencePipeline {
             draft_tokens: pending.drafted,
             accepted_draft_tokens: pending.accepted_drafts,
             generated_text,
+            reasoning_text,
             tool_calls,
             finish_reason: reason,
         };

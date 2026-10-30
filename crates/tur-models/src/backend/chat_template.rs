@@ -205,7 +205,19 @@ impl ChatTemplate {
         env.add_template("chat", &self.source)
             .map_err(|e| TurError::Other(format!("chat template compile error: {e}")))?;
         let mut ctx = self.tokens.clone();
-        ctx.insert("messages".into(), serde_json::to_value(messages)?);
+        let mut rendered = serde_json::to_value(messages)?;
+        // Harmony templates replay reasoning from `thinking`, not `reasoning_content`.
+        if self.source.contains("message.thinking")
+            && !self.source.contains("reasoning_content")
+            && let Some(turns) = rendered.as_array_mut()
+        {
+            for turn in turns.iter_mut().filter_map(|turn| turn.as_object_mut()) {
+                if let Some(reasoning) = turn.remove("reasoning_content") {
+                    turn.insert("thinking".into(), reasoning);
+                }
+            }
+        }
+        ctx.insert("messages".into(), rendered);
         ctx.insert(
             "add_generation_prompt".into(),
             options.add_generation_prompt.into(),
@@ -337,6 +349,16 @@ fn python_method(
         };
         let item = value.get_item(key)?;
         return Ok(if item.is_undefined() { default } else { item });
+    }
+    if value.kind() == minijinja::value::ValueKind::Map && method == "items" {
+        let pairs = value
+            .try_iter()?
+            .map(|key| {
+                let item = value.get_item(&key)?;
+                Ok(minijinja::Value::from(vec![key, item]))
+            })
+            .collect::<std::result::Result<Vec<_>, minijinja::Error>>()?;
+        return Ok(minijinja::Value::from(pairs));
     }
     let Some(text) = value.as_str() else {
         return Err(minijinja::Error::from(minijinja::ErrorKind::UnknownMethod));

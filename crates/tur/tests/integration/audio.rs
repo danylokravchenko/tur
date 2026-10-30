@@ -887,6 +887,7 @@ mod http {
                     accepted_draft_tokens: 0,
                     tool_calls: vec![],
                     generated_text: clips.join(","),
+                    reasoning_text: String::new(),
                 })));
             }
         });

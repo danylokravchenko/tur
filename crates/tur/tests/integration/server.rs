@@ -45,7 +45,13 @@ fn mock_worker(response_text: &'static str) -> PipelineWorker {
             if let Some(token_tx) = &msg.token_tx {
                 for fragment in response_text.split_inclusive(' ') {
                     // The adapter requires streamed text to be a prefix of the final text.
-                    drop(token_tx.send(fragment.to_string()).await);
+                    drop(
+                        token_tx
+                            .send(tur::server::worker::TextDelta::Content(
+                                fragment.to_string(),
+                            ))
+                            .await,
+                    );
                 }
             }
             drop(msg.token_tx);
@@ -62,6 +68,7 @@ fn mock_worker(response_text: &'static str) -> PipelineWorker {
                 accepted_draft_tokens: 0,
                 tool_calls: vec![],
                 generated_text: response_text.to_string(),
+                reasoning_text: String::new(),
             })));
         }
     });
@@ -94,6 +101,7 @@ fn mock_tool_call_worker(
                 accepted_draft_tokens: 0,
                 tool_calls: vec![tc],
                 generated_text: String::new(),
+                reasoning_text: String::new(),
             })));
         }
     });

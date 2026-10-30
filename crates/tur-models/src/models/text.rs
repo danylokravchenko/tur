@@ -144,6 +144,10 @@ impl TextModel {
             Self::GptOss(m) => m.config().max_position(),
         }
     }
+    /// Whether this model writes its output in Harmony channels.
+    pub fn speaks_harmony(&self) -> bool {
+        matches!(self, Self::GptOss(_))
+    }
     /// How a clip appears in prompts, when the model has an audio encoder loaded.
     pub fn audio_prompt(&self) -> Option<AudioPrompt> {
         match self {

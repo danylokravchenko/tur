@@ -138,14 +138,28 @@ pub(crate) fn run(mut args: Args) -> Result<()> {
     let request = args.request()?;
     let mut stdout = std::io::stdout().lock();
     let mut output_error = None;
-    let stats = pipeline.run(&request, |text| {
-        if output_error.is_none() {
-            output_error = stdout
-                .write_all(text.as_bytes())
-                .and_then(|()| stdout.flush())
-                .err();
-        }
-    })?;
+    // Reasoning goes to stderr so that stdout holds only the answer.
+    let mut stderr = std::io::stderr().lock();
+    let mut reasoned = false;
+    let stats = pipeline.run_channels(
+        &request,
+        |text| {
+            if output_error.is_none() {
+                output_error = stdout
+                    .write_all(text.as_bytes())
+                    .and_then(|()| stdout.flush())
+                    .err();
+            }
+        },
+        |text| {
+            reasoned = true;
+            // Nothing depends on progress text reaching a closed stderr.
+            drop(stderr.write_all(text.as_bytes()));
+        },
+    )?;
+    if reasoned {
+        drop(writeln!(stderr));
+    }
     if let Some(error) = output_error {
         return Err(error.into());
     }

@@ -31,7 +31,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Generate one completion and stream it to stdout.
+    /// Generate one completion and stream it to stdout, and any separate reasoning to stderr.
     Run(run::Args),
     /// Serve one resident model over an OpenAI-style HTTP API.
     Serve(serve::Args),

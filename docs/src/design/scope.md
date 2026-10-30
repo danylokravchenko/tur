@@ -29,7 +29,7 @@ Tur is an inference service for Apple Silicon Macs. It aims for three things at 
 | Gemma 4 E2B | Pinned Transformers F32 architecture fixtures, and real Q8_0 checkpoint generation; its Q8_0 audio encoder matches the F32 Transformers encoder at cosine similarity 0.9999 |
 | Whisper large-v3-turbo | Small Transformers fixture for the encoder, decoder and cached greedy decode; real F32 and Q8_0 transcripts equal Transformers' on a pinned clip, and F32 long-form tokens and segment times equal its `generate` on a clip beyond 30 s |
 | Gemma 4 E4B, 12B, 26B-A4B, 31B | Architecture fixtures and configuration checks; full checkpoints not yet run |
-| gpt-oss-20b | Pinned Transformers F32 fixture, and real weights compared per layer through the expert cache; the Harmony reasoning and answer channels are not yet separated |
+| gpt-oss-20b | Pinned Transformers F32 fixture, and real weights compared per layer through the expert cache |
 
 ## Principles
 

@@ -13,6 +13,7 @@ pub use requests::{BatchStepOutput, GenerationRequest, GenerationStats, PassTimi
 
 use super::{
     guidance::ParserFactory,
+    harmony::Harmony,
     memory::{BudgetLease, MemoryPlan},
     prefix::{PrefixCache, PrefixKeys, PrefixStats},
     scheduler::{Candidate, Chunk, Scheduler},
@@ -78,6 +79,8 @@ struct Pending {
     /// Holds model state. Preemption clears it and `consumed`, so the request recomputes.
     running: bool,
     stream: TokenOutputStream,
+    /// Splits output by channel, for models that speak Harmony.
+    harmony: Option<Harmony>,
     max_tokens: usize,
     arrival: Instant,
     deadline: Option<Instant>,
@@ -246,7 +249,17 @@ impl InferencePipeline {
     pub fn run(
         &mut self,
         request: &GenerationRequest,
+        on_token: impl FnMut(&str),
+    ) -> Result<GenerationStats> {
+        self.run_channels(request, on_token, |_| {})
+    }
+
+    /// [`Self::run`], also streaming the reasoning of models that separate it.
+    pub fn run_channels(
+        &mut self,
+        request: &GenerationRequest,
         mut on_token: impl FnMut(&str),
+        mut on_reasoning: impl FnMut(&str),
     ) -> Result<GenerationStats> {
         if !self.pending.is_empty() {
             return Err(invalid("run requires an idle pipeline"));
@@ -260,6 +273,9 @@ impl InferencePipeline {
                     return Err(error);
                 }
             };
+            for (_, text) in step.new_reasoning {
+                on_reasoning(&text);
+            }
             for (_, text) in step.new_tokens {
                 on_token(&text);
             }

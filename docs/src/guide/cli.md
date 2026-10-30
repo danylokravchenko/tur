@@ -3,7 +3,7 @@
 `tur` has four commands:
 
 ```text
-tur run         Generate one completion and stream it to stdout
+tur run         Generate one completion: the answer to stdout, separated reasoning to stderr
 tur serve       Serve one model over an OpenAI-compatible HTTP API
 tur transcribe  Transcribe a WAV file with a Whisper checkpoint
 tur quantize    Prepack weights offline, optionally calibrated, for instant loading

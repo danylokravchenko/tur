@@ -385,3 +385,48 @@ fn test_gpt_oss_config_rejects_settings_tur_does_not_execute() -> Result<()> {
     assert!(Config::from_json(&raw.to_string()).is_err());
     Ok(())
 }
+
+/// The published template replays a whole turn: reasoning as the analysis channel, the tool
+/// call on commentary addressed to the function, and its result, ending ready for the model.
+#[test]
+fn test_published_template_replays_reasoning_and_tool_turns() -> Result<()> {
+    use tur_models::backend::chat_template::{
+        ChatMessage, ChatTemplate, RenderOptions, Role, ToolCall,
+    };
+    use tur_models::backend::tools::ToolDefinition;
+    let template =
+        ChatTemplate::from_template(include_str!("../fixtures/gpt_oss/20b-chat_template.jinja"))?;
+    let mut call = ChatMessage::new(Role::Assistant, "");
+    call.reasoning_content = Some("I should look it up.".into());
+    call.tool_calls = vec![ToolCall {
+        name: "lookup".into(),
+        arguments: serde_json::from_value(serde_json::json!({"city": "Kyiv"}))?,
+    }];
+    let messages = [
+        ChatMessage::new(Role::User, "Weather?"),
+        call,
+        ChatMessage::new(Role::Tool, "sunny"),
+    ];
+    let tools = [ToolDefinition::new(
+        "lookup",
+        "Find weather",
+        serde_json::json!({"type":"object","properties":{"city":{"type":"string"}}}),
+    )];
+    let text = template.render(
+        &messages,
+        &tools,
+        &RenderOptions {
+            add_generation_prompt: true,
+            ..RenderOptions::default()
+        },
+    )?;
+    assert!(
+        text.contains("<|channel|>analysis<|message|>I should look it up.<|end|>"),
+        "{text}"
+    );
+    assert!(text.contains("to=functions.lookup"), "{text}");
+    assert!(text.contains("<|call|>"), "{text}");
+    assert!(text.contains("sunny"), "{text}");
+    assert!(text.ends_with("<|start|>assistant"), "{text}");
+    Ok(())
+}
