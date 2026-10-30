@@ -172,11 +172,14 @@ impl InferencePipeline {
             cap = cap.min(boundary.saturating_sub(pending.consumed + 1));
         }
         let eos = &self.defaults.eos_tokens;
+        let vocab = self.engine.pool().description().vocab_size;
+        // A prompt's audio positions hold clip identities above the vocabulary, which a
+        // lookup must never propose.
         let mut proposal: Vec<u32> = pending
             .ngrams
             .propose(&pending.tokens, &self.speculation, cap)
             .into_iter()
-            .take_while(|token| !eos.contains(token))
+            .take_while(|&token| !eos.contains(&token) && (token as usize) < vocab)
             .collect();
         let mut source = DraftSource::Lookup;
         let mut acceptance = pending.acceptance;
@@ -296,10 +299,27 @@ impl InferencePipeline {
             };
             // Each chained draft is expected to add the probability of reaching it.
             rates.extend((1..=drafts).map(|depth| rate.powi(depth as i32)));
+            // The head reads the token after each position; clip positions feed it the
+            // model's slot token, as the target pass did.
+            let tokens = self.model.audio_prompt().map_or_else(
+                || tokens.to_vec(),
+                |prompt| {
+                    tokens
+                        .iter()
+                        .map(|&t| {
+                            if super::audio::is_identity(t) {
+                                prompt.slot
+                            } else {
+                                t
+                            }
+                        })
+                        .collect()
+                },
+            );
             requests.push(DraftRequest {
                 handle: pending.handle,
                 start: before,
-                tokens: tokens.to_vec(),
+                tokens,
                 hidden,
                 drafts,
             });

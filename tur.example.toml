@@ -11,6 +11,7 @@ revision = "2fc06364715b967f1860aea9cf38778875588b17"
 kv_format = "f16"         # f32, f16, q8 (= q8_32), q8_<group>.
 kv_page_tokens = 16
 recurrent_state = "f32"   # f32 or f16; speculation needs f32.
+# audio_encoder = true    # Load Gemma 4 E2B/E4B's audio encoder; false saves its memory.
 
 [engine]                 # Shared by run and serve.
 prefill_chunk_size = 256
@@ -56,6 +57,11 @@ seed = 299792458
 # thinking = false
 # reasoning_effort = "medium" # low, medium, xhigh.
 # preserve_thinking = false
+
+# [whisper]              # Speech to text for serve (/v1/audio/*) and transcribe.
+# source = "openai/whisper-large-v3-turbo"
+# revision = "41f01f3fe87f28c78e2fbf8b568835947dd65ed9"
+# weight_format = "q8_0"  # f32, q8_0, q4k.
 
 # Prompts, --tools files, --cpu-reference and quantize jobs stay on the command line.
 # Logging stays in RUST_LOG; Hugging Face credentials/cache stay in HF_TOKEN/HF_HOME.

@@ -5,7 +5,7 @@ use candle_core::Tensor;
 use std::ops::Range;
 use tur_core::{
     Result,
-    execution::{ModelDescription, invalid},
+    execution::{EmbeddedInput, ModelDescription, invalid},
 };
 pub use tur_metal::{
     pool::StatePool,
@@ -31,6 +31,9 @@ pub struct PackedForward<'a> {
     pub tokens: &'a [u32],
     pub positions: &'a [usize],
     pub sequences: &'a [SequenceForward<'a>],
+    /// Rows replacing the input embeddings of packed token ranges, validated by
+    /// [`tur_core::execution::PackedExecution::validate`].
+    pub embeddings: &'a [EmbeddedInput],
     /// Persistent state of every sequence; built from the model's own description.
     pub pool: &'a StatePool,
 }

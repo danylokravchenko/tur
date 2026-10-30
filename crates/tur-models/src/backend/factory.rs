@@ -40,6 +40,8 @@ pub struct ModelFactory {
     pub kv: KvLayout,
     /// Recurrent matrix storage: F32, F16 or BF16.
     pub recurrent: candle_core::DType,
+    /// Load the checkpoint's audio encoder, when it has one ([`LoadOptions::audio`]).
+    pub audio: bool,
 }
 
 fn hub_error(error: impl std::fmt::Display) -> TurError {
@@ -143,6 +145,7 @@ impl ModelFactory {
             kv: self.kv,
             recurrent: self.recurrent,
             mtp: draft,
+            audio: self.audio,
         };
         let config = if options.mtp.is_some() {
             config.with_mtp()?
@@ -172,6 +175,46 @@ pub fn resolve_drafter(source: &ModelSource, revision: &str) -> Result<PathBuf> 
         },
         &[],
     )
+}
+
+/// Loads a revision-pinned Whisper checkpoint for transcription.
+#[derive(Clone)]
+pub struct WhisperFactory {
+    pub source: ModelSource,
+    /// Immutable commit for remote sources; a caller-provided identity for local weights.
+    pub revision: String,
+    /// Storage of projection matrices (`Q8_0` matched Transformers' F32 transcripts).
+    pub format: WeightFormat,
+    pub device: Device,
+}
+
+impl WhisperFactory {
+    /// Resolve the source, rejecting other architectures before downloading weights.
+    pub fn resolve(&self) -> Result<PathBuf> {
+        resolve(
+            &self.source,
+            &self.revision,
+            |json| crate::models::whisper::Config::from_json(json).map(drop),
+            &["tokenizer.json", "generation_config.json"],
+        )
+    }
+
+    /// Device bytes the loaded model will hold, and its peak encoder activations, for
+    /// admission against a device budget before any weight is read.
+    pub fn memory_requirements(&self) -> Result<(usize, usize)> {
+        let dir = self.resolve()?;
+        let config = crate::models::whisper::Config::from_json(&std::fs::read_to_string(
+            dir.join("config.json"),
+        )?)?;
+        Ok((
+            crate::models::whisper::Whisper::planned_bytes(&config, self.format)?,
+            crate::models::whisper::Whisper::scratch_bytes(&config)?,
+        ))
+    }
+
+    pub fn create(&self) -> Result<crate::models::whisper::Transcriber> {
+        crate::models::whisper::Transcriber::load(&self.resolve()?, self.format, &self.device)
+    }
 }
 
 /// Snapshot directory of `source`: validate `config.json` with `validate` before any
@@ -221,7 +264,11 @@ fn resolve(
         if name.ends_with(".safetensors")
             || matches!(
                 name,
-                "model.safetensors.index.json" | "generation_config.json" | "chat_template.jinja"
+                "model.safetensors.index.json"
+                    | "generation_config.json"
+                    | "chat_template.jinja"
+                    | "processor_config.json"
+                    | "preprocessor_config.json"
             )
         {
             checkpoint_file(name)?;
@@ -265,6 +312,7 @@ mod tests {
             device: Device::Cpu,
             kv: crate::models::DEFAULT_KV_LAYOUT,
             recurrent: crate::models::DEFAULT_RECURRENT_STATE,
+            audio: false,
         };
         let error = factory
             .resolve()

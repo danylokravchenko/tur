@@ -1,9 +1,12 @@
+pub mod media;
 pub mod routes;
+pub mod transcription;
 pub mod types;
 pub mod worker;
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{get, post},
 };
 use std::net::SocketAddr;
@@ -11,7 +14,12 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
 use std::collections::HashMap;
+use transcription::TranscriptionWorker;
 use worker::PipelineWorker;
+
+/// Largest request body: room for a few minutes of 48 kHz stereo WAV, base64-encoded
+/// in a chat request or uploaded to the transcription endpoints.
+pub const MAX_BODY_BYTES: usize = 64 << 20;
 
 /// Shared state injected into every request handler.
 #[derive(Clone)]
@@ -20,12 +28,22 @@ pub struct AppState {
     pub workers: HashMap<String, PipelineWorker>,
     /// The model used when the client omits the `model` field.
     pub default_model: String,
+    /// Speech-to-text workers keyed by their served name.
+    pub transcribers: HashMap<String, TranscriptionWorker>,
+    /// The transcriber used when a form omits `model`.
+    pub default_transcriber: Option<String>,
 }
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/v1/models", get(routes::models::list_models))
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
+        .route(
+            "/v1/audio/transcriptions",
+            post(routes::audio::transcriptions),
+        )
+        .route("/v1/audio/translations", post(routes::audio::translations))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)

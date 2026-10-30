@@ -1,10 +1,10 @@
 # HTTP API
 
-`tur serve` exposes an OpenAI-compatible API for one model. It accepts text only. Requests and responses follow OpenAI's chat-completion shapes, with a few extra fields for the chat template and prefix reuse.
+`tur serve` exposes an OpenAI-compatible API for one chat model and, with `--whisper`, one speech-to-text model. Chat requests carry text, plus audio for models with an audio encoder (Gemma 4 E2B and E4B). Requests and responses follow OpenAI's shapes, with a few extra fields for the chat template and prefix reuse. Request bodies may be up to 64 MiB.
 
 ## `GET /v1/models`
 
-Lists the served model:
+Lists the served chat model, and the transcription model when one is loaded:
 
 ```json
 {"object":"list","data":[{"id":"qwen-hybrid","object":"model","created":1792867193,"owned_by":"tur"}]}
@@ -47,7 +47,18 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 Each message has a `role` of `system`, `user`, `assistant` or `tool`. `content` is a string or an array of `{"type":"text","text":...}` parts. Assistant turns may carry `reasoning_content` and `tool_calls` (function calls with JSON-encoded `arguments`), and tool results are `tool` turns. The checkpoint's own chat template renders all of them.
 
-Image, video and audio parts are rejected, and so are prompts containing the model's image or audio placeholder tokens.
+User content may also hold audio parts, in OpenAI's `input_audio` form or as an `audio_url` holding a `data:` URL:
+
+```json
+{"role": "user", "content": [
+  {"type": "input_audio", "input_audio": {"data": "<base64 WAV>", "format": "wav"}},
+  {"type": "text", "text": "Transcribe this audio."}
+]}
+```
+
+Audio must be WAV (integer PCM or float, any rate and channel count) and 40 ms to 30 s long. Only models with an audio encoder accept it; others answer 400. Remote URLs are rejected, since the server never fetches media. Audio positions count toward `prompt_tokens`, 25 per second. See [Audio](../architecture/audio.md).
+
+Image and video parts are rejected, and so are prompts containing the model's image placeholder tokens or an audio placeholder without a clip.
 
 ### Response
 
@@ -87,6 +98,33 @@ The server sends a keep-alive comment every 15 seconds. If generation fails mid-
 
 A slow client never holds up other requests. Each stream has a small bounded queue, and text that doesn't fit waits in a buffer. If a client falls more than 16 KiB behind, the server cancels its request with a `slow_client` error and frees its memory. A disconnected client is noticed within one pass.
 
+## `POST /v1/audio/transcriptions`
+
+Transcribes speech with the `--whisper` model. The body is `multipart/form-data`, as OpenAI's API takes it:
+
+```sh
+curl http://127.0.0.1:8080/v1/audio/transcriptions \
+  -F model=whisper-1 -F file=@speech.wav -F language=en
+```
+
+```json
+{"text": "The quick brown fox jumps over the lazy dog."}
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `file` | required | A WAV file |
+| `model` | the transcription model | Must equal `--transcription-model-name` (otherwise 404) |
+| `language` | detected | ISO 639-1 code such as `en` |
+| `response_format` | `json` | `json` or `text` (plain text body) |
+| `temperature` | 0 | Only 0: decoding is greedy |
+
+`prompt`, timestamps and the `srt`, `vtt` and `verbose_json` formats are rejected with 400. Clips longer than 30 s are decoded in consecutive 30-second windows. A full transcription queue answers 429.
+
+## `POST /v1/audio/translations`
+
+Takes the same form and returns English text translated from the speech. Whisper large-v3-turbo was not trained for translation, so prefer a multilingual checkpoint such as large-v3 for this endpoint.
+
 ## Errors
 
 Errors use OpenAI's shape:
@@ -97,10 +135,11 @@ Errors use OpenAI's shape:
 
 | Status | `type` / `code` | Cause |
 | --- | --- | --- |
-| 400 | `invalid_request_error` | Empty messages, unknown role, invalid sampling values, unsupported `tool_choice`, or a request the engine rejects (`invalid_request`) |
+| 400 | `invalid_request_error` | Empty messages, unknown role, invalid sampling values, unsupported `tool_choice`, undecodable or unsupported audio, or a request the engine rejects (`invalid_request`) |
 | 404 | `invalid_request_error` | Unknown `model` |
 | 408 | `timeout_error` / `slow_client` | A streaming client stopped reading |
-| 422 | (plain text) | The body doesn't deserialize, for example a non-text content part |
+| 413 | (plain text) | The body exceeds 64 MiB |
+| 422 | (plain text) | The body doesn't deserialize, for example an image content part |
 | 429 | `rate_limit_error` / `queue_full` | The queue already holds `--max-waiting` requests |
 | 503 | `server_error` / `insufficient_memory` | The request can't fit in memory even running alone |
 | 503 | `server_error` / `worker_unavailable` | The inference worker stopped |

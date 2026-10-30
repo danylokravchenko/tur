@@ -1,5 +1,7 @@
 //! Gemma 4 equations over the common packed weights and persistent state pools.
+use super::config::Audio as AudioSettings;
 use super::{Config, config::LayerKind};
+use crate::audio::{Audio, AudioPrompt};
 use crate::{
     hybrid::{
         Addresses, Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward,
@@ -15,12 +17,14 @@ use crate::{
 };
 use candle_core::{DType, Device, Tensor};
 use std::{collections::BTreeSet, path::Path, sync::Arc};
+use tur_core::execution::EmbeddedInput;
 use tur_core::{
     Result,
     execution::{ModelDescription, checked_elements, invalid},
 };
 use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
 mod assistant;
+mod audio;
 mod moe;
 
 struct Layer {
@@ -62,6 +66,8 @@ pub struct Gemma4 {
     ple: Option<PerLayer>,
     /// The published drafter, when loaded for speculative decoding.
     assistant: Option<assistant::Assistant>,
+    /// The audio encoder, when the checkpoint has one and the load requested it.
+    audio: Option<audio::AudioTower>,
     #[cfg(feature = "metal")]
     fused: Option<Fused>,
 }
@@ -90,6 +96,18 @@ fn assistant_dir(head: &crate::models::DraftHead) -> Result<&Path> {
     head.model
         .as_deref()
         .ok_or_else(|| invalid("Gemma 4 drafting needs an assistant checkpoint (--draft-model)"))
+}
+
+/// Storage of the audio encoder's projections when this load includes it: requested,
+/// declared by the checkpoint, and converted from `SafeTensors` (prepacked artifacts
+/// carry the text tower only).
+fn audio_precision(config: &Config, options: &LoadOptions) -> Option<crate::models::Precision> {
+    let text_f32 = match &options.weights {
+        Weights::Prepacked(_) => return None,
+        Weights::Uniform(format) => *format == crate::models::WeightFormat::F32,
+        Weights::Plan(_) => false,
+    };
+    (options.audio && config.audio.is_some()).then(|| audio::precision(text_f32))
 }
 
 fn format_plan(config: &Config, options: &LoadOptions) -> Result<WeightPlan> {
@@ -347,6 +365,23 @@ impl Gemma4 {
             .as_ref()
             .map(|head| assistant::Assistant::load(assistant_dir(head)?, &config, options))
             .transpose()?;
+        let audio = match (audio_precision(&config, options), &config.audio) {
+            (Some(precision), Some(settings)) => {
+                // Clip framing tokens are ordinary prompt tokens once the encoder exists.
+                config
+                    .forbidden
+                    .retain(|id| *id != settings.begin && *id != settings.end);
+                Some(audio::AudioTower::load(
+                    dir,
+                    &t.checkpoint,
+                    settings,
+                    config.hidden_size(),
+                    precision,
+                    &options.device,
+                )?)
+            }
+            _ => None,
+        };
         let (description, _, _) = Self::memory_requirements(&config, options, 1, &[1])?;
         Self {
             config,
@@ -358,6 +393,7 @@ impl Gemma4 {
             layers,
             ple,
             assistant,
+            audio,
             #[cfg(feature = "metal")]
             fused: None,
         }
@@ -410,6 +446,76 @@ impl Gemma4 {
     /// Validated Gemma 4 settings.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+    /// How a clip appears in prompts, when the audio encoder is loaded.
+    pub fn audio_prompt(&self) -> Option<AudioPrompt> {
+        let settings = self
+            .config
+            .audio
+            .as_ref()
+            .filter(|_| self.audio.is_some())?;
+        Some(AudioPrompt {
+            placeholder: settings.token,
+            begin: settings.begin,
+            end: settings.end,
+            slot: self.config.text.pad_token_id.unwrap_or(0),
+        })
+    }
+    /// Soft tokens a clip occupies in the prompt, or an error outside 40 ms to 30 s.
+    pub fn audio_tokens(&self, clip: &Audio) -> Result<usize> {
+        if self.audio.is_none() {
+            return Err(invalid("this model has no audio encoder loaded"));
+        }
+        Some(audio::soft_tokens(clip.samples().len()))
+            .filter(|&n| n > 0 && n <= AudioSettings::MAX_TOKENS)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "Gemma 4 audio clips must be between 40 ms and 30 s; this one is {:.2} s",
+                    clip.duration().as_secs_f64()
+                ))
+            })
+    }
+    /// F32 `[audio_tokens, hidden]` soft tokens of a clip, enqueued on the model device.
+    pub fn encode_audio(&self, clip: &Audio) -> Result<Tensor> {
+        self.audio
+            .as_ref()
+            .ok_or_else(|| invalid("this model has no audio encoder loaded"))?
+            .encode(clip)
+    }
+    /// Scaled token embeddings of the packed spans, with embedded inputs in place of
+    /// their rows. Rows of sequences that failed validation are skipped with them.
+    fn embed(&self, batch: &PackedForward<'_>, spans: &[Span<'_>], ids: &Tensor) -> Result<Tensor> {
+        let x =
+            (self.embedding.rows(ids, &self.head)? * (self.config.hidden_size() as f64).sqrt())?;
+        if batch.embeddings.is_empty() {
+            return Ok(x);
+        }
+        let mut pieces = Vec::new();
+        let mut cursor = 0;
+        for input in batch.embeddings {
+            let Some(span) = spans.iter().find(|s| {
+                s.sequence.tokens.start <= input.tokens.start
+                    && input.tokens.end <= s.sequence.tokens.end
+            }) else {
+                continue;
+            };
+            let start = span.start + (input.tokens.start - span.sequence.tokens.start);
+            if start < cursor
+                || input.rows.dims2()? != (input.tokens.len(), self.config.hidden_size())
+            {
+                return Err(invalid("embedded input rows do not match the model width"));
+            }
+            if start > cursor {
+                pieces.push(x.narrow(0, cursor, start - cursor)?);
+            }
+            pieces.push(input.rows.to_device(&self.device)?);
+            cursor = start + input.tokens.len();
+        }
+        let rows = x.dim(0)?;
+        if cursor < rows {
+            pieces.push(x.narrow(0, cursor, rows - cursor)?);
+        }
+        Ok(Tensor::cat(&pieces, 0)?)
     }
     /// Whether common Metal kernels or Candle reference operations execute passes.
     pub fn execution(&self) -> Execution {
@@ -477,6 +583,7 @@ impl Gemma4 {
                 .assistant
                 .as_ref()
                 .map_or(0, assistant::Assistant::bytes)
+            + self.audio.as_ref().map_or(0, audio::AudioTower::bytes)
     }
 
     /// Plan packed weights, per-layer embedding storage and peak activations before loading.
@@ -487,9 +594,11 @@ impl Gemma4 {
         contexts: &[usize],
     ) -> Result<(ModelDescription, usize, usize)> {
         let plan = format_plan(config, options)?;
+        let audio = audio_precision(config, options);
         let description = config.description(
             format!("{}#{}", options.revision, options.weights.tag()),
             options.kv,
+            audio.is_some(),
         )?;
         let projections = config.projection_layout()?;
         let mut accounted: BTreeSet<String> = projections
@@ -498,6 +607,11 @@ impl Gemma4 {
             .collect();
         accounted.insert(format!("{}.embed_tokens.weight", config.prefix));
         let mut weights = plan.bytes(config)?;
+        if let (Some(precision), Some(settings)) = (audio, &config.audio) {
+            weights = audio::planned_bytes(settings, config.hidden_size(), precision)?
+                .checked_add(weights)
+                .ok_or_else(|| invalid("Gemma 4 weight bytes overflow"))?;
+        }
         if let Some(head) = &options.mtp {
             weights = assistant::Assistant::planned_bytes(assistant_dir(head)?, config, options)?
                 .checked_add(weights)
@@ -594,8 +708,8 @@ impl Gemma4 {
             positions.extend_from_slice(&batch.positions[s.sequence.tokens.clone()]);
         }
         let ids = Tensor::new(tokens.as_slice(), &self.device)?;
-        let x =
-            (self.embedding.rows(&ids, &self.head)? * (self.config.hidden_size() as f64).sqrt())?;
+        // Per-layer inputs read the embedded rows too, and the slot token's identity row.
+        let x = self.embed(batch, spans, &ids)?;
         let inputs = self.inputs(&ids, &x)?;
         let pass = Pass {
             pool: batch.pool,
@@ -1063,8 +1177,14 @@ impl Gemma4 {
             sequence,
         })
     }
-    /// Run a fresh sequence and return per-layer residual streams and selected logits.
-    pub fn trace(&self, tokens: &[u32], rows: &[usize]) -> Result<(Vec<Tensor>, Tensor)> {
+    /// Run a fresh sequence, with `embeddings` replacing rows of its token embeddings, and
+    /// return per-layer residual streams and selected logits.
+    pub fn trace(
+        &self,
+        tokens: &[u32],
+        rows: &[usize],
+        embeddings: &[EmbeddedInput],
+    ) -> Result<(Vec<Tensor>, Tensor)> {
         let pool = StatePool::new(
             Arc::new(self.description.clone()),
             &self.device,
@@ -1086,6 +1206,7 @@ impl Gemma4 {
         };
         let sequences = [sequence];
         let batch = PackedForward {
+            embeddings,
             tokens,
             positions: &positions,
             sequences: &sequences,

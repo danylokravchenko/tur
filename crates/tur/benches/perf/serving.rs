@@ -1009,6 +1009,7 @@ pub(crate) fn run() -> Result<()> {
         recurrent: std::env::var("TUR_BENCH_STATE")
             .map_or(Ok(DEFAULT_RECURRENT_STATE), |s| parse_recurrent_state(&s))
             .map_err(TurError::Other)?,
+        audio: false,
     };
     let bench = Bench {
         factory: &factory,

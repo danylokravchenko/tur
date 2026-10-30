@@ -1,18 +1,19 @@
 # Command line
 
-`tur` has three commands:
+`tur` has four commands:
 
 ```text
-tur run       Generate one completion and stream it to stdout
-tur serve     Serve one model over an OpenAI-compatible HTTP API
-tur quantize  Prepack weights offline, optionally calibrated, for instant loading
+tur run         Generate one completion and stream it to stdout
+tur serve       Serve one model over an OpenAI-compatible HTTP API
+tur transcribe  Transcribe a WAV file with a Whisper checkpoint
+tur quantize    Prepack weights offline, optionally calibrated, for instant loading
 ```
 
 `tur <command> --help` prints every flag. This page groups the flags by purpose and gives their defaults.
 
 ## Configuration
 
-`run` and `serve` read `./tur.toml` if it exists; see [Configuration](configuration.md) for the file format and the settings that only the file exposes. Flags override `TUR_MODEL` and `TUR_REVISION`, which override the file. `--config <path>` picks another file and `--no-config` skips it.
+`run`, `serve` and `transcribe` read `./tur.toml` if it exists; see [Configuration](configuration.md) for the file format and the settings that only the file exposes. Flags override `TUR_MODEL` and `TUR_REVISION`, which override the file. `--config <path>` picks another file and `--no-config` skips it.
 
 ## Model and state (`run`, `serve`)
 
@@ -24,6 +25,7 @@ tur quantize  Prepack weights offline, optionally calibrated, for instant loadin
 | `--kv-format f32\|f16\|q8\|q8_<group>` | `f16` | Storage for attention keys and values; `q8` uses one scale per 32 values |
 | `--kv-page-tokens <n>` | 16 | Tokens per K/V page |
 | `--recurrent-state f32\|f16` | `f32` | Storage for DeltaNet recurrent state |
+| `--audio-encoder [true\|false]` | `true` | Load the checkpoint's audio encoder when it has one (Gemma 4 E2B and E4B); `false` saves its memory |
 | `--cpu-reference` | off | Run the slow F32 CPU reference instead of Metal, for development |
 
 Gemma 4 uses the same commands. For the E2B model used in development:
@@ -70,6 +72,7 @@ Speculation needs F32 recurrent state. With `--recurrent-state f16`, Tur logs a 
 | `--reasoning-effort low\|medium\|xhigh` | template default | Passed to the chat template |
 | `--preserve-thinking true\|false` | template default | Passed to the chat template |
 | `--tools <file>` | none | JSON array of `{name, description, parameters}` function definitions |
+| `--audio <file.wav>` | none | A clip placed before the prompt, for models with an audio encoder |
 
 Sampling settings you leave out come from the checkpoint's `generation_config.json`. Thinking settings you leave out keep the template's defaults, and Tur adds nothing to the prompt.
 
@@ -84,6 +87,26 @@ Sampling settings you leave out come from the checkpoint's `generation_config.js
 | `--max-waiting <n>` | 256 | Queued requests before new ones get HTTP 429 |
 | `--request-timeout-secs <n>` | none | Fail requests not finished this long after arrival (HTTP 504) |
 | `--prefix-snapshots <n>` | one per running request | Prefix snapshots kept for reuse; 0 turns prefix reuse off |
+| `--transcription-model-name <id>` | `whisper-1` | The model ID of `--whisper` at `/v1/audio/*` and in `/v1/models` |
+| `--max-waiting-transcriptions <n>` | 16 | Queued clips before new ones get HTTP 429 |
+
+## Speech to text (`serve`, `transcribe`)
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--whisper <dir or org/name>` | none | Whisper checkpoint; `serve` loads it beside the chat model |
+| `--whisper-revision <rev>` | required with `--whisper` | A 40-character commit for remote models, or a name for local ones |
+| `--whisper-weight-format f32\|q8_0\|q4k` | `q8_0` | Storage for Whisper's projections |
+| `--language <code>` | detected | `transcribe` only: spoken language, such as `en` |
+| `--translate` | off | `transcribe` only: write English text instead of a transcript |
+
+```sh
+tur transcribe --whisper openai/whisper-large-v3-turbo \
+  --whisper-revision 41f01f3fe87f28c78e2fbf8b568835947dd65ed9 speech.wav
+
+tur run --model google/gemma-4-E2B-it --revision 3e22461f65e89153144f8adb70e3b8c2cc9845a7 \
+  --audio speech.wav --prompt 'Summarize this recording.' --thinking false
+```
 
 ## Quantization (`quantize`)
 

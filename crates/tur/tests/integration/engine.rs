@@ -63,6 +63,7 @@ fn load(dir: &Path, format: WeightFormat, device: Device) -> Result<Arc<Qwen35>>
             kv: EXACT_KV,
             recurrent: candle_core::DType::F32,
             mtp: None,
+            audio: false,
         },
     )?))
 }
@@ -110,6 +111,7 @@ impl Runner {
     /// Submit `(request, tokens)` pairs with an output at each last token; returns tokens.
     fn step(&mut self, items: &[(StateHandle, Vec<u32>)]) -> Result<Vec<u32>> {
         let mut plan = PackedExecution {
+            embeddings: Vec::new(),
             tokens: Vec::new(),
             positions: Vec::new(),
             sequences: Vec::new(),
@@ -233,6 +235,7 @@ fn test_speculative_verification_reproduces_greedy_decode() -> Result<()> {
         let meta = runner.engine.metadata(h.request)?;
         let n = drafts.len();
         runner.engine.submit(PackedExecution {
+            embeddings: Vec::new(),
             positions: (0..n).map(|i| meta.position + i).collect(),
             tokens: drafts,
             sequences: vec![SequenceDescriptor {
@@ -266,6 +269,7 @@ fn test_vision_placeholders_fail_only_their_request() -> Result<()> {
         .engine
         .allocate(0, SamplingOptions::default(), None)?;
     let plan = PackedExecution {
+        embeddings: Vec::new(),
         tokens: vec![5, 6, 95, 7],
         positions: vec![0, 1, 0, 1],
         sequences: vec![
@@ -383,6 +387,7 @@ fn real(format: WeightFormat) -> Result<Real> {
             kv: EXACT_KV,
             recurrent: candle_core::DType::F32,
             mtp: None,
+            audio: false,
         },
     )?);
     let generation = std::fs::read_to_string(dir.join("generation_config.json")).ok();
@@ -527,6 +532,7 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
                     vocab: None,
                     model: None,
                 }),
+                audio: false,
             },
         )?;
         let description = model.description();
@@ -544,6 +550,7 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
         let binding = reservation.binding();
         let positions: Vec<usize> = (0..count).collect();
         let mut steps = model.forward(&PackedForward {
+            embeddings: &[],
             tokens: &tokens[..count],
             positions: &positions,
             sequences: &[SequenceForward {

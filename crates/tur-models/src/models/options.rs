@@ -133,6 +133,9 @@ pub struct LoadOptions {
     pub recurrent: DType,
     /// Load the checkpoint's native multi-token prediction head ([`super::qwen3_5::Config::with_mtp`]).
     pub mtp: Option<DraftHead>,
+    /// Load the checkpoint's audio encoder, when it declares one. Prepacked artifacts
+    /// hold the text tower only and load without it.
+    pub audio: bool,
 }
 
 /// A native multi-token prediction drafter, loaded for drafting: Qwen3.5's head inside

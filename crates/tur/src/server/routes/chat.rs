@@ -13,26 +13,28 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::audio::Audio;
 use crate::{
     backend::{
-        chat_template::{ChatMessage, RenderOptions, Role, ToolCall},
+        chat_template::{ChatMessage, Content, ContentPart, RenderOptions, Role, ToolCall},
         pipeline::{GenerationRequest, GenerationStats},
         tools::ToolDefinition,
     },
     hybrid::SamplingOptions,
     server::{
-        AppState,
+        AppState, media,
         types::{
             ApiErrorBody, ApiErrorResponse, AssistantFunction, AssistantToolCall, ChatChoice,
             ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
-            ChatResponseMessage, ChunkChoice, DeltaFunction, DeltaMessage, DeltaToolCall,
-            MessageContent, PromptTokensDetails, ResponseFunction, ResponseToolCall, Usage,
+            ChatResponseMessage, ChunkChoice, ContentPart as Part, DeltaFunction, DeltaMessage,
+            DeltaToolCall, MessageContent, PromptTokensDetails, ResponseFunction, ResponseToolCall,
+            Usage,
         },
         worker::WorkerMsg,
     },
 };
 
-fn execution_error(error: &crate::TurError) -> (StatusCode, ApiErrorResponse) {
+pub(crate) fn execution_error(error: &crate::TurError) -> (StatusCode, ApiErrorResponse) {
     use crate::TurError;
     let (status, error_type, code) = match error {
         TurError::QueueFull(_) => (
@@ -90,6 +92,63 @@ fn new_completion_id() -> String {
     format!("chatcmpl-{}", Uuid::new_v4().simple())
 }
 
+fn wav(bytes: &[u8]) -> crate::Result<ContentPart> {
+    Ok(ContentPart::Audio(Audio::from_wav(bytes)?))
+}
+
+/// Decode a request's content; audio parts are decoded and resampled here, so callers run
+/// this off the async executor.
+fn to_internal_content(content: &MessageContent) -> crate::Result<Content> {
+    let parts = match content {
+        MessageContent::Text(text) => return Ok(Content::Text(text.clone())),
+        MessageContent::Parts(parts) => parts,
+    };
+    let unsupported = |what: &str| {
+        crate::core::execution::invalid(format!(
+            "unsupported audio {what}: send WAV (input_audio format \"wav\")"
+        ))
+    };
+    let mut internal = Vec::with_capacity(parts.len());
+    for part in parts {
+        internal.push(match part {
+            Part::Text { text } => ContentPart::Text(text.clone()),
+            Part::InputAudio { input_audio } => {
+                if input_audio
+                    .format
+                    .as_deref()
+                    .is_some_and(|f| !f.eq_ignore_ascii_case("wav"))
+                {
+                    return Err(unsupported("format"));
+                }
+                wav(&media::base64(&input_audio.data)?)?
+            }
+            Part::AudioUrl { audio_url } => {
+                let (media_type, bytes) = media::data_url(&audio_url.url)?;
+                if !matches!(
+                    media_type.as_str(),
+                    "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/vnd.wave"
+                ) {
+                    return Err(unsupported("media type"));
+                }
+                wav(&bytes)?
+            }
+        });
+    }
+    // Text-only parts render exactly like string content.
+    if internal.iter().all(|p| matches!(p, ContentPart::Text(_))) {
+        return Ok(Content::Text(
+            internal
+                .into_iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text(text) => Some(text),
+                    ContentPart::Audio(_) => None,
+                })
+                .collect(),
+        ));
+    }
+    Ok(Content::Parts(internal))
+}
+
 fn to_internal_messages(
     msgs: &[crate::server::types::ChatMessage],
 ) -> crate::Result<Vec<ChatMessage>> {
@@ -127,8 +186,7 @@ fn to_internal_messages(
                 content: m
                     .content
                     .as_ref()
-                    .map(MessageContent::as_text)
-                    .unwrap_or_default(),
+                    .map_or_else(|| Ok(Content::Text(String::new())), to_internal_content)?,
                 reasoning_content: m.reasoning_content.clone(),
                 tool_calls,
             })
@@ -149,7 +207,7 @@ fn to_internal_tools(tools: &[crate::server::types::OpenAITool]) -> Vec<ToolDefi
 
 pub async fn chat_completions(
     State(state): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
+    Json(mut req): Json<ChatCompletionRequest>,
 ) -> Response {
     if req.messages.is_empty() {
         return (
@@ -180,12 +238,21 @@ pub async fn chat_completions(
         }
     };
 
-    let messages = match to_internal_messages(&req.messages) {
-        Ok(messages) => messages,
-        Err(error) => {
+    let input = std::mem::take(&mut req.messages);
+    let converted = tokio::task::spawn_blocking(move || to_internal_messages(&input)).await;
+    let messages = match converted {
+        Ok(Ok(messages)) => messages,
+        Ok(Err(error)) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ApiErrorResponse::bad_request(error.to_string())),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse::internal("message decoding failed")),
             )
                 .into_response();
         }

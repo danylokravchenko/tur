@@ -657,6 +657,7 @@ impl Qwen35 {
             hidden: false,
         }];
         let batch = PackedForward {
+            embeddings: &[],
             tokens,
             positions: &positions,
             sequences: &sequences,
@@ -1183,6 +1184,9 @@ impl HybridModel for Qwen35 {
             return Err(invalid(
                 "state pool was built for another model layout or device",
             ));
+        }
+        if !batch.embeddings.is_empty() {
+            return Err(invalid("Qwen3.5 accepts text input only"));
         }
         let mut results: Vec<Option<Result<SequenceStep>>> =
             batch.sequences.iter().map(|_| None).collect();

@@ -206,6 +206,7 @@ impl InferencePipeline {
         if tokens.is_empty() {
             return Err(invalid("chat template produced an empty prompt"));
         }
+        let (tokens, audio) = self.expand_audio(&request.messages, tokens)?;
         // The final sampled token need not be consumed into model state.
         let positions = tokens
             .len()
@@ -259,7 +260,13 @@ impl InferencePipeline {
             })
             .transpose()?;
         let handle = self.engine.allocate(request.seed, options, guidance)?;
-        self.engine.add_context(handle, &tokens)?;
+        // Audio positions are not tokens the repetition penalty could see repeated.
+        let text: Vec<u32> = tokens
+            .iter()
+            .copied()
+            .filter(|&t| !super::audio::is_identity(t))
+            .collect();
+        self.engine.add_context(handle, &text)?;
         let keys = self.prefix.keys(request.cache_salt.as_deref(), &tokens);
         self.pending.insert(
             handle.request,
@@ -268,6 +275,7 @@ impl InferencePipeline {
                 prompt_tokens: tokens.len(),
                 turn_boundary,
                 tokens,
+                audio,
                 consumed: 0,
                 boundaries: Vec::new(),
                 replay_floor: 0,

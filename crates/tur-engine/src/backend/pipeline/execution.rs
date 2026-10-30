@@ -16,6 +16,7 @@ impl InferencePipeline {
     /// position, for verification. Returns the plan and its longest resulting context.
     fn pack(&self, chunks: &[Chunk], drafts: &[Vec<u32>]) -> Result<(PackedExecution, usize)> {
         let mut plan = PackedExecution {
+            embeddings: Vec::new(),
             tokens: Vec::new(),
             positions: Vec::new(),
             sequences: Vec::with_capacity(chunks.len()),
@@ -35,7 +36,16 @@ impl InferencePipeline {
                 .get(pending.consumed..end)
                 .ok_or_else(|| invalid("chunk beyond the request's tokens"))?;
             let start = plan.tokens.len();
-            plan.tokens.extend_from_slice(input);
+            if pending.audio.is_empty() {
+                plan.tokens.extend_from_slice(input);
+            } else {
+                self.embedded(
+                    &pending.audio,
+                    input,
+                    (pending.consumed, start),
+                    (&mut plan.tokens, &mut plan.embeddings),
+                )?;
+            }
             plan.tokens.extend_from_slice(draft);
             let end = end
                 .checked_add(draft.len())
@@ -203,10 +213,8 @@ impl InferencePipeline {
                     pending.drafted += drafted;
                     pending.accepted_drafts += accepted;
                 }
-                let (confidences, greedy) = self
-                    .pending
-                    .get_mut(&id)
-                    .map_or((Vec::new(), false), |p| {
+                let (confidences, greedy) =
+                    self.pending.get_mut(&id).map_or((Vec::new(), false), |p| {
                         (std::mem::take(&mut p.mtp_verifying), p.greedy)
                     });
                 let stats = &mut self.speculation_stats;
@@ -223,8 +231,11 @@ impl InferencePipeline {
                         stats.mtp_accepted += accepted as u64;
                         // Each draft the verification reached: those after a rejection
                         // were never tested.
-                        for (depth, &confidence) in
-                            confidences.iter().enumerate().take(drafted).take(accepted + 1)
+                        for (depth, &confidence) in confidences
+                            .iter()
+                            .enumerate()
+                            .take(drafted)
+                            .take(accepted + 1)
                         {
                             let hit = depth < accepted;
                             self.calibration[usize::from(greedy)].observe(confidence, hit);

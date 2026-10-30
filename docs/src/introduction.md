@@ -1,6 +1,6 @@
 # Introduction
 
-Tur is a Rust inference engine for language models on Apple Silicon. It runs Qwen3.5-family hybrid models and Gemma 4 text models on the Mac's GPU, and you can use it from the command line, through an OpenAI-compatible HTTP server, or as a Rust library.
+Tur is a Rust inference engine for language models on Apple Silicon. It runs Qwen3.5-family hybrid models and Gemma 4 models on the Mac's GPU, with audio input for Gemma 4 E2B and E4B and Whisper transcription, and you can use it from the command line, through an OpenAI-compatible HTTP server, or as a Rust library.
 
 ## What makes it fast
 
@@ -20,7 +20,7 @@ Prepacked weights load as stored. `tur quantize` writes 4-bit or 8-bit weights, 
 
 ## Status
 
-Qwen3.5-0.8B and Gemma 4 E2B are validated against pinned Transformers references and run on real checkpoints. Larger Qwen and Gemma sizes share the same code and pass configuration and small-fixture checks, but their full checkpoints haven't been run yet. [Scope and principles](design/scope.md) lists the evidence for each model. Tur accepts text input only.
+Qwen3.5-0.8B and Gemma 4 E2B are validated against pinned Transformers references and run on real checkpoints. Larger Qwen and Gemma sizes share the same code and pass configuration and small-fixture checks, but their full checkpoints haven't been run yet. [Scope and principles](design/scope.md) lists the evidence for each model. Tur accepts text and WAV audio; image and video input are rejected (see [Audio](architecture/audio.md)).
 
 Every measurement in this book comes from one Apple M1 with 16 GB unless it says otherwise. [Measured performance](guide/performance.md) collects them.
 

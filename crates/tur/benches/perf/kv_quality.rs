@@ -78,6 +78,7 @@ impl Runner {
                 kv: KvLayout::new(16, format),
                 recurrent,
                 mtp: None,
+                audio: false,
             },
         )?;
         let pool = StatePool::new(
@@ -105,6 +106,7 @@ impl Runner {
         let step = self
             .model
             .forward(&PackedForward {
+                embeddings: &[],
                 tokens: chunk,
                 positions: &positions,
                 sequences: &[SequenceForward {
@@ -136,6 +138,7 @@ impl Runner {
             let step = self
                 .model
                 .forward(&PackedForward {
+                    embeddings: &[],
                     tokens: &[next],
                     positions: &[state.position()],
                     sequences: &[SequenceForward {

@@ -10,7 +10,7 @@
 //! The axum router is exercised via `tower::ServiceExt::oneshot` (no TCP
 //! socket needed) for single-request tests, and via a shared `axum::Router`
 //! clone for concurrent-request tests.
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -101,10 +101,12 @@ fn mock_tool_call_worker(
 }
 
 fn test_state(response_text: &'static str) -> AppState {
-    let mut workers = std::collections::HashMap::new();
+    let mut workers = HashMap::new();
     workers.insert("test-model".to_string(), mock_worker(response_text));
     AppState {
         workers,
+        transcribers: HashMap::new(),
+        default_transcriber: None,
         default_model: "test-model".to_string(),
     }
 }
@@ -202,13 +204,15 @@ async fn test_chat_empty_messages_returns_400() -> TestResult {
 
 #[tokio::test]
 async fn test_tool_call_response_has_correct_structure() -> TestResult {
-    let mut workers = std::collections::HashMap::new();
+    let mut workers = HashMap::new();
     workers.insert(
         "test-model".to_string(),
         mock_tool_call_worker("get_weather", r#"{"location": "Paris", "unit": "celsius"}"#)?,
     );
     let app = build_router(AppState {
         workers,
+        transcribers: HashMap::new(),
+        default_transcriber: None,
         default_model: "test-model".to_string(),
     });
 

@@ -9,25 +9,29 @@ pub enum MessageContent {
     Parts(Vec<ContentPart>),
 }
 
-impl MessageContent {
-    pub fn as_text(&self) -> String {
-        match self {
-            Self::Text(s) => s.clone(),
-            Self::Parts(parts) => parts
-                .iter()
-                .map(|p| match p {
-                    ContentPart::Text { text } => text.as_str(),
-                })
-                .collect::<Vec<_>>()
-                .join(""),
-        }
-    }
-}
-
+/// A typed content part: text, or audio as `OpenAI`'s `input_audio` (base64 data) or a
+/// `data:` URL in the `audio_url` form other servers accept. Other part types fail to
+/// deserialize, so the request is rejected rather than silently stripped.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     Text { text: String },
+    InputAudio { input_audio: InputAudio },
+    AudioUrl { audio_url: MediaUrl },
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InputAudio {
+    /// Base64-encoded file bytes.
+    pub data: String,
+    /// Container format; only `wav` is decoded.
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MediaUrl {
+    pub url: String,
 }
 
 // ── Request ──────────────────────────────────────────────────────────────────
@@ -216,6 +220,12 @@ pub struct ModelObject {
     pub object: &'static str,
     pub created: u64,
     pub owned_by: &'static str,
+}
+
+/// `json` response of the speech-to-text endpoints.
+#[derive(Debug, Serialize)]
+pub struct TranscriptionResponse {
+    pub text: String,
 }
 
 #[derive(Debug, Serialize)]

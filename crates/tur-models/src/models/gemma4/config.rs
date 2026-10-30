@@ -63,9 +63,189 @@ pub(super) struct TextConfig {
     pub final_logit_softcapping: Option<f64>,
     pub use_bidirectional_attention: Option<String>,
     pub enable_moe_block: bool,
+    /// The embedding row Transformers looks up at multimodal positions (default 0).
+    #[serde(default)]
+    pub pad_token_id: Option<u32>,
     pub num_experts: Option<usize>,
     pub top_k_experts: Option<usize>,
     pub moe_intermediate_size: Option<usize>,
+}
+
+/// The USM-style conformer audio encoder of Gemma 4 E2B and E4B.
+#[derive(Clone, Debug, Deserialize)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "fields mirror the checkpoint architecture"
+)]
+pub(super) struct AudioConfig {
+    pub hidden_size: usize,
+    pub num_attention_heads: usize,
+    pub num_hidden_layers: usize,
+    pub subsampling_conv_channels: Vec<usize>,
+    pub output_proj_dims: usize,
+    pub conv_kernel_size: usize,
+    pub attention_chunk_size: usize,
+    pub attention_context_left: usize,
+    pub attention_context_right: usize,
+    pub attention_logit_cap: f64,
+    pub attention_invalid_logits_value: f64,
+    pub residual_weight: f64,
+    pub gradient_clipping: f64,
+    pub hidden_act: String,
+    pub rms_norm_eps: f64,
+    pub use_clipped_linears: bool,
+}
+
+/// The audio tower's settings and the prompt tokens that frame its soft tokens.
+#[derive(Clone, Debug)]
+pub(super) struct Audio {
+    pub config: AudioConfig,
+    /// `<|audio|>`: one per soft token.
+    pub token: u32,
+    /// `<|audio>` and `<audio|>` around a clip's soft tokens.
+    pub begin: u32,
+    pub end: u32,
+}
+
+impl Audio {
+    /// Mel bins of the feature extractor (Transformers' `Gemma4AudioFeatureExtractor`).
+    pub(super) const MELS: usize = 128;
+    /// Soft tokens of one clip at most: 30 s at 40 ms each (`audio_seq_length`).
+    pub(super) const MAX_TOKENS: usize = 750;
+
+    fn parse(raw: &serde_json::Value, vocab: usize) -> Result<Option<Self>> {
+        let Some(section) = raw.get("audio_config").filter(|v| !v.is_null()) else {
+            return Ok(None);
+        };
+        let config: AudioConfig = serde_json::from_value(section.clone())?;
+        let heads = config.num_attention_heads;
+        if section["model_type"].as_str() != Some("gemma4_audio")
+            || config.hidden_act != "silu"
+            || heads == 0
+            || config.hidden_size == 0
+            || !config.hidden_size.is_multiple_of(heads)
+            || config.num_hidden_layers == 0
+            || config.subsampling_conv_channels.len() != 2
+            || config.subsampling_conv_channels.contains(&0)
+            || config.conv_kernel_size == 0
+            || config.output_proj_dims == 0
+            // Relative positions then index exactly the causal window (see `audio.rs`).
+            || config.attention_context_right != 0
+            || config.attention_context_left < 2
+            || config.attention_chunk_size + 1 != config.attention_context_left
+            || [config.attention_logit_cap, config.rms_norm_eps, config.gradient_clipping]
+                .iter()
+                .any(|v| v.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater))
+            || !config.residual_weight.is_finite()
+        {
+            return Err(invalid("unsupported Gemma 4 audio encoder configuration"));
+        }
+        let token = |key: &str| -> Result<u32> {
+            let id = raw[key]
+                .as_u64()
+                .and_then(|id| u32::try_from(id).ok())
+                .filter(|&id| (id as usize) < vocab)
+                .ok_or_else(|| invalid(format!("Gemma 4 audio needs a valid {key}")))?;
+            Ok(id)
+        };
+        Ok(Some(Self {
+            config,
+            token: token("audio_token_id")?,
+            begin: token("boa_token_id")?,
+            end: raw
+                .get("eoa_token_id")
+                .filter(|v| !v.is_null())
+                .map_or_else(|| token("eoa_token_index"), |_| token("eoa_token_id"))?,
+        }))
+    }
+
+    /// Head width of the encoder's attention.
+    pub(super) fn head_dim(&self) -> usize {
+        self.config.hidden_size / self.config.num_attention_heads
+    }
+
+    /// Checkpoint tensors of the tower and its projector into the text model, with shapes.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one entry per tensor of the encoder's fixed layout"
+    )]
+    pub(super) fn weight_shapes(&self, text_hidden: usize) -> BTreeMap<String, Vec<usize>> {
+        let c = &self.config;
+        let (h, [c0, c1]) = (
+            c.hidden_size,
+            [
+                c.subsampling_conv_channels[0],
+                c.subsampling_conv_channels[1],
+            ],
+        );
+        let mut shapes = BTreeMap::new();
+        let mut add = |name: String, shape: Vec<usize>| {
+            shapes.insert(name, shape);
+        };
+        let tower = "model.audio_tower";
+        let sub = format!("{tower}.subsample_conv_projection");
+        add(format!("{sub}.layer0.conv.weight"), vec![c0, 1, 3, 3]);
+        add(format!("{sub}.layer0.norm.weight"), vec![c0]);
+        add(format!("{sub}.layer1.conv.weight"), vec![c1, c0, 3, 3]);
+        add(format!("{sub}.layer1.norm.weight"), vec![c1]);
+        add(
+            format!("{sub}.input_proj_linear.weight"),
+            vec![h, Self::MELS / 4 * c1],
+        );
+        let clipped = |add: &mut dyn FnMut(String, Vec<usize>), name: String, rows, cols| {
+            add(format!("{name}.linear.weight"), vec![rows, cols]);
+            if c.use_clipped_linears {
+                for bound in ["input_min", "input_max", "output_min", "output_max"] {
+                    add(format!("{name}.{bound}"), Vec::new());
+                }
+            }
+        };
+        for i in 0..c.num_hidden_layers {
+            let layer = format!("{tower}.layers.{i}");
+            for ff in ["feed_forward1", "feed_forward2"] {
+                clipped(&mut add, format!("{layer}.{ff}.ffw_layer_1"), 4 * h, h);
+                clipped(&mut add, format!("{layer}.{ff}.ffw_layer_2"), h, 4 * h);
+                add(format!("{layer}.{ff}.pre_layer_norm.weight"), vec![h]);
+                add(format!("{layer}.{ff}.post_layer_norm.weight"), vec![h]);
+            }
+            for p in ["q_proj", "k_proj", "v_proj", "post"] {
+                clipped(&mut add, format!("{layer}.self_attn.{p}"), h, h);
+            }
+            add(
+                format!("{layer}.self_attn.relative_k_proj.weight"),
+                vec![h, h],
+            );
+            add(
+                format!("{layer}.self_attn.per_dim_scale"),
+                vec![self.head_dim()],
+            );
+            clipped(&mut add, format!("{layer}.lconv1d.linear_start"), 2 * h, h);
+            clipped(&mut add, format!("{layer}.lconv1d.linear_end"), h, h);
+            add(
+                format!("{layer}.lconv1d.depthwise_conv1d.weight"),
+                vec![h, 1, c.conv_kernel_size],
+            );
+            for norm in ["lconv1d.pre_layer_norm", "lconv1d.conv_norm"] {
+                add(format!("{layer}.{norm}.weight"), vec![h]);
+            }
+            for norm in ["norm_pre_attn", "norm_post_attn", "norm_out"] {
+                add(format!("{layer}.{norm}.weight"), vec![h]);
+            }
+        }
+        add(
+            format!("{tower}.output_proj.weight"),
+            vec![c.output_proj_dims, h],
+        );
+        add(
+            format!("{tower}.output_proj.bias"),
+            vec![c.output_proj_dims],
+        );
+        add(
+            "model.embed_audio.embedding_projection.weight".into(),
+            vec![text_hidden, c.output_proj_dims],
+        );
+        shapes
+    }
 }
 
 /// Settings belonging to the Gemma 4 text tower, validated before weights are read.
@@ -77,6 +257,8 @@ pub struct Config {
     pub(super) eos: Vec<u32>,
     /// Each decoder layer's physical K/V owner; sharing layers allocate no extra state.
     pub(super) owners: Vec<usize>,
+    /// The audio encoder, when the checkpoint declares one.
+    pub(super) audio: Option<Audio>,
 }
 
 impl Config {
@@ -178,12 +360,14 @@ impl Config {
             };
             owners.push(owner);
         }
+        let audio = Audio::parse(&raw, settings.vocab_size)?;
         let config = Self {
             text: settings,
             prefix: prefix.into(),
             forbidden,
             eos,
             owners,
+            audio,
         };
         config.weight_shapes()?;
         Ok(config)
@@ -195,6 +379,11 @@ impl Config {
         json: Option<&str>,
     ) -> Result<crate::models::GenerationDefaults> {
         crate::models::generation::defaults(&self.eos, self.vocab_size(), json)
+    }
+
+    /// Whether the checkpoint declares an audio encoder.
+    pub fn has_audio(&self) -> bool {
+        self.audio.is_some()
     }
 
     /// Exclusive text position limit.
@@ -254,7 +443,13 @@ impl Config {
             .filter(|(j, owner)| **owner == *j)
             .count()
     }
-    pub(super) fn description(&self, revision: String, kv: KvLayout) -> Result<ModelDescription> {
+    /// The model's state and limits; `audio` declares that the encoder is loaded.
+    pub(super) fn description(
+        &self,
+        revision: String,
+        kv: KvLayout,
+        audio: bool,
+    ) -> Result<ModelDescription> {
         let description = ModelDescription {
             identity: ModelIdentity {
                 revision,
@@ -274,7 +469,11 @@ impl Config {
                 })
                 .collect(),
             kv,
-            modalities: vec![Modality::Text],
+            modalities: if audio {
+                vec![Modality::Text, Modality::Audio]
+            } else {
+                vec![Modality::Text]
+            },
             vocab_size: self.vocab_size(),
             max_position: self.max_position(),
         };

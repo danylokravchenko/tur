@@ -130,6 +130,7 @@ fn pass(model: &TextModel, pool: &StatePool, sequences: &[(&ModelState, &[u32])]
         })
         .collect();
     for result in model.forward(&PackedForward {
+        embeddings: &[],
         tokens: &packed,
         positions: &positions,
         sequences: &forwards,
@@ -155,6 +156,7 @@ fn prefilled(model: &TextModel, pool: &StatePool, prompt: &[u32]) -> Result<Mode
         let positions: Vec<usize> = (state.position()..state.position() + piece.len()).collect();
         model
             .forward(&PackedForward {
+                embeddings: &[],
                 tokens: piece,
                 positions: &positions,
                 sequences: &[SequenceForward {
@@ -245,6 +247,7 @@ fn engine_case(model: Arc<TextModel>, generated: usize) -> Result<Value> {
         // The device has no work queued from the previous completion until this submission.
         let gap = completed.map(|at| start.saturating_duration_since(at).as_secs_f64());
         engine.submit(PackedExecution {
+            embeddings: Vec::new(),
             positions: (meta.position..meta.position + n).collect(),
             tokens: std::mem::take(&mut next),
             sequences: vec![SequenceDescriptor {
@@ -372,6 +375,7 @@ pub(crate) fn run() -> Result<()> {
                             kv: KvLayout::new(page, kv),
                             recurrent,
                             mtp: None,
+                            audio: false,
                         },
                     )?;
                     let load_seconds = load_start.elapsed().as_secs_f64();

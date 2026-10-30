@@ -239,6 +239,7 @@ fn packed(
     speculative: bool,
 ) -> Result<PackedExecution> {
     let mut packed = PackedExecution {
+        embeddings: Vec::new(),
         tokens: Vec::new(),
         positions: Vec::new(),
         sequences: Vec::new(),
@@ -827,6 +828,7 @@ fn test_position_overflow_and_limit_are_checked() -> Result<()> {
     let (mut engine, model) = engine(fixture())?;
     let a = allocate(&mut engine, 1)?;
     let input = PackedExecution {
+        embeddings: Vec::new(),
         tokens: vec![1],
         positions: vec![usize::MAX],
         sequences: vec![SequenceDescriptor {

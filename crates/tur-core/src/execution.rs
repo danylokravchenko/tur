@@ -16,7 +16,8 @@ pub struct ModelIdentity {
     pub state_format: u32,
 }
 
-/// Input kinds a model accepts. Packed execution currently carries text tokens only.
+/// Input kinds a model accepts. Non-text inputs reach packed execution as
+/// [`EmbeddedInput`] rows that replace the embeddings of placeholder tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Modality {
     Text,
@@ -471,12 +472,25 @@ pub struct SequenceDescriptor {
     pub speculative: bool,
 }
 
+/// Encoder output that replaces the input embeddings of a packed token range, such as
+/// audio soft tokens. The tokens in the range still select the model's per-token inputs
+/// other than the main embedding (Gemma 4 passes its pad token there).
+#[derive(Clone, Debug)]
+pub struct EmbeddedInput {
+    /// Packed token range, within one sequence.
+    pub tokens: Range<usize>,
+    /// F32 `[tokens.len(), hidden]` rows, on the model's device.
+    pub rows: candle_core::Tensor,
+}
+
 /// Untrusted execution input; validate against current request metadata before use.
 #[derive(Clone, Debug)]
 pub struct PackedExecution {
     pub tokens: Vec<u32>,
     pub positions: Vec<usize>,
     pub sequences: Vec<SequenceDescriptor>,
+    /// Embedding overrides, in packed order; empty for text.
+    pub embeddings: Vec<EmbeddedInput>,
 }
 
 /// Immutable execution input with checked ranges, positions and unique state writes.
@@ -528,6 +542,38 @@ impl ValidatedExecution {
 }
 
 impl PackedExecution {
+    /// Embedded ranges are nonempty, ordered, disjoint, inside one sequence each, and
+    /// carry one F32 row per token; only a model accepting non-text input takes them.
+    fn validate_embeddings(&self, model: &ModelDescription) -> Result<()> {
+        if self.embeddings.is_empty() {
+            return Ok(());
+        }
+        if model.modalities.iter().all(|m| *m == Modality::Text) {
+            return Err(invalid("model accepts text input only"));
+        }
+        let mut cursor = 0;
+        for input in &self.embeddings {
+            let range = &input.tokens;
+            if range.start < cursor
+                || range.is_empty()
+                || !self
+                    .sequences
+                    .iter()
+                    .any(|s| s.tokens.start <= range.start && range.end <= s.tokens.end)
+            {
+                return Err(invalid(
+                    "embedded inputs must be ordered, disjoint ranges within one sequence",
+                ));
+            }
+            let (rows, width) = input.rows.dims2()?;
+            if rows != range.len() || width == 0 || input.rows.dtype() != DType::F32 {
+                return Err(invalid("embedded rows must be F32, one per token"));
+            }
+            cursor = range.end;
+        }
+        Ok(())
+    }
+
     /// Reject stale handles, aliased writes, holes, invalid tokens and out-of-range outputs.
     pub fn validate(
         self,
@@ -617,6 +663,16 @@ impl PackedExecution {
         if cursor != self.tokens.len() {
             return Err(invalid("unassigned packed tokens"));
         }
+        self.validate_embeddings(model)?;
+        requirements.packed_input_bytes =
+            self.embeddings
+                .iter()
+                .try_fold(requirements.packed_input_bytes, |total, input| {
+                    checked_elements(&[input.rows.elem_count(), 4])
+                        .ok()
+                        .and_then(|bytes| total.checked_add(bytes))
+                        .ok_or_else(|| invalid("embedded input size overflow"))
+                })?;
         requirements.logits_bytes = outputs
             .checked_mul(model.vocab_size)
             .and_then(|n| n.checked_mul(4))
@@ -684,6 +740,7 @@ mod tests {
             revision: 0,
         };
         let plan = PackedExecution {
+            embeddings: Vec::new(),
             tokens: vec![1, 2, 3],
             positions: vec![1, 2, 3],
             sequences: vec![SequenceDescriptor {

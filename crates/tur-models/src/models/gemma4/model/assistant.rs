@@ -252,6 +252,10 @@ struct AssistantLayer {
     owner: usize,
     state_layer: usize,
     window: Option<usize>,
+    #[cfg_attr(
+        not(feature = "metal"),
+        allow(dead_code, reason = "only the fused Metal path reads the rotary table")
+    )]
     rope: Tensor,
 }
 

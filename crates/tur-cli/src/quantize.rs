@@ -224,6 +224,7 @@ fn mixed_plan(
             kv: KvLayout::new(16, KvFormat::F32),
             recurrent: DEFAULT_RECURRENT_STATE,
             mtp: None,
+            audio: false,
         },
     )?;
     let calibration = model.calibrate(samples, args.method == Method::Gptq)?;

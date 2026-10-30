@@ -56,6 +56,8 @@ async fn test_real_worker_serves_concurrent_requests_with_queued_admission() -> 
     let fixture = common::Checkpoint::new()?;
     let state = AppState {
         workers: HashMap::from([("tiny".into(), worker(&fixture, 1)?)]),
+        transcribers: HashMap::new(),
+        default_transcriber: None,
         default_model: "tiny".into(),
     };
     let router = build_router(state);
@@ -87,6 +89,8 @@ async fn test_real_stream_stops_at_tokenizer_eos_and_reports_usage() -> Result<(
     std::fs::write(fixture.0.join("tokenizer_config.json"), config.to_string())?;
     let state = AppState {
         workers: HashMap::from([("tiny".into(), worker(&fixture, 2)?)]),
+        transcribers: HashMap::new(),
+        default_transcriber: None,
         default_model: "tiny".into(),
     };
     let response = build_router(state).oneshot(request(&json!({"messages":[{"role":"user","content":"t10 t11 t12"}],"stream":true,"max_tokens":20}))?).await
@@ -203,6 +207,8 @@ async fn test_http_preserves_limits_sampling_thinking_and_tool_history() -> Resu
     let (tx, mut rx) = mpsc::channel::<WorkerMsg>(1);
     let state = AppState {
         workers: HashMap::from([("tiny".into(), PipelineWorker::from_sender(tx))]),
+        transcribers: HashMap::new(),
+        default_transcriber: None,
         default_model: "tiny".into(),
     };
     let handle = tokio::spawn(async move {
@@ -215,7 +221,7 @@ async fn test_http_preserves_limits_sampling_thinking_and_tool_history() -> Resu
             msg.request
                 .messages
                 .iter()
-                .map(|message| (message.role, message.content.as_str()))
+                .map(|message| (message.role, message.content.as_text().unwrap_or_default()))
                 .collect::<Vec<_>>(),
             [
                 (Role::System, "You are helpful."),
@@ -274,6 +280,8 @@ async fn test_http_rejects_unsupported_media_and_invalid_controls() -> Result<()
     let (tx, _rx) = mpsc::channel(1);
     let router = build_router(AppState {
         workers: HashMap::from([("tiny".into(), PipelineWorker::from_sender(tx))]),
+        transcribers: HashMap::new(),
+        default_transcriber: None,
         default_model: "tiny".into(),
     });
     for body in [
@@ -322,6 +330,8 @@ async fn test_http_maps_admission_and_deadline_failures_and_streams_error_codes(
         let (tx, mut rx) = mpsc::channel::<WorkerMsg>(1);
         let router = build_router(AppState {
             workers: HashMap::from([("tiny".into(), PipelineWorker::from_sender(tx))]),
+            transcribers: HashMap::new(),
+            default_transcriber: None,
             default_model: "tiny".into(),
         });
         let backend = tokio::spawn(async move {
@@ -352,6 +362,8 @@ async fn test_http_maps_admission_and_deadline_failures_and_streams_error_codes(
     let (tx, mut rx) = mpsc::channel::<WorkerMsg>(1);
     let router = build_router(AppState {
         workers: HashMap::from([("tiny".into(), PipelineWorker::from_sender(tx))]),
+        transcribers: HashMap::new(),
+        default_transcriber: None,
         default_model: "tiny".into(),
     });
     let backend = tokio::spawn(async move {

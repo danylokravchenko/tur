@@ -1,6 +1,6 @@
 # Model and checkpoints
 
-`tur-models` implements Qwen3.5-family hybrid decoders and Gemma 4 text decoders. `ModelConfig` picks the model from checkpoint fields, and `TextModel` runs it through the shared `HybridModel` contract. Both families share the engine, state pools, memory planner, packed projections, weight loader, norms, rotary embeddings and attention kernels, so an improvement to one of those helps both.
+`tur-models` implements Qwen3.5-family hybrid decoders, Gemma 4 decoders with Gemma's audio encoder, and Whisper for transcription. `ModelConfig` picks the model from checkpoint fields, and `TextModel` runs it through the shared `HybridModel` contract. Both families share the engine, state pools, memory planner, packed projections, weight loader, norms, rotary embeddings and attention kernels, so an improvement to one of those helps both.
 
 ## Qwen: a hybrid of recurrence and attention
 
@@ -19,7 +19,7 @@ Gemma 4 alternates sliding-window attention, where each token sees only the last
 
 E2B and E4B add per-layer embeddings (PLE): each layer gets an extra token-specific input, injected through a gated projection after its feed-forward step. The last layers of E2B reuse the keys and values of an earlier layer of the same kind instead of computing their own, so only the layers that produce K/V get memory in the pool. Sliding layers keep only the pages their window can still reach (see [State memory](memory.md)).
 
-The 31B and 12B Unified models use the same equations without PLE. The 26B-A4B model adds normalized top-k experts with learned per-expert scales. Its global layers reuse the raw key projection as values. Vision and audio encoders are not run.
+The 31B and 12B Unified models use the same equations without PLE. The 26B-A4B model adds normalized top-k experts with learned per-expert scales. Its global layers reuse the raw key projection as values. E2B and E4B also carry an audio encoder, which [Audio](audio.md) describes; the vision encoder is not run.
 
 E2B (`google/gemma-4-E2B-it@3e22461f65e89153144f8adb70e3b8c2cc9845a7`) is the checkpoint used in development. The other sizes are covered by configuration checks and small architecture fixtures, but their full checkpoints haven't been run.
 
@@ -61,7 +61,7 @@ Tur derives and checks every weight shape before reading any data. It finds Safe
 - Any end-of-sequence token named in `generation_config.json`, the config, or the tokenizer's `eos_token` ends generation.
 - The checkpoint's own Jinja chat template (`chat_template.jinja`, or the one in `tokenizer_config.json`) renders every request through MiniJinja. Thinking controls are template variables, and Tur never appends anything to the prompt. A missing or invalid template fails at load time. Tokenizer special tokens, such as Gemma's `bos_token`, are passed to the template, and Python-style `get` and string methods behave as in Transformers.
 - Function definitions go to the template. Tur parses Qwen's XML tool calls using argument types from each tool's JSON schema, and Gemma's `call:name{...}` blocks with their own typed grammar. Protocol tokens are decoded separately, so special delimiters never leak into user-visible text.
-- Input is text only. Image, video, audio and vision-boundary token IDs from the config are rejected in prompts, and so is multimodal content.
+- Image, video and vision-boundary token IDs from the config are rejected in prompts, and so are audio placeholders unless the model's audio encoder is loaded. With the encoder, each audio part must render exactly one placeholder.
 
 ## Weights
 
@@ -71,7 +71,7 @@ Projections are stored as F32, Q8_0 or Q4K blocks (`PackedLinear`). Embedding ta
 
 - The architecture comes from checkpoint fields, never from the model's name. Mapping every "qwen3" name to one decoder would silently run the wrong maths.
 - Correctness comes from pinned external references. The 0.8B checkpoint matches Transformers 5.20.2 (CPU, F32) per layer and in final logits within 3.5e-6 relative error, against a 1e-4 gate. Whole-prompt, chunked and incremental execution agree, and so do requests joining and leaving a batch. Qwen3.8-27B is validated against its pinned config, tensor headers and template, but hasn't been run. The MoE path passes an independent small Transformers fixture.
-- Image, video and audio inputs are rejected, not silently dropped, until their encoders and position handling exist.
+- Image and video inputs are rejected, not silently dropped, until their encoders and position handling exist. Audio reaches Gemma 4 E2B and E4B through their encoder (see [Audio](audio.md)).
 - Recurrent accumulation stays F32. The checkpoint's state dtype is F32, and rounding error in recurrent state carries into every later token.
 - Model families share execution infrastructure. Each adapter keeps its own equations, while weight plans, packing, tokenizer metadata and state ownership have one implementation.
 - Gemma conformance and quantization quality are separate gates. Small pinned Transformers F32 fixtures cover the dense PLE and sharing, MoE and Unified equations per layer and in logits on CPU and Metal at 1e-4 relative error. The real E2B Q8_0 checkpoint passes the 95% next-token agreement floor plus greedy-prefix and termination checks. That is a short conformance check, not a held-out quality study.
