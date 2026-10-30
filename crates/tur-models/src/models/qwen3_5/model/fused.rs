@@ -201,10 +201,12 @@ impl Qwen35 {
         let mixed =
             self.fused_attention(fused, a, &h, &positions, pass, &paging, self.layers.len())?;
         let (sum, normed) = k.add_rms_norm(&x, &mixed, &mtp.layer.post_norm, d.eps)?;
-        let Mlp::Dense(mlp) = &mtp.layer.mlp else {
-            return Err(invalid("draft head MLP is not dense"));
+        let out = match &mtp.layer.mlp {
+            Mlp::Dense(mlp) => {
+                k.linear(&mlp.down, &k.swiglu(&k.linear(&mlp.gate_up, &normed)?)?)?
+            }
+            Mlp::Moe(moe) => moe.fused(k, &normed, None)?,
         };
-        let out = k.linear(&mlp.down, &k.swiglu(&k.linear(&mlp.gate_up, &normed)?)?)?;
         let (_, h) = k.add_rms_norm(&sum, &out, &mtp.norm, d.eps)?;
         self.row_logits(k, mtp.lm_head(&self.lm_head), &h, pass)
     }

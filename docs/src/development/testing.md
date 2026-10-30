@@ -74,6 +74,8 @@ python -I scripts/gemma4_assistant_reference.py --model "$TUR_GEMMA4_E2B" \
 just test-checkpoint -E 'test(e2b_assistant)'
 ```
 
+The offline expert MTP fixture comes from `scripts/qwen3_5_moe_mtp_reference.py`, which assembles the head from Transformers' own `MoE` modules with the conventions the dense reference established on real weights.
+
 The gpt-oss-20b test compares real weights through the expert cache with Transformers' own decoder layers, which the script runs one at a time so that the decoded experts never share memory:
 
 ```sh
@@ -116,6 +118,7 @@ python -I scripts/audio_reference.py --tiny crates/tur/tests/fixtures/audio
 | `qwen3_5_mtp_reference.py` | The MTP head assembled from Transformers modules, with next-next-token accuracy |
 | `qwen3_5_moe_reference.py` | The offline MoE oracle on deterministic weights |
 | `gemma4_reference.py` | Dense, MoE and Unified F32 fixtures; Gemma template bytes; real E2B logits and greedy continuation |
+| `qwen3_5_moe_mtp_reference.py` | The MTP head over routed experts, on a tiny random checkpoint |
 | `gemma4_assistant_reference.py` | The assistant drafter over the dense fixture, and teacher-forced E2B assistant drafts past the sliding window |
 | `qwen3_6_reference_headers.py` | Qwen3.6 tensor headers via byte-range requests, without downloading weights |
 | `audio_reference.py` | Gemma 4 audio and Whisper F32 fixtures with a test tone; real Whisper transcripts, long-form segments and E2B audio-encoder outputs for a WAV clip |

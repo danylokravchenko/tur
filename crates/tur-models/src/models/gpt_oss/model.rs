@@ -1,6 +1,9 @@
 //! gpt-oss equations over the common packed weights and persistent state pools.
 use super::Config;
 use super::config::SWIGLU_ALPHA;
+use super::prune::ExpertProbe;
+#[cfg(feature = "metal")]
+use super::prune::LayerProbe;
 #[cfg(feature = "metal")]
 use crate::models::paging::Paging;
 use crate::{
@@ -73,9 +76,12 @@ pub struct GptOss {
     kernels: Option<tur_metal::kernels::Kernels>,
     #[cfg(feature = "metal")]
     cache: Option<tur_metal::experts::ExpertCache>,
-    /// Routing mass per `layer * experts + expert` while [`Self::routing_mass`] runs.
+    /// Filled while [`Self::expert_probe`] runs.
     #[cfg(feature = "metal")]
-    mass: parking_lot::Mutex<Option<Vec<f64>>>,
+    probe: parking_lot::Mutex<Option<ExpertProbe>>,
+    /// Per layer, a router penalty that hides experts a candidate pruning removes.
+    #[cfg(feature = "metal")]
+    hidden_experts: parking_lot::Mutex<Option<Vec<Tensor>>>,
 }
 
 fn checkpoint(dir: &Path, config: &Config) -> Result<Checkpoint> {
@@ -469,7 +475,9 @@ impl GptOss {
             #[cfg(feature = "metal")]
             cache,
             #[cfg(feature = "metal")]
-            mass: parking_lot::Mutex::new(None),
+            probe: parking_lot::Mutex::new(None),
+            #[cfg(feature = "metal")]
+            hidden_experts: parking_lot::Mutex::new(None),
         }
         .with_execution(options.execution)
     }
@@ -842,22 +850,34 @@ impl GptOss {
 }
 
 impl GptOss {
-    /// Summed routing weight each expert receives over `samples`, as `[layer][expert]`.
-    /// Offline only: reading routes after every layer waits for the GPU each time.
+    /// What every expert would output for every token of `samples`, reduced to what a
+    /// pruning search needs: see [`ExpertProbe`]. Offline only: it runs every expert of every
+    /// layer, so each sample reads the whole expert set.
     #[cfg(not(feature = "metal"))]
-    pub fn routing_mass(&self, _samples: &[Vec<u32>]) -> Result<Vec<Vec<f64>>> {
-        Err(invalid("routing mass is measured on the Metal kernels"))
+    pub fn expert_probe(&self, _samples: &[Vec<u32>]) -> Result<ExpertProbe> {
+        Err(invalid("expert outputs are measured on the Metal kernels"))
     }
 
-    /// Summed routing weight each expert receives over `samples`, as `[layer][expert]`.
-    /// Offline only: reading routes after every layer waits for the GPU each time.
+    /// Hide every expert outside `kept` from the routers. Pruning searches need the kernels.
+    #[cfg(not(feature = "metal"))]
+    pub fn hide_experts(&self, _kept: Option<&[Vec<usize>]>) -> Result<()> {
+        Err(invalid("experts are hidden on the Metal kernels"))
+    }
+
+    /// What every expert would output for every token of `samples`, reduced to what a
+    /// pruning search needs: see [`ExpertProbe`]. Offline only: it runs every expert of every
+    /// layer, so each sample reads the whole expert set.
     #[cfg(feature = "metal")]
-    pub fn routing_mass(&self, samples: &[Vec<u32>]) -> Result<Vec<Vec<f64>>> {
+    pub fn expert_probe(&self, samples: &[Vec<u32>]) -> Result<ExpertProbe> {
         if self.kernels.is_none() {
-            return Err(invalid("routing mass is measured on the Metal kernels"));
+            return Err(invalid("expert outputs are measured on the Metal kernels"));
         }
-        let experts = self.config.text.num_local_experts;
-        *self.mass.lock() = Some(vec![0.0; checked_elements(&[self.layers.len(), experts])?]);
+        let t = &self.config.text;
+        *self.probe.lock() = Some(ExpertProbe {
+            experts: t.num_local_experts,
+            top_k: t.num_experts_per_tok,
+            layers: vec![LayerProbe::default(); self.layers.len()],
+        });
         let result = samples.iter().try_for_each(|sample| {
             let last = sample
                 .len()
@@ -865,13 +885,92 @@ impl GptOss {
                 .ok_or_else(|| invalid("empty calibration sample"))?;
             self.trace(sample, &[last]).map(drop)
         });
-        let mass = self
-            .mass
+        let probe = self
+            .probe
             .lock()
             .take()
-            .ok_or_else(|| invalid("routing mass was not recorded"))?;
+            .ok_or_else(|| invalid("expert outputs were not recorded"))?;
         result?;
-        Ok(mass.chunks(experts).map(<[f64]>::to_vec).collect())
+        Ok(probe)
+    }
+
+    /// Hide every expert outside `kept` from the routers, which routes exactly as removing
+    /// those experts from the checkpoint does, without writing one. `None` restores them all.
+    #[cfg(feature = "metal")]
+    pub fn hide_experts(&self, kept: Option<&[Vec<usize>]>) -> Result<()> {
+        // Far below any router score, yet finite as the routing kernels require.
+        const HIDDEN: f32 = -1e9;
+        let experts = self.config.text.num_local_experts;
+        let penalties = kept
+            .map(|layers| {
+                layers
+                    .iter()
+                    .map(|kept| {
+                        let mut row = vec![HIDDEN; experts];
+                        for &expert in kept {
+                            *row.get_mut(expert)
+                                .ok_or_else(|| invalid("kept expert outside the bank"))? = 0.0;
+                        }
+                        Ok(Tensor::new(row.as_slice(), &self.device)?)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        *self.hidden_experts.lock() = penalties;
+        Ok(())
+    }
+
+    /// Log-probabilities at every fourth position of `sample`, teacher-forced.
+    pub fn log_probs(&self, sample: &[u32]) -> Result<Vec<Vec<f32>>> {
+        let rows: Vec<usize> = (0..sample.len()).step_by(4).collect();
+        let (_, logits) = self.trace(sample, &rows)?;
+        Ok(candle_nn::ops::log_softmax(&logits, candle_core::D::Minus1)?.to_vec2::<f32>()?)
+    }
+
+    /// Run all of `index`'s experts on `h` and add their overlaps to the probe.
+    #[cfg(feature = "metal")]
+    fn record_probe(
+        &self,
+        k: &tur_metal::kernels::Kernels,
+        index: usize,
+        e: &Experts,
+        h: &Tensor,
+        logits: &Tensor,
+    ) -> Result<()> {
+        let t = &self.config.text;
+        let experts = t.num_local_experts;
+        let routes = k.route(logits, experts)?;
+        let (routes, gate_up_bank, down_bank) = match (&self.cache, &e.banks) {
+            (Some(cache), _) => (
+                cache.route(k, index, routes, None)?,
+                cache.gate_up(),
+                cache.down(),
+            ),
+            (None, Some((gate_up, down))) => (routes, gate_up, down),
+            (None, None) => return Err(invalid("experts have no weights")),
+        };
+        let gate_up = k.expert_linear_routed(gate_up_bank, h, &routes)?;
+        let act = k.expert_glu(
+            &gate_up,
+            &e.gate_up_bias,
+            &routes,
+            SWIGLU_ALPHA,
+            t.swiglu_limit,
+        )?;
+        let out = k.expert_bias(
+            &k.expert_linear(down_bank, &act, &routes)?,
+            &e.down_bias,
+            &routes,
+        )?;
+        let rows = routes.assignment_rows()?;
+        let values = out.flatten_all()?.to_vec1::<f32>()?;
+        let scores = logits.flatten_all()?.to_vec1::<f32>()?;
+        let mut probe = self.probe.lock();
+        let layer = probe
+            .as_mut()
+            .and_then(|p| p.layers.get_mut(index))
+            .ok_or_else(|| invalid("expert probe has no such layer"))?;
+        layer.add(experts, t.hidden_size, &rows, &values, &scores)
     }
 }
 
@@ -1018,23 +1117,27 @@ impl GptOss {
     ) -> Result<Tensor> {
         let t = &self.config.text;
         let logits = h.matmul(&e.router.t()?)?.broadcast_add(&e.router_bias)?;
+        let hidden = self.hidden_experts.lock();
+        let hide = |layer: usize, logits: Tensor| -> Result<Tensor> {
+            Ok(match hidden.as_ref().and_then(|h| h.get(layer)) {
+                Some(penalty) => logits.broadcast_add(penalty)?,
+                None => logits,
+            })
+        };
+        let logits = hide(index, logits)?;
+        if self.probe.lock().is_some() {
+            self.record_probe(k, index, e, h, &logits)?;
+        }
         let routes = k.route(&logits, t.num_experts_per_tok)?;
         // Encoded before the routes are read, so reading them waits for this too.
         let next_logits = match (&self.cache, self.layers.get(index + 1)) {
-            (Some(_), Some(next)) => Some(
+            (Some(_), Some(next)) => Some(hide(
+                index + 1,
                 h.matmul(&next.experts.router.t()?)?
                     .broadcast_add(&next.experts.router_bias)?,
-            ),
+            )?),
             _ => None,
         };
-        if let Some(mass) = self.mass.lock().as_mut() {
-            for (expert, weight) in routes.selections()? {
-                let cell = mass
-                    .get_mut(index * t.num_local_experts + expert)
-                    .ok_or_else(|| invalid("routed expert outside the bank"))?;
-                *cell += f64::from(weight);
-            }
-        }
         let (routes, gate_up_bank, down_bank) = match (&self.cache, &e.banks) {
             (Some(cache), _) => (
                 cache.route(k, index, routes, next_logits.as_ref())?,

@@ -77,16 +77,17 @@ impl ExpertRoutes {
     pub(crate) fn tile_values(&self) -> Result<Vec<f32>> {
         Ok(self.tiles.flatten_all()?.to_vec1::<f32>()?)
     }
-    /// `(expert, weight)` of every assignment, in token order; waits for all GPU work.
-    pub fn selections(&self) -> Result<Vec<(usize, f32)>> {
-        let values = self.selected.flatten_all()?.to_vec1::<f32>()?;
+    /// `(token, expert)` of each output row in group order; waits for all GPU work.
+    pub fn assignment_rows(&self) -> Result<Vec<(usize, usize)>> {
+        let values = self.order.flatten_all()?.to_vec1::<f32>()?;
         Ok(values
-            .as_chunks::<2>()
+            .as_chunks::<3>()
             .0
             .iter()
-            .map(|pair| (pair[0] as usize, pair[1]))
+            .map(|row| (row[0] as usize / self.top_k, row[1] as usize))
             .collect())
     }
+
     fn rows(&self) -> usize {
         self.tokens * self.top_k
     }

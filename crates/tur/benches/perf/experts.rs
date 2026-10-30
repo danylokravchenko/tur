@@ -6,7 +6,7 @@
 //!  [reference dir]`. Tokens and samples: `TUR_EXPERTS_TOKENS` (2048), `TUR_EXPERTS_SAMPLE`
 //! (128). SSD counters are system-wide, so run it on an otherwise idle machine.
 
-use candle_core::{D, DType, Device};
+use candle_core::{DType, Device};
 use std::{path::Path, process::Command, time::Instant};
 use tur_core::{Result, TurError, execution::invalid};
 use tur_models::models::{
@@ -76,14 +76,6 @@ fn samples(dir: &Path, text: &Path) -> Result<Vec<Vec<u32>>> {
         .chunks(env("TUR_EXPERTS_SAMPLE", 128))
         .map(<[u32]>::to_vec)
         .collect())
-}
-
-/// Log-probabilities at every fourth position of each sample, so a whole run's references
-/// stay small enough to hold while the other checkpoint loads.
-fn log_probs(model: &GptOss, sample: &[u32]) -> Result<Vec<Vec<f32>>> {
-    let rows: Vec<usize> = (0..sample.len()).step_by(4).collect();
-    let (_, logits) = model.trace(sample, &rows)?;
-    Ok(candle_nn::ops::log_softmax(&logits, D::Minus1)?.to_vec2::<f32>()?)
 }
 
 /// Mean `KL(reference ‖ candidate)` in nats and the rate of equal top tokens.
@@ -196,18 +188,24 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             // Its own device, so its buffers are gone before the candidate loads.
             let device = Device::new_metal(0)?;
             let model = load(Path::new(path), cache, &device)?;
-            samples.iter().map(|s| log_probs(&model, s)).collect()
+            samples.iter().map(|s| model.log_probs(s)).collect()
         })
         .transpose()?;
     let loaded = Instant::now();
     let model = load(dir, cache, &device)?;
+    // `TUR_EXPERTS_KEPT` names a `tur prune --plan-only` file, judged without writing it out.
+    if let Ok(path) = std::env::var("TUR_EXPERTS_KEPT") {
+        let plan: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        let kept: Vec<Vec<usize>> = serde_json::from_value(plan["kept"].clone())?;
+        model.hide_experts(Some(&kept))?;
+    }
     device.synchronize()?;
     let load_seconds = loaded.elapsed().as_secs_f64();
     let before = counters()?;
     let started = Instant::now();
     let mut outputs = Vec::with_capacity(samples.len());
     for sample in &samples {
-        outputs.push(log_probs(&model, sample)?);
+        outputs.push(model.log_probs(sample)?);
         device.synchronize()?;
     }
     let seconds = started.elapsed().as_secs_f64();

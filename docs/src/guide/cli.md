@@ -7,7 +7,7 @@ tur run         Generate one completion and stream it to stdout
 tur serve       Serve one model over an OpenAI-compatible HTTP API
 tur transcribe  Transcribe a WAV file with a Whisper checkpoint
 tur quantize    Prepack weights offline, optionally calibrated, for instant loading
-tur prune       Experiment: keep the experts a gpt-oss checkpoint routes to most
+tur prune       Experiment: write a gpt-oss checkpoint with fewer experts
 ```
 
 `tur <command> --help` prints every flag. This page groups the flags by purpose and gives their defaults.

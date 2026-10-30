@@ -361,11 +361,9 @@ fn cache_banks(
     if !matches!(options.weights, Weights::Prepacked(_))
         || options.execution != Execution::Fused
         || !options.device.is_metal()
-        || options.mtp.is_some()
     {
         return Err(invalid(
-            "the Qwen expert cache reads a prepacked artifact on the Metal kernels, without \
-             a draft head",
+            "the Qwen expert cache reads a prepacked artifact on the Metal kernels",
         ));
     }
     let banks: Vec<_> = config
@@ -441,15 +439,17 @@ fn open_cache(
     options: &LoadOptions,
 ) -> Result<Arc<tur_metal::experts::ExpertCache>> {
     use tur_metal::experts::{BankSource, ExpertCache, ExpertSources};
+    let text_layers = config.layer_kinds().len();
     let (experts, gate_up, down) = cache_banks(config, &tensors.plan, options)?;
     let moe = config
         .moe
         .ok_or_else(|| invalid("the expert cache needs a checkpoint with experts"))?;
     let bank = |layer: usize, name: &str| -> Result<BankSource> {
-        let (file, blocks) = tensors.checkpoint.location(&format!(
-            "{}.layers.{layer}.mlp.experts.{name}",
-            config.text_prefix()
-        ))?;
+        let (file, blocks) = tensors.checkpoint.location(&if layer < text_layers {
+            format!("{}.layers.{layer}.mlp.experts.{name}", config.text_prefix())
+        } else {
+            format!("mtp.layers.0.mlp.experts.{name}")
+        })?;
         Ok(BankSource {
             file: file.to_path_buf(),
             blocks,
@@ -461,7 +461,7 @@ fn open_cache(
         top_k: moe.num_experts_per_tok,
         gate_up,
         down,
-        layers: (0..config.layer_kinds().len())
+        layers: (0..text_layers + usize::from(config.mtp()))
             .map(|i| Ok([bank(i, "gate_up_proj")?, bank(i, "down_proj")?]))
             .collect::<Result<_>>()?,
     };
@@ -654,7 +654,17 @@ impl Qwen35 {
                         &format!("{p}.self_attn"),
                         device,
                     )?),
-                    mlp: Mlp::Dense(DenseMlp::load(&tensors, &format!("{p}.mlp"))?),
+                    mlp: match config.moe {
+                        // The head's bank is one more layer of a cache.
+                        Some(settings) => Mlp::Moe(Box::new(moe::Moe::load(
+                            &tensors,
+                            config.layer_kinds().len(),
+                            &format!("{p}.mlp"),
+                            settings,
+                            device,
+                        )?)),
+                        None => Mlp::Dense(DenseMlp::load(&tensors, &format!("{p}.mlp"))?),
+                    },
                 },
                 norm: centred(&tensors.take("mtp.norm.weight")?, device)?,
                 head: None,

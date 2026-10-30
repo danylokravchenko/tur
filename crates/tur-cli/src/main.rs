@@ -37,7 +37,7 @@ enum Command {
     Serve(serve::Args),
     /// Prepack weights offline, optionally calibrated, for direct loading.
     Quantize(quantize::Args),
-    /// Keep the experts each layer routes to most (gpt-oss): a smaller checkpoint whose
+    /// Keep the experts a search finds each layer can least lose (gpt-oss): a checkpoint whose
     /// kept weights are copied byte for byte.
     Prune(prune::Args),
     /// Transcribe a WAV file with a Whisper checkpoint and print the text.

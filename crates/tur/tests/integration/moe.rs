@@ -322,3 +322,190 @@ fn test_expert_cache_over_artifacts_is_bit_identical_to_resident() -> Result<()>
     );
     Ok(())
 }
+
+fn head_fixture() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3_5_moe_mtp")
+}
+
+/// One draft per position over `ids`, as serving accumulates the head's keys and values.
+fn head_logits(model: &Qwen35, ids: &[u32]) -> Result<Vec<Vec<f32>>> {
+    use std::sync::Arc;
+    use tur_engine::hybrid::{
+        Boundaries, DraftForward, DraftSequence, HybridModel, ModelState, PackedForward,
+        PoolConfig, SequenceForward, StatePool,
+    };
+    let count = ids.len() - 1;
+    let description = model.description();
+    let pool = StatePool::new(
+        Arc::new(description.clone()),
+        model.device(),
+        PoolConfig {
+            pages: description.pages_for(count),
+            window_pages: description.pages_for(count),
+            recurrent_slots: 2,
+        },
+    )?;
+    let mut reservation = ModelState::new(&pool).reserve(count, Boundaries::Final)?;
+    reservation.prepare()?;
+    let binding = reservation.binding();
+    let positions: Vec<usize> = (0..count).collect();
+    let hidden = model
+        .forward(&PackedForward {
+            embeddings: &[],
+            tokens: &ids[..count],
+            positions: &positions,
+            sequences: &[SequenceForward {
+                tokens: 0..count,
+                state: &binding,
+                logits: &[],
+                hidden: true,
+            }],
+            pool: &pool,
+        })?
+        .pop()
+        .ok_or_else(|| invalid("missing step"))??
+        .hidden
+        .ok_or_else(|| invalid("missing hidden states"))?;
+    let state = reservation.commit(count)?;
+    drop(reservation);
+    let mut rows = Vec::with_capacity(count);
+    for row in 0..count {
+        let side = state.side(row, 1)?;
+        let logits = model
+            .draft(&DraftForward {
+                tokens: &ids[row + 1..row + 2],
+                positions: &positions[row..=row],
+                sequences: &[DraftSequence {
+                    tokens: 0..1,
+                    state: &side,
+                    hidden: &hidden.narrow(0, row, 1)?,
+                    drafts: 1,
+                }],
+                pool: &pool,
+            })?
+            .pop()
+            .ok_or_else(|| invalid("missing draft"))??
+            .ok_or_else(|| invalid("missing draft logits"))?;
+        rows.push(logits.to_vec2::<f32>()?.remove(0));
+    }
+    Ok(rows)
+}
+
+fn head_options(device: &Device, execution: Execution) -> LoadOptions {
+    LoadOptions {
+        revision: "moe-mtp-fixture-v1".into(),
+        weights: WeightFormat::F32.into(),
+        device: device.clone(),
+        execution,
+        kv: KvLayout::new(16, KvFormat::F32),
+        recurrent: DType::F32,
+        mtp: Some(tur_models::models::DraftHead::default()),
+        audio: false,
+        expert_cache: None,
+    }
+}
+
+/// The expert head against Transformers' own `MoE` decoder layer, on the host and on the
+/// kernels; the kernels stay F32 here so that only execution can differ.
+#[test]
+fn test_mtp_head_over_experts_matches_transformers() -> Result<()> {
+    let mut golden =
+        candle_core::safetensors::load(head_fixture().join("golden.safetensors"), &Device::Cpu)?;
+    let ids: Vec<u32> = golden
+        .remove("tokens")
+        .ok_or_else(|| invalid("missing tokens"))?
+        .to_vec1::<i64>()?
+        .into_iter()
+        .map(|v| u32::try_from(v).map_err(|_| invalid("invalid golden ID")))
+        .collect::<Result<_>>()?;
+    let expected = golden
+        .remove("logits")
+        .ok_or_else(|| invalid("missing logits"))?
+        .to_vec2::<f32>()?;
+    #[cfg_attr(
+        not(feature = "metal"),
+        allow(unused_mut, reason = "only Metal adds a second device")
+    )]
+    let mut devices = vec![(Device::Cpu, Execution::Reference)];
+    #[cfg(feature = "metal")]
+    devices.push((Device::new_metal(0)?, Execution::Fused));
+    for (device, execution) in devices {
+        let model = Qwen35::load(&head_fixture(), &head_options(&device, execution))?;
+        let error = max_relative(&head_logits(&model, &ids)?, &expected);
+        assert!(error < 2e-4, "{execution:?}: {error}");
+    }
+    Ok(())
+}
+
+/// A prepacked artifact carries the head's bank, and a cache serves it as one more layer:
+/// bit-identical drafts with and without eviction, and an exact memory plan.
+#[cfg(feature = "metal")]
+#[test]
+fn test_mtp_head_reads_its_experts_through_the_cache() -> Result<()> {
+    use tur_models::models::{
+        Conversion, Manifest, Packer, WeightPlan, Weights,
+        qwen3_5::{artifact_config, write_artifact},
+    };
+    let device = Device::new_metal(0)?;
+    let output = std::env::temp_dir().join(format!("tur-moe-mtp-{}", uuid::Uuid::new_v4()));
+    write_artifact(
+        &Conversion {
+            source: &head_fixture(),
+            identity: "moe-mtp-fixture-v1",
+            output: &output,
+            calibration: "",
+        },
+        &WeightPlan::uniform(&artifact_config(&head_fixture())?, WeightFormat::Q8_0)?,
+        &Packer::RTN,
+    )?;
+    let result = (|| -> Result<()> {
+        let manifest = std::sync::Arc::new(Manifest::read(&output)?);
+        let options = |expert_cache| LoadOptions {
+            weights: Weights::Prepacked(std::sync::Arc::clone(&manifest)),
+            expert_cache,
+            ..head_options(&device, Execution::Fused)
+        };
+        let ids: Vec<u32> = (0..18).map(|i| 2 + (i * 37 + 11) % 88).collect();
+        let expected = head_logits(&Qwen35::load(&output, &options(None))?, &ids)?;
+        // Q8_0: gate|up 128 rows and down 64 rows, two 34-byte blocks per row.
+        let expert = (128 + 64) * 2 * 34;
+        for slots in [4, 9] {
+            let opts = options(Some(slots * expert));
+            let model = Qwen35::load(&output, &opts)?;
+            let actual = head_logits(&model, &ids)?;
+            for (a, e) in actual.iter().flatten().zip(expected.iter().flatten()) {
+                assert_eq!(a.to_bits(), e.to_bits(), "{slots} slots");
+            }
+            let stats = model
+                .expert_stats()
+                .ok_or_else(|| invalid("missing expert stats"))?;
+            assert!(stats.evictions > 0, "{slots} slots");
+            let (_, planned, _) = Qwen35::memory_requirements(model.config(), &opts, 32, &[32])?;
+            assert_eq!(planned, model.weight_bytes());
+        }
+        Ok(())
+    })();
+    drop(std::fs::remove_dir_all(&output));
+    result
+}
+
+#[test]
+fn test_mtp_expert_tensors_match_the_pinned_checkpoint() -> Result<()> {
+    let config = Config::from_json(include_str!("../fixtures/checkpoints/qwen3.6-config.json"))?;
+    assert!(config.supports_mtp());
+    let expected = config.with_mtp()?.weight_shapes()?;
+    let headers: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/checkpoints/qwen3.6-text-tensors.json"
+    ))?;
+    let mut checked = 0;
+    for (name, shape) in expected.iter().filter(|(n, _)| n.starts_with("mtp.")) {
+        assert_eq!(
+            serde_json::to_value(shape)?,
+            headers["tensors"][name]["shape"],
+            "{name}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 15);
+    Ok(())
+}

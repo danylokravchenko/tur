@@ -258,18 +258,17 @@ impl Config {
     }
 
     /// Whether the checkpoint declares a native multi-token prediction head this
-    /// implementation can run: one dense full-attention layer sharing the embedding.
+    /// implementation can run: one full-attention layer, with the checkpoint's own
+    /// feed-forward kind, sharing the embedding.
     pub fn supports_mtp(&self) -> bool {
-        self.text.mtp_num_hidden_layers == 1
-            && !self.text.mtp_use_dedicated_embeddings
-            && self.moe.is_none()
+        self.text.mtp_num_hidden_layers == 1 && !self.text.mtp_use_dedicated_embeddings
     }
 
     /// Also load the `mtp.*` head, whose attention keys and values add one state layer.
     pub fn with_mtp(self) -> Result<Self> {
         if !self.supports_mtp() {
             return Err(invalid(
-                "checkpoint has no supported MTP head (one dense layer, shared embedding)",
+                "checkpoint has no supported MTP head (one layer, shared embedding)",
             ));
         }
         Ok(Self { mtp: true, ..self })
@@ -366,6 +365,89 @@ impl Config {
             vocab_size: t.vocab_size,
             max_position: t.max_position_embeddings,
         })
+    }
+
+    /// Tensors of the MTP head: `q` and `kv` are the widths of its attention projections.
+    fn mtp_shapes(
+        &self,
+        q: usize,
+        kv: usize,
+        shapes: &mut BTreeMap<String, Vec<usize>>,
+    ) -> Result<()> {
+        let t = &self.text;
+        let h = t.hidden_size;
+        let p = "mtp.layers.0";
+        for (name, shape) in [
+            (
+                "mtp.fc.weight".to_owned(),
+                vec![h, checked_elements(&[2, h])?],
+            ),
+            ("mtp.pre_fc_norm_embedding.weight".into(), vec![h]),
+            ("mtp.pre_fc_norm_hidden.weight".into(), vec![h]),
+            ("mtp.norm.weight".into(), vec![h]),
+            (format!("{p}.input_layernorm.weight"), vec![h]),
+            (format!("{p}.post_attention_layernorm.weight"), vec![h]),
+            (
+                format!("{p}.self_attn.q_proj.weight"),
+                vec![checked_elements(&[2, q])?, h],
+            ),
+            (format!("{p}.self_attn.k_proj.weight"), vec![kv, h]),
+            (format!("{p}.self_attn.v_proj.weight"), vec![kv, h]),
+            (format!("{p}.self_attn.o_proj.weight"), vec![h, q]),
+            (format!("{p}.self_attn.q_norm.weight"), vec![t.head_dim]),
+            (format!("{p}.self_attn.k_norm.weight"), vec![t.head_dim]),
+        ] {
+            shapes.insert(name, shape);
+        }
+        let mlp = format!("{p}.mlp");
+        match &self.moe {
+            Some(moe) => {
+                let (experts, inner) = (moe.num_experts, moe.moe_intermediate_size);
+                let shared = moe.shared_expert_intermediate_size;
+                for (name, shape) in [
+                    (format!("{mlp}.gate.weight"), vec![experts, h]),
+                    (
+                        format!("{mlp}.experts.gate_up_proj"),
+                        vec![experts, checked_elements(&[2, inner])?, h],
+                    ),
+                    (format!("{mlp}.experts.down_proj"), vec![experts, h, inner]),
+                    (format!("{mlp}.shared_expert_gate.weight"), vec![1, h]),
+                    (
+                        format!("{mlp}.shared_expert.gate_proj.weight"),
+                        vec![shared, h],
+                    ),
+                    (
+                        format!("{mlp}.shared_expert.up_proj.weight"),
+                        vec![shared, h],
+                    ),
+                    (
+                        format!("{mlp}.shared_expert.down_proj.weight"),
+                        vec![h, shared],
+                    ),
+                ] {
+                    shapes.insert(name, shape);
+                }
+            }
+            None => {
+                for (name, shape) in [
+                    (
+                        format!("{mlp}.gate_proj.weight"),
+                        vec![t.intermediate_size, h],
+                    ),
+                    (
+                        format!("{mlp}.up_proj.weight"),
+                        vec![t.intermediate_size, h],
+                    ),
+                    (
+                        format!("{mlp}.down_proj.weight"),
+                        vec![h, t.intermediate_size],
+                    ),
+                ] {
+                    shapes.insert(name, shape);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Exact `SafeTensors` weight names and dimensions required by the text tower.
@@ -475,42 +557,7 @@ impl Config {
             }
         }
         if self.mtp {
-            let h = t.hidden_size;
-            let p = "mtp.layers.0";
-            for (name, shape) in [
-                (
-                    "mtp.fc.weight".to_owned(),
-                    vec![h, checked_elements(&[2, h])?],
-                ),
-                ("mtp.pre_fc_norm_embedding.weight".into(), vec![h]),
-                ("mtp.pre_fc_norm_hidden.weight".into(), vec![h]),
-                ("mtp.norm.weight".into(), vec![h]),
-                (format!("{p}.input_layernorm.weight"), vec![h]),
-                (format!("{p}.post_attention_layernorm.weight"), vec![h]),
-                (
-                    format!("{p}.self_attn.q_proj.weight"),
-                    vec![checked_elements(&[2, q])?, h],
-                ),
-                (format!("{p}.self_attn.k_proj.weight"), vec![kv, h]),
-                (format!("{p}.self_attn.v_proj.weight"), vec![kv, h]),
-                (format!("{p}.self_attn.o_proj.weight"), vec![h, q]),
-                (format!("{p}.self_attn.q_norm.weight"), vec![t.head_dim]),
-                (format!("{p}.self_attn.k_norm.weight"), vec![t.head_dim]),
-                (
-                    format!("{p}.mlp.gate_proj.weight"),
-                    vec![t.intermediate_size, h],
-                ),
-                (
-                    format!("{p}.mlp.up_proj.weight"),
-                    vec![t.intermediate_size, h],
-                ),
-                (
-                    format!("{p}.mlp.down_proj.weight"),
-                    vec![h, t.intermediate_size],
-                ),
-            ] {
-                shapes.insert(name, shape);
-            }
+            self.mtp_shapes(q, kv, &mut shapes)?;
         }
         for shape in shapes.values() {
             checked_elements(shape)?
@@ -625,7 +672,29 @@ impl Config {
                 checked_elements(&[2, hidden])?,
             ));
             projections.extend(attention("mtp.layers.0"));
-            projections.extend(dense("mtp.layers.0.mlp".into(), t.intermediate_size));
+            let head = "mtp.layers.0.mlp";
+            match &self.moe {
+                Some(moe) => {
+                    let inner = moe.moe_intermediate_size;
+                    projections.push(Projection::bank(
+                        format!("{head}.experts.gate_up_proj"),
+                        moe.num_experts,
+                        checked_elements(&[2, inner])?,
+                        hidden,
+                    ));
+                    projections.push(Projection::bank(
+                        format!("{head}.experts.down_proj"),
+                        moe.num_experts,
+                        hidden,
+                        inner,
+                    ));
+                    projections.extend(dense(
+                        format!("{head}.shared_expert"),
+                        moe.shared_expert_intermediate_size,
+                    ));
+                }
+                None => projections.extend(dense(head.into(), t.intermediate_size)),
+            }
         }
         let head = if t.tie_word_embeddings {
             self.embedding_name()

@@ -5,4 +5,6 @@ mod model;
 mod prune;
 pub use config::Config;
 pub use model::GptOss;
-pub use prune::{Pruning, keep_by_mass, prune};
+pub use prune::{
+    ExpertProbe, LayerPlan, LayerProbe, Pruning, divergence, plan_pruning, prune, refine,
+};

@@ -236,32 +236,34 @@ fn test_expert_cache_recovers_from_read_failures_and_never_writes() -> Result<()
     result
 }
 
-/// Removing an expert must equal masking its router logit: with every expert the router
-/// would pick kept, a pruned checkpoint computes bit-identical logits from copied bytes.
+/// Hiding experts from the routers routes exactly as removing them does: a checkpoint pruned
+/// to a searched plan, copied byte for byte, computes bit-identical logits.
 #[cfg(feature = "metal")]
 #[test]
-fn test_pruning_unrouted_experts_changes_no_logit_and_kept_bytes_are_verbatim() -> Result<()> {
-    use tur_models::models::gpt_oss::{Pruning, keep_by_mass, prune};
+fn test_pruned_checkpoint_equals_hiding_its_removed_experts() -> Result<()> {
+    use tur_models::models::gpt_oss::{Pruning, plan_pruning, prune};
     let device = Device::new_metal(0)?;
     let golden = golden()?;
     let (model, _) = cached(&fixture(), &device, 4)?;
-    let mass = model.routing_mass(std::slice::from_ref(&golden.ids))?;
-    assert_eq!(mass.len(), 4);
-    // Top-2 of 4 over this text: every routed expert stays only if at most three are used,
-    // so the fixture's own routing decides which layers can lose an expert unnoticed.
-    let unused = mass.iter().filter(|m| m.contains(&0.0)).count();
+    let probe = model.expert_probe(std::slice::from_ref(&golden.ids))?;
+    assert_eq!(probe.layers.len(), 4);
+    let kept: Vec<Vec<usize>> = plan_pruning(&probe, 3)?
+        .into_iter()
+        .map(|plan| {
+            let mut kept = plan.kept;
+            kept.sort_unstable();
+            kept
+        })
+        .collect();
+    assert!(kept.iter().all(|layer| layer.len() == 3));
     let dir = std::env::temp_dir().join(format!("tur-gpt-oss-{}", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
-        let kept = keep_by_mass(&mass, 3)?;
-        prune(
-            &fixture(),
-            &dir,
-            &Pruning {
-                source: "gpt-oss-fixture-v1".into(),
-                calibration: "golden tokens".into(),
-                kept: kept.clone(),
-            },
-        )?;
+        let pruning = |kept: Vec<Vec<usize>>| Pruning {
+            source: "gpt-oss-fixture-v1".into(),
+            calibration: "golden tokens".into(),
+            kept,
+        };
+        prune(&fixture(), &dir, &pruning(kept.clone()))?;
         let pruned = GptOss::load(
             &dir,
             &LoadOptions {
@@ -276,38 +278,13 @@ fn test_pruning_unrouted_experts_changes_no_logit_and_kept_bytes_are_verbatim() 
                 expert_cache: None,
             },
         )?;
-        let rows: Vec<usize> = (0..golden.ids.len()).collect();
-        let actual = pruned.trace(&golden.ids, &rows)?.1.to_vec2::<f32>()?;
-        if unused == mass.len() {
-            assert_eq!(actual, logits(&model, &golden.ids)?);
-        }
-        assert_eq!(pruned.config().vocab_size(), 96);
-        assert!(
-            prune(
-                &fixture(),
-                &dir,
-                &Pruning {
-                    source: "again".into(),
-                    calibration: String::new(),
-                    kept,
-                },
-            )
-            .is_err()
-        );
-        let mut uneven = keep_by_mass(&mass, 3)?;
+        model.hide_experts(Some(&kept))?;
+        assert_eq!(logits(&pruned, &golden.ids)?, logits(&model, &golden.ids)?);
+        model.hide_experts(None)?;
+        assert!(prune(&fixture(), &dir, &pruning(kept.clone())).is_err());
+        let mut uneven = kept.clone();
         uneven[0].pop();
-        assert!(
-            prune(
-                &fixture(),
-                &dir.join("uneven"),
-                &Pruning {
-                    source: "uneven".into(),
-                    calibration: String::new(),
-                    kept: uneven,
-                },
-            )
-            .is_err()
-        );
+        assert!(prune(&fixture(), &dir.join("uneven"), &pruning(uneven)).is_err());
         Ok(())
     })();
     drop(std::fs::remove_dir_all(&dir));

@@ -7,7 +7,7 @@ tur run --model openai/gpt-oss-20b --revision 6cee5e81ee83917806bbde320786a8fb61
   --expert-cache-mb 2048 --prompt 'Hello'
 ```
 
-The cache also serves Qwen3.5-family MoE checkpoints, from a prepacked artifact: the banks have to be on disk exactly as the kernels read them, so write one with `tur quantize` first. Its banks can be Q8_0 or Q4K, with one format per projection across layers. Dense models and Gemma 4 reject the flag, and so do Qwen checkpoints converted at load time or loaded with a draft head.
+The cache also serves Qwen3.5-family MoE checkpoints, from a prepacked artifact: the banks have to be on disk exactly as the kernels read them, so write one with `tur quantize` first. Its banks can be Q8_0 or Q4K, with one format per projection across layers. A native MTP head reads its own expert bank through the same cache. Dense models and Gemma 4 reject the flag, and so do Qwen checkpoints converted at load time.
 
 ## How it works
 
@@ -52,7 +52,11 @@ A cancelled request needs no special handling, because reads and copies finish i
 
 ## Pruning experts
 
-`tur prune` writes a smaller checkpoint that keeps the same number of experts in every layer, copying their bytes unchanged and dropping the others' router rows. It keeps the experts that calibration text routes to most. That ranking is not good enough yet. Keeping 16 of 32 experts saves 4.7 GiB, but on held-out text the top token matches the full model only 78% of the time on code and documentation and 55% on prose, with KL divergences of 0.21 and 1.41 nats, and greedy generation falls into repetition. Treat it as an experiment.
+Pruning is a separate step from the cache. The cache never changes what the model computes; `tur prune` writes a smaller checkpoint that permanently lacks some experts, so tokens that would use them go to their next choice. It keeps the same number of experts in every layer and copies their bytes unchanged. Nothing prunes unless you run this command, and the source checkpoint stays untouched.
+
+To choose, it runs every expert on calibration text and removes, one at a time, whichever moves the layer's output least, including where tokens reroute. `--search-evaluations` then tries swaps and keeps those that lower end-to-end KL. `--plan-only` writes the choice without a checkpoint, and the `experts` benchmark can judge it by hiding those experts from the routers.
+
+None of this is good enough yet, so treat pruning as an experiment. Keeping 16 of 32 experts saves 4.7 GiB, but on held-out code and documentation the top token matches the full model about 80% of the time, and on prose under 60%. The limit is generalization rather than search: experts removed because calibration text rarely needs them are what other text needs.
 
 ## Decisions
 
@@ -67,4 +71,4 @@ Measured on gpt-oss-20b on an M1 with 16 GB:
 - Serving four concurrent requests on a 5.9 GiB plan swapped out 251 MiB over a run of several minutes, where single requests swapped nothing. The spare-memory check sees the machine at load time only, so keep `--max-batch-size` small on a tight machine.
 - Below one token's experts (96 on gpt-oss-20b), eviction takes the expert needed furthest ahead, since passes visit layers in order. At or above it, eviction is LRU, which keeps what routing repeats.
 - The arena sits outside Candle's buffer pool, which rounds sizes up to a power of two.
-- Pruning by routing mass isn't recommended, for the reasons above. Published results for this kind of pruning (RCO) search on KL divergence directly, which Tur doesn't do.
+- Pruning isn't recommended. Keeping 16 of 32 experts, held-out KL on code and documentation, then prose: routing mass 0.21 and 1.41 nats; output-movement search on 512 tokens 0.26 and 1.45; on 4,096 mixed tokens 0.18 and 1.11; plus 48 KL-tested swaps 0.19 and 1.14, even though those lowered calibration KL by 28%. These rest on 256 held-out tokens per text, and no task benchmark has run. Keeping 24 of 32 on 512 tokens gave 0.05 and 0.71.
