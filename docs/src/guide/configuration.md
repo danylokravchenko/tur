@@ -94,7 +94,7 @@ These controls exist in the file and the Rust library but have no CLI flag. Thei
 | `engine.min_prefill_tokens` | `min(prefill_chunk_size, 32)` | Smallest prefill share of a pass while prompts wait; positive, at most the chunk size and below the pass token cap |
 | `engine.target_pass_ms` | 60 | Target pass length while requests are decoding; the scheduler also allows twice the decode-only cost |
 | `engine.max_queue_wait_ms` | 2000 | Queue age after which the oldest prompt ignores the pass target; 0 applies this immediately |
-| `engine.prefix_spacing` | 256 | Tokens between prefix snapshots; a positive multiple of the K/V page size |
+| `engine.prefix_spacing` | 256, or 1024 with an expert cache | Tokens between prefix snapshots; a positive multiple of the K/V page size |
 | `engine.prefix_restorable_first` | `false` | Let requests with a cached prefix start ahead of older uncached ones; see [Prefix reuse](../architecture/prefix-reuse.md) |
 | `server.stream_channel_capacity` | 64 | Queued messages per streaming request |
 | `server.stream_max_buffered_bytes` | 16384 | Unsent text allowed per streaming request before a slow client is cancelled |

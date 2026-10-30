@@ -37,10 +37,9 @@ const READ_BATCH: usize = 8;
 /// Concurrent reads of one batch.
 const READ_THREADS: usize = 4;
 /// Memory left for the state pool, scratch, staging and everything else on the machine
-/// beyond the arena. Measured on a 16 GB M1: with less than this to spare, 4 GiB arenas
-/// swapped out 700 to 830 MB in a short run and a 6 GiB arena 2.4 GB, while 2 GiB with
-/// about 6 GiB to spare swapped nothing.
-const RESERVE_BYTES: usize = 3584 << 20;
+/// beyond the arena. Measured on a 16 GB M1: 4 GiB arenas leaving less swapped out 700 to
+/// 830 MB in a short run and a 6 GiB arena 2.4 GB; 1 GiB leaving this much swapped nothing.
+const RESERVE_BYTES: usize = 2560 << 20;
 /// Arenas below this cannot push other memory into swap, and skip the spare-memory check.
 const NEGLIGIBLE_BYTES: usize = 256 << 20;
 /// Marks an expert that holds no slot.
@@ -110,7 +109,39 @@ pub struct ExpertStats {
     pub evictions: u64,
     /// Time the execution owner spent waiting for reads and copies.
     pub wait: Duration,
+    /// Of `wait`: reads and staging uploads not already finished ahead of time, and the
+    /// copies' GPU wait.
+    pub read: Duration,
+    pub copy: Duration,
+    /// Time spent waiting for earlier GPU work when reading a layer's routes.
+    pub gpu: Duration,
+    /// Experts read ahead of their layer, and how many of those it then routed to.
+    pub prefetched: u64,
+    pub prefetch_used: u64,
 }
+
+/// One expert's bytes uploaded to staging buffers, ready to copy into any slot.
+struct Staged {
+    layer: usize,
+    expert: usize,
+    /// `[gate_up blocks, gate_up scales, down blocks, down scales]`.
+    parts: Vec<Arc<Buffer>>,
+}
+
+/// What reading needs, shared with the prefetch thread.
+struct Source {
+    metal: MetalDevice,
+    files: Vec<File>,
+    /// File index and stored offsets of each layer's banks.
+    layers: Vec<[(usize, u64, u64); 2]>,
+    shapes: [BankShape; 2],
+}
+
+/// One read's position in its batch and its staging buffer.
+type StagedPart = (usize, Arc<Buffer>);
+
+/// What a prefetch thread returns: the read buffers it borrowed, and what it staged.
+type Prefetched = (Vec<Vec<u8>>, Result<Vec<Staged>>);
 
 struct Slots {
     /// Slot of each `layer * experts + expert`.
@@ -120,6 +151,10 @@ struct Slots {
     used: Vec<u64>,
     tick: u64,
     stats: ExpertStats,
+    /// Host read buffers, one per read thread, kept so reads do not fault fresh pages in.
+    buffers: Vec<Vec<u8>>,
+    /// Reads started when the previous layer routed.
+    pending: Option<std::thread::JoinHandle<Prefetched>>,
 }
 
 /// One bank's arena: blocks of every slot, then scales of every slot, as the kernels read.
@@ -152,10 +187,9 @@ impl Arena {
 pub struct ExpertCache {
     device: Device,
     metal: MetalDevice,
-    files: Vec<File>,
-    /// File index and stored offsets of each layer's banks.
-    sources: Vec<[(usize, u64, u64); 2]>,
+    source: Arc<Source>,
     experts: usize,
+    top_k: usize,
     /// Fewer slots than one token touches: LRU would evict each just before its next use.
     cyclic: bool,
     gate_up: Arena,
@@ -292,9 +326,14 @@ impl ExpertCache {
         Ok(Self {
             device: device.clone(),
             metal: metal.clone(),
-            files,
-            sources: layers,
+            source: Arc::new(Source {
+                metal: metal.clone(),
+                files,
+                layers,
+                shapes: [gate_up, down],
+            }),
             experts: sources.experts,
+            top_k: sources.top_k,
             cyclic: slots < checked_elements(&[sources.layers.len(), sources.top_k])?,
             gate_up: Arena::new(metal, gate_up, slots)?,
             down: Arena::new(metal, down, slots)?,
@@ -305,6 +344,8 @@ impl ExpertCache {
                 used: vec![0; slots],
                 tick: 0,
                 stats: ExpertStats::default(),
+                buffers: (0..READ_THREADS).map(|_| Vec::new()).collect(),
+                pending: None,
             }),
         })
     }
@@ -336,14 +377,27 @@ impl ExpertCache {
     /// Make every expert `routes` selects for `layer` resident and address it by slot.
     /// Waits for all earlier GPU work, and returns only once the copies have completed. On
     /// an I/O failure the affected slots are left ownerless, so a later pass reads them again.
-    pub fn route(&self, k: &Kernels, layer: usize, routes: ExpertRoutes) -> Result<ExpertRoutes> {
-        if layer >= self.sources.len() {
+    ///
+    /// `next_logits` are the following layer's router scores on this layer's input, already
+    /// encoded. They predict what that layer will route to, and reading those experts starts
+    /// now so that the SSD works while the GPU runs this layer.
+    pub fn route(
+        &self,
+        k: &Kernels,
+        layer: usize,
+        routes: ExpertRoutes,
+        next_logits: Option<&Tensor>,
+    ) -> Result<ExpertRoutes> {
+        if layer >= self.source.layers.len() {
             return Err(invalid("expert cache has no such layer"));
         }
         // The readback is the wait the slot lifetime rule relies on.
+        let waited = Instant::now();
         let mut tiles = routes.tile_values()?;
+        let gpu = waited.elapsed();
         let started = Instant::now();
         let mut state = self.state.lock();
+        state.stats.gpu += gpu;
         state.tick += 1;
         let tick = state.tick;
         let base = layer * self.experts;
@@ -368,9 +422,22 @@ impl ExpertCache {
                 }
             }
         }
+        tracing::trace!(
+            target: "tur_expert_trace",
+            layer,
+            experts = ?seen
+                .iter()
+                .enumerate()
+                .filter_map(|(expert, &routed)| routed.then_some(expert))
+                .collect::<Vec<_>>(),
+        );
         let wrote = !misses.is_empty();
+        let mut ready = Self::finish_prefetch(&mut state);
         for batch in misses.chunks(READ_BATCH) {
-            self.fill(&mut state, layer, batch)?;
+            self.fill(&mut state, layer, batch, &mut ready)?;
+        }
+        if let Some(logits) = next_logits {
+            self.start_prefetch(&mut state, layer + 1, logits)?;
         }
         for tile in tiles.as_chunks_mut::<4>().0 {
             if tile[0] >= 0.0 {
@@ -384,20 +451,75 @@ impl ExpertCache {
         k.with_slots(routes, tiles, self.slots)
     }
 
-    /// Read `experts` of `layer` into free or evicted slots and wait for the
-    /// copies. A slot loses its owner before it is touched, so a failure cannot leave one
-    /// claiming contents it does not hold.
-    fn fill(&self, state: &mut Slots, layer: usize, experts: &[usize]) -> Result<()> {
+    /// Experts the finished prefetch staged. Its read errors are dropped on purpose: a read
+    /// the pass needs is retried on demand, and reports its own failure there.
+    fn finish_prefetch(state: &mut Slots) -> Vec<Staged> {
+        let Some(handle) = state.pending.take() else {
+            return Vec::new();
+        };
+        let Ok((buffers, staged)) = handle.join() else {
+            state.buffers = (0..READ_THREADS).map(|_| Vec::new()).collect();
+            return Vec::new();
+        };
+        state.buffers = buffers;
+        staged.unwrap_or_default()
+    }
+
+    /// Begin reading the absent experts that `logits` rank highest for `layer`, on its own
+    /// thread. Nothing it does touches a slot, so it needs no ordering with the GPU, and
+    /// [`Self::finish_prefetch`] or the drop of this cache always joins it.
+    fn start_prefetch(&self, state: &mut Slots, layer: usize, logits: &Tensor) -> Result<()> {
+        let base = layer * self.experts;
+        let mut votes = vec![0u32; self.experts];
+        for row in logits.to_vec2::<f32>()? {
+            let mut order: Vec<usize> = (0..row.len()).collect();
+            order.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]));
+            for &expert in order.iter().take(self.top_k) {
+                if let Some(vote) = votes.get_mut(expert) {
+                    *vote += 1;
+                }
+            }
+        }
+        let mut wanted: Vec<usize> = (0..self.experts)
+            .filter(|&e| votes[e] > 0 && state.map[base + e] == ABSENT)
+            .collect();
+        wanted.sort_by_key(|&e| std::cmp::Reverse(votes[e]));
+        wanted.truncate(READ_BATCH);
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        state.stats.prefetched += wanted.len() as u64;
+        state.stats.bytes_read += self.source.read_bytes()? * wanted.len() as u64;
+        let source = Arc::clone(&self.source);
+        let mut buffers = std::mem::take(&mut state.buffers);
+        state.pending = Some(std::thread::spawn(move || {
+            let staged = source.stage(layer, &wanted, &mut buffers);
+            (buffers, staged)
+        }));
+        Ok(())
+    }
+
+    /// Bring `experts` of `layer` into free or evicted slots, from `ready` where prefetch
+    /// already staged them, and wait for the copies. A slot loses its owner before it is
+    /// touched, so a failure cannot leave one claiming contents it does not hold.
+    fn fill(
+        &self,
+        state: &mut Slots,
+        layer: usize,
+        experts: &[usize],
+        ready: &mut Vec<Staged>,
+    ) -> Result<()> {
         let tick = state.tick;
         let base = layer * self.experts;
-        let layers = self.sources.len();
+        let layers = self.source.layers.len();
         let mut chosen = Vec::with_capacity(experts.len());
         for &expert in experts {
             // Slots stamped this tick belong to this layer's own routes: the budget holds a
             // whole layer, so a victim always exists. Passes visit layers in order, so when a
             // token's experts exceed the slots, LRU hits nothing (0% against 34% at 81 slots
             // of 96) and the victim is what runs furthest ahead. With more slots LRU keeps
-            // what routing repeats (79% against 65% at 324 slots).
+            // what routing repeats (79% against 65% at 324 slots). Replaying a real trace,
+            // LFU and LRU-2 gained at most two points over this.
             let slot = (0..self.slots)
                 .filter(|&s| state.used[s] != tick)
                 .max_by_key(|&s| match state.owners[s] {
@@ -419,118 +541,200 @@ impl ExpertCache {
             state.used[slot] = tick;
             chosen.push((expert, slot));
         }
-        let [gate_up, down] = self.sources[layer];
-        let mut reads = Vec::with_capacity(4 * chosen.len());
-        for &(expert, slot) in &chosen {
-            for (arena, (file, blocks, scales)) in [(&self.gate_up, gate_up), (&self.down, down)] {
-                let block_bytes = arena.shape.block_bytes()?;
-                let scale_bytes = arena.shape.scale_bytes()?;
-                reads.push(Read::new(
-                    file,
-                    blocks,
-                    expert,
-                    block_bytes,
-                    &arena.buffer,
-                    slot * block_bytes,
-                )?);
-                reads.push(Read::new(
-                    file,
-                    scales,
-                    expert,
-                    scale_bytes,
-                    &arena.buffer,
-                    arena.scales + slot * scale_bytes,
-                )?);
+        let mut staged = Vec::with_capacity(experts.len());
+        let mut missing = Vec::new();
+        for &expert in experts {
+            match ready
+                .iter()
+                .position(|r| r.layer == layer && r.expert == expert)
+            {
+                Some(found) => {
+                    staged.push(ready.swap_remove(found));
+                    state.stats.prefetch_used += 1;
+                }
+                None => missing.push(expert),
             }
         }
-        self.read_all(&mut reads)?;
-        // Keep every staging buffer alive until its copy has completed.
-        let mut staging = Vec::with_capacity(reads.len());
-        for read in &reads {
-            staging.push(self.metal.new_buffer_with_data(&read.bytes)?);
+        if !missing.is_empty() {
+            let step = Instant::now();
+            let mut buffers = std::mem::take(&mut state.buffers);
+            let read = self.source.stage(layer, &missing, &mut buffers);
+            state.buffers = buffers;
+            staged.extend(read?);
+            state.stats.read += step.elapsed();
+            state.stats.bytes_read += self.source.read_bytes()? * missing.len() as u64;
         }
+        let step = Instant::now();
         {
             let mut blit = self.metal.blit_command_encoder()?;
             blit.set_label("tur_expert_fill");
-            for (read, source) in reads.iter().zip(&staging) {
-                blit.copy_from_buffer(source, 0, read.target, read.at, read.bytes.len());
+            for &(expert, slot) in &chosen {
+                let parts = staged
+                    .iter()
+                    .find(|r| r.expert == expert)
+                    .ok_or_else(|| invalid("expert was not staged"))?;
+                self.copy(&mut blit, &parts.parts, slot)?;
             }
         }
+        // Staging buffers stay alive in `staged` until their copies have completed.
         self.device.synchronize()?;
+        state.stats.copy += step.elapsed();
         for &(expert, slot) in &chosen {
             state.map[base + expert] =
                 u32::try_from(slot).map_err(|_| invalid("too many expert slots"))?;
             state.owners[slot] = Some(base + expert);
             state.stats.misses += 1;
         }
-        state.stats.bytes_read += reads.iter().map(|r| r.bytes.len() as u64).sum::<u64>();
         Ok(())
     }
 
-    /// Run every read on scoped threads, so none can outlive this call or its buffers.
-    fn read_all(&self, reads: &mut [Read<'_>]) -> Result<()> {
-        let mut shares: Vec<Vec<&mut Read<'_>>> = (0..READ_THREADS).map(|_| Vec::new()).collect();
-        for (i, read) in reads.iter_mut().enumerate() {
-            shares[i % READ_THREADS].push(read);
+    /// Encode one expert's copies from staging into `slot` of both arenas.
+    fn copy(
+        &self,
+        blit: &mut candle_metal_kernels::metal::BlitCommandsGuard<'_>,
+        parts: &[Arc<Buffer>],
+        slot: usize,
+    ) -> Result<()> {
+        let [gate_blocks, gate_scales, down_blocks, down_scales] = parts else {
+            return Err(invalid("staged expert has the wrong parts"));
+        };
+        for (arena, blocks, scales) in [
+            (&self.gate_up, gate_blocks, gate_scales),
+            (&self.down, down_blocks, down_scales),
+        ] {
+            let block_bytes = arena.shape.block_bytes()?;
+            let scale_bytes = arena.shape.scale_bytes()?;
+            blit.copy_from_buffer(blocks, 0, &arena.buffer, slot * block_bytes, block_bytes);
+            blit.copy_from_buffer(
+                scales,
+                0,
+                &arena.buffer,
+                arena.scales + slot * scale_bytes,
+                scale_bytes,
+            );
         }
-        let files = &self.files;
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = shares
-                .into_iter()
-                .map(|share| {
-                    scope.spawn(move || -> Result<()> {
-                        for read in share {
-                            let file = files
-                                .get(read.file)
-                                .ok_or_else(|| invalid("expert read has no file"))?;
-                            file.read_exact_at(&mut read.bytes, read.offset)?;
-                        }
-                        Ok(())
-                    })
-                })
+        Ok(())
+    }
+}
+
+impl Source {
+    /// Bytes one expert reads.
+    fn read_bytes(&self) -> Result<u64> {
+        let [gate_up, down] = self.shapes;
+        Ok(gate_up
+            .expert_bytes()?
+            .checked_add(down.expert_bytes()?)
+            .ok_or_else(|| invalid("expert size overflow"))? as u64)
+    }
+
+    /// Read `experts` of `layer` and upload them to staging buffers, on scoped threads so
+    /// none outlives this call. Uploads run in the read threads: one at a time they took
+    /// almost as long as the reads themselves (24 s against 33 s for 160 tokens).
+    fn stage(
+        &self,
+        layer: usize,
+        experts: &[usize],
+        buffers: &mut [Vec<u8>],
+    ) -> Result<Vec<Staged>> {
+        let banks = self
+            .layers
+            .get(layer)
+            .ok_or_else(|| invalid("expert cache has no such layer"))?;
+        let mut parts = Vec::with_capacity(4 * experts.len());
+        for (index, &expert) in experts.iter().enumerate() {
+            for (shape, &(file, blocks, scales)) in self.shapes.iter().zip(banks) {
+                let block_bytes = shape.block_bytes()?;
+                let scale_bytes = shape.scale_bytes()?;
+                parts.push((
+                    index,
+                    file,
+                    part_offset(blocks, expert, block_bytes)?,
+                    block_bytes,
+                ));
+                parts.push((
+                    index,
+                    file,
+                    part_offset(scales, expert, scale_bytes)?,
+                    scale_bytes,
+                ));
+            }
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (parts, next, this) = (&parts, &next, self);
+        let uploaded = std::thread::scope(|scope| -> Result<Vec<Vec<StagedPart>>> {
+            let handles: Vec<_> = buffers
+                .iter_mut()
+                .map(|buffer| scope.spawn(move || this.stage_parts(parts, next, buffer)))
                 .collect();
             handles
                 .into_iter()
-                .try_for_each(|h| h.join().map_err(|_| invalid("expert read thread failed"))?)
-        })
+                .map(|h| h.join().map_err(|_| invalid("expert read thread failed"))?)
+                .collect()
+        })?;
+        let mut slots: Vec<Option<Arc<Buffer>>> = vec![None; parts.len()];
+        for (at, buffer) in uploaded.into_iter().flatten() {
+            *slots
+                .get_mut(at)
+                .ok_or_else(|| invalid("expert read outside its batch"))? = Some(buffer);
+        }
+        let mut slots = slots.into_iter();
+        experts
+            .iter()
+            .map(|&expert| {
+                let parts = slots
+                    .by_ref()
+                    .take(4)
+                    .map(|part| part.ok_or_else(|| invalid("expert part was not read")))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Staged {
+                    layer,
+                    expert,
+                    parts,
+                })
+            })
+            .collect()
+    }
+
+    /// One thread's share of a batch: claim parts until none remain.
+    fn stage_parts(
+        &self,
+        parts: &[(usize, usize, u64, usize)],
+        next: &std::sync::atomic::AtomicUsize,
+        buffer: &mut Vec<u8>,
+    ) -> Result<Vec<StagedPart>> {
+        let mut done = Vec::new();
+        loop {
+            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(&(_, file, offset, size)) = parts.get(at) else {
+                return Ok(done);
+            };
+            let file = self
+                .files
+                .get(file)
+                .ok_or_else(|| invalid("expert read has no file"))?;
+            buffer.resize(size, 0);
+            file.read_exact_at(buffer, offset)?;
+            done.push((at, self.metal.new_buffer_with_data(buffer.as_slice())?));
+        }
     }
 }
 
-/// One contiguous read from a checkpoint and where it lands in an arena.
-struct Read<'a> {
-    file: usize,
-    offset: u64,
-    bytes: Vec<u8>,
-    target: &'a Buffer,
-    at: usize,
-}
-
-impl<'a> Read<'a> {
-    fn new(
-        file: usize,
-        start: u64,
-        expert: usize,
-        size: usize,
-        target: &'a Buffer,
-        at: usize,
-    ) -> Result<Self> {
-        let offset = (expert as u64)
-            .checked_mul(size as u64)
-            .and_then(|skip| start.checked_add(skip))
-            .ok_or_else(|| invalid("expert offset overflow"))?;
-        Ok(Self {
-            file,
-            offset,
-            bytes: vec![0; size],
-            target,
-            at,
-        })
-    }
+/// Stored offset of `expert`'s part of `size` bytes, from the offset of expert 0's.
+fn part_offset(start: u64, expert: usize, size: usize) -> Result<u64> {
+    (expert as u64)
+        .checked_mul(size as u64)
+        .and_then(|skip| start.checked_add(skip))
+        .ok_or_else(|| invalid("expert offset overflow"))
 }
 
 impl Drop for ExpertCache {
     fn drop(&mut self) {
-        let stats = self.state.get_mut().stats;
+        let state = self.state.get_mut();
+        if let Some(pending) = state.pending.take() {
+            // Only its completion matters: a prefetch nobody will use has nothing to report.
+            drop(pending.join());
+        }
+        let stats = state.stats;
         tracing::info!(
             slots = self.slots,
             hits = stats.hits,
@@ -538,6 +742,11 @@ impl Drop for ExpertCache {
             evictions = stats.evictions,
             bytes_read = stats.bytes_read,
             wait_ms = stats.wait.as_millis() as u64,
+            read_ms = stats.read.as_millis() as u64,
+            prefetched = stats.prefetched,
+            prefetch_used = stats.prefetch_used,
+            copy_ms = stats.copy.as_millis() as u64,
+            gpu_ms = stats.gpu.as_millis() as u64,
             "Expert cache"
         );
     }

@@ -15,23 +15,26 @@ The weights outside the routed experts stay resident. Experts live in one fixed 
 
 Reading the routes waits for all earlier GPU work, so no kernel can be using a slot while it is overwritten, and copies complete before the layer's kernels are encoded. A failed read fails that pass and leaves the slot without an owner, and a later pass reads it again.
 
+Reading ahead overlaps the SSD with the GPU. When a layer routes, the next layer's router also scores the same hidden state, and the experts it ranks highest are read in the background while the GPU works. Those reads only fill staging buffers and never touch a slot, so they can't race a kernel. Four in five turn out to be used.
+
+The embedding table stays on the SSD as well. It is over a gigabyte, and a token only needs its own row.
+
 ## Protecting the SSD
 
-SSD wear comes from writes, and the cache makes none. Checkpoint files open read-only, evicted slots are clean and simply overwritten, and reads bypass the page cache so that the arena really bounds what experts occupy. The way a cache can still cost writes is indirect: taking memory other applications hold pushes them into swap. So a load refuses a cache larger than what macOS can spare without swapping, minus a reserve of 3.5 GiB for state, scratch and everything else.
+SSD wear comes from writes, and the cache makes none. Checkpoint files open read-only, evicted slots are clean and simply overwritten, and reads bypass the page cache so that the arena really bounds what experts occupy. The way a cache can still cost writes is indirect: taking memory other applications hold pushes them into swap. So a load refuses a cache larger than what macOS can spare without swapping, minus a reserve of 2.5 GiB for state, scratch and everything else.
 
 ## Choosing a size
 
 The cache must hold every expert of one layer, which is 423 MiB on gpt-oss-20b, because one pass can route to all of them. Beyond that, more memory means fewer reads. Generating 160 tokens from a 91-token prompt on an M1 with 16 GB:
 
-| Cache | Hit rate | Tokens/s | Read per token |
-| --- | ---: | ---: | ---: |
-| 512 MiB | 16% | 1.6 | 1.0 GiB |
-| 1 GiB | 34% | 1.9 | 0.8 GiB |
-| 2 GiB | 52% | 2.1 | 0.6 GiB |
-| 3 GiB | 67% | 2.7 | 0.4 GiB |
-| 4 GiB | 79% | 3.7 | 0.3 GiB |
+| Cache | Hit rate | Tokens/s |
+| --- | ---: | ---: |
+| 1 GiB | 34% | 2.9 |
+| 2 GiB | 52% | 3.3 |
 
-Waiting for reads takes two thirds to four fifths of the time at every size, so a faster SSD or better hit rate is what speeds this up. These are single-request numbers: concurrent requests and prefill touch more experts.
+These are single-request numbers: concurrent requests touch more experts. Larger caches raise the hit rate further (67% at 3 GiB and 79% at 4 GiB), though on a busy 16 GB Mac the spare-memory check may refuse them.
+
+Long prompts behave differently. Each pass reads at most the whole expert set however many tokens it holds, so fewer, larger passes read far less. With a cache, prefill chunks and prefix snapshots default to every 1,024 tokens, and a 2,037-token prompt takes 18 s instead of 32 s at the usual 256. A repeat of that prompt with a different ending takes 10 s, because prefix reuse skips its first 1,024 tokens.
 
 ## Pruning experts
 
@@ -42,7 +45,10 @@ Waiting for reads takes two thirds to four fifths of the time at every size, so 
 Measured on gpt-oss-20b on an M1 with 16 GB:
 
 - Correctness comes from Transformers. A tiny MXFP4 fixture and the real checkpoint match its layers and logits within 1e-4 relative error, the real one through a 1 GiB cache with F32 projections.
-- Up to 4 GiB of cache, system-wide SSD writes during a run were usually under 100 MiB when nothing swapped (386 MiB at most), which is background activity. A 6 GiB cache swapped out 2.4 GB in one run, which is why the load checks spare memory. 2 GiB with about 6 GiB to spare swapped nothing in repeated runs; 3 and 4 GiB swapped up to 830 MiB under the same conditions.
+- Up to 4 GiB of cache, system-wide SSD writes during a run were usually under 100 MiB when nothing swapped (386 MiB at most), which is background activity. A 6 GiB cache swapped out 2.4 GB in one run, which is why the load checks spare memory. Under the 2.5 GiB reserve, 1 and 2 GiB swapped nothing; before it, 3 and 4 GiB swapped up to 830 MiB.
+- A miss cost more in our own pipeline than expected: for 160 tokens, 33 s of reads at about 4 GB/s, 24 s of staging uploads and 7 s of copies. Uploading inside the read threads plus reading ahead cut 83 s to 55 s at 1 GiB, with the same hit rate and logits.
+- Eviction stays as it is. Replaying a real trace reproduced the live hit rates, and LFU and LRU-2 gained at most two points. Only foreknowledge does better (55% at 81 slots, 89% at 324), which is why reading ahead pays off.
+- The MXFP4 kernels stay on a lookup table. It is as fast as Q8_0 at the bank's shape, and an arithmetic decode is 1.3 to 2.1× slower. A GPU round trip costs about 0.2 ms, so the wait at each of 24 layers isn't worth removing.
 - Below one token's experts (96 on gpt-oss-20b), eviction takes the expert needed furthest ahead, since passes visit layers in order. At or above it, eviction is LRU, which keeps what routing repeats.
 - The arena sits outside Candle's buffer pool, which rounds sizes up to a power of two.
 - Pruning by routing mass isn't recommended, for the reasons above. Published results for this kind of pruning (RCO) search on KL divergence directly, which Tur doesn't do.

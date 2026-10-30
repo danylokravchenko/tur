@@ -49,12 +49,19 @@ struct Layer {
     experts: Experts,
 }
 
+/// Input embeddings: a token only ever needs its own row of a table over a gigabyte in
+/// size, so a load that is short of memory reads rows from the checkpoint on demand.
+enum Embedding {
+    Resident(Embeddings),
+    OnDisk(Checkpoint),
+}
+
 /// gpt-oss text tower; immutable weights, with all request state in the engine's pools.
 pub struct GptOss {
     config: Config,
     description: ModelDescription,
     device: Device,
-    embedding: Embeddings,
+    embedding: Embedding,
     head: PackedLinear,
     norm: Tensor,
     layers: Vec<Layer>,
@@ -298,6 +305,17 @@ impl GptOss {
             .collect();
         let placement = Placement::of(&plan, options)?;
         let mut weights = plan.bytes(config)?;
+        if placement == Placement::Cached {
+            let table = match plan.embedding {
+                crate::models::Embedding::Table(precision) => {
+                    precision.bytes(config.vocab_size(), config.text.hidden_size)?
+                }
+                crate::models::Embedding::Head => 0,
+            };
+            weights = weights
+                .checked_sub(table)
+                .ok_or_else(|| invalid("embedding table exceeds the planned weights"))?;
+        }
         for (name, shape) in config.weight_shapes() {
             if accounted.contains(&name) {
                 continue;
@@ -328,10 +346,10 @@ impl GptOss {
         #[cfg(feature = "metal")]
         let mut staging = 0;
         #[cfg(feature = "metal")]
-        if let (Placement::Cached, Some(budget)) = (placement, options.expert_cache) {
+        if let (Placement::Cached, Some(cache)) = (placement, options.expert_cache) {
             use tur_metal::experts::ExpertCache;
             let (experts, gate_up, down) = config.bank_shapes();
-            let slots = ExpertCache::planned_slots(budget, experts, gate_up, down)?;
+            let slots = ExpertCache::planned_slots(cache, experts, gate_up, down)?;
             let arena = checked_elements(&[slots, ExpertCache::expert_bytes(gate_up, down)?])?;
             weights = weights
                 .checked_add(arena)
@@ -409,10 +427,10 @@ impl GptOss {
         #[cfg(feature = "metal")]
         let cache = options
             .expert_cache
-            .map(|budget| {
+            .map(|cache| {
                 tur_metal::experts::ExpertCache::new(
                     &config.expert_sources(&tensors.checkpoint)?,
-                    budget,
+                    cache,
                     device,
                 )
             })
@@ -426,11 +444,15 @@ impl GptOss {
                 options.kv,
             )?,
             device: device.clone(),
-            embedding: tensors.embedding(
-                "model.embed_tokens.weight",
-                config.vocab_size(),
-                width,
-            )?,
+            embedding: if placement == Placement::Cached {
+                Embedding::OnDisk(checkpoint(dir, &config)?)
+            } else {
+                Embedding::Resident(tensors.embedding(
+                    "model.embed_tokens.weight",
+                    config.vocab_size(),
+                    width,
+                )?)
+            },
             head: tensors.projection("lm_head")?,
             norm: f32_tensor(&tensors, "model.norm.weight")?,
             #[cfg(feature = "metal")]
@@ -516,7 +538,10 @@ impl GptOss {
     /// Resident bytes loaded onto the device.
     pub fn weight_bytes(&self) -> usize {
         self.projection_bytes()
-            + self.embedding.bytes()
+            + match &self.embedding {
+                Embedding::Resident(table) => table.bytes(),
+                Embedding::OnDisk(_) => 0,
+            }
             + self.norm.elem_count() * 4
             + self.layers.iter().map(Layer::bytes).sum::<usize>()
     }
@@ -584,8 +609,15 @@ impl GptOss {
             tokens.extend_from_slice(&batch.tokens[s.sequence.tokens.clone()]);
             positions.extend_from_slice(&batch.positions[s.sequence.tokens.clone()]);
         }
-        let ids = Tensor::new(tokens.as_slice(), &self.device)?;
-        let x = self.embedding.rows(&ids, &self.head)?;
+        let x = match &self.embedding {
+            Embedding::Resident(table) => {
+                table.rows(&Tensor::new(tokens.as_slice(), &self.device)?, &self.head)?
+            }
+            Embedding::OnDisk(checkpoint) => checkpoint
+                .gather_rows("model.embed_tokens.weight", &tokens)?
+                .to_dtype(DType::F32)?
+                .to_device(&self.device)?,
+        };
         let pass = Pass {
             pool: batch.pool,
             spans,
@@ -984,6 +1016,14 @@ impl GptOss {
         let t = &self.config.text;
         let logits = h.matmul(&e.router.t()?)?.broadcast_add(&e.router_bias)?;
         let routes = k.route(&logits, t.num_experts_per_tok)?;
+        // Encoded before the routes are read, so reading them waits for this too.
+        let next_logits = match (&self.cache, self.layers.get(index + 1)) {
+            (Some(_), Some(next)) => Some(
+                h.matmul(&next.experts.router.t()?)?
+                    .broadcast_add(&next.experts.router_bias)?,
+            ),
+            _ => None,
+        };
         if let Some(mass) = self.mass.lock().as_mut() {
             for (expert, weight) in routes.selections()? {
                 let cell = mass
@@ -994,7 +1034,7 @@ impl GptOss {
         }
         let (routes, gate_up_bank, down_bank) = match (&self.cache, &e.banks) {
             (Some(cache), _) => (
-                cache.route(k, index, routes)?,
+                cache.route(k, index, routes, next_logits.as_ref())?,
                 cache.gate_up(),
                 cache.down(),
             ),

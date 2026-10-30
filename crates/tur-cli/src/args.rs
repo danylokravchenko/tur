@@ -66,6 +66,11 @@ pub(crate) struct ModelArgs {
 }
 
 impl ModelArgs {
+    /// Whether experts stay on disk behind a bounded cache.
+    pub(crate) fn caches_experts(&self) -> bool {
+        self.expert_cache_mb.is_some()
+    }
+
     inherit!(
         model,
         revision,
@@ -246,6 +251,15 @@ pub(crate) struct PipelineArgs {
 }
 
 impl PipelineArgs {
+    /// Prefill defaults when experts stay on disk: every pass can read the whole expert set
+    /// whatever its size, so fewer, larger passes read far less. A 2,037-token prompt on
+    /// gpt-oss-20b took 32 s in 256-token chunks and 18 s in 1024-token chunks. Snapshots
+    /// sit on chunk boundaries, so their spacing has to grow with the chunk.
+    pub(crate) fn prefer_large_passes(&mut self) {
+        self.prefill_chunk_size.get_or_insert(1024);
+        self.prefix_spacing.get_or_insert(1024);
+    }
+
     inherit!(
         prefill_chunk_size,
         state_memory_mb,

@@ -50,7 +50,7 @@ tur run --model google/gemma-4-E2B-it --revision 3e22461f65e89153144f8adb70e3b8c
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--prefill-chunk-size <n>` | 256 | Most prompt tokens one request adds to one pass |
+| `--prefill-chunk-size <n>` | 256, or 1024 with `--expert-cache-mb` | Most prompt tokens one request adds to one pass |
 | `--state-memory-mb <n>` | derived | Memory for K/V pages and recurrent state. By default, room for an 8K-token context per concurrent request |
 | `--speculative-draft <n>` | 0 | Most tokens drafted from the request's own text per step; 0 turns speculation off |
 | `--mtp [true\|false]` | off | Also draft with the checkpoint's multi-token-prediction head; turns off prefix reuse |

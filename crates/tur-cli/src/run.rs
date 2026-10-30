@@ -118,7 +118,10 @@ impl Args {
     }
 }
 
-pub(crate) fn run(args: Args) -> Result<()> {
+pub(crate) fn run(mut args: Args) -> Result<()> {
+    if args.model.caches_experts() {
+        args.pipeline.prefer_large_passes();
+    }
     let factory = args.model.factory()?;
     let config = args.pipeline.config(1)?;
     config.scheduler.validate()?;

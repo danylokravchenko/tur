@@ -7,7 +7,7 @@ Tur is an inference service for Apple Silicon Macs. It aims for three things at 
 ## In scope
 
 - Apple Silicon Macs with Metal. CPU execution exists only as a numerical reference for tests.
-- Qwen3.5-family hybrid text models (dense Qwen3.5 and Qwen3.8, and experimentally the Qwen3.6 MoE) and Gemma 4 text models. The architecture is identified from checkpoint fields, never from the name.
+- Qwen3.5-family hybrid text models (dense Qwen3.5 and Qwen3.8, and experimentally the Qwen3.6 MoE), Gemma 4 text models and gpt-oss text models. The architecture is identified from checkpoint fields, never from the name.
 - Speech: audio input to Gemma 4 E2B and E4B through their own encoder, and Whisper transcription (see [Audio](../architecture/audio.md)).
 - The `tur` CLI, an OpenAI-compatible HTTP API and the Rust library.
 
@@ -29,6 +29,7 @@ Tur is an inference service for Apple Silicon Macs. It aims for three things at 
 | Gemma 4 E2B | Pinned Transformers F32 architecture fixtures, and real Q8_0 checkpoint generation; its Q8_0 audio encoder matches the F32 Transformers encoder at cosine similarity 0.9999 |
 | Whisper large-v3-turbo | Small Transformers fixture for the encoder, decoder and cached greedy decode; real F32 and Q8_0 transcripts equal Transformers' on a pinned clip, and F32 long-form tokens and segment times equal its `generate` on a clip beyond 30 s |
 | Gemma 4 E4B, 12B, 26B-A4B, 31B | Architecture fixtures and configuration checks; full checkpoints not yet run |
+| gpt-oss-20b | Pinned Transformers F32 fixture, and real weights compared per layer through the expert cache; the Harmony reasoning and answer channels are not yet separated |
 
 ## Principles
 
