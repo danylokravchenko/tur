@@ -17,6 +17,7 @@ Each case prints one JSON document to stdout and progress to stderr. Timed regio
 | `prefix` | CPU cost of prefix keys, lookups and eviction (no checkpoint) | none |
 | `kv_quality` | Teacher-forced KL, top-1 and NLL of K/V, state and weight variants against an F32 reference | `TUR_EVAL_TEXT`, `TUR_EVAL_KV`, `TUR_EVAL_STATE`, `TUR_EVAL_WEIGHTS`, `TUR_EVAL_TOKENS`, `TUR_EVAL_GENERATE` |
 | `tensorops` | Metal 4 TensorOps availability and F32 GEMM against Candle | none |
+| `whisper` | Whisper's encoder operations at their shapes; with checkpoints, whole-window encoding and transcription, and text passes during a concurrent Gemma clip | `TUR_AUDIO_SPEECH`, `TUR_WHISPER`, `TUR_GEMMA4_E2B` (all optional) |
 | `load_weights <dir> <variant>` | Load time and memory of `f32`, `q8_0`, `q4k` or `prepacked` | wrap in `/usr/bin/time -l` for peak memory |
 
 The module doc of each case in `crates/tur/benches/perf/` lists every variable. The serving workloads are:

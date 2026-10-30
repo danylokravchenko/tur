@@ -1063,6 +1063,7 @@ impl<M: HybridModel> HybridEngine<M> {
         })?;
         let bindings: Vec<_> = reservations.iter().map(Reservation::binding).collect();
         requirements.workspace_bytes = self.model.workspace_bytes(&PackedForward {
+            embeddings: &plan.embeddings,
             tokens: &plan.tokens,
             positions: &plan.positions,
             sequences: &forwards(&plan, &bindings, self.draft_head),
@@ -1095,6 +1096,7 @@ impl<M: HybridModel> HybridEngine<M> {
             .try_for_each(Reservation::prepare);
         let result = prepared.and_then(|()| {
             batch.model.forward(&PackedForward {
+                embeddings: &batch.plan.embeddings,
                 tokens: &batch.plan.tokens,
                 positions: &batch.plan.positions,
                 sequences: &forwards(&batch.plan, &bindings, self.draft_head),
@@ -1167,8 +1169,7 @@ impl<M: HybridModel> HybridEngine<M> {
         if self.pending.is_some() {
             return Err(invalid("the draft head runs between passes"));
         }
-        let mut results: Vec<Option<Result<Vec<Draft>>>> =
-            requests.iter().map(|_| None).collect();
+        let mut results: Vec<Option<Result<Vec<Draft>>>> = requests.iter().map(|_| None).collect();
         let (mut tokens, mut positions, mut live, mut states) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (index, request) in requests.iter().enumerate() {
@@ -1690,6 +1691,7 @@ mod tests {
             .ok_or_else(|| invalid("missing fixture request"))?
             .handle = handle;
         let plan = PackedExecution {
+            embeddings: Vec::new(),
             tokens: vec![1],
             positions: vec![0],
             sequences: vec![SequenceDescriptor {

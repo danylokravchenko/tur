@@ -9,7 +9,7 @@
 
 ---
 
-Tur runs Qwen3.5-family and Gemma 4 text models on your Mac's GPU. You can generate from the terminal, serve an OpenAI-compatible HTTP API, or embed the engine in a Rust program. One `tur` binary handles generation, serving and quantization.
+Tur runs Qwen3.5-family and Gemma 4 models on your Mac's GPU. Gemma 4 E2B and E4B also hear audio, and Whisper large-v3-turbo transcribes speech beside the chat model. You can generate from the terminal, serve an OpenAI-compatible HTTP API, or embed the engine in a Rust program. One `tur` binary handles generation, serving, transcription and quantization.
 
 General-purpose engines treat every model the same way. Tur is built around one family of models on one kind of hardware, so each part of the path, from Metal kernels to request scheduling, can be shaped to what those models need.
 
@@ -88,10 +88,11 @@ To keep your settings, copy [`tur.example.toml`](tur.example.toml) to `tur.toml`
 | Qwen3.5-0.8B | Validated layer by layer against Transformers, on CPU and Metal |
 | Qwen3.8-27B | Same code path and validated config; not yet run, since it needs more than 16 GB |
 | Qwen3.6-35B-A3B (MoE) | Experimental |
-| Gemma 4 E2B | Validated against Transformers; real checkpoint generation tested |
+| Gemma 4 E2B | Validated against Transformers; real checkpoint generation tested, including audio input |
+| Whisper large-v3-turbo | Transcripts equal Transformers' on a pinned clip, in F32 and Q8_0 |
 | Gemma 4 E4B, 12B, 26B-A4B, 31B | Architecture covered by small fixtures; full checkpoints not yet run |
 
-Tur accepts text input only.
+Tur accepts text, and WAV audio for Gemma 4 E2B and E4B and for transcription; image and video input are rejected.
 
 ### Smaller weights
 

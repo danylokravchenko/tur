@@ -2,7 +2,11 @@ use std::{io::Write, path::PathBuf};
 
 use tur::{
     Result,
-    backend::pipeline::{GenerationRequest, InferencePipeline},
+    audio::Audio,
+    backend::{
+        chat_template::{Content, ContentPart},
+        pipeline::{GenerationRequest, InferencePipeline},
+    },
     hybrid::SamplingOptions,
 };
 
@@ -23,6 +27,11 @@ pub(crate) struct Args {
     #[arg(long, default_value = "Who are you?")]
     #[serde(skip)]
     prompt: String,
+    /// WAV clip placed before the prompt, for models with an audio encoder (Gemma 4 E2B
+    /// and E4B).
+    #[arg(long)]
+    #[serde(skip)]
+    audio: Option<PathBuf>,
     /// Generated-token limit, including EOS (default: 128).
     #[arg(short = 'n', long)]
     max_tokens: Option<usize>,
@@ -81,7 +90,15 @@ impl Args {
     }
 
     fn request(self) -> Result<GenerationRequest> {
-        let mut request = GenerationRequest::new(self.prompt, self.max_tokens.unwrap_or(128));
+        let mut request =
+            GenerationRequest::new(self.prompt.clone(), self.max_tokens.unwrap_or(128));
+        if let Some(path) = &self.audio {
+            let clip = Audio::from_wav(&std::fs::read(path)?)?;
+            request.messages[0].content = Content::Parts(vec![
+                ContentPart::Audio(clip),
+                ContentPart::Text(self.prompt),
+            ]);
+        }
         request.seed = self.seed.unwrap_or(299_792_458);
         request.sampling = SamplingOptions {
             temperature: self.temperature,

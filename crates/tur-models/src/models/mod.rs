@@ -15,6 +15,7 @@ pub use options::{
 pub use weights::{Embedding, Method, Packer, Precision, Projection, WeightPlan};
 pub mod gemma4;
 pub mod qwen3_5;
+pub mod whisper;
 
 mod text;
 pub use text::{ModelConfig, TextModel};

@@ -5,12 +5,13 @@ use tur::{
     backend::{memory::DeviceBudget, pipeline::PipelineConfig},
     server::{
         AppState, run_server,
+        transcription::{TranscriptionConfig, TranscriptionWorker},
         worker::{PipelineWorker, StreamConfig, WorkerConfig},
     },
 };
 
 use crate::{
-    args::{ModelArgs, PipelineArgs},
+    args::{ModelArgs, PipelineArgs, WhisperArgs},
     config::inherit,
 };
 
@@ -23,9 +24,19 @@ pub(crate) struct Args {
     #[command(flatten)]
     #[serde(skip)]
     pipeline: PipelineArgs,
+    #[command(flatten)]
+    #[serde(skip)]
+    whisper: WhisperArgs,
     /// Model ID accepted by /v1/chat/completions and listed by /v1/models (default: qwen-hybrid).
     #[arg(long)]
     served_model_name: Option<String>,
+    /// Model ID of `--whisper` at /v1/audio/transcriptions and /v1/models (default:
+    /// whisper-1, the name `OpenAI` clients send).
+    #[arg(long)]
+    transcription_model_name: Option<String>,
+    /// Clips queued for transcription before new ones are rejected (default: 16).
+    #[arg(long)]
+    max_waiting_transcriptions: Option<usize>,
     /// Address the HTTP listener binds once the model has loaded (default: 127.0.0.1:8080).
     #[arg(long)]
     listen: Option<SocketAddr>,
@@ -56,6 +67,8 @@ pub(crate) struct Args {
 impl Args {
     inherit!(
         served_model_name,
+        transcription_model_name,
+        max_waiting_transcriptions,
         listen,
         max_batch_size,
         max_batch_tokens,
@@ -69,6 +82,7 @@ impl Args {
     pub(crate) fn configure(&mut self, settings: crate::config::FileSettings) {
         self.model.inherit(settings.model);
         self.pipeline.inherit(settings.engine);
+        self.whisper.inherit(settings.whisper);
         self.inherit(settings.server);
     }
 
@@ -120,9 +134,26 @@ pub(crate) async fn serve(args: Args) -> Result<()> {
     }
     let factory = args.model.factory()?;
     pipeline.prefix.validate(factory.kv.page_tokens)?;
+    let budget = DeviceBudget::for_device(&factory.device);
+    // Whisper leases first, so the text state pool is sized from what remains.
+    let mut transcribers = HashMap::new();
+    let transcription_name = args
+        .transcription_model_name
+        .unwrap_or_else(|| "whisper-1".into());
+    // A device of its own has its own queue, so text passes interleave with a transcription.
+    let whisper_device = tur::shared::inference_device(factory.device.is_cpu())?;
+    if let Some(whisper) = args.whisper.factory(&whisper_device)? {
+        let worker = TranscriptionWorker::spawn(TranscriptionConfig {
+            factory: whisper,
+            budget: budget.clone(),
+            max_waiting: args.max_waiting_transcriptions.unwrap_or(16),
+        })?;
+        transcribers.insert(transcription_name.clone(), worker);
+    }
+    let default_transcriber = (!transcribers.is_empty()).then_some(transcription_name);
     // Load before binding the listener so readiness means a validated, usable checkpoint.
     let worker = PipelineWorker::spawn(WorkerConfig {
-        budget: DeviceBudget::for_device(&factory.device),
+        budget,
         factory,
         pipeline,
         request_timeout: args.request_timeout_secs.map(Duration::from_secs),
@@ -132,6 +163,8 @@ pub(crate) async fn serve(args: Args) -> Result<()> {
     run_server(
         AppState {
             workers,
+            transcribers,
+            default_transcriber,
             default_model,
         },
         args.listen

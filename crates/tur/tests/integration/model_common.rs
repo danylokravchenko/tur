@@ -136,6 +136,7 @@ pub(crate) fn forward(
         })
         .collect();
     let steps = model.forward(&PackedForward {
+        embeddings: &[],
         tokens: &tokens,
         positions: &positions,
         sequences: &forwards,
@@ -190,6 +191,7 @@ pub(crate) fn generate<M: HybridModel>(
         let meta = engine.metadata(h.request)?;
         let n = next.len();
         engine.submit(PackedExecution {
+            embeddings: Vec::new(),
             positions: (0..n).map(|i| meta.position + i).collect(),
             tokens: std::mem::take(&mut next),
             sequences: vec![SequenceDescriptor {

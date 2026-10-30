@@ -7,6 +7,12 @@
 - Finish Gemma 4. Run the larger checkpoints on suitable Macs and set held-out quality budgets. Assistant chains pay only with one request decoding (see [Speculative decoding](../architecture/speculation.md#decisions)); several requests need a cheaper chained step, for example gathering candidate heads in a batch without a CPU round trip per step. Calibrated Gemma artifacts (`imatrix`, GPTQ) need layer-by-layer calibration that handles PLE and shared K/V.
 - More Macs. Every number so far comes from one M1. Launch shapes and crossover points need per-device sweeps, and the minimum supported macOS and chip still has to be decided.
 
+## Audio
+
+- An E4B checkpoint run.
+- A faster Whisper encoder. Attention now runs on Tur's tiled kernel, and the projections take most of the remaining 2 s per window on the M1. They run on Candle's GEMM at about 1.5 TFLOP/s, which a matrix-unit kernel did not beat (see [Rejected experiments](rejected.md)), so the next step is hardware with faster matrix units.
+- Finer silence handling in Whisper. The energy gate works on whole windows, so a segment after a long silence starts at its window's opening, and text can still be invented in a quiet stretch inside a window with speech. Voice activity detection would address both.
+
 ## Performance
 
 - Long-prompt prefill. llama.cpp prefills 8K-token prompts 6 to 11% faster than Tur, while 2K-token prompts are level ([Compared with llama.cpp](../guide/performance.md#compared-with-llamacpp)). In an 8K-token prefill, tiled attention takes the largest share, about 2.3 s across six layers. Matching llama.cpp's attention speed needs faster matrix work, for example F16 staging.

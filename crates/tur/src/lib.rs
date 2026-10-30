@@ -7,7 +7,7 @@ pub use tur_engine::backend;
 /// Hybrid request execution contracts.
 pub use tur_engine::hybrid;
 pub use tur_metal as runtime;
-pub use tur_models::{models, quantization};
+pub use tur_models::{audio, models, quantization};
 
 pub use backend::{
     factory::{ModelFactory, ModelSource},

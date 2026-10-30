@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 use tur::{Result, TurError, models::parse_recurrent_state};
 
 use crate::{
-    args::{ModelArgs, PipelineArgs},
+    args::{ModelArgs, PipelineArgs, WhisperArgs},
     run, serve,
 };
 
@@ -27,6 +27,7 @@ pub(crate) struct FileSettings {
     pub(crate) engine: PipelineArgs,
     pub(crate) server: serve::Args,
     pub(crate) generation: run::Args,
+    pub(crate) whisper: WhisperArgs,
 }
 
 impl FileSettings {
@@ -56,9 +57,9 @@ impl FileSettings {
         let mut settings: Self = toml::from_str(&text).map_err(|error| {
             TurError::Other(format!("invalid configuration {}: {error}", path.display()))
         })?;
-        settings
-            .model
-            .relative_to(path.parent().unwrap_or_else(|| Path::new(".")));
+        let directory = path.parent().unwrap_or_else(|| Path::new("."));
+        settings.model.relative_to(directory);
+        settings.whisper.relative_to(directory);
         Ok(settings)
     }
 }

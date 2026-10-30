@@ -4,14 +4,14 @@ use crate::model_common as common;
 use crate::model_common::{max_relative, rows};
 use candle_core::{DType, Device};
 use std::path::{Path, PathBuf};
-#[cfg(feature = "metal")]
 use std::sync::Arc;
 use tur_core::{
     Result,
     execution::{KvFormat, KvLayout, invalid},
 };
+use tur_metal::pool::PoolConfig;
 #[cfg(feature = "metal")]
-use tur_metal::{pool::PoolConfig, state::ModelState};
+use tur_metal::state::ModelState;
 #[cfg(feature = "metal")]
 use tur_models::hybrid::{Boundaries, HybridModel, StatePool};
 use tur_models::models::{
@@ -38,6 +38,7 @@ fn options(
         kv: KvLayout::new(4, kv),
         recurrent: DType::F32,
         mtp: None,
+        audio: false,
     }
 }
 #[cfg(feature = "metal")]
@@ -69,7 +70,7 @@ fn conformance(device: &Device, execution: Execution) -> Result<()> {
             .flatten_all()?
             .to_vec1::<u32>()?;
         let requested: Vec<usize> = (0..tokens.len()).collect();
-        let (trace, logits) = model.trace(&tokens, &requested)?;
+        let (trace, logits) = model.trace(&tokens, &requested, &[])?;
         assert_eq!(trace.len(), 4);
         for (i, hidden) in trace.iter().enumerate() {
             let reference = golden
@@ -207,7 +208,12 @@ fn test_gemma4_batched_assistant_chains_keep_their_rows() -> Result<()> {
                 vocab: None,
                 model: Some(fixture("assistant")),
             }),
-            ..options(Device::Cpu, Execution::Reference, WeightFormat::F32, KvFormat::F32)
+            ..options(
+                Device::Cpu,
+                Execution::Reference,
+                WeightFormat::F32,
+                KvFormat::F32,
+            )
         },
     )?;
     let mut engine = HybridEngine::new(
@@ -222,6 +228,7 @@ fn test_gemma4_batched_assistant_chains_keep_their_rows() -> Result<()> {
     engine.enable_draft_head();
     let prompts: [&[u32]; 2] = [&[2, 7, 5, 9, 3, 12, 7], &[4, 11, 17, 7, 12]];
     let mut plan = PackedExecution {
+        embeddings: Vec::new(),
         tokens: Vec::new(),
         positions: Vec::new(),
         sequences: Vec::new(),
@@ -255,7 +262,9 @@ fn test_gemma4_batched_assistant_chains_keep_their_rows() -> Result<()> {
             handle: engine.metadata(result.request)?.handle,
             start: 0,
             tokens,
-            hidden: result.hidden.ok_or_else(|| invalid("missing hidden states"))?,
+            hidden: result
+                .hidden
+                .ok_or_else(|| invalid("missing hidden states"))?,
             drafts,
         });
     }
@@ -373,7 +382,7 @@ fn test_gemma4_e2b_checkpoint_logits_match_transformers() -> Result<()> {
     )?;
     let model = Arc::new(model);
     let requested: Vec<usize> = (0..tokens.len()).collect();
-    let (_, logits) = model.trace(&tokens, &requested)?;
+    let (_, logits) = model.trace(&tokens, &requested, &[])?;
     let reference = golden
         .get("logits")
         .ok_or_else(|| invalid("missing reference logits"))?;
@@ -528,8 +537,8 @@ fn test_gemma4_prepacked_artifacts_match_load_time_conversion_exactly() -> Resul
                 },
             )?;
             assert_eq!(stored.weight_bytes(), converted.weight_bytes());
-            let (_, expected) = converted.trace(&tokens, &requested)?;
-            let (_, actual) = stored.trace(&tokens, &requested)?;
+            let (_, expected) = converted.trace(&tokens, &requested, &[])?;
+            let (_, actual) = stored.trace(&tokens, &requested, &[])?;
             assert_eq!(rows(&actual)?, rows(&expected)?, "{kind} {format:?}");
             // An artifact directory only loads as prepacked weights.
             assert!(
@@ -598,6 +607,7 @@ fn assistant_drafts(device: &Device, execution: Execution) -> Result<()> {
         let binding = reservation.binding();
         let step = model
             .forward(&PackedForward {
+                embeddings: &[],
                 tokens: &tokens[p..=p],
                 positions: &[p],
                 sequences: &[SequenceForward {
@@ -647,7 +657,10 @@ fn assistant_drafts(device: &Device, execution: Execution) -> Result<()> {
                 "position {p} depth {depth} candidates"
             );
             let error = max_relative(&[finite(actual)], &[finite(expected)]);
-            assert!(error < 1e-4, "{execution:?} position {p} depth {depth}: {error}");
+            assert!(
+                error < 1e-4,
+                "{execution:?} position {p} depth {depth}: {error}"
+            );
         }
     }
     Ok(())
@@ -709,6 +722,7 @@ fn test_gemma4_e2b_assistant_drafts_agree_with_transformers_past_the_window() ->
         let packed: Vec<usize> = (state.position()..=p).collect();
         let step = model
             .forward(&PackedForward {
+                embeddings: &[],
                 tokens: piece,
                 positions: &packed,
                 sequences: &[SequenceForward {

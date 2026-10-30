@@ -12,7 +12,11 @@ pub async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
         .unwrap_or_default()
         .as_secs();
 
-    let mut ids: Vec<&String> = state.workers.keys().collect();
+    let mut ids: Vec<&String> = state
+        .workers
+        .keys()
+        .chain(state.transcribers.keys())
+        .collect();
     ids.sort();
     let data = ids
         .into_iter()

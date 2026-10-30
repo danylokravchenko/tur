@@ -5,6 +5,7 @@
     reason = "tests assert outcomes after fallible setup"
 )]
 
+mod audio;
 mod common;
 mod contracts;
 mod engine;

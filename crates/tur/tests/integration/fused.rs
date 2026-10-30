@@ -88,6 +88,7 @@ fn load_state(
             kv,
             recurrent,
             mtp: None,
+            audio: false,
         },
     )
 }
@@ -465,6 +466,7 @@ fn test_execution_selection_and_declared_workspace() -> Result<()> {
         let reservation = state.reserve(n, Boundaries::Final)?;
         let binding = reservation.binding();
         model.workspace_bytes(&PackedForward {
+            embeddings: &[],
             tokens: &tokens,
             positions: &positions,
             sequences: &[SequenceForward {
@@ -489,6 +491,7 @@ fn test_execution_selection_and_declared_workspace() -> Result<()> {
             kv: F32_KV,
             recurrent: DType::F32,
             mtp: None,
+            audio: false,
         },
         512,
         &[512],
@@ -534,6 +537,7 @@ fn test_preload_weight_plans_match_every_format_and_tied_embedding_layout() -> R
                 kv: F32_KV,
                 recurrent: DType::F16,
                 mtp: None,
+                audio: false,
             };
             let (description, weights, scratch) =
                 Qwen35::memory_requirements(&parsed, &options, 512, &[512])?;
@@ -672,6 +676,7 @@ fn feed(engine: &mut HybridEngine<Qwen35>, request: StateHandle, tokens: &[u32])
     let meta = engine.metadata(request.request)?;
     let n = tokens.len();
     engine.submit(PackedExecution {
+        embeddings: Vec::new(),
         positions: (meta.position..meta.position + n).collect(),
         tokens: tokens.to_vec(),
         sequences: vec![SequenceDescriptor {
@@ -759,6 +764,7 @@ fn test_full_and_partial_prefix_forks_and_restores_continue_exactly() -> Result<
         let meta = engine.metadata(c.request)?;
         let n = drafts.len();
         engine.submit(PackedExecution {
+            embeddings: Vec::new(),
             positions: (meta.position..meta.position + n).collect(),
             tokens: drafts,
             sequences: vec![SequenceDescriptor {
@@ -867,6 +873,7 @@ fn real(format: WeightFormat, execution: Execution, kv: KvLayout) -> Result<Qwen
             kv,
             recurrent: DType::F32,
             mtp: None,
+            audio: false,
         },
     )
 }
@@ -991,6 +998,7 @@ fn generate(
             });
         }
         engine.submit(PackedExecution {
+            embeddings: Vec::new(),
             tokens,
             positions,
             sequences,
@@ -1160,6 +1168,7 @@ fn test_grammar_masks_are_applied_on_the_device() -> Result<()> {
             .map(|h| engine.metadata(h.request).map(|m| m.handle))
             .collect::<Result<_>>()?;
         let mut plan = PackedExecution {
+            embeddings: Vec::new(),
             tokens: Vec::new(),
             positions: Vec::new(),
             sequences: Vec::new(),
@@ -1240,6 +1249,7 @@ fn test_cached_last_logits_sample_like_the_pass_that_produced_them() -> Result<(
         let original = engine.allocate(seed, options, None)?;
         engine.add_context(original, &tokens)?;
         engine.submit(PackedExecution {
+            embeddings: Vec::new(),
             positions: (0..tokens.len()).collect(),
             tokens: tokens.clone(),
             sequences: vec![SequenceDescriptor {

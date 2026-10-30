@@ -25,6 +25,7 @@
 - [Prefix reuse](architecture/prefix-reuse.md)
 - [Sampling](architecture/sampling.md)
 - [Speculative decoding](architecture/speculation.md)
+- [Audio](architecture/audio.md)
 - [Metal kernels](architecture/kernels.md)
 - [Serving](architecture/serving.md)
 
@@ -40,3 +41,4 @@
 - [Rejected experiments](design/rejected.md)
 - [Open work](design/open.md)
 - [Research: partial models](research/partial-model-initiative.md)
+- [Research: serving larger models](research/strata-large-model-serving.md)

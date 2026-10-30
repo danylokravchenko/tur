@@ -273,6 +273,27 @@ impl WeightPlan {
 }
 
 /// 64-bit FNV-1a: a stable content fingerprint for identities, not a security hash.
+/// Storage of a `[_, cols]` projection in `precision`: the same format, or F32 when its
+/// rows do not tile into the format's blocks (small test widths).
+pub(crate) fn tiled(precision: Precision, cols: usize) -> Precision {
+    match precision.ggml() {
+        Some(format) if !cols.is_multiple_of(format.block_size()) => Precision::F32,
+        _ => precision,
+    }
+}
+
+/// Upload a `[rows, cols]` matrix as a projection stored in [`tiled`] `precision`.
+pub(crate) fn upload_projection(
+    weight: &candle_core::Tensor,
+    precision: Precision,
+    device: &candle_core::Device,
+) -> Result<tur_metal::packed::PackedLinear> {
+    tiled(precision, weight.dim(1)?).ggml().map_or_else(
+        || tur_metal::packed::PackedLinear::dense(weight, device),
+        |format| tur_metal::packed::PackedLinear::quantized(weight, format, device),
+    )
+}
+
 pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &b| {
         (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)

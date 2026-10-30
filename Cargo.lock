@@ -3521,6 +3521,7 @@ version = "0.2.0"
 dependencies = [
  "candle-core",
  "candle-nn",
+ "flate2",
  "hf-hub",
  "minijinja",
  "safetensors 0.8.0",

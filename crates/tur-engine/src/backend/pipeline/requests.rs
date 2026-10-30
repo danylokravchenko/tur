@@ -42,6 +42,9 @@ pub struct GenerationRequest {
     pub cache_salt: Option<String>,
     /// Constrain generation to this grammar; the request completes when it terminates.
     pub grammar: Option<TopLevelGrammar>,
+    /// Soft tokens of every clip of `messages`, in order, when they were encoded before
+    /// submission; empty encodes them at submission, on the calling thread.
+    pub encoded_audio: Vec<Tensor>,
 }
 
 impl GenerationRequest {
@@ -61,7 +64,17 @@ impl GenerationRequest {
             submitted_at: None,
             cache_salt: None,
             grammar: None,
+            encoded_audio: Vec::new(),
         }
+    }
+
+    /// Whether submission would have to encode audio.
+    pub fn needs_audio_encoding(&self) -> bool {
+        self.encoded_audio.is_empty()
+            && self
+                .messages
+                .iter()
+                .any(|m| m.content.audio().next().is_some())
     }
 }
 
@@ -206,6 +219,7 @@ impl InferencePipeline {
         if tokens.is_empty() {
             return Err(invalid("chat template produced an empty prompt"));
         }
+        let (tokens, audio) = self.expand_audio(request, tokens)?;
         // The final sampled token need not be consumed into model state.
         let positions = tokens
             .len()
@@ -259,7 +273,13 @@ impl InferencePipeline {
             })
             .transpose()?;
         let handle = self.engine.allocate(request.seed, options, guidance)?;
-        self.engine.add_context(handle, &tokens)?;
+        // Audio positions are not tokens the repetition penalty could see repeated.
+        let text: Vec<u32> = tokens
+            .iter()
+            .copied()
+            .filter(|&t| !super::audio::is_identity(t))
+            .collect();
+        self.engine.add_context(handle, &text)?;
         let keys = self.prefix.keys(request.cache_salt.as_deref(), &tokens);
         self.pending.insert(
             handle.request,
@@ -268,6 +288,7 @@ impl InferencePipeline {
                 prompt_tokens: tokens.len(),
                 turn_boundary,
                 tokens,
+                audio,
                 consumed: 0,
                 boundaries: Vec::new(),
                 replay_floor: 0,

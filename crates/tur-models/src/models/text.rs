@@ -4,9 +4,19 @@ use super::{
     gemma4::{self, Gemma4},
     qwen3_5::{self, Qwen35},
 };
-use crate::hybrid::{DraftForward, HybridModel, PackedForward, SequenceStep};
+use crate::{
+    audio::{Audio, AudioPrompt},
+    hybrid::{DraftForward, HybridModel, PackedForward, SequenceStep},
+};
 use std::path::Path;
-use tur_core::{Result, execution::ModelDescription};
+use tur_core::{
+    Result,
+    execution::{ModelDescription, invalid},
+};
+
+fn no_audio() -> tur_core::TurError {
+    invalid("this model has no audio encoder")
+}
 
 /// Validated model-specific settings selected from explicit checkpoint architecture fields.
 #[derive(Clone, Debug)]
@@ -117,6 +127,27 @@ impl TextModel {
         match self {
             Self::Qwen35(m) => m.config().max_position(),
             Self::Gemma4(m) => m.config().max_position(),
+        }
+    }
+    /// How a clip appears in prompts, when the model has an audio encoder loaded.
+    pub fn audio_prompt(&self) -> Option<AudioPrompt> {
+        match self {
+            Self::Qwen35(_) => None,
+            Self::Gemma4(m) => m.audio_prompt(),
+        }
+    }
+    /// Prompt positions a clip's soft tokens occupy, between its framing tokens.
+    pub fn audio_tokens(&self, clip: &Audio) -> Result<usize> {
+        match self {
+            Self::Qwen35(_) => Err(no_audio()),
+            Self::Gemma4(m) => m.audio_tokens(clip),
+        }
+    }
+    /// Encode a clip into F32 `[audio_tokens, hidden]` embedding rows on the model device.
+    pub fn encode_audio(&self, clip: &Audio) -> Result<candle_core::Tensor> {
+        match self {
+            Self::Qwen35(_) => Err(no_audio()),
+            Self::Gemma4(m) => m.encode_audio(clip),
         }
     }
     fn model(&self) -> &dyn HybridModel {

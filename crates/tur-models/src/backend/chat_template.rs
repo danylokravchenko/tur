@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::path::Path;
 
 use crate::backend::tools::ToolDefinition;
-use crate::{Result, TurError};
+use crate::{Result, TurError, audio::Audio};
 
 /// Renders a checkpoint's own Hugging Face-compatible Jinja2 chat template.
 pub struct ChatTemplate {
@@ -40,11 +40,69 @@ impl Serialize for ToolCall {
     }
 }
 
+/// One typed piece of a turn, in order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContentPart {
+    Text(String),
+    /// A clip, rendered as Hugging Face's `{"type": "audio"}` part; the template emits
+    /// the model's audio placeholder for it.
+    Audio(Audio),
+}
+
+/// A turn's content: plain text, or typed parts as Hugging Face templates receive them.
+/// Text serializes as a string, so text-only templates see exactly what they expect.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Content {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl Content {
+    /// The text when the content holds nothing else.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Parts(_) => None,
+        }
+    }
+
+    /// Clips in the order the template renders their placeholders.
+    pub fn audio(&self) -> impl Iterator<Item = &Audio> {
+        let parts = match self {
+            Self::Text(_) => &[][..],
+            Self::Parts(parts) => parts,
+        };
+        parts.iter().filter_map(|part| match part {
+            ContentPart::Audio(clip) => Some(clip),
+            ContentPart::Text(_) => None,
+        })
+    }
+}
+
+impl Serialize for Content {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Text(text) => serializer.serialize_str(text),
+            Self::Parts(parts) => parts
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text(text) => serde_json::json!({"type": "text", "text": text}),
+                    ContentPart::Audio(_) => serde_json::json!({"type": "audio"}),
+                })
+                .collect::<Vec<_>>()
+                .serialize(serializer),
+        }
+    }
+}
+
 /// A conversation turn with the optional fields Hugging Face chat templates read.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ChatMessage {
     pub role: Role,
-    pub content: String,
+    pub content: Content,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -56,7 +114,7 @@ impl ChatMessage {
     pub fn new(role: Role, content: impl Into<String>) -> Self {
         Self {
             role,
-            content: content.into(),
+            content: Content::Text(content.into()),
             reasoning_content: None,
             tool_calls: Vec::new(),
         }

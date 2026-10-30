@@ -1,0 +1,25 @@
+{
+  "architectures": [
+    "WhisperForConditionalGeneration"
+  ],
+  "model_type": "whisper",
+  "vocab_size": 64,
+  "num_mel_bins": 128,
+  "d_model": 64,
+  "encoder_layers": 2,
+  "encoder_attention_heads": 4,
+  "decoder_layers": 2,
+  "decoder_attention_heads": 4,
+  "encoder_ffn_dim": 128,
+  "decoder_ffn_dim": 128,
+  "max_source_positions": 1500,
+  "max_target_positions": 32,
+  "activation_function": "gelu",
+  "scale_embedding": false,
+  "tie_word_embeddings": true,
+  "decoder_start_token_id": 3,
+  "pad_token_id": 1,
+  "bos_token_id": 2,
+  "eos_token_id": 1,
+  "dtype": "float16"
+}

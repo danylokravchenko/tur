@@ -58,6 +58,7 @@ Defaults that depend on other settings are worked out after merging. If you leav
 | `[engine]` | Prefill chunk size, state memory, speculation, advanced scheduler controls, device sampling |
 | `[server]` | Listener and model ID, concurrency and queue limits, request deadline, prefix retention, streaming limits |
 | `[generation]` | Defaults for `tur run`: output limit, seed, sampling and thinking |
+| `[whisper]` | Speech-to-text checkpoint for `serve` and `transcribe`: source, revision, weight format |
 | CLI only | Command, config selection, prompt, tools file, CPU reference mode, quantization jobs |
 | HTTP request | Sampling, output limit, seed, thinking, tools, grammar, cache salt and other per-request controls |
 | Environment | `RUST_LOG`, Hugging Face cache and token (`HF_HOME`, `HF_TOKEN`), optional `TUR_MODEL` and `TUR_REVISION` |
@@ -72,9 +73,10 @@ File keys are the CLI flags in snake_case. See [Command line](cli.md) for values
 | --- | --- | --- |
 | `model` | `source` | `--model` / `TUR_MODEL` |
 | `model` | `revision` | `--revision` / `TUR_REVISION` |
-| `model` | `weight_format`, `kv_format`, `kv_page_tokens`, `recurrent_state` | Same name with hyphens |
+| `model` | `weight_format`, `kv_format`, `kv_page_tokens`, `recurrent_state`, `audio_encoder` | Same name with hyphens |
 | `engine` | `prefill_chunk_size`, `state_memory_mb`, `speculative_draft`, `mtp` | Same name with hyphens |
-| `server` | `listen`, `served_model_name`, `max_batch_size`, `max_batch_tokens`, `max_waiting`, `request_timeout_secs`, `prefix_snapshots` | Same name with hyphens |
+| `server` | `listen`, `served_model_name`, `max_batch_size`, `max_batch_tokens`, `max_waiting`, `request_timeout_secs`, `prefix_snapshots`, `transcription_model_name`, `max_waiting_transcriptions` | Same name with hyphens |
+| `whisper` | `source`, `revision`, `weight_format` | `--whisper`, `--whisper-revision`, `--whisper-weight-format` |
 | `generation` | `max_tokens`, `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `thinking`, `reasoning_effort`, `preserve_thinking` | Same name with hyphens |
 
 Formats, addresses and reasoning effort are strings. Counts, seeds and durations are integers, and durations name their unit in the key. Sampling controls are numbers, and thinking and MTP are booleans. `state_memory_mb` is in MiB.

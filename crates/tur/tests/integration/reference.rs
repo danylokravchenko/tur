@@ -210,6 +210,7 @@ fn test_f32_layers_and_logits_match_transformers() -> Result<()> {
             kv: tur_core::execution::KvLayout::new(16, tur_core::execution::KvFormat::F32),
             recurrent: candle_core::DType::F32,
             mtp: None,
+            audio: false,
         },
     )?;
     let tokens = ids(get("input_ids")?)?;

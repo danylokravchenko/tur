@@ -184,13 +184,15 @@ impl InferencePipeline {
                 "loaded weights disagree with the pre-load memory plan",
             ));
         }
-        let mut engine = HybridEngine::new(Arc::new(model), factory.device.clone(), pool)?;
+        let model = Arc::new(model);
+        let mut engine = HybridEngine::new(Arc::clone(&model), factory.device.clone(), pool)?;
         engine.set_device_sampling(config.device_sampling);
         if config.speculation.mtp_enabled() {
             engine.enable_draft_head();
         }
         Ok(Self {
             engine,
+            model,
             tokenizer,
             template,
             defaults,

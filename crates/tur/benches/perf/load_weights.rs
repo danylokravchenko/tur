@@ -45,6 +45,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             kv: KvLayout::new(16, KvFormat::F16),
             recurrent: DType::F32,
             mtp: None,
+            audio: false,
         },
     )?;
     device.synchronize()?;

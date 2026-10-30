@@ -8,12 +8,14 @@ Tur is an inference service for Apple Silicon Macs. It aims for three things at 
 
 - Apple Silicon Macs with Metal. CPU execution exists only as a numerical reference for tests.
 - Qwen3.5-family hybrid text models (dense Qwen3.5 and Qwen3.8, and experimentally the Qwen3.6 MoE) and Gemma 4 text models. The architecture is identified from checkpoint fields, never from the name.
+- Speech: audio input to Gemma 4 E2B and E4B through their own encoder, and Whisper transcription (see [Audio](../architecture/audio.md)).
 - The `tur` CLI, an OpenAI-compatible HTTP API and the Rust library.
 
 ## Out of scope
 
 - Intel Macs, CUDA and Linux.
-- Image, video and audio input, which are rejected until encoders and their position handling exist.
+- Image and video input, which are rejected until encoders and their position handling exist.
+- Speech output and audio containers other than WAV.
 - Other model families, such as plain Qwen3 transformers.
 - Splitting a model across GPUs or machines, spilling state to SSD, and the Apple Neural Engine. These wait until a measured workload needs them.
 
@@ -24,7 +26,8 @@ Tur is an inference service for Apple Silicon Macs. It aims for three things at 
 | Qwen3.5-0.8B | Matches Transformers per layer and in logits on CPU and Metal (within 3.5e-6 relative error, against a 1e-4 gate); Q8_0 meets its 95% top-1 floor |
 | Qwen3.8-27B | Pinned config, tensor headers and template validated, and it shares the 0.8B code path; not yet run, because its Q4K weights exceed a 16 GB Mac |
 | Qwen3.6-35B-A3B | Passes an independent small Transformers fixture and pinned headers; full execution, quality and expert-kernel performance are open |
-| Gemma 4 E2B | Pinned Transformers F32 architecture fixtures, and real Q8_0 checkpoint generation |
+| Gemma 4 E2B | Pinned Transformers F32 architecture fixtures, and real Q8_0 checkpoint generation; its Q8_0 audio encoder matches the F32 Transformers encoder at cosine similarity 0.9999 |
+| Whisper large-v3-turbo | Small Transformers fixture for the encoder, decoder and cached greedy decode; real F32 and Q8_0 transcripts equal Transformers' on a pinned clip, and F32 long-form tokens and segment times equal its `generate` on a clip beyond 30 s |
 | Gemma 4 E4B, 12B, 26B-A4B, 31B | Architecture fixtures and configuration checks; full checkpoints not yet run |
 
 ## Principles

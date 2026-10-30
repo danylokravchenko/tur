@@ -3,6 +3,7 @@
 
 use std::{
     collections::HashMap,
+    sync::{Arc, mpsc as std_mpsc},
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -10,12 +11,14 @@ use uuid::Uuid;
 
 use crate::{
     ModelFactory, Result, TurError,
+    audio::Audio,
     backend::{
         memory::DeviceBudget,
         pipeline::{
             BatchStepOutput, GenerationRequest, GenerationStats, InferencePipeline, PipelineConfig,
         },
     },
+    models::TextModel,
 };
 
 /// A validated text conversation and its independent response channels. Only streaming
@@ -24,6 +27,13 @@ pub struct WorkerMsg {
     pub request: GenerationRequest,
     pub token_tx: Option<mpsc::Sender<String>>,
     pub result_tx: oneshot::Sender<Result<GenerationStats>>,
+}
+
+impl WorkerMsg {
+    /// Whether the client has gone away.
+    fn is_abandoned(&self) -> bool {
+        self.result_tx.is_closed() || self.token_tx.as_ref().is_some_and(mpsc::Sender::is_closed)
+    }
 }
 
 /// Bounded delivery of streamed text. Each pass sends at most one coalesced message per
@@ -111,6 +121,49 @@ pub struct PipelineWorker {
 }
 
 const MAX_ADMISSIONS_PER_PASS: usize = 32;
+/// Requests waiting for their clips to be encoded before new ones are rejected.
+const MAX_ENCODING: usize = 8;
+
+/// Encodes chat clips on its own OS thread, so text passes keep running meanwhile. A request
+/// returns through the worker's intake once its clips are encoded. The thread stops when
+/// the worker drops this handle; the weak sender lets the worker's intake close regardless.
+struct ClipEncoder {
+    tx: std_mpsc::SyncSender<WorkerMsg>,
+}
+
+impl ClipEncoder {
+    fn spawn(model: Arc<TextModel>, intake: mpsc::WeakSender<WorkerMsg>) -> Result<Self> {
+        let (tx, rx) = std_mpsc::sync_channel::<WorkerMsg>(MAX_ENCODING);
+        std::thread::Builder::new()
+            .name("clip-encoder".into())
+            .spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    encode_clips(&model, msg, &intake);
+                }
+            })?;
+        Ok(Self { tx })
+    }
+}
+
+fn encode_clips(model: &TextModel, mut msg: WorkerMsg, intake: &mpsc::WeakSender<WorkerMsg>) {
+    if msg.is_abandoned() {
+        return;
+    }
+    let clips: Vec<&Audio> = msg
+        .request
+        .messages
+        .iter()
+        .flat_map(|m| m.content.audio())
+        .collect();
+    match clips.iter().map(|clip| model.encode_audio(clip)).collect() {
+        Ok(rows) => msg.request.encoded_audio = rows,
+        Err(error) => return reply(msg.result_tx, Err(error)),
+    }
+    // A worker that stopped drops the request, which tells its client.
+    if let Some(intake) = intake.upgrade() {
+        drop(intake.blocking_send(msg));
+    }
+}
 
 /// Hand a request its outcome. A client that disconnected has dropped the receiver, and
 /// nobody is left to tell.
@@ -134,9 +187,23 @@ fn drain_intake<T>(rx: &mut mpsc::Receiver<T>, mut admit: impl FnMut(T)) {
 fn admit(
     msg: WorkerMsg,
     pipeline: &mut InferencePipeline,
+    encoder: Option<&ClipEncoder>,
     pending: &mut HashMap<Uuid, PendingRequest>,
 ) {
-    if msg.result_tx.is_closed() || msg.token_tx.as_ref().is_some_and(mpsc::Sender::is_closed) {
+    if msg.is_abandoned() {
+        return;
+    }
+    if let Some(encoder) = encoder.filter(|_| msg.request.needs_audio_encoding()) {
+        match encoder.tx.try_send(msg) {
+            Ok(()) => {}
+            Err(std_mpsc::TrySendError::Full(msg)) => reply(
+                msg.result_tx,
+                Err(TurError::QueueFull("audio encoding queue is full".into())),
+            ),
+            Err(std_mpsc::TrySendError::Disconnected(msg)) => {
+                reply(msg.result_tx, Err(TurError::WorkerUnavailable));
+            }
+        }
         return;
     }
     match pipeline.submit_request(&msg.request) {
@@ -227,22 +294,32 @@ fn deliver(
 
 fn serve(
     mut rx: mpsc::Receiver<WorkerMsg>,
+    intake: mpsc::WeakSender<WorkerMsg>,
     mut pipeline: InferencePipeline,
     config: StreamConfig,
 ) -> Result<()> {
+    let encoder = pipeline
+        .audio_model()
+        .map(|model| ClipEncoder::spawn(model, intake))
+        .transpose()?;
+    let encoder = encoder.as_ref();
     let mut pending: HashMap<Uuid, PendingRequest> = HashMap::new();
     loop {
         if pending.is_empty() {
             let Some(msg) = rx.blocking_recv() else {
                 return Ok(());
             };
-            admit(msg, &mut pipeline, &mut pending);
-            drain_intake(&mut rx, |msg| admit(msg, &mut pipeline, &mut pending));
+            admit(msg, &mut pipeline, encoder, &mut pending);
+            drain_intake(&mut rx, |msg| {
+                admit(msg, &mut pipeline, encoder, &mut pending);
+            });
         }
         // Intake (rendering and tokenization) and disconnects run while the device
         // executes the submitted pass; the next pass needs its sampled tokens.
         let step = pipeline.begin_step().and_then(|_| {
-            drain_intake(&mut rx, |msg| admit(msg, &mut pipeline, &mut pending));
+            drain_intake(&mut rx, |msg| {
+                admit(msg, &mut pipeline, encoder, &mut pending);
+            });
             release_disconnected(&mut pipeline, &mut pending)?;
             pipeline.finish_step()
         });
@@ -265,6 +342,7 @@ impl PipelineWorker {
         let timeout = config.request_timeout;
         let stream = config.stream;
         let (tx, rx) = mpsc::channel(256);
+        let intake = tx.downgrade();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("hybrid-worker".into())
@@ -287,7 +365,7 @@ impl PipelineWorker {
                         if ready_tx.send(Ok(())).is_err() {
                             return;
                         }
-                        if let Err(error) = serve(rx, pipeline, stream) {
+                        if let Err(error) = serve(rx, intake, pipeline, stream) {
                             tracing::warn!("Hybrid worker stopped: {error}");
                         }
                     }
@@ -420,6 +498,7 @@ mod tests {
                 device: Device::Cpu,
                 kv: DEFAULT_KV_LAYOUT,
                 recurrent: DEFAULT_RECURRENT_STATE,
+                audio: false,
             },
             pipeline: PipelineConfig::new(1, 64),
             budget: DeviceBudget::new(None),

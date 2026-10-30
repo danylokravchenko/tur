@@ -5,6 +5,7 @@ mod config;
 mod quantize;
 mod run;
 mod serve;
+mod transcribe;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -17,7 +18,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Tur hybrid text inference for Apple Silicon")]
 struct Cli {
-    /// Read this TOML file instead of ./tur.toml (run and serve only).
+    /// Read this TOML file instead of ./tur.toml (run, serve and transcribe only).
     #[arg(long, global = true, conflicts_with = "no_config")]
     config: Option<PathBuf>,
     /// Ignore ./tur.toml and use only flags, environment and built-in defaults.
@@ -35,6 +36,8 @@ enum Command {
     Serve(serve::Args),
     /// Prepack weights offline, optionally calibrated, for direct loading.
     Quantize(quantize::Args),
+    /// Transcribe a WAV file with a Whisper checkpoint and print the text.
+    Transcribe(transcribe::Args),
 }
 
 fn main() -> Result<()> {
@@ -57,6 +60,13 @@ fn main() -> Result<()> {
                 .enable_all()
                 .build()?
                 .block_on(serve::serve(args))
+        }
+        Command::Transcribe(mut args) => {
+            args.configure(config::FileSettings::load(
+                cli.config.as_deref(),
+                cli.no_config,
+            )?);
+            transcribe::transcribe(&args)
         }
         Command::Quantize(args) => {
             if cli.config.is_some() {

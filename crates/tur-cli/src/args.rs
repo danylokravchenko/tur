@@ -7,7 +7,11 @@ use clap::builder::{PossibleValuesParser, TypedValueParser as _};
 use serde::Deserialize;
 use tur::{
     ModelFactory, ModelSource, Result, TurError,
-    backend::{factory::resolve_drafter, pipeline::PipelineConfig, speculation::SpeculationConfig},
+    backend::{
+        factory::{WhisperFactory, resolve_drafter},
+        pipeline::PipelineConfig,
+        speculation::SpeculationConfig,
+    },
     core::execution::{KvFormat, KvLayout},
 };
 
@@ -46,6 +50,10 @@ pub(crate) struct ModelArgs {
     )]
     #[serde(deserialize_with = "optional_recurrent")]
     recurrent_state: Option<DType>,
+    /// Load the checkpoint's audio encoder when it has one, so chat requests may carry
+    /// audio (Gemma 4 E2B and E4B). `--audio-encoder=false` saves its memory (default: true).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    audio_encoder: Option<bool>,
     /// Use the CPU numerical reference for development checks.
     #[arg(long)]
     #[serde(skip)]
@@ -59,7 +67,8 @@ impl ModelArgs {
         weight_format,
         kv_format,
         kv_page_tokens,
-        recurrent_state
+        recurrent_state,
+        audio_encoder
     );
 
     /// Explicit paths and existing directories load locally; other values name a Hugging Face repository.
@@ -96,6 +105,7 @@ impl ModelArgs {
             device: tur::shared::inference_device(self.cpu_reference)?,
             kv: self.kv_layout(),
             recurrent: self.recurrent_state.unwrap_or(DType::F32),
+            audio: self.audio_encoder.unwrap_or(true),
         })
     }
 
@@ -117,6 +127,64 @@ impl ModelArgs {
             self.kv_page_tokens.unwrap_or(DEFAULT_KV_LAYOUT.page_tokens),
             self.kv_format.unwrap_or(DEFAULT_KV_LAYOUT.format),
         )
+    }
+}
+
+/// Speech-to-text checkpoint, served apart from the chat model.
+#[derive(Debug, Default, Deserialize, clap::Args)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct WhisperArgs {
+    /// Whisper checkpoint for /v1/audio/transcriptions and `tur transcribe`: a local
+    /// directory or a Hugging Face repository at `--whisper-revision`.
+    #[arg(long)]
+    #[serde(rename = "source")]
+    whisper: Option<String>,
+    /// Immutable commit of a remote `--whisper` checkpoint, or an identity for a local one.
+    #[arg(long)]
+    #[serde(rename = "revision")]
+    whisper_revision: Option<String>,
+    /// Whisper projection storage: f32, `q8_0` or q4k (default: `q8_0`).
+    #[arg(long)]
+    #[serde(rename = "weight_format", deserialize_with = "optional_from_str")]
+    whisper_weight_format: Option<WeightFormat>,
+}
+
+impl WhisperArgs {
+    inherit!(whisper, whisper_revision, whisper_weight_format);
+
+    pub(crate) fn relative_to(&mut self, directory: &Path) {
+        if let Some(model) = &mut self.whisper {
+            let path = Path::new(model);
+            if path.is_relative() && (path.starts_with(".") || directory.join(path).is_dir()) {
+                *model = directory.join(path).to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    /// The configured checkpoint on `device`, if any; local directories load as is.
+    pub(crate) fn factory(&self, device: &candle_core::Device) -> Result<Option<WhisperFactory>> {
+        let Some(model) = self.whisper.as_ref().filter(|m| !m.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let path = Path::new(model);
+        let source = if path.is_dir() || path.is_absolute() || path.starts_with(".") {
+            ModelSource::LocalPath(model.into())
+        } else {
+            ModelSource::HuggingFace(model.clone())
+        };
+        let revision = self
+            .whisper_revision
+            .clone()
+            .filter(|r| !r.trim().is_empty())
+            .ok_or_else(|| {
+                TurError::Other("--whisper needs --whisper-revision (or [whisper].revision)".into())
+            })?;
+        Ok(Some(WhisperFactory {
+            source,
+            revision,
+            format: self.whisper_weight_format.unwrap_or(WeightFormat::Q8_0),
+            device: device.clone(),
+        }))
     }
 }
 
