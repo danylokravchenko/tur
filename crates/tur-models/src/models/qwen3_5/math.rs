@@ -382,7 +382,7 @@ mod tests {
         let q = random(&[6, 4, 8], 1)?;
         let keys = random(&[6, 2, 8], 2)?;
         let values = random(&[6, 2, 8], 3)?;
-        let whole = attention(&q, &keys, &values, 0, 8.0f64.sqrt().recip(), None)?;
+        let whole = attention(&q, &keys, &values, 0, 8.0f64.sqrt().recip(), None, None)?;
         for t in 0..6 {
             let step = attention(
                 &q.narrow(0, t, 1)?,
@@ -390,6 +390,7 @@ mod tests {
                 &values.narrow(0, 0, t + 1)?,
                 t,
                 8.0f64.sqrt().recip(),
+                None,
                 None,
             )?;
             assert!(max_diff(&step.get(0)?, &whole.get(t)?)? < 1e-6);

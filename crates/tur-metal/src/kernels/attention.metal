@@ -96,6 +96,7 @@ struct AttentionParams {
     float scale;
     uint window;
     uint ungated;
+    uint sinks;
 };
 
 // Keys per attention_kv step: their table lookups and K/V loads are all in flight at once,
@@ -229,10 +230,13 @@ kernel void attention_kv(
             }
         }
     }
+    // A sink joins the softmax as one more key without a value: it enters the running
+    // maximum and sum once, here for one split and in the reduction otherwise.
+    bool sink = p.sinks != 0 && p.splits == 1;
     float m[HG], l[HG];
     for (uint x = 0; x < HG; ++x) {
-        m[x] = -FLT_MAX;
-        l[x] = 0.0f;
+        m[x] = sink ? gate[h0 + x] : -FLT_MAX;
+        l[x] = sink ? 1.0f : 0.0f;
     }
     for (uint j0 = begin; j0 < end; j0 += U) {
         // Pool rows (slot * kv_heads + g; the host bounds them by 2^32) of this step's keys.
@@ -361,6 +365,7 @@ struct TiledParams {
     float scale;
     uint window;
     uint ungated;
+    uint sinks;
 };
 
 // Row and first column of the two elements a lane holds in an 8x8 simdgroup matrix. Lanes
@@ -525,8 +530,8 @@ kernel void attention_tiled(
     for (uint x = 0; x < 8 * CHUNKS; ++x) {
         o[x] = simdgroup_float8x8(0.0f);
     }
-    float m = -FLT_MAX;
-    float l = 0.0f;
+    float m = p.sinks != 0 ? gate[h] : -FLT_MAX;
+    float l = p.sinks != 0 ? 1.0f : 0.0f;
     uint key0 = tid / (TD / 4);
     uint d0 = 4 * (tid % (TD / 4));
     if (QUANT == 0) {
@@ -657,13 +662,13 @@ kernel void attention_reduce_f32(
     uint t = item / p.heads;
     uint h = item % p.heads;
     ulong first = ulong(item) * p.splits;
-    float m = -FLT_MAX;
+    float m = p.sinks != 0 ? gate[h] : -FLT_MAX;
     for (uint s = 0; s < p.splits; ++s) {
         if (stats[2 * (first + s) + 1] > 0.0f) {
             m = max(m, stats[2 * (first + s)]);
         }
     }
-    float l = 0.0f;
+    float l = p.sinks != 0 ? exp(gate[h] - m) : 0.0f;
     float acc[R];
     for (uint r = 0; r < R; ++r) {
         acc[r] = 0.0f;

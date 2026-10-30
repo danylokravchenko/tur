@@ -1010,6 +1010,7 @@ pub(crate) fn run() -> Result<()> {
             .map_or(Ok(DEFAULT_RECURRENT_STATE), |s| parse_recurrent_state(&s))
             .map_err(TurError::Other)?,
         audio: false,
+        expert_cache: None,
     };
     let bench = Bench {
         factory: &factory,

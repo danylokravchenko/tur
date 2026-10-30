@@ -30,6 +30,7 @@ fn load(path: &Path, device: &Device, format: WeightFormat) -> Result<Qwen35> {
             recurrent: DType::F32,
             mtp: None,
             audio: false,
+            expert_cache: None,
         },
     )
 }
@@ -170,6 +171,7 @@ fn test_moe_fused_packed_prefill_decode_and_rollback_match_reference() -> Result
                 recurrent: DType::F32,
                 mtp: None,
                 audio: false,
+                expert_cache: None,
             },
             32,
             &[32],

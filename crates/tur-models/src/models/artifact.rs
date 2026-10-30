@@ -10,7 +10,7 @@ use candle_core::{DType, Device, Tensor};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    io::{BufWriter, Read, Seek, Write},
+    io::{BufWriter, Seek, Write},
     path::{Path, PathBuf},
 };
 use tur_core::{Result, execution::invalid};
@@ -243,11 +243,16 @@ pub(crate) fn open_for(dir: &Path, config: &impl ArtifactLayout) -> Result<(Chec
     Ok((checkpoint, manifest))
 }
 
-/// Streams tensors to a temporary payload file, then writes the header and payload as
-/// one `SafeTensors` file: host memory holds one tensor at a time.
+/// Bytes reserved for the header at the start of an artifact, far above the few hundred
+/// kilobytes of any supported model's tensor table and manifest. Spaces pad what is unused.
+const HEADER_RESERVE: usize = 4 << 20;
+
+/// Streams tensors straight into their final place in a partial `SafeTensors` file, then
+/// fills in the reserved header and renames it. Every payload byte reaches the disk once,
+/// and host memory holds one tensor at a time.
 pub(crate) struct Writer {
     dir: PathBuf,
-    payload: PathBuf,
+    partial: PathBuf,
     data: BufWriter<std::fs::File>,
     entries: Vec<(String, safetensors::Dtype, Vec<usize>, usize, usize)>,
     offset: usize,
@@ -269,11 +274,13 @@ impl Writer {
                 std::fs::copy(&from, dir.join(name))?;
             }
         }
-        let payload = dir.join(format!("{ARTIFACT_FILE}.payload"));
+        let partial = dir.join(format!("{ARTIFACT_FILE}.partial"));
+        let mut data = BufWriter::new(std::fs::File::create(&partial)?);
+        data.seek(std::io::SeekFrom::Start(HEADER_RESERVE as u64))?;
         Ok(Self {
             dir: dir.to_path_buf(),
-            data: BufWriter::new(std::fs::File::create(&payload)?),
-            payload,
+            partial,
+            data,
             entries: Vec::new(),
             offset: 0,
         })
@@ -305,7 +312,7 @@ impl Writer {
             .checked_add(size)
             .ok_or_else(|| invalid("artifact payload size overflow"))?;
         write(&mut self.data)?;
-        if self.data.stream_position()? != end as u64 {
+        if self.data.stream_position()? != (HEADER_RESERVE + end) as u64 {
             return Err(invalid(format!(
                 "artifact tensor {name} has an incorrect payload size"
             )));
@@ -316,14 +323,12 @@ impl Writer {
         Ok(())
     }
 
-    /// Write the header carrying `manifest`, then the payload, and validate the result.
+    /// Write the header carrying `manifest`, publish the file, and validate the result.
     pub(crate) fn finish(
         mut self,
         manifest: &Manifest,
         config: &impl ArtifactLayout,
     ) -> Result<()> {
-        self.data.flush()?;
-        drop(self.data);
         let mut header = serde_json::Map::new();
         header.insert(
             "__metadata__".into(),
@@ -336,25 +341,20 @@ impl Writer {
             );
         }
         let mut header = serde_json::to_vec(&header)?;
-        header.resize(header.len().next_multiple_of(8), b' ');
-        let partial = self.dir.join(format!("{ARTIFACT_FILE}.partial"));
-        {
-            let mut out = BufWriter::new(std::fs::File::create(&partial)?);
-            out.write_all(&(header.len() as u64).to_le_bytes())?;
-            out.write_all(&header)?;
-            let mut payload = std::fs::File::open(&self.payload)?;
-            let mut buffer = vec![0u8; 8 << 20];
-            loop {
-                let read = payload.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                out.write_all(&buffer[..read])?;
-            }
-            out.flush()?;
+        let room = HEADER_RESERVE - 8;
+        if header.len() > room {
+            return Err(invalid(format!(
+                "artifact header of {} bytes exceeds its {room} reserved bytes",
+                header.len()
+            )));
         }
-        std::fs::remove_file(&self.payload)?;
-        std::fs::rename(&partial, self.dir.join(ARTIFACT_FILE))?;
+        header.resize(room, b' ');
+        self.data.seek(std::io::SeekFrom::Start(0))?;
+        self.data.write_all(&(room as u64).to_le_bytes())?;
+        self.data.write_all(&header)?;
+        self.data.flush()?;
+        drop(self.data);
+        std::fs::rename(&self.partial, self.dir.join(ARTIFACT_FILE))?;
         open_for(&self.dir, config).map(|_| ())
     }
 }

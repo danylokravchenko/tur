@@ -43,6 +43,7 @@ The reference path is a slow, readable F32 implementation built from Candle oper
 | `gemma4_text` | `Gemma4ForCausalLM` |
 | `gemma4_unified` | `Gemma4UnifiedForConditionalGeneration` (settings in `text_config`) |
 | `gemma4_unified_text` | `Gemma4UnifiedForCausalLM` |
+| `gpt_oss` | `GptOssForCausalLM` |
 
 The Qwen parser rejects any setting Tur doesn't implement, rather than running the wrong maths:
 

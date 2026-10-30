@@ -385,6 +385,9 @@ impl Qwen35 {
         tokens: usize,
         contexts: &[usize],
     ) -> Result<(ModelDescription, usize, usize)> {
+        if options.expert_cache.is_some() {
+            return Err(invalid("the expert cache reads MXFP4 banks (gpt-oss) only"));
+        }
         let with_mtp;
         let config = if options.mtp.is_some() && !config.mtp() {
             with_mtp = config.clone().with_mtp()?;
@@ -866,6 +869,7 @@ impl Qwen35 {
                 &values,
                 span.past,
                 (d.head_dim as f64).sqrt().recip(),
+                None,
                 None,
             )?);
         }

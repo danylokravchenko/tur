@@ -164,6 +164,7 @@ impl Checkpoint {
             kv: KvLayout::new(16, KvFormat::F32),
             recurrent: DType::F32,
             audio: false,
+            expert_cache: None,
         }
     }
 }

@@ -14,6 +14,8 @@ candle-core.workspace = true
 parking_lot.workspace = true
 candle-metal-kernels = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
+tracing.workspace = true
 
 [features]
 default = ["metal"]
@@ -22,6 +24,7 @@ metal = [
     "tur-core/metal",
     "dep:candle-metal-kernels",
     "dep:objc2-metal",
+    "dep:rustix",
 ]
 
 [lints]

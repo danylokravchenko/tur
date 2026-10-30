@@ -12,6 +12,7 @@ kv_format = "f16"         # f32, f16, q8 (= q8_32), q8_<group>.
 kv_page_tokens = 16
 recurrent_state = "f32"   # f32 or f16; speculation needs f32.
 # audio_encoder = true    # Load Gemma 4 E2B/E4B's audio encoder; false saves its memory.
+# expert_cache_mb = 4096  # gpt-oss: read routed experts from disk into this much memory.
 
 [engine]                 # Shared by run and serve.
 prefill_chunk_size = 256

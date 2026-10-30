@@ -3443,6 +3443,7 @@ dependencies = [
  "axum",
  "candle-core",
  "candle-metal-kernels",
+ "candle-nn",
  "http-body-util",
  "metal 0.33.0",
  "objc2-metal",
@@ -3512,6 +3513,8 @@ dependencies = [
  "candle-metal-kernels",
  "objc2-metal",
  "parking_lot",
+ "rustix",
+ "tracing",
  "tur-core",
 ]
 
@@ -3524,6 +3527,7 @@ dependencies = [
  "flate2",
  "hf-hub",
  "minijinja",
+ "parking_lot",
  "safetensors 0.8.0",
  "serde",
  "serde_json",

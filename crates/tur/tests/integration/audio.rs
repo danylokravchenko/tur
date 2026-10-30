@@ -46,6 +46,7 @@ fn gemma(device: &Device, execution: Execution, audio: bool) -> Result<Gemma4> {
             recurrent: DType::F32,
             mtp: None,
             audio,
+            expert_cache: None,
         },
     )
 }
@@ -146,6 +147,7 @@ fn test_gemma4_artifacts_carry_the_audio_encoder_packed() -> Result<()> {
             recurrent: DType::F32,
             mtp: None,
             audio,
+            expert_cache: None,
         };
         let converted = Gemma4::load(&source, &options(true))?;
         let prepacked = |audio| LoadOptions {
@@ -197,6 +199,7 @@ fn test_gemma4_audio_is_optional_and_bounded() -> Result<()> {
                 recurrent: DType::F32,
                 mtp: None,
                 audio: true,
+                expert_cache: None,
             },
             1,
             &[1],
@@ -250,6 +253,7 @@ fn test_gemma4_e2b_audio_encoder_matches_transformers() -> Result<()> {
             recurrent: DType::F32,
             mtp: None,
             audio: true,
+            expert_cache: None,
         },
     )?;
     let expected = tensor(&golden, "soft_tokens")?;
@@ -317,6 +321,7 @@ fn factory(fixture: &crate::common::Checkpoint) -> tur::ModelFactory {
         kv: KvLayout::new(4, KvFormat::F32),
         recurrent: DType::F32,
         audio: true,
+        expert_cache: None,
     }
 }
 

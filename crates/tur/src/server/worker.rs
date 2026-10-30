@@ -499,6 +499,7 @@ mod tests {
                 kv: DEFAULT_KV_LAYOUT,
                 recurrent: DEFAULT_RECURRENT_STATE,
                 audio: false,
+                expert_cache: None,
             },
             pipeline: PipelineConfig::new(1, 64),
             budget: DeviceBudget::new(None),

@@ -74,6 +74,13 @@ python -I scripts/gemma4_assistant_reference.py --model "$TUR_GEMMA4_E2B" \
 just test-checkpoint -E 'test(e2b_assistant)'
 ```
 
+The gpt-oss-20b test compares real weights through the expert cache with Transformers' own decoder layers, which the script runs one at a time so that the decoded experts never share memory:
+
+```sh
+python -I scripts/gpt_oss_reference.py --model "$TUR_GPT_OSS_20B" --golden "$TUR_GPT_OSS_GOLDEN"
+just test-checkpoint -E 'test(gpt_oss_20b)'
+```
+
 The audio tests need a speech clip, the Whisper checkpoint and goldens from `scripts/audio_reference.py`. The Gemma test compares the Q8_0 encoder with Transformers' F32 encoder by cosine similarity (mean above 0.999, minimum above 0.99); the Whisper tests require Transformers' exact transcript in F32 and in Q8_0, and on a clip beyond 30 s its exact tokens and segment times, prompted and conditioned tokens and word times in F32, and all but 2% of its words in Q8_0:
 
 ```sh

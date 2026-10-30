@@ -130,6 +130,7 @@ struct AttentionParams {
     scale: f32,
     window: u32,
     ungated: u32,
+    sinks: u32,
 }
 
 #[repr(C)]
@@ -145,6 +146,7 @@ struct TiledParams {
     scale: f32,
     window: u32,
     ungated: u32,
+    sinks: u32,
 }
 
 /// Output and score semantics of one tiled dispatch: the gate's head layout (unread when
@@ -153,6 +155,7 @@ struct TiledParams {
 struct TileShape {
     gate: Heads,
     ungated: bool,
+    sinks: bool,
     scale: f32,
     window: u32,
 }
@@ -774,6 +777,64 @@ impl Kernels {
             .dispatch(pipeline, "tur_qk_norm_rope", groups, threads, |e| {
                 xv.bind(e, 0)?;
                 wv.bind(e, 1)?;
+                pv.bind(e, 2)?;
+                fv.bind(e, 3)?;
+                out.bind(e, 4);
+                e.set_bytes(5, &params);
+                Ok(())
+            })?;
+        let shape = (xv.rows, heads.count, heads.dim);
+        self.finish(out, shape)
+    }
+
+    /// Split-half rotary of every head at angle `position * inv_freq[i]`, with `cos` and
+    /// `sin` multiplied by the one-element `scale` and no norm. `x` is `[tokens, width]`;
+    /// returns contiguous `[tokens, heads, dim]`.
+    pub fn rope_scaled(
+        &self,
+        x: &Tensor,
+        heads: Heads,
+        scale: &Tensor,
+        positions: &Tensor,
+        inv_freq: &Tensor,
+    ) -> Result<Tensor> {
+        let xv = self.view(x)?;
+        let sv = self.view(scale)?;
+        let pv = self.runtime.view(positions, DType::U32)?;
+        let fv = self.view(inv_freq)?;
+        sv.expect(1, 1, "rotary scale")?;
+        pv.expect(1, xv.rows, "positions")?;
+        let last = heads
+            .count
+            .checked_sub(1)
+            .and_then(|h| h.checked_mul(heads.head_stride))
+            .and_then(|o| o.checked_add(heads.col_offset))
+            .and_then(|o| o.checked_add(heads.dim))
+            .ok_or_else(|| invalid("invalid head geometry"))?;
+        if fv.rows != 1 || last > xv.cols || heads.dim == 0 || 2 * fv.cols != heads.dim {
+            return Err(invalid("rotary frequencies must cover each whole head"));
+        }
+        let params = RopeParams {
+            tokens: to_u32(xv.rows, "tokens")?,
+            heads: to_u32(heads.count, "heads")?,
+            dim: to_u32(heads.dim, "head dim")?,
+            row_stride: to_u32(xv.row_stride, "row stride")?,
+            head_stride: to_u32(heads.head_stride, "head stride")?,
+            col_offset: to_u32(heads.col_offset, "column offset")?,
+            half_rotary: to_u32(fv.cols, "rotary dim")?,
+            eps: 0.0,
+        };
+        let items = xv
+            .rows
+            .checked_mul(heads.count)
+            .ok_or_else(|| invalid("head count overflow"))?;
+        let pipeline = self.pipeline("rope_scaled_f32")?;
+        let out = self.output(items, heads.dim)?;
+        let (groups, threads) = self.simdgroup_launch(pipeline, items);
+        self.runtime
+            .dispatch(pipeline, "tur_rope_scaled", groups, threads, |e| {
+                xv.bind(e, 0)?;
+                sv.bind(e, 1)?;
                 pv.bind(e, 2)?;
                 fv.bind(e, 3)?;
                 out.bind(e, 4);
@@ -1534,7 +1595,7 @@ impl Kernels {
         gate_source: &Tensor,
         gate: Heads,
     ) -> Result<Tensor> {
-        self.attend(q, pool, kv, Some((gate_source, gate)), None, None)
+        self.attend(q, pool, kv, Some((gate_source, gate)), None, None, None)
     }
 
     /// Causal paged attention with an optional sliding window, explicit score scale and
@@ -1550,9 +1611,29 @@ impl Kernels {
         if window == Some(0) || !scale.is_finite() || scale <= 0.0 {
             return Err(invalid("invalid attention window or scale"));
         }
-        self.attend(q, pool, kv, None, window, Some(scale))
+        self.attend(q, pool, kv, None, window, Some(scale), None)
     }
 
+    /// [`Self::attention_ungated`] with one sink logit per query head in each softmax.
+    pub fn attention_sinks(
+        &self,
+        q: &Tensor,
+        pool: &AttentionPool,
+        kv: &PagedKv,
+        window: Option<usize>,
+        scale: f64,
+        sinks: &Tensor,
+    ) -> Result<Tensor> {
+        if window == Some(0) || !scale.is_finite() || scale <= 0.0 {
+            return Err(invalid("invalid attention window or scale"));
+        }
+        self.attend(q, pool, kv, None, window, Some(scale), Some(sinks))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per attention variant's optional input"
+    )]
     fn attend(
         &self,
         q: &Tensor,
@@ -1561,12 +1642,14 @@ impl Kernels {
         output_gate: Option<(&Tensor, Heads)>,
         window: Option<usize>,
         scale: Option<f64>,
+        sinks: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (tokens, heads, dim) = q.dims3()?;
         let kv_heads = pool.kv_heads;
         let fallback = q.reshape((tokens, heads * dim))?;
+        // The kernels read sinks through the unused gate binding.
         let (gate_source, gate) = output_gate.unwrap_or((
-            &fallback,
+            sinks.unwrap_or(&fallback),
             Heads {
                 count: heads,
                 dim,
@@ -1597,7 +1680,13 @@ impl Kernels {
         let qv = self.view(q)?;
         let gv = self.view(gate_source)?;
         qv.contiguous("queries")?;
-        if gv.rows != tokens || gate.col_offset + (heads - 1) * gate.head_stride + dim > gv.cols {
+        if let Some(sinks) = sinks {
+            if output_gate.is_some() || sinks.dims() != [heads] {
+                return Err(invalid("attention sinks need one logit per ungated head"));
+            }
+        } else if gv.rows != tokens
+            || gate.col_offset + (heads - 1) * gate.head_stride + dim > gv.cols
+        {
             return Err(invalid("attention gate exceeds its projection"));
         }
         let scale = scale.unwrap_or_else(|| (dim as f64).sqrt().recip()) as f32;
@@ -1611,6 +1700,7 @@ impl Kernels {
             let shape = TileShape {
                 gate,
                 ungated: output_gate.is_none(),
+                sinks: sinks.is_some(),
                 scale,
                 window,
             };
@@ -1656,6 +1746,7 @@ impl Kernels {
             scale,
             window,
             ungated: u32::from(output_gate.is_none()),
+            sinks: u32::from(sinks.is_some()),
         };
         let items = tokens * heads;
         let out = self.output(items, dim)?;
@@ -1737,6 +1828,7 @@ impl Kernels {
             scale: shape.scale,
             window: shape.window,
             ungated: u32::from(shape.ungated),
+            sinks: u32::from(shape.sinks),
         };
         let pipeline = self.pipeline(&Self::kv_kernel("attention_tiled", dim, pool.format)?)?;
         if pipeline.threads(TILE_THREADS) != TILE_THREADS {

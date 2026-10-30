@@ -164,6 +164,7 @@ fn gemma(device: &Device, dir: &Path, wav: &Path) -> Result<()> {
             recurrent: DType::F32,
             mtp: None,
             audio: true,
+            expert_cache: None,
         },
     )?;
     let clip = Audio::from_wav(&std::fs::read(wav)?)?;
@@ -191,6 +192,7 @@ fn gemma_contention(dir: &Path, wav: &Path) -> Result<()> {
         kv: KvLayout::new(16, KvFormat::F16),
         recurrent: DType::F32,
         audio: true,
+        expert_cache: None,
     };
     let clip = Audio::from_wav(&std::fs::read(wav)?)?;
     let clip = Audio::from_samples(&clip.samples()[..clip.samples().len().min(480_000)], 16_000)?;

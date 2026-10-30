@@ -42,6 +42,8 @@ pub struct ModelFactory {
     pub recurrent: candle_core::DType,
     /// Load the checkpoint's audio encoder, when it has one ([`LoadOptions::audio`]).
     pub audio: bool,
+    /// Device bytes of a bounded expert cache ([`LoadOptions::expert_cache`]).
+    pub expert_cache: Option<usize>,
 }
 
 fn hub_error(error: impl std::fmt::Display) -> TurError {
@@ -146,6 +148,7 @@ impl ModelFactory {
             recurrent: self.recurrent,
             mtp: draft,
             audio: self.audio,
+            expert_cache: self.expert_cache,
         };
         let config = if options.mtp.is_some() {
             config.with_mtp()?
@@ -261,16 +264,7 @@ fn resolve(
     }
     for file in &info.siblings {
         let name = file.rfilename.as_str();
-        if name.ends_with(".safetensors")
-            || matches!(
-                name,
-                "model.safetensors.index.json"
-                    | "generation_config.json"
-                    | "chat_template.jinja"
-                    | "processor_config.json"
-                    | "preprocessor_config.json"
-            )
-        {
+        if serving_file(name) {
             checkpoint_file(name)?;
             repo.get(name).map_err(hub_error)?;
         }
@@ -279,6 +273,21 @@ fn resolve(
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| hub_error("checkpoint has no directory"))
+}
+
+/// Files a load needs from a repository. Repositories may keep other copies of the weights
+/// in subdirectories (gpt-oss has `original/` and `metal/`), which are never downloaded.
+fn serving_file(name: &str) -> bool {
+    !name.contains('/')
+        && (name.ends_with(".safetensors")
+            || matches!(
+                name,
+                "model.safetensors.index.json"
+                    | "generation_config.json"
+                    | "chat_template.jinja"
+                    | "processor_config.json"
+                    | "preprocessor_config.json"
+            ))
 }
 
 #[cfg(test)]
@@ -304,6 +313,15 @@ mod tests {
     }
 
     #[test]
+    fn test_only_root_serving_files_are_downloaded() {
+        assert!(serving_file("model-00000-of-00002.safetensors"));
+        assert!(serving_file("chat_template.jinja"));
+        assert!(!serving_file("original/model.safetensors"));
+        assert!(!serving_file("metal/model.bin"));
+        assert!(!serving_file("README.md"));
+    }
+
+    #[test]
     fn test_mutable_remote_revision_rejected_without_network() -> Result<()> {
         let factory = ModelFactory {
             source: ModelSource::HuggingFace("Qwen/Qwen3.5-0.8B".into()),
@@ -313,6 +331,7 @@ mod tests {
             kv: crate::models::DEFAULT_KV_LAYOUT,
             recurrent: crate::models::DEFAULT_RECURRENT_STATE,
             audio: false,
+            expert_cache: None,
         };
         let error = factory
             .resolve()

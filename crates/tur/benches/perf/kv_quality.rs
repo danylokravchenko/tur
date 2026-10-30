@@ -79,6 +79,7 @@ impl Runner {
                 recurrent,
                 mtp: None,
                 audio: false,
+                expert_cache: None,
             },
         )?;
         let pool = StatePool::new(

@@ -376,6 +376,7 @@ pub(crate) fn run() -> Result<()> {
                             recurrent,
                             mtp: None,
                             audio: false,
+                            expert_cache: None,
                         },
                     )?;
                     let load_seconds = load_start.elapsed().as_secs_f64();

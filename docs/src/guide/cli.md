@@ -7,6 +7,7 @@ tur run         Generate one completion and stream it to stdout
 tur serve       Serve one model over an OpenAI-compatible HTTP API
 tur transcribe  Transcribe a WAV file with a Whisper checkpoint
 tur quantize    Prepack weights offline, optionally calibrated, for instant loading
+tur prune       Experiment: keep the experts a gpt-oss checkpoint routes to most
 ```
 
 `tur <command> --help` prints every flag. This page groups the flags by purpose and gives their defaults.
@@ -26,6 +27,7 @@ tur quantize    Prepack weights offline, optionally calibrated, for instant load
 | `--kv-page-tokens <n>` | 16 | Tokens per K/V page |
 | `--recurrent-state f32\|f16` | `f32` | Storage for DeltaNet recurrent state |
 | `--audio-encoder [true\|false]` | `true` | Load the checkpoint's audio encoder when it has one (Gemma 4 E2B and E4B); `false` saves its memory |
+| `--expert-cache-mb <MiB>` | every expert resident | Keep gpt-oss experts on disk and read them into this much memory; see [Expert cache](../architecture/expert-cache.md) |
 | `--cpu-reference` | off | Run the slow F32 CPU reference instead of Metal, for development |
 
 Gemma 4 uses the same commands. For the E2B model used in development:

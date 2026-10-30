@@ -1,5 +1,5 @@
 struct MoeRouteParams { uint tokens, experts, top_k, stride, scaled; };
-struct ExpertParams { uint rows, experts, top_k, width, stride, out, routed; };
+struct ExpertParams { uint rows, experts, top_k, width, stride, out, routed; ulong scales; };
 struct ScatterParams { uint tokens, top_k, width, stride, shared, shared_stride, gate_stride; };
 
 // Assignments per histogram block; also the threads of the histogram, offset and scatter
@@ -228,7 +228,7 @@ template <uint FORMAT, uint NR> kernel void moe_gemv(device const uchar *w [[buf
         for (uint chunk = ix; chunk < p.width / 32; chunk += 8) {
             float4 lo[NR], hi[NR];
             for (uint r = 0; r < NR; ++r) {
-                packed_weights8<FORMAT>(w, base + min(col + r, p.out - 1), chunk, start, p.width, lo[r], hi[r]);
+                packed_weights8<FORMAT>(w, base + min(col + r, p.out - 1), chunk, start, p.width, lo[r], hi[r], p.scales);
             }
             for (uint b = 0; b < 3; ++b) {
                 if (b < count) {
@@ -317,7 +317,7 @@ template <uint FORMAT, uint BT> inline void moe_gemm_tile(device const uchar *w,
     } else {
         for (uint c = 0; c < p.width / 32; ++c) {
             float4 lo[4], hi[4];
-            for (uint t = 0; t < 4; ++t) packed_weights8<FORMAT>(w, wr[t], c, 4 * fc, p.width, lo[t], hi[t]);
+            for (uint t = 0; t < 4; ++t) packed_weights8<FORMAT>(w, wr[t], c, 4 * fc, p.width, lo[t], hi[t], p.scales);
             chunk(c, lo, hi);
         }
     }
@@ -385,7 +385,7 @@ template <uint FORMAT> kernel void moe_gemm_wide(device const uchar *w [[buffer(
     for (uint chunk = 0; chunk < p.width / 32; ++chunk) {
         for (uint h = 0; h < 2; ++h) {
             float4 lo, hi;
-            packed_weights8<FORMAT>(w, w_global, chunk, w_start + 8 * h, p.width, lo, hi);
+            packed_weights8<FORMAT>(w, w_global, chunk, w_start + 8 * h, p.width, lo, hi, p.scales);
             threadgroup half *wd = ws + w_row * 32 + w_start + 8 * h;
             *((threadgroup half4 *)wd) = half4(lo); *((threadgroup half4 *)(wd + 4)) = half4(hi);
         }
@@ -428,6 +428,35 @@ template [[host_name("moe_gemm_wide_" SUFFIX)]] kernel void moe_gemm_wide<FORMAT
 EXPERT_GEMM(0, 4, "f32")
 EXPERT_GEMM(1, 4, "q8_0")
 EXPERT_GEMM(2, 4, "q4k")
+EXPERT_GEMM(3, 4, "mxfp4")
+
+// y = x + bias[expert], for one row per assignment in group order.
+kernel void moe_bias_f32(device const float *x [[buffer(0)]], device const float *order [[buffer(1)]],
+    device const float *bias [[buffer(2)]], device float *y [[buffer(3)]], constant ExpertParams &p [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]]) {
+    if (row >= p.rows) return;
+    device const float *b = bias + ulong(uint(order[ulong(row) * 3 + 1])) * p.width;
+    device const float *xr = x + ulong(row) * p.stride;
+    device float *yr = y + ulong(row) * p.width;
+    for (uint i = tid; i < p.width; i += threads) yr[i] = xr[i] + b[i];
+}
+
+// Gated output of interleaved gate|up columns after their expert's bias:
+// clamp(up + 1) * glu(clamp(gate)), computed as the reference does in F32.
+struct MoeGluParams { uint rows, width, stride; float alpha, limit; };
+kernel void moe_glu_f32(device const float *x [[buffer(0)]], device const float *order [[buffer(1)]],
+    device const float *bias [[buffer(2)]], device float *y [[buffer(3)]], constant MoeGluParams &p [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]]) {
+    if (row >= p.rows) return;
+    device const float *b = bias + ulong(uint(order[ulong(row) * 3 + 1])) * 2 * p.width;
+    device const float *xr = x + ulong(row) * p.stride;
+    device float *yr = y + ulong(row) * p.width;
+    for (uint i = tid; i < p.width; i += threads) {
+        float gate = min(xr[2 * i] + b[2 * i], p.limit);
+        float up = clamp(xr[2 * i + 1] + b[2 * i + 1], -p.limit, p.limit);
+        yr[i] = (up + 1.0f) * (gate * (1.0f / (1.0f + exp(-gate * p.alpha))));
+    }
+}
 
 // One threadgroup per token: its experts are ranked by ID once, then every column sums
 // them in ascending ID order without floating-point atomics. An optional shared expert

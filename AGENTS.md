@@ -4,7 +4,7 @@ Guidance for AI coding agents working on Tur. Read it before changing code. Befo
 
 ## Project
 
-Tur is a Rust (edition 2024, Rust 1.99+) inference engine for Apple Silicon. It serves Qwen3.5-family hybrid and Gemma 4 text models on shared Metal kernels over Candle, with paged K/V and recurrent state pools, packed continuous batching, prefix reuse, device sampling and exact speculative decoding. CPU execution exists only as a numerical reference for tests.
+Tur is a Rust (edition 2024, Rust 1.99+) inference engine for Apple Silicon. It serves Qwen3.5-family hybrid, Gemma 4 and gpt-oss text models on shared Metal kernels over Candle, with paged K/V and recurrent state pools, packed continuous batching, prefix reuse, device sampling and exact speculative decoding. CPU execution exists only as a numerical reference for tests.
 
 ## Layout
 

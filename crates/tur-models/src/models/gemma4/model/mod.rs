@@ -2,6 +2,8 @@
 use super::config::Audio as AudioSettings;
 use super::{Config, config::LayerKind};
 use crate::audio::{Audio, AudioPrompt};
+#[cfg(feature = "metal")]
+use crate::models::paging::Paging;
 use crate::{
     hybrid::{
         Addresses, Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward,
@@ -628,6 +630,9 @@ impl Gemma4 {
         tokens: usize,
         contexts: &[usize],
     ) -> Result<(ModelDescription, usize, usize)> {
+        if options.expert_cache.is_some() {
+            return Err(invalid("the expert cache reads MXFP4 banks (gpt-oss) only"));
+        }
         let plan = format_plan(config, options)?;
         let audio = audio_precision(config, options);
         let description = config.description(
@@ -893,6 +898,7 @@ impl Gemma4 {
                     s.past,
                     1.0,
                     window,
+                    None,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1077,8 +1083,7 @@ impl Gemma4 {
             &k.attention_ungated(&query, store, paging, window, 1.0)?,
         )
     }
-    /// Page addressing of this pass for full and windowed layers: each sequence's tables,
-    /// and for each new token its first table entry and visible key count.
+    /// Page addressing of this pass for full and windowed layers.
     fn paging(
         &self,
         k: &tur_metal::kernels::Kernels,
@@ -1086,78 +1091,13 @@ impl Gemma4 {
         spans: &[Span<'_>],
         tokens: usize,
     ) -> Result<Paging> {
-        let mut first = Vec::with_capacity(tokens);
-        let mut visible = Vec::with_capacity(tokens);
-        let (mut full, mut windows) = (Vec::new(), Vec::new());
-        for s in spans {
-            let base = u32::try_from(full.len().max(windows.len()))
-                .map_err(|_| invalid("page table overflow"))?;
-            // Both tables index the same logical pages; pad the shorter so bases agree.
-            full.extend_from_slice(&s.addresses.pages);
-            windows.extend_from_slice(&s.addresses.windows);
-            let end = usize::try_from(base).map_err(|_| invalid("page table overflow"))?
-                + s.addresses.pages.len().max(s.addresses.windows.len());
-            full.resize(end, 0);
-            windows.resize(end, 0);
-            for p in s.past..s.past + s.len {
-                first.push(base);
-                visible.push(u32::try_from(p + 1).map_err(|_| invalid("context overflow"))?);
-            }
-        }
         Paging::new(
             k,
             &self.description,
             pool,
-            (&full, &windows),
-            &first,
-            &visible,
+            spans.iter().map(|s| (&s.addresses, s.past, s.len)),
+            tokens,
         )
-    }
-}
-
-/// Paged addressing of one pass, for the full and the windowed attention layers.
-#[cfg(feature = "metal")]
-pub(super) struct Paging {
-    full: Option<tur_metal::kernels::PagedKv>,
-    windowed: Option<tur_metal::kernels::PagedKv>,
-}
-
-#[cfg(feature = "metal")]
-impl Paging {
-    fn new(
-        k: &tur_metal::kernels::Kernels,
-        description: &ModelDescription,
-        pool: &StatePool,
-        (full, windows): (&[u32], &[u32]),
-        first: &[u32],
-        visible: &[u32],
-    ) -> Result<Self> {
-        let rows = |windowed: bool| -> Result<Option<usize>> {
-            description
-                .layers
-                .iter()
-                .position(|kind| {
-                    matches!(kind, tur_core::execution::LayerStateKind::Attention { .. })
-                        && kind.windowed() == windowed
-                })
-                .map(|layer| Ok(pool.attention(layer)?.key.data.dim(0)?))
-                .transpose()
-        };
-        let page = description.kv.page_tokens;
-        Ok(Self {
-            full: rows(false)?
-                .map(|slots| k.paged_kv(page, slots, full, first, visible))
-                .transpose()?,
-            windowed: rows(true)?
-                .map(|slots| k.paged_kv(page, slots, windows, first, visible))
-                .transpose()?,
-        })
-    }
-
-    fn layer(&self, windowed: bool) -> Result<&tur_metal::kernels::PagedKv> {
-        if windowed { &self.windowed } else { &self.full }
-            .as_ref()
-            .ok_or_else(|| invalid("no page addressing for this attention layer"))
     }
 }
 

@@ -54,6 +54,11 @@ pub(crate) struct ModelArgs {
     /// audio (Gemma 4 E2B and E4B). `--audio-encoder=false` saves its memory (default: true).
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     audio_encoder: Option<bool>,
+    /// Keep routed experts on disk and read them on demand into this many MiB of device
+    /// memory, for gpt-oss checkpoints larger than the GPU's working set. Reads only: the
+    /// cache never writes to disk (default: every expert resident).
+    #[arg(long)]
+    expert_cache_mb: Option<usize>,
     /// Use the CPU numerical reference for development checks.
     #[arg(long)]
     #[serde(skip)]
@@ -68,7 +73,8 @@ impl ModelArgs {
         kv_format,
         kv_page_tokens,
         recurrent_state,
-        audio_encoder
+        audio_encoder,
+        expert_cache_mb
     );
 
     /// Explicit paths and existing directories load locally; other values name a Hugging Face repository.
@@ -106,6 +112,13 @@ impl ModelArgs {
             kv: self.kv_layout(),
             recurrent: self.recurrent_state.unwrap_or(DType::F32),
             audio: self.audio_encoder.unwrap_or(true),
+            expert_cache: self
+                .expert_cache_mb
+                .map(|mb| {
+                    mb.checked_mul(1 << 20)
+                        .ok_or_else(|| TurError::Other("expert cache size overflow".into()))
+                })
+                .transpose()?,
         })
     }
 

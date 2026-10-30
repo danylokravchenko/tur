@@ -4,6 +4,8 @@ mod checkpoint;
 mod generation;
 mod math;
 mod options;
+#[cfg(feature = "metal")]
+mod paging;
 pub use artifact::{ARTIFACT_FILE, CalibrationInfo, Conversion, Manifest, Quantizer, is_artifact};
 pub use generation::GenerationDefaults;
 pub(crate) use weights::STAGING_BYTES;
@@ -14,6 +16,7 @@ pub use options::{
 };
 pub use weights::{Embedding, Method, Packer, Precision, Projection, WeightPlan};
 pub mod gemma4;
+pub mod gpt_oss;
 pub mod qwen3_5;
 pub mod whisper;
 

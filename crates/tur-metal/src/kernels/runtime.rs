@@ -20,7 +20,8 @@ use tur_core::{Result, TurError, execution::invalid};
 /// 3: tiled prefill attention over query tiles.
 /// 4: windowed ungated attention and learned expert route scales.
 /// 5: windowed ungated tiled attention.
-pub const LAYOUT_VERSION: u32 = 5;
+/// 6: attention sinks and MXFP4 expert banks.
+pub const LAYOUT_VERSION: u32 = 6;
 
 // Runtime Metal compilation has no local include search path, so embed the families as
 // one source string with shared helpers first.
@@ -59,6 +60,12 @@ const FUNCTIONS: &[&str] = &[
     "moe_gemm_wide_f32",
     "moe_gemm_wide_q8_0",
     "moe_gemm_wide_q4k",
+    "moe_gemv_mxfp4",
+    "moe_gemm_mxfp4",
+    "moe_gemm_wide_mxfp4",
+    "moe_bias_f32",
+    "moe_glu_f32",
+    "rope_scaled_f32",
     "rms_norm_f32",
     "add_rms_norm_f32",
     "qk_norm_rope_f32",

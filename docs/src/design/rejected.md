@@ -35,6 +35,7 @@ git show 99b073e:<path> > change.patch
 | Kernel-level speculation cost model | Not built: the cost of a draft at eight sequences caps the gain at about 10% | none |
 | Learned drafters (EAGLE-3, DFlash, DSpark) and separate draft models for Qwen | No compatible drafter or smaller Qwen3.5 exists for these checkpoints | none |
 | Gemma 4 assistant chains with more than one request decoding | With four requests on E2B, against one draft per pass: 6% slower on prose and 13% on code, though 28% faster on repetitive text. Limited by `CHAIN_MAX_DECODES` | none |
+| Plain LRU for an expert cache smaller than one token's experts | On gpt-oss-20b, each token touches 96 experts in layer order, so 40 or 81 slots hit nothing at 1.37 tokens/s. Evicting the expert needed furthest ahead hits 34% at 1.87 tokens/s with 81 slots, but only 65% against LRU's 79% with 324, so LRU stays above the crossover | none |
 
 ## Worth retrying on other hardware
 
