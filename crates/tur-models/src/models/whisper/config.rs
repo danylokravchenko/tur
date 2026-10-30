@@ -144,6 +144,9 @@ pub struct Generation {
     pub max_length: Option<usize>,
     #[serde(default)]
     pub is_multilingual: Option<bool>,
+    /// Latest timestamp step a window may open with.
+    #[serde(default)]
+    pub max_initial_timestamp_index: Option<u32>,
 }
 
 impl Generation {

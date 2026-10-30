@@ -27,7 +27,7 @@ Tur is an inference service for Apple Silicon Macs. It aims for three things at 
 | Qwen3.8-27B | Pinned config, tensor headers and template validated, and it shares the 0.8B code path; not yet run, because its Q4K weights exceed a 16 GB Mac |
 | Qwen3.6-35B-A3B | Passes an independent small Transformers fixture and pinned headers; full execution, quality and expert-kernel performance are open |
 | Gemma 4 E2B | Pinned Transformers F32 architecture fixtures, and real Q8_0 checkpoint generation; its Q8_0 audio encoder matches the F32 Transformers encoder at cosine similarity 0.9999 |
-| Whisper large-v3-turbo | Small Transformers fixture for the encoder, decoder and cached greedy decode; real F32 and Q8_0 transcripts equal Transformers' on a pinned clip |
+| Whisper large-v3-turbo | Small Transformers fixture for the encoder, decoder and cached greedy decode; real F32 and Q8_0 transcripts equal Transformers' on a pinned clip, and F32 long-form tokens and segment times equal its `generate` on a clip beyond 30 s |
 | Gemma 4 E4B, 12B, 26B-A4B, 31B | Architecture fixtures and configuration checks; full checkpoints not yet run |
 
 ## Principles

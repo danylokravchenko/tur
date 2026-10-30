@@ -37,7 +37,7 @@ just test             # offline nextest suite (~30 s); `just test -E 'test(prefi
 just ci               # fmt-check + lint + check + test: run before declaring work done
 just run --prompt 'Hello' -n 64          # pinned 0.8B checkpoint unless TUR_MODEL/TUR_REVISION
 just serve --listen 127.0.0.1:8080
-just bench <case>     # kernels | model | serving | prefix | kv_quality | tensorops | load_weights
+just bench <case>     # kernels | model | serving | prefix | kv_quality | tensorops | whisper | load_weights
 just test-checkpoint  # ignored real-checkpoint tests; needs TUR_QWEN35_0_8B and golden files
 ```
 

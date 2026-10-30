@@ -9,10 +9,9 @@
 
 ## Audio
 
-- Faster Whisper encoding. The large-v3-turbo encoder takes about 2.9 s per 30-second window on the M1, at about 0.8 TFLOP/s through Candle matmuls; Tur's packed kernels or F16 activations should help. Decoding a sentence takes about 0.4 s.
-- Whisper's timestamp-guided seeking for clips beyond 30 s, so words at window boundaries are not cut, and the `verbose_json`, `srt` and `vtt` formats that need timestamps.
 - Gemma 4 audio from prepacked artifacts, which store the text tower only, and an E4B checkpoint run.
-- Encoding clips off the worker thread: today a clip is encoded when its request is submitted, between passes.
+- A faster Whisper encoder. Attention now runs on Tur's tiled kernel, and the projections take most of the remaining 2 s per window on the M1. They run on Candle's GEMM at about 1.5 TFLOP/s, which a matrix-unit kernel did not beat (see [Rejected experiments](rejected.md)), so the next step is hardware with faster matrix units.
+- Word-level timestamps, and `prompt` with previous-text conditioning. Whisper's temperature fallback is also missing, so a window that loops on repeated text decodes until the length limit.
 
 ## Performance
 

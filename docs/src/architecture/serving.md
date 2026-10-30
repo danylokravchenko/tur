@@ -13,7 +13,7 @@ The HTTP server is an axum application (`tur::server`) in front of a `PipelineWo
 
 ## Transcription
 
-`TranscriptionWorker` owns a Whisper model on its own thread, like the chat worker, and takes clips from a bounded queue (16 by default, `--max-waiting-transcriptions`). A full queue returns HTTP 429. Handlers decode uploads and base64 audio on Tokio's blocking pool, so a large WAV file never stalls the async runtime. [Audio](audio.md) covers the models.
+`TranscriptionWorker` owns a Whisper model on its own thread and Metal queue, and takes clips from a bounded queue (16 by default, `--max-waiting-transcriptions`). A full queue returns HTTP 429. Handlers decode uploads and base64 audio on Tokio's blocking pool, so a large WAV file never stalls the async runtime. Chat clips go to a separate encoder thread that holds up to 8 waiting requests, and a full one returns HTTP 429; each request rejoins the worker's intake once its clips are encoded. [Audio](audio.md) covers the models.
 
 ## Streaming
 

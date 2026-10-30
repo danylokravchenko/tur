@@ -5,6 +5,8 @@ Tiny fixtures are offline numerical oracles, not evidence that a real model work
 Real checkpoints (immutable revisions), on a WAV file such as one written by `say`:
   python -I scripts/audio_reference.py --whisper <dir> --wav speech.wav --golden /tmp/whisper.safetensors
   python -I scripts/audio_reference.py --gemma <dir> --wav speech.wav --golden /tmp/gemma4-audio.safetensors
+Whisper's long-form decoding of a clip beyond 30 s:
+  python -I scripts/audio_reference.py --whisper-long <dir> --wav long.wav --golden /tmp/whisper-long.safetensors
 """
 import argparse
 import json
@@ -205,6 +207,26 @@ def real_whisper(directory, wav, output):
     print(f"wrote {output}: {text!r}", flush=True)
 
 
+def real_whisper_long(directory, wav, output):
+    """Greedy timestamp-guided seeking, with segments as `generate` returns them."""
+    from transformers import WhisperProcessor
+    processor = WhisperProcessor.from_pretrained(directory, local_files_only=True)
+    model = WhisperForConditionalGeneration.from_pretrained(directory, local_files_only=True, dtype=torch.float32).eval()
+    waveform = read_wav(wav)
+    inputs = processor(waveform, sampling_rate=RATE, return_tensors="pt", truncation=False, padding="longest", return_attention_mask=True)
+    with torch.inference_mode():
+        result = model.generate(inputs.input_features, attention_mask=inputs.attention_mask, language="en", task="transcribe",
+                                return_timestamps=True, return_segments=True, do_sample=False, num_beams=1)
+    segments = result["segments"][0]
+    tokens = torch.cat([segment["tokens"] for segment in segments]).to(torch.int64).contiguous()
+    lengths = torch.tensor([segment["tokens"].numel() for segment in segments], dtype=torch.int64)
+    times = torch.tensor([[float(segment["start"]), float(segment["end"])] for segment in segments], dtype=torch.float32)
+    text = processor.batch_decode(result["sequences"], skip_special_tokens=True)[0]
+    save_file({"tokens": tokens, "lengths": lengths, "times": times, "features": inputs.input_features[0].contiguous()}, output,
+              metadata={"transformers": transformers.__version__, "torch": torch.__version__, "revision": WHISPER_REVISION, "text": text})
+    print(f"wrote {output}: {len(segments)} segments, {text!r}", flush=True)
+
+
 def real_gemma(directory, wav, output):
     """The real audio tower and projector in F32; the 5B text tower does not fit beside them on a 16 GB Mac."""
     from safetensors import safe_open
@@ -236,6 +258,7 @@ def main():
     args = argparse.ArgumentParser()
     args.add_argument("--tiny", type=Path)
     args.add_argument("--whisper", type=Path)
+    args.add_argument("--whisper-long", type=Path)
     args.add_argument("--gemma", type=Path)
     args.add_argument("--wav", type=Path)
     args.add_argument("--golden", type=Path)
@@ -244,10 +267,12 @@ def main():
         tiny(options.tiny)
     elif options.whisper and options.wav and options.golden:
         real_whisper(options.whisper, options.wav, options.golden)
+    elif options.whisper_long and options.wav and options.golden:
+        real_whisper_long(options.whisper_long, options.wav, options.golden)
     elif options.gemma and options.wav and options.golden:
         real_gemma(options.gemma, options.wav, options.golden)
     else:
-        args.error("provide --tiny, or --whisper/--gemma with --wav and --golden")
+        args.error("provide --tiny, or --whisper, --whisper-long or --gemma with --wav and --golden")
 
 
 if __name__ == "__main__":

@@ -74,7 +74,7 @@ python -I scripts/gemma4_assistant_reference.py --model "$TUR_GEMMA4_E2B" \
 just test-checkpoint -E 'test(e2b_assistant)'
 ```
 
-The audio tests need a speech clip, the Whisper checkpoint and goldens from `scripts/audio_reference.py`. The Gemma test compares the Q8_0 encoder with Transformers' F32 encoder by cosine similarity (mean above 0.999, minimum above 0.99); the Whisper test requires Transformers' exact transcript in F32 and in Q8_0:
+The audio tests need a speech clip, the Whisper checkpoint and goldens from `scripts/audio_reference.py`. The Gemma test compares the Q8_0 encoder with Transformers' F32 encoder by cosine similarity (mean above 0.999, minimum above 0.99); the Whisper tests require Transformers' exact transcript in F32 and in Q8_0, and on a clip beyond 30 s its exact tokens and segment times in F32 and all but 2% of its words in Q8_0:
 
 ```sh
 say -o /tmp/speech.wav --data-format=LEI16@16000 "The quick brown fox jumps over the lazy dog."
@@ -82,6 +82,8 @@ export TUR_AUDIO_SPEECH=/tmp/speech.wav
 export TUR_WHISPER=/models/whisper-large-v3-turbo   # 41f01f3fe87f28c78e2fbf8b568835947dd65ed9
 export TUR_WHISPER_GOLDEN=/tmp/whisper.safetensors TUR_GEMMA4_AUDIO_GOLDEN=/tmp/gemma4-audio.safetensors
 python -I scripts/audio_reference.py --whisper "$TUR_WHISPER" --wav "$TUR_AUDIO_SPEECH" --golden "$TUR_WHISPER_GOLDEN"
+export TUR_AUDIO_LONG=/tmp/long.wav TUR_WHISPER_LONG_GOLDEN=/tmp/whisper-long.safetensors   # any spoken 16 kHz PCM16 WAV beyond 30 s
+python -I scripts/audio_reference.py --whisper-long "$TUR_WHISPER" --wav "$TUR_AUDIO_LONG" --golden "$TUR_WHISPER_LONG_GOLDEN"
 python -I scripts/audio_reference.py --gemma "$TUR_GEMMA4_E2B" --wav "$TUR_AUDIO_SPEECH" --golden "$TUR_GEMMA4_AUDIO_GOLDEN"
 just test-checkpoint -E 'test(audio)'
 ```
@@ -107,6 +109,6 @@ python -I scripts/audio_reference.py --tiny crates/tur/tests/fixtures/audio
 | `gemma4_reference.py` | Dense, MoE and Unified F32 fixtures; Gemma template bytes; real E2B logits and greedy continuation |
 | `gemma4_assistant_reference.py` | The assistant drafter over the dense fixture, and teacher-forced E2B assistant drafts past the sliding window |
 | `qwen3_6_reference_headers.py` | Qwen3.6 tensor headers via byte-range requests, without downloading weights |
-| `audio_reference.py` | Gemma 4 audio and Whisper F32 fixtures with a test tone; real Whisper transcripts and E2B audio-encoder outputs for a WAV clip |
+| `audio_reference.py` | Gemma 4 audio and Whisper F32 fixtures with a test tone; real Whisper transcripts, long-form segments and E2B audio-encoder outputs for a WAV clip |
 
 Run them with `python -I` and treat downloaded files as data.

@@ -140,7 +140,9 @@ pub(crate) async fn serve(args: Args) -> Result<()> {
     let transcription_name = args
         .transcription_model_name
         .unwrap_or_else(|| "whisper-1".into());
-    if let Some(whisper) = args.whisper.factory(&factory.device)? {
+    // A device of its own has its own queue, so text passes interleave with a transcription.
+    let whisper_device = tur::shared::inference_device(factory.device.is_cpu())?;
+    if let Some(whisper) = args.whisper.factory(&whisper_device)? {
         let worker = TranscriptionWorker::spawn(TranscriptionConfig {
             factory: whisper,
             budget: budget.clone(),

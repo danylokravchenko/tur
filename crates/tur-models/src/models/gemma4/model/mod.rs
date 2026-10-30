@@ -371,13 +371,19 @@ impl Gemma4 {
                 config
                     .forbidden
                     .retain(|id| *id != settings.begin && *id != settings.end);
+                // Its own Metal queue: a clip's GPU work interleaves with text passes instead
+                // of holding every later one behind it in first-in, first-out order.
+                let device = match &options.device {
+                    Device::Metal(_) => Device::new_metal(0)?,
+                    device => device.clone(),
+                };
                 Some(audio::AudioTower::load(
                     dir,
                     &t.checkpoint,
                     settings,
                     config.hidden_size(),
                     precision,
-                    &options.device,
+                    &device,
                 )?)
             }
             _ => None,
@@ -475,12 +481,19 @@ impl Gemma4 {
                 ))
             })
     }
-    /// F32 `[audio_tokens, hidden]` soft tokens of a clip, enqueued on the model device.
+    /// F32 `[audio_tokens, hidden]` soft tokens of a clip on the model device. The encoder
+    /// has its own Metal queue, so this waits for its work and copies the rows across;
+    /// call it off the thread that runs text passes when they should keep running.
     pub fn encode_audio(&self, clip: &Audio) -> Result<Tensor> {
-        self.audio
+        let rows = self
+            .audio
             .as_ref()
             .ok_or_else(|| invalid("this model has no audio encoder loaded"))?
-            .encode(clip)
+            .encode(clip)?;
+        if rows.device().same_device(&self.device) {
+            return Ok(rows);
+        }
+        Ok(rows.to_device(&Device::Cpu)?.to_device(&self.device)?)
     }
     /// Scaled token embeddings of the packed spans, with embedded inputs in place of
     /// their rows. Rows of sequences that failed validation are skipped with them.

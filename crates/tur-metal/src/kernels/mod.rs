@@ -310,15 +310,16 @@ impl PagedKv {
     }
 }
 
-/// Split runs of tokens sharing a page table, at consecutive positions, into tiles of at
-/// most `TILE_QUERIES`; `None` if any run breaks that shape.
+/// Split runs of tokens sharing a page table, at consecutive positions or all seeing the
+/// same keys, into tiles of at most `TILE_QUERIES`; `None` if any run breaks that shape.
 fn query_tiles(first_block: &[u32], visible: &[u32]) -> Option<Vec<u32>> {
     let mut tiles = Vec::new();
     let mut start = 0;
     while start < visible.len() {
         let mut end = start + 1;
         while end < visible.len() && first_block[end] == first_block[start] {
-            if visible[end - 1].checked_add(1) != Some(visible[end]) {
+            let previous = visible[end - 1];
+            if visible[end] != previous && previous.checked_add(1) != Some(visible[end]) {
                 return None;
             }
             end += 1;
@@ -1920,6 +1921,11 @@ mod tests {
             query_tiles(&first, &visible),
             Some(vec![0, 32, 32, 1, 33, 7])
         );
+    }
+
+    #[test]
+    fn test_query_tiles_accept_queries_that_all_see_the_same_keys() {
+        assert_eq!(query_tiles(&[0; 40], &[1500; 40]), Some(vec![0, 32, 32, 8]));
     }
 
     #[test]

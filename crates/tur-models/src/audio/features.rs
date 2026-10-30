@@ -229,40 +229,90 @@ impl WhisperFeatures {
     }
 
     /// `[mels, 3000]` features of at most one window, zero-padded to 30 s.
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "features are F32 model inputs"
-    )]
     pub(crate) fn extract(&self, samples: &[f32]) -> Result<Tensor> {
         if samples.len() > WHISPER_WINDOW {
             return Err(invalid("a Whisper window holds at most 30 s"));
         }
         let mut clip = samples.to_vec();
         clip.resize(WHISPER_WINDOW, 0.0);
+        self.clip(&clip)?.window(0, WHISPER_FRAMES, &self.device)
+    }
+
+    /// Features of a whole clip of at least one frame, normalized by its loudest frame.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "features are F32 model inputs"
+    )]
+    pub(crate) fn clip(&self, samples: &[f32]) -> Result<WhisperClip> {
+        const REFLECTED: usize = 200;
+        if samples.len() <= REFLECTED {
+            return Err(invalid("audio is too short for a Whisper frame"));
+        }
         // Centre frames by reflecting 200 samples at each edge, as `torch.stft`.
-        let mut padded = Vec::with_capacity(WHISPER_WINDOW + 400);
-        padded.extend(clip[1..=200].iter().rev());
-        padded.extend_from_slice(&clip);
-        padded.extend(clip[WHISPER_WINDOW - 201..WHISPER_WINDOW - 1].iter().rev());
-        // The transform yields one frame more than the 3000 Whisper keeps.
+        let mut padded = Vec::with_capacity(samples.len() + 2 * REFLECTED);
+        padded.extend(samples[1..=REFLECTED].iter().rev());
+        padded.extend_from_slice(samples);
+        padded.extend(
+            samples[samples.len() - REFLECTED - 1..samples.len() - 1]
+                .iter()
+                .rev(),
+        );
+        // The transform yields one frame more than Whisper keeps.
+        let frames = samples.len() / self.spectrogram.hop;
         let log: Vec<f64> = self
             .spectrogram
-            .mel(&padded, WHISPER_FRAMES)?
+            .mel(&padded, frames)?
             .into_iter()
             .map(|mel| mel.max(1e-10).log10())
             .collect();
         let floor = log.iter().copied().fold(f64::NEG_INFINITY, f64::max) - 8.0;
         let mels = self.spectrogram.mels;
-        let mut features = vec![0.0f32; mels * WHISPER_FRAMES];
+        let mut features = vec![0.0f32; mels * frames];
         for (frame, row) in log.chunks_exact(mels).enumerate() {
             for (m, &value) in row.iter().enumerate() {
-                features[m * WHISPER_FRAMES + frame] = ((value.max(floor) + 4.0) / 4.0) as f32;
+                features[m * frames + frame] = ((value.max(floor) + 4.0) / 4.0) as f32;
             }
         }
-        Ok(Tensor::from_vec(
+        Ok(WhisperClip {
             features,
-            (mels, WHISPER_FRAMES),
-            &self.device,
+            mels,
+            frames,
+        })
+    }
+}
+
+/// Row-major `[mels, frames]` features of a whole clip, on the host.
+pub(crate) struct WhisperClip {
+    features: Vec<f32>,
+    mels: usize,
+    frames: usize,
+}
+
+impl WhisperClip {
+    pub(crate) fn frames(&self) -> usize {
+        self.frames
+    }
+
+    /// `[mels, 3000]` features from frame `seek`: `frames` of them, then zeros, as
+    /// Transformers pads a clip's last window.
+    pub(crate) fn window(&self, seek: usize, frames: usize, device: &Device) -> Result<Tensor> {
+        let end = seek
+            .checked_add(frames)
+            .filter(|&end| end <= self.frames && frames <= WHISPER_FRAMES)
+            .ok_or_else(|| invalid("Whisper window outside the clip"))?;
+        let mut window = vec![0.0f32; self.mels * WHISPER_FRAMES];
+        for (row, source) in window
+            .as_chunks_mut::<WHISPER_FRAMES>()
+            .0
+            .iter_mut()
+            .zip(self.features.chunks_exact(self.frames))
+        {
+            row[..frames].copy_from_slice(&source[seek..end]);
+        }
+        Ok(Tensor::from_vec(
+            window,
+            (self.mels, WHISPER_FRAMES),
+            device,
         )?)
     }
 }

@@ -99,6 +99,7 @@ Sampling settings you leave out come from the checkpoint's `generation_config.js
 | `--whisper-weight-format f32\|q8_0\|q4k` | `q8_0` | Storage for Whisper's projections |
 | `--language <code>` | detected | `transcribe` only: spoken language, such as `en` |
 | `--translate` | off | `transcribe` only: write English text instead of a transcript |
+| `--format text\|srt\|vtt` | `text` | `transcribe` only: plain text or timed subtitles |
 
 ```sh
 tur transcribe --whisper openai/whisper-large-v3-turbo \

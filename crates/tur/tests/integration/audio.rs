@@ -313,6 +313,75 @@ fn test_gemma4_audio_chat_matches_transformers_and_isolates_clips() -> Result<()
 }
 
 #[test]
+fn test_clips_encoded_before_submission_replace_encoding_and_must_match() -> Result<()> {
+    use tur::{InferencePipeline, backend::pipeline::PipelineConfig};
+    let fixture = gemma_chat()?;
+    let mut pipeline = InferencePipeline::new(&factory(&fixture), PipelineConfig::new(1, 256))?;
+    let inline = pipeline.run(&audio_request(tone()?, 3), |_| {})?;
+    let model = pipeline
+        .audio_model()
+        .ok_or_else(|| invalid("no audio model"))?;
+    let mut fresh = InferencePipeline::new(&factory(&fixture), PipelineConfig::new(1, 256))?;
+    let mut encoded = audio_request(tone()?, 3);
+    assert!(encoded.needs_audio_encoding());
+    encoded.encoded_audio = vec![model.encode_audio(&tone()?)?];
+    assert!(!encoded.needs_audio_encoding());
+    assert_eq!(
+        fresh.run(&encoded, |_| {})?.generated_text,
+        inline.generated_text
+    );
+    encoded.encoded_audio = vec![model.encode_audio(&tone()?)?; 2];
+    assert!(fresh.submit_request(&encoded).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_worker_encodes_clips_off_its_thread_and_answers_identically() -> Result<()> {
+    use tokio::sync::oneshot;
+    use tur::{
+        InferencePipeline, TurError,
+        backend::{memory::DeviceBudget, pipeline::PipelineConfig},
+        server::worker::{PipelineWorker, StreamConfig, WorkerConfig, WorkerMsg},
+    };
+    let fixture = gemma_chat()?;
+    let mut direct = InferencePipeline::new(&factory(&fixture), PipelineConfig::new(1, 256))?;
+    let expected = direct
+        .run(&audio_request(tone()?, 3), |_| {})?
+        .generated_text;
+    let worker = PipelineWorker::spawn(WorkerConfig {
+        factory: factory(&fixture),
+        pipeline: PipelineConfig::new(1, 256),
+        budget: DeviceBudget::for_device(&Device::Cpu),
+        request_timeout: None,
+        stream: StreamConfig::default(),
+    })?;
+    let (result_tx, result) = oneshot::channel();
+    worker
+        .send(WorkerMsg {
+            request: audio_request(tone()?, 3),
+            token_tx: None,
+            result_tx,
+        })
+        .await?;
+    let stats = result.await.map_err(|_| TurError::WorkerUnavailable)??;
+    assert_eq!(stats.generated_text, expected);
+    // A clip the encoder refuses reaches its client as an error.
+    let (result_tx, result) = oneshot::channel();
+    worker
+        .send(WorkerMsg {
+            request: audio_request(Audio::from_samples(&[0.0; 100], 16_000)?, 3),
+            token_tx: None,
+            result_tx,
+        })
+        .await?;
+    assert!(matches!(
+        result.await.map_err(|_| TurError::WorkerUnavailable)?,
+        Err(TurError::InvalidExecution(_))
+    ));
+    Ok(())
+}
+
+#[test]
 fn test_audio_requests_need_an_encoder_and_one_placeholder_per_clip() -> Result<()> {
     use tur::{
         InferencePipeline, TurError,
@@ -408,6 +477,71 @@ fn test_whisper_turbo_transcription_matches_transformers() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "requires the pinned Whisper large-v3-turbo checkpoint, a WAV beyond 30 s and its Transformers golden"]
+#[cfg(feature = "metal")]
+fn test_whisper_turbo_long_form_matches_transformers() -> Result<()> {
+    use tur_models::models::whisper::{TranscribeOptions, Transcriber};
+    let golden =
+        candle_core::safetensors::load(required("TUR_WHISPER_LONG_GOLDEN")?, &Device::Cpu)?;
+    let tokens: Vec<u32> = tensor(&golden, "tokens")?.to_dtype(DType::U32)?.to_vec1()?;
+    let lengths: Vec<u32> = tensor(&golden, "lengths")?
+        .to_dtype(DType::U32)?
+        .to_vec1()?;
+    let times: Vec<Vec<f32>> = tensor(&golden, "times")?.to_vec2()?;
+    let clip = Audio::from_wav(&std::fs::read(required("TUR_AUDIO_LONG")?)?)?;
+    assert!(clip.duration().as_secs() > 30);
+    let dir = required("TUR_WHISPER")?;
+    let options = TranscribeOptions {
+        language: Some("en".into()),
+        ..Default::default()
+    };
+    // F32 is the reference's arithmetic: every window, token and time must agree.
+    let transcriber = Transcriber::load(&dir, WeightFormat::F32, &Device::new_metal(0)?)?;
+    let result = transcriber.transcribe(&clip, &options)?;
+    assert_eq!(result.segments.len(), lengths.len());
+    let mut offset = 0;
+    for ((segment, &length), time) in result.segments.iter().zip(&lengths).zip(&times) {
+        let end = offset + length as usize;
+        assert_eq!(segment.tokens, tokens[offset..end]);
+        assert!((segment.start - f64::from(time[0])).abs() < 1e-3);
+        assert!((segment.end - f64::from(time[1])).abs() < 1e-3);
+        offset = end;
+    }
+    assert_eq!(offset, tokens.len());
+    // Q8_0 weights move close decisions, so segment breaks may differ. Measured on a spoken
+    // 80 s clip: one word in 239 differs in punctuation.
+    let reference = result.text;
+    let transcriber = Transcriber::load(&dir, WeightFormat::Q8_0, &Device::new_metal(0)?)?;
+    let packed = transcriber.transcribe(&clip, &options)?.text;
+    let (expected, actual): (Vec<_>, Vec<_>) = (
+        reference.split_whitespace().collect(),
+        packed.split_whitespace().collect(),
+    );
+    let distance = edit_distance(&expected, &actual);
+    assert!(
+        distance * 50 <= expected.len(),
+        "{distance} words differ: {packed}"
+    );
+    Ok(())
+}
+
+/// Levenshtein distance between two word lists.
+#[cfg(feature = "metal")]
+fn edit_distance(a: &[&str], b: &[&str]) -> usize {
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, x) in a.iter().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, y) in b.iter().enumerate() {
+            let cost = diagonal + usize::from(x != y);
+            diagonal = row[j + 1];
+            row[j + 1] = cost.min(row[j] + 1).min(diagonal + 1);
+        }
+    }
+    row[b.len()]
+}
+
 mod http {
     use super::*;
     use axum::{body::Body, http::Request};
@@ -417,7 +551,7 @@ mod http {
     use tur::{
         TurError,
         backend::pipeline::GenerationStats,
-        models::whisper::{Task, Transcription},
+        models::whisper::{Segment, Task, Transcription},
         server::{
             AppState, build_router,
             transcription::{TranscriptionJob, TranscriptionWorker},
@@ -486,11 +620,23 @@ mod http {
                     job.options.language.as_deref().unwrap_or("auto"),
                     job.audio.duration().as_millis()
                 );
+                let segments = if job.options.timestamps {
+                    vec![Segment {
+                        start: 61.5,
+                        end: 3723.25,
+                        text: format!(" {text}"),
+                        seek: 6150,
+                        tokens: vec![7, 8],
+                    }]
+                } else {
+                    vec![]
+                };
                 drop(job.reply.send(Ok(Transcription {
                     text,
-                    language: None,
+                    language: Some("en".into()),
                     tokens: 1,
                     windows: 1,
+                    segments,
                 })));
             }
         });
@@ -599,6 +745,41 @@ Content-Type: audio/wav\r\n\r\n",
         )?)
         .await?;
         assert_eq!((status, body.as_str()), (200, "Transcribe uk 1234"));
+        let (status, body) = send(form(&[("response_format", "srt")], Some(&wav))?).await?;
+        assert_eq!(
+            (status, body.as_str()),
+            (
+                200,
+                "1\n00:01:01,500 --> 01:02:03,250\nTranscribe auto 1234\n\n"
+            )
+        );
+        let (status, body) = send(form(&[("response_format", "vtt")], Some(&wav))?).await?;
+        assert_eq!(
+            (status, body.as_str()),
+            (
+                200,
+                "WEBVTT\n\n00:01:01.500 --> 01:02:03.250\nTranscribe auto 1234\n\n"
+            )
+        );
+        let (status, body) = send(form(
+            &[
+                ("response_format", "verbose_json"),
+                ("timestamp_granularities[]", "segment"),
+            ],
+            Some(&wav),
+        )?)
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        let verbose: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(verbose["task"], "transcribe");
+        assert_eq!(verbose["language"], "en");
+        assert_eq!(verbose["duration"], 1.234);
+        assert_eq!(verbose["text"], "Transcribe auto 1234");
+        assert_eq!(
+            verbose["segments"],
+            serde_json::json!([{"id": 0, "seek": 6150, "start": 61.5, "end": 3723.25,
+                "text": " Transcribe auto 1234", "tokens": [7, 8]}])
+        );
         let mut translation = form(&[], Some(&wav))?;
         *translation.uri_mut() = "/v1/audio/translations"
             .parse()
@@ -612,7 +793,12 @@ Content-Type: audio/wav\r\n\r\n",
         for (fields, file, status) in [
             (vec![], None, 400),
             (vec![("temperature", "0.4")], Some(&wav[..]), 400),
-            (vec![("response_format", "srt")], Some(&wav[..]), 400),
+            (vec![("response_format", "ass")], Some(&wav[..]), 400),
+            (
+                vec![("timestamp_granularities[]", "word")],
+                Some(&wav[..]),
+                400,
+            ),
             (vec![("prompt", "earlier words")], Some(&wav[..]), 400),
             (vec![], Some(&b"OggS"[..]), 400),
             (vec![("model", "whisper-2")], Some(&wav[..]), 404),

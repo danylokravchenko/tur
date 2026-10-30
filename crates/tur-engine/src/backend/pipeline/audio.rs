@@ -5,12 +5,12 @@
 //! keys and restores (which compare tokens) tell clips apart, and a snapshot taken after
 //! a clip is reused only for the same clip. Packing feeds the model its slot token there
 //! and the encoder's rows as [`EmbeddedInput`]s.
-use super::InferencePipeline;
+use super::{GenerationRequest, InferencePipeline};
 use crate::{Result, TurError};
 use candle_core::Tensor;
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 use tur_core::execution::{EmbeddedInput, invalid};
-use tur_models::backend::chat_template::ChatMessage;
+use tur_models::models::TextModel;
 
 /// Tokens at or above this mark a clip's soft-token position, not a vocabulary entry.
 const IDENTITY: u32 = 1 << 31;
@@ -51,15 +51,28 @@ pub(super) fn is_identity(token: u32) -> bool {
 }
 
 impl InferencePipeline {
+    /// The model, for encoding clips off the execution thread, when it hears audio.
+    pub fn audio_model(&self) -> Option<Arc<TextModel>> {
+        self.model.audio_prompt().map(|_| Arc::clone(&self.model))
+    }
+
     /// Replace each audio placeholder the template rendered with the clip's framing and
     /// identity tokens, and encode the clips. The template must render exactly one
-    /// placeholder per clip, in message and part order.
+    /// placeholder per clip, in message and part order. Clips the request brought encoded are not
+    /// encoded again.
     pub(super) fn expand_audio(
         &self,
-        messages: &[ChatMessage],
+        request: &GenerationRequest,
         tokens: Vec<u32>,
     ) -> Result<(Vec<u32>, Vec<AudioSpan>)> {
-        let clips: Vec<_> = messages.iter().flat_map(|m| m.content.audio()).collect();
+        let clips: Vec<_> = request
+            .messages
+            .iter()
+            .flat_map(|m| m.content.audio())
+            .collect();
+        if !request.encoded_audio.is_empty() && request.encoded_audio.len() != clips.len() {
+            return Err(invalid("encoded audio does not match the request's clips"));
+        }
         let Some(prompt) = self.model.audio_prompt() else {
             if clips.is_empty() {
                 return Ok((tokens, Vec::new()));
@@ -76,6 +89,7 @@ impl InferencePipeline {
         if clips.is_empty() {
             return Ok((tokens, Vec::new()));
         }
+        let mut encoded = request.encoded_audio.iter();
         let mut clips = clips.into_iter();
         let mut expanded = Vec::with_capacity(tokens.len());
         let mut spans = Vec::new();
@@ -88,7 +102,10 @@ impl InferencePipeline {
                 .next()
                 .ok_or_else(|| invalid("audio placeholder without a clip"))?;
             let count = self.model.audio_tokens(clip)?;
-            let rows = self.model.encode_audio(clip)?;
+            let rows = match encoded.next() {
+                Some(rows) => rows.clone(),
+                None => self.model.encode_audio(clip)?,
+            };
             if rows.dim(0)? != count {
                 return Err(TurError::Other(
                     "audio encoder returned the wrong number of rows".into(),

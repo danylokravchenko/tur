@@ -16,7 +16,7 @@ The encoder is a 12-layer conformer, about 300 million parameters, from Google's
 
 Each soft token then replaces the input embedding at its position. The text model sees its pad token there for everything else it reads per token, which is what Transformers feeds Gemma's per-layer embeddings. Everything after the embedding (the decoder layers, paged K/V, scheduling, sampling and speculation) runs as for text, so a clip costs one prefill of its soft tokens and nothing per generated token.
 
-The encoder runs when a request is submitted, on the worker thread, and its output stays with the request until it finishes. A request that is preempted and recomputed reuses the rows instead of encoding the clip again.
+The server encodes clips on a dedicated thread with its own Metal queue, so text passes keep running while a clip encodes, then hands the request to the worker with the rows attached. A stream sharing the GPU with a 30-second clip sees its passes take as long as they do alone. The rows stay with the request until it finishes, so one that is preempted and recomputed never encodes its clip again.
 
 ### Prefix reuse with audio
 
@@ -24,12 +24,19 @@ Prefix reuse compares tokens, and every position of a clip carries the same plac
 
 ## Whisper transcribes the clip
 
-Whisper is an encoder-decoder model with cross-attention, a shape the paged hybrid engine doesn't run, so it gets its own runtime on Candle tensor operations. A `TranscriptionWorker` owns it on a dedicated thread and transcribes one clip at a time from a bounded queue.
+Whisper is an encoder-decoder model with cross-attention, a shape the paged hybrid engine doesn't run, so it gets its own runtime. A `TranscriptionWorker` owns it on a dedicated thread and transcribes one clip at a time from a bounded queue.
 
-- The encoder reads one 30-second window of 128 mel features and returns 1500 states.
-- The decoder starts from `<|startoftranscript|>`, the language, the task and `<|notimestamps|>`, and decodes greedily with the checkpoint's suppressed tokens, keeping a key-value cache of its own tokens and the encoder states' cross-attention keys and values.
+- The encoder reads one 30-second window of 128 mel features and returns 1500 states. Its self-attention runs on the tiled kernel that long-prompt prefill uses, reading the projected keys and values in place as a single page of a K/V pool; projections, norms and convolutions run on Candle.
+- The decoder starts from `<|startoftranscript|>`, the language and the task, and decodes greedily with the checkpoint's suppressed tokens, keeping a key-value cache of its own tokens and the encoder states' cross-attention keys and values.
 - Without a `language`, the first window picks the most likely language token, as Transformers' `detect_language` does.
-- Longer clips are cut into consecutive 30-second windows. A word that straddles a boundary can be split, since Whisper's timestamp-guided seeking isn't implemented.
+
+### Long audio
+
+A clip of up to 30 seconds is one window, and a plain transcript adds `<|notimestamps|>` to the prompt. A longer clip, or a request for timed output, decodes with timestamp tokens instead. They arrive in pairs that close one segment and open the next, under the rules of Transformers' `WhisperTimeStampLogitsProcessor`.
+
+Timestamps drive the seek. A window usually ends partway through a sentence, so Tur keeps the segments that closed, drops the text after the last pair, and starts the next window at that timestamp. A word at a window's edge is therefore decoded again, whole, in the next window. A window ending in a single timestamp has no speech after it, and the seek moves past the whole window.
+
+Features for a long clip are computed once over the whole clip and normalized by its loudest frame, so a quiet stretch keeps its level relative to the rest. The last window is padded with zeros in feature space.
 
 The worker leases its weights and one encoder pass from the device budget before the chat model sizes its state pool, so both fit the same memory plan.
 
@@ -41,5 +48,8 @@ The worker leases its weights and one encoder pass from the device budget before
 - Conformance comes from pinned references. On small Transformers 5.20.2 fixtures, Gemma's soft tokens match within 1.3e-6 relative error and every text layer with audio within 4e-6, on CPU and Metal. Whisper's encoder states and logits pass the 1e-4 gate, and its greedy decode through the cache reproduces the reference tokens.
 - Encoder projections are `Q8_0` beside a packed text model and F32 beside an F32 one. On the real E2B checkpoint, `Q8_0` soft tokens agree with the F32 Transformers tower at a mean cosine similarity of 0.99994 (minimum 0.99965) on a 5.3-second clip, which took 267 ms to encode.
 - Whisper large-v3-turbo in `Q8_0` and in F32 produces the same transcript as Transformers on that clip. `Q8_0` is the default: it holds 0.88 GB of weights instead of 3.2 GB.
+- Long-form decoding follows Transformers' `generate`: F32 reproduces its tokens and segment times exactly on an 80-second clip. `Q8_0` weights shift close decisions, giving 24 segments instead of 15, with one word of 239 differing in punctuation.
+- Whisper's attention uses Tur's kernels, because Candle's matmuls and softmax take 124 ms per layer on the encoder's shape and the tiled kernel 13 ms. One window's encoder went from 2.8 s to 2.0 s on the M1, and transcribing a short clip from 3.5 s to 2.3 s. Projections keep Candle's GEMM, the fastest measured at these shapes.
+- Gemma's audio encoder and Whisper each own a Metal device, because one queue runs first-in, first-out: on a shared queue a 30-second clip's 1.1 s of GPU work would hold every later text pass behind it. On separate queues the slowest text pass stays at 115 ms during that encode, which itself takes 2.7 s instead of 1.45 s while sharing the GPU. During an 80-second transcription, a stream's longest pause was 0.45 s. Direct `InferencePipeline` callers without a server still encode at submission, and wait for it.
 - WAV is the only container. MP3, FLAC and Opus decoders would be new dependencies.
 - Prepacked artifacts hold the text tower only, so a model loaded from one has no audio encoder and rejects audio.

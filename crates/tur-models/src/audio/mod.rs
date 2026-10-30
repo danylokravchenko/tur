@@ -5,7 +5,7 @@ mod resample;
 mod wav;
 
 pub(crate) use features::{
-    GemmaFeatures, WHISPER_FRAMES, WHISPER_WINDOW, WhisperFeatures, gemma_frames,
+    GemmaFeatures, WHISPER_FRAMES, WHISPER_WINDOW, WhisperClip, WhisperFeatures, gemma_frames,
 };
 use std::{sync::Arc, time::Duration};
 use tur_core::{Result, execution::invalid};

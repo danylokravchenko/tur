@@ -228,6 +228,29 @@ pub struct TranscriptionResponse {
     pub text: String,
 }
 
+/// `response_format=verbose_json` of the transcription endpoints.
+#[derive(Debug, Serialize)]
+pub struct VerboseTranscription {
+    pub task: &'static str,
+    pub language: Option<String>,
+    /// Seconds of audio.
+    pub duration: f64,
+    pub text: String,
+    pub segments: Vec<TranscriptionSegment>,
+}
+
+/// One timed stretch of a [`VerboseTranscription`].
+#[derive(Debug, Serialize)]
+pub struct TranscriptionSegment {
+    pub id: usize,
+    /// Feature frame at which this segment's window started.
+    pub seek: usize,
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+    pub tokens: Vec<u32>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ModelList {
     pub object: &'static str,

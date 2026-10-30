@@ -11,20 +11,51 @@ use crate::{
     TurError,
     audio::Audio,
     core::execution::invalid,
-    models::whisper::{Task, TranscribeOptions},
+    models::whisper::{Task, TranscribeOptions, Transcription},
     server::{
         AppState, media,
         routes::chat::execution_error,
-        types::{ApiErrorResponse, TranscriptionResponse},
+        types::{
+            ApiErrorResponse, TranscriptionResponse, TranscriptionSegment, VerboseTranscription,
+        },
     },
 };
+
+/// How a transcription is returned.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Json,
+    Text,
+    VerboseJson,
+    Srt,
+    Vtt,
+}
+
+impl Format {
+    fn parse(name: Option<&str>) -> crate::Result<Self> {
+        match name {
+            None | Some("json") => Ok(Self::Json),
+            Some("text") => Ok(Self::Text),
+            Some("verbose_json") => Ok(Self::VerboseJson),
+            Some("srt") => Ok(Self::Srt),
+            Some("vtt") => Ok(Self::Vtt),
+            Some(other) => Err(invalid(format!(
+                "response_format '{other}' is not supported; use json, text, verbose_json, srt or vtt"
+            ))),
+        }
+    }
+
+    fn timed(self) -> bool {
+        matches!(self, Self::VerboseJson | Self::Srt | Self::Vtt)
+    }
+}
 
 /// The fields of a transcription form that Tur reads.
 struct Form {
     audio: Audio,
     model: String,
     language: Option<String>,
-    text: bool,
+    format: Format,
 }
 
 fn bad_request(message: impl Into<String>) -> Response {
@@ -73,28 +104,58 @@ fn parse(content_type: &str, body: &[u8]) -> crate::Result<Form> {
                 }
             }
             "prompt" if field.data.is_empty() => {}
-            "prompt" | "timestamp_granularities[]" | "timestamp_granularities" => {
-                return Err(invalid(format!("{} is not supported", field.name)));
+            "prompt" => return Err(invalid("prompt is not supported")),
+            "timestamp_granularities[]" | "timestamp_granularities"
+                if text(field.data, &field.name)? != "segment" =>
+            {
+                return Err(invalid("only segment timestamps are supported"));
             }
             // Unknown fields are ignored, as `OpenAI` adds optional ones over time.
             _ => {}
         }
     }
-    let text = match format.as_deref() {
-        None | Some("json") => false,
-        Some("text") => true,
-        Some(other) => {
-            return Err(invalid(format!(
-                "response_format '{other}' is not supported; use json or text"
-            )));
-        }
-    };
+    let format = Format::parse(format.as_deref())?;
     Ok(Form {
         audio: audio.ok_or_else(|| invalid("the form needs a file field"))?,
         model,
         language,
-        text,
+        format,
     })
+}
+
+fn respond(result: Transcription, format: Format, task: Task, duration: f64) -> Response {
+    let plain = |body: String, content_type: &'static str| {
+        ([(header::CONTENT_TYPE, content_type)], body).into_response()
+    };
+    match format {
+        Format::Json => Json(TranscriptionResponse { text: result.text }).into_response(),
+        Format::Text => plain(result.text, "text/plain; charset=utf-8"),
+        Format::Srt => plain(result.srt(), "application/x-subrip"),
+        Format::Vtt => plain(result.vtt(), "text/vtt; charset=utf-8"),
+        Format::VerboseJson => Json(VerboseTranscription {
+            task: match task {
+                Task::Transcribe => "transcribe",
+                Task::Translate => "translate",
+            },
+            language: result.language,
+            duration,
+            text: result.text,
+            segments: result
+                .segments
+                .into_iter()
+                .enumerate()
+                .map(|(id, segment)| TranscriptionSegment {
+                    id,
+                    seek: segment.seek,
+                    start: segment.start,
+                    end: segment.end,
+                    text: segment.text,
+                    tokens: segment.tokens,
+                })
+                .collect(),
+        })
+        .into_response(),
+    }
 }
 
 async fn speech(state: AppState, headers: HeaderMap, body: Bytes, task: Task) -> Response {
@@ -134,14 +195,11 @@ async fn speech(state: AppState, headers: HeaderMap, body: Bytes, task: Task) ->
     let options = TranscribeOptions {
         language: form.language,
         task,
+        timestamps: form.format.timed(),
     };
+    let duration = form.audio.duration().as_secs_f64();
     match worker.transcribe(form.audio, options).await {
-        Ok(result) if form.text => (
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            result.text,
-        )
-            .into_response(),
-        Ok(result) => Json(TranscriptionResponse { text: result.text }).into_response(),
+        Ok(result) => respond(result, form.format, task, duration),
         Err(error) => {
             let (status, body) = execution_error(&error);
             if matches!(error, TurError::InvalidExecution(_)) {

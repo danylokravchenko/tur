@@ -323,6 +323,7 @@ pub async fn chat_completions(
             submitted_at: None,
             cache_salt: req.cache_salt,
             grammar: None,
+            encoded_audio: Vec::new(),
             render: RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.thinking,

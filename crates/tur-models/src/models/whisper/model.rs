@@ -5,7 +5,7 @@
 //! Whisper's encoder and cached decoder over Candle tensor operations.
 use super::config::{Config, validate_preprocessor};
 use crate::{
-    audio::WhisperFeatures,
+    audio::{WhisperClip, WhisperFeatures},
     models::{
         Precision, WeightFormat,
         checkpoint::{Checkpoint, weight_files},
@@ -22,6 +22,62 @@ use tur_metal::packed::PackedLinear;
 const EPS: f32 = 1e-5;
 /// Encoder heads attended at once: bounds the `[heads, 1500, 1500]` score buffer.
 const HEAD_GROUP: usize = 4;
+
+/// Metal attention over rows that every query sees whole: the paged kernels read the
+/// projections in place, as one page of a pool that needs no copy. 10× faster than
+/// Candle's matmuls and softmax on the encoder's shape.
+#[cfg(feature = "metal")]
+struct FusedAttention {
+    kernels: tur_metal::kernels::Kernels,
+    head_dim: usize,
+}
+
+#[cfg(feature = "metal")]
+impl FusedAttention {
+    /// Kernels for `device` when it is Metal and has kernels for the head width.
+    fn new(config: &Config, device: &Device) -> Result<Option<Self>> {
+        let head_dim = config.d_model / config.encoder_attention_heads;
+        if !device.is_metal()
+            || !matches!(head_dim, 64 | 128 | 256)
+            || config.d_model / config.decoder_attention_heads != head_dim
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            kernels: tur_metal::kernels::Kernels::new(device)?,
+            head_dim,
+        }))
+    }
+
+    /// `[queries, heads · dim]` attention of query rows over `[keys, heads · dim]` rows.
+    fn attend(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        use tur_metal::pool::{AttentionPool, KvPool};
+        let ((queries, width), keys) = (q.dims2()?, k.dim(0)?);
+        let (heads, dim) = (width / self.head_dim, self.head_dim);
+        let visible = u32::try_from(keys).map_err(|_| invalid("too many Whisper keys"))?;
+        let pool = AttentionPool {
+            key: KvPool {
+                data: k.reshape((keys, heads, dim))?,
+                scales: None,
+            },
+            value: KvPool {
+                data: v.reshape((keys, heads, dim))?,
+                scales: None,
+            },
+            format: tur_core::execution::KvFormat::F32,
+            page_tokens: keys,
+            kv_heads: heads,
+            head_dim: dim,
+        };
+        let kv =
+            self.kernels
+                .paged_kv(keys, keys, &[0], &vec![0; queries], &vec![visible; queries])?;
+        #[allow(clippy::cast_precision_loss, reason = "head widths are small")]
+        let scale = (dim as f64).powf(-0.5);
+        self.kernels
+            .attention_ungated(&q.reshape((queries, heads, dim))?, &pool, &kv, None, scale)
+    }
+}
 
 struct Norm {
     weight: Tensor,
@@ -82,6 +138,8 @@ pub struct Whisper {
     decoder_norm: Norm,
     device: Device,
     bytes: usize,
+    #[cfg(feature = "metal")]
+    fused: Option<FusedAttention>,
 }
 
 struct Loader<'a> {
@@ -246,6 +304,8 @@ impl Whisper {
         let bytes = t.bytes;
         Ok(Self {
             features: WhisperFeatures::new(config.num_mel_bins, device)?,
+            #[cfg(feature = "metal")]
+            fused: FusedAttention::new(&config, device)?,
             config,
             conv,
             encoder_positions,
@@ -315,6 +375,11 @@ impl Whisper {
         self.features.extract(samples)
     }
 
+    /// Host features of a whole clip, to window for long audio.
+    pub(crate) fn clip_features(&self, samples: &[f32]) -> Result<WhisperClip> {
+        self.features.clip(samples)
+    }
+
     /// The encoder's `[1500, d_model]` states for one window's features.
     pub fn encode(&self, features: &Tensor) -> Result<Tensor> {
         let mut x = features.unsqueeze(0)?;
@@ -333,27 +398,38 @@ impl Whisper {
         for layer in &self.encoder {
             let a = &layer.attention;
             let h = a.norm.forward(&x)?;
-            let (q, k, v) = (
-                self::heads(&a.q.forward(&h)?, heads)?,
-                self::heads(&a.k.forward(&h)?, heads)?,
-                self::heads(&a.v.forward(&h)?, heads)?,
-            );
-            let groups = (0..heads)
-                .step_by(HEAD_GROUP)
-                .map(|start| {
-                    let n = HEAD_GROUP.min(heads - start);
-                    attend(
-                        &q.narrow(0, start, n)?,
-                        &k.narrow(0, start, n)?,
-                        &v.narrow(0, start, n)?,
-                        None,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            x = (x + a.out.forward(&merge(&Tensor::cat(&groups, 0)?)?)?)?;
+            let attended = self.attend_whole(
+                &a.q.forward(&h)?,
+                &a.k.forward(&h)?,
+                &a.v.forward(&h)?,
+                heads,
+            )?;
+            x = (x + a.out.forward(&attended)?)?;
             x = (&x + Self::feed_forward(layer, &x)?)?;
         }
         self.encoder_norm.forward(&x)
+    }
+
+    /// `[queries, heads · dim]` attention over `[keys, heads · dim]` rows every query sees.
+    fn attend_whole(&self, q: &Tensor, k: &Tensor, v: &Tensor, count: usize) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if let Some(fused) = &self.fused {
+            return fused.attend(q, k, v);
+        }
+        let (q, k, v) = (heads(q, count)?, heads(k, count)?, heads(v, count)?);
+        let groups = (0..count)
+            .step_by(HEAD_GROUP)
+            .map(|start| {
+                let n = HEAD_GROUP.min(count - start);
+                attend(
+                    &q.narrow(0, start, n)?,
+                    &k.narrow(0, start, n)?,
+                    &v.narrow(0, start, n)?,
+                    None,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        merge(&Tensor::cat(&groups, 0)?)
     }
 
     fn feed_forward(layer: &Layer, x: &Tensor) -> Result<Tensor> {
@@ -365,7 +441,6 @@ impl Whisper {
     /// A decoding over one window's encoder states: cross-attention keys and values are
     /// projected once here, and self-attention keys and values accumulate per step.
     pub fn decoder(&self, encoded: &Tensor) -> Result<Decoder<'_>> {
-        let heads = self.config.decoder_attention_heads;
         let cross = self
             .decoder
             .iter()
@@ -374,10 +449,7 @@ impl Whisper {
                     .cross
                     .as_ref()
                     .ok_or_else(|| invalid("decoder layer without cross-attention"))?;
-                Ok((
-                    heads_of(&cross.k, encoded, heads)?,
-                    heads_of(&cross.v, encoded, heads)?,
-                ))
+                Ok((cross.k.forward(encoded)?, cross.v.forward(encoded)?))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Decoder {
@@ -396,6 +468,7 @@ fn heads_of(linear: &Linear, x: &Tensor, count: usize) -> Result<Tensor> {
 /// Incremental decoder state of one window.
 pub struct Decoder<'a> {
     model: &'a Whisper,
+    /// Each layer's cross-attention `[1500, heads · dim]` keys and values.
     cross: Vec<(Tensor, Tensor)>,
     cache: Vec<Option<(Tensor, Tensor)>>,
     position: usize,
@@ -445,12 +518,59 @@ impl Decoder<'_> {
                 .cross
                 .as_ref()
                 .ok_or_else(|| invalid("decoder layer without cross-attention"))?;
-            let q = self::heads(&cross.q.forward(&cross.norm.forward(&x)?)?, heads)?;
+            let q = cross.q.forward(&cross.norm.forward(&x)?)?;
             let (k, v) = &self.cross[i];
-            x = (&x + cross.out.forward(&merge(&attend(&q, k, v, None)?)?)?)?;
+            x = (&x + cross.out.forward(&model.attend_whole(&q, k, v, heads)?)?)?;
             x = (&x + Whisper::feed_forward(layer, &x)?)?;
         }
         self.position = end;
         model.embedding.forward(&model.decoder_norm.forward(&x)?)
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests assert numerics after fallible setup"
+)]
+mod tests {
+    use super::*;
+
+    fn rows(device: &Device, tokens: usize, width: usize, seed: f32) -> Result<Tensor> {
+        let values: Vec<f32> = (0..tokens * width)
+            .map(|i| ((i as f32).mul_add(0.37, seed)).sin())
+            .collect();
+        Ok(Tensor::from_vec(values, (tokens, width), device)?)
+    }
+
+    /// Candle's matmuls and softmax are the numerical reference for the fused kernels: the
+    /// tiled shape the encoder runs and the per-query shape of decoder cross-attention.
+    #[test]
+    fn test_fused_attention_matches_the_candle_reference() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let (heads, dim) = (4, 64);
+        let fused = FusedAttention {
+            kernels: tur_metal::kernels::Kernels::new(&device)?,
+            head_dim: dim,
+        };
+        for (queries, keys) in [(1500, 1500), (3, 1500), (1, 40)] {
+            let q = rows(&device, queries, heads * dim, 0.5)?;
+            let k = rows(&device, keys, heads * dim, 1.5)?;
+            let v = rows(&device, keys, heads * dim, 2.5)?;
+            let reference = merge(&attend(
+                &self::heads(&q, heads)?,
+                &self::heads(&k, heads)?,
+                &self::heads(&v, heads)?,
+                None,
+            )?)?;
+            let actual = fused.attend(&q, &k, &v)?;
+            assert_eq!(actual.dims(), reference.dims());
+            let error = (actual - &reference)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert!(error < 1e-3, "{queries}×{keys}: {error}");
+        }
+        Ok(())
     }
 }

@@ -9,6 +9,15 @@ use tur::{
 
 use crate::args::WhisperArgs;
 
+/// What `tur transcribe` writes.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum Format {
+    #[default]
+    Text,
+    Srt,
+    Vtt,
+}
+
 #[derive(Debug, Default, clap::Args)]
 pub(crate) struct Args {
     #[command(flatten)]
@@ -21,6 +30,9 @@ pub(crate) struct Args {
     /// Write an English translation instead of a transcript.
     #[arg(long)]
     translate: bool,
+    /// Output format; `srt` and `vtt` carry timestamps.
+    #[arg(long, value_enum, default_value_t)]
+    format: Format,
     /// Use the CPU numerical reference for development checks.
     #[arg(long)]
     cpu_reference: bool,
@@ -50,10 +62,15 @@ pub(crate) fn transcribe(args: &Args) -> Result<()> {
             } else {
                 Task::Transcribe
             },
+            timestamps: !matches!(args.format, Format::Text),
         },
     )?;
     let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "{}", result.text)?;
+    match args.format {
+        Format::Text => writeln!(stdout, "{}", result.text)?,
+        Format::Srt => write!(stdout, "{}", result.srt())?,
+        Format::Vtt => write!(stdout, "{}", result.vtt())?,
+    }
     let elapsed = started.elapsed();
     tracing::info!(
         audio_secs = audio.duration().as_secs_f64(),
