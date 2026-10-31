@@ -45,7 +45,7 @@ jobs:
           unpacked=$(mktemp -d)
           tar -xzf "dist/$ASSET.tar.gz" -C "$unpacked"
           cd "$unpacked"
-          test "$(./tur --version)" = "tur ${TAG#v}"
+          test "$(./tur --version)" = "tur-cli ${TAG#v}"
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}

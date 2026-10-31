@@ -29,6 +29,9 @@ fmt-check:
 test *args:
     cargo nextest run --workspace "$@"
 
+# What hosted CI runs: its paravirtual GPU needs the reduced nextest `ci` profile.
+ci-hosted: fmt-check lint check (test "--profile" "ci")
+
 # Checkpoint-dependent tests; set the selected model and golden environment variables.
 test-checkpoint *args:
     cargo nextest run --workspace --run-ignored only "$@"
