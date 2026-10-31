@@ -9,9 +9,17 @@ use std::{
 };
 
 use candle_core::Device;
-use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
+use hf_hub::{
+    HFClientSync, HFRepositorySync,
+    progress::{DownloadEvent, ProgressEvent, ProgressHandler},
+    repository::RepoTypeModel,
+};
+use parking_lot::Mutex;
 use tokenizers::Tokenizer;
-use tur_core::execution::KvLayout;
+use tur_core::{
+    execution::KvLayout,
+    progress::{BYTES, Stage},
+};
 
 use crate::{
     Result, TurError,
@@ -61,12 +69,7 @@ fn checkpoint_file(name: &str) -> Result<()> {
 impl ModelFactory {
     /// Resolve the source, rejecting unsupported architectures before downloading weights.
     pub fn resolve(&self) -> Result<PathBuf> {
-        resolve(
-            &self.source,
-            &self.revision,
-            |json| ModelConfig::from_json(json).map(drop),
-            &["tokenizer.json", "tokenizer_config.json"],
-        )
+        resolve_checkpoint(&self.source, &self.revision)
     }
 
     /// Load the text model and serving metadata. Missing or invalid templates are errors.
@@ -161,6 +164,17 @@ impl ModelFactory {
     }
 }
 
+/// Snapshot directory of a text checkpoint, for work that reads it without loading a model.
+/// Rejects unsupported architectures before downloading weights.
+pub fn resolve_checkpoint(source: &ModelSource, revision: &str) -> Result<PathBuf> {
+    resolve(
+        source,
+        revision,
+        |json| ModelConfig::from_json(json).map(drop),
+        &["tokenizer.json", "tokenizer_config.json"],
+    )
+}
+
 /// Resolve a drafter checkpoint for `--draft-model`: a local directory, or a repository
 /// at an immutable commit whose config names a Gemma 4 assistant. The target validates
 /// the drafter against itself when it loads it.
@@ -240,39 +254,96 @@ fn resolve(
             "remote --revision must be an immutable 40-character commit",
         ));
     }
-    if id.split('/').count() != 2 || id.split('/').any(str::is_empty) {
+    let (Some((owner, name)), 2) = (id.split_once('/'), id.split('/').count()) else {
+        return Err(hub_error(
+            "use a fully qualified Hugging Face repository (organization/model)",
+        ));
+    };
+    if owner.is_empty() || name.is_empty() {
         return Err(hub_error(
             "use a fully qualified Hugging Face repository (organization/model)",
         ));
     }
-    let api = ApiBuilder::from_env().build().map_err(hub_error)?;
-    let repo = api.repo(Repo::with_revision(
-        id.clone(),
-        RepoType::Model,
-        revision.to_owned(),
-    ));
-    let config_path = repo.get("config.json").map_err(hub_error)?;
+    let repo = HFClientSync::new().map_err(hub_error)?.model(owner, name);
+    let fetch = |name: &str| fetch(&repo, revision, name);
+    let config_path = fetch("config.json")?;
     validate(&std::fs::read_to_string(&config_path)?)?;
-    let info = repo.info().map_err(hub_error)?;
-    if info.sha != revision {
+    let info = repo.info().revision(revision).send().map_err(hub_error)?;
+    if info.sha.as_deref() != Some(revision) {
         return Err(hub_error(
             "repository returned a different checkpoint revision",
         ));
     }
     for name in required {
-        repo.get(name).map_err(hub_error)?;
+        fetch(name)?;
     }
-    for file in &info.siblings {
+    for file in info.siblings.iter().flatten() {
         let name = file.rfilename.as_str();
         if serving_file(name) {
             checkpoint_file(name)?;
-            repo.get(name).map_err(hub_error)?;
+            fetch(name)?;
         }
     }
     config_path
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| hub_error("checkpoint has no directory"))
+}
+
+/// The cached copy of `name`, or a download that reports its progress.
+fn fetch(repo: &HFRepositorySync<RepoTypeModel>, revision: &str, name: &str) -> Result<PathBuf> {
+    repo.download_file()
+        .filename(name)
+        .revision(revision)
+        .progress(Download {
+            name: name.to_owned(),
+            stage: Mutex::new(None),
+        })
+        .send()
+        .map_err(hub_error)
+}
+
+/// One file's download as a progress stage. Cached files never start one.
+struct Download {
+    name: String,
+    /// The stage and the bytes it has counted: the hub reports running totals.
+    stage: Mutex<Option<(Stage, u64)>>,
+}
+
+impl Download {
+    fn reached(&self, bytes: u64) {
+        if let Some((stage, counted)) = self.stage.lock().as_mut() {
+            stage.advance(bytes.saturating_sub(*counted));
+            *counted = bytes.max(*counted);
+        }
+    }
+}
+
+impl ProgressHandler for Download {
+    fn on_progress(&self, event: &ProgressEvent) {
+        let ProgressEvent::Download(event) = event else {
+            return;
+        };
+        match event {
+            DownloadEvent::Start { total_bytes, .. } => {
+                let name = format!("Downloading {}", self.name);
+                *self.stage.lock() = Some((Stage::begin(name, *total_bytes, BYTES), 0));
+            }
+            DownloadEvent::Progress { files } => {
+                for file in files {
+                    self.reached(file.bytes_completed);
+                }
+            }
+            DownloadEvent::AggregateProgress {
+                bytes_completed, ..
+            } => self.reached(*bytes_completed),
+            DownloadEvent::Complete => {
+                if let Some((stage, _)) = self.stage.lock().take() {
+                    stage.finish();
+                }
+            }
+        }
+    }
 }
 
 /// Files a load needs from a repository. Repositories may keep other copies of the weights

@@ -262,11 +262,21 @@ async fn test_health_readiness_metrics_and_revision_report_a_serving_worker() ->
     let (_, text) = get(&router, "/diagnostics").await?;
     assert!(!text.contains(PROMPT), "diagnostics exposed a prompt");
     let diagnostics: Value = serde_json::from_str(&text)?;
+    assert_eq!(
+        diagnostics["pid"].as_u64(),
+        Some(u64::from(std::process::id()))
+    );
     let model = &diagnostics["models"]["tiny"];
     assert_eq!(model["checkpoint"]["revision"], "tiny-adapter-fixture-v1");
     assert_eq!(model["checkpoint"]["source"], "local");
     assert!(model["checkpoint"]["memory_plan"]["resident_bytes"].as_u64() > Some(0));
     assert!(model["activity"]["pool"]["kv_pages"]["capacity"].as_u64() > Some(0));
+    let latency = &model["activity"]["latency"]["request_seconds"];
+    assert!(latency["count"].as_u64() > Some(0));
+    assert_eq!(
+        latency["bounds"].as_array().map(Vec::len),
+        latency["buckets"].as_array().map(Vec::len)
+    );
 
     // Draining fails readiness and new work, but not liveness or read-only endpoints.
     status.begin_drain();

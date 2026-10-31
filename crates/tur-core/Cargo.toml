@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 candle-core.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 

@@ -57,6 +57,16 @@ impl Histogram {
         }
     }
 
+    /// Cumulative buckets beside their upper bounds in seconds, for `/diagnostics`.
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "bounds": LATENCY_BOUNDS,
+            "buckets": self.buckets,
+            "count": self.count,
+            "sum": self.sum,
+        })
+    }
+
     fn render(&self, out: &mut String, name: &str, labels: &str) -> fmt::Result {
         for (bound, bucket) in LATENCY_BOUNDS.iter().zip(&self.buckets) {
             writeln!(out, "{name}_bucket{{{labels},le=\"{bound}\"}} {bucket}")?;

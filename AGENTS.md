@@ -18,7 +18,7 @@ crates/
     tests/integration/   every crate's integration tests, one binary
     tests/fixtures/      pinned configs, templates, tensor headers, golden outputs
     benches/perf/        every benchmark and measurement tool, one binary
-  tur-cli/     the `tur` binary: run, serve, quantize
+  tur-cli/     the `tur` binary: run, serve, status, top, stop, transcribe, quantize, prune
 docs/                    mdBook (`just docs`): guide, architecture with decisions, development, design
 scripts/                 Python generators for golden references and fixtures
 ```
@@ -37,6 +37,7 @@ just test             # offline nextest suite (~30 s); `just test -E 'test(prefi
 just ci               # fmt-check + lint + check + test: run before declaring work done
 just run --prompt 'Hello' -n 64          # pinned 0.8B checkpoint unless TUR_MODEL/TUR_REVISION
 just serve --listen 127.0.0.1:8080
+just status           # one reading of a running server; `just top` watches it
 just bench <case>     # kernels | model | serving | prefix | kv_quality | tensorops | whisper | load_weights
 just test-checkpoint  # ignored real-checkpoint tests; needs TUR_QWEN35_0_8B and golden files
 ```

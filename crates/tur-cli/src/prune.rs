@@ -1,10 +1,11 @@
 //! Measure which experts calibration text routes to and write a smaller checkpoint without
 //! the rest. The source stays read-only and is read through the bounded expert cache.
-use crate::quantize::encode_samples;
+use crate::{args::checkpoint_dir, quantize::encode_samples, ui::Console};
 use candle_core::DType;
 use std::{io::Write, path::PathBuf};
 use tur::{
     Result, TurError,
+    core::progress::Stage,
     models::{
         DEFAULT_KV_LAYOUT, Execution, LoadOptions, WeightFormat,
         gpt_oss::{GptOss, Pruning, divergence, plan_pruning, prune, refine},
@@ -13,7 +14,8 @@ use tur::{
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct Args {
-    /// Source gpt-oss `SafeTensors` checkpoint directory.
+    /// Source gpt-oss `SafeTensors` checkpoint: a local directory, or a Hugging Face repository
+    /// at `--revision`.
     #[arg(long)]
     model: PathBuf,
     /// Exact identity of the source checkpoint, recorded in the output.
@@ -47,9 +49,17 @@ pub(crate) struct Args {
     /// Device memory for experts while measuring.
     #[arg(long, default_value_t = 2_048)]
     expert_cache_mb: usize,
+    /// Print the outcome as JSON on stdout.
+    #[arg(long)]
+    json: bool,
 }
 
-pub(crate) fn run(args: &Args) -> Result<()> {
+pub(crate) fn run(args: &mut Args, console: &Console) -> Result<()> {
+    args.model = checkpoint_dir(&args.model, &args.revision)?;
+    let expert_cache = args
+        .expert_cache_mb
+        .checked_mul(1 << 20)
+        .ok_or_else(|| TurError::Other("expert cache size overflow".into()))?;
     let samples = encode_samples(
         &args.model,
         &args.calibration,
@@ -70,17 +80,29 @@ pub(crate) fn run(args: &Args) -> Result<()> {
             recurrent: DType::F32,
             mtp: None,
             audio: false,
-            expert_cache: Some(args.expert_cache_mb << 20),
+            expert_cache: Some(expert_cache),
         },
     )?;
     let probe = model.expert_probe(&samples)?;
+    let planning = Stage::begin("Planning which experts to keep", 0, "");
     let mut plans = plan_pruning(&probe, args.keep)?;
+    planning.finish();
     drop(probe);
     let judged = &samples[..args.search_samples.min(samples.len())];
+    let mut measuring = Stage::begin(
+        "Recording reference outputs",
+        judged.len() as u64,
+        "samples",
+    );
     let reference = judged
         .iter()
-        .map(|s| model.log_probs(s))
+        .map(|s| {
+            let probs = model.log_probs(s);
+            measuring.advance(1);
+            probs
+        })
         .collect::<Result<Vec<_>>>()?;
+    measuring.finish();
     let (local, searched) = refine(&mut plans, args.search_evaluations, |kept| {
         model.hide_experts(Some(kept))?;
         let candidate = judged
@@ -111,17 +133,29 @@ pub(crate) fn run(args: &Args) -> Result<()> {
         Some(path) => std::fs::write(path, serde_json::to_string_pretty(&pruning)?)?,
         None => prune(&args.model, &args.output, &pruning)?,
     }
-    writeln!(
-        std::io::stdout(),
-        "{}",
-        serde_json::json!({
-            "output": args.plan_only.as_ref().unwrap_or(&args.output),
-            "samples": samples.len(),
-            "tokens": samples.iter().map(Vec::len).sum::<usize>(),
-            "kept_per_layer": args.keep,
-            "calibration_kl_local": local,
-            "calibration_kl_searched": searched,
-        })
-    )?;
+    let output = args.plan_only.as_ref().unwrap_or(&args.output);
+    if args.json {
+        writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::json!({
+                "output": output,
+                "samples": samples.len(),
+                "tokens": samples.iter().map(Vec::len).sum::<usize>(),
+                "kept_per_layer": args.keep,
+                "calibration_kl_local": local,
+                "calibration_kl_searched": searched,
+            })
+        )?;
+    }
+    console.line(&format!(
+        "  {} wrote {}",
+        console.paint("32", "✓"),
+        output.display()
+    ));
+    console.rows(&[
+        ("Kept", format!("{} experts per layer", args.keep)),
+        ("Calibration KL", format!("{local:.4} → {searched:.4} nats")),
+    ]);
     Ok(())
 }

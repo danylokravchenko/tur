@@ -173,7 +173,7 @@ Counters and gauges in Prometheus text format. The ones you'll usually want:
 
 ### `GET /diagnostics`
 
-One JSON document for a person debugging the server: version, uptime and system memory, then for each model its revision, weight and K/V formats, context limit, the whole memory plan, scheduler limits, device capabilities and kernel tuning, pool occupancy, and sampling, prefix and speculation counters. `context` reads:
+One JSON document for a person debugging the server: version, process ID, uptime and system memory, then for each model its revision, weight and K/V formats, context limit, the whole memory plan, scheduler limits, device capabilities and kernel tuning, pool occupancy, latency histograms, and sampling, prefix and speculation counters. `tur status` and `tur top` are built on it. `context` reads:
 
 ```json
 {"limit_tokens": 8192, "full_contexts": 4, "sized_for_tokens": 8192, "max_running": 4}

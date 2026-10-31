@@ -13,7 +13,7 @@ use std::{
     io::{BufWriter, Seek, Write},
     path::{Path, PathBuf},
 };
-use tur_core::{Result, execution::invalid};
+use tur_core::{Result, execution::invalid, progress::Stage};
 
 /// File name of the weights inside an artifact directory.
 pub const ARTIFACT_FILE: &str = "tur-weights.safetensors";
@@ -409,14 +409,18 @@ pub(crate) fn write(
 ) -> Result<Manifest> {
     plan.validate(config)?;
     let mut writer = Writer::create(conversion.source, conversion.output)?;
-    for projection in config.projection_layout()? {
+    let projections = config.projection_layout()?;
+    let mut packing = Stage::begin("Packing projections", projections.len() as u64, "tensors");
+    for projection in projections {
         packer.write(
             checkpoint,
             &projection,
             plan.precision(&projection.name)?,
             &mut writer,
         )?;
+        packing.advance(1);
     }
+    packing.finish();
     finish(conversion, config, plan, packer, checkpoint, writer)
 }
 
@@ -436,6 +440,13 @@ pub(crate) fn finish(
         .flat_map(|p| p.parts.into_iter().map(|(name, _)| name))
         .collect();
     let embedding = config.embedding_tensor();
+    let shapes = config.tensor_shapes()?;
+    let companions = config.companions(plan)?;
+    let mut copying = Stage::begin(
+        "Writing remaining tensors",
+        (shapes.len() + companions.len()) as u64,
+        "tensors",
+    );
     if let Embedding::Table(precision) = plan.embedding {
         let table = Projection {
             name: embedding.clone(),
@@ -455,7 +466,8 @@ pub(crate) fn finish(
             Packer::RTN.write(checkpoint, &table, precision, &mut writer)?;
         }
     }
-    for (name, shape) in config.tensor_shapes()? {
+    for (name, shape) in shapes {
+        copying.advance(1);
         if parts.contains(&name) || name == embedding {
             continue;
         }
@@ -472,8 +484,8 @@ pub(crate) fn finish(
             writer.put(&name, entry.dtype, entry.shape, &bytes)?;
         }
     }
-    let companions = config.companions(plan)?;
     for (name, companion) in &companions {
+        copying.advance(1);
         if let (Some(precision), &[rows, cols]) = (companion.packed, companion.shape.as_slice()) {
             let projection = Projection::new(name.clone(), vec![(name.clone(), rows)], cols);
             Packer::RTN.write(checkpoint, &projection, precision, &mut writer)?;
@@ -502,6 +514,7 @@ pub(crate) fn finish(
         audio: !companions.is_empty(),
     };
     writer.finish(&manifest, config)?;
+    copying.finish();
     Ok(manifest)
 }
 

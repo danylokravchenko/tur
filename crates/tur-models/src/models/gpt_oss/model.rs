@@ -19,6 +19,7 @@ use crate::{
 };
 use candle_core::{DType, Device, Tensor};
 use std::{path::Path, sync::Arc};
+use tur_core::progress::Stage;
 use tur_core::{
     Result,
     execution::{ModelDescription, checked_elements, invalid},
@@ -429,9 +430,15 @@ impl GptOss {
                 .collect(),
             device: device.clone(),
         };
+        let mut loading = Stage::begin("Loading weights", config.layers() as u64, "layers");
         let layers = (0..config.layers())
-            .map(|i| Layer::load(&tensors, i, placement))
+            .map(|i| {
+                let layer = Layer::load(&tensors, i, placement);
+                loading.advance(1);
+                layer
+            })
             .collect::<Result<Vec<_>>>()?;
+        loading.finish();
         #[cfg(feature = "metal")]
         let cache = options
             .expert_cache
@@ -878,13 +885,19 @@ impl GptOss {
             top_k: t.num_experts_per_tok,
             layers: vec![LayerProbe::default(); self.layers.len()],
         });
+        let mut stage = Stage::begin("Probing experts", samples.len() as u64, "samples");
         let result = samples.iter().try_for_each(|sample| {
             let last = sample
                 .len()
                 .checked_sub(1)
                 .ok_or_else(|| invalid("empty calibration sample"))?;
-            self.trace(sample, &[last]).map(drop)
+            self.trace(sample, &[last]).map(drop)?;
+            stage.advance(1);
+            Ok::<(), tur_core::TurError>(())
         });
+        if result.is_ok() {
+            stage.finish();
+        }
         let probe = self
             .probe
             .lock()

@@ -9,6 +9,7 @@ use tur::models::{
 use tur::{
     Result, TurError,
     core::execution::{KvFormat, KvLayout},
+    core::progress::Stage,
     models::{
         Conversion, gemma4,
         qwen3_5::{
@@ -19,9 +20,15 @@ use tur::{
     quantization::Calibration,
 };
 
+use crate::{
+    args::checkpoint_dir,
+    ui::{Console, bytes, seconds},
+};
+
 #[derive(Debug, clap::Args)]
 pub(crate) struct Args {
-    /// Source `SafeTensors` checkpoint directory.
+    /// Source `SafeTensors` checkpoint: a local directory, or a Hugging Face repository at
+    /// `--revision`.
     #[arg(long)]
     model: PathBuf,
     /// Exact identity of the source checkpoint, recorded in the artifact.
@@ -62,6 +69,9 @@ pub(crate) struct Args {
     /// Write calibration, sensitivity and plan details as JSON here.
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Print those details as JSON on stdout.
+    #[arg(long)]
+    json: bool,
 }
 
 fn samples(args: &Args) -> Result<Vec<Vec<u32>>> {
@@ -83,6 +93,7 @@ pub(crate) fn encode_samples(
 ) -> Result<Vec<Vec<u32>>> {
     let tokenizer = tokenizers::Tokenizer::from_file(model.join("tokenizer.json"))
         .map_err(|e| TurError::Tokenizer(e.to_string()))?;
+    let stage = Stage::begin("Tokenizing calibration text", 0, "");
     let mut samples = Vec::new();
     let mut budget = tokens;
     for path in paths {
@@ -92,6 +103,7 @@ pub(crate) fn encode_samples(
             .map_err(|e| TurError::Tokenizer(e.to_string()))?;
         for sample in ids.get_ids().chunks(sample_tokens.max(1)) {
             if budget == 0 {
+                stage.finish();
                 return Ok(samples);
             }
             let sample = &sample[..sample.len().min(budget)];
@@ -99,15 +111,58 @@ pub(crate) fn encode_samples(
             samples.push(sample.to_vec());
         }
     }
+    stage.finish();
     Ok(samples)
 }
 
-pub(crate) fn quantize(args: &Args) -> Result<()> {
-    if let ModelConfig::Gemma4(config) =
+pub(crate) fn quantize(args: &mut Args, console: &Console) -> Result<()> {
+    args.model = checkpoint_dir(&args.model, &args.revision)?;
+    let report = if let ModelConfig::Gemma4(config) =
         ModelConfig::from_json(&std::fs::read_to_string(args.model.join("config.json"))?)?
     {
-        return quantize_gemma(args, &config);
+        quantize_gemma(args, &config)?
+    } else {
+        quantize_qwen(args)?
+    };
+    present(args, console, &report)
+}
+
+/// Deliver the report where it was asked for, and summarize it for whoever is watching.
+fn present(args: &Args, console: &Console, report: &serde_json::Value) -> Result<()> {
+    let text = serde_json::to_string_pretty(report)?;
+    if let Some(path) = &args.report {
+        std::fs::write(path, &text)?;
     }
+    if args.json {
+        writeln!(std::io::stdout(), "{text}")?;
+    }
+    console.line(&format!(
+        "  {} wrote {}",
+        console.paint("32", "✓"),
+        args.output.display()
+    ));
+    console.rows(&[
+        (
+            "Method",
+            format!(
+                "{} · {}",
+                report["method"].as_str().unwrap_or("-"),
+                Precision::from(args.weight_format).name()
+            ),
+        ),
+        (
+            "Weights",
+            bytes(report["plan_bytes"].as_f64().unwrap_or(0.0)),
+        ),
+        (
+            "Took",
+            seconds(report["total_seconds"].as_f64().unwrap_or(0.0)),
+        ),
+    ]);
+    Ok(())
+}
+
+fn quantize_qwen(args: &Args) -> Result<serde_json::Value> {
     let config = artifact_config(&args.model)?;
     let embedding = match args.embedding.as_deref() {
         None if config.tied_embeddings() => Embedding::Head,
@@ -169,17 +224,12 @@ pub(crate) fn quantize(args: &Args) -> Result<()> {
     report["packing_seconds"] = packing.elapsed().as_secs_f64().into();
     report["total_seconds"] = started.elapsed().as_secs_f64().into();
     report["manifest"] = serde_json::to_value(&manifest)?;
-    let text = serde_json::to_string_pretty(&report)?;
-    match &args.report {
-        Some(path) => std::fs::write(path, text)?,
-        None => writeln!(std::io::stdout(), "{text}")?,
-    }
-    Ok(())
+    Ok(report)
 }
 
 /// Round-to-nearest Gemma 4 artifact; calibrated rounding and byte budgets need the
 /// Qwen-only layer-streaming calibration.
-fn quantize_gemma(args: &Args, config: &gemma4::Config) -> Result<()> {
+fn quantize_gemma(args: &Args, config: &gemma4::Config) -> Result<serde_json::Value> {
     if args.method != Method::Rtn || args.budget_bits.is_some() || !args.calibration.is_empty() {
         return Err(TurError::Other(
             "Gemma 4 artifacts support --method rtn without --budget-bits or --calibration".into(),
@@ -207,18 +257,12 @@ fn quantize_gemma(args: &Args, config: &gemma4::Config) -> Result<()> {
         &plan,
         &Packer::RTN,
     )?;
-    let report = serde_json::json!({
+    Ok(serde_json::json!({
         "source": args.revision, "method": args.method,
         "plan_bytes": plan.bytes(config)?,
         "total_seconds": started.elapsed().as_secs_f64(),
         "manifest": manifest,
-    });
-    let text = serde_json::to_string_pretty(&report)?;
-    match &args.report {
-        Some(path) => std::fs::write(path, text)?,
-        None => writeln!(std::io::stdout(), "{text}")?,
-    }
-    Ok(())
+    }))
 }
 
 fn mixed_plan(

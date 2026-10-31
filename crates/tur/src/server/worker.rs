@@ -192,11 +192,12 @@ fn model_report(factory: &ModelFactory, pipeline: &InferencePipeline) -> ModelRe
             ModelSource::LocalPath(_) => "local".into(),
         },
         revision: factory.revision.clone(),
-        weight_format: factory
-            .format
-            .map_or_else(|| "as stored".into(), |format| format!("{format:?}")),
-        kv: format!("{:?}", factory.kv),
-        recurrent_state: format!("{:?}", factory.recurrent),
+        weight_format: factory.format.map_or_else(
+            || "as stored".into(),
+            |format| format!("{format:?}").to_lowercase(),
+        ),
+        kv: format!("{}/{}", factory.kv.format, factory.kv.page_tokens),
+        recurrent_state: format!("{:?}", factory.recurrent).to_lowercase(),
         max_position: model.max_position(),
         vocab_size: pipeline.vocab_size(),
         plan: *pipeline.memory_plan(),

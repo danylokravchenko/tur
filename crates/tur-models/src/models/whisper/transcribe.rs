@@ -13,7 +13,7 @@ use crate::{
 use candle_core::{Device, Tensor};
 use std::path::Path;
 use tokenizers::Tokenizer;
-use tur_core::{Result, TurError, execution::invalid};
+use tur_core::{Result, TurError, execution::invalid, progress::Stage};
 
 /// What the decoder writes: the spoken language, or an English translation of it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -183,8 +183,11 @@ impl Transcriber {
                 "tokenizer IDs exceed the Whisper vocabulary".into(),
             ));
         }
+        let loading = Stage::begin("Loading Whisper", 0, "");
+        let model = Whisper::load(dir, format, device)?;
+        loading.finish();
         Ok(Self {
-            model: Whisper::load(dir, format, device)?,
+            model,
             tokenizer,
             generation,
         })
@@ -239,8 +242,10 @@ impl Transcriber {
             padded.resize(WHISPER_WINDOW, 0.0);
             self.seek_through(&padded, &plan, &mut progress)?;
         } else if !plan.fallback.is_quiet(samples) {
+            let decoding = Stage::begin("Transcribing", 0, "");
             let encoded = self.model.encode(&self.model.features(samples)?)?;
             let decoded = self.decode_window(&encoded, 0, &plan, &mut progress)?;
+            decoding.finish();
             progress.tokens += decoded.tokens.len();
             progress.windows += 1;
             progress.text.push_str(&self.decode_text(&decoded.tokens)?);
@@ -264,7 +269,14 @@ impl Transcriber {
         progress: &mut Progress,
     ) -> Result<()> {
         let features = self.model.clip_features(samples)?;
+        // Audio seconds, not windows: a window advances only as far as its last closed segment.
+        let mut stage = Stage::begin(
+            "Transcribing",
+            (features.frames() * HOP / crate::audio::SAMPLE_RATE as usize) as u64,
+            "audio seconds",
+        );
         let mut seek = 0;
+        let mut seconds = 0;
         while seek < features.frames() {
             let frames = (features.frames() - seek).min(WHISPER_FRAMES);
             if plan
@@ -277,7 +289,11 @@ impl Transcriber {
             }
             let window = features.window(seek, frames, self.model.device())?;
             seek += self.timed_window(&window, (seek, frames), plan, progress)?;
+            let reached = seek.min(features.frames()) * HOP / crate::audio::SAMPLE_RATE as usize;
+            stage.advance((reached - seconds) as u64);
+            seconds = reached;
         }
+        stage.finish();
         Ok(())
     }
 

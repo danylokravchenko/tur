@@ -93,7 +93,7 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 /// Forward each SIGINT and SIGTERM until the receiver goes away.
-fn forward_signals(tx: mpsc::Sender<()>) -> crate::Result<()> {
+pub fn forward_signals(tx: mpsc::Sender<()>) -> crate::Result<()> {
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     tokio::spawn(async move {

@@ -7,7 +7,7 @@ use crate::models::{Embedding, Method, Packer, Precision, WeightPlan};
 use candle_core::{D, Device, Tensor};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
-use tur_core::{Result, execution::invalid};
+use tur_core::{Result, execution::invalid, progress::Stage};
 
 /// The source config with its MTP head when the checkpoint has one, so an artifact can
 /// serve speculative decoding too.
@@ -52,6 +52,11 @@ pub fn write_calibrated_artifact(
     let checkpoint = config.open_checkpoint(conversion.source)?;
     let mut writer = Writer::create(conversion.source, conversion.output)?;
     let projections = config.projections()?;
+    let mut packing = Stage::begin(
+        "Calibrating and packing",
+        projections.len() as u64,
+        "tensors",
+    );
     let info = calibrate_layers(
         conversion.source,
         &config,
@@ -74,6 +79,7 @@ pub fn write_calibrated_artifact(
                     plan.precision(&projection.name)?,
                     &mut writer,
                 )?;
+                packing.advance(1);
             }
             Ok(())
         },
@@ -85,7 +91,9 @@ pub fn write_calibrated_artifact(
             plan.precision(&projection.name)?,
             &mut writer,
         )?;
+        packing.advance(1);
     }
+    packing.finish();
     let packer = Packer {
         calibration: Some(&info),
         ..*packer
@@ -151,10 +159,16 @@ pub fn sensitivities(
     packer: &Packer<'_>,
     mut progress: impl FnMut(&Sensitivity),
 ) -> Result<Vec<Sensitivity>> {
-    let projections = model.config().projections()?;
-    let mut measured = Vec::new();
+    let mut projections = model.config().projections()?;
     // Teacher-forced passes never run an MTP head.
-    for projection in projections.iter().filter(|p| !p.name.starts_with("mtp.")) {
+    projections.retain(|p| !p.name.starts_with("mtp."));
+    let mut stage = Stage::begin(
+        "Measuring sensitivity",
+        (projections.len() * precisions.len()) as u64,
+        "variants",
+    );
+    let mut measured = Vec::new();
+    for projection in &projections {
         let values = model
             .projection(&projection.name)?
             .dequantize()?
@@ -180,9 +194,11 @@ pub fn sensitivities(
                 bytes: precision.bytes(projection.rows, projection.cols)?,
             };
             progress(&sensitivity);
+            stage.advance(1);
             measured.push(sensitivity);
         }
     }
+    stage.finish();
     Ok(measured)
 }
 

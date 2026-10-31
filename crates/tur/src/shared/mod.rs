@@ -4,17 +4,28 @@ use tracing_subscriber::{
 };
 pub use tur_core::errors;
 
-/// Initialize stderr logging, returning invalid setup or duplicate-subscriber errors.
-pub fn init_tracing() -> Result<()> {
-    let mut env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    for directive in ["ureq=error", "tokenizers=error", "rustls=error"] {
-        env_filter = env_filter.add_directive(
+/// `RUST_LOG`, or `default` without it, minus chatty dependencies and the progress events
+/// that are data for a front end rather than log lines.
+pub fn log_filter(default: &str) -> Result<EnvFilter> {
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
+    for directive in [
+        "ureq=error",
+        "tokenizers=error",
+        "rustls=error",
+        "tur_progress=off",
+    ] {
+        filter = filter.add_directive(
             directive
                 .parse()
                 .map_err(|error| TurError::Other(format!("Invalid logging directive: {error}")))?,
         );
     }
+    Ok(filter)
+}
+
+/// Initialize stderr logging, returning invalid setup or duplicate-subscriber errors.
+pub fn init_tracing() -> Result<()> {
+    let env_filter = log_filter("info")?;
     let console_layer = tracing_subscriber::fmt::layer()
         .compact()
         .with_writer(std::io::stderr)

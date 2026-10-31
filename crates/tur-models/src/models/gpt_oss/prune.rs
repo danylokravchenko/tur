@@ -9,7 +9,11 @@ use std::{
     os::unix::fs::FileExt,
     path::Path,
 };
-use tur_core::{Result, execution::invalid};
+use tur_core::{
+    Result,
+    execution::invalid,
+    progress::{BYTES, Stage},
+};
 
 /// Serving files carried over from the source checkpoint.
 const COPIED: [&str; 5] = [
@@ -230,7 +234,13 @@ pub fn refine(
             })
             .collect()
     };
+    let mut stage = Stage::begin(
+        "Searching expert swaps",
+        evaluations as u64 + 1,
+        "evaluations",
+    );
     let first = measure(&kept_sets(plans))?;
+    stage.advance(1);
     let mut best = first;
     let layers = plans.len().max(1);
     for evaluation in 0..evaluations {
@@ -247,7 +257,9 @@ pub fn refine(
             let plan = &mut plans[layer];
             std::mem::swap(&mut plan.kept[rank], &mut plan.dropped[rank]);
         }
+        stage.advance(1);
     }
+    stage.finish();
     Ok((first, best))
 }
 
@@ -373,6 +385,7 @@ pub fn prune(source: &Path, output: &Path, pruning: &Pruning) -> Result<()> {
         out.write_all(&(header.len() as u64).to_le_bytes())?;
         out.write_all(&header)?;
         let mut buffer = vec![0u8; CHUNK];
+        let mut writing = Stage::begin("Writing checkpoint", offset as u64, BYTES);
         for tensor in &planned {
             for &(file, start, size) in &tensor.ranges {
                 let handle = files
@@ -384,10 +397,12 @@ pub fn prune(source: &Path, output: &Path, pruning: &Pruning) -> Result<()> {
                     handle.read_exact_at(&mut buffer[..step], start + done as u64)?;
                     out.write_all(&buffer[..step])?;
                     done += step;
+                    writing.advance(step as u64);
                 }
             }
         }
         out.flush()?;
+        writing.finish();
     }
     for name in COPIED {
         if source.join(name).is_file() {

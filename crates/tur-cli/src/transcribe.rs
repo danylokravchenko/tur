@@ -7,7 +7,10 @@ use tur::{
     models::whisper::{Fallback, Task, TranscribeOptions},
 };
 
-use crate::args::WhisperArgs;
+use crate::{
+    args::WhisperArgs,
+    ui::{Console, seconds},
+};
 
 /// What `tur transcribe` writes.
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -55,7 +58,7 @@ impl Args {
     }
 }
 
-pub(crate) fn transcribe(args: &Args) -> Result<()> {
+pub(crate) fn transcribe(args: &Args, console: &Console) -> Result<()> {
     let device = tur::shared::inference_device(args.cpu_reference)?;
     let factory = args
         .whisper
@@ -108,5 +111,17 @@ pub(crate) fn transcribe(args: &Args) -> Result<()> {
         tokens = result.tokens,
         "Transcribed"
     );
+    if console.interactive() {
+        console.line(&console.paint(
+            "2",
+            &format!(
+                "  {} of {} audio in {} · {} tokens",
+                result.language.as_deref().unwrap_or("-"),
+                seconds(audio.duration().as_secs_f64()),
+                seconds(elapsed.as_secs_f64()),
+                result.tokens,
+            ),
+        ));
+    }
     Ok(())
 }

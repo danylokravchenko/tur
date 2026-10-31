@@ -1,10 +1,19 @@
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{net::TcpListener, sync::mpsc};
 
 use tur::{
     Result, TurError,
     backend::{memory::DeviceBudget, pipeline::PipelineConfig},
     server::{
-        AppState, ServerStatus, run_server,
+        AppState, ServerStatus, forward_signals, serve_until,
         transcription::{TranscriptionConfig, TranscriptionWorker},
         worker::{PipelineWorker, StreamConfig, WorkerConfig},
     },
@@ -13,6 +22,8 @@ use tur::{
 use crate::{
     args::{ModelArgs, PipelineArgs, WhisperArgs},
     config::inherit,
+    monitor,
+    ui::Console,
 };
 
 #[derive(Debug, Default, serde::Deserialize, clap::Args)]
@@ -62,6 +73,10 @@ pub(crate) struct Args {
     /// ends the wait (default: 30).
     #[arg(long)]
     shutdown_timeout_secs: Option<u64>,
+    /// Show the live dashboard in this terminal once serving; logs move into it (default: true
+    /// in a terminal). `q` closes it and the server keeps running.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    dashboard: Option<bool>,
     #[arg(skip)]
     stream_channel_capacity: Option<usize>,
     #[arg(skip)]
@@ -80,6 +95,7 @@ impl Args {
         request_timeout_secs,
         prefix_snapshots,
         shutdown_timeout_secs,
+        dashboard,
         stream_channel_capacity,
         stream_max_buffered_bytes
     );
@@ -89,6 +105,12 @@ impl Args {
         self.pipeline.inherit(settings.engine);
         self.whisper.inherit(settings.whisper);
         self.inherit(settings.server);
+    }
+
+    /// Where the listener binds.
+    pub(crate) fn listen_address(&self) -> SocketAddr {
+        self.listen
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080)))
     }
 
     fn pipeline_config(&self) -> Result<PipelineConfig> {
@@ -126,10 +148,11 @@ impl Args {
     }
 }
 
-pub(crate) async fn serve(mut args: Args) -> Result<()> {
+pub(crate) async fn serve(mut args: Args, console: Console) -> Result<()> {
     if args.model.caches_experts() {
         args.pipeline.prefer_large_passes();
     }
+    let address = args.listen_address();
     let stream = args.stream_config()?;
     let pipeline = args.pipeline_config()?;
     let default_model = args
@@ -168,7 +191,13 @@ pub(crate) async fn serve(mut args: Args) -> Result<()> {
         stream,
     })?;
     let workers = HashMap::from([(default_model.clone(), worker)]);
-    run_server(
+    let watch = Watch {
+        console,
+        address,
+        dashboard: args.dashboard.unwrap_or(true),
+        drain_seconds: args.shutdown_timeout_secs.unwrap_or(30),
+    };
+    serve_watched(
         AppState {
             workers,
             transcribers,
@@ -176,11 +205,52 @@ pub(crate) async fn serve(mut args: Args) -> Result<()> {
             default_model,
             status: ServerStatus::shared(),
         },
-        args.listen
-            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080))),
-        Duration::from_secs(args.shutdown_timeout_secs.unwrap_or(30)),
+        watch,
     )
     .await
+}
+
+/// How a running server is presented and stopped.
+struct Watch {
+    console: Console,
+    address: SocketAddr,
+    dashboard: bool,
+    drain_seconds: u64,
+}
+
+/// Open the listener and serve, with the display on a thread of its own: it blocks on the
+/// terminal, and its failures must never reach the server.
+async fn serve_watched(state: AppState, watch: Watch) -> Result<()> {
+    let address = watch.address;
+    let listener = TcpListener::bind(address)
+        .await
+        .map_err(|error| TurError::Other(format!("cannot bind {address}: {error}")))?;
+    tracing::info!("Listening on http://{address}");
+    // Beside the signals, a dashboard holds raw-mode Ctrl-C and asks for a drain through this.
+    let (drain, signals) = mpsc::channel(2);
+    forward_signals(drain.clone())?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let attachment = monitor::Attachment {
+        console: watch.console,
+        server: monitor::Server::listening_on(address),
+        dashboard: watch.dashboard,
+        drain_seconds: watch.drain_seconds,
+        drain,
+        stop: Arc::clone(&stop),
+    };
+    let display = tokio::task::spawn_blocking(move || monitor::attach(&attachment));
+    let served = serve_until(
+        state,
+        listener,
+        signals,
+        Duration::from_secs(watch.drain_seconds),
+    )
+    .await;
+    stop.store(true, Ordering::Relaxed);
+    if let Err(error) = display.await {
+        tracing::warn!("server display failed: {error}");
+    }
+    served
 }
 
 #[cfg(test)]
@@ -194,7 +264,7 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Result<Args> {
         match parse_cli(values)?.command {
-            Command::Serve(args) => Ok(args),
+            Some(Command::Serve(args)) => Ok(args),
             _ => Err(TurError::Other("expected serve arguments".into())),
         }
     }

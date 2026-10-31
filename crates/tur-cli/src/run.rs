@@ -13,6 +13,7 @@ use tur::{
 use crate::{
     args::{ModelArgs, PipelineArgs},
     config::inherit,
+    ui::{Console, seconds},
 };
 
 #[derive(Debug, Default, serde::Deserialize, clap::Args)]
@@ -118,7 +119,7 @@ impl Args {
     }
 }
 
-pub(crate) fn run(mut args: Args) -> Result<()> {
+pub(crate) fn run(mut args: Args, console: &Console) -> Result<()> {
     if args.model.caches_experts() {
         args.pipeline.prefer_large_passes();
     }
@@ -130,8 +131,6 @@ pub(crate) fn run(mut args: Args) -> Result<()> {
     let request = args.request()?;
     let mut stdout = std::io::stdout().lock();
     let mut output_error = None;
-    // Reasoning goes to stderr so that stdout holds only the answer.
-    let mut stderr = std::io::stderr().lock();
     let mut reasoned = false;
     let stats = pipeline.run_channels(
         &request,
@@ -144,13 +143,15 @@ pub(crate) fn run(mut args: Args) -> Result<()> {
             }
         },
         |text| {
+            // Reasoning goes to stderr so that stdout holds only the answer. The handle is
+            // locked per write: a held lock would stall log lines from other threads. Nothing
+            // depends on progress text reaching a closed stderr.
             reasoned = true;
-            // Nothing depends on progress text reaching a closed stderr.
-            drop(stderr.write_all(text.as_bytes()));
+            drop(std::io::stderr().write_all(console.paint("2", text).as_bytes()));
         },
     )?;
     if reasoned {
-        drop(writeln!(stderr));
+        drop(writeln!(std::io::stderr()));
     }
     if let Some(error) = output_error {
         return Err(error.into());
@@ -158,6 +159,20 @@ pub(crate) fn run(mut args: Args) -> Result<()> {
     writeln!(stdout)?;
     tracing::info!(prompt_tokens = stats.prompt_tokens, generated_tokens = stats.generated_tokens,
         elapsed = ?stats.elapsed, finish_reason = stats.finish_reason, "Generation complete");
+    if console.interactive() {
+        let elapsed = stats.elapsed.as_secs_f64();
+        console.line(&console.paint(
+            "2",
+            &format!(
+                "  {} tokens at {:.1}/s · first token {} · {} total · {}",
+                stats.generated_tokens,
+                stats.generated_tokens as f64 / elapsed.max(f64::MIN_POSITIVE),
+                seconds(stats.first_token.as_secs_f64()),
+                seconds(elapsed),
+                stats.finish_reason,
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -172,7 +187,7 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Result<Args> {
         match parse_cli(values)?.command {
-            Command::Run(args) => Ok(args),
+            Some(Command::Run(args)) => Ok(args),
             _ => Err(TurError::Other("expected run arguments".into())),
         }
     }

@@ -177,6 +177,10 @@ fn counters_json(counters: &WorkerCounters) -> Value {
             "generated": counters.generated_tokens,
         },
         "preemptions": counters.preemptions,
+        "latency": {
+            "request_seconds": counters.request_seconds.json(),
+            "first_token_seconds": counters.first_token_seconds.json(),
+        },
         "pool": pool_json(&counters.pool),
         "device_allocated_bytes": counters.device_allocated,
         "device_allocated_peak_bytes": counters.device_allocated_peak,
@@ -255,6 +259,7 @@ pub async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     });
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "pid": std::process::id(),
         "uptime_seconds": state.status.uptime().as_secs_f64(),
         "draining": state.status.draining(),
         "system": system,

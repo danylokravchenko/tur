@@ -23,35 +23,37 @@ publish = false
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-candle-core = "0.11.0"
-candle-nn = "0.11.0"
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
 tokenizers = "0.21"
-llguidance = { version = "1.7.5", default-features = false, features = ["lark"] }
-toktrie_hf_tokenizers = "1.7.5"
+llguidance = { version = "1.9.1", default-features = false, features = ["lark"] }
+toktrie_hf_tokenizers = "1.9.1"
 
-serde = { version = "1.0.228", features = ["serde_derive"] }
-serde_json = { version = "1.0.149", features = ["preserve_order"] }
-toml = "0.9.12"
-minijinja = { version = "2.19.0", features = ["builtins", "json", "preserve_order"] }
-thiserror = "2.0.18"
+serde = { version = "1.0.229", features = ["serde_derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+toml = "1.1.8"
+minijinja = { version = "3.0.5", features = ["builtins", "json", "preserve_order", "serde"] }
+thiserror = "2.0.21"
 parking_lot = "0.12.5"
-rustix = { version = "1.1.4", default-features = false, features = ["fs", "std"] }
-uuid = { version = "1.23.1", features = ["v4"] }
+rustix = { version = "1.1.6", default-features = false, features = ["fs", "std"] }
+uuid = { version = "1.29.0", features = ["v4"] }
 metal = { version = "0.33.0", features = ["mps"] }
-hf-hub = "0.5.0"
-clap = { version = "4.6.1", features = ["derive", "env"] }
+hf-hub = { version = "1.0.0", features = ["blocking"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 axum = { version = "0.8.9", features = ["json", "macros"] }
-tokio = { version = "1.52.3", features = ["full"] }
-tower-http = { version = "0.6.11", features = ["cors", "trace"] }
+tokio = { version = "1.54.1", features = ["full"] }
+tower-http = { version = "0.7.1", features = ["cors", "trace"] }
 async-stream = "0.3.6"
+indicatif = "0.18"
+ratatui = "0.30.2"
 
-tikv-jemallocator = "0.6.1"
+tikv-jemallocator = "0.7.0"
 
 safetensors = "0.8.0"
-flate2 = "1.1.9"
+flate2 = "1.1.10"
 tower = { version = "0.5.3", features = ["util"] }
-http-body-util = "0.1.3"
-candle-metal-kernels = "=0.11.0"
+http-body-util = "0.1.5"
+candle-metal-kernels = "=0.11.1"
 objc2-metal = "=0.3.2"
 
 [workspace.lints.rust]

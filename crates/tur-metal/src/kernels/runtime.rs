@@ -12,7 +12,8 @@ use objc2_metal::{
     MTLCompileOptions, MTLComputePipelineState as _, MTLDevice as _, MTLGPUFamily, MTLMathMode,
     MTLSize,
 };
-use std::{collections::HashMap, sync::Arc, sync::RwLockReadGuard};
+use parking_lot::RwLockReadGuard;
+use std::{collections::HashMap, sync::Arc};
 use tur_core::{Result, TurError, execution::invalid};
 
 /// Version of the buffer layouts the kernels assume. Bump when any binding layout changes.

@@ -36,6 +36,7 @@ prefix_restorable_first = false # Restorable prompts pass older cold ones in the
 listen = "127.0.0.1:8080"
 served_model_name = "qwen-hybrid"
 max_batch_size = 8
+# dashboard = true        # Live dashboard when serve runs in a terminal.
 # max_batch_tokens = 2048 # Default: max(2048, prefill_chunk_size + max_batch_size).
 max_waiting = 256
 # request_timeout_secs = 120 # Omit for no server deadline (includes time in queue).
