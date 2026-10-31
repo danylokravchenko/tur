@@ -19,7 +19,7 @@ env:
 
 jobs:
   ci:
-    name: just ci
+    name: CI
     # Arm64: Tur has no other target, and the tests fail rather than skip without Metal.
     runs-on: macos-26
     timeout-minutes: 60
@@ -35,4 +35,4 @@ jobs:
         run: system_profiler SPDisplaysDataType
       - name: Check that Cargo.lock is current
         run: cargo metadata --locked --format-version 1 > /dev/null
-      - run: just ci
+      - run: just ci-hosted

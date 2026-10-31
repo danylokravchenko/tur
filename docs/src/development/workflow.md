@@ -12,6 +12,7 @@ The `justfile` holds every routine task:
 | `just test [args]` | The offline nextest suite; arguments go to nextest, e.g. `-E 'test(prefix)'` |
 | `just test-checkpoint` | Ignored real-checkpoint tests (see [Testing](testing.md)) |
 | `just ci` | `fmt-check`, `lint`, `check` and `test`; run it before calling work done |
+| `just ci-hosted` | The same checks with the reduced `ci` test profile that hosted CI uses (see [Testing](testing.md)) |
 | `just build` | Release build of `tur` |
 | `just install [args]` | Install `tur` with `install.sh`; arguments go to `cargo install` |
 | `just run …` / `just serve …` | The CLI against the pinned development checkpoint |
