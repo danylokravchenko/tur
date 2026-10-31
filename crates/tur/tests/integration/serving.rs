@@ -55,6 +55,7 @@ async fn json_body(response: axum::response::Response) -> Result<Value> {
 async fn test_real_worker_serves_concurrent_requests_with_queued_admission() -> Result<()> {
     let fixture = common::Checkpoint::new()?;
     let state = AppState {
+        status: tur::server::ServerStatus::shared(),
         workers: HashMap::from([("tiny".into(), worker(&fixture, 1)?)]),
         transcribers: HashMap::new(),
         default_transcriber: None,
@@ -88,6 +89,7 @@ async fn test_real_stream_stops_at_tokenizer_eos_and_reports_usage() -> Result<(
     config["eos_token"] = json!("t5");
     std::fs::write(fixture.0.join("tokenizer_config.json"), config.to_string())?;
     let state = AppState {
+        status: tur::server::ServerStatus::shared(),
         workers: HashMap::from([("tiny".into(), worker(&fixture, 2)?)]),
         transcribers: HashMap::new(),
         default_transcriber: None,
@@ -206,6 +208,7 @@ async fn test_stalled_stream_is_cancelled_with_bounded_buffering() -> Result<()>
 async fn test_http_preserves_limits_sampling_thinking_and_tool_history() -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<WorkerMsg>(1);
     let state = AppState {
+        status: tur::server::ServerStatus::shared(),
         workers: HashMap::from([("tiny".into(), PipelineWorker::from_sender(tx))]),
         transcribers: HashMap::new(),
         default_transcriber: None,
@@ -280,6 +283,7 @@ async fn test_http_preserves_limits_sampling_thinking_and_tool_history() -> Resu
 async fn test_http_rejects_unsupported_media_and_invalid_controls() -> Result<()> {
     let (tx, _rx) = mpsc::channel(1);
     let router = build_router(AppState {
+        status: tur::server::ServerStatus::shared(),
         workers: HashMap::from([("tiny".into(), PipelineWorker::from_sender(tx))]),
         transcribers: HashMap::new(),
         default_transcriber: None,
@@ -330,6 +334,7 @@ async fn test_http_maps_admission_and_deadline_failures_and_streams_error_codes(
     ] {
         let (tx, mut rx) = mpsc::channel::<WorkerMsg>(1);
         let router = build_router(AppState {
+            status: tur::server::ServerStatus::shared(),
             workers: HashMap::from([("tiny".into(), PipelineWorker::from_sender(tx))]),
             transcribers: HashMap::new(),
             default_transcriber: None,
@@ -362,6 +367,7 @@ async fn test_http_maps_admission_and_deadline_failures_and_streams_error_codes(
     }
     let (tx, mut rx) = mpsc::channel::<WorkerMsg>(1);
     let router = build_router(AppState {
+        status: tur::server::ServerStatus::shared(),
         workers: HashMap::from([("tiny".into(), PipelineWorker::from_sender(tx))]),
         transcribers: HashMap::new(),
         default_transcriber: None,

@@ -401,6 +401,15 @@ pub fn working_set_bytes(device: &Device) -> Option<usize> {
     }
 }
 
+/// Bytes the device has allocated now, across every buffer of this process (Metal).
+pub fn allocated_bytes(device: &Device) -> Option<usize> {
+    match device {
+        #[cfg(feature = "metal")]
+        Device::Metal(metal) => Some(metal.current_allocated_size()),
+        _ => None,
+    }
+}
+
 /// Device-resident state storage for one model on one device. Cloning shares the pool.
 #[derive(Clone)]
 pub struct StatePool(Arc<Shared>);

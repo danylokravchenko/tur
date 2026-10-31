@@ -2,7 +2,7 @@
 
 ## Models and hardware
 
-- Run a real Qwen MoE checkpoint through the expert cache, and make the check for spare memory continue after load, since concurrent serving can still swap.
+- Run a real Qwen MoE checkpoint through the expert cache.
 - Make pruning generalize. Search on KL now exists and overfits its calibration text, so the next step is far more varied calibration, or recovery training, judged by task benchmarks rather than KL.
 - Run the larger models. Qwen3.8-27B and the Qwen3.6-35B MoE need Macs that fit them, and then measurements of quality, the K/V format choice (Q8 is the likely default under 16 GB), and the wide MoE tier, which trails Candle by 1.2 to 1.5× and needs real routing traces.
 - Run a real expert checkpoint's MTP head and measure its draft acceptance. Only a tiny Transformers fixture has run it so far.
@@ -17,8 +17,8 @@
 
 ## Performance
 
-- Long-prompt prefill. llama.cpp prefills 8K-token prompts 6 to 11% faster than Tur, while 2K-token prompts are level ([Compared with llama.cpp](../guide/performance.md#compared-with-llamacpp)). In an 8K-token prefill, tiled attention takes the largest share, about 2.3 s across six layers. Matching llama.cpp's attention speed needs faster matrix work, for example F16 staging.
-- Tiled prefill attention reaches about 28% of the matrix units' F32 peak, with eight barriers per 32-key block at head dimension 256 over F32 and F16 pools, and sixteen over Q8.
+- Long-prompt prefill. llama.cpp prefills 8K-token prompts 6 to 11% faster than Tur, while 2K-token prompts are level ([Compared with llama.cpp](../guide/performance.md#compared-with-llamacpp)). Tiled attention is about 2.4 s of an 8K-token prefill across six layers, and the other 6 s grows linearly with tokens, so that remainder is the larger target. Chunk size isn't the lever: 256- and 512-token chunks match a single pass at 8K.
+- Tiled prefill attention reaches about 30% of the matrix units' F32 peak, with eight barriers per 32-key block at head dimension 256 over F32 and F16 pools, and sixteen over Q8. Barriers aren't the limit, since cutting them to two made it slower. Removing K/V reads would save about 17%, the softmax 10% and query loads about 13%, and the multiplies themselves take most of the rest.
 - Broader comparisons. llama.cpp is measured for Q8_0 and Q4_K_M at up to 16 sequences. Still to do: MLX-LM on this Mac, 32K-token prompts, cached and uncached prefixes, and sustained load.
 - Quality budgets. Held-out budgets, declared in advance, for language, code, tool calls and JSON, and long-context retrieval, with confidence intervals.
 - Chained MTP drafts, estimated at about 10% with one request.
@@ -27,6 +27,5 @@
 
 ## Serving
 
-- Production hardening: health and readiness endpoints, request metrics, graceful shutdown, stop sequences, model revision reporting, and memory and kernel diagnostics.
 - Soak tests: multi-hour cancellation and churn runs to check thermal behaviour and leaks.
 - Lints: tighten `indexing_slicing` crate by crate, starting with `tur-core` and `tur-cli`.

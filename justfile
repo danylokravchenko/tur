@@ -51,6 +51,16 @@ run *args:
 serve *args:
     cargo run --release --bin tur -- serve --model {{model}} --revision {{revision}} "$@"
 
+# One reading of a running server; `just top` watches it live.
+status *args:
+    cargo run --release --bin tur -- status "$@"
+
+top *args:
+    cargo run --release --bin tur -- top "$@"
+
+stop *args:
+    cargo run --release --bin tur -- stop "$@"
+
 # Prepack weights: `just quantize <checkpoint dir> <output dir> --method rtn`.
 quantize dir output *args:
     cargo run --release --bin tur -- quantize --model "$1" --revision {{revision}} --output "$2" "${@:3}"

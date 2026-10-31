@@ -64,12 +64,14 @@ EOF
 tur run --prompt 'What is the weather in Kyiv?' --tools tools.json --thinking false
 ```
 
-Text goes to stdout. The memory plan and timing go to stderr:
+Text goes to stdout. Loading progress and a timing summary go to stderr:
 
 ```text
-INFO tur::run: Memory plan resident_bytes=3017015772 weights=1309441280 state_pool=181469184 scratch_peak=251789312
-INFO tur::run: Generation complete prompt_tokens=19 generated_tokens=26 elapsed=741ms finish_reason="stop"
+  ✓ Loading weights  24/24 layers in 1.6 s
+  26 tokens at 35.1/s · first token 117 ms · 741 ms total · stop
 ```
+
+Set `RUST_LOG=info` to also see the memory plan. See [Command line](cli.md) for how every command reports its work.
 
 ## 5. Serve
 

@@ -950,6 +950,7 @@ mod http {
 
     fn router() -> axum::Router {
         build_router(AppState {
+            status: tur::server::ServerStatus::shared(),
             workers: HashMap::from([("gemma".to_owned(), chat_worker())]),
             default_model: "gemma".into(),
             transcribers: HashMap::from([("whisper-1".to_owned(), whisper_worker())]),

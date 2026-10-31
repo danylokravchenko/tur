@@ -1,10 +1,13 @@
 # Command line
 
-`tur` has four commands:
+Run `tur` alone for a welcome screen listing the commands:
 
 ```text
 tur run         Generate one completion: the answer to stdout, separated reasoning to stderr
-tur serve       Serve one model over an OpenAI-compatible HTTP API
+tur serve       Serve one model over an OpenAI-compatible HTTP API, with a live dashboard
+tur status      Print a running server's state once
+tur top         Watch a running server live
+tur stop        Stop a server on this machine
 tur transcribe  Transcribe a WAV file with a Whisper checkpoint
 tur quantize    Prepack weights offline, optionally calibrated, for instant loading
 tur prune       Experiment: write a gpt-oss checkpoint with fewer experts
@@ -12,9 +15,40 @@ tur prune       Experiment: write a gpt-oss checkpoint with fewer experts
 
 `tur <command> --help` prints every flag. This page groups the flags by purpose and gives their defaults.
 
+## What you see
+
+Every command shares one way of reporting. Long work draws a progress bar with an estimate: downloads, weight loading, calibration, packing, sensitivity measurement, expert probing and transcription. Each stage leaves a line with what it did and how long it took, so a finished job reads as a short record. A summary follows.
+
+All of this goes to stderr. Stdout holds only the command's result, so `tur run … > answer.txt` and `tur quantize … --json | jq` stay clean. When stderr isn't a terminal, bars become a plain line every 10 seconds and logs keep their timestamps, threads and targets for whatever collects them.
+
+| Flag or variable | Effect |
+| --- | --- |
+| `-q`, `--quiet` | Only warnings, errors and the result |
+| `NO_COLOR` | No color; the banner appears without its animation |
+| `RUST_LOG` | Log filter. In a terminal the default is `warn`, or `info` for `serve`; otherwise `info` |
+
+## Watching a server
+
+In a terminal, `tur serve` opens a dashboard once its listener is up, with traffic, memory, efficiency, a throughput chart and the server's logs. `q` closes it and the server keeps running, printing the logs it held and any that follow. Ctrl-C drains the server, and a second Ctrl-C stops it at once. `--dashboard=false`, or `dashboard = false` under `[server]`, keeps plain logs instead.
+
+From another terminal or machine, `tur top` shows the same dashboard without logs, and `tur status` prints one reading:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--url <http://host:port>` | `TUR_URL`, else `[server].listen`, else `127.0.0.1:8080` | Server to read |
+| `--force` | off | `stop` only: fail running requests and stop at once |
+| `--interval <seconds>` | 1 | `top` only: time between readings |
+| `--json` | off | `status` only: print `/diagnostics` as it is |
+
+`tur status` exits nonzero when nothing answers, or when the server is draining or a worker has stopped, so a script can gate on it. Both read [`/diagnostics`](http-api.md), so they agree with what any other client sees.
+
+`tur stop` works like Ctrl-C from anywhere on the machine: running requests finish, up to `--shutdown-timeout-secs`, and it returns once the process has exited and released its device memory. It takes the same `--url` and refuses a server on another machine.
+
+Throughput counts tokens through the model, prompts and speculative drafts included, because a request's generated tokens only count once it finishes. Device busy is the share of wall time a pass was on the device. First-token and request latencies are upper bounds from the histogram's buckets, over the server's whole life.
+
 ## Configuration
 
-`run`, `serve` and `transcribe` read `./tur.toml` if it exists; see [Configuration](configuration.md) for the file format and the settings that only the file exposes. Flags override `TUR_MODEL` and `TUR_REVISION`, which override the file. `--config <path>` picks another file and `--no-config` skips it.
+`run`, `serve`, `transcribe`, `status`, `top` and `stop` read `./tur.toml` if it exists; see [Configuration](configuration.md) for the file format and the settings that only the file exposes. Flags override `TUR_MODEL` and `TUR_REVISION`, which override the file. `--config <path>` picks another file and `--no-config` skips it.
 
 ## Model and state (`run`, `serve`)
 
@@ -51,6 +85,7 @@ tur run --model google/gemma-4-E2B-it --revision 3e22461f65e89153144f8adb70e3b8c
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--prefill-chunk-size <n>` | 256, or 1024 with `--expert-cache-mb` | Most prompt tokens one request adds to one pass |
+| `--context-tokens <n>` | what the pool and model allow | Most tokens one request may hold, prompt and output together. Sizes the state pool for that many per concurrent request; a start that can't fit it fails and names what would |
 | `--state-memory-mb <n>` | derived | Memory for K/V pages and recurrent state. By default, room for an 8K-token context per concurrent request |
 | `--speculative-draft <n>` | 0 | Most tokens drafted from the request's own text per step; 0 turns speculation off |
 | `--mtp [true\|false]` | off | Also draft with the checkpoint's multi-token-prediction head; turns off prefix reuse |
@@ -89,6 +124,8 @@ Sampling settings you leave out come from the checkpoint's `generation_config.js
 | `--max-waiting <n>` | 256 | Queued requests before new ones get HTTP 429 |
 | `--request-timeout-secs <n>` | none | Fail requests not finished this long after arrival (HTTP 504) |
 | `--prefix-snapshots <n>` | one per running request | Prefix snapshots kept for reuse; 0 turns prefix reuse off |
+| `--dashboard [true\|false]` | `true` in a terminal | Show the live dashboard once serving |
+| `--shutdown-timeout-secs <n>` | 30 | How long accepted requests may take to finish after SIGINT or SIGTERM. A second signal ends the wait |
 | `--transcription-model-name <id>` | `whisper-1` | The model ID of `--whisper` at `/v1/audio/*` and in `/v1/models` |
 | `--max-waiting-transcriptions <n>` | 16 | Queued clips before new ones get HTTP 429 |
 
@@ -118,7 +155,7 @@ tur run --model google/gemma-4-E2B-it --revision 3e22461f65e89153144f8adb70e3b8c
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--model <dir>` | required | Source SafeTensors checkpoint directory |
+| `--model <dir or org/name>` | required | Source SafeTensors checkpoint: a directory, or a Hugging Face repository at `--revision` |
 | `--revision <rev>` | required | Name of the source, recorded in the artifact |
 | `--output <dir>` | required | New artifact directory |
 | `--method rtn\|imatrix\|gptq` | `gptq` | Rounding method; `imatrix` and `gptq` need calibration text |
@@ -130,15 +167,20 @@ tur run --model google/gemma-4-E2B-it --revision 3e22461f65e89153144f8adb70e3b8c
 | `--sample-tokens <n>` | 512 | Tokens per calibration sample |
 | `--sensitivity-tokens <n>` | 1024 | Tokens used to measure each projection's sensitivity |
 | `--damp <x>` | 0.01 | GPTQ damping, relative to the mean Hessian diagonal |
-| `--report <file>` | stdout | Calibration, sensitivity and plan details as JSON |
+| `--report <file>` | none | Write calibration, sensitivity and plan details as JSON |
+| `--json` | off | Print those details on stdout |
 
-[Prepacked weights](quantization.md) walks through the workflow.
+[Prepacked weights](quantization.md) walks through the workflow. `tur prune` takes `--json` the same way, and its `--model` also accepts a repository.
 
 ## Logging
 
-Logs go to stderr through `tracing`. `RUST_LOG` sets the filter, for example `RUST_LOG=tur_engine=debug`; the default is `info`.
+Logs go to stderr through `tracing`. `RUST_LOG` sets the filter, for example `RUST_LOG=tur_engine=debug`.
 
 ## Decisions
 
 - Common flags stay available as overrides beside the file, and `--mtp false` can undo a file's `true`. Rarely changed scheduler and stream limits live only in the file to keep the CLI manageable.
+- Progress is `tracing` events from a `Stage` in `tur-core`, not callbacks: no signature changes, a library user pays for a filtered event, and any front end can subscribe to the `tur_progress` target.
+- Monitoring reads the public `/diagnostics` over HTTP, in `serve` too, so there is one source of truth and it works remotely. Bars use `indicatif` and the dashboard `ratatui`; the client stays on `std` because it only makes plain GETs.
+- `tur stop` signals the process named by `/diagnostics` rather than calling a shutdown route. The API port has no authentication and allows any origin, so a route would let any web page stop the server. The signal limits stopping to the machine and the user running the server, and `stop` checks that the process is a `tur` binary, because a forwarded port can report a PID that means something else locally.
+- The banner animates for bare `tur`, `serve`, `quantize` and `prune`. `run`, `transcribe`, `status` and `top` start without it, because people run them often or in scripts.
 - Per-run inputs stay explicit: prompts, tool files, CPU reference mode and quantization jobs are always flags, and logging stays in `RUST_LOG`.

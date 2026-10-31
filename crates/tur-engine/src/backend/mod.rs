@@ -6,4 +6,5 @@ pub mod pipeline;
 pub mod prefix;
 pub mod scheduler;
 pub mod speculation;
+mod stop;
 pub mod tokenizer;

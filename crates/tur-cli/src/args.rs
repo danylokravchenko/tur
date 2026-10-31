@@ -1,5 +1,8 @@
 //! Flags shared by `run` and `serve`.
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tur::models::{DEFAULT_KV_LAYOUT, DraftHead, WeightFormat, parse_recurrent_state};
 
 use candle_core::DType;
@@ -8,7 +11,7 @@ use serde::Deserialize;
 use tur::{
     ModelFactory, ModelSource, Result, TurError,
     backend::{
-        factory::{WhisperFactory, resolve_drafter},
+        factory::{WhisperFactory, resolve_checkpoint, resolve_drafter},
         pipeline::PipelineConfig,
         speculation::SpeculationConfig,
     },
@@ -17,9 +20,33 @@ use tur::{
 
 use crate::config::{inherit, optional_from_str, optional_recurrent};
 
+/// Explicit paths and existing directories load locally; other values name a Hugging Face
+/// repository.
+pub(crate) fn model_source(model: &str) -> ModelSource {
+    let path = Path::new(model);
+    if path.is_dir() || path.is_absolute() || path.starts_with(".") || path.starts_with("..") {
+        ModelSource::LocalPath(model.into())
+    } else {
+        ModelSource::HuggingFace(model.to_owned())
+    }
+}
+
+/// The local directory of a job's `--model`, downloading a repository's snapshot if needed.
+pub(crate) fn checkpoint_dir(model: &Path, revision: &str) -> Result<PathBuf> {
+    let source = model_source(&model.to_string_lossy());
+    if matches!(source, ModelSource::LocalPath(_)) && !model.is_dir() {
+        return Err(TurError::Other(format!(
+            "no checkpoint directory at {}",
+            model.display()
+        )));
+    }
+    resolve_checkpoint(&source, revision)
+}
+
 /// Checkpoint and state storage.
 #[derive(Debug, Default, Deserialize, clap::Args)]
 #[serde(default, deny_unknown_fields)]
+#[command(next_help_heading = "Model")]
 pub(crate) struct ModelArgs {
     /// Local checkpoint directory, or a fully qualified Hugging Face repository.
     #[arg(long, env = "TUR_MODEL")]
@@ -82,7 +109,6 @@ impl ModelArgs {
         expert_cache_mb
     );
 
-    /// Explicit paths and existing directories load locally; other values name a Hugging Face repository.
     pub(crate) fn factory(&self) -> Result<ModelFactory> {
         let model = self
             .model
@@ -96,16 +122,7 @@ impl ModelArgs {
             })?;
         let revision = self.revision.as_ref().filter(|value| !value.trim().is_empty())
             .ok_or_else(|| TurError::Other("revision is required: set --revision, TUR_REVISION or [model].revision in tur.toml".into()))?;
-        let path = Path::new(model);
-        let source = if path.is_dir()
-            || path.is_absolute()
-            || path.starts_with(".")
-            || path.starts_with("..")
-        {
-            ModelSource::LocalPath(model.into())
-        } else {
-            ModelSource::HuggingFace(model.clone())
-        };
+        let source = model_source(model);
         if self.kv_layout().page_tokens == 0 {
             return Err(TurError::Other("K/V page tokens must be positive".into()));
         }
@@ -151,6 +168,7 @@ impl ModelArgs {
 /// Speech-to-text checkpoint, served apart from the chat model.
 #[derive(Debug, Default, Deserialize, clap::Args)]
 #[serde(default, deny_unknown_fields)]
+#[command(next_help_heading = "Speech")]
 pub(crate) struct WhisperArgs {
     /// Whisper checkpoint for /v1/audio/transcriptions and `tur transcribe`: a local
     /// directory or a Hugging Face repository at `--whisper-revision`.
@@ -184,12 +202,7 @@ impl WhisperArgs {
         let Some(model) = self.whisper.as_ref().filter(|m| !m.trim().is_empty()) else {
             return Ok(None);
         };
-        let path = Path::new(model);
-        let source = if path.is_dir() || path.is_absolute() || path.starts_with(".") {
-            ModelSource::LocalPath(model.into())
-        } else {
-            ModelSource::HuggingFace(model.clone())
-        };
+        let source = model_source(model);
         let revision = self
             .whisper_revision
             .clone()
@@ -209,6 +222,7 @@ impl WhisperArgs {
 /// Pass shape, state memory and speculation.
 #[derive(Debug, Default, Deserialize, clap::Args)]
 #[serde(default, deny_unknown_fields)]
+#[command(next_help_heading = "Engine")]
 pub(crate) struct PipelineArgs {
     /// Largest prefill chunk of one request in one pass (default: 256).
     #[arg(long)]
@@ -217,6 +231,11 @@ pub(crate) struct PipelineArgs {
     /// request's 8K-token context within the device's working set.
     #[arg(long)]
     state_memory_mb: Option<usize>,
+    /// Most tokens one request may hold: its prompt and output. Sizes the state pool for that
+    /// many tokens per concurrent request and bounds kernel scratch; a start that cannot fit
+    /// it fails and names what would. Default: whatever the pool and the model allow.
+    #[arg(long)]
+    context_tokens: Option<usize>,
     /// Maximum prompt-lookup drafts per decode. Opt-in throughput mode: tokens arrive in
     /// bursts and pauses can grow. Zero disables it; draft length adapts to measured cost.
     /// Requires F32 recurrent state; narrower state automatically uses ordinary decoding. Default: 0.
@@ -263,6 +282,7 @@ impl PipelineArgs {
     inherit!(
         prefill_chunk_size,
         state_memory_mb,
+        context_tokens,
         speculative_draft,
         mtp,
         draft_model,
@@ -287,17 +307,14 @@ impl PipelineArgs {
             .transpose()?;
         let mut config =
             PipelineConfig::new(max_batch_size, self.prefill_chunk_size.unwrap_or(256));
+        config.context_tokens = self.context_tokens;
         let drafts = self.speculative_draft.unwrap_or(0);
         config.speculation = if let Some(model) = &self.draft_model {
             let revision = self
                 .draft_revision
                 .as_deref()
                 .ok_or_else(|| TurError::Other("--draft-model needs --draft-revision".into()))?;
-            let source = if Path::new(model).is_dir() {
-                ModelSource::LocalPath(model.into())
-            } else {
-                ModelSource::HuggingFace(model.clone())
-            };
+            let source = model_source(model);
             SpeculationConfig {
                 mtp: Some(DraftHead {
                     vocab: None,
@@ -340,6 +357,29 @@ impl PipelineArgs {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_paths_load_locally_and_names_come_from_the_hub() {
+        for local in ["/absent/model", "./model", "../model", "."] {
+            assert!(
+                matches!(model_source(local), ModelSource::LocalPath(_)),
+                "{local}"
+            );
+        }
+        assert!(matches!(
+            model_source("org/name"),
+            ModelSource::HuggingFace(_)
+        ));
+    }
+
+    #[test]
+    fn test_a_missing_job_checkpoint_is_named() -> Result<()> {
+        let error = checkpoint_dir(Path::new("/absent/model"), "x")
+            .err()
+            .ok_or_else(|| TurError::Other("missing directory was accepted".into()))?;
+        assert!(error.to_string().contains("/absent/model"));
+        Ok(())
+    }
 
     #[test]
     fn test_state_memory_overflow_is_rejected() -> Result<()> {

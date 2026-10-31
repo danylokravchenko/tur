@@ -12,19 +12,24 @@ pub async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
         .unwrap_or_default()
         .as_secs();
 
-    let mut ids: Vec<&String> = state
+    let chat = state
         .workers
-        .keys()
-        .chain(state.transcribers.keys())
-        .collect();
-    ids.sort();
-    let data = ids
+        .iter()
+        .map(|(id, worker)| (id, worker.report().map(|report| report.revision.clone())));
+    let speech = state
+        .transcribers
+        .iter()
+        .map(|(id, worker)| (id, worker.revision().map(str::to_owned)));
+    let mut models: Vec<_> = chat.chain(speech).collect();
+    models.sort();
+    let data = models
         .into_iter()
-        .map(|id| ModelObject {
+        .map(|(id, revision)| ModelObject {
             id: id.clone(),
             object: "model",
             created,
             owned_by: "tur",
+            revision,
         })
         .collect();
 

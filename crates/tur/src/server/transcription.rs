@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! A dedicated Whisper execution owner behind the transcription endpoints.
-use tokio::sync::{mpsc, oneshot};
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     Result, TurError,
@@ -31,6 +32,9 @@ pub struct TranscriptionConfig {
 #[derive(Clone)]
 pub struct TranscriptionWorker {
     tx: mpsc::Sender<TranscriptionJob>,
+    revision: Option<Arc<str>>,
+    leased_bytes: usize,
+    exit: watch::Receiver<()>,
 }
 
 impl TranscriptionWorker {
@@ -42,11 +46,14 @@ impl TranscriptionWorker {
             ));
         }
         let (weights, scratch) = config.factory.memory_requirements()?;
+        let revision: Arc<str> = config.factory.revision.as_str().into();
+        let (exit_tx, exit) = watch::channel(());
         let lease = config.budget.lease(
             weights
                 .checked_add(scratch)
                 .ok_or_else(|| TurError::Other("Whisper memory overflow".into()))?,
         )?;
+        let leased_bytes = lease.bytes();
         let (tx, mut rx) = mpsc::channel::<TranscriptionJob>(config.max_waiting);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -70,16 +77,47 @@ impl TranscriptionWorker {
                 }
                 serve(&mut rx, &transcriber);
                 drop(lease);
+                drop(exit_tx);
             })?;
         ready_rx
             .recv()
             .map_err(|error| TurError::Other(format!("Whisper startup failed: {error}")))??;
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            revision: Some(revision),
+            leased_bytes,
+            exit,
+        })
     }
 
     /// Wrap a caller-provided sender, allowing HTTP tests to provide deterministic workers.
     pub fn from_sender(tx: mpsc::Sender<TranscriptionJob>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            revision: None,
+            leased_bytes: 0,
+            exit: watch::channel(()).1,
+        }
+    }
+
+    /// Whether the worker still takes clips.
+    pub fn is_alive(&self) -> bool {
+        !self.tx.is_closed()
+    }
+
+    /// The loaded checkpoint's immutable revision.
+    pub fn revision(&self) -> Option<&str> {
+        self.revision.as_deref()
+    }
+
+    /// Device memory the model holds.
+    pub fn leased_bytes(&self) -> usize {
+        self.leased_bytes
+    }
+
+    /// A receiver whose sender drops when the worker has released its model.
+    pub(crate) fn exit(&self) -> watch::Receiver<()> {
+        self.exit.clone()
     }
 
     /// Queue a clip and wait for its transcription. A full queue fails immediately.

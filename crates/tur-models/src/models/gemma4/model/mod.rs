@@ -20,6 +20,7 @@ use crate::{
 use candle_core::{DType, Device, Tensor};
 use std::{collections::BTreeSet, path::Path, sync::Arc};
 use tur_core::execution::EmbeddedInput;
+use tur_core::progress::Stage;
 use tur_core::{
     Result,
     execution::{ModelDescription, checked_elements, invalid},
@@ -360,9 +361,15 @@ impl Gemma4 {
             .take(&format!("{}.norm.weight", config.prefix))?
             .to_dtype(DType::F32)?
             .to_device(&options.device)?;
+        let mut loading = Stage::begin("Loading weights", config.layers() as u64, "layers");
         let layers = (0..config.layers())
-            .map(|i| Layer::load(&t, &config, i))
+            .map(|i| {
+                let layer = Layer::load(&t, &config, i);
+                loading.advance(1);
+                layer
+            })
             .collect::<Result<Vec<_>>>()?;
+        loading.finish();
         let ple = if config.text.hidden_size_per_layer_input > 0 {
             let name = format!("{}.embed_tokens_per_layer.weight", config.prefix);
             Some(PerLayer {

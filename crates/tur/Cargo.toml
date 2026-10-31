@@ -26,13 +26,13 @@ axum = { workspace = true }
 tokio = { workspace = true }
 tower-http = { workspace = true }
 async-stream = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 candle-nn.workspace = true
 tokenizers.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
-parking_lot.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 candle-metal-kernels.workspace = true

@@ -21,6 +21,7 @@ use super::{
         Acceptance, Calibration, DraftCosts, DraftSource, HeadCosts, NgramIndex, SpeculationConfig,
         SpeculationStats,
     },
+    stop::StopMatcher,
     tokenizer::TokenOutputStream,
 };
 use crate::{
@@ -81,6 +82,8 @@ struct Pending {
     stream: TokenOutputStream,
     /// Splits output by channel, for models that speak Harmony.
     harmony: Option<Harmony>,
+    /// Ends the answer at the request's stop sequences.
+    stop: StopMatcher,
     max_tokens: usize,
     arrival: Instant,
     deadline: Option<Instant>,
@@ -159,9 +162,9 @@ pub struct InferencePipeline {
     tokenizer: Tokenizer,
     template: ChatTemplate,
     defaults: GenerationDefaults,
-    max_position: usize,
     scheduler: Scheduler,
     plan: MemoryPlan,
+    device_sampling: bool,
     _lease: BudgetLease,
     pending: HashMap<Uuid, Pending>,
     prefix: PrefixCache,
@@ -210,6 +213,26 @@ impl InferencePipeline {
 
     pub fn scheduler(&self) -> &Scheduler {
         &self.scheduler
+    }
+
+    /// The model behind this pipeline, for its identity and kernels.
+    pub fn model(&self) -> &TextModel {
+        &self.model
+    }
+
+    /// Width of the model's output.
+    pub fn vocab_size(&self) -> usize {
+        self.engine.pool().description().vocab_size
+    }
+
+    /// Whether unconstrained rows are sampled on the device when the kernels allow it.
+    pub fn device_sampling(&self) -> bool {
+        self.device_sampling
+    }
+
+    /// Whether requests may draft speculatively.
+    pub fn speculation_enabled(&self) -> bool {
+        self.speculation.enabled()
     }
 
     /// Prefix reuse counters.

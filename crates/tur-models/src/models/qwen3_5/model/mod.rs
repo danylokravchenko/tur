@@ -17,6 +17,7 @@ use crate::models::{Execution, LoadOptions, Weights, artifact};
 use crate::quantization::{Calibration, Recorder};
 use candle_core::{DType, Device, Tensor};
 use std::{path::Path, sync::Arc};
+use tur_core::progress::Stage;
 use tur_core::{
     Result,
     execution::{ModelDescription, checked_elements, invalid},
@@ -628,9 +629,16 @@ impl Qwen35 {
         let dims = Dims::new(&config)?;
         let prefix = config.text_prefix().to_string();
         let mut layers = Vec::with_capacity(config.layer_kinds().len());
+        let mut loading = Stage::begin(
+            "Loading weights",
+            config.layer_kinds().len() as u64,
+            "layers",
+        );
         for i in 0..config.layer_kinds().len() {
             layers.push(Layer::load(&tensors, &config, i)?);
+            loading.advance(1);
         }
+        loading.finish();
         let mtp = if config.mtp() {
             let p = "mtp.layers.0";
             Some(MtpHead {
@@ -870,11 +878,14 @@ impl Qwen35 {
     pub fn calibrate(&self, samples: &[Vec<u32>], hessians: bool) -> Result<Calibration> {
         let recorder = Recorder::new(hessians);
         let mut ids = Vec::new();
+        let mut stage = Stage::begin("Calibrating", samples.len() as u64, "samples");
         for sample in samples {
             self.single(sample, &[], None, Some(&recorder))?;
             self.device.synchronize()?;
             ids.extend(sample.iter().flat_map(|t| t.to_le_bytes()));
+            stage.advance(1);
         }
+        stage.finish();
         let names: Vec<String> = self
             .config
             .projections()?

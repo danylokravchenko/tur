@@ -158,7 +158,7 @@ impl ChatTemplate {
     pub fn from_template(template: impl Into<String>) -> Result<Self> {
         let source = template.into();
         faithful_environment()
-            .add_template("chat", &source)
+            .and_then(|mut env| env.add_template("chat", &source))
             .map_err(|e| TurError::Other(format!("invalid chat template syntax: {e}")))?;
         Ok(Self {
             source,
@@ -201,7 +201,8 @@ impl ChatTemplate {
         tools: &[ToolDefinition],
         options: &RenderOptions,
     ) -> Result<String> {
-        let mut env = faithful_environment();
+        let mut env = faithful_environment()
+            .map_err(|e| TurError::Other(format!("chat template environment: {e}")))?;
         env.add_template("chat", &self.source)
             .map_err(|e| TurError::Other(format!("chat template compile error: {e}")))?;
         let mut ctx = self.tokens.clone();
@@ -248,11 +249,7 @@ impl ChatTemplate {
             ctx.insert("preserve_thinking".into(), value.into());
         }
         env.get_template("chat")
-            .and_then(|t| {
-                t.render(minijinja::Value::from_serialize(serde_json::Value::Object(
-                    ctx,
-                )))
-            })
+            .and_then(|t| t.render(minijinja::value::Serde(serde_json::Value::Object(ctx))))
             .map_err(|e| TurError::Other(format!("chat template render error: {e}")))
     }
 }
@@ -319,15 +316,20 @@ fn raise_exception(msg: String) -> std::result::Result<minijinja::Value, minijin
 }
 
 /// Environment matching Hugging Face's sandboxed Jinja2 setup for chat templates.
-fn faithful_environment() -> minijinja::Environment<'static> {
+fn faithful_environment() -> std::result::Result<minijinja::Environment<'static>, minijinja::Error>
+{
     let mut env = minijinja::Environment::new();
-    env.set_trim_blocks(true);
-    env.set_lstrip_blocks(true);
+    env.set_syntax(
+        minijinja::syntax::SyntaxConfig::builder()
+            .trim_blocks(true)
+            .lstrip_blocks(true)
+            .build()?,
+    );
     env.add_function("raise_exception", raise_exception);
     env.add_function("strftime_now", strftime_now);
     env.add_filter("tojson", python_tojson);
     env.set_unknown_method_callback(python_method);
-    env
+    Ok(env)
 }
 
 fn template_error(message: impl Into<String>) -> minijinja::Error {
@@ -336,7 +338,7 @@ fn template_error(message: impl Into<String>) -> minijinja::Error {
 
 /// Python string and mapping methods used by checkpoint templates.
 fn python_method(
-    _: &minijinja::State<'_, '_>,
+    _: &mut minijinja::State<'_, '_>,
     value: &minijinja::Value,
     method: &str,
     args: &[minijinja::Value],

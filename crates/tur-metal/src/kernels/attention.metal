@@ -412,18 +412,21 @@ static inline void kv_fetch(thread vec<T, 4> *raw, device const T *data, thread 
     }
 }
 
-// Q·K over dimension chunk `c` of the staged keys, accumulated into the score tiles.
-static inline void tile_scores(thread simdgroup_float8x8 *s, threadgroup const float *stage, device const float *qr, uint c, ushort2 fc, float scale) {
+// Q·K over dimension chunk `c` of the staged keys, accumulated into the score tiles. F16
+// and Q8 pools leave the score scale to the softmax, where it is applied once per block:
+// per query fragment it costs them 3-8% of the kernel, while F32 pools run 9% faster with it here.
+template <typename S, bool SCALE_QUERY>
+static inline void tile_scores(thread simdgroup_float8x8 *s, threadgroup const S *stage, device const float *qr, uint c, ushort2 fc, float scale) {
     #pragma clang loop unroll(full)
     for (uint x = 0; x < TD / 8; ++x) {
         simdgroup_float8x8 a;
         // The clamped token also keeps partial query tiles inside the allocation.
         float2 pair = *(device const float2 *)(qr + c * TD + 8 * x + fc.y);
-        a.thread_elements()[0] = pair[0] * scale;
-        a.thread_elements()[1] = pair[1] * scale;
+        a.thread_elements()[0] = SCALE_QUERY ? pair[0] * scale : pair[0];
+        a.thread_elements()[1] = SCALE_QUERY ? pair[1] * scale : pair[1];
         #pragma clang loop unroll(full)
         for (uint kt = 0; kt < TK / 8; ++kt) {
-            simdgroup_float8x8 b;
+            simdgroup_matrix<S, 8, 8> b;
             simdgroup_load(b, stage + 8 * kt * TD + 8 * x, TD, ulong2(0, 0), true);
             simdgroup_multiply_accumulate(s[kt], a, b, s[kt]);
         }
@@ -431,17 +434,18 @@ static inline void tile_scores(thread simdgroup_float8x8 *s, threadgroup const f
 }
 
 // Online softmax on this lane's two elements per key tile of the block at `kb`, all in
-// one row, whose visible keys are [lower, limit): scores become weights, and the output
-// and running sums are rescaled.
+// one row, whose visible keys are [lower, limit): scaled scores become weights, and the
+// output and running sums are rescaled.
 template <uint CHUNKS>
-static inline void tile_softmax(thread simdgroup_float8x8 *s, thread simdgroup_float8x8 *o, thread float &m, thread float &l, uint kb, uint lower, uint limit, ushort2 fc) {
+static inline void tile_softmax(thread simdgroup_float8x8 *s, thread simdgroup_float8x8 *o, thread float &m, thread float &l, uint kb, uint lower, uint limit, ushort2 fc, float scale) {
     float block = -FLT_MAX;
     #pragma clang loop unroll(full)
     for (uint kt = 0; kt < TK / 8; ++kt) {
         #pragma clang loop unroll(full)
         for (uint e = 0; e < 2; ++e) {
             uint key = kb + 8 * kt + fc.y + e;
-            float score = s[kt].thread_elements()[e];
+            float score = s[kt].thread_elements()[e] * scale;
+            s[kt].thread_elements()[e] = score;
             block = key >= lower && key < limit ? max(block, score) : block;
         }
     }
@@ -468,17 +472,23 @@ static inline void tile_softmax(thread simdgroup_float8x8 *s, thread simdgroup_f
 }
 
 // P·V over dimension chunk `c` of the staged values, accumulated into the output tiles.
-static inline void tile_values(thread simdgroup_float8x8 *o, thread const simdgroup_float8x8 *s, threadgroup const float *stage, uint c) {
+template <typename S>
+static inline void tile_values(thread simdgroup_float8x8 *o, thread const simdgroup_float8x8 *s, threadgroup const S *stage, uint c) {
     #pragma clang loop unroll(full)
     for (uint kt = 0; kt < TK / 8; ++kt) {
         #pragma clang loop unroll(full)
         for (uint u = 0; u < TD / 8; ++u) {
-            simdgroup_float8x8 b;
+            simdgroup_matrix<S, 8, 8> b;
             simdgroup_load(b, stage + 8 * kt * TD + 8 * u, TD, ulong2(0, 0), false);
             simdgroup_multiply_accumulate(o[8 * c + u], s[kt], b, o[8 * c + u]);
         }
     }
 }
+
+// Staged element type: pools stage values as stored, so F16 multiplies in F16 against F32
+// queries and weights with no rounding, and Q8 stages dequantized F32.
+template <typename T> struct tile_stage { using type = T; };
+template <> struct tile_stage<char> { using type = float; };
 
 template <uint CHUNKS, typename T, uint QUANT>
 kernel void attention_tiled(
@@ -539,6 +549,8 @@ kernel void attention_tiled(
         // same keys of every chunk, and issues the next chunk's reads before this chunk's
         // matrix work so their latency overlaps it; one barrier per chunk orders the
         // buffers.
+        using S = typename tile_stage<T>::type;
+        constexpr bool SCALE_QUERY = is_same<T, float>::value;
         uint slot[LOADS];
         uint next_slot[LOADS];
         vec<T, 4> fetched[LOADS];
@@ -554,10 +566,10 @@ kernel void attention_tiled(
             // 2 * CHUNKS steps per block keep every step's buffer constant.
             #pragma clang loop unroll(full)
             for (uint step = 0; step < 2 * CHUNKS; ++step) {
-                threadgroup float *stage = shared + (step % 2) * TK * TD;
+                threadgroup S *stage = (threadgroup S *)shared + (step % 2) * TK * TD;
                 #pragma clang loop unroll(full)
                 for (uint i = 0; i < LOADS; ++i) {
-                    *(threadgroup float4 *)(stage + (key0 + i * KEY_STRIDE) * TD + d0) = float4(fetched[i]);
+                    *(threadgroup vec<S, 4> *)(stage + (key0 + i * KEY_STRIDE) * TD + d0) = vec<S, 4>(fetched[i]);
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (step + 1 < CHUNKS) {
@@ -568,12 +580,12 @@ kernel void attention_tiled(
                     kv_fetch<T>(fetched, k, next_slot, kb + TK, keys, key0, p.kv_heads, g, D, d0);
                 }
                 if (step < CHUNKS) {
-                    tile_scores(s, stage, qr, step, fc, p.scale);
+                    tile_scores<S, SCALE_QUERY>(s, stage, qr, step, fc, p.scale);
                 } else {
-                    tile_values(o, s, stage, step - CHUNKS);
+                    tile_values<S>(o, s, stage, step - CHUNKS);
                 }
                 if (step == CHUNKS - 1) {
-                    tile_softmax<CHUNKS>(s, o, m, l, kb, lower, limit, fc);
+                    tile_softmax<CHUNKS>(s, o, m, l, kb, lower, limit, fc, SCALE_QUERY ? 1.0f : p.scale);
                 }
             }
             #pragma clang loop unroll(full)
@@ -608,9 +620,9 @@ kernel void attention_tiled(
                         : float4(0.0f);
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                tile_scores(s, shared, qr, c, fc, p.scale);
+                tile_scores<float, false>(s, shared, qr, c, fc, p.scale);
             }
-            tile_softmax<CHUNKS>(s, o, m, l, kb, lower, limit, fc);
+            tile_softmax<CHUNKS>(s, o, m, l, kb, lower, limit, fc, p.scale);
             #pragma clang loop unroll(full)
             for (uint c = 0; c < CHUNKS; ++c) {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -623,7 +635,7 @@ kernel void attention_tiled(
                         : float4(0.0f);
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                tile_values(o, s, shared, c);
+                tile_values<float>(o, s, shared, c);
             }
         }
     }
