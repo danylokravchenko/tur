@@ -35,6 +35,8 @@ use tur_core::{
 
 /// Experts read and copied between waits, which bounds host staging.
 const READ_BATCH: usize = 8;
+/// Batches staged at once: what a finished prefetch left, a demand read, and the next prefetch.
+const STAGED_BATCHES: usize = 3;
 /// Concurrent reads of one batch.
 const READ_THREADS: usize = 4;
 /// Memory left for the state pool, scratch, staging and everything else on the machine
@@ -170,6 +172,8 @@ struct Slots {
     stats: ExpertStats,
     /// Host read buffers, one per read thread, kept so reads do not fault fresh pages in.
     buffers: Vec<Vec<u8>>,
+    /// The same for prefetch, which runs while demand reads do.
+    prefetch_buffers: Vec<Vec<u8>>,
     /// Reads started when the previous layer routed.
     pending: Option<std::thread::JoinHandle<Prefetched>>,
 }
@@ -312,7 +316,11 @@ impl ExpertCache {
 
     /// Host and upload memory the largest read batch can hold beside the arena.
     pub fn staging_bytes(gate_up: BankShape, down: BankShape) -> Result<usize> {
-        checked_elements(&[2, READ_BATCH, Self::expert_bytes(gate_up, down)?])
+        checked_elements(&[
+            STAGED_BATCHES,
+            READ_BATCH,
+            Self::expert_bytes(gate_up, down)?,
+        ])
     }
 
     /// Allocate the arena and open every source file.
@@ -378,6 +386,7 @@ impl ExpertCache {
                 tick: 0,
                 stats: ExpertStats::default(),
                 buffers: (0..READ_THREADS).map(|_| Vec::new()).collect(),
+                prefetch_buffers: (0..READ_THREADS).map(|_| Vec::new()).collect(),
                 pending: None,
             }),
         })
@@ -474,11 +483,14 @@ impl ExpertCache {
         );
         let wrote = !misses.is_empty();
         let mut ready = Self::finish_prefetch(&mut state);
-        for batch in misses.chunks(READ_BATCH) {
-            self.fill(&mut state, layer, batch, &mut ready)?;
-        }
+        let claimed = self.claim(&mut state, layer, &misses)?;
+        // Started before this layer's reads and copies so that the SSD works through their
+        // waits too, and after the claim so that it sees which experts those just evicted.
         if let Some(logits) = next_logits {
             self.start_prefetch(&mut state, layer + 1, logits)?;
+        }
+        for batch in claimed.chunks(READ_BATCH) {
+            self.fill(&mut state, layer, batch, &mut ready)?;
         }
         for tile in tiles.as_chunks_mut::<4>().0 {
             if tile[0] >= 0.0 {
@@ -499,10 +511,10 @@ impl ExpertCache {
             return Vec::new();
         };
         let Ok((buffers, staged)) = handle.join() else {
-            state.buffers = (0..READ_THREADS).map(|_| Vec::new()).collect();
+            state.prefetch_buffers = (0..READ_THREADS).map(|_| Vec::new()).collect();
             return Vec::new();
         };
-        state.buffers = buffers;
+        state.prefetch_buffers = buffers;
         staged.unwrap_or_default()
     }
 
@@ -532,7 +544,7 @@ impl ExpertCache {
         state.stats.prefetched += wanted.len() as u64;
         state.stats.bytes_read += self.source.read_bytes()? * wanted.len() as u64;
         let source = Arc::clone(&self.source);
-        let mut buffers = std::mem::take(&mut state.buffers);
+        let mut buffers = std::mem::take(&mut state.prefetch_buffers);
         state.pending = Some(std::thread::spawn(move || {
             let staged = source.stage(layer, &wanted, &mut buffers);
             (buffers, staged)
@@ -540,18 +552,15 @@ impl ExpertCache {
         Ok(())
     }
 
-    /// Bring `experts` of `layer` into free or evicted slots, from `ready` where prefetch
-    /// already staged them, and wait for the copies. A slot loses its owner before it is
-    /// touched, so a failure cannot leave one claiming contents it does not hold.
-    fn fill(
+    /// Choose a free or evicted slot for each of `experts`. A slot loses its owner here, before
+    /// it is touched, so a failure cannot leave one claiming contents it does not hold.
+    fn claim(
         &self,
         state: &mut Slots,
         layer: usize,
         experts: &[usize],
-        ready: &mut Vec<Staged>,
-    ) -> Result<()> {
+    ) -> Result<Vec<(usize, usize)>> {
         let tick = state.tick;
-        let base = layer * self.experts;
         let layers = self.source.layers.len();
         let mut chosen = Vec::with_capacity(experts.len());
         for &expert in experts {
@@ -582,9 +591,22 @@ impl ExpertCache {
             state.used[slot] = tick;
             chosen.push((expert, slot));
         }
-        let mut staged = Vec::with_capacity(experts.len());
+        Ok(chosen)
+    }
+
+    /// Bring `chosen` experts of `layer` into their claimed slots, from `ready` where prefetch
+    /// already staged them, and wait for the copies.
+    fn fill(
+        &self,
+        state: &mut Slots,
+        layer: usize,
+        chosen: &[(usize, usize)],
+        ready: &mut Vec<Staged>,
+    ) -> Result<()> {
+        let base = layer * self.experts;
+        let mut staged = Vec::with_capacity(chosen.len());
         let mut missing = Vec::new();
-        for &expert in experts {
+        for &(expert, _) in chosen {
             match ready
                 .iter()
                 .position(|r| r.layer == layer && r.expert == expert)
@@ -609,7 +631,7 @@ impl ExpertCache {
         {
             let mut blit = self.metal.blit_command_encoder()?;
             blit.set_label("tur_expert_fill");
-            for &(expert, slot) in &chosen {
+            for &(expert, slot) in chosen {
                 let parts = staged
                     .iter()
                     .find(|r| r.expert == expert)
@@ -620,7 +642,7 @@ impl ExpertCache {
         // Staging buffers stay alive in `staged` until their copies have completed.
         self.device.synchronize()?;
         state.stats.copy += step.elapsed();
-        for &(expert, slot) in &chosen {
+        for &(expert, slot) in chosen {
             state.map[base + expert] =
                 u32::try_from(slot).map_err(|_| invalid("too many expert slots"))?;
             state.owners[slot] = Some(base + expert);

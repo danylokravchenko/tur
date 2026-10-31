@@ -203,7 +203,7 @@ This model holds 12.8 GiB of weights, more than a 16 GB M1's GPU working set, so
 
 | Cache | Decode, tokens/s | Hit rate |
 | --- | ---: | ---: |
-| 1 GiB | 2.9 | 34% |
+| 1 GiB | 3.1 | 34% |
 | 2 GiB | 3.3 | 52% |
 
 A 2,037-token prompt takes 18 s with a 1 GiB cache, about 115 tokens/s. Repeating it with a different ending takes 10 s. These numbers come from `tur run` on a Mac with an editor and browser open, and concurrent requests are not yet measured.

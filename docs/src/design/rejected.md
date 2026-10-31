@@ -37,6 +37,8 @@ git show 99b073e:<path> > change.patch
 | Gemma 4 assistant chains with more than one request decoding | With four requests on E2B, against one draft per pass: 6% slower on prose and 13% on code, though 28% faster on repetitive text. Limited by `CHAIN_MAX_DECODES` | none |
 | Plain LRU for an expert cache smaller than one token's experts | On gpt-oss-20b, each token touches 96 experts in layer order, so 40 or 81 slots hit nothing at 1.37 tokens/s. Evicting the expert needed furthest ahead hits 34% at 1.87 tokens/s with 81 slots, but only 65% against LRU's 79% with 324, so LRU stays above the crossover | none |
 | Arithmetic MXFP4 decode instead of a lookup table | 1.3 to 2.1× slower at gpt-oss-20b's bank shape, while the table matches Q8_0 | none |
+| Reading experts ahead by two or three layers | On gpt-oss-20b with a 1 GiB cache, 160 tokens took 52.5 s and 54.3 s against 51.5 s at one layer, because they read 9% and 13% more bytes for almost no further used experts | none |
+| Serving expert reads through the page cache | On gpt-oss-20b with a 1 GiB cache, 160 tokens took 53 to 55 s against 56 s with `F_NOCACHE`, and 51.5 to 52.9 s against 52.2 to 52.4 s with read-ahead also off | none |
 | Skipping experts with little routing weight | On gpt-oss-20b at floors of 0.1 and 0.2, KL from the exact model was 0.14 to 0.30 nats and top-token agreement 81 to 91%. Decode gained nothing at 0.1 and 8% at 0.2, though prefetch didn't yet honor the floor | none |
 
 ## Worth retrying on other hardware
