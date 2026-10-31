@@ -67,3 +67,6 @@ Measured on Qwen3.5-0.8B on an M1:
 - Prepacked artifacts load directly, byte-identical to load-time conversion. The 0.8B Q4K artifact loads in 0.2 s instead of 9 s, with half the peak memory.
 - Projections are F32, Q8_0 or Q4K only. Candle's Q5K and Q6K kernels at 2 to 16 rows are 2.5 to 3.5× slower than Tur's Q8_0 and Q4K kernels, so those formats are offered only for embedding tables.
 - AWQ-style rescaling and DWQ are not implemented.
+- Artifacts are written in one pass, into a reserved header and payload in the final file, so a conversion costs its size in SSD writes rather than twice that.
+- Artifacts of expert checkpoints that declare an MTP head include its bank, as they do for dense checkpoints, which adds about one layer of experts. That is about 0.4 GiB on Qwen3.6-35B at Q4K.
+- gpt-oss ships its experts in MXFP4 and runs them as stored, so it has no artifacts. `tur prune` is its only size reduction, and it is an experiment: see [Expert cache](../architecture/expert-cache.md).

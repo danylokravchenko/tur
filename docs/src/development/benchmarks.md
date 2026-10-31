@@ -7,6 +7,8 @@ just bench <case> [args] > out.json
 # same as: cargo bench --offline -p tur --bench perf -- <case> [args]
 ```
 
+`experts <dir> <cache MiB> <text> [reference dir]` measures the expert cache: its reads, hit rate and wait, system-wide SSD writes and swap-outs, and KL against a reference checkpoint.
+
 Each case prints one JSON document to stdout and progress to stderr. Timed regions always end when the GPU finishes; timing only the moment work is queued would measure nothing. `model` and `serving` take a local Qwen or Gemma checkpoint in `TUR_BENCH_MODEL`, and the Qwen quality studies use `TUR_QWEN35_0_8B`.
 
 | Case | Measures | Main knobs |

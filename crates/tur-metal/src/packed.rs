@@ -20,6 +20,19 @@ enum Weights {
         #[cfg(feature = "metal")]
         buffer: Option<candle_metal_kernels::metal::Buffer>,
     },
+    /// MXFP4 blocks then one scale byte per block, read only by the expert kernels. The
+    /// `Arc` is what keeps Candle's pool from recycling the buffer.
+    #[cfg(feature = "metal")]
+    Mxfp4 {
+        buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
+        scales: usize,
+    },
+    /// GGML blocks in an arena the expert cache fills; the expert kernels read them in place.
+    #[cfg(feature = "metal")]
+    Arena {
+        buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
+        format: GgmlDType,
+    },
 }
 
 /// A `[out, in]` projection whose weights stay packed on the device; never expanded.
@@ -89,6 +102,108 @@ impl PackedLinear {
         })
     }
 
+    /// A `[rows, cols]` expert bank in MXFP4 on `device`: read in place by the expert
+    /// kernels on Metal, and decoded to F32 for host reference execution.
+    pub fn mxfp4(
+        blocks: &[u8],
+        scales: &[u8],
+        (rows, cols): (usize, usize),
+        device: &Device,
+    ) -> Result<Self> {
+        let count = rows
+            .checked_mul(cols / crate::quantize::MXFP4_BLOCK_VALUES)
+            .filter(|_| cols.is_multiple_of(crate::quantize::MXFP4_BLOCK_VALUES))
+            .filter(|&count| count > 0 && scales.len() == count)
+            .ok_or_else(|| invalid("MXFP4 scales do not form the projection"))?;
+        if blocks.len() / crate::quantize::MXFP4_BLOCK_BYTES != count {
+            return Err(invalid("MXFP4 blocks do not form the projection"));
+        }
+        match device {
+            #[cfg(feature = "metal")]
+            Device::Metal(metal) => {
+                let buffer = metal.new_buffer_with_data(&[blocks, scales].concat())?;
+                Ok(Self {
+                    weights: Weights::Mxfp4 {
+                        buffer,
+                        scales: blocks.len(),
+                    },
+                    out_features: rows,
+                    in_features: cols,
+                    resident_bytes: blocks.len() + scales.len(),
+                })
+            }
+            _ => Self::dense(
+                &Tensor::from_vec(
+                    crate::quantize::mxfp4_decode(blocks, scales)?,
+                    (rows, cols),
+                    &Device::Cpu,
+                )?,
+                device,
+            ),
+        }
+    }
+
+    /// Weights over an arena the expert cache fills after this returns.
+    #[cfg(feature = "metal")]
+    pub(crate) fn mxfp4_arena(
+        buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
+        scales: usize,
+        (rows, cols): (usize, usize),
+    ) -> Result<Self> {
+        let resident_bytes = buffer.length();
+        if rows == 0 || scales >= resident_bytes {
+            return Err(invalid("expert arena has no room for its scales"));
+        }
+        Ok(Self {
+            weights: Weights::Mxfp4 { buffer, scales },
+            out_features: rows,
+            in_features: cols,
+            resident_bytes,
+        })
+    }
+
+    /// GGML-block weights over an arena the expert cache fills after this returns.
+    #[cfg(feature = "metal")]
+    pub(crate) fn packed_arena(
+        buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
+        format: GgmlDType,
+        (rows, cols): (usize, usize),
+    ) -> Result<Self> {
+        let resident_bytes = crate::quantize::packed_bytes(format, rows, cols)?;
+        if rows == 0 || buffer.length() < resident_bytes {
+            return Err(invalid("expert arena is smaller than its projection"));
+        }
+        Ok(Self {
+            weights: Weights::Arena { buffer, format },
+            out_features: rows,
+            in_features: cols,
+            resident_bytes,
+        })
+    }
+
+    /// Another handle to the same arena, for each layer that reads it. Other weights have
+    /// no shared storage to hand out.
+    #[cfg(feature = "metal")]
+    pub(crate) fn arena_handle(&self) -> Result<Self> {
+        let weights = match &self.weights {
+            Weights::Arena { buffer, format } => Weights::Arena {
+                buffer: std::sync::Arc::clone(buffer),
+                format: *format,
+            },
+            Weights::Mxfp4 { buffer, scales } => Weights::Mxfp4 {
+                buffer: std::sync::Arc::clone(buffer),
+                scales: *scales,
+            },
+            _ => return Err(invalid("only arena weights can be shared")),
+        };
+        Ok(Self {
+            weights,
+            out_features: self.out_features,
+            in_features: self.in_features,
+            resident_bytes: self.resident_bytes,
+        })
+    }
+
     /// Stack `[rows, in]` parts into one `[Σ rows, in]` projection, converting and
     /// quantizing one part at a time so the host never holds more than one full-precision
     /// part. GGML blocks never span rows, so the packed bytes equal quantizing the whole
@@ -153,7 +268,7 @@ impl PackedLinear {
                     .ok_or_else(|| invalid("packed rows outside weights"))?;
                 Self::from_blocks(prefix, *format, (rows, self.in_features), &packed.device())
             }
-            Weights::Packed { .. } => Err(invalid("packed weights lost their blocks")),
+            _ => Err(invalid("weights have no host blocks")),
         }
     }
 
@@ -173,8 +288,10 @@ impl PackedLinear {
     /// Packed GGML format, or `None` for dense weights.
     pub fn format(&self) -> Option<GgmlDType> {
         match &self.weights {
-            Weights::Dense(_) => None,
             Weights::Packed { format, .. } => Some(*format),
+            #[cfg(feature = "metal")]
+            Weights::Arena { format, .. } => Some(*format),
+            _ => None,
         }
     }
 
@@ -183,6 +300,8 @@ impl PackedLinear {
         Ok(match &self.weights {
             Weights::Dense(weight) => x.matmul(&weight.t()?)?,
             Weights::Packed { matmul, .. } => matmul.forward(x)?,
+            #[cfg(feature = "metal")]
+            Weights::Mxfp4 { .. } | Weights::Arena { .. } => return Err(host_read()),
         })
     }
 
@@ -215,6 +334,8 @@ impl PackedLinear {
                 QMatMul::from_qtensor(slice)?.forward(x)?
             }
             Weights::Packed { matmul, .. } => matmul.forward(x)?.narrow(1, start, rows)?,
+            #[cfg(feature = "metal")]
+            Weights::Mxfp4 { .. } | Weights::Arena { .. } => return Err(host_read()),
         })
     }
 
@@ -228,7 +349,7 @@ impl PackedLinear {
                 matmul: QMatMul::QTensor(packed),
                 ..
             } => packed.embedding(ids)?,
-            Weights::Packed { .. } => return Err(invalid("packed weights lost their blocks")),
+            _ => return Err(host_read()),
         })
     }
 
@@ -240,7 +361,7 @@ impl PackedLinear {
                 matmul: QMatMul::QTensor(packed),
                 ..
             } => packed.dequantize(&packed.device())?,
-            Weights::Packed { .. } => return Err(invalid("packed weights lost their blocks")),
+            _ => return Err(host_read()),
         })
     }
 
@@ -252,7 +373,7 @@ impl PackedLinear {
                 matmul: QMatMul::QTensor(packed),
                 ..
             } => Some(packed.data()?.into_owned()),
-            Weights::Packed { .. } => return Err(invalid("packed weights lost their blocks")),
+            _ => return Err(host_read()),
         })
     }
 
@@ -260,7 +381,7 @@ impl PackedLinear {
     pub(crate) fn dense_tensor(&self) -> Option<&Tensor> {
         match &self.weights {
             Weights::Dense(weight) => Some(weight),
-            Weights::Packed { .. } => None,
+            _ => None,
         }
     }
 
@@ -274,9 +395,25 @@ impl PackedLinear {
                 format,
                 ..
             } => Some((buffer, *format)),
+            Weights::Arena { buffer, format } => Some((buffer.as_ref(), *format)),
             _ => None,
         }
     }
+}
+
+#[cfg(feature = "metal")]
+impl PackedLinear {
+    /// MXFP4 buffer and the byte offset of its scales, when these weights are in MXFP4.
+    pub(crate) fn mxfp4_buffer(&self) -> Option<(&candle_metal_kernels::metal::Buffer, usize)> {
+        match &self.weights {
+            Weights::Mxfp4 { buffer, scales } => Some((buffer.as_ref(), *scales)),
+            _ => None,
+        }
+    }
+}
+
+fn host_read() -> tur_core::TurError {
+    invalid("these weights have no host blocks; only the device kernels read them")
 }
 
 /// A host F32 copy that owns its storage from offset zero: GGML quantization and device

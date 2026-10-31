@@ -71,6 +71,7 @@ pub(crate) fn rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 
 /// Causal grouped-query attention for `n` new queries at positions `past..past+n`.
 /// `keys`/`values` hold all `past + n` positions as `[length, kv_heads, head_dim]`.
+/// `sinks`, one logit per query head, join each softmax and are dropped from its output.
 pub(crate) fn attention(
     q: &Tensor,
     keys: &Tensor,
@@ -78,6 +79,7 @@ pub(crate) fn attention(
     past: usize,
     scale: f64,
     window: Option<usize>,
+    sinks: Option<&Tensor>,
 ) -> Result<Tensor> {
     let (n, heads, dim) = q.dims3()?;
     let (length, kv_heads, kdim) = keys.dims3()?;
@@ -113,7 +115,20 @@ pub(crate) fn attention(
             })
             .collect();
         let mask = Tensor::from_vec(mask, (1, rows, visible), q.device())?;
-        let probs = candle_nn::ops::softmax_last_dim(&scores.broadcast_add(&mask)?)?;
+        let scores = scores.broadcast_add(&mask)?;
+        let probs = match sinks {
+            Some(sinks) => {
+                let sinks = sinks
+                    .reshape((heads, 1, 1))?
+                    .broadcast_as((heads, rows, 1))?
+                    .contiguous()?;
+                let joined = Tensor::cat(&[&scores.contiguous()?, &sinks], 2)?;
+                candle_nn::ops::softmax_last_dim(&joined)?
+                    .narrow(2, 0, visible)?
+                    .contiguous()?
+            }
+            None => candle_nn::ops::softmax_last_dim(&scores)?,
+        };
         let block = probs.matmul(&values.narrow(1, 0, visible)?.contiguous()?)?;
         blocks.push(block.transpose(0, 1)?);
     }

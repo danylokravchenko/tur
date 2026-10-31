@@ -121,7 +121,10 @@ impl Args {
     }
 }
 
-pub(crate) async fn serve(args: Args) -> Result<()> {
+pub(crate) async fn serve(mut args: Args) -> Result<()> {
+    if args.model.caches_experts() {
+        args.pipeline.prefer_large_passes();
+    }
     let stream = args.stream_config()?;
     let pipeline = args.pipeline_config()?;
     let default_model = args

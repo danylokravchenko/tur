@@ -87,10 +87,21 @@ static inline uchar2 q4k_scale_min(uint j, device const uchar *q) {
 }
 
 // Eight consecutive dequantized weights of `row` from element 32 * chunk + start, where
-// start is a multiple of four below 32. FORMAT: 0 F32, 1 Q8_0, 2 Q4_K.
+// start is a multiple of four below 32. FORMAT: 0 F32, 1 Q8_0, 2 Q4_K, 3 MXFP4, whose scale
+// bytes follow the blocks at byte offset `scales`.
+constant float MXFP4_VALUES[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 template <uint FORMAT> inline void packed_weights8(device const uchar *w, ulong row, uint chunk,
-    uint start, uint width, thread float4 &lo, thread float4 &hi) {
-    if (FORMAT == 0) {
+    uint start, uint width, thread float4 &lo, thread float4 &hi, ulong scales = 0) {
+    if (FORMAT == 3) {
+        ulong block = row * (width / 32) + chunk;
+        // 2^(s - 127) as float bits, so no scale needs a power function.
+        float d = as_type<float>(uint(w[scales + block]) << 23);
+        // Eight values of a block are four bytes; start is even, so low nibbles lead.
+        uint q = as_type<uint>(uchar4(*((device const packed_uchar4 *)(w + block * 16 + start / 2))));
+        lo = float4(MXFP4_VALUES[q & 15], MXFP4_VALUES[(q >> 4) & 15], MXFP4_VALUES[(q >> 8) & 15], MXFP4_VALUES[(q >> 12) & 15]) * d;
+        hi = float4(MXFP4_VALUES[(q >> 16) & 15], MXFP4_VALUES[(q >> 20) & 15], MXFP4_VALUES[(q >> 24) & 15], MXFP4_VALUES[q >> 28]) * d;
+    } else if (FORMAT == 0) {
         device const packed_float4 *v = (device const packed_float4 *)((device const float *)w
             + row * width + chunk * 32 + start);
         lo = float4(v[0]); hi = float4(v[1]);

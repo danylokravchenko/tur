@@ -46,6 +46,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             recurrent: DType::F32,
             mtp: None,
             audio: false,
+            expert_cache: None,
         },
     )?;
     device.synchronize()?;

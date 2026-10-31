@@ -30,7 +30,7 @@ use crate::{
             DeltaToolCall, MessageContent, PromptTokensDetails, ResponseFunction, ResponseToolCall,
             Usage,
         },
-        worker::WorkerMsg,
+        worker::{TextDelta, WorkerMsg},
     },
 };
 
@@ -407,6 +407,7 @@ async fn blocking_response(
             message: ChatResponseMessage {
                 role: "assistant",
                 content,
+                reasoning_content: Some(stats.reasoning_text.clone()).filter(|r| !r.is_empty()),
                 tool_calls: response_tool_calls
                     .iter()
                     .map(|tc| ResponseToolCall {
@@ -435,9 +436,25 @@ async fn blocking_response(
 
 // ── Streaming ─────────────────────────────────────────────────────────────────
 
+/// One streamed chunk carrying `delta`, with no finish reason yet.
+fn delta_chunk(id: &str, created: u64, model: &str, delta: DeltaMessage) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.to_owned(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.to_owned(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta,
+            finish_reason: None,
+        }],
+        usage: None,
+    }
+}
+
 fn stream_response(
     model_id: String,
-    mut token_rx: mpsc::Receiver<String>,
+    mut token_rx: mpsc::Receiver<TextDelta>,
     result_rx: oneshot::Receiver<crate::Result<GenerationStats>>,
 ) -> Response {
     let id = new_completion_id();
@@ -445,51 +462,41 @@ fn stream_response(
 
     let stream = async_stream::stream! {
         // First delta establishes the assistant role.
-        let first = ChatCompletionChunk {
-            id: id.clone(),
-            object: "chat.completion.chunk",
-            created,
-            model: model_id.clone(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: DeltaMessage { role: Some("assistant"), content: None, tool_calls: vec![] },
-                finish_reason: None,
-            }],
-            usage: None,
-        };
+        let first = delta_chunk(&id, created, &model_id, DeltaMessage { role: Some("assistant"), content: None, reasoning_content: None, tool_calls: vec![] });
         match serde_json::to_string(&first) {
             Ok(data) => yield Ok::<Event, String>(Event::default().data(data)),
             Err(e) => { yield Err(e.to_string()); return; }
         }
 
-        let delta = |text: String| ChatCompletionChunk {
-            id: id.clone(),
-            object: "chat.completion.chunk",
-            created,
-            model: model_id.clone(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: DeltaMessage { role: None, content: Some(text), tool_calls: vec![] },
-                finish_reason: None,
-            }],
-            usage: None,
+        let delta = |text: String| {
+            delta_chunk(&id, created, &model_id, DeltaMessage {
+                role: None,
+                content: Some(text),
+                reasoning_content: None,
+                tool_calls: vec![],
+            })
         };
-        let mut streamed = String::new();
-        while let Some(token) = token_rx.recv().await {
-            streamed.push_str(&token);
-            let chunk = ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk",
-                created,
-                model: model_id.clone(),
-                choices: vec![ChunkChoice {
-                    index: 0,
-                    delta: DeltaMessage { role: None, content: Some(token), tool_calls: vec![] },
-                    finish_reason: None,
-                }],
-                usage: None,
+        let reasoning_delta = |text: String| {
+            delta_chunk(&id, created, &model_id, DeltaMessage {
+                role: None,
+                content: None,
+                reasoning_content: Some(text),
+                tool_calls: vec![],
+            })
+        };
+        let (mut streamed, mut streamed_reasoning) = (String::new(), String::new());
+        while let Some(text) = token_rx.recv().await {
+            let piece = match text {
+                TextDelta::Content(text) => {
+                    streamed.push_str(&text);
+                    delta(text)
+                }
+                TextDelta::Reasoning(text) => {
+                    streamed_reasoning.push_str(&text);
+                    reasoning_delta(text)
+                }
             };
-            match serde_json::to_string(&chunk) {
+            match serde_json::to_string(&piece) {
                 Ok(data) => yield Ok(Event::default().data(data)),
                 Err(e) => warn!("chunk serialisation error: {e}"),
             }
@@ -509,6 +516,14 @@ fn stream_response(
         };
         // Text the worker could not hand over before completion without waiting on this
         // client; streamed fragments always concatenate to a prefix of the final text.
+        if let Some(rest) = stats.reasoning_text.strip_prefix(streamed_reasoning.as_str())
+            && !rest.is_empty()
+        {
+            match serde_json::to_string(&reasoning_delta(rest.to_owned())) {
+                Ok(data) => yield Ok(Event::default().data(data)),
+                Err(e) => warn!("chunk serialisation error: {e}"),
+            }
+        }
         if let Some(rest) = stats.generated_text.strip_prefix(streamed.as_str())
             && !rest.is_empty()
         {
@@ -520,32 +535,22 @@ fn stream_response(
 
         // Emit parsed tool-call deltas when the model produced any.
         for (idx, tc) in stats.tool_calls.iter().enumerate() {
-            let call_chunk = ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk",
-                created,
-                model: model_id.clone(),
-                choices: vec![ChunkChoice {
-                    index: 0,
-                    delta: DeltaMessage {
-                        role: None,
-                        content: None,
-                        tool_calls: vec![DeltaToolCall {
-                            index: idx as u32,
-                            id: Some(format!("call_{:08x}", Uuid::new_v4().as_fields().0)),
-                            call_type: Some("function"),
-                            function: Some(DeltaFunction {
-                                name: Some(tc.name.clone()),
-                                arguments: Some(
-                                    serde_json::to_string(&tc.arguments).unwrap_or_default(),
-                                ),
-                            }),
-                        }],
-                    },
-                    finish_reason: None,
+            let call_chunk = delta_chunk(&id, created, &model_id, DeltaMessage {
+                role: None,
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![DeltaToolCall {
+                    index: idx as u32,
+                    id: Some(format!("call_{:08x}", Uuid::new_v4().as_fields().0)),
+                    call_type: Some("function"),
+                    function: Some(DeltaFunction {
+                        name: Some(tc.name.clone()),
+                        arguments: Some(
+                            serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                        ),
+                    }),
                 }],
-                usage: None,
-            };
+            });
             match serde_json::to_string(&call_chunk) {
                 Ok(data) => yield Ok(Event::default().data(data)),
                 Err(e) => warn!("tool-call chunk serialisation error: {e}"),
@@ -562,7 +567,7 @@ fn stream_response(
             model: model_id.clone(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: DeltaMessage { role: None, content: None, tool_calls: vec![] },
+                delta: DeltaMessage { role: None, content: None, reasoning_content: None, tool_calls: vec![] },
                 finish_reason: Some(finish_reason),
             }],
             usage: Some(Usage {

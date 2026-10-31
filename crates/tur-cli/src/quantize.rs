@@ -65,16 +65,32 @@ pub(crate) struct Args {
 }
 
 fn samples(args: &Args) -> Result<Vec<Vec<u32>>> {
-    let tokenizer = tokenizers::Tokenizer::from_file(args.model.join("tokenizer.json"))
+    encode_samples(
+        &args.model,
+        &args.calibration,
+        args.calibration_tokens,
+        args.sample_tokens,
+    )
+}
+
+/// Tokenize `paths` with the checkpoint's tokenizer into independent samples of at most
+/// `sample_tokens`, until `tokens` have been taken.
+pub(crate) fn encode_samples(
+    model: &std::path::Path,
+    paths: &[PathBuf],
+    tokens: usize,
+    sample_tokens: usize,
+) -> Result<Vec<Vec<u32>>> {
+    let tokenizer = tokenizers::Tokenizer::from_file(model.join("tokenizer.json"))
         .map_err(|e| TurError::Tokenizer(e.to_string()))?;
     let mut samples = Vec::new();
-    let mut budget = args.calibration_tokens;
-    for path in &args.calibration {
+    let mut budget = tokens;
+    for path in paths {
         let text = std::fs::read_to_string(path)?;
         let ids = tokenizer
             .encode(text.as_str(), false)
             .map_err(|e| TurError::Tokenizer(e.to_string()))?;
-        for sample in ids.get_ids().chunks(args.sample_tokens.max(1)) {
+        for sample in ids.get_ids().chunks(sample_tokens.max(1)) {
             if budget == 0 {
                 return Ok(samples);
             }
@@ -225,6 +241,7 @@ fn mixed_plan(
             recurrent: DEFAULT_RECURRENT_STATE,
             mtp: None,
             audio: false,
+            expert_cache: None,
         },
     )?;
     let calibration = model.calibrate(samples, args.method == Method::Gptq)?;

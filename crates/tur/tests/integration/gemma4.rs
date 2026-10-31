@@ -39,6 +39,7 @@ fn options(
         recurrent: DType::F32,
         mtp: None,
         audio: false,
+        expert_cache: None,
     }
 }
 #[cfg(feature = "metal")]

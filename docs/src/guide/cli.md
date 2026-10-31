@@ -3,10 +3,11 @@
 `tur` has four commands:
 
 ```text
-tur run         Generate one completion and stream it to stdout
+tur run         Generate one completion: the answer to stdout, separated reasoning to stderr
 tur serve       Serve one model over an OpenAI-compatible HTTP API
 tur transcribe  Transcribe a WAV file with a Whisper checkpoint
 tur quantize    Prepack weights offline, optionally calibrated, for instant loading
+tur prune       Experiment: write a gpt-oss checkpoint with fewer experts
 ```
 
 `tur <command> --help` prints every flag. This page groups the flags by purpose and gives their defaults.
@@ -26,6 +27,7 @@ tur quantize    Prepack weights offline, optionally calibrated, for instant load
 | `--kv-page-tokens <n>` | 16 | Tokens per K/V page |
 | `--recurrent-state f32\|f16` | `f32` | Storage for DeltaNet recurrent state |
 | `--audio-encoder [true\|false]` | `true` | Load the checkpoint's audio encoder when it has one (Gemma 4 E2B and E4B); `false` saves its memory |
+| `--expert-cache-mb <MiB>` | every expert resident | Keep gpt-oss experts, or a Qwen artifact's, on disk and read them into this much memory; see [Expert cache](../architecture/expert-cache.md) |
 | `--cpu-reference` | off | Run the slow F32 CPU reference instead of Metal, for development |
 
 Gemma 4 uses the same commands. For the E2B model used in development:
@@ -48,7 +50,7 @@ tur run --model google/gemma-4-E2B-it --revision 3e22461f65e89153144f8adb70e3b8c
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--prefill-chunk-size <n>` | 256 | Most prompt tokens one request adds to one pass |
+| `--prefill-chunk-size <n>` | 256, or 1024 with `--expert-cache-mb` | Most prompt tokens one request adds to one pass |
 | `--state-memory-mb <n>` | derived | Memory for K/V pages and recurrent state. By default, room for an 8K-token context per concurrent request |
 | `--speculative-draft <n>` | 0 | Most tokens drafted from the request's own text per step; 0 turns speculation off |
 | `--mtp [true\|false]` | off | Also draft with the checkpoint's multi-token-prediction head; turns off prefix reuse |

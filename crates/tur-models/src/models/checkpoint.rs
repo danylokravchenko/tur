@@ -184,6 +184,33 @@ impl Checkpoint {
         Ok((entry, file))
     }
 
+    #[cfg(feature = "metal")]
+    /// File and absolute payload offset of a validated tensor, for reading parts of it later.
+    pub(crate) fn location(&self, name: &str) -> Result<(&Path, u64)> {
+        let entry = self
+            .entries
+            .get(name)
+            .ok_or_else(|| invalid(format!("missing tensor {name}")))?;
+        Ok((&self.files[entry.file], entry.offset))
+    }
+
+    /// File index and absolute payload offset of a validated tensor.
+    pub(crate) fn located(&self, name: &str) -> Result<(usize, u64)> {
+        let entry = self
+            .entries
+            .get(name)
+            .ok_or_else(|| invalid(format!("missing tensor {name}")))?;
+        Ok((entry.file, entry.offset))
+    }
+
+    /// Read-only handles of every file, indexed as [`Self::located`] reports.
+    pub(crate) fn open_files(&self) -> Result<Vec<std::fs::File>> {
+        self.files
+            .iter()
+            .map(|path| Ok(std::fs::File::open(path)?))
+            .collect()
+    }
+
     /// Read just this tensor's payload, after every header has passed validation.
     pub(crate) fn take_raw(&self, name: &str) -> Result<(Entry, Vec<u8>)> {
         let (entry, mut file) = self.locate(name)?;

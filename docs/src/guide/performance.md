@@ -197,6 +197,17 @@ With one sequence, the assistant now chains several drafts per pass, which measu
 
 The artifact reads embeddings from its packed output layer, which saves the 805 MB embedding table. Of either total, 4.4 GiB is Gemma's per-layer embedding table.
 
+## gpt-oss-20b
+
+This model holds 12.8 GiB of weights, more than a 16 GB M1's GPU working set, so it runs through the [expert cache](../architecture/expert-cache.md) with most experts on the SSD. One request, Q8_0 attention and output projections, MXFP4 experts as published:
+
+| Cache | Decode, tokens/s | Hit rate |
+| --- | ---: | ---: |
+| 1 GiB | 3.1 | 34% |
+| 2 GiB | 3.3 | 52% |
+
+A 2,037-token prompt takes 18 s with a 1 GiB cache, about 115 tokens/s. Repeating it with a different ending takes 10 s. These numbers come from `tur run` on a Mac with an editor and browser open, and concurrent requests are not yet measured.
+
 ## Whisper large-v3-turbo
 
 `openai/whisper-large-v3-turbo` at revision `41f01f3fe87f28c78e2fbf8b568835947dd65ed9`, on clips spoken by macOS `say`, measured with `just bench whisper`. Language is detected from the first window unless a row says otherwise, and every time excludes loading the checkpoint.

@@ -82,6 +82,8 @@ Image and video parts are rejected, and so are prompts containing the model's im
 
 `finish_reason` is `stop` when the model ends its turn, `length` when it hits `max_tokens`, or `tool_calls`. `completion_tokens` counts sampled tokens, including the end-of-turn token. `cached_tokens` counts prompt tokens restored from a prefix snapshot rather than computed, which is a quick way to check that prefix reuse is working.
 
+For gpt-oss, which writes its reasoning on a separate Harmony channel, `message.reasoning_content` holds the reasoning and `content` only the answer. Send it back in `reasoning_content` on later turns with tool calls, and the template replays it.
+
 When the model emits complete function calls, Tur parses them against each tool's parameter schema and returns them as `tool_calls` with no `content`. Tur never runs the tools itself.
 
 ### Streaming
@@ -89,7 +91,7 @@ When the model emits complete function calls, Tur parses them against each tool'
 With `"stream": true`, the response is `text/event-stream`:
 
 1. A chunk with `delta: {"role": "assistant"}`.
-2. Text chunks with `delta.content`, one per model pass at most.
+2. Text chunks with `delta.content`, one per model pass at most. Reasoning a model separates arrives the same way in `delta.reasoning_content`.
 3. Tool-call chunks, if any.
 4. A final chunk with `finish_reason` and `usage`.
 5. `data: [DONE]`.

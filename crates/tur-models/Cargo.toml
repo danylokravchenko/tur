@@ -9,6 +9,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+parking_lot.workspace = true
 tur-core = { path = "../tur-core", default-features = false }
 tur-metal = { path = "../tur-metal", default-features = false }
 candle-core.workspace = true

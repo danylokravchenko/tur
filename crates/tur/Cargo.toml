@@ -28,6 +28,7 @@ tower-http = { workspace = true }
 async-stream = { workspace = true }
 
 [dev-dependencies]
+candle-nn.workspace = true
 tokenizers.workspace = true
 tower.workspace = true
 http-body-util.workspace = true

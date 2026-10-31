@@ -22,6 +22,8 @@ pub struct ExpertRoutes {
     tokens: usize,
     experts: usize,
     top_k: usize,
+    /// Banks the weights hold when `tiles` address slots of an arena rather than experts.
+    slots: Option<usize>,
 }
 
 #[repr(C)]
@@ -41,6 +43,15 @@ struct ExpertParams {
     stride: u32,
     out: u32,
     routed: u32,
+    scales: u64,
+}
+#[repr(C)]
+struct GluParams {
+    rows: u32,
+    width: u32,
+    stride: u32,
+    alpha: f32,
+    limit: f32,
 }
 #[repr(C)]
 struct ScatterParams {
@@ -62,6 +73,21 @@ pub struct SharedExpert<'a> {
 }
 
 impl ExpertRoutes {
+    /// Tile rows `[expert, first row, rows, wide]`; waits for all GPU work before this.
+    pub(crate) fn tile_values(&self) -> Result<Vec<f32>> {
+        Ok(self.tiles.flatten_all()?.to_vec1::<f32>()?)
+    }
+    /// `(token, expert)` of each output row in group order; waits for all GPU work.
+    pub fn assignment_rows(&self) -> Result<Vec<(usize, usize)>> {
+        let values = self.order.flatten_all()?.to_vec1::<f32>()?;
+        Ok(values
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|row| (row[0] as usize / self.top_k, row[1] as usize))
+            .collect())
+    }
+
     fn rows(&self) -> usize {
         self.tokens * self.top_k
     }
@@ -80,6 +106,7 @@ impl ExpertRoutes {
             stride: to_u32(stride, "row stride")?,
             out: to_u32(out, "output width")?,
             routed: u32::from(routed),
+            scales: 0,
         })
     }
 }
@@ -212,6 +239,26 @@ impl Kernels {
             tokens,
             experts,
             top_k,
+            slots: None,
+        })
+    }
+
+    /// `routes` reading `tiles` whose expert field now holds a slot of an arena of `slots`
+    /// banks. Only the weight kernels read that field: the permutation and the scatter keep
+    /// original expert IDs, so biases and accumulation order do not change.
+    pub(crate) fn with_slots(
+        &self,
+        routes: ExpertRoutes,
+        tiles: Vec<f32>,
+        slots: usize,
+    ) -> Result<ExpertRoutes> {
+        if tiles.len() != routes.tiles.elem_count() {
+            return Err(invalid("expert slot tiles changed shape"));
+        }
+        Ok(ExpertRoutes {
+            tiles: crate::experts::tile_tensor(tiles, self.device())?,
+            slots: Some(slots),
+            ..routes
         })
     }
 
@@ -279,24 +326,29 @@ impl Kernels {
     ) -> Result<Tensor> {
         let xv = self.view(x)?;
         let width = layer.in_features();
-        let out_width = layer.out_features() / routes.experts;
+        let banks = routes.slots.unwrap_or(routes.experts);
+        let out_width = layer.out_features() / banks;
         let rows = if routed { routes.tokens } else { routes.rows() };
         if xv.rows != rows
             || xv.cols != width
             || !width.is_multiple_of(32)
             || out_width == 0
-            || !layer.out_features().is_multiple_of(routes.experts)
+            || !layer.out_features().is_multiple_of(banks)
         {
             return Err(invalid(
                 "grouped expert projection shape differs or width is not a multiple of 32",
             ));
         }
-        let p = routes.params(width, xv.row_stride, out_width, routed)?;
+        let mut p = routes.params(width, xv.row_stride, out_width, routed)?;
         // GEMV outputs per simdgroup match the dense GEMV kernels.
-        let (suffix, gemv_rows, packed) = match layer.packed_buffer() {
-            Some((buffer, GgmlDType::Q8_0)) => ("q8_0", 4, Some(buffer)),
-            Some((buffer, GgmlDType::Q4K)) => ("q4k", 4, Some(buffer)),
-            None if layer.format().is_none() => ("f32", 4, None),
+        let (suffix, gemv_rows, packed) = match (layer.packed_buffer(), layer.mxfp4_buffer()) {
+            (_, Some((buffer, scales))) => {
+                p.scales = scales as u64;
+                ("mxfp4", 4, Some(buffer))
+            }
+            (Some((buffer, GgmlDType::Q8_0)), _) => ("q8_0", 4, Some(buffer)),
+            (Some((buffer, GgmlDType::Q4K)), _) => ("q4k", 4, Some(buffer)),
+            (None, None) if layer.format().is_none() => ("f32", 4, None),
             _ => return Err(invalid("unsupported expert weight format")),
         };
         let dense = layer.dense_tensor().map(|t| self.view(t)).transpose()?;
@@ -370,6 +422,80 @@ impl Kernels {
                 })?;
         }
         self.finish(out, (routes.rows(), out_width))
+    }
+
+    /// `x + bias[expert]` over one row per assignment in group order; `bias` is
+    /// `[experts, width]` and stays indexed by original expert IDs.
+    pub fn expert_bias(&self, x: &Tensor, bias: &Tensor, routes: &ExpertRoutes) -> Result<Tensor> {
+        let xv = self.view(x)?;
+        let bv = self.view(bias)?;
+        xv.expect(routes.rows(), xv.cols, "expert output")?;
+        bv.expect(routes.experts, xv.cols, "expert bias")?;
+        bv.contiguous("expert bias")?;
+        let order = self.view(&routes.order)?;
+        let p = routes.params(xv.cols, xv.row_stride, xv.cols, false)?;
+        let out = self.output(routes.rows(), xv.cols)?;
+        self.runtime.dispatch(
+            self.pipeline("moe_bias_f32")?,
+            "tur_moe_bias",
+            routes.rows(),
+            BLOCK,
+            |e| {
+                xv.bind(e, 0)?;
+                order.bind(e, 1)?;
+                bv.bind(e, 2)?;
+                out.bind(e, 3);
+                e.set_bytes(4, &p);
+                Ok(())
+            },
+        )?;
+        self.finish(out, (routes.rows(), xv.cols))
+    }
+
+    /// `(clamp(up) + 1) * gate * sigmoid(gate * alpha)` over interleaved gate|up columns of
+    /// one row per assignment, after adding each expert's `[experts, 2 * width]` bias.
+    /// Gates clamp above at `limit`, and ups to `±limit`. Returns `[rows, width]`.
+    pub fn expert_glu(
+        &self,
+        gate_up: &Tensor,
+        bias: &Tensor,
+        routes: &ExpertRoutes,
+        alpha: f32,
+        limit: f32,
+    ) -> Result<Tensor> {
+        let xv = self.view(gate_up)?;
+        let bv = self.view(bias)?;
+        xv.expect(routes.rows(), xv.cols, "expert gate|up")?;
+        bv.expect(routes.experts, xv.cols, "expert gate|up bias")?;
+        bv.contiguous("expert gate|up bias")?;
+        if !xv.cols.is_multiple_of(2) {
+            return Err(invalid("expert gate|up width is odd"));
+        }
+        let width = xv.cols / 2;
+        let order = self.view(&routes.order)?;
+        let p = GluParams {
+            rows: to_u32(routes.rows(), "assignments")?,
+            width: to_u32(width, "width")?,
+            stride: to_u32(xv.row_stride, "row stride")?,
+            alpha,
+            limit,
+        };
+        let out = self.output(routes.rows(), width)?;
+        self.runtime.dispatch(
+            self.pipeline("moe_glu_f32")?,
+            "tur_moe_glu",
+            routes.rows(),
+            BLOCK,
+            |e| {
+                xv.bind(e, 0)?;
+                order.bind(e, 1)?;
+                bv.bind(e, 2)?;
+                out.bind(e, 3);
+                e.set_bytes(4, &p);
+                Ok(())
+            },
+        )?;
+        self.finish(out, (routes.rows(), width))
     }
 
     /// Weighted scatter to token order, accumulated in expert ID order for stable rounding.

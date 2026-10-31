@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::path::Path;
+use std::{fmt::Write as _, path::Path};
 
 use crate::backend::tools::ToolDefinition;
 use crate::{Result, TurError, audio::Audio};
@@ -205,7 +205,19 @@ impl ChatTemplate {
         env.add_template("chat", &self.source)
             .map_err(|e| TurError::Other(format!("chat template compile error: {e}")))?;
         let mut ctx = self.tokens.clone();
-        ctx.insert("messages".into(), serde_json::to_value(messages)?);
+        let mut rendered = serde_json::to_value(messages)?;
+        // Harmony templates replay reasoning from `thinking`, not `reasoning_content`.
+        if self.source.contains("message.thinking")
+            && !self.source.contains("reasoning_content")
+            && let Some(turns) = rendered.as_array_mut()
+        {
+            for turn in turns.iter_mut().filter_map(|turn| turn.as_object_mut()) {
+                if let Some(reasoning) = turn.remove("reasoning_content") {
+                    turn.insert("thinking".into(), reasoning);
+                }
+            }
+        }
+        ctx.insert("messages".into(), rendered);
         ctx.insert(
             "add_generation_prompt".into(),
             options.add_generation_prompt.into(),
@@ -245,6 +257,58 @@ impl ChatTemplate {
     }
 }
 
+/// `strftime_now(format)`, as Transformers offers templates, in UTC. Templates only stamp
+/// a date, so `%Y`, `%m`, `%d` and `%%` are supported and anything else is an error.
+fn strftime_now(format: &str) -> std::result::Result<String, minijinja::Error> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| template_error(format!("strftime_now: {e}")))?
+        .as_secs();
+    format_date(format, seconds / 86_400)
+}
+
+fn date_error(error: std::fmt::Error) -> minijinja::Error {
+    template_error(format!("strftime_now: {error}"))
+}
+
+/// `format` for the civil date `days` after 1970-01-01 (Hinnant's `civil_from_days`).
+fn format_date(format: &str, days: u64) -> std::result::Result<String, minijinja::Error> {
+    let shifted = days + 719_468;
+    let era = shifted / 146_097;
+    let of_era = shifted - era * 146_097;
+    let year_of_era = (of_era - of_era / 1460 + of_era / 36_524 - of_era / 146_096) / 365;
+    let day_of_year = of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    let mut out = String::with_capacity(format.len() + 8);
+    let mut chars = format.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => write!(out, "{year:04}").map_err(date_error)?,
+            Some('m') => write!(out, "{month:02}").map_err(date_error)?,
+            Some('d') => write!(out, "{day:02}").map_err(date_error)?,
+            Some('%') => out.push('%'),
+            other => {
+                return Err(template_error(format!(
+                    "strftime_now does not support %{}",
+                    other.unwrap_or(' ')
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Registered as a Jinja2 global so templates that call `raise_exception(msg)`
 /// produce a descriptive render error rather than a silent undefined call.
 fn raise_exception(msg: String) -> std::result::Result<minijinja::Value, minijinja::Error> {
@@ -260,6 +324,7 @@ fn faithful_environment() -> minijinja::Environment<'static> {
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
     env.add_function("raise_exception", raise_exception);
+    env.add_function("strftime_now", strftime_now);
     env.add_filter("tojson", python_tojson);
     env.set_unknown_method_callback(python_method);
     env
@@ -284,6 +349,16 @@ fn python_method(
         };
         let item = value.get_item(key)?;
         return Ok(if item.is_undefined() { default } else { item });
+    }
+    if value.kind() == minijinja::value::ValueKind::Map && method == "items" {
+        let pairs = value
+            .try_iter()?
+            .map(|key| {
+                let item = value.get_item(&key)?;
+                Ok(minijinja::Value::from(vec![key, item]))
+            })
+            .collect::<std::result::Result<Vec<_>, minijinja::Error>>()?;
+        return Ok(minijinja::Value::from(pairs));
     }
     let Some(text) = value.as_str() else {
         return Err(minijinja::Error::from(minijinja::ErrorKind::UnknownMethod));
@@ -425,6 +500,24 @@ mod tests {
             "<bos><eos>"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_strftime_formats_civil_dates_and_rejects_other_directives() {
+        assert_eq!(
+            format_date("%Y-%m-%d", 0).ok().as_deref(),
+            Some("1970-01-01")
+        );
+        // 2024-02-29 and the day after, across a leap day.
+        assert_eq!(
+            format_date("%Y-%m-%d", 19_782).ok().as_deref(),
+            Some("2024-02-29")
+        );
+        assert_eq!(
+            format_date("%Y/%m/%d %%", 19_783).ok().as_deref(),
+            Some("2024/03/01 %")
+        );
+        assert!(format_date("%H", 0).is_err());
     }
 
     #[test]

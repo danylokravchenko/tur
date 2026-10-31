@@ -17,6 +17,32 @@ pub const FORMATS: [GgmlDType; 4] = [
     GgmlDType::Q4K,
 ];
 
+/// Values one MXFP4 nibble selects, before its block's power-of-two scale.
+pub const MXFP4_VALUES: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+/// Values and packed bytes of one MXFP4 block.
+pub const MXFP4_BLOCK_VALUES: usize = 32;
+pub const MXFP4_BLOCK_BYTES: usize = 16;
+
+/// Row-major F32 values of MXFP4 `blocks` and their `scales`, one byte per block: each
+/// value is `MXFP4_VALUES[nibble] * 2^(scale - 127)`, low nibble first.
+pub fn mxfp4_decode(blocks: &[u8], scales: &[u8]) -> Result<Vec<f32>> {
+    let (groups, tail) = blocks.as_chunks::<MXFP4_BLOCK_BYTES>();
+    if groups.len() != scales.len() || !tail.is_empty() {
+        return Err(invalid("MXFP4 blocks and scales differ in count"));
+    }
+    let mut values = Vec::with_capacity(scales.len() * MXFP4_BLOCK_VALUES);
+    for (block, &scale) in groups.iter().zip(scales) {
+        let factor = 2f32.powi(i32::from(scale) - 127);
+        for &byte in block {
+            values.push(MXFP4_VALUES[usize::from(byte & 15)] * factor);
+            values.push(MXFP4_VALUES[usize::from(byte >> 4)] * factor);
+        }
+    }
+    Ok(values)
+}
+
 /// Packed bytes of `rows` rows of `cols` values in `format`.
 pub fn packed_bytes(format: GgmlDType, rows: usize, cols: usize) -> Result<usize> {
     if !FORMATS.contains(&format) {
@@ -507,6 +533,19 @@ mod tests {
             }
         }
         total / (w.len() / cols * x.len() / cols) as f64
+    }
+
+    #[test]
+    fn test_mxfp4_decodes_low_nibbles_first_and_rejects_mismatched_scales() -> Result<()> {
+        let mut block = [0u8; MXFP4_BLOCK_BYTES];
+        block[0] = 0xF1; // 0.5 then -6
+        block[15] = 0x27; // 6 then 1
+        let decoded = mxfp4_decode(&block, &[128])?;
+        assert_eq!(decoded.len(), MXFP4_BLOCK_VALUES);
+        assert_eq!(decoded[..2], [1.0, -12.0]);
+        assert_eq!(decoded[30..], [12.0, 2.0]);
+        assert!(mxfp4_decode(&block, &[128, 128]).is_err());
+        Ok(())
     }
 
     #[test]

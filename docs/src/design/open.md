@@ -2,8 +2,10 @@
 
 ## Models and hardware
 
+- Run a real Qwen MoE checkpoint through the expert cache, and make the check for spare memory continue after load, since concurrent serving can still swap.
+- Make pruning generalize. Search on KL now exists and overfits its calibration text, so the next step is far more varied calibration, or recovery training, judged by task benchmarks rather than KL.
 - Run the larger models. Qwen3.8-27B and the Qwen3.6-35B MoE need Macs that fit them, and then measurements of quality, the K/V format choice (Q8 is the likely default under 16 GB), and the wide MoE tier, which trails Candle by 1.2 to 1.5× and needs real routing traces.
-- An MTP head for the expert checkpoints.
+- Run a real expert checkpoint's MTP head and measure its draft acceptance. Only a tiny Transformers fixture has run it so far.
 - Finish Gemma 4. Run the larger checkpoints on suitable Macs and set held-out quality budgets. Assistant chains pay only with one request decoding (see [Speculative decoding](../architecture/speculation.md#decisions)); several requests need a cheaper chained step, for example gathering candidate heads in a batch without a CPU round trip per step. Calibrated Gemma artifacts (`imatrix`, GPTQ) need layer-by-layer calibration that handles PLE and shared K/V.
 - More Macs. Every number so far comes from one M1. Launch shapes and crossover points need per-device sweeps, and the minimum supported macOS and chip still has to be decided.
 

@@ -103,6 +103,15 @@ impl Checkpoint {
         Self::random_config(&config.to_string())
     }
 
+    /// A random expert checkpoint with its native multi-token prediction head.
+    #[cfg(feature = "metal")]
+    pub(crate) fn fused_moe_mtp() -> Result<Self> {
+        let mut config: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/qwen3_5_moe_config.json"))?;
+        config["mtp_num_hidden_layers"] = serde_json::json!(1);
+        Self::random_config(&config.to_string())
+    }
+
     fn random_config(config: &str) -> Result<Self> {
         Self::write(config, |name, count, seed| {
             let scale = if name.contains("norm") { 0.1 } else { 0.5 };
@@ -164,6 +173,7 @@ impl Checkpoint {
             kv: KvLayout::new(16, KvFormat::F32),
             recurrent: DType::F32,
             audio: false,
+            expert_cache: None,
         }
     }
 }

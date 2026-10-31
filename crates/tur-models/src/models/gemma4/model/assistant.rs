@@ -304,6 +304,8 @@ impl Assistant {
             }
         }
         let t = Tensors {
+            #[cfg(feature = "metal")]
+            expert_cache: None,
             checkpoint,
             prepacked: false,
             plan,
@@ -684,6 +686,7 @@ impl Gemma4 {
                     row.position - 1,
                     1.0,
                     layer.window,
+                    None,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -713,7 +716,7 @@ impl Gemma4 {
             windows.resize(end, 0);
             visible.push(u32::try_from(row.position).map_err(|_| invalid("context overflow"))?);
         }
-        super::Paging::new(
+        super::Paging::from_tables(
             k,
             &self.description,
             pass.pool,

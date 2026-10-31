@@ -91,6 +91,40 @@ struct RopeParams {
 // reference does, because a one-ulp frequency difference grows linearly with position.
 // Reads heads at an arbitrary row/head stride (e.g. the q half of an interleaved q|gate
 // projection) and writes contiguous [tokens, heads, dim]. One simdgroup per (token, head).
+kernel void rope_scaled_f32(
+    device const float *x [[buffer(0)]],
+    device const float *scale [[buffer(1)]],
+    device const uint *positions [[buffer(2)]],
+    device const float *inv_freq [[buffer(3)]],
+    device float *y [[buffer(4)]],
+    constant RopeParams &p [[buffer(5)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgs [[simdgroups_per_threadgroup]]) {
+    uint item = tg * sgs + sg;
+    if (item >= p.tokens * p.heads) {
+        return;
+    }
+    uint t = item / p.heads;
+    uint h = item % p.heads;
+    device const float *xr = x + ulong(t) * p.row_stride + p.col_offset + ulong(h) * p.head_stride;
+    float position = float(positions[t]);
+    uint half_rotary = p.half_rotary;
+    float amplitude = scale[0];
+    device float *yr = y + (ulong(t) * p.heads + h) * p.dim;
+    for (uint i = lane; i < 2 * half_rotary; i += SIMD) {
+        bool left = i < half_rotary;
+        uint f = left ? i : i - half_rotary;
+        float angle = position * inv_freq[f];
+        float c = precise::cos(angle) * amplitude;
+        float s = precise::sin(angle) * amplitude;
+        float v = xr[i];
+        float u = xr[left ? i + half_rotary : i - half_rotary];
+        yr[i] = left ? v * c - u * s : v * c + u * s;
+    }
+}
+
 kernel void qk_norm_rope_f32(
     device const float *x [[buffer(0)]],
     device const float *w [[buffer(1)]],

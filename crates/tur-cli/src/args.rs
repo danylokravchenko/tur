@@ -54,6 +54,11 @@ pub(crate) struct ModelArgs {
     /// audio (Gemma 4 E2B and E4B). `--audio-encoder=false` saves its memory (default: true).
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     audio_encoder: Option<bool>,
+    /// Keep routed experts on disk and read them on demand into this many MiB of device
+    /// memory, for gpt-oss checkpoints or Qwen `MoE` artifacts larger than the GPU's working
+    /// set. Reads only: the cache never writes to disk (default: every expert resident).
+    #[arg(long)]
+    expert_cache_mb: Option<usize>,
     /// Use the CPU numerical reference for development checks.
     #[arg(long)]
     #[serde(skip)]
@@ -61,6 +66,11 @@ pub(crate) struct ModelArgs {
 }
 
 impl ModelArgs {
+    /// Whether experts stay on disk behind a bounded cache.
+    pub(crate) fn caches_experts(&self) -> bool {
+        self.expert_cache_mb.is_some()
+    }
+
     inherit!(
         model,
         revision,
@@ -68,7 +78,8 @@ impl ModelArgs {
         kv_format,
         kv_page_tokens,
         recurrent_state,
-        audio_encoder
+        audio_encoder,
+        expert_cache_mb
     );
 
     /// Explicit paths and existing directories load locally; other values name a Hugging Face repository.
@@ -106,6 +117,13 @@ impl ModelArgs {
             kv: self.kv_layout(),
             recurrent: self.recurrent_state.unwrap_or(DType::F32),
             audio: self.audio_encoder.unwrap_or(true),
+            expert_cache: self
+                .expert_cache_mb
+                .map(|mb| {
+                    mb.checked_mul(1 << 20)
+                        .ok_or_else(|| TurError::Other("expert cache size overflow".into()))
+                })
+                .transpose()?,
         })
     }
 
@@ -233,6 +251,15 @@ pub(crate) struct PipelineArgs {
 }
 
 impl PipelineArgs {
+    /// Prefill defaults when experts stay on disk: every pass can read the whole expert set
+    /// whatever its size, so fewer, larger passes read far less. A 2,037-token prompt on
+    /// gpt-oss-20b took 32 s in 256-token chunks and 18 s in 1024-token chunks. Snapshots
+    /// sit on chunk boundaries, so their spacing has to grow with the chunk.
+    pub(crate) fn prefer_large_passes(&mut self) {
+        self.prefill_chunk_size.get_or_insert(1024);
+        self.prefix_spacing.get_or_insert(1024);
+    }
+
     inherit!(
         prefill_chunk_size,
         state_memory_mb,

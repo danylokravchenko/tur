@@ -78,6 +78,14 @@ impl TokenOutputStream {
         }
     }
 
+    /// Text still held back, ending this run of tokens so that none of it is published twice.
+    pub(crate) fn take_rest(&mut self) -> Result<Option<String>> {
+        let rest = self.decode_rest()?;
+        self.prev_index = self.tokens.len();
+        self.current_index = self.tokens.len();
+        Ok(rest)
+    }
+
     pub fn decode_all(&self) -> Result<String> {
         self.decode(&self.tokens)
     }

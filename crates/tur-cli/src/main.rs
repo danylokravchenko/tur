@@ -2,6 +2,7 @@
 //! The `tur` command: one-shot generation, the HTTP server and offline weight preparation.
 mod args;
 mod config;
+mod prune;
 mod quantize;
 mod run;
 mod serve;
@@ -30,12 +31,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Generate one completion and stream it to stdout.
+    /// Generate one completion and stream it to stdout, and any separate reasoning to stderr.
     Run(run::Args),
     /// Serve one resident model over an OpenAI-style HTTP API.
     Serve(serve::Args),
     /// Prepack weights offline, optionally calibrated, for direct loading.
     Quantize(quantize::Args),
+    /// Keep the experts a search finds each layer can least lose (gpt-oss): a checkpoint whose
+    /// kept weights are copied byte for byte.
+    Prune(prune::Args),
     /// Transcribe a WAV file with a Whisper checkpoint and print the text.
     Transcribe(transcribe::Args),
 }
@@ -67,6 +71,15 @@ fn main() -> Result<()> {
                 cli.no_config,
             )?);
             transcribe::transcribe(&args)
+        }
+        Command::Prune(args) => {
+            if cli.config.is_some() {
+                return Err(TurError::Other(
+                    "--config applies only to run and serve; prune uses explicit job arguments"
+                        .into(),
+                ));
+            }
+            prune::run(&args)
         }
         Command::Quantize(args) => {
             if cli.config.is_some() {

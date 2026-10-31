@@ -1,5 +1,6 @@
 pub use tur_models::backend::{chat_template, factory, tools};
 pub mod guidance;
+mod harmony;
 pub mod memory;
 pub mod pipeline;
 pub mod prefix;

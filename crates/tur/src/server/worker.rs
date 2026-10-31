@@ -21,11 +21,18 @@ use crate::{
     models::TextModel,
 };
 
+/// A piece of generated text and who it is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextDelta {
+    Content(String),
+    Reasoning(String),
+}
+
 /// A validated text conversation and its independent response channels. Only streaming
 /// requests carry a text channel; it is bounded (see [`StreamConfig`]).
 pub struct WorkerMsg {
     pub request: GenerationRequest,
-    pub token_tx: Option<mpsc::Sender<String>>,
+    pub token_tx: Option<mpsc::Sender<TextDelta>>,
     pub result_tx: oneshot::Sender<Result<GenerationStats>>,
 }
 
@@ -76,28 +83,40 @@ enum Undelivered {
 
 /// A streaming client's channel and the text it has not taken yet.
 struct Stream {
-    tx: mpsc::Sender<String>,
-    buffer: String,
+    tx: mpsc::Sender<TextDelta>,
+    content: String,
+    reasoning: String,
 }
 
 impl Stream {
-    /// Send everything buffered as one message, keeping it if the channel is full.
+    /// Send everything buffered, reasoning first as the model writes it, keeping what the
+    /// channel has no room for.
     fn flush(&mut self, limit: usize) -> std::result::Result<(), Undelivered> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-        match self.tx.try_send(std::mem::take(&mut self.buffer)) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(text)) => {
-                self.buffer = text;
-                if self.buffer.len() > limit {
-                    Err(Undelivered::Stalled(self.buffer.len()))
-                } else {
-                    Ok(())
+        for (buffer, wrap) in [
+            (
+                &mut self.reasoning,
+                TextDelta::Reasoning as fn(String) -> TextDelta,
+            ),
+            (&mut self.content, TextDelta::Content),
+        ] {
+            if buffer.is_empty() {
+                continue;
+            }
+            match self.tx.try_send(wrap(std::mem::take(buffer))) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(
+                    TextDelta::Content(text) | TextDelta::Reasoning(text),
+                )) => *buffer = text,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(Undelivered::Disconnected);
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(Undelivered::Disconnected),
         }
+        let held = self.content.len() + self.reasoning.len();
+        if held > limit {
+            return Err(Undelivered::Stalled(held));
+        }
+        Ok(())
     }
 }
 
@@ -213,7 +232,8 @@ fn admit(
                 PendingRequest {
                     stream: msg.token_tx.map(|tx| Stream {
                         tx,
-                        buffer: String::new(),
+                        content: String::new(),
+                        reasoning: String::new(),
                     }),
                     result_tx: msg.result_tx,
                 },
@@ -250,9 +270,14 @@ fn deliver(
     pending: &mut HashMap<Uuid, PendingRequest>,
     config: StreamConfig,
 ) -> Result<()> {
+    for (id, text) in step.new_reasoning {
+        if let Some(stream) = pending.get_mut(&id).and_then(|r| r.stream.as_mut()) {
+            stream.reasoning.push_str(&text);
+        }
+    }
     for (id, text) in step.new_tokens {
         if let Some(stream) = pending.get_mut(&id).and_then(|r| r.stream.as_mut()) {
-            stream.buffer.push_str(&text);
+            stream.content.push_str(&text);
         }
     }
     for (id, result) in step.completed {
@@ -395,7 +420,7 @@ impl PipelineWorker {
     }
 
     /// Bounded text channel for one streaming request.
-    pub fn stream_channel(&self) -> (mpsc::Sender<String>, mpsc::Receiver<String>) {
+    pub fn stream_channel(&self) -> (mpsc::Sender<TextDelta>, mpsc::Receiver<TextDelta>) {
         mpsc::channel(self.stream.channel_capacity.max(1))
     }
 
@@ -499,6 +524,7 @@ mod tests {
                 kv: DEFAULT_KV_LAYOUT,
                 recurrent: DEFAULT_RECURRENT_STATE,
                 audio: false,
+                expert_cache: None,
             },
             pipeline: PipelineConfig::new(1, 64),
             budget: DeviceBudget::new(None),

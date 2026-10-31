@@ -9,7 +9,7 @@ Most of a Qwen3.5 model's layers are Gated DeltaNet layers, a form of linear att
 - A Gated DeltaNet layer runs a short causal convolution over its last few inputs, then a gated delta-rule update of its key-by-value matrix. Its state is the convolution history plus that matrix.
 - A gated full attention layer is grouped-query attention with partial rotary embeddings and a sigmoid output gate. Its state is the keys and values of every past token.
 
-Each layer then runs a SwiGLU MLP or, in MoE checkpoints, routed experts plus a gated shared expert. Qwen3.5 checkpoints also ship a one-layer multi-token-prediction (MTP) head, which Tur can use to draft tokens (see [Speculative decoding](speculation.md)).
+Each layer then runs a SwiGLU MLP or, in MoE checkpoints, routed experts plus a gated shared expert. Qwen3.5 checkpoints, dense and MoE alike, also ship a one-layer multi-token-prediction (MTP) head, which Tur can use to draft tokens (see [Speculative decoding](speculation.md)).
 
 This mix is why Tur pages attention state but keeps recurrent state in slots. It's also why prefix reuse has to snapshot exact token boundaries: unlike a key-value cache, a recurrent state can't be cut back to an earlier token.
 
@@ -43,6 +43,7 @@ The reference path is a slow, readable F32 implementation built from Candle oper
 | `gemma4_text` | `Gemma4ForCausalLM` |
 | `gemma4_unified` | `Gemma4UnifiedForConditionalGeneration` (settings in `text_config`) |
 | `gemma4_unified_text` | `Gemma4UnifiedForCausalLM` |
+| `gpt_oss` | `GptOssForCausalLM` |
 
 The Qwen parser rejects any setting Tur doesn't implement, rather than running the wrong maths:
 

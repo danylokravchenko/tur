@@ -2,6 +2,7 @@
 use super::{
     GenerationDefaults, LoadOptions,
     gemma4::{self, Gemma4},
+    gpt_oss::{self, GptOss},
     qwen3_5::{self, Qwen35},
 };
 use crate::{
@@ -23,6 +24,7 @@ fn no_audio() -> tur_core::TurError {
 pub enum ModelConfig {
     Qwen35(qwen3_5::Config),
     Gemma4(gemma4::Config),
+    GptOss(gpt_oss::Config),
 }
 impl ModelConfig {
     /// Parse the architecture before any weight download or allocation.
@@ -32,6 +34,7 @@ impl ModelConfig {
             Some("gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text") => {
                 Ok(Self::Gemma4(gemma4::Config::from_json(json)?))
             }
+            Some("gpt_oss") => Ok(Self::GptOss(gpt_oss::Config::from_json(json)?)),
             _ => Ok(Self::Qwen35(qwen3_5::Config::from_json(json)?)),
         }
     }
@@ -40,6 +43,7 @@ impl ModelConfig {
         match self {
             Self::Qwen35(c) => c.max_position(),
             Self::Gemma4(c) => c.max_position(),
+            Self::GptOss(c) => c.max_position(),
         }
     }
     /// Output vocabulary width.
@@ -47,6 +51,7 @@ impl ModelConfig {
         match self {
             Self::Qwen35(c) => c.vocab_size(),
             Self::Gemma4(c) => c.vocab_size(),
+            Self::GptOss(c) => c.vocab_size(),
         }
     }
     /// Merge generation metadata with architecture EOS tokens.
@@ -54,6 +59,7 @@ impl ModelConfig {
         match self {
             Self::Qwen35(c) => c.generation_defaults(json),
             Self::Gemma4(c) => c.generation_defaults(json),
+            Self::GptOss(c) => c.generation_defaults(json),
         }
     }
     pub(crate) fn with_mtp(self) -> Result<Self> {
@@ -61,6 +67,7 @@ impl ModelConfig {
             Self::Qwen35(c) => Ok(Self::Qwen35(c.with_mtp()?)),
             // The assistant is a separate checkpoint, loaded from the draft head's directory.
             Self::Gemma4(c) => Ok(Self::Gemma4(c)),
+            Self::GptOss(_) => Err(invalid("gpt-oss has no draft head")),
         }
     }
     /// Reserve the selected model's exact weights and bounded scratch before loading.
@@ -73,12 +80,14 @@ impl ModelConfig {
         match self {
             Self::Qwen35(c) => Qwen35::memory_requirements(c, options, tokens, contexts),
             Self::Gemma4(c) => Gemma4::memory_requirements(c, options, tokens, contexts),
+            Self::GptOss(c) => GptOss::memory_requirements(c, options, tokens, contexts),
         }
     }
     pub(crate) fn load(&self, dir: &Path, options: &LoadOptions) -> Result<TextModel> {
         match self {
             Self::Qwen35(_) => Ok(TextModel::Qwen35(Box::new(Qwen35::load(dir, options)?))),
             Self::Gemma4(_) => Ok(TextModel::Gemma4(Box::new(Gemma4::load(dir, options)?))),
+            Self::GptOss(_) => Ok(TextModel::GptOss(Box::new(GptOss::load(dir, options)?))),
         }
     }
 }
@@ -87,6 +96,7 @@ impl ModelConfig {
 pub enum TextModel {
     Qwen35(Box<Qwen35>),
     Gemma4(Box<Gemma4>),
+    GptOss(Box<GptOss>),
 }
 impl TextModel {
     /// Load a validated architecture from a local checkpoint using shared placement settings.
@@ -99,6 +109,7 @@ impl TextModel {
         match self {
             Self::Qwen35(m) => m.device(),
             Self::Gemma4(m) => m.device(),
+            Self::GptOss(m) => m.device(),
         }
     }
     /// Resident bytes of projection matrices, excluding embeddings and auxiliary tensors.
@@ -106,6 +117,7 @@ impl TextModel {
         match self {
             Self::Qwen35(m) => m.projection_bytes(),
             Self::Gemma4(m) => m.projection_bytes(),
+            Self::GptOss(m) => m.projection_bytes(),
         }
     }
     /// Switch between the common Metal path and the numerical reference on the same weights.
@@ -113,6 +125,7 @@ impl TextModel {
         match self {
             Self::Qwen35(m) => Ok(Self::Qwen35(Box::new((*m).with_execution(execution)?))),
             Self::Gemma4(m) => Ok(Self::Gemma4(Box::new((*m).with_execution(execution)?))),
+            Self::GptOss(m) => Ok(Self::GptOss(Box::new((*m).with_execution(execution)?))),
         }
     }
     /// Device bytes held by loaded weights.
@@ -120,6 +133,7 @@ impl TextModel {
         match self {
             Self::Qwen35(m) => m.weight_bytes(),
             Self::Gemma4(m) => m.weight_bytes(),
+            Self::GptOss(m) => m.weight_bytes(),
         }
     }
     /// Exclusive text position limit.
@@ -127,26 +141,31 @@ impl TextModel {
         match self {
             Self::Qwen35(m) => m.config().max_position(),
             Self::Gemma4(m) => m.config().max_position(),
+            Self::GptOss(m) => m.config().max_position(),
         }
+    }
+    /// Whether this model writes its output in Harmony channels.
+    pub fn speaks_harmony(&self) -> bool {
+        matches!(self, Self::GptOss(_))
     }
     /// How a clip appears in prompts, when the model has an audio encoder loaded.
     pub fn audio_prompt(&self) -> Option<AudioPrompt> {
         match self {
-            Self::Qwen35(_) => None,
+            Self::Qwen35(_) | Self::GptOss(_) => None,
             Self::Gemma4(m) => m.audio_prompt(),
         }
     }
     /// Prompt positions a clip's soft tokens occupy, between its framing tokens.
     pub fn audio_tokens(&self, clip: &Audio) -> Result<usize> {
         match self {
-            Self::Qwen35(_) => Err(no_audio()),
+            Self::Qwen35(_) | Self::GptOss(_) => Err(no_audio()),
             Self::Gemma4(m) => m.audio_tokens(clip),
         }
     }
     /// Encode a clip into F32 `[audio_tokens, hidden]` embedding rows on the model device.
     pub fn encode_audio(&self, clip: &Audio) -> Result<candle_core::Tensor> {
         match self {
-            Self::Qwen35(_) => Err(no_audio()),
+            Self::Qwen35(_) | Self::GptOss(_) => Err(no_audio()),
             Self::Gemma4(m) => m.encode_audio(clip),
         }
     }
@@ -154,6 +173,7 @@ impl TextModel {
         match self {
             Self::Qwen35(m) => m.as_ref(),
             Self::Gemma4(m) => m.as_ref(),
+            Self::GptOss(m) => m.as_ref(),
         }
     }
 }

@@ -400,6 +400,16 @@ fn test_fused_mtp_drafts_preserve_target_sampling() -> Result<()> {
     assert_mtp_preserves_outputs(&factory)
 }
 
+#[cfg(feature = "metal")]
+#[test]
+fn test_mtp_over_experts_preserves_target_sampling() -> Result<()> {
+    let fixture = Checkpoint::fused_moe_mtp()?;
+    let mut factory = fixture.factory();
+    factory.device = candle_core::Device::new_metal(0)?;
+    factory.format = Some(tur_models::models::WeightFormat::F32);
+    assert_mtp_preserves_outputs(&factory)
+}
+
 #[test]
 fn test_mtp_needs_a_head_and_disables_prefix_reuse() -> Result<()> {
     let with_head = Checkpoint::random_mtp()?;

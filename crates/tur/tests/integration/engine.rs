@@ -64,6 +64,7 @@ fn load(dir: &Path, format: WeightFormat, device: Device) -> Result<Arc<Qwen35>>
             recurrent: candle_core::DType::F32,
             mtp: None,
             audio: false,
+            expert_cache: None,
         },
     )?))
 }
@@ -388,6 +389,7 @@ fn real(format: WeightFormat) -> Result<Real> {
             recurrent: candle_core::DType::F32,
             mtp: None,
             audio: false,
+            expert_cache: None,
         },
     )?);
     let generation = std::fs::read_to_string(dir.join("generation_config.json")).ok();
@@ -533,6 +535,7 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
                     model: None,
                 }),
                 audio: false,
+                expert_cache: None,
             },
         )?;
         let description = model.description();
