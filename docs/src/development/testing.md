@@ -108,6 +108,12 @@ python -I scripts/gemma4_reference.py --templates crates/tur/tests/fixtures/gemm
 python -I scripts/audio_reference.py --tiny crates/tur/tests/fixtures/audio
 ```
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs `just ci` on an Arm64 macOS runner for every pull request and push to `main`. It uses only the offline suite, so it downloads no model: its weights are the small fixtures in `crates/tur/tests/fixtures` and the random checkpoints built by `common.rs` and `model_common.rs`. Real-checkpoint tests stay a local step, so run them when a change touches model math.
+
+Pushing a tag such as `v0.3.0` runs `.github/workflows/release.yml`. It runs the same CI, checks that the tag matches the workspace version, builds the release binary from `Cargo.lock` and publishes it with its SHA-256 checksum. A tag with a hyphen, such as `v0.3.0-rc.1`, becomes a prerelease.
+
 ## Reference scripts
 
 `scripts/` regenerates golden data with pinned Transformers 5.20.2 and torch, on the CPU in F32:

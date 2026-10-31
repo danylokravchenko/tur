@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+  # Pull requests can only restore caches saved on their base branch, so main seeds them.
+  push:
+    branches: [main]
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.workflow_ref }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: just ci
+    # Arm64: Tur has no other target, and the tests fail rather than skip without Metal.
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: just,cargo-nextest
+      - name: Report the Metal device
+        run: system_profiler SPDisplaysDataType
+      - name: Check that Cargo.lock is current
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      - run: just ci
