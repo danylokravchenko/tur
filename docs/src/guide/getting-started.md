@@ -8,6 +8,17 @@ This page is the reference for what Tur needs. For a guided first run, follow th
 - Rust installed through rustup. The checkout's `rust-toolchain.toml` selects Rust 1.99 (edition 2024) with rustfmt and Clippy.
 - Optionally, [`just`](https://github.com/casey/just) for the task recipes, [`cargo-nextest`](https://nexte.st) for tests, and [`mdbook`](https://rust-lang.github.io/mdBook/) for this book.
 
+## Download
+
+Each [release](https://github.com/danylokravchenko/tur/releases) has a prebuilt binary for Apple Silicon, which needs no Rust toolchain:
+
+```sh
+curl -fsSL https://github.com/danylokravchenko/tur/releases/latest/download/tur-aarch64-apple-darwin.tar.gz | tar -xz
+./tur --version
+```
+
+The binary isn't notarized. `curl` doesn't mark its downloads for Gatekeeper, but a browser does; for a browser download, run `xattr -d com.apple.quarantine tur`.
+
 ## Build
 
 Install the release binary from the checkout:

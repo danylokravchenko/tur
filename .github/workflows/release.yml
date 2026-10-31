@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Publish the macOS binary
+    needs: ci
+    runs-on: macos-26
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      ASSET: tur-aarch64-apple-darwin
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Check that the tag matches the workspace version
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "tur-cli") | .version')
+          test "$TAG" = "v$version" || { echo "tag $TAG does not match version $version"; exit 1; }
+      # No build cache: a published binary comes only from this commit and Cargo.lock.
+      - run: cargo build --release --locked --bin tur
+      - name: Package
+        run: |
+          mkdir dist
+          tar -czf "dist/$ASSET.tar.gz" -C target/release tur
+          (cd dist && shasum -a 256 "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256")
+      - name: Smoke-test the packaged binary
+        run: |
+          unpacked=$(mktemp -d)
+          tar -xzf "dist/$ASSET.tar.gz" -C "$unpacked"
+          cd "$unpacked"
+          test "$(./tur --version)" = "tur ${TAG#v}"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          [[ "$TAG" == *-* ]] && prerelease=(--prerelease)
+          gh release create "$TAG" dist/* --verify-tag --generate-notes "${prerelease[@]}"
