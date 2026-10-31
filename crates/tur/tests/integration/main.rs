@@ -15,6 +15,7 @@ mod gpt_oss;
 mod kernels;
 mod model_common;
 mod moe;
+mod operations;
 mod pipeline;
 mod prefix_reuse;
 mod prepacked;

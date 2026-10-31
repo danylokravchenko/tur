@@ -4,7 +4,7 @@ use tur::{
     Result, TurError,
     backend::{memory::DeviceBudget, pipeline::PipelineConfig},
     server::{
-        AppState, run_server,
+        AppState, ServerStatus, run_server,
         transcription::{TranscriptionConfig, TranscriptionWorker},
         worker::{PipelineWorker, StreamConfig, WorkerConfig},
     },
@@ -58,6 +58,10 @@ pub(crate) struct Args {
     /// prefix reuse.
     #[arg(long)]
     prefix_snapshots: Option<usize>,
+    /// Seconds accepted requests may take to finish after SIGINT or SIGTERM. A second signal
+    /// ends the wait (default: 30).
+    #[arg(long)]
+    shutdown_timeout_secs: Option<u64>,
     #[arg(skip)]
     stream_channel_capacity: Option<usize>,
     #[arg(skip)]
@@ -75,6 +79,7 @@ impl Args {
         max_waiting,
         request_timeout_secs,
         prefix_snapshots,
+        shutdown_timeout_secs,
         stream_channel_capacity,
         stream_max_buffered_bytes
     );
@@ -169,9 +174,11 @@ pub(crate) async fn serve(mut args: Args) -> Result<()> {
             transcribers,
             default_transcriber,
             default_model,
+            status: ServerStatus::shared(),
         },
         args.listen
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080))),
+        Duration::from_secs(args.shutdown_timeout_secs.unwrap_or(30)),
     )
     .await
 }

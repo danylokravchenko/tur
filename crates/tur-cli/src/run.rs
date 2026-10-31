@@ -127,14 +127,6 @@ pub(crate) fn run(mut args: Args) -> Result<()> {
     config.scheduler.validate()?;
     config.prefix.validate(factory.kv.page_tokens)?;
     let mut pipeline = InferencePipeline::new(&factory, config)?;
-    let plan = pipeline.memory_plan();
-    tracing::info!(
-        resident_bytes = plan.resident(),
-        weights = plan.weights,
-        state_pool = plan.state_pool,
-        scratch_peak = plan.scratch_peak,
-        "Memory plan"
-    );
     let request = args.request()?;
     let mut stdout = std::io::stdout().lock();
     let mut output_error = None;

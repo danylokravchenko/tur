@@ -16,6 +16,8 @@ recurrent_state = "f32"   # f32 or f16; speculation needs f32.
 
 [engine]                 # Shared by run and serve.
 prefill_chunk_size = 256
+# context_tokens = 32768  # Most tokens one request may hold. Sizes the state pool for this
+                         # many per concurrent request; a start that can't fit it fails.
 # state_memory_mb = 2048  # Omit for an 8K-token context per concurrent request,
                          # capped by available device memory. This example value is MiB.
 speculative_draft = 0     # Prompt-lookup drafts per sequence; 0 disables them.
@@ -39,6 +41,8 @@ max_waiting = 256
 # request_timeout_secs = 120 # Omit for no server deadline (includes time in queue).
 # prefix_snapshots = 8    # Default: one per running request, capped at 1/8 of state
                          # memory. An explicit count removes that cap; 0 disables reuse.
+
+shutdown_timeout_secs = 30 # Time accepted requests get to finish after SIGINT or SIGTERM.
 
 # Advanced streaming limits available only in TOML. Both must be positive.
 stream_channel_capacity = 64

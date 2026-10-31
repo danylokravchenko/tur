@@ -28,7 +28,7 @@ use crate::{
             ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
             ChatResponseMessage, ChunkChoice, ContentPart as Part, DeltaFunction, DeltaMessage,
             DeltaToolCall, MessageContent, PromptTokensDetails, ResponseFunction, ResponseToolCall,
-            Usage,
+            StopSequences, Usage,
         },
         worker::{TextDelta, WorkerMsg},
     },
@@ -58,6 +58,11 @@ pub(crate) fn execution_error(error: &crate::TurError) -> (StatusCode, ApiErrorR
             "worker_unavailable",
         ),
         TurError::SlowClient(_) => (StatusCode::REQUEST_TIMEOUT, "timeout_error", "slow_client"),
+        TurError::ContextExceeded(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "context_length_exceeded",
+        ),
         TurError::InvalidExecution(_) => (
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -310,6 +315,8 @@ pub async fn chat_completions(
             messages,
             tools,
             max_tokens,
+            fit_context: req.max_tokens.is_none(),
+            stop: req.stop.map_or_else(Vec::new, StopSequences::into_vec),
             sampling: SamplingOptions {
                 temperature: req.temperature,
                 top_p: req.top_p,

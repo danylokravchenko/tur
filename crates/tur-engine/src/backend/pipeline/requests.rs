@@ -4,6 +4,7 @@ use super::super::{
     guidance::{GuidanceControl, TopLevelGrammar, build_llg_factory},
     harmony::{Fragment, Harmony},
     speculation::NgramIndex,
+    stop::StopMatcher,
     tokenizer::TokenOutputStream,
 };
 use super::{InferencePipeline, Pending};
@@ -31,6 +32,12 @@ pub struct GenerationRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: usize,
+    /// Shorten `max_tokens` to what the context leaves instead of failing: for a limit the
+    /// caller did not choose. A prompt that alone exceeds the context still fails.
+    pub fit_context: bool,
+    /// End the answer before the first of these texts. It is left out of the output, and
+    /// streams never show part of it. Reasoning is not searched.
+    pub stop: Vec<String>,
     pub render: RenderOptions,
     pub sampling: SamplingOptions,
     pub seed: u64,
@@ -55,6 +62,8 @@ impl GenerationRequest {
             messages: vec![ChatMessage::new(Role::User, prompt)],
             tools: Vec::new(),
             max_tokens,
+            fit_context: false,
+            stop: Vec::new(),
             render: RenderOptions {
                 add_generation_prompt: true,
                 ..Default::default()
@@ -101,16 +110,6 @@ pub struct GenerationStats {
     pub reasoning_text: String,
     /// `stop` for EOS, `length` for the request limit.
     pub finish_reason: &'static str,
-}
-
-/// Hand one request's newly decoded text to its audiences.
-fn publish(output: &mut BatchStepOutput, id: Uuid, fragment: Fragment) {
-    if let Some(text) = fragment.reasoning {
-        output.new_reasoning.push((id, text));
-    }
-    if let Some(text) = fragment.content {
-        output.new_tokens.push((id, text));
-    }
 }
 
 /// Incremental text and independent request outcomes from one packed model invocation.
@@ -161,6 +160,66 @@ fn sampling(overrides: SamplingOptions, defaults: &GenerationDefaults) -> Sampli
         top_p: overrides.top_p.or(defaults.top_p),
         repetition_penalty: overrides.repetition_penalty.or(defaults.repetition_penalty),
         ..overrides
+    }
+}
+
+impl Pending {
+    /// Hand one request's newly decoded text to its audiences.
+    fn publish_fragment(&mut self, id: Uuid, fragment: Fragment, output: &mut BatchStepOutput) {
+        if let Some(text) = fragment.reasoning {
+            output.new_reasoning.push((id, text));
+        }
+        if let Some(text) = fragment.content.and_then(|text| self.stop.push(text)) {
+            output.new_tokens.push((id, text));
+        }
+    }
+
+    /// Decode one sampled token and publish whatever text it completes.
+    fn decode_token(&mut self, id: Uuid, token: u32, output: &mut BatchStepOutput) -> Result<()> {
+        let fragment = match &mut self.harmony {
+            Some(harmony) => harmony.push(token)?,
+            None => Fragment {
+                content: self.stream.next_token(token)?,
+                reasoning: None,
+            },
+        };
+        self.publish_fragment(id, fragment, output);
+        Ok(())
+    }
+
+    /// Publish all text still held back and return the final answer, reasoning and calls.
+    fn finish_text(
+        &mut self,
+        id: Uuid,
+        output: &mut BatchStepOutput,
+    ) -> Result<(String, String, Vec<ToolCall>)> {
+        let fragment = match &mut self.harmony {
+            Some(harmony) => harmony.finish()?,
+            None => Fragment {
+                content: self.stream.decode_rest()?,
+                reasoning: None,
+            },
+        };
+        self.publish_fragment(id, fragment, output);
+        if let Some(text) = self.stop.flush() {
+            output.new_tokens.push((id, text));
+        }
+        let (mut content, reasoning, tool_calls) = if let Some(harmony) = &mut self.harmony {
+            (
+                harmony.content()?,
+                harmony.reasoning()?,
+                harmony.tool_calls(&self.tools)?,
+            )
+        } else {
+            let tool_calls = if self.tools.is_empty() {
+                Vec::new()
+            } else {
+                ToolCall::parse_from_output(&self.stream.decode_raw()?, &self.tools)
+            };
+            (self.stream.decode_all()?, String::new(), tool_calls)
+        };
+        self.stop.truncate(&mut content);
+        Ok((content, reasoning, tool_calls))
     }
 }
 
@@ -235,26 +294,28 @@ impl InferencePipeline {
             return Err(invalid("chat template produced an empty prompt"));
         }
         let (tokens, audio) = self.expand_audio(request, tokens)?;
+        let limit = self.plan.context_tokens;
+        let max_tokens = if request.fit_context {
+            request
+                .max_tokens
+                .min(limit.saturating_add(1).saturating_sub(tokens.len()))
+                .max(1)
+        } else {
+            request.max_tokens
+        };
         // The final sampled token need not be consumed into model state.
         let positions = tokens
             .len()
-            .checked_add(request.max_tokens - 1)
+            .checked_add(max_tokens - 1)
             .ok_or_else(|| invalid("request context length overflow"))?;
-        if positions > self.max_position {
-            return Err(invalid(
-                "prompt and generation limit exceed the model context",
-            ));
-        }
-        // A request that cannot fit the whole pool alone would never complete.
-        let usage = self.engine.memory()?;
-        let pages = self.engine.pool().description().pages_for(positions);
-        if pages > usage.pages.capacity {
-            return Err(TurError::MemoryAllocation(format!(
-                "request needs {pages} K/V pages for {positions} positions; the state pool \
-                 holds {}",
-                usage.pages.capacity
+        if positions > limit {
+            return Err(TurError::ContextExceeded(format!(
+                "{} prompt tokens and {max_tokens} output tokens need {positions} positions; \
+                 this server allows {limit}",
+                tokens.len(),
             )));
         }
+        let stop = StopMatcher::new(&request.stop)?;
         let (waiting, waiting_tokens) = self
             .pending
             .values()
@@ -317,7 +378,8 @@ impl InferencePipeline {
                     .speaks_harmony()
                     .then(|| Harmony::new(&self.tokenizer))
                     .flatten(),
-                max_tokens: request.max_tokens,
+                stop,
+                max_tokens,
                 arrival,
                 deadline,
                 first_token: None,
@@ -431,15 +493,12 @@ impl InferencePipeline {
                 .get_or_insert_with(|| sampled_at.saturating_duration_since(pending.arrival));
             let eos = self.defaults.eos_tokens.contains(&token.token);
             if !eos {
-                if let Some(harmony) = &mut pending.harmony {
-                    publish(output, id, harmony.push(token.token)?);
-                } else if let Some(text) = pending.stream.next_token(token.token)? {
-                    output.new_tokens.push((id, text));
-                }
+                pending.decode_token(id, token.token, output)?;
             }
-            if eos || pending.generated() >= pending.max_tokens {
+            let stopped = eos || pending.stop.matched();
+            if stopped || pending.generated() >= pending.max_tokens {
                 finished = true;
-                reason = if eos { "stop" } else { "length" };
+                reason = if stopped { "stop" } else { "length" };
                 break;
             }
         }
@@ -461,25 +520,7 @@ impl InferencePipeline {
         if !finished {
             return Ok(());
         }
-        let (generated_text, reasoning_text, tool_calls) =
-            if let Some(harmony) = &mut pending.harmony {
-                publish(output, id, harmony.finish()?);
-                (
-                    harmony.content()?,
-                    harmony.reasoning()?,
-                    harmony.tool_calls(&pending.tools)?,
-                )
-            } else {
-                if let Some(text) = pending.stream.decode_rest()? {
-                    output.new_tokens.push((id, text));
-                }
-                let tool_calls = if pending.tools.is_empty() {
-                    Vec::new()
-                } else {
-                    ToolCall::parse_from_output(&pending.stream.decode_raw()?, &pending.tools)
-                };
-                (pending.stream.decode_all()?, String::new(), tool_calls)
-            };
+        let (generated_text, reasoning_text, tool_calls) = pending.finish_text(id, output)?;
         let elapsed = pending.arrival.elapsed();
         if pending
             .deadline

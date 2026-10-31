@@ -165,7 +165,8 @@ impl InferencePipeline {
             .min(room)
             .min(remaining.saturating_sub(1))
             .min(
-                self.max_position
+                self.plan
+                    .context_tokens
                     .saturating_sub(pending.consumed.saturating_add(1)),
             );
         if let Some(boundary) = self.prefix.next_boundary(pending.consumed) {

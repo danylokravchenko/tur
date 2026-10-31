@@ -51,6 +51,7 @@ tur run --model google/gemma-4-E2B-it --revision 3e22461f65e89153144f8adb70e3b8c
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--prefill-chunk-size <n>` | 256, or 1024 with `--expert-cache-mb` | Most prompt tokens one request adds to one pass |
+| `--context-tokens <n>` | what the pool and model allow | Most tokens one request may hold, prompt and output together. Sizes the state pool for that many per concurrent request; a start that can't fit it fails and names what would |
 | `--state-memory-mb <n>` | derived | Memory for K/V pages and recurrent state. By default, room for an 8K-token context per concurrent request |
 | `--speculative-draft <n>` | 0 | Most tokens drafted from the request's own text per step; 0 turns speculation off |
 | `--mtp [true\|false]` | off | Also draft with the checkpoint's multi-token-prediction head; turns off prefix reuse |
@@ -89,6 +90,7 @@ Sampling settings you leave out come from the checkpoint's `generation_config.js
 | `--max-waiting <n>` | 256 | Queued requests before new ones get HTTP 429 |
 | `--request-timeout-secs <n>` | none | Fail requests not finished this long after arrival (HTTP 504) |
 | `--prefix-snapshots <n>` | one per running request | Prefix snapshots kept for reuse; 0 turns prefix reuse off |
+| `--shutdown-timeout-secs <n>` | 30 | How long accepted requests may take to finish after SIGINT or SIGTERM. A second signal ends the wait |
 | `--transcription-model-name <id>` | `whisper-1` | The model ID of `--whisper` at `/v1/audio/*` and in `/v1/models` |
 | `--max-waiting-transcriptions <n>` | 16 | Queued clips before new ones get HTTP 429 |
 

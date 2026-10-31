@@ -2,7 +2,7 @@
 
 ## Models and hardware
 
-- Run a real Qwen MoE checkpoint through the expert cache, and make the check for spare memory continue after load, since concurrent serving can still swap.
+- Run a real Qwen MoE checkpoint through the expert cache.
 - Make pruning generalize. Search on KL now exists and overfits its calibration text, so the next step is far more varied calibration, or recovery training, judged by task benchmarks rather than KL.
 - Run the larger models. Qwen3.8-27B and the Qwen3.6-35B MoE need Macs that fit them, and then measurements of quality, the K/V format choice (Q8 is the likely default under 16 GB), and the wide MoE tier, which trails Candle by 1.2 to 1.5× and needs real routing traces.
 - Run a real expert checkpoint's MTP head and measure its draft acceptance. Only a tiny Transformers fixture has run it so far.
@@ -27,6 +27,5 @@
 
 ## Serving
 
-- Production hardening: health and readiness endpoints, request metrics, graceful shutdown, stop sequences, model revision reporting, and memory and kernel diagnostics.
 - Soak tests: multi-hour cancellation and churn runs to check thermal behaviour and leaks.
 - Lints: tighten `indexing_slicing` crate by crate, starting with `tur-core` and `tur-cli`.

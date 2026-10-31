@@ -226,41 +226,13 @@ pub struct ExpertCache {
     state: Mutex<Slots>,
 }
 
-/// Bytes macOS can hand out without swapping, from `vm_stat`'s report: free and purgeable
-/// pages, and file-backed ones among those it would reclaim first. Inactive anonymous pages
-/// do not count: reclaiming them is exactly the swap this check exists to prevent.
-fn reclaimable_bytes(report: &str) -> Option<usize> {
-    let page: usize = report
-        .split("page size of ")
-        .nth(1)?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()?;
-    let count = |key: &str| -> Option<usize> {
-        let line = report
-            .lines()
-            .find(|line| line.trim_start().starts_with(key))?;
-        line.rsplit(' ').next()?.trim_end_matches('.').parse().ok()
-    };
-    let reclaimable = count("Pages inactive:")?.checked_add(count("Pages speculative:")?)?;
-    count("Pages free:")?
-        .checked_add(count("Pages purgeable:")?)?
-        .checked_add(reclaimable.min(count("File-backed pages:")?))?
-        .checked_mul(page)
-}
-
 /// Refuse an arena that would push other memory into swap, the only way this cache could
 /// cost SSD writes. Called with the model's other weights already resident.
 fn check_spare_memory(arena: usize) -> Result<()> {
     if arena < NEGLIGIBLE_BYTES {
         return Ok(());
     }
-    let output = std::process::Command::new("vm_stat").output()?;
-    let report = String::from_utf8_lossy(&output.stdout);
-    let Some(spare) = reclaimable_bytes(&report) else {
-        return Err(invalid("cannot read spare memory from vm_stat"));
-    };
+    let spare = crate::system::SystemMemory::read()?.spare_bytes;
     if arena.saturating_add(RESERVE_BYTES) > spare {
         return Err(tur_core::TurError::MemoryAllocation(format!(
             "an expert cache of {} MiB would swap: macOS can spare {} MiB and {} MiB stays \
@@ -837,21 +809,6 @@ pub(crate) fn tile_tensor(values: Vec<f32>, device: &Device) -> Result<Tensor> {
 )]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_spare_memory_counts_only_pages_macos_reclaims_without_swapping() {
-        let report = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
-            Pages free:                                  10.\n\
-            Pages active:                              1000.\n\
-            Pages inactive:                              20.\n\
-            Pages speculative:                            3.\n\
-            Pages wired down:                          1000.\n\
-            Pages purgeable:                              7.\n\
-            File-backed pages:                            5.\n";
-        // Free and purgeable, and at most the file-backed share of inactive pages.
-        assert_eq!(reclaimable_bytes(report), Some(22 * 16384));
-        assert_eq!(reclaimable_bytes("no page size here"), None);
-    }
 
     #[test]
     fn test_budgets_below_one_layer_of_experts_are_rejected() -> Result<()> {

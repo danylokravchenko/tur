@@ -217,6 +217,11 @@ pub(crate) struct PipelineArgs {
     /// request's 8K-token context within the device's working set.
     #[arg(long)]
     state_memory_mb: Option<usize>,
+    /// Most tokens one request may hold: its prompt and output. Sizes the state pool for that
+    /// many tokens per concurrent request and bounds kernel scratch; a start that cannot fit
+    /// it fails and names what would. Default: whatever the pool and the model allow.
+    #[arg(long)]
+    context_tokens: Option<usize>,
     /// Maximum prompt-lookup drafts per decode. Opt-in throughput mode: tokens arrive in
     /// bursts and pauses can grow. Zero disables it; draft length adapts to measured cost.
     /// Requires F32 recurrent state; narrower state automatically uses ordinary decoding. Default: 0.
@@ -263,6 +268,7 @@ impl PipelineArgs {
     inherit!(
         prefill_chunk_size,
         state_memory_mb,
+        context_tokens,
         speculative_draft,
         mtp,
         draft_model,
@@ -287,6 +293,7 @@ impl PipelineArgs {
             .transpose()?;
         let mut config =
             PipelineConfig::new(max_batch_size, self.prefill_chunk_size.unwrap_or(256));
+        config.context_tokens = self.context_tokens;
         let drafts = self.speculative_draft.unwrap_or(0);
         config.speculation = if let Some(model) = &self.draft_model {
             let revision = self

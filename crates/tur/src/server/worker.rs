@@ -6,11 +6,11 @@ use std::{
     sync::{Arc, mpsc as std_mpsc},
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::{
-    ModelFactory, Result, TurError,
+    ModelFactory, ModelSource, Result, TurError,
     audio::Audio,
     backend::{
         memory::DeviceBudget,
@@ -19,6 +19,8 @@ use crate::{
         },
     },
     models::TextModel,
+    runtime::pool::allocated_bytes,
+    server::telemetry::{ModelReport, PassReading, WorkerTelemetry},
 };
 
 /// A piece of generated text and who it is for.
@@ -137,6 +139,9 @@ pub struct PipelineWorker {
     tx: mpsc::Sender<WorkerMsg>,
     timeout: Option<Duration>,
     stream: StreamConfig,
+    report: Option<Arc<ModelReport>>,
+    telemetry: Arc<WorkerTelemetry>,
+    exit: watch::Receiver<()>,
 }
 
 const MAX_ADMISSIONS_PER_PASS: usize = 32;
@@ -150,22 +155,104 @@ struct ClipEncoder {
     tx: std_mpsc::SyncSender<WorkerMsg>,
 }
 
+/// The loaded model's device capabilities and launch tuning, when it runs on Metal kernels.
+#[cfg(feature = "metal")]
+fn kernel_report(model: &TextModel) -> serde_json::Value {
+    use tur_models::hybrid::HybridModel as _;
+    let Some(kernels) = model.kernels() else {
+        return serde_json::Value::Null;
+    };
+    let device = kernels.capabilities();
+    serde_json::json!({
+        "device": device.name,
+        "architecture": device.architecture,
+        "apple_family": device.apple_family,
+        "metal3": device.metal3,
+        "metal4": device.metal4,
+        "unified_memory": device.unified_memory,
+        "max_threads_per_threadgroup": device.max_threads_per_threadgroup,
+        "threadgroup_memory_bytes": device.threadgroup_memory_bytes,
+        "max_buffer_bytes": device.max_buffer_bytes,
+        "recommended_working_set_bytes": device.recommended_working_set_bytes,
+        "tuning": format!("{:?}", kernels.tuning()),
+    })
+}
+
+#[cfg(not(feature = "metal"))]
+fn kernel_report(_model: &TextModel) -> serde_json::Value {
+    serde_json::Value::Null
+}
+
+/// Facts to report for the model `pipeline` loaded from `factory`.
+fn model_report(factory: &ModelFactory, pipeline: &InferencePipeline) -> ModelReport {
+    let model = pipeline.model();
+    ModelReport {
+        source: match &factory.source {
+            ModelSource::HuggingFace(id) => id.clone(),
+            ModelSource::LocalPath(_) => "local".into(),
+        },
+        revision: factory.revision.clone(),
+        weight_format: factory
+            .format
+            .map_or_else(|| "as stored".into(), |format| format!("{format:?}")),
+        kv: format!("{:?}", factory.kv),
+        recurrent_state: format!("{:?}", factory.recurrent),
+        max_position: model.max_position(),
+        vocab_size: pipeline.vocab_size(),
+        plan: *pipeline.memory_plan(),
+        scheduler: *pipeline.scheduler().config(),
+        device_sampling: pipeline.device_sampling(),
+        speculation: pipeline.speculation_enabled(),
+        kernels: kernel_report(model),
+    }
+}
+
+/// Publish what the pass changed. `timing` is absent when no pass ran.
+fn publish_pass(
+    telemetry: &WorkerTelemetry,
+    pipeline: &mut InferencePipeline,
+    device: &candle_core::Device,
+    timing: Option<crate::backend::pipeline::PassTiming>,
+) -> Result<()> {
+    telemetry.publish_pass(&PassReading {
+        active: pipeline.active_request_count(),
+        waiting: pipeline.waiting_request_count(),
+        pool: pipeline.memory()?,
+        prefix: pipeline.prefix_stats(),
+        sampling: pipeline.sampling_stats(),
+        speculation: pipeline.speculation_stats(),
+        allocated: allocated_bytes(device),
+        timing,
+    });
+    Ok(())
+}
+
 impl ClipEncoder {
-    fn spawn(model: Arc<TextModel>, intake: mpsc::WeakSender<WorkerMsg>) -> Result<Self> {
+    fn spawn(
+        model: Arc<TextModel>,
+        intake: mpsc::WeakSender<WorkerMsg>,
+        telemetry: Arc<WorkerTelemetry>,
+    ) -> Result<Self> {
         let (tx, rx) = std_mpsc::sync_channel::<WorkerMsg>(MAX_ENCODING);
         std::thread::Builder::new()
             .name("clip-encoder".into())
             .spawn(move || {
                 while let Ok(msg) = rx.recv() {
-                    encode_clips(&model, msg, &intake);
+                    encode_clips(&model, msg, &intake, &telemetry);
                 }
             })?;
         Ok(Self { tx })
     }
 }
 
-fn encode_clips(model: &TextModel, mut msg: WorkerMsg, intake: &mpsc::WeakSender<WorkerMsg>) {
+fn encode_clips(
+    model: &TextModel,
+    mut msg: WorkerMsg,
+    intake: &mpsc::WeakSender<WorkerMsg>,
+    telemetry: &WorkerTelemetry,
+) {
     if msg.is_abandoned() {
+        telemetry.record_cancelled();
         return;
     }
     let clips: Vec<&Audio> = msg
@@ -176,7 +263,7 @@ fn encode_clips(model: &TextModel, mut msg: WorkerMsg, intake: &mpsc::WeakSender
         .collect();
     match clips.iter().map(|clip| model.encode_audio(clip)).collect() {
         Ok(rows) => msg.request.encoded_audio = rows,
-        Err(error) => return reply(msg.result_tx, Err(error)),
+        Err(error) => return reply(telemetry, msg.result_tx, Err(error)),
     }
     // A worker that stopped drops the request, which tells its client.
     if let Some(intake) = intake.upgrade() {
@@ -184,9 +271,14 @@ fn encode_clips(model: &TextModel, mut msg: WorkerMsg, intake: &mpsc::WeakSender
     }
 }
 
-/// Hand a request its outcome. A client that disconnected has dropped the receiver, and
-/// nobody is left to tell.
-fn reply(tx: oneshot::Sender<Result<GenerationStats>>, result: Result<GenerationStats>) {
+/// Count a request's outcome and hand it over. A client that disconnected has dropped the
+/// receiver, and nobody is left to tell.
+fn reply(
+    telemetry: &WorkerTelemetry,
+    tx: oneshot::Sender<Result<GenerationStats>>,
+    result: Result<GenerationStats>,
+) {
+    telemetry.record(&result);
     drop(tx.send(result));
 }
 
@@ -208,19 +300,22 @@ fn admit(
     pipeline: &mut InferencePipeline,
     encoder: Option<&ClipEncoder>,
     pending: &mut HashMap<Uuid, PendingRequest>,
+    telemetry: &WorkerTelemetry,
 ) {
     if msg.is_abandoned() {
+        telemetry.record_cancelled();
         return;
     }
     if let Some(encoder) = encoder.filter(|_| msg.request.needs_audio_encoding()) {
         match encoder.tx.try_send(msg) {
             Ok(()) => {}
             Err(std_mpsc::TrySendError::Full(msg)) => reply(
+                telemetry,
                 msg.result_tx,
                 Err(TurError::QueueFull("audio encoding queue is full".into())),
             ),
             Err(std_mpsc::TrySendError::Disconnected(msg)) => {
-                reply(msg.result_tx, Err(TurError::WorkerUnavailable));
+                reply(telemetry, msg.result_tx, Err(TurError::WorkerUnavailable));
             }
         }
         return;
@@ -240,7 +335,7 @@ fn admit(
             );
         }
         Err(error) => {
-            reply(msg.result_tx, Err(error));
+            reply(telemetry, msg.result_tx, Err(error));
         }
     }
 }
@@ -249,6 +344,7 @@ fn admit(
 fn release_disconnected(
     pipeline: &mut InferencePipeline,
     pending: &mut HashMap<Uuid, PendingRequest>,
+    telemetry: &WorkerTelemetry,
 ) -> Result<()> {
     let gone: Vec<Uuid> = pending
         .iter()
@@ -258,6 +354,7 @@ fn release_disconnected(
     for id in gone {
         pipeline.cancel(id)?;
         pending.remove(&id);
+        telemetry.record_cancelled();
     }
     Ok(())
 }
@@ -269,6 +366,7 @@ fn deliver(
     pipeline: &mut InferencePipeline,
     pending: &mut HashMap<Uuid, PendingRequest>,
     config: StreamConfig,
+    telemetry: &WorkerTelemetry,
 ) -> Result<()> {
     for (id, text) in step.new_reasoning {
         if let Some(stream) = pending.get_mut(&id).and_then(|r| r.stream.as_mut()) {
@@ -288,9 +386,19 @@ fn deliver(
                 stream.flush(usize::MAX).ok();
             }
             drop(request.stream);
-            reply(request.result_tx, result);
+            reply(telemetry, request.result_tx, result);
         }
     }
+    flush_streams(pipeline, pending, config, telemetry)
+}
+
+/// Send each stream its buffered text, cancelling those that left or stalled.
+fn flush_streams(
+    pipeline: &mut InferencePipeline,
+    pending: &mut HashMap<Uuid, PendingRequest>,
+    config: StreamConfig,
+    telemetry: &WorkerTelemetry,
+) -> Result<()> {
     let mut cancelled = Vec::new();
     for (id, request) in pending.iter_mut() {
         if let Some(stream) = &mut request.stream {
@@ -303,9 +411,14 @@ fn deliver(
     }
     for (id, stalled) in cancelled {
         pipeline.cancel(id)?;
-        if let (Some(request), Some(bytes)) = (pending.remove(&id), stalled) {
+        let request = pending.remove(&id);
+        if stalled.is_none() {
+            telemetry.record_cancelled();
+        }
+        if let (Some(request), Some(bytes)) = (request, stalled) {
             tracing::warn!(request = %id, bytes, "cancelled a stalled stream");
             reply(
+                telemetry,
                 request.result_tx,
                 Err(TurError::SlowClient(format!(
                     "{bytes} bytes undelivered beyond the {}-byte bound",
@@ -317,47 +430,93 @@ fn deliver(
     Ok(())
 }
 
+/// Fail everything the worker holds, between passes, for a shutdown that ran out of time.
+fn abandon(
+    pipeline: &mut InferencePipeline,
+    pending: &mut HashMap<Uuid, PendingRequest>,
+    telemetry: &WorkerTelemetry,
+) -> Result<()> {
+    for (id, request) in pending.drain() {
+        pipeline.cancel(id)?;
+        reply(
+            telemetry,
+            request.result_tx,
+            Err(TurError::WorkerUnavailable),
+        );
+    }
+    Ok(())
+}
+
+/// Run one pass. Intake (rendering and tokenization) and disconnects run while the device
+/// executes it; the next pass needs its sampled tokens.
+fn run_pass(
+    rx: &mut mpsc::Receiver<WorkerMsg>,
+    pipeline: &mut InferencePipeline,
+    encoder: Option<&ClipEncoder>,
+    pending: &mut HashMap<Uuid, PendingRequest>,
+    telemetry: &WorkerTelemetry,
+) -> Result<BatchStepOutput> {
+    pipeline.begin_step()?;
+    drain_intake(rx, |msg| admit(msg, pipeline, encoder, pending, telemetry));
+    release_disconnected(pipeline, pending, telemetry)?;
+    pipeline.finish_step()
+}
+
+/// A whole pass failed: every pending request gets the error.
+fn fail_pending(
+    pending: &mut HashMap<Uuid, PendingRequest>,
+    telemetry: &WorkerTelemetry,
+    error: &TurError,
+) {
+    for (_, request) in pending.drain() {
+        reply(
+            telemetry,
+            request.result_tx,
+            Err(TurError::Other(error.to_string())),
+        );
+    }
+}
+
 fn serve(
     mut rx: mpsc::Receiver<WorkerMsg>,
     intake: mpsc::WeakSender<WorkerMsg>,
     mut pipeline: InferencePipeline,
     config: StreamConfig,
+    telemetry: &Arc<WorkerTelemetry>,
+    device: &candle_core::Device,
 ) -> Result<()> {
     let encoder = pipeline
         .audio_model()
-        .map(|model| ClipEncoder::spawn(model, intake))
+        .map(|model| ClipEncoder::spawn(model, intake, Arc::clone(telemetry)))
         .transpose()?;
     let encoder = encoder.as_ref();
+    let telemetry = telemetry.as_ref();
     let mut pending: HashMap<Uuid, PendingRequest> = HashMap::new();
+    publish_pass(telemetry, &mut pipeline, device, None)?;
     loop {
+        if telemetry.stop_requested() {
+            return abandon(&mut pipeline, &mut pending, telemetry);
+        }
         if pending.is_empty() {
             let Some(msg) = rx.blocking_recv() else {
                 return Ok(());
             };
-            admit(msg, &mut pipeline, encoder, &mut pending);
+            admit(msg, &mut pipeline, encoder, &mut pending, telemetry);
             drain_intake(&mut rx, |msg| {
-                admit(msg, &mut pipeline, encoder, &mut pending);
+                admit(msg, &mut pipeline, encoder, &mut pending, telemetry);
             });
         }
-        // Intake (rendering and tokenization) and disconnects run while the device
-        // executes the submitted pass; the next pass needs its sampled tokens.
-        let step = pipeline.begin_step().and_then(|_| {
-            drain_intake(&mut rx, |msg| {
-                admit(msg, &mut pipeline, encoder, &mut pending);
-            });
-            release_disconnected(&mut pipeline, &mut pending)?;
-            pipeline.finish_step()
-        });
+        let step = run_pass(&mut rx, &mut pipeline, encoder, &mut pending, telemetry);
         let step = match step {
             Ok(step) => step,
             Err(error) => {
-                for (_, request) in pending.drain() {
-                    reply(request.result_tx, Err(TurError::Other(error.to_string())));
-                }
+                fail_pending(&mut pending, telemetry, &error);
                 return Err(error);
             }
         };
-        deliver(step, &mut pipeline, &mut pending, config)?;
+        let timing = step.timing;
+        deliver(step, &mut pipeline, &mut pending, config, telemetry)?;
+        publish_pass(telemetry, &mut pipeline, device, timing)?;
     }
 }
 
@@ -369,6 +528,9 @@ impl PipelineWorker {
         let (tx, rx) = mpsc::channel(256);
         let intake = tx.downgrade();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let telemetry = Arc::new(WorkerTelemetry::default());
+        let worker_telemetry = Arc::clone(&telemetry);
+        let (exit_tx, exit) = watch::channel(());
         std::thread::Builder::new()
             .name("hybrid-worker".into())
             .spawn(move || {
@@ -378,19 +540,24 @@ impl PipelineWorker {
                     &config.budget,
                 ) {
                     Ok(pipeline) => {
-                        let plan = pipeline.memory_plan();
+                        let report = model_report(&config.factory, &pipeline);
                         tracing::info!(
-                            resident_bytes = plan.resident(),
-                            weights = plan.weights,
-                            state_pool = plan.state_pool,
-                            scratch_peak = plan.scratch_peak,
-                            limit = ?plan.limit,
-                            "Memory plan"
+                            source = %report.source,
+                            revision = %report.revision,
+                            kernels = %report.kernels,
+                            "Model loaded"
                         );
-                        if ready_tx.send(Ok(())).is_err() {
+                        if ready_tx.send(Ok(report)).is_err() {
                             return;
                         }
-                        if let Err(error) = serve(rx, intake, pipeline, stream) {
+                        if let Err(error) = serve(
+                            rx,
+                            intake,
+                            pipeline,
+                            stream,
+                            &worker_telemetry,
+                            &config.factory.device,
+                        ) {
                             tracing::warn!("Hybrid worker stopped: {error}");
                         }
                     }
@@ -399,14 +566,19 @@ impl PipelineWorker {
                         drop(ready_tx.send(Err(error)));
                     }
                 }
+                // Dropped last: the pipeline and its device memory are gone by now.
+                drop(exit_tx);
             })?;
-        ready_rx
+        let report = ready_rx
             .recv()
             .map_err(|error| TurError::Other(format!("Worker startup failed: {error}")))??;
         Ok(Self {
             tx,
             timeout,
             stream,
+            report: Some(Arc::new(report)),
+            telemetry,
+            exit,
         })
     }
 
@@ -416,7 +588,30 @@ impl PipelineWorker {
             tx,
             timeout: None,
             stream: StreamConfig::default(),
+            report: None,
+            telemetry: Arc::default(),
+            exit: watch::channel(()).1,
         }
+    }
+
+    /// Whether the worker still takes requests. A stopped one never comes back.
+    pub fn is_alive(&self) -> bool {
+        !self.tx.is_closed()
+    }
+
+    /// The loaded model, absent for a test double.
+    pub fn report(&self) -> Option<&ModelReport> {
+        self.report.as_deref()
+    }
+
+    /// Counters the worker publishes every pass.
+    pub fn telemetry(&self) -> &WorkerTelemetry {
+        &self.telemetry
+    }
+
+    /// A receiver whose sender drops when the worker has released its model.
+    pub(crate) fn exit(&self) -> watch::Receiver<()> {
+        self.exit.clone()
     }
 
     /// Bounded text channel for one streaming request.
@@ -445,7 +640,6 @@ impl PipelineWorker {
 )]
 mod tests {
     use super::*;
-    use crate::ModelSource;
     use candle_core::Device;
     use tur_models::models::{DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, WeightFormat};
 
@@ -473,6 +667,9 @@ mod tests {
             tx,
             timeout: Some(Duration::from_secs(1)),
             stream: StreamConfig::default(),
+            report: None,
+            telemetry: Arc::default(),
+            exit: watch::channel(()).1,
         };
         let message = || {
             let (token_tx, token_rx) = mpsc::channel(1);

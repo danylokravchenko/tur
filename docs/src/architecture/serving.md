@@ -15,6 +15,16 @@ The HTTP server is an axum application (`tur::server`) in front of a `PipelineWo
 
 `TranscriptionWorker` owns a Whisper model on its own thread and Metal queue, and takes clips from a bounded queue (16 by default, `--max-waiting-transcriptions`). A full queue returns HTTP 429. Handlers decode uploads and base64 audio on Tokio's blocking pool, so a large WAV file never stalls the async runtime. Chat clips go to a separate encoder thread that holds up to 8 waiting requests, and a full one returns HTTP 429; each request rejoins the worker's intake once its clips are encoded. [Audio](audio.md) covers the models.
 
+## Reporting
+
+Each pass the worker publishes its counters and pool occupancy to a small shared structure, so a scrape never interrupts the worker or waits for a pass. `/metrics` and `/diagnostics` read that copy, and a background task adds system memory every 10 seconds. HTTP counters are keyed by route pattern, so client-chosen paths can't grow them. See [HTTP API](../guide/http-api.md#operating-the-server).
+
+## Shutdown
+
+On SIGINT or SIGTERM the listener closes, new requests on open connections get 503 `server_shutting_down`, and accepted requests run to completion, including queued ones. Then the workers' senders drop, each worker exits and releases its model, and the process exits with status 0.
+
+If requests are still running after `--shutdown-timeout-secs`, or at a second signal, the worker fails what it holds with `worker_unavailable` between passes, so no buffer is released while the GPU may use it.
+
 ## Streaming
 
 Each streaming request has a bounded channel of 64 messages and a buffer behind it.
@@ -34,4 +44,7 @@ The listener, model ID, admission and deadline settings, prefix retention and st
 - Everything is bounded: intake, waiting requests, waiting tokens, stream messages and stream buffers, each with its own error.
 - Errors are typed. A full queue, a missed deadline, lack of memory and a slow client each map to a distinct HTTP status (see [HTTP API](../guide/http-api.md#errors)).
 - Deployment settings can live in TOML. Stream limits join the other server limits without more flags, and generation settings stay per request.
-- The server isn't production-hardened yet. It has no health or readiness endpoints, metrics, graceful shutdown or stop sequences (see [Open work](../design/open.md)).
+- Stop sequences hold text back. Text that could still become a sequence stays in the worker until it completes or can't, so a stream never shows part of a stop sequence. Only the answer is searched; reasoning isn't.
+- Metrics are written by hand in Prometheus text, with no new dependency. The format is small, and the counters already had one writer.
+- `/health` also fails when a worker has stopped. Nothing restarts a worker, so a supervisor should replace the process.
+- Local checkpoints report as `local`. Clients get the revision, not the server's file paths, and no endpoint reports prompts.

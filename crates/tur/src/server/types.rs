@@ -60,6 +60,24 @@ pub struct ChatCompletionRequest {
     pub preserve_thinking: Option<bool>,
     /// Prefix-reuse namespace: only requests with the same salt share cached prompts.
     pub cache_salt: Option<String>,
+    pub stop: Option<StopSequences>,
+}
+
+/// `OpenAI`'s two forms of the `stop` field.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum StopSequences {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StopSequences {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(stop) => vec![stop],
+            Self::Many(stops) => stops,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,6 +243,9 @@ pub struct ModelObject {
     pub object: &'static str,
     pub created: u64,
     pub owned_by: &'static str,
+    /// The checkpoint's immutable revision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 /// `json` response of the speech-to-text endpoints.
@@ -295,6 +316,17 @@ impl ApiErrorResponse {
                 message: message.into(),
                 error_type: "server_error",
                 code: None,
+            },
+        }
+    }
+
+    /// The answer to new work while the server drains.
+    pub fn shutting_down() -> Self {
+        Self {
+            error: ApiErrorBody {
+                message: "the server is shutting down".into(),
+                error_type: "server_error",
+                code: Some("server_shutting_down"),
             },
         }
     }

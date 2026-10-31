@@ -7,8 +7,10 @@
 Lists the served chat model, and the transcription model when one is loaded:
 
 ```json
-{"object":"list","data":[{"id":"qwen-hybrid","object":"model","created":1792867193,"owned_by":"tur"}]}
+{"object":"list","data":[{"id":"qwen-hybrid","object":"model","created":1792867193,"owned_by":"tur","revision":"2fc06364715b967f1860aea9cf38778875588b17"}]}
 ```
+
+`revision` is the checkpoint's immutable revision, so a client can tell exactly what is answering it.
 
 ## `POST /v1/chat/completions`
 
@@ -30,7 +32,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | --- | --- | --- | --- |
 | `messages` | array | required, non-empty | Conversation turns, see below |
 | `model` | string | served model | If present, must equal `--served-model-name` (otherwise 404) |
-| `max_tokens` | integer > 0 | 1024 | Most tokens to generate, counting EOS; must fit the model's context |
+| `max_tokens` | integer > 0 | 1024, or what the context leaves | Most tokens to generate, counting EOS. An explicit value must fit the context |
+| `stop` | string or array | none | End the answer before the first of these texts (up to 16, each up to 1024 bytes). The text is left out, and `finish_reason` is `stop` |
 | `stream` | bool | false | Server-sent events instead of one JSON response |
 | `temperature` | number ≥ 0 | checkpoint | 0 is greedy |
 | `top_k` | integer > 0 | checkpoint | |
@@ -137,6 +140,47 @@ Silent windows produce no text. Clips longer than 30 s are transcribed window by
 
 Takes the same form and returns English text translated from the speech. Whisper large-v3-turbo was not trained for translation, so prefer a multilingual checkpoint such as large-v3 for this endpoint.
 
+## Operating the server
+
+These endpoints have no authentication, like the rest of the API, so keep the port away from untrusted clients.
+
+### `GET /health`
+
+Liveness. Returns 200 with `{"status":"ok"}` while the process answers and every worker runs, and 503 with `{"status":"worker_stopped","workers":[...]}` once one has stopped. Nothing restarts a stopped worker, so restart the server when this fails.
+
+### `GET /ready`
+
+Readiness. Returns 200 with `{"status":"ready"}` when new requests would be served, and 503 for a stopped worker or a server that is draining. The listener opens only after every model has loaded, so a server that accepts connections has finished loading.
+
+### `GET /metrics`
+
+Counters and gauges in Prometheus text format. The ones you'll usually want:
+
+| Metric | Meaning |
+| --- | --- |
+| `tur_requests_total{model,outcome}` | Finished requests: `ok`, `cancelled` or an error code. It counts failures mid-stream, which HTTP status can't show |
+| `tur_http_requests_total{path,status}` | Finished HTTP exchanges by route |
+| `tur_request_duration_seconds`, `tur_time_to_first_token_seconds` | Latency histograms of successful requests |
+| `tur_requests_running`, `tur_requests_waiting` | Current load |
+| `tur_prompt_tokens_total`, `tur_cached_prompt_tokens_total`, `tur_generated_tokens_total` | Token counts of finished requests |
+| `tur_preemptions_total` | Recomputations forced by memory pressure; a steady rise means the pool is too small for the load |
+| `tur_kv_pages_leased`, `tur_kv_pages_peak`, `tur_kv_pages_capacity` | State pool occupancy |
+| `tur_context_tokens`, `tur_memory_plan_*_bytes` | What startup planned |
+| `tur_device_allocated_bytes`, `tur_process_resident_bytes` | What is actually allocated |
+| `tur_system_spare_memory_bytes`, `tur_system_swapouts_total` | Memory pressure on the machine; swap is counted from server start |
+| `tur_pass_phase_seconds_total{phase}`, `tur_device_seconds_total` | Where pass time goes |
+| `tur_model_info{source,revision}` | The served checkpoint, as labels |
+
+### `GET /diagnostics`
+
+One JSON document for a person debugging the server: version, uptime and system memory, then for each model its revision, weight and K/V formats, context limit, the whole memory plan, scheduler limits, device capabilities and kernel tuning, pool occupancy, and sampling, prefix and speculation counters. `context` reads:
+
+```json
+{"limit_tokens": 8192, "full_contexts": 4, "sized_for_tokens": 8192, "max_running": 4}
+```
+
+`limit_tokens` is the most one request may hold, and `full_contexts` is how many requests of `sized_for_tokens` the pool holds at once. When `full_contexts` is below `max_running`, some requests wait or recompute at full length.
+
 ## Errors
 
 Errors use OpenAI's shape:
@@ -148,6 +192,7 @@ Errors use OpenAI's shape:
 | Status | `type` / `code` | Cause |
 | --- | --- | --- |
 | 400 | `invalid_request_error` | Empty messages, unknown role, invalid sampling values, unsupported `tool_choice`, undecodable or unsupported audio, or a request the engine rejects (`invalid_request`) |
+| 400 | `invalid_request_error` / `context_length_exceeded` | The prompt and `max_tokens` don't fit the context the server allows |
 | 404 | `invalid_request_error` | Unknown `model` |
 | 408 | `timeout_error` / `slow_client` | A streaming client stopped reading |
 | 413 | (plain text) | The body exceeds 64 MiB |
@@ -155,6 +200,7 @@ Errors use OpenAI's shape:
 | 429 | `rate_limit_error` / `queue_full` | The queue already holds `--max-waiting` requests |
 | 503 | `server_error` / `insufficient_memory` | The request can't fit in memory even running alone |
 | 503 | `server_error` / `worker_unavailable` | The inference worker stopped |
+| 503 | `server_error` / `server_shutting_down` | The server is draining |
 | 504 | `timeout_error` / `deadline_exceeded` | `--request-timeout-secs` elapsed |
 | 500 | `server_error` / `internal_error` | Anything else |
 

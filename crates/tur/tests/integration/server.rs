@@ -112,6 +112,7 @@ fn test_state(response_text: &'static str) -> AppState {
     let mut workers = HashMap::new();
     workers.insert("test-model".to_string(), mock_worker(response_text));
     AppState {
+        status: tur::server::ServerStatus::shared(),
         workers,
         transcribers: HashMap::new(),
         default_transcriber: None,
@@ -218,6 +219,7 @@ async fn test_tool_call_response_has_correct_structure() -> TestResult {
         mock_tool_call_worker("get_weather", r#"{"location": "Paris", "unit": "celsius"}"#)?,
     );
     let app = build_router(AppState {
+        status: tur::server::ServerStatus::shared(),
         workers,
         transcribers: HashMap::new(),
         default_transcriber: None,

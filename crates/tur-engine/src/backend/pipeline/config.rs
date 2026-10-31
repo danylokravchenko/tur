@@ -33,6 +33,10 @@ pub struct PipelineConfig {
     /// `max_running` contexts of [`super::super::memory::DEFAULT_CONTEXT_TOKENS`] tokens, within
     /// what the device budget leaves.
     pub state_bytes: Option<usize>,
+    /// Most positions one request may use. It sizes the pool for `max_running` such
+    /// requests and bounds kernel scratch, and a start that cannot hold it fails. `None`
+    /// allows whatever the pool and the model do, with scratch for the model's limit.
+    pub context_tokens: Option<usize>,
 }
 
 impl PipelineConfig {
@@ -51,6 +55,7 @@ impl PipelineConfig {
             device_sampling: true,
             speculation: SpeculationConfig::DISABLED,
             state_bytes: None,
+            context_tokens: None,
         }
     }
 
@@ -126,11 +131,13 @@ impl InferencePipeline {
             .create_model_with(draft, |architecture, options| {
                 let tokens = limits.max_batch_tokens;
                 let sequences = limits.max_running.min(tokens);
-                let (description, weights, scratch_peak) = architecture.memory_requirements(
-                    options,
-                    tokens,
-                    &vec![architecture.max_position(); sequences],
-                )?;
+                // An oversized context is left to the plan, which reports it.
+                let context = config
+                    .context_tokens
+                    .unwrap_or_else(|| architecture.max_position())
+                    .min(architecture.max_position());
+                let (description, weights, scratch_peak) =
+                    architecture.memory_requirements(options, tokens, &vec![context; sequences])?;
                 config.prefix.validate(description.kv.page_tokens)?;
                 // Full model logits and their gathered copy coexist for sampled requests;
                 // every drafted token adds an output row.
@@ -151,11 +158,7 @@ impl InferencePipeline {
                     })
                     .ok_or_else(|| invalid("in-flight size overflow"))?;
                 let in_flight = in_flight
-                    .checked_add(
-                        config
-                            .speculation
-                            .index_bytes(sequences, architecture.max_position())?,
-                    )
+                    .checked_add(config.speculation.index_bytes(sequences, context)?)
                     .ok_or_else(|| invalid("draft index reservation overflow"))?;
                 let (plan, pool) = MemoryPlan::new(
                     &description,
@@ -171,14 +174,15 @@ impl InferencePipeline {
                             .max_chunk
                             .max(config.speculation.max_draft.saturating_add(1)),
                         state_bytes: config.state_bytes,
+                        context: config.context_tokens,
                         limit: budget.limit(),
                         reserved: budget.leased(),
                     },
                 )?;
                 let lease = budget.lease(plan.resident())?;
+                plan.report(limits.max_running);
                 Ok((plan, pool, lease))
             })?;
-        let max_position = model.max_position();
         if model.weight_bytes() != plan.weights {
             return Err(invalid(
                 "loaded weights disagree with the pre-load memory plan",
@@ -196,9 +200,9 @@ impl InferencePipeline {
             tokenizer,
             template,
             defaults,
-            max_position,
             scheduler,
             plan,
+            device_sampling: config.device_sampling,
             _lease: lease,
             pending: HashMap::new(),
             prefix: PrefixCache::new(PrefixConfig {

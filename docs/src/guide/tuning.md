@@ -36,6 +36,22 @@ The total is the weights, plus the state pool (K/V pages, recurrent state, prefi
 | Snapshots | `--prefix-snapshots N` | By default, one per running request, using at most 1/8 of the pool |
 | Concurrency | `--max-batch-size` | Each running request holds recurrent state and its own K/V pages |
 
+The same numbers stay available while the server runs, at [`/diagnostics`](http-api.md#get-diagnostics) and `/metrics`.
+
+## Set the context you need
+
+`--context-tokens` says how long one conversation may get, and Tur plans around it:
+
+```sh
+tur serve --context-tokens 32768 --max-batch-size 4 --kv-format q8
+```
+
+The state pool is sized so that all four requests can reach 32K tokens at once, and kernel scratch only for that length. If the plan doesn't fit the GPU's working set, the start fails with the largest context that would fit. A request beyond the limit gets HTTP 400 with `context_length_exceeded`, and one that leaves out `max_tokens` is cut off where the context ends.
+
+Without the flag, Tur sizes the pool for 8K tokens per request and lets one request use as much of the pool as the model allows. It shrinks the pool to fit the device, and logs a warning when that leaves room for fewer full contexts than concurrent requests. With both `--context-tokens` and `--state-memory-mb`, the pool you set must hold one full context; requests beyond what it holds wait or recompute rather than fail.
+
+At startup Tur also compares the plan with what macOS can spare without compressing or swapping, and warns if the plan is larger. While serving, it reads spare memory every 10 seconds and warns when spare memory falls below 1 GiB or macOS starts writing to swap.
+
 ## What each setting trades
 
 | Setting | Raise it to | Lower it to | Default |

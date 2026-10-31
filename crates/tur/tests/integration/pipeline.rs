@@ -205,7 +205,7 @@ fn test_requests_beyond_the_state_pool_are_rejected_at_admission() -> Result<()>
     assert_eq!(planned, pipeline.memory()?.resident_bytes());
     assert!(matches!(
         pipeline.submit_request(&GenerationRequest::new("t10 t11 t12 t13 t14".into(), 13)),
-        Err(TurError::MemoryAllocation(_))
+        Err(TurError::ContextExceeded(_))
     ));
     let id = pipeline.submit_request(&GenerationRequest::new("t10 t11 t12 t13 t14".into(), 12))?;
     let mut results = drain(&mut pipeline)?;

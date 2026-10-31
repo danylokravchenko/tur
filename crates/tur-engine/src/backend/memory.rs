@@ -10,7 +10,10 @@ use tur_core::{
     Result, TurError,
     execution::{ModelDescription, invalid},
 };
-use tur_metal::pool::{PoolConfig, working_set_bytes};
+use tur_metal::{
+    pool::{PoolConfig, working_set_bytes},
+    system::SystemMemory,
+};
 
 /// Context each concurrent sequence is sized for when no state budget is given.
 pub const DEFAULT_CONTEXT_TOKENS: usize = 8192;
@@ -43,6 +46,13 @@ pub struct MemoryPlan {
     pub retained: usize,
     /// Recurrent slots held beyond live sequences and snapshots for speculative drafts.
     pub draft_slots: usize,
+    /// Most positions one request may use: its prompt and all but the last generated token.
+    pub context_tokens: usize,
+    /// Requests the pool can hold at once at `sized_context` positions each. Beyond that,
+    /// snapshots go first and then requests wait or recompute; nothing fails or swaps.
+    pub full_contexts: usize,
+    /// The context `full_contexts` is counted in: the configured one, or the default.
+    pub sized_context: usize,
 }
 
 /// What the plan must hold besides the state pool.
@@ -67,6 +77,10 @@ pub struct PlanInputs {
     /// Explicit state pool budget in bytes; otherwise sized for [`DEFAULT_CONTEXT_TOKENS`]
     /// per sequence within the device limit.
     pub state_bytes: Option<usize>,
+    /// Configured context per request. The plan must hold it for every sequence, unless
+    /// `state_bytes` sets the pool, which must then hold it at least once. `None` lets a
+    /// request use whatever the pool and the model allow.
+    pub context: Option<usize>,
     /// The device's recommended working set.
     pub limit: Option<usize>,
     /// Bytes already leased by other models on the device.
@@ -83,6 +97,75 @@ impl MemoryPlan {
             .saturating_add(self.overhead)
     }
 
+    /// Bytes left of the device limit beside this plan and other models.
+    pub fn headroom(&self) -> Option<usize> {
+        self.limit.map(|limit| {
+            limit
+                .saturating_sub(self.resident())
+                .saturating_sub(self.reserved)
+        })
+    }
+
+    /// Log the plan, warning where it promises less than was asked for or more than macOS
+    /// can spare now. Other applications may free memory later, and working-set accounting
+    /// already refuses what can never fit, so low spare memory warns rather than refuses.
+    pub fn report(&self, sequences: usize) {
+        self.log_sizes();
+        self.log_context(sequences);
+        if self.limit.is_some() {
+            self.warn_if_beyond_spare();
+        }
+    }
+
+    fn log_sizes(&self) {
+        tracing::info!(
+            resident_bytes = self.resident(),
+            weights = self.weights,
+            state_pool = self.state_pool,
+            scratch_peak = self.scratch_peak,
+            in_flight = self.in_flight,
+            overhead = self.overhead,
+            other_models = self.reserved,
+            limit = ?self.limit,
+            "Memory plan"
+        );
+    }
+
+    fn log_context(&self, sequences: usize) {
+        tracing::info!(
+            limit = self.context_tokens,
+            full_contexts = self.full_contexts,
+            of_tokens = self.sized_context,
+            requests = sequences,
+            snapshots = self.retained,
+            "Context plan"
+        );
+        if self.full_contexts < sequences {
+            tracing::warn!(
+                "the state pool holds {} of {sequences} concurrent requests at {} tokens each; \
+                 the rest wait or recompute under load",
+                self.full_contexts,
+                self.sized_context,
+            );
+        }
+    }
+
+    fn warn_if_beyond_spare(&self) {
+        let Ok(system) = SystemMemory::read() else {
+            return;
+        };
+        // The overhead is a margin within the limit, not memory this plan will touch.
+        let needed = self.resident().saturating_sub(self.overhead);
+        if needed > system.spare_bytes {
+            tracing::warn!(
+                "this plan needs {} MiB and macOS can spare {} MiB without compressing or \
+                 swapping; close other applications or shrink the plan to avoid swap",
+                needed >> 20,
+                system.spare_bytes >> 20,
+            );
+        }
+    }
+
     /// Size the state pool and check the plan, beside memory other models reserved, against
     /// the device limit. An explicit budget that would exceed the limit is rejected rather
     /// than left to swap.
@@ -95,37 +178,37 @@ impl MemoryPlan {
             .and_then(|b| b.checked_add(overhead))
             .and_then(|b| b.checked_add(inputs.reserved))
             .ok_or_else(|| invalid("memory plan overflow"))?;
+        if inputs.context == Some(0) {
+            return Err(invalid("context must be at least one token"));
+        }
+        let sized_context = match inputs.context {
+            Some(context) if context > description.max_position => {
+                return Err(TurError::ContextExceeded(format!(
+                    "a context of {context} tokens exceeds the model's {} positions",
+                    description.max_position
+                )));
+            }
+            Some(context) => context,
+            None => DEFAULT_CONTEXT_TOKENS.min(description.max_position),
+        };
         let available = inputs.limit.map(|limit| limit.saturating_sub(fixed));
         let bytes = if let Some(bytes) = inputs.state_bytes {
             bytes
         } else {
-            let context = DEFAULT_CONTEXT_TOKENS.min(description.max_position);
-            let window_pages = match description.window() {
-                Some(window) => inputs
-                    .sequences
-                    .checked_add(inputs.retained)
-                    .and_then(|holders| {
-                        let held = window.checked_add(inputs.pass_tokens)?;
-                        holders.checked_mul(description.pages_for(held).checked_add(1)?)
-                    })
-                    .ok_or_else(|| invalid("window page count overflow"))?,
-                None => 0,
-            };
-            let wanted = PoolConfig {
-                pages: description
-                    .full_pages_for(context)
-                    .checked_mul(inputs.sequences)
-                    .ok_or_else(|| invalid("page count overflow"))?,
-                window_pages,
-                recurrent_slots: inputs
-                    .sequences
-                    .checked_mul(2)
-                    .and_then(|slots| slots.checked_add(inputs.retained))
-                    .and_then(|slots| slots.checked_add(inputs.draft_slots))
-                    .ok_or_else(|| invalid("recurrent slot count overflow"))?,
+            let wanted = wanted_pool_bytes(description, &inputs, sized_context)?;
+            match available {
+                Some(available) if inputs.context.is_some() && wanted > available => {
+                    return Err(context_beyond_memory(
+                        description,
+                        &inputs,
+                        sized_context,
+                        wanted,
+                        available,
+                    ));
+                }
+                Some(available) => wanted.min(available),
+                None => wanted,
             }
-            .bytes(description)?;
-            available.map_or(wanted, |available| wanted.min(available))
         };
         // A snapshot costs a whole recurrent state (157 MB on Qwen3.8-27B against 20 MB on
         // 0.8B), so large models on small budgets retain proportionally fewer.
@@ -153,6 +236,26 @@ impl MemoryPlan {
             extra,
             inputs.pass_tokens,
         )?;
+        let full_contexts = match description.full_pages_for(sized_context) {
+            0 => inputs.sequences,
+            pages => config.pages / pages,
+        };
+        if inputs.context.is_some() && full_contexts == 0 {
+            return Err(TurError::MemoryAllocation(format!(
+                "a state pool of {} K/V pages cannot hold one context of {sized_context} tokens",
+                config.pages
+            )));
+        }
+        let context_tokens = inputs.context.unwrap_or_else(|| {
+            if description.has_full_attention() {
+                config
+                    .pages
+                    .saturating_mul(description.kv.page_tokens)
+                    .min(description.max_position)
+            } else {
+                description.max_position
+            }
+        });
         let plan = Self {
             weights: inputs.weights,
             state_pool: config.bytes(description)?,
@@ -163,6 +266,9 @@ impl MemoryPlan {
             reserved: inputs.reserved,
             retained,
             draft_slots,
+            context_tokens,
+            full_contexts,
+            sized_context,
         };
         if let Some(limit) = inputs.limit
             && plan.resident().saturating_add(plan.reserved) > limit
@@ -178,6 +284,69 @@ impl MemoryPlan {
         }
         Ok((plan, config))
     }
+}
+
+/// Pool bytes that hold `context` tokens for every sequence, with all its other state.
+fn wanted_pool_bytes(
+    description: &ModelDescription,
+    inputs: &PlanInputs,
+    context: usize,
+) -> Result<usize> {
+    let window_pages = match description.window() {
+        Some(window) => inputs
+            .sequences
+            .checked_add(inputs.retained)
+            .and_then(|holders| {
+                let held = window.checked_add(inputs.pass_tokens)?;
+                holders.checked_mul(description.pages_for(held).checked_add(1)?)
+            })
+            .ok_or_else(|| invalid("window page count overflow"))?,
+        None => 0,
+    };
+    PoolConfig {
+        pages: description
+            .full_pages_for(context)
+            .checked_mul(inputs.sequences)
+            .ok_or_else(|| invalid("page count overflow"))?,
+        window_pages,
+        recurrent_slots: inputs
+            .sequences
+            .checked_mul(2)
+            .and_then(|slots| slots.checked_add(inputs.retained))
+            .and_then(|slots| slots.checked_add(inputs.draft_slots))
+            .ok_or_else(|| invalid("recurrent slot count overflow"))?,
+    }
+    .bytes(description)
+}
+
+/// The refusal of a configured context, naming the largest one that would fit.
+fn context_beyond_memory(
+    description: &ModelDescription,
+    inputs: &PlanInputs,
+    context: usize,
+    wanted: usize,
+    available: usize,
+) -> TurError {
+    let unit = description
+        .page_bytes()
+        .unwrap_or(1)
+        .saturating_mul(inputs.sequences)
+        .max(1);
+    let excess = wanted.saturating_sub(available).div_ceil(unit);
+    let fits = description
+        .full_pages_for(context)
+        .saturating_sub(excess)
+        .saturating_mul(description.kv.page_tokens);
+    TurError::MemoryAllocation(format!(
+        "a context of {context} tokens for {} concurrent requests needs {} MiB of state, and \
+         {} MiB remain after weights, scratch and reserve (device working set {} MiB). The \
+         largest context that fits is about {fits} tokens; or lower --max-batch-size, use \
+         --kv-format q8 or a smaller --weight-format",
+        inputs.sequences,
+        wanted >> 20,
+        available >> 20,
+        inputs.limit.unwrap_or(0) >> 20,
+    ))
 }
 
 #[derive(Debug)]
@@ -307,9 +476,73 @@ mod tests {
             draft_slots: 0,
             pass_tokens: 1,
             state_bytes,
+            context: None,
             limit,
             reserved: 0,
         }
+    }
+
+    #[test]
+    fn test_configured_context_sizes_the_pool_and_reports_its_limit() -> Result<()> {
+        let model = description();
+        let context = |context| PlanInputs {
+            context: Some(context),
+            ..inputs(None, None)
+        };
+        let (plan, config) = MemoryPlan::new(&model, context(1600))?;
+        assert_eq!(config.pages, 2 * 100);
+        assert_eq!(
+            (plan.context_tokens, plan.full_contexts, plan.sized_context),
+            (1600, 2, 1600)
+        );
+        // Beyond the model's positions, or empty, it never reaches the plan.
+        assert!(matches!(
+            MemoryPlan::new(&model, context(model.max_position + 1)),
+            Err(TurError::ContextExceeded(_))
+        ));
+        assert!(MemoryPlan::new(&model, context(0)).is_err());
+        // Left unset, a request may use the whole pool.
+        let (plan, config) = MemoryPlan::new(&model, inputs(None, None))?;
+        assert_eq!(plan.context_tokens, config.pages * 16);
+        assert_eq!(plan.full_contexts, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_configured_context_beyond_memory_is_refused_while_the_default_shrinks() -> Result<()> {
+        let model = description();
+        let (page, slot) = (model.page_bytes()?, model.recurrent_slot_bytes()?);
+        // Room for 100 pages in all after fixed memory and the reserve: 50 per request.
+        let limit = (1600 + 100 * page + 5 * slot) * 10 / 9;
+        let context = |context| PlanInputs {
+            context: Some(context),
+            ..inputs(None, Some(limit))
+        };
+        let Err(TurError::MemoryAllocation(message)) = MemoryPlan::new(&model, context(1600))
+        else {
+            return Err(invalid("a context beyond memory was accepted"));
+        };
+        // The refusal names a context that does fit.
+        assert!(message.contains("about 800 tokens"), "{message}");
+        let (plan, _) = MemoryPlan::new(&model, context(800))?;
+        assert!(plan.resident() <= limit);
+        assert_eq!(plan.full_contexts, 2);
+        // Unconfigured, the same memory shrinks the pool and the report says so.
+        let (plan, config) = MemoryPlan::new(&model, inputs(None, Some(limit)))?;
+        assert!(plan.full_contexts < 2);
+        assert_eq!(plan.context_tokens, config.pages * 16);
+        // A pool set by hand must hold the context once, and may hold it only once.
+        let pinned = |pages: usize| PlanInputs {
+            context: Some(1600),
+            state_bytes: Some(pages * page + 5 * slot),
+            ..inputs(None, None)
+        };
+        assert!(matches!(
+            MemoryPlan::new(&model, pinned(99)),
+            Err(TurError::MemoryAllocation(_))
+        ));
+        assert_eq!(MemoryPlan::new(&model, pinned(100))?.0.full_contexts, 1);
+        Ok(())
     }
 
     #[test]
