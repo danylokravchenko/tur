@@ -28,6 +28,11 @@ git show 99b073e:<path> > change.patch
 | Transposed DeltaNet scan with 16 or 64 rows per lane | 10 to 22% and 1.45× slower than 32 | none |
 | Decode attention with 8 keys per step | Up to 23% slower at short contexts, only 2 to 8% faster at long ones | none |
 | Tiled attention with 64-query tiles | 0.86 to 0.89× on long prefill, 0.65× on short chunks | none |
+| Tiled attention with 64-key blocks | About 15% slower at 2K tokens over F16 pools | none |
+| Fewer tiled barriers through 128- or 256-dimension F16 chunks | 128 dimensions showed no gain beyond noise, and 256 was 25 to 45% slower despite two barriers per block instead of eight | none |
+| Keeping tiled query fragments in registers across key blocks | 9 to 18% slower than reloading them on prefill from empty, and level on a chunk after 8K | none |
+| Staging the query tile as F16 in threadgroup memory | About 15% slower than scaling once per block, and it would round queries | none |
+| `fast::exp` in the tiled softmax | No gain beyond noise | none |
 | Four query heads per simdgroup in decode attention | Lost at every shape | none |
 | A high-precision K/V window for recent tokens | Not built: Q8 error is flat across positions | none |
 | Radix tree for prefix lookup | Not built: the indexed hash lookup costs at most 7 µs at 32K tokens | none |

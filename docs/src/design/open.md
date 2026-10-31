@@ -17,8 +17,8 @@
 
 ## Performance
 
-- Long-prompt prefill. llama.cpp prefills 8K-token prompts 6 to 11% faster than Tur, while 2K-token prompts are level ([Compared with llama.cpp](../guide/performance.md#compared-with-llamacpp)). In an 8K-token prefill, tiled attention takes the largest share, about 2.3 s across six layers. Matching llama.cpp's attention speed needs faster matrix work, for example F16 staging.
-- Tiled prefill attention reaches about 28% of the matrix units' F32 peak, with eight barriers per 32-key block at head dimension 256 over F32 and F16 pools, and sixteen over Q8.
+- Long-prompt prefill. llama.cpp prefills 8K-token prompts 6 to 11% faster than Tur, while 2K-token prompts are level ([Compared with llama.cpp](../guide/performance.md#compared-with-llamacpp)). Tiled attention is about 2.4 s of an 8K-token prefill across six layers, and the other 6 s grows linearly with tokens, so that remainder is the larger target. Chunk size isn't the lever: 256- and 512-token chunks match a single pass at 8K.
+- Tiled prefill attention reaches about 30% of the matrix units' F32 peak, with eight barriers per 32-key block at head dimension 256 over F32 and F16 pools, and sixteen over Q8. Barriers aren't the limit, since cutting them to two made it slower. Removing K/V reads would save about 17%, the softmax 10% and query loads about 13%, and the multiplies themselves take most of the rest.
 - Broader comparisons. llama.cpp is measured for Q8_0 and Q4_K_M at up to 16 sequences. Still to do: MLX-LM on this Mac, 32K-token prompts, cached and uncached prefixes, and sustained load.
 - Quality budgets. Held-out budgets, declared in advance, for language, code, tool calls and JSON, and long-context retrieval, with confidence intervals.
 - Chained MTP drafts, estimated at about 10% with one request.
