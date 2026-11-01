@@ -3,47 +3,76 @@
   <h1>Tur</h1>
   <p><strong>Local inference with a little muscle.</strong></p>
   <p>A Rust inference engine for hybrid language models on Apple Silicon.</p>
-  <p> <a href="#why-tur-is-fast">Why it's fast</a> · <a href="#get-started">Get started</a> · <a href="#what-tur-can-do">Features</a> · <a href="#measured-on-a-mac">Performance</a> · <a href="docs/src/SUMMARY.md">Read the book</a> </p>
+  <p>Built to get the most out of your Mac.</p>
+  <p> <a href="#why-tur">Why Tur</a> · <a href="#how-it-works">How it works</a> · <a href="#performance">Performance</a> · <a href="#models">Models</a> · <a href="#get-started">Get started</a> · <a href="docs/src/SUMMARY.md">Read the book</a> </p>
   <p><strong>Rust · Metal · Apple Silicon · Apache-2.0</strong></p>
 </div>
 
 ---
 
-Tur runs Qwen3.5-family, Gemma 4 and gpt-oss models on your Mac's GPU. It can keep most of a large model's experts on the SSD, so a model that doesn't fit in memory still runs. Gemma 4 E2B and E4B also hear audio, and Whisper large-v3-turbo transcribes speech beside the chat model. You can generate from the terminal, serve an OpenAI-compatible HTTP API, or embed the engine in a Rust program. One `tur` binary handles generation, serving, transcription and quantization.
+Tur runs language models on your Mac's GPU with Metal kernels fitted to those models. One `tur` binary handles generation, an OpenAI-compatible HTTP server, Whisper transcription and quantization, and you can also embed the engine in a Rust program.
 
-General-purpose engines treat every model the same way. Tur is built around one family of models on one kind of hardware, so each part of the path, from Metal kernels to request scheduling, can be shaped to what those models need.
+## Why Tur
 
-## Why Tur is fast
+Choose Tur if you want one of these on an Apple Silicon Mac:
 
-On a Mac, producing a token is mostly a memory problem. The GPU has to read the model's weights and each request's attention and recurrent state, and it spends more time waiting for those bytes than computing with them. Tur's design follows from that:
+- Several clients or agents sharing one model. Requests share each model pass, so eight sequences decode 60% faster than on llama.cpp on the same Mac.
+- A mixture-of-experts model larger than your Mac's memory. Tur keeps most experts on the SSD and reads them into a fixed cache, with several requests at once and no SSD writes during a run.
+- A server you can leave running. Tur plans all its memory before loading a weight, so a configuration that doesn't fit fails at startup, and one failed request doesn't affect the others.
 
-- Several requests share each pass over the weights. Continuous batching packs every active request's next token, plus chunks of new prompts, into one model pass with no padding. The weights are read once and used for all of them, so eight users cost far less than eight times one user.
-- Kernels do more per memory read. Norms, gates, activations and residual additions are fused into neighbouring kernels, and the recurrent-state kernels read memory in the order the GPU prefers. Where Candle's own kernel is faster, Tur uses Candle's.
-- State stays where the GPU reads it. Attention keys and values live in fixed pages that kernels read in place, so nothing is copied or reassembled per token. Recurrent state lives in reusable slots.
-- Sampling happens on the GPU. Temperature, top-k, top-p, penalties and grammar masks run right after the model pass, and only the chosen token travels back to the CPU.
-- Smaller weights mean fewer bytes to read. With 4-bit weights, a single conversation decodes about 1.6× faster than with 8-bit ones.
+Tur supports few models and doesn't accept images or video. It has no embeddings, it serves one chat model per process, and its HTTP API doesn't offer structured output yet. For those, or for other hardware, look at oMLX, llama.cpp, Ollama, SGLang or Strata. [Tur and other engines](docs/src/architecture/comparison.md) compares them.
 
-Two more features skip work entirely. Prefix reuse keeps the state of prompts it has already processed, so a shared system prompt or an agent's growing conversation is computed once. Speculative decoding guesses several tokens ahead and checks them all in one pass, which pays off on repetitive output such as code edits. Both give exactly the output you would get without them.
+## How it works
 
-The [architecture chapters](docs/src/architecture/overview.md) explain each mechanism and the measurements that decided it.
+Producing a token on a Mac is mostly a memory problem: the GPU spends more time waiting for weights and request state than computing with them. Tur is built around one family of models on this one kind of hardware, so it can shape each layer to read fewer bytes.
+
+- Continuous batching packs every request's next token and chunks of new prompts into one pass with no padding, so the weights are read once for all of them.
+- Metal kernels fuse neighbouring steps and read recurrent state in the order the GPU prefers. Tur keeps a custom kernel only where it measurably beats Candle's.
+- Attention and recurrent state live in fixed pools that kernels read in place, so nothing is copied or reassembled per token.
+- Sampling runs on the GPU right after the model pass, and only the chosen token returns to the CPU.
+- Calibrated 4-bit weights load in a fraction of a second and hold fewer bytes to read, which makes a single conversation about 1.6× faster than 8-bit.
+
+Prefix reuse computes a shared system prompt or an agent's growing conversation once. Speculative decoding drafts several tokens and verifies them in one pass, which pays off on repetitive output such as code edits. Neither changes the generated text.
+
+The [architecture chapters](docs/src/architecture/overview.md) explain each mechanism and the measurements behind it.
+
+## Performance
+
+Tur against llama.cpp on an M3 Pro with 36 GB, in tokens per second. 4-bit rows use each engine's usual format, so they compare engines and weights together.
+
+| Test | Tur | llama.cpp | Difference |
+| --- | ---: | ---: | ---: |
+| Qwen3.5-0.8B, 8-bit, decode, 1 sequence | 123 | 113 | +9% |
+| Qwen3.5-0.8B, 8-bit, decode, 8 sequences | 729 | 456 | +60% |
+| Qwen3.5-0.8B, 4-bit, decode, 1 sequence | 182 | 141 | +29% |
+| Qwen3.5-0.8B, 8-bit, prefill, 2K tokens | 3,799 | 3,383 | +12% |
+| Qwen3.6-35B, 4-bit, decode, 1 sequence | 47.1 | 35.6 | +32% |
+
+Tur doesn't win everywhere: on a 16 GB M1, llama.cpp prefills 8K-token prompts 6 to 11% faster. Prefill is mostly compute, so Tur's savings on memory reads help less there.
+
+Other results for Qwen3.5-0.8B on that 16 GB M1:
+
+- Through the full server with sampling, eight concurrent requests produce 186 tokens/s in total, with 27 ms between tokens.
+- Eight users behind a cached 1.5K-token system prompt get their first token in 0.56 s at the median, against 9.5 s without prefix reuse.
+- Prompt-lookup speculation reaches up to 2.9× normal decoding on repetitive text.
+
+[Measured performance](docs/src/guide/performance.md) has the full tables, versions and methods.
+
+## Models
+
+Tur supports the Qwen3.5 family, Gemma 4 and gpt-oss for text, plus Whisper for transcription. Gemma 4 E2B and E4B also accept WAV audio. [Scope and principles](docs/src/design/scope.md) lists how far each model has been validated.
 
 ## Get started
 
-You need an Apple Silicon Mac and Rust installed through [rustup](https://rustup.rs/). The first build takes a few minutes, and the first run downloads the model into your Hugging Face cache.
-
-### 1. Install
+You need an Apple Silicon Mac. Install the prebuilt binary, which goes into `~/.local/bin`:
 
 ```sh
-git clone https://github.com/danylokravchenko/tur.git
-cd tur
-./install.sh
+curl -fsSL https://github.com/danylokravchenko/tur/releases/latest/download/install.sh | sh
 ```
 
-The binary goes into `~/.cargo/bin`, so make sure that is on your `PATH`. Use `./install.sh --root "$HOME/.local"` to install into `~/.local/bin` instead.
+To build from source instead, or to see the installer's options, read [Requirements and checkpoints](docs/src/guide/getting-started.md).
 
-### 2. Say hello
-
-Pin the model revision so every run loads the same weights:
+Generate some text. The first run downloads the model into your Hugging Face cache, and pinning the revision means every run loads the same weights:
 
 ```sh
 export TUR_MODEL=Qwen/Qwen3.5-0.8B
@@ -52,13 +81,13 @@ export TUR_REVISION=2fc06364715b967f1860aea9cf38778875588b17
 tur run --prompt 'Write one sentence about the Moon.' --temperature 0 -n 64 --thinking false
 ```
 
-### 3. Make it an API
+Serve it as an API:
 
 ```sh
 tur serve --served-model-name qwen
 ```
 
-From another terminal:
+Any OpenAI client then works with the base URL `http://127.0.0.1:8080/v1` and the model `qwen`:
 
 ```sh
 curl -s http://127.0.0.1:8080/v1/chat/completions \
@@ -66,106 +95,23 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"qwen","messages":[{"role":"user","content":"Say hi"}],"max_tokens":32,"thinking":false}'
 ```
 
-Any OpenAI client works with the base URL `http://127.0.0.1:8080/v1` and the model `qwen`. The [HTTP API guide](docs/src/guide/http-api.md) covers streaming, tool calls and structured output.
-
-To keep your settings, copy [`tur.example.toml`](tur.example.toml) to `tur.toml`; flags still override it. The [configuration guide](docs/src/guide/configuration.md) lists every key, and the [quickstart](docs/src/guide/quickstart.md) walks through local downloads, offline use and quantization.
-
-## What Tur can do
-
-| Feature | What it gives you |
-| --- | --- |
-| Continuous batching | Many requests share each model pass, with no padding |
-| Paged state | Attention and recurrent state in fixed pools, with F32, F16 or Q8 keys and values |
-| Prefix reuse | Shared prompts and multi-turn conversations are computed once |
-| GPU sampling | Temperature, top-k, top-p, penalties and grammar masks without a round trip to the CPU |
-| Exact speculative decoding | Drafted tokens verified in one pass, with output identical to normal decoding |
-| Calibrated quantization | GPTQ, importance-weighted and mixed-precision 4-bit weights that load instantly |
-
-### Models
-
-| Model | Status |
-| --- | --- |
-| Qwen3.5-0.8B | Validated layer by layer against Transformers, on CPU and Metal |
-| Qwen3.8-27B | Same code path and validated config; the Q4K artifact runs on a 36 GB Mac, with quality not yet measured, and it needs more than 16 GB |
-| Qwen3.6-35B-A3B (MoE) | Real checkpoint generation tested. |
-| Gemma 4 E2B | Validated against Transformers; real checkpoint generation tested, including audio input |
-| Whisper large-v3-turbo | Transcripts equal Transformers' on a pinned clip, in F32 and Q8_0 |
-| Gemma 4 E4B, 12B, 26B-A4B, 31B | Architecture covered by small fixtures; full checkpoints not yet run |
-| gpt-oss-20b | Validated against Transformers on real weights; generates on a 16 GB Mac with [`--expert-cache-mb`](docs/src/architecture/expert-cache.md) |
-
-Tur accepts text, and WAV audio for Gemma 4 E2B and E4B and for transcription; image and video input are rejected.
-
-### Smaller weights
-
-With the [Hugging Face CLI](docs/src/guide/quickstart.md#3-download) installed and some text that resembles your traffic in `calib.txt`, you can prepack calibrated 4-bit weights:
-
-```sh
-hf download Qwen/Qwen3.5-0.8B --revision "$TUR_REVISION" --local-dir ~/models/qwen3.5-0.8b
-tur quantize --model ~/models/qwen3.5-0.8b --revision "$TUR_REVISION" \
-  --output ~/models/qwen3.5-0.8b-q4k --calibration calib.txt
-tur serve --model ~/models/qwen3.5-0.8b-q4k --revision q4k-v1 --served-model-name qwen
-```
-
-[Choosing a quantization](docs/src/guide/choosing-quantization.md) explains the trade-offs, and the [tuning recipes](docs/src/guide/tuning.md) match settings to workloads.
-
-## Measured on a Mac
-
-These numbers come from an Apple M1 with 16 GB running Qwen3.5-0.8B. The [performance guide](docs/src/guide/performance.md) has the full tables and how to reproduce them.
-
-| Workload | Result |
-| --- | --- |
-| One conversation, 8-bit weights | 58 tokens/s |
-| One conversation, 4-bit weights | 92 tokens/s |
-| Prefill of a 2K-token prompt | 1,311 tokens/s |
-| Prompt-lookup speculation on repetitive output | Up to 2.9× normal decoding |
-
-Under load, through the full server pipeline with sampling, 8-bit weights, 128-token prompts and 64-token replies:
-
-| Concurrent requests | Output tokens/s | Time to first token | Time between tokens |
-| --- | --- | --- | --- |
-| 1 | 50 | 0.14 s | 18 ms |
-| 4 | 121 | 0.45 s | 23 ms |
-| 8 | 186 | 0.87 s | 27 ms |
-| 16 | 204 | 1.63 s | 46 ms |
-
-On the same Mac, Tur decodes up to 1.55× faster than llama.cpp with batches of 8 to 16 sequences. llama.cpp is 6 to 11% faster at prefilling 8K-token prompts. The [comparison](docs/src/guide/performance.md#compared-with-llamacpp) lists versions and methods.
-
-Prefix reuse matters most when many users share a prompt. Eight users who send the same new 1.5K-token prompt at once get their first token in 1.7 s at the median; without prefix reuse they wait 9.5 s.
-
-## Find your way around
+## Documentation
 
 The [Tur book](docs/src/SUMMARY.md) covers usage, architecture and the measurements behind each decision. Run `just docs` to read it locally.
 
 | I want to | Start here |
 | --- | --- |
-| Run my first model | [Quickstart](docs/src/guide/quickstart.md) |
+| Run my first model, offline use included | [Quickstart](docs/src/guide/quickstart.md) |
 | Configure the CLI or server | [Configuration](docs/src/guide/configuration.md), [Command line](docs/src/guide/cli.md) |
 | Connect an app | [HTTP API](docs/src/guide/http-api.md), [Rust library](docs/src/guide/library.md) |
-| Choose weights and tune performance | [Quantization](docs/src/guide/choosing-quantization.md), [Tuning](docs/src/guide/tuning.md), [Benchmarks](docs/src/guide/performance.md) |
+| Make weights smaller | [Choosing a quantization](docs/src/guide/choosing-quantization.md), [Prepacked weights](docs/src/guide/quantization.md) |
+| Match settings to my workload | [Tuning](docs/src/guide/tuning.md), [Best practice](docs/src/guide/best-practice.md) |
 | Understand the engine | [Architecture](docs/src/architecture/overview.md), [Scope](docs/src/design/scope.md) |
 | See what's next | [Open work](docs/src/design/open.md), [Rejected experiments](docs/src/design/rejected.md) |
 
-## Build with us
+## Contributing
 
-Contributions are welcome. Read the [development workflow](docs/src/development/workflow.md) and [AGENTS.md](AGENTS.md) for the project's conventions, and install [`just`](https://github.com/casey/just) to run the workspace tasks:
-
-```sh
-just ci           # format, lint, check with and without Metal, and run offline tests
-just bench <case> # kernels | model | serving | prefix | kv_quality | tensorops | load_weights
-```
-
-Tests need direct Metal access on an Apple Silicon Mac. Real-checkpoint tests run separately, as the [testing guide](docs/src/development/testing.md) explains.
-
-| Crate | Responsibility |
-| --- | --- |
-| `tur-core` | Shared errors and checked packed-execution descriptors |
-| `tur-metal` | State pools, completion fences, Metal kernels, packed weights, sampler |
-| `tur-models` | Checkpoint loading and validation, Qwen and Gemma models, templates, tools |
-| `tur-engine` | Engine, scheduler, prefix cache, speculation, pipeline, memory plan |
-| `tur` | Facade and HTTP server; integration tests and benchmarks |
-| `tur-cli` | The `tur` binary |
-
-The code has no `unsafe` and no panics, and every performance claim comes from a measurement on a Mac.
+Contributions are welcome. Read the [development workflow](docs/src/development/workflow.md) and [AGENTS.md](AGENTS.md), install [`just`](https://github.com/casey/just), and run `just ci` before you open a pull request. Tests need direct Metal access on an Apple Silicon Mac.
 
 ---
 

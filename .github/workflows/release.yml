@@ -11,12 +11,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
-    uses: ./.github/workflows/ci.yml
-
   release:
     name: Publish the macOS binary
-    needs: ci
     runs-on: macos-26
     timeout-minutes: 90
     permissions:
@@ -40,12 +36,12 @@ jobs:
           mkdir dist
           tar -czf "dist/$ASSET.tar.gz" -C target/release tur
           (cd dist && shasum -a 256 "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256")
-      - name: Smoke-test the packaged binary
+          cp scripts/install-release.sh dist/install.sh
+      - name: Smoke-test the installer and packaged binary
         run: |
-          unpacked=$(mktemp -d)
-          tar -xzf "dist/$ASSET.tar.gz" -C "$unpacked"
-          cd "$unpacked"
-          test "$(./tur --version)" = "tur-cli ${TAG#v}"
+          home=$(mktemp -d)
+          HOME="$home" TUR_NO_MODIFY_PATH=1 TUR_RELEASE_URL="file://$PWD/dist" sh dist/install.sh
+          test "$("$home/.local/bin/tur" --version)" = "tur-cli ${TAG#v}"
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}

@@ -131,4 +131,5 @@ Leave out `--weight-format`, because the artifact loads exactly as stored. The m
 
 - [Choosing a quantization](choosing-quantization.md) helps you pick a format for your Mac and model.
 - [Tuning](tuning.md) has recipes for latency, throughput, memory and agents.
+- [Best practice](best-practice.md) has a starting configuration for each model.
 - [HTTP API](http-api.md) documents every request field and error.

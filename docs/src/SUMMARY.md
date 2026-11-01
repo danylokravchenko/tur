@@ -12,12 +12,14 @@
 - [Prepacked weights](guide/quantization.md)
 - [Choosing a quantization](guide/choosing-quantization.md)
 - [Tuning](guide/tuning.md)
+- [Best practice](guide/best-practice.md)
 - [Rust library](guide/library.md)
 - [Measured performance](guide/performance.md)
 
 # Architecture
 
 - [Overview](architecture/overview.md)
+  - [Tur and other engines](architecture/comparison.md)
 - [Model and checkpoints](architecture/model.md)
 - [Execution engine](architecture/execution.md)
 - [State memory](architecture/memory.md)

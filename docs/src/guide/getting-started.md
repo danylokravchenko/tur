@@ -10,14 +10,29 @@ This page is the reference for what Tur needs. For a guided first run, follow th
 
 ## Download
 
-Each [release](https://github.com/danylokravchenko/tur/releases) has a prebuilt binary for Apple Silicon, which needs no Rust toolchain:
+Each [release](https://github.com/danylokravchenko/tur/releases) has a prebuilt binary for Apple Silicon, which needs no Rust toolchain, and an installer for it:
+
+```sh
+curl -fsSL https://github.com/danylokravchenko/tur/releases/latest/download/install.sh | sh
+```
+
+The installer checks the download against the release's SHA-256 checksum, signs the binary ad hoc, and moves it to `~/.local/bin`. If that directory isn't on your `PATH`, it adds it to `~/.zshrc` or `~/.bash_profile`. Running it again replaces the binary. Settings go after the pipe, for example `| TUR_VERSION=v0.3.0 sh`:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `TUR_VERSION` | latest | Release tag to install |
+| `TUR_INSTALL_DIR` | `~/.local/bin` | Destination directory |
+| `TUR_NO_MODIFY_PATH` | unset | Set to 1 to leave shell startup files alone |
+| `TUR_RELEASE_URL` | GitHub | Directory holding the release assets, for mirrors |
+
+To skip the installer, download the archive yourself:
 
 ```sh
 curl -fsSL https://github.com/danylokravchenko/tur/releases/latest/download/tur-aarch64-apple-darwin.tar.gz | tar -xz
 ./tur --version
 ```
 
-The binary isn't notarized. `curl` doesn't mark its downloads for Gatekeeper, but a browser does; for a browser download, run `xattr -d com.apple.quarantine tur`.
+The binary isn't notarized, and an ad-hoc signature doesn't change that or identify who built it. `curl` doesn't mark its downloads for Gatekeeper, but a browser does; for a browser download, run `xattr -d com.apple.quarantine tur`.
 
 ## Build
 
