@@ -10,7 +10,7 @@
 - Run the larger models. Qwen3.8-27B runs on a 36 GB Mac but not yet on a 16 GB one. For both it and the Qwen3.6-35B MoE, quality, the K/V format choice (Q8 is the likely default under 16 GB) and the wide MoE tier, which trails Candle by 1.2 to 1.5× and needs real routing traces, are still unmeasured.
 - Run the Qwen3.6-35B-A3B MTP head through the expert cache and with eight or more requests. It is measured with resident experts at one to four requests ([Qwen3.6-35B-A3B](../guide/performance.md#qwen36-35b-a3b)); whether its own expert reads pay off behind a cache, and why a second pipeline in one process ran out of GPU memory, are open.
 - Finish Gemma 4. Run the larger checkpoints on suitable Macs and set held-out quality budgets. Assistant chains pay only with one request decoding (see [Speculative decoding](../architecture/speculation.md#decisions)); several requests need a cheaper chained step, for example gathering candidate heads in a batch without a CPU round trip per step. Calibrated Gemma artifacts (`imatrix`, GPTQ) need layer-by-layer calibration that handles PLE and shared K/V.
-- More Macs. Most numbers come from one M1; the Qwen3.6-35B-A3B and Qwen3.8-27B sections are the only ones from an M3 Pro. Launch shapes and crossover points need per-device sweeps, and the minimum supported macOS and chip still has to be decided.
+- More Macs. Most numbers come from one M1; the Qwen3.6-35B-A3B and Qwen3.8-27B sections and a short Qwen3.5-0.8B run are the only ones from an M3 Pro. Launch shapes and crossover points need per-device sweeps, and the minimum supported macOS and chip still has to be decided.
 
 ## Audio
 

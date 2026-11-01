@@ -8,7 +8,7 @@ Every timed region ends when the GPU finishes, and serving rows are the best of 
 
 ## Qwen3.5-0.8B
 
-These sections use an Apple M1 with 16 GB, on AC power with low-power mode off, and Qwen3.5-0.8B at revision `2fc06364715b967f1860aea9cf38778875588b17`. K/V is F16 in 16-token pages, recurrent state is F32 and prefill chunks are 256 tokens. The last two subsections compare Tur with llama.cpp and MLX on this model.
+These sections use an Apple M1 with 16 GB, on AC power with low-power mode off, and Qwen3.5-0.8B at revision `2fc06364715b967f1860aea9cf38778875588b17`, except the last subsection, which ran on an M3 Pro. K/V is F16 in 16-token pages, recurrent state is F32 and prefill chunks are 256 tokens. The comparison subsections set Tur against llama.cpp and MLX on this model.
 
 ### Single model pass
 
@@ -222,6 +222,28 @@ Batched 4-bit decode, total tokens/s (Tur at 128 tokens of context; oMLX doesn't
 | oMLX OptiQ-4bit | 73.7 | 123 | 198 |
 
 With one sequence, Tur decodes 1.1 to 1.3× faster than oMLX and 1.1 to 1.6× faster than mlx_lm, with half or less of their reported peak memory. Its 4-bit prefill is level with oMLX's and ahead of mlx_lm's. With two to four sequences the lead disappears: oMLX scales better from one sequence to two, because Tur's batched decode is limited by recurrent-state traffic rather than weights.
+
+### On an M3 Pro
+
+The same checkpoint on the Apple M3 Pro with 36 GB that the larger Qwen sections use, against llama.cpp 0.8.0 (build 11960, Homebrew) with the same unsloth GGUF files as above and its defaults: Metal and F16 K/V. Tur's weights are converted at load from the checkpoint. llama.cpp's figures are the mean of three `llama-bench` repeats, with a standard deviation of at most 1.4 tokens/s on decode and 27 on prefill, except the batched row, which is one `llama-batched-bench` run. Tur's decode is the median of 12 timed steps and its prefill the median of 2 to 4 passes. GGUF's Q4_K_M mixes Q4_K and Q6_K blocks while Tur's Q4K uses Q4_K for every projection, so the 4-bit columns compare engines with their usual weights.
+
+Single sequence, in tokens/s:
+
+| Test | Tur Q8_0 | llama.cpp Q8_0 | Tur Q4K | llama.cpp Q4_K_M |
+| --- | --- | --- | --- | --- |
+| Decode at 128 tokens | 123.4 | 113.0 | 181.6 | 140.9 |
+| Decode at 2K | 119.6 | 109.8 | 172.6 | 136.3 |
+| Prefill 512 | 3,853 | 3,446 | 3,635 | 3,277 |
+| Prefill 2K | 3,799 | 3,383 | 3,611 | 3,208 |
+
+Batched decode with Q8_0, total tokens/s at about 128 tokens of context (Tur from the `model` benchmark, llama.cpp from `llama-batched-bench -c 8192 -ub 512` with 128-token prompts and 64 generated tokens):
+
+| Sequences | 1 | 2 | 4 | 8 |
+| --- | --- | --- | --- | --- |
+| Tur | 123 | 240 | 420 | 729 |
+| llama.cpp | 113 | 172 | 320 | 456 |
+
+Tur prefills 11 to 13% faster and decodes one Q8_0 sequence 9% faster. With more sequences the lead grows to 31 to 60%, and Tur's 4-bit decode is 27 to 29% ahead of Q4_K_M. Tur's 4-bit prefill is 5 to 6% slower than its Q8_0 prefill.
 
 ## Gemma 4 E2B
 
