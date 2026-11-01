@@ -2,15 +2,15 @@
 
 This page collects Tur's current numbers. Each architecture chapter explains the mechanism behind them, and [`just bench`](../development/benchmarks.md) reproduces them; re-measure on your own Mac before relying on a figure.
 
-Unless a section says otherwise, every table uses:
-
-- an Apple M1 with 16 GB, on AC power with low-power mode off;
-- Qwen3.5-0.8B at revision `2fc06364715b967f1860aea9cf38778875588b17`;
-- F16 K/V in 16-token pages, F32 recurrent state and 256-token prefill chunks.
+Each section names its model and checkpoint. Qwen3.5-0.8B, Gemma 4 E2B, gpt-oss-20b and Whisper ran on an Apple M1 with 16 GB. Qwen3.6-35B-A3B and Qwen3.8-27B ran on an Apple M3 Pro with 36 GB, which the first of them describes.
 
 Every timed region ends when the GPU finishes, and serving rows are the best of three runs.
 
-## Single model pass
+## Qwen3.5-0.8B
+
+These sections use an Apple M1 with 16 GB, on AC power with low-power mode off, and Qwen3.5-0.8B at revision `2fc06364715b967f1860aea9cf38778875588b17`. K/V is F16 in 16-token pages, recurrent state is F32 and prefill chunks are 256 tokens. The last two subsections compare Tur with llama.cpp and MLX on this model.
+
+### Single model pass
 
 Raw model speed, without scheduling or HTTP (`model` benchmark, synthetic tokens).
 
@@ -44,7 +44,7 @@ Prefill, in prompt tokens/s for one sequence:
 
 A 2K-token prompt takes about 1.6 s, and an 8K-token prompt about 8 s.
 
-## Serving
+### Serving
 
 Bursts through the full scheduled pipeline: N requests arrive at once, each with a 128-token prompt and 64 output tokens, using Q8_0 weights and sampling at temperature 0.7, top-k 20 and top-p 0.95. Output tokens/s is the total across the burst, time to first token (TTFT) counts from submission, and inter-token latency (ITL) is the gap between tokens of one request.
 
@@ -60,7 +60,7 @@ Greedy decoding is only 2 to 8% faster, because sampling runs on the GPU.
 
 With mixed prompt lengths, sixteen requests at once where half have 128-token prompts and half 2K-token prompts, the burst produced 55 output tokens/s with a median TTFT of 8.2 s and a median ITL of 217 ms. The eight long prompts add up to 16K prefill tokens, about 13 s of GPU work, which the scheduler interleaves with the short requests' replies.
 
-## Requests arriving over time
+### Requests arriving over time
 
 48 requests with 512-token prompts and 64 output tokens arrive at random (a Poisson process), sampled as above.
 
@@ -71,7 +71,7 @@ With mixed prompt lengths, sixteen requests at once where half have 128-token pr
 
 Both rates ask for more prefill than one M1 can do, so the queue grows and TTFT climbs over the run. The server accepts new requests while the GPU is busy, which keeps it idle only about 5% of the time.
 
-## Grammar-constrained output
+### Grammar-constrained output
 
 A JSON-like grammar masks every token; greedy decoding.
 
@@ -84,7 +84,7 @@ A JSON-like grammar masks every token; greedy decoding.
 
 With masks applied on the GPU, constrained output runs as fast as unconstrained output.
 
-## Prefix reuse
+### Prefix reuse
 
 The `reuse` workloads, three runs each:
 
@@ -103,7 +103,7 @@ Multi-turn chat: four conversations of six turns each, with a 256-token first me
 | 8 | 44.5% | 1.46 s | 13.2 s |
 | 16 | 68.3% | 0.79 s | 10.9 s |
 
-## Speculative decoding
+### Speculative decoding
 
 80 output tokens per request, three repeats each, total output tokens/s.
 
@@ -137,7 +137,7 @@ Sampled at temperature 0.7, top-k 20, top-p 0.95:
 
 Prompt lookup gives up to 2.9× on repetitive text. On new text, the MTP head adds 1.1 to 1.4× with one to four sequences. With eight sequences the head costs a few percent, so Tur switches it off there by itself. In every configuration the output was identical to normal decoding.
 
-## Loading
+### Loading
 
 A fresh process with a warm file cache, timed until the last weight reaches the GPU. Peak memory comes from `/usr/bin/time -l`.
 
@@ -149,7 +149,7 @@ A fresh process with a warm file cache, timed until the last weight reaches the 
 | Mixed 5.5-bit GPTQ artifact | 0.20 s | 521 MB | 0.80 GB |
 | Q8_0 artifact | 0.27 s | 801 MB | 1.20 GB |
 
-## Quality of weight formats
+### Quality of weight formats
 
 Teacher-forced over about 8K held-out tokens per domain, against F32 weights. KL is the mean divergence in nats per token (lower is better), and top-1 is how often the format's most likely token matches F32's.
 
@@ -162,6 +162,66 @@ Teacher-forced over about 8K held-out tokens per domain, against F32 weights. KL
 | Q4K plain rounding | 0.1413 / 79.7% | 0.0832 / 88.4% | 0.0577 / 87.0% | 0.1142 / 93.9% |
 
 For K/V, F16 is indistinguishable from F32, and Q8 stays within 1e-4 nats of F32 with 99.3 to 99.8% top-1 agreement.
+
+### Compared with llama.cpp
+
+llama.cpp 0.7.0 (build 11669, Homebrew) on the same M1, with unsloth's Qwen3.5-0.8B GGUF files (revision `6ab461498e2023f6e3c1baea90a8f0fe38ab64d0`) and its defaults: Metal and F16 K/V. Its figures are the best of three runs. Q8_0 is the like-for-like format. GGUF's Q4_K_M mixes Q4_K and Q6_K blocks (497 MiB), while Tur's Q4K uses Q4_K for every projection.
+
+Single sequence, in tokens/s (llama.cpp from `llama-bench`):
+
+| Test | Tur Q8_0 | llama.cpp Q8_0 | Tur Q4K | llama.cpp Q4_K_M |
+| --- | --- | --- | --- | --- |
+| Decode at 128 tokens | 58 | 51.4 | 92 | 65.6 |
+| Decode at 2K | 56 | 49.4 | 89 | 63.5 |
+| Decode at 8K | 50 | 46.2 | 75 | 58.9 |
+| Prefill 2K | 1,311 | 1,323 | 1,210 | 1,188 |
+| Prefill 8K | 1,031 | 1,142 | 982 | 1,037 |
+
+Batched decode with Q8_0, total tokens/s at about 128 tokens of context (Tur from the `model` benchmark, llama.cpp from `llama-batched-bench`):
+
+| Sequences | 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| Tur | 58 | 108 | 181 | 311 | 357 |
+| llama.cpp | 51.6 | 85.6 | 138 | 201 | 230 |
+
+Bursts of N requests with 128-token prompts and 64 output tokens, in output tokens/s. Tur's figures go through the full pipeline with sampling. llama.cpp's are `llama-batched-bench` wall time for the same prefill and decode, with no scheduler and no sampling.
+
+| Concurrent | 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| Tur Q8_0, sampled | 49.6 | 85.8 | 121 | 186 | 204 |
+| llama.cpp Q8_0 | 47.6 | 75.5 | 114 | 155 | 170 |
+| llama.cpp Q4_K_M | 59.4 | 78.7 | 114 | 151 | 160 |
+
+Tur decodes 1.1 to 1.4× faster with one sequence and up to 1.55× faster with 8 to 16, and finishes bursts of 8 to 16 requests 1.2× faster end to end. Prefill is level at 2K tokens; at 8K, llama.cpp is 6 to 11% faster.
+
+```sh
+llama-bench -m <gguf> -p 2048,8192 -n 0 -r 3
+llama-bench -m <gguf> -p 0 -n 64 -d 128,2048,8192 -r 3
+llama-batched-bench -m <gguf> -c 4096 -b 2048 -ub 512 -npp 128 -ntg 64 -npl 1,2,4,8,16
+```
+
+### Compared with MLX and oMLX
+
+These are published community results for Qwen3.5-0.8B on an M1 (8-core GPU) with 16 GB, not reruns on this Mac: mlx_lm from [whatcani.run](https://www.whatcani.run/?device=Apple+M1:8:Apple+M1:8:16) with 4,096 prompt and 1,024 output tokens, and oMLX 0.7.3 from [omlx.ai](https://omlx.ai/benchmarks/performance/yw52053o) at temperature 0.7. Tur has no 4K-context row, so its 2K and 8K figures bracket theirs. MLX's OptiQ-4bit (620 MB) is a mixed 4-bit format; Tur's Q4K GPTQ artifact is 425 MB.
+
+Single sequence, in tokens/s:
+
+| Engine, weights | Prefill | Decode | Peak memory |
+| --- | --- | --- | --- |
+| Tur Q8_0 | 1,311 at 2K, 1,031 at 8K | 56 at 2K, 50 at 8K | 1.20 GB RSS (artifact) |
+| mlx_lm 8-bit | 814 at 4K | 46.1 at 4K | 2.46 GB |
+| Tur Q4K GPTQ | 1,210 at 2K, 982 at 8K | 89 at 2K, 75 at 8K | 0.71 GB RSS |
+| mlx_lm OptiQ-4bit | 946 at 4K | 56.0 at 4K | 3.50 GB |
+| oMLX OptiQ-4bit | 1,025 at 1K, 990 at 4K | 73.7 at 1K, 68.6 at 4K | 2.17 GB footprint |
+
+Batched 4-bit decode, total tokens/s (Tur at 128 tokens of context; oMLX doesn't state its context):
+
+| Sequences | 1 | 2 | 4 |
+| --- | --- | --- | --- |
+| Tur Q4K GPTQ | 90 | 114 | 202 |
+| oMLX OptiQ-4bit | 73.7 | 123 | 198 |
+
+With one sequence, Tur decodes 1.1 to 1.3× faster than oMLX and 1.1 to 1.6× faster than mlx_lm, with half or less of their reported peak memory. Its 4-bit prefill is level with oMLX's and ahead of mlx_lm's. With two to four sequences the lead disappears: oMLX scales better from one sequence to two, because Tur's batched decode is limited by recurrent-state traffic rather than weights.
 
 ## Gemma 4 E2B
 
@@ -310,62 +370,49 @@ On repetitive text prompt lookup supplies every draft and all of them are accept
 
 In one process, the MTP configuration ran out of GPU memory after the normal-decoding configuration had run first, though it runs alone. Each configuration therefore ran in its own process. Whether the first pipeline's memory is released late or the two plans genuinely do not fit together is not established.
 
-## Compared with llama.cpp
+## Qwen3.8-27B
 
-llama.cpp 0.7.0 (build 11669, Homebrew) on the same Mac, with unsloth's Qwen3.5-0.8B GGUF files (revision `6ab461498e2023f6e3c1baea90a8f0fe38ab64d0`) and its defaults: Metal and F16 K/V. Its figures are the best of three runs. Q8_0 is the like-for-like format. GGUF's Q4_K_M mixes Q4_K and Q6_K blocks (497 MiB), while Tur's Q4K uses Q4_K for every projection.
+Qwen3.8-27B is a dense model with 64 layers: every token goes through all 27 billion parameters, where the MoE above uses 3 billion. Decode reads the projection weights once per step whatever the batch, so extra sequences add little to a step, while prefill does the arithmetic of all 27 billion parameters for every prompt token. The rows below use a Q4K artifact made with `tur quantize --method rtn` (no calibration) from the pinned `Qwen/Qwen3.8-27B` snapshot. Quantizing took 3 min 50 s. The artifact file is 17.2 GB, of which the projections are 14.4 GB, and it loads in 4.2 s. Quality against Transformers has not been measured.
 
-Single sequence, in tokens/s (llama.cpp from `llama-bench`):
+The machine is the M3 Pro described above, with F16 K/V. Single-sequence figures come from the `model` benchmark, each case group in its own process, because one process running the whole sweep ran out of GPU memory partway through.
 
-| Test | Tur Q8_0 | llama.cpp Q8_0 | Tur Q4K | llama.cpp Q4_K_M |
-| --- | --- | --- | --- | --- |
-| Decode at 128 tokens | 58 | 51.4 | 92 | 65.6 |
-| Decode at 2K | 56 | 49.4 | 89 | 63.5 |
-| Decode at 8K | 50 | 46.2 | 75 | 58.9 |
-| Prefill 2K | 1,311 | 1,323 | 1,210 | 1,188 |
-| Prefill 8K | 1,031 | 1,142 | 982 | 1,037 |
+| Case | Result |
+| --- | --- |
+| Prefill, 512 / 2K / 4K / 8K tokens | 96.0 / 93.7 / 93.5 / 92.3 tokens/s |
+| Decode, 1 sequence at 128 tokens | 8.6 tokens/s (about 116 ms per step) |
+| Decode, 2 / 4 / 8 sequences at 128 tokens | 15.2 / 29.0 / 52.5 tokens/s |
+| Decode, 1 sequence at 2K / 4K / 8K tokens | 8.69 / 8.50 / 8.45 tokens/s |
+| Decode, 4 sequences at 2K / 4K / 8K tokens | 28.1 / 27.2 / 23.3 tokens/s |
 
-Batched decode with Q8_0, total tokens/s at about 128 tokens of context (Tur from the `model` benchmark, llama.cpp from `llama-batched-bench`):
+Repeats of the same 128-token step varied by up to 7% between processes (114 to 121 ms). A step takes about 116 ms with one sequence and 152 ms with eight, so batching is nearly free: eight sequences deliver six times the tokens per second of one. Context costs little for one sequence (3% slower at 8K than at 2K), while four sequences lose 17% over the same range. At 8K the four sequences hold 2.6 GiB of K/V and recurrent state.
 
-| Sequences | 1 | 2 | 4 | 8 | 16 |
-| --- | --- | --- | --- | --- | --- |
-| Tur | 58 | 108 | 181 | 311 | 357 |
-| llama.cpp | 51.6 | 85.6 | 138 | 201 | 230 |
+Bursts through the full pipeline, with 128-token prompts and 64 output tokens, sampled at temperature 0.7, top-k 20 and top-p 0.95. Rows are the best of three runs, and the range is the output rate across the three:
 
-Bursts of N requests with 128-token prompts and 64 output tokens, in output tokens/s. Tur's figures go through the full pipeline with sampling. llama.cpp's are `llama-batched-bench` wall time for the same prefill and decode, with no scheduler and no sampling.
+| Concurrent | Output tok/s | Range | TTFT p50 | ITL p50 | ITL p95 | ITL p99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 6.8 | 6.4 to 6.8 | 2.0 s | 115 ms | 119 ms | 121 ms |
+| 2 | 10.3 | 9.8 to 10.3 | 4.1 s | 132 ms | 136 ms | 137 ms |
+| 4 | 15.3 | 14.6 to 15.3 | 7.7 s | 141 ms | 144 ms | 146 ms |
 
-| Concurrent | 1 | 2 | 4 | 8 | 16 |
-| --- | --- | --- | --- | --- | --- |
-| Tur Q8_0, sampled | 49.6 | 85.8 | 121 | 186 | 204 |
-| llama.cpp Q8_0 | 47.6 | 75.5 | 114 | 155 | 170 |
-| llama.cpp Q4_K_M | 59.4 | 78.7 | 114 | 151 | 160 |
+The burst rates are lower than the `model` benchmark's because they include prefill, which takes the 2 s to first token at one request (about 180 tokens at 90 tokens/s), and sampling. Eight concurrent requests ran out of GPU memory in every attempt, though eight sequences at 128 tokens ran in the `model` benchmark. Which part of the serving plan does not fit has not been established.
 
-Tur decodes 1.1 to 1.4× faster with one sequence and up to 1.55× faster with 8 to 16, and finishes bursts of 8 to 16 requests 1.2× faster end to end. Prefill is level at 2K tokens; at 8K, llama.cpp is 6 to 11% faster.
+Against llama.cpp 0.8.0 (build 11960, Homebrew) on the same Mac, with unsloth's `Qwen3.8-27B-UD-Q4_K_M` GGUF (revision `4ca720788d1e01f1bff70c033e0d0028fd02e502`, 15.3 GiB) and its defaults: Metal and F16 K/V. The GGUF mixes quantization types per tensor and is not the same format as Tur's RTN Q4K artifact, so this compares engines with their usual 4-bit weights, not kernels on identical bits. Quality was not measured for either. This is a short run: prefill at 512 to 4K tokens is the mean of two `llama-bench` repeats and everything else is one run, so differences of a few percent are within noise. Decode is 32 tokens after the stated context.
 
-```sh
-llama-bench -m <gguf> -p 2048,8192 -n 0 -r 3
-llama-bench -m <gguf> -p 0 -n 64 -d 128,2048,8192 -r 3
-llama-batched-bench -m <gguf> -c 4096 -b 2048 -ub 512 -npp 128 -ntg 64 -npl 1,2,4,8,16
-```
+| Test | Tur | llama.cpp |
+| --- | --- | --- |
+| Prefill, 512 tokens | 96.0 tokens/s | 97.1 |
+| Prefill, 2K | 93.7 | 96.3 |
+| Prefill, 4K | 93.5 | 94.4 |
+| Prefill, 8K | 92.3 | 93.4 |
+| Decode, 1 sequence at 128 tokens | 8.6 | 7.95 |
+| Decode, 1 sequence at 2K | 8.69 | 7.78 |
+| Decode, 1 sequence at 8K | 8.45 | 7.10 |
 
-## Compared with MLX and oMLX
+Batched decode at about 128 tokens of context, in tokens/s over all sequences (Tur from the `model` benchmark, llama.cpp from `llama-batched-bench -c 8192 -ub 512` with 128-token prompts, as its generation rate):
 
-These are published community results for Qwen3.5-0.8B on an M1 (8-core GPU) with 16 GB, not reruns on this Mac: mlx_lm from [whatcani.run](https://www.whatcani.run/?device=Apple+M1:8:Apple+M1:8:16) with 4,096 prompt and 1,024 output tokens, and oMLX 0.7.3 from [omlx.ai](https://omlx.ai/benchmarks/performance/yw52053o) at temperature 0.7. Tur has no 4K-context row, so its 2K and 8K figures bracket theirs. MLX's OptiQ-4bit (620 MB) is a mixed 4-bit format; Tur's Q4K GPTQ artifact is 425 MB.
+| Sequences | 1 | 2 | 4 | 8 |
+| --- | ---: | ---: | ---: | ---: |
+| Tur | 8.6 | 15.2 | 29.0 | 52.5 |
+| llama.cpp | 7.3 | 11.8 | 23.2 | 41.1 |
 
-Single sequence, in tokens/s:
-
-| Engine, weights | Prefill | Decode | Peak memory |
-| --- | --- | --- | --- |
-| Tur Q8_0 | 1,311 at 2K, 1,031 at 8K | 56 at 2K, 50 at 8K | 1.20 GB RSS (artifact) |
-| mlx_lm 8-bit | 814 at 4K | 46.1 at 4K | 2.46 GB |
-| Tur Q4K GPTQ | 1,210 at 2K, 982 at 8K | 89 at 2K, 75 at 8K | 0.71 GB RSS |
-| mlx_lm OptiQ-4bit | 946 at 4K | 56.0 at 4K | 3.50 GB |
-| oMLX OptiQ-4bit | 1,025 at 1K, 990 at 4K | 73.7 at 1K, 68.6 at 4K | 2.17 GB footprint |
-
-Batched 4-bit decode, total tokens/s (Tur at 128 tokens of context; oMLX doesn't state its context):
-
-| Sequences | 1 | 2 | 4 |
-| --- | --- | --- | --- |
-| Tur Q4K GPTQ | 90 | 114 | 202 |
-| oMLX OptiQ-4bit | 73.7 | 123 | 198 |
-
-With one sequence, Tur decodes 1.1 to 1.3× faster than oMLX and 1.1 to 1.6× faster than mlx_lm, with half or less of their reported peak memory. Its 4-bit prefill is level with oMLX's and ahead of mlx_lm's. With two to four sequences the lead disappears: oMLX scales better from one sequence to two, because Tur's batched decode is limited by recurrent-state traffic rather than weights.
+Prefill is level, with llama.cpp 1 to 3% ahead. Both engines are limited by compute there. Decode is where they differ: Tur is 8% faster with one sequence at 128 tokens, 19% at 8K, and 25 to 29% faster with 2 to 8 sequences. Bursts through the serving pipeline were not compared, because the two harnesses use different output lengths and sampling. MLX was not run on this model.

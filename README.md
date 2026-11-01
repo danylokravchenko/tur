@@ -86,8 +86,8 @@ To keep your settings, copy [`tur.example.toml`](tur.example.toml) to `tur.toml`
 | Model | Status |
 | --- | --- |
 | Qwen3.5-0.8B | Validated layer by layer against Transformers, on CPU and Metal |
-| Qwen3.8-27B | Same code path and validated config; not yet run, since it needs more than 16 GB |
-| Qwen3.6-35B-A3B (MoE) | Experimental |
+| Qwen3.8-27B | Same code path and validated config; the Q4K artifact runs on a 36 GB Mac, with quality not yet measured, and it needs more than 16 GB |
+| Qwen3.6-35B-A3B (MoE) | Real checkpoint generation tested. |
 | Gemma 4 E2B | Validated against Transformers; real checkpoint generation tested, including audio input |
 | Whisper large-v3-turbo | Transcripts equal Transformers' on a pinned clip, in F32 and Q8_0 |
 | Gemma 4 E4B, 12B, 26B-A4B, 31B | Architecture covered by small fixtures; full checkpoints not yet run |

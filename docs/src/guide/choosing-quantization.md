@@ -45,9 +45,9 @@ Weights take roughly `parameters × bits / 8` bytes:
 | Qwen3.5-0.8B | 1.3 GB | 0.9 GB (0.4 GB artifact) | Yes |
 | Qwen3.5-4B | about 4.3 GB | about 2.3 GB | Yes |
 | Qwen3.5-9B | about 9.6 GB | about 5.1 GB | Q4K only |
-| Qwen3.8-27B | about 28.7 GB | about 15.2 GB | No; Q4K needs a 32 GB Mac |
+| Qwen3.8-27B | about 28.7 GB | 17.0 GB (17.2 GB artifact) | No; Q4K needs a 32 GB Mac |
 
-Only the 0.8B row is measured; the others are arithmetic. macOS lets the GPU use about two thirds to three quarters of RAM, and Tur refuses to start if its plan doesn't fit, so check the plan it logs.
+The 0.8B and 27B Q4K rows are measured (the 27B on a 36 GB Mac, see [Measured performance](performance.md#qwen38-27b)); the others are arithmetic. macOS lets the GPU use about two thirds to three quarters of RAM, and Tur refuses to start if its plan doesn't fit, so check the plan it logs.
 
 Each running request also needs state. Recurrent state is fixed per request (20 MB on the 0.8B in F32, about 157 MB on the 27B), and K/V pages grow with the context.
 
