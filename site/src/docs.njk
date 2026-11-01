@@ -1,0 +1,44 @@
+---
+layout: base.njk
+pagination:
+  data: book.chapters
+  size: 1
+  alias: chapter
+permalink: "{{ chapter.url }}index.html"
+eleventyComputed:
+  title: "{{ chapter.title }} · Tur docs"
+  description: "{{ chapter.description }}"
+---
+<div class="docs">
+  <details class="docs__menu">
+    <summary>Chapters</summary>
+    {% include "sidebar.njk" %}
+  </details>
+  <aside class="docs__side" aria-label="Chapters">
+    {% include "sidebar.njk" %}
+  </aside>
+
+  <main id="main" class="docs__main">
+    {% if chapter.part %}<p class="eyebrow">{{ chapter.part }}</p>{% endif %}
+    {% if chapter.file == "guide/performance.md" %}
+    <a class="callout" href="/benchmarks/">See these tables as charts on the benchmarks page</a>
+    {% endif %}
+    <article class="prose">
+      {{ chapter.html | safe }}
+    </article>
+    <nav class="pager" aria-label="Chapter">
+      {% if chapter.prev %}<a href="{{ chapter.prev.url }}"><small>Previous</small>{{ chapter.prev.title }}</a>{% else %}<span></span>{% endif %}
+      {% if chapter.next %}<a class="pager__next" href="{{ chapter.next.url }}"><small>Next</small>{{ chapter.next.title }}</a>{% endif %}
+    </nav>
+    <p class="edit"><a href="{{ chapter.editUrl }}">Edit this page on GitHub</a></p>
+  </main>
+
+  {% if chapter.toc.length > 1 %}
+  <nav class="docs__toc" aria-label="On this page">
+    <p class="docs__toc-title">On this page</p>
+    {% for item in chapter.toc %}
+    <a class="lvl{{ item.level }}" href="#{{ item.id }}">{{ item.text }}</a>
+    {% endfor %}
+  </nav>
+  {% endif %}
+</div>

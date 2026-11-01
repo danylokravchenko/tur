@@ -1,0 +1,160 @@
+---
+layout: base.njk
+labs: true
+permalink: index.html
+title: "Tur: local inference with a little muscle"
+description: "A Rust inference engine for hybrid language models on Apple Silicon. One binary for generation, an OpenAI-compatible server, Whisper transcription and quantization."
+---
+<section class="hero">
+  <div class="hero__inner">
+    <div class="hero__copy">
+      <p class="eyebrow eyebrow--hero">Rust · Metal · Apple Silicon</p>
+      <h1>Local inference with a little muscle</h1>
+      <p class="hero__tag">Use the maximum of your Mac</p>
+      <p class="hero__lead">Tur runs language models on your Mac's GPU with Metal kernels fitted to those models. One binary handles generation, an OpenAI-compatible server, Whisper transcription and quantization.</p>
+      <div class="install"><code>{{ readme.install }}</code><button type="button" data-copy="{{ readme.install }}">Copy</button></div>
+      <div class="hero__cta">
+        <a class="btn btn--wheat" href="/docs/guide/quickstart/">Get started</a>
+        <a class="btn" href="/benchmarks/">See the benchmarks</a>
+      </div>
+    </div>
+    <div class="hero__figure">
+      <div class="sun" aria-hidden="true"></div>
+      <img src="/assets/mascot.webp" width="760" height="760" alt="Tur mascot, a red Cossack with a sweeping moustache, flexing an arm">
+    </div>
+  </div>
+  <div class="field" aria-hidden="true"></div>
+</section>
+<div class="rushnyk" aria-hidden="true"></div>
+
+<main id="main">
+  <section class="stats wrap" aria-label="Headline measurements">
+    <a class="stat" href="/benchmarks/#batching"><b>+{{ perf.stats.batched }}%</b><span>eight-sequence decode against llama.cpp, {{ perf.stats.batchedTok }} tok/s to {{ perf.stats.batchedBase }} on an M3 Pro</span></a>
+    <a class="stat" href="/benchmarks/#reuse"><b>{{ perf.stats.prefixCached }}</b><span>to first token behind a cached system prompt, against {{ perf.stats.prefixCold }} without reuse</span></a>
+    <a class="stat" href="/benchmarks/#reuse"><b>{{ perf.stats.speculation }}</b><span>speculative decoding on repetitive text, with output identical to normal decoding</span></a>
+    <a class="stat" href="/benchmarks/#start"><b>{{ perf.stats.load }}</b><span>to load 4-bit prepacked weights for a 0.8B model on a 16 GB M1</span></a>
+  </section>
+
+  <section class="wrap band">
+    <h2>Why Tur</h2>
+    <p class="band__lead">Pick Tur if you want one of these on an Apple Silicon Mac.</p>
+    <div class="cards">
+      <article class="card">
+        <h3>Many clients, one model</h3>
+        <p>Several clients or agents share each model pass, so eight sequences decode {{ perf.stats.batched }}% faster than on llama.cpp on the same Mac.</p>
+        <a href="/docs/architecture/scheduling/">Scheduling</a>
+      </article>
+      <article class="card">
+        <h3>Models larger than memory</h3>
+        <p>Tur keeps most of a mixture-of-experts model on the SSD and reads experts into a fixed cache, with several requests at once and no SSD writes during a run.</p>
+        <a href="/docs/architecture/expert-cache/">Expert cache</a>
+      </article>
+      <article class="card">
+        <h3>A server you can leave running</h3>
+        <p>Tur plans all its memory before loading a weight, so a configuration that doesn't fit fails at startup, and one failed request doesn't affect the others.</p>
+        <a href="/docs/architecture/memory/">State memory</a>
+      </article>
+    </div>
+  </section>
+
+  <section class="wrap band">
+    <h2>How one pass works</h2>
+    <p class="band__lead">Producing a token on a Mac is mostly a memory problem: the GPU spends more time waiting for weights and request state than computing with them. Tur shapes each layer to read fewer bytes.</p>
+    <ol class="pass">
+      <li class="pass__step">
+        <div class="pass__art pack" aria-hidden="true">
+          <i class="a"></i><i class="b"></i><i class="c"></i><i class="d"></i><i class="p"></i><i class="p"></i><i class="p"></i><i class="p"></i>
+        </div>
+        <h3>Pack</h3>
+        <p>Every running request's next token joins chunks of new prompts in one execution with no padding.</p>
+        <a href="/docs/architecture/execution/">Execution engine</a>
+      </li>
+      <li class="pass__step">
+        <div class="pass__art weights" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+        <h3>Read weights once</h3>
+        <p>Fused Metal kernels read the weights once for the whole batch. A custom kernel stays only where it beats Candle's.</p>
+        <a href="/docs/architecture/kernels/">Metal kernels</a>
+      </li>
+      <li class="pass__step">
+        <div class="pass__art pool" aria-hidden="true"><i></i><i class="on"></i><i></i><i class="on"></i><i class="on"></i><i></i><i class="on"></i><i></i><i></i><i class="on"></i><i class="on"></i><i></i></div>
+        <h3>Read state in place</h3>
+        <p>Attention and recurrent state live in fixed pools, so nothing is copied or reassembled per token.</p>
+        <a href="/docs/architecture/memory/">State memory</a>
+      </li>
+      <li class="pass__step">
+        <div class="pass__art sample" aria-hidden="true"><i style="--h:30%"></i><i style="--h:85%" class="on"></i><i style="--h:50%"></i><i style="--h:20%"></i><i style="--h:40%"></i></div>
+        <h3>Sample on the GPU</h3>
+        <p>Sampling runs right after the model pass, and only the chosen token returns to the CPU.</p>
+        <a href="/docs/architecture/sampling/">Sampling</a>
+      </li>
+    </ol>
+    <p class="band__after">Two more mechanisms skip work without changing the generated text. <a href="/docs/architecture/prefix-reuse/">Prefix reuse</a> computes a shared system prompt once, and <a href="/docs/architecture/speculation/">speculative decoding</a> drafts several tokens and verifies them in one pass.</p>
+  </section>
+
+  <section class="wrap band">
+    <h2>Watch the tokens</h2>
+    <p class="band__lead">Add sequences and see total throughput climb. Each row is one request, replayed at the rate measured on that Mac. No model runs in your browser.</p>
+    <div class="lab" data-lab="race"></div>
+  </section>
+
+  <section class="wrap band">
+    <h2>Measured, with the losses left in</h2>
+    <div class="chart-grid">
+      {{ perf.charts.versus | safe }}
+      {{ perf.charts.batchedM3 | safe }}
+    </div>
+    <p class="band__after"><a class="btn btn--small" href="/benchmarks/">All the charts</a></p>
+  </section>
+
+  <section class="wrap band">
+    <h2>Up and running</h2>
+    <p class="band__lead">You need an Apple Silicon Mac. The first run downloads the model into your Hugging Face cache, and the pinned revision means every run loads the same weights.</p>
+    <div class="tabs" data-tabs>
+      <div class="tabs__list" role="tablist" aria-label="Commands">
+        <button role="tab" aria-selected="true" data-tab="run">Generate</button>
+        <button role="tab" aria-selected="false" data-tab="serve">Serve</button>
+        <button role="tab" aria-selected="false" data-tab="connect">Connect</button>
+      </div>
+      <pre data-panel="run" class="code"><code>{{ readme.run | escape }}</code></pre>
+      <pre data-panel="serve" class="code" hidden><code>{{ readme.serve | escape }}</code></pre>
+      <pre data-panel="connect" class="code" hidden><code>{{ readme.connect | escape }}</code></pre>
+    </div>
+  </section>
+
+  <section class="wrap band fit">
+    <div>
+      <h2>Models</h2>
+      <ul class="plain">
+        <li>Qwen3.5-family hybrid text models, including Qwen3.8 and, experimentally, the Qwen3.6 mixture-of-experts</li>
+        <li>Gemma 4 text, with WAV audio on E2B and E4B</li>
+        <li>gpt-oss text, through the expert cache when it doesn't fit</li>
+        <li>Whisper large-v3-turbo for transcription</li>
+      </ul>
+      <p><a href="/docs/design/scope/#validation-status">How far each model has been validated</a></p>
+    </div>
+    <div>
+      <h2>When to look elsewhere</h2>
+      <p>Tur supports few models and doesn't accept images or video. It has no embeddings, serves one chat model per process, and its HTTP API doesn't offer structured output yet. On 8K-token prompts, llama.cpp prefills 6 to 11% faster on a 16 GB M1.</p>
+      <p>For those, or for other hardware, look at oMLX, llama.cpp, Ollama, SGLang or Strata. <a href="/docs/architecture/comparison/">Tur and other engines</a> says which fits what.</p>
+    </div>
+  </section>
+
+  <section class="wrap band">
+    <h2>Is Tur the right engine for you?</h2>
+    <p class="band__lead">Pick what you need most.</p>
+    <div class="lab" data-lab="chooser"></div>
+  </section>
+
+  <section class="wrap band">
+    <h2>The book</h2>
+    <p class="band__lead">Usage, architecture and the measurement behind each decision.</p>
+    <div class="book-map">
+      {% for part in book.parts %}{% if part.title %}
+      <div>
+        <h3>{{ part.title }}</h3>
+        {% for item in part.chapters %}<a href="{{ item.url }}">{{ item.title }}</a>{% endfor %}
+      </div>
+      {% endif %}{% endfor %}
+    </div>
+  </section>
+</main>

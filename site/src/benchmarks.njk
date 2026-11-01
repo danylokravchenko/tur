@@ -1,0 +1,78 @@
+---
+layout: base.njk
+labs: true
+permalink: benchmarks/index.html
+title: "Benchmarks · Tur"
+description: "Tur's measured throughput, latency, prefix reuse, speculation, load times and quantization quality on Apple Silicon, with the cases where other engines win."
+---
+<main id="main" class="wrap page">
+  <p class="eyebrow">Benchmarks</p>
+  <h1>Where the speed comes from, and where it runs out</h1>
+  <p class="page__lead"><a href="/docs/guide/performance/">Measured performance</a> has the versions and methods behind these charts. Hover or tap a mark for its values, or open the numbers under any chart. Re-measure on your own Mac with <a href="/docs/development/benchmarks/"><code>just bench</code></a> before relying on a figure.</p>
+
+  <nav class="jump" aria-label="Sections">
+    <a href="#overall">Overall</a><a href="#batching">Batching</a><a href="#serving">Serving</a><a href="#moe">Mixture of experts</a><a href="#reuse">Skipping work</a><a href="#start">Loading and weights</a>
+  </nav>
+
+  <section id="overall" class="band">
+    <h2>Overall</h2>
+    <p class="band__lead">The biggest lead appears when requests share a pass. Prefill is mostly compute, so Tur's savings on memory reads help less there.</p>
+    {{ perf.charts.versus | safe }}
+  </section>
+
+  <section id="batching" class="band">
+    <h2>Batching</h2>
+    <p class="band__lead">Requests share one read of the weights, so total throughput climbs with each sequence added to a pass.</p>
+    <div class="lab" data-lab="race"></div>
+    <div class="chart-grid" style="margin-top:20px">
+      {{ perf.charts.batchedM3 | safe }}
+      {{ perf.charts.batchedM1 | safe }}
+      {{ perf.charts.batchedDense | safe }}
+      {{ perf.charts.omlx | safe }}
+    </div>
+  </section>
+
+  <section id="serving" class="band">
+    <h2>Serving</h2>
+    <p class="band__lead">These bursts go through the scheduler and the sampler, as a real client's requests do.</p>
+    <div class="lab" data-lab="serving"></div>
+    <div class="chart-grid" style="margin-top:20px">
+      {{ perf.charts.servingOutput | safe }}
+      {{ perf.charts.servingGap | safe }}
+    </div>
+  </section>
+
+  <section id="moe" class="band">
+    <h2>Mixture of experts</h2>
+    <p class="band__lead">Qwen3.6-35B-A3B has 35 billion parameters, of which 3 billion are active for each token: every layer routes a token to 8 of its 256 experts. Its 4-bit weights take 20.3 GB and load in {{ perf.moe.load }} s on a 36 GB M3 Pro.</p>
+    <div class="chart-grid">
+      {{ perf.charts.burstMoe | safe }}
+      {{ perf.charts.moeDecode | safe }}
+      {{ perf.charts.moeEngineDecode | safe }}
+      {{ perf.charts.moeEnginePrefill | safe }}
+    </div>
+    <div class="lab" data-lab="moeSpeculation" style="margin-top:20px"></div>
+    <p class="band__after">Sixteen concurrent requests don't fit with every expert resident: Tur runs out of GPU memory. With a 4 GiB <a href="/docs/architecture/expert-cache/">expert cache</a> the burst completes at {{ perf.moe.sixteenTur }} tok/s, while llama.cpp keeps its weights resident and reaches {{ perf.moe.sixteenLlama }} tok/s.</p>
+  </section>
+
+  <section id="reuse" class="band">
+    <h2>Skipping work</h2>
+    <p class="band__lead">Prefix reuse and speculation avoid passes altogether, and neither changes the generated text.</p>
+    <div class="lab" data-lab="speculation"></div>
+    <div class="chart-grid" style="margin-top:20px">
+      {{ perf.charts.prefix | safe }}
+      {{ perf.charts.speculation | safe }}
+    </div>
+  </section>
+
+  <section id="start" class="band">
+    <h2>Loading and weights</h2>
+    <p class="band__lead">Prepacked artifacts load as stored. Fewer bytes also cost some quality, which <a href="/docs/guide/choosing-quantization/">Choosing a quantization</a> weighs up.</p>
+    <div class="lab" data-lab="formats"></div>
+    <div class="chart-grid" style="margin-top:20px">
+      {{ perf.charts.loadTime | safe }}
+      {{ perf.charts.loadMemory | safe }}
+      {{ perf.charts.formats | safe }}
+    </div>
+  </section>
+</main>

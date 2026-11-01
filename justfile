@@ -88,3 +88,11 @@ docs:
 # Build the book into docs/book.
 docs-build:
     mdbook build docs
+
+# Serve the website at http://localhost:8080/tur/ with live reload.
+site:
+    cd site && npm ci && npm run dev
+
+# Build the website into site/_site.
+site-build:
+    cd site && npm ci && npm run build

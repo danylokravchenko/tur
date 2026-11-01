@@ -1,0 +1,8 @@
+<nav class="sidebar">
+  {% for part in book.parts %}
+  {% if part.title %}<p class="sidebar__part">{{ part.title }}</p>{% endif %}
+  {% for item in part.chapters %}
+  <a class="{% if item.nested %}is-nested{% endif %}{% if item.url == chapter.url %} is-active{% endif %}" {% if item.url == chapter.url %}aria-current="page" {% endif %}href="{{ item.url }}">{{ item.title }}</a>
+  {% endfor %}
+  {% endfor %}
+</nav>
