@@ -14,44 +14,45 @@ Pick Tur to serve several requests at once from a supported model on an Apple Si
 
 Other projects' features come from their documentation as of November 2026 and change quickly, so check upstream before deciding.
 
-## At a glance
+## The other engines
 
-| | Tur | llama.cpp | oMLX | Ollama | SGLang | Strata |
-| --- | --- | --- | --- | --- | --- | --- |
-| Hardware | Apple Silicon | CPUs and GPUs of most vendors | Apple Silicon | Mac, Linux, Windows | Data-center GPUs, TPUs, NPUs; Macs through MLX | Consumer NVIDIA, AMD and Intel GPUs; Apple Silicon |
-| Models | Qwen3.5 family, Gemma 4, gpt-oss, Whisper | Very broad, as GGUF | Broad, through MLX | Broad, from its library | Broad | Selected large MoE models |
-| Execution | Own Metal kernels over Candle | Own Metal backend | MLX, optional native kernels | llama.cpp, or MLX | MLX on a Mac | Own Metal engine on a Mac |
-| Requests at once on a Mac | Continuous batching | Parallel slots | Continuous batching, 8 by default | 1 by default; [no concurrency on the MLX engine yet](https://github.com/ollama/ollama/issues/17280) | [Guide](https://docs.sglang.io/docs/hardware-platforms/apple_metal) shows single-request runs only | [One](https://github.com/Niko1221/Strata/blob/5cfe96ee6a0827acf83f4c6f5ac74dd21c16fe9a/docs/MAC.md) |
-| Prompt cache | In memory, shared pages | [In slots and host memory](https://github.com/ggml-org/llama.cpp/pull/16391) | Memory and SSD, survives restart | Slots, or [MLX snapshots](https://ollama.com/blog/mlx) | RadixAttention; not documented for MLX | Not compared |
-| Weights larger than memory | Expert cache | Memory-mapped files | No expert offload documented | Not documented | Not documented for Macs | Expert streaming |
-| Images and embeddings | No | Images through its multimodal library | Yes | Yes | Yes | Images in Qwen3.8 |
-| Structured output over HTTP | No, only `tool_choice=auto` | Yes | Yes | Yes | Yes | Not compared |
+### llama.cpp
+
+llama.cpp runs on the CPUs and GPUs of most vendors and loads a very broad range of models as GGUF. On a Mac it uses its own Metal backend and serves concurrent requests through parallel slots. It keeps prompt caches [in slots and host memory](https://github.com/ggml-org/llama.cpp/pull/16391), handles larger-than-memory weights by memory-mapping them, takes images through its multimodal library, and offers structured output over HTTP.
+
+### oMLX
+
+oMLX runs on Apple Silicon and covers a broad range of models through MLX, with optional native kernels. It uses continuous batching, with 8 requests at once by default, and its prompt cache lives in memory and on the SSD, so it survives a restart. It supports images, embeddings and structured output, and documents no expert offload.
+
+### Ollama
+
+Ollama runs on Mac, Linux and Windows and offers a broad model library, running each model on llama.cpp or MLX. It serves one request at a time by default, and there is [no concurrency on the MLX engine yet](https://github.com/ollama/ollama/issues/17280). Prompts are cached in slots or as [MLX snapshots](https://ollama.com/blog/mlx). It supports images, embeddings and structured output, and doesn't document running weights larger than memory.
+
+### SGLang
+
+SGLang is built for data-center GPUs, TPUs and NPUs, covers a broad range of models, and reaches Macs through MLX. Its [Mac guide](https://docs.sglang.io/docs/hardware-platforms/apple_metal) shows single-request runs only. Its RadixAttention prompt cache and any handling of larger-than-memory weights aren't documented for Macs. It supports images, embeddings and structured output.
+
+### Strata
+
+Strata runs selected large MoE models on consumer NVIDIA, AMD and Intel GPUs and on Apple Silicon, with its own Metal engine on a Mac. That engine serves [one request at a time](https://github.com/Niko1221/Strata/blob/5cfe96ee6a0827acf83f4c6f5ac74dd21c16fe9a/docs/MAC.md). It streams experts to run models larger than memory and takes images in Qwen3.8. We haven't compared its prompt cache or structured output.
 
 ## How Tur's design differs
 
 Most of these engines start from generality: a tensor library or a broad server that many models and devices can plug into. Tur starts from one machine and one model shape, then builds each layer around them. That narrowness costs it model coverage, and every new family needs its own implementation and validation. It pays for the choices below. The descriptions of other engines come from their documentation, not from auditing their code.
 
-| Concern | Tur's approach | What you get | Elsewhere |
-| --- | --- | --- | --- |
-| Compute | Kernels fitted to these models and to each batch shape, with Candle where it wins | Fused steps, and a kernel chosen by measurement at each shape | llama.cpp and MLX run models through general tensor libraries; oMLX adds optional native kernels for some families |
-| Recurrent state | A first-class kind of state with its own slots and exact boundaries | Prefix reuse and rollback that work on hybrid models by construction | Prompt caches usually grow from K/V, which can be cut at any length |
-| Memory | One plan for weights, state, scratch and drafts, reserved before loading | A configuration that doesn't fit fails at startup | oMLX evicts models against a process limit; Ollama's RAM [scales with parallel requests times context](https://docs.ollama.com/faq) |
-| Scheduling | Decodes first, with prompts sized from measured pass times | New prompts can at most double the wait for the next token | oMLX uses first-come, first-served; Strata and Ollama's MLX engine queue requests |
-| Failure | One owner, per-request errors, generation-tagged handles | One failed request doesn't take down the others | Not compared |
-
 ### State built for hybrid models
 
-Hybrid models keep attention state and recurrent state side by side, and the two behave differently. You can trim cached keys and values to any length, but the recurrent state after token `n` exists only if a pass ended exactly at `n`. Tur treats this as a basic constraint: the scheduler stops prompt chunks at snapshot positions, so the boundaries a later request needs always exist. Each pass also writes new recurrent slots next to the committed ones, so rejecting a speculative draft means picking a slot, with nothing to recompute.
+Hybrid models keep attention state and recurrent state side by side, and the two behave differently. You can trim cached keys and values to any length, but the recurrent state after token `n` exists only if a pass ended exactly at `n`. Prompt caches usually grow from K/V, which can be cut anywhere. Tur treats recurrent boundaries as a basic constraint instead: the scheduler stops prompt chunks at snapshot positions, so the boundaries a later request needs always exist. Each pass also writes new recurrent slots next to the committed ones, so rejecting a speculative draft means picking a slot, with nothing to recompute.
 
 Snapshots share pages and slots instead of copying them, so taking one costs almost nothing, and a page is copied only when a request appends to a page someone else still holds. oMLX's block cache also uses copy-on-write. llama.cpp's [host-memory cache](https://github.com/ggml-org/llama.cpp/pull/16391) instead keeps prompt states in RAM and swaps them into the context. Tur's choice ties reuse to the GPU pools it reads every token, while theirs can hold more prompts than the context, and oMLX's survive a restart.
 
 ### Memory as a promise
 
-Tur works out its whole memory use before reading a weight, and `--context-tokens` is a promise that every concurrent request gets that much room. Running out is then a planned event. Snapshots go first, then the newest request gives up its state and later recomputes it, with its random stream intact. A server you leave running is less likely to push the Mac into swap partway through a job, though the plan can't see what other applications do after startup. The cost is that Tur holds its full plan even while idle.
+Tur works out its whole memory use before reading a weight, and `--context-tokens` is a promise that every concurrent request gets that much room. Running out is then a planned event. Snapshots go first, then the newest request gives up its state and later recomputes it, with its random stream intact. A server you leave running is less likely to push the Mac into swap partway through a job, though the plan can't see what other applications do after startup. The cost is that Tur holds its full plan even while idle. Elsewhere, oMLX evicts models against a process limit, and Ollama's RAM [scales with parallel requests times context](https://docs.ollama.com/faq).
 
 ### Scheduling for steady replies
 
-Every pass mixes replying requests and new prompts. Tur's scheduler times each pass on the GPU and gives prompts the largest share that keeps the pass within its target, so a long prompt arriving doesn't stall every stream. On a mixed workload this made the slowest 5% of gaps between tokens 3.7× shorter than running prompts unchecked, in exchange for 7% less throughput. Tur still processes prompts in arrival order, with no priorities or per-client fairness yet.
+Every pass mixes replying requests and new prompts. Tur's scheduler times each pass on the GPU and gives prompts the largest share that keeps the pass within its target, so a long prompt arriving doesn't stall every stream. On a mixed workload this made the slowest 5% of gaps between tokens 3.7× shorter than running prompts unchecked, in exchange for 7% less throughput. Tur still processes prompts in arrival order, with no priorities or per-client fairness yet. oMLX also uses first-come, first-served, while Strata and Ollama's MLX engine queue whole requests.
 
 ### Speed-ups that don't change the answer
 
@@ -59,7 +60,7 @@ Tur treats optimizations as exact by default. Prefix restores compare every toke
 
 ### A small, strict runtime
 
-Tur is one Rust binary, with no Python environment to manage, unlike oMLX and SGLang. The code has no `unsafe` and no panics. One thread owns each model's requests and memory, so no locks are held during execution, and every shape, offset and page index is checked before GPU work is submitted. Defaults follow the same discipline: a custom kernel stays only if it beats the existing one by more than run-to-run noise, and the losers are deleted and listed in [Rejected experiments](../design/rejected.md).
+Tur is one Rust binary, with no Python environment to manage, unlike oMLX and SGLang. The code has no `unsafe` and no panics. One thread owns each model's requests and memory, so no locks are held during execution, and every shape, offset and page index is checked before GPU work is submitted. Errors are per request and handles are tagged by generation, so one failed request doesn't take down the others. Defaults follow the same discipline: a custom kernel stays only if it beats the existing one by more than run-to-run noise, and the losers are deleted and listed in [Rejected experiments](../design/rejected.md). llama.cpp and MLX run models through general tensor libraries, and oMLX adds optional native kernels for some families.
 
 ## Why Tur is faster on a Mac
 
@@ -91,13 +92,7 @@ These results are for llama.cpp 0.8.0 on an M3 Pro with 36 GB, Qwen3.5-0.8B and 
 | Qwen3.6-35B, 4-bit, burst of 8, end to end | 101.5 tok/s | 75.0 tok/s | +35% |
 | Qwen3.8-27B, 4-bit, decode, 8 sequences | 52.5 tok/s | 41.1 tok/s | +28% |
 
-Against oMLX on an M1 with 16 GB and 4-bit Qwen3.5-0.8B, using its [published results](https://omlx.ai/benchmarks/performance/yw52053o), not a rerun on our Mac:
-
-| Sequences | Tur | oMLX | Peak memory, Tur / oMLX |
-| --- | ---: | ---: | ---: |
-| 1 | 90 tok/s | 73.7 tok/s | 0.71 GB / 2.17 GB |
-| 2 | 114 tok/s | 123 tok/s | |
-| 4 | 202 tok/s | 198 tok/s | |
+Against oMLX on an M1 with 16 GB and 4-bit Qwen3.5-0.8B, using its [published results](https://omlx.ai/benchmarks/performance/yw52053o) rather than a rerun on our Mac, Tur leads with one sequence, at 90 tok/s to 73.7 and with a peak of 0.71 GB to 2.17 GB. oMLX leads at two sequences, 123 tok/s to 114, and the two are level at four, with Tur at 202 and oMLX at 198.
 
 [Measured performance](../guide/performance.md) has the methods, versions and remaining rows.
 
@@ -117,18 +112,13 @@ We haven't benchmarked Ollama or SGLang. Ollama on GGUF runs llama.cpp, so the l
 - llama.cpp memory-maps its model file and leaves paging to the OS. That lets a larger file load, but a mapped file sets no limit on residency and gets no read-ahead from the model's routers. We haven't measured it on a model that doesn't fit.
 - oMLX writes K/V blocks to the SSD so prompts survive eviction and restarts. This saves prefill, and the weights still have to fit. It also adds steady SSD writes, which is why [Tur doesn't do it](../research/serving-technique-gaps.md#not-recommended).
 
-Strata is the closest comparison, and [its Metal expert stream](https://github.com/Niko1221/Strata/blob/46c152a1310f77cd2f0ce2c7cd213962df14fe83/metal/src/engine/stream.h) was the reference for Tur's [expert cache](expert-cache.md). Both keep dense weights resident, map expert IDs to arena slots on the device, read misses on demand and read ahead using the next layer's likely experts. They differ in what they optimize:
+Strata is the closest comparison, and [its Metal expert stream](https://github.com/Niko1221/Strata/blob/46c152a1310f77cd2f0ce2c7cd213962df14fe83/metal/src/engine/stream.h) was the reference for Tur's [expert cache](expert-cache.md). Both keep dense weights resident, map expert IDs to arena slots on the device, read misses on demand and read ahead using the next layer's likely experts.
 
-| | Tur | Strata on a Mac |
-| --- | --- | --- |
-| Built for | Serving smaller MoE models on small Macs | The largest MoE models on consumer hardware |
-| Models | gpt-oss-20b, Qwen3.6-35B-A3B | Qwen3.8-Flash-Next, DeepSeek V4.1-Flash; Qwen3.6 doesn't run on its Mac engine |
-| Smallest measured Mac | M1 with 16 GB | M4 Mac mini with 32 GB, M1 Max with 34 GB |
-| Requests at once | Several, sharing the arena | One, others queue |
-| Arena size | You set it, and the load refuses a size that would cause swapping | Chosen automatically: Metal's share or available memory minus a reserve, whichever is smaller |
-| Arena on large Macs | Not wired, not measured | Wired from 64 GB up, so macOS doesn't compress it |
-| SSD writes | None during a run, and page cache bypassed | Optional one-time copy that stores each expert's matrices together, which it measured at 17% faster decode and 30% faster prompts |
-| Long prompts | Prefill chunks grow to 1,024 tokens, so each pass reads fewer experts | No equivalent documented |
+They differ in what they optimize. Tur serves smaller MoE models on small Macs: gpt-oss-20b and Qwen3.6-35B-A3B, measured down to an M1 with 16 GB. Strata runs the largest MoE models on consumer hardware: Qwen3.8-Flash-Next and DeepSeek V4.1-Flash, measured down to an M4 Mac mini with 32 GB and an M1 Max with 34 GB. Qwen3.6 doesn't run on its Mac engine. Tur serves several requests that share the arena, while Strata serves one and queues the others.
+
+You set Tur's arena size, and the load refuses a size that would cause swapping. Strata chooses automatically: Metal's share or available memory minus a reserve, whichever is smaller. From 64 GB up it wires the arena so macOS doesn't compress it, which Tur doesn't do and hasn't measured.
+
+Tur writes nothing to the SSD during a run and bypasses the page cache. Strata offers an optional one-time copy that stores each expert's matrices together, which it measured at 17% faster decode and 30% faster prompts. Tur grows prefill chunks to 1,024 tokens on long prompts, so each pass reads fewer experts, and Strata documents no equivalent.
 
 Their speeds can't be compared directly, because no model and Mac appear on both sides. Strata reports 13 to 14 tok/s on Flash-Next Q2_0 with one request on the 32 GB Mac mini, using an arena of 11.5 to 14.7 GB. Tur reports 3.1 to 3.3 tok/s on gpt-oss-20b on a 16 GB M1, using 1 to 2 GiB. Tur has no support for Flash-Next, whose 512 experts per layer exceed its router's limit of 256. Both results show that speed depends on how many reads the arena avoids.
 

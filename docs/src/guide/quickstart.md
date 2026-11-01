@@ -5,12 +5,11 @@ This walkthrough installs Tur, downloads a model, chats with it and serves it. T
 ## 1. Install
 
 ```sh
-git clone https://github.com/danylokravchenko/tur && cd tur
-./install.sh                          # puts `tur` in ~/.cargo/bin by default
+curl -fsSL https://github.com/danylokravchenko/tur/releases/latest/download/install.sh | sh
 tur --help
 ```
 
-Install Rust through rustup first; the checkout selects the right toolchain for you. The first build takes a few minutes. Running the script again replaces an existing installation. Use `./install.sh --root "$HOME/.local"` to install into `~/.local/bin`, and make sure the destination's `bin` directory is on your `PATH`. If you'd rather not install, `cargo build --release --bin tur` leaves the binary at `target/release/tur`.
+The script installs the prebuilt binary into `~/.local/bin`, so you don't need Rust. If that directory isn't on your `PATH`, the script adds it to `~/.zshrc` or `~/.bash_profile`; open a new terminal if `tur` isn't found. Running the script again replaces an existing installation. [Requirements and checkpoints](getting-started.md#download) lists its settings and explains how to build from source.
 
 ## 2. Pick and pin a model
 

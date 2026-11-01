@@ -1,0 +1,22 @@
+{
+  "name": "tur-site",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Website for Tur, built with Eleventy from the book in docs/src.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "eleventy --serve",
+    "build": "eleventy"
+  },
+  "devDependencies": {
+    "@11ty/eleventy": "^3.1.2",
+    "@fontsource/bowlby-one": "^5.2.5",
+    "@fontsource/ibm-plex-sans": "^5.2.5",
+    "@fontsource/jetbrains-mono": "^5.2.5",
+    "highlight.js": "^11.11.1",
+    "markdown-it": "^14.1.0"
+  }
+}

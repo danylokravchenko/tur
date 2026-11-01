@@ -97,7 +97,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 ## Documentation
 
-The [Tur book](docs/src/SUMMARY.md) covers usage, architecture and the measurements behind each decision. Run `just docs` to read it locally.
+The [Tur book](https://danylokravchenko.github.io/tur/docs/) covers usage, architecture and the measurements behind each decision, and the [benchmarks page](https://danylokravchenko.github.io/tur/benchmarks/) lets you explore them. Run `just docs` to read the book locally.
 
 | I want to | Start here |
 | --- | --- |

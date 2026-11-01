@@ -20,6 +20,7 @@ crates/
     benches/perf/        every benchmark and measurement tool, one binary
   tur-cli/     the `tur` binary: run, serve, status, top, stop, transcribe, quantize, prune
 docs/                    mdBook (`just docs`): guide, architecture with decisions, development, design
+site/                    Eleventy website (`just site`), built from docs/src and README.md, deployed to GitHub Pages
 scripts/                 Python generators for golden references and fixtures
 ```
 
@@ -78,7 +79,7 @@ Engineering expectations:
 
 - Doc comments on public items say what the method does and any invariants it relies on.
 - Comments explain why: a measured threshold, an ordering constraint, a non-obvious invariant. Do not restate the code, and do not cite phase numbers or report files.
-- Keep the book current. A changed default, flag, endpoint or mechanism updates its chapter in `docs/src`, including the chapter's "Decisions" section. Keep decisions to the choice and its evidence, not narrative. `just docs-build` must pass.
+- Keep the book current. A changed default, flag, endpoint or mechanism updates its chapter in `docs/src`, including the chapter's "Decisions" section. Keep decisions to the choice and its evidence, not narrative. `just docs-build` must pass. The website's charts read tables in `guide/performance.md` and `architecture/comparison.md` by heading and column name, so after renaming one run `just site-build`, which fails with the lookup that no longer matches.
 - Write the book and README for people learning what Tur does and why it is good: explain a mechanism and why it helps before its numbers, keep only numbers the reader needs, and leave history (earlier policies, measurement rounds, dates) to git. Apply the [deslop](.agents/skills/deslop/SKILL.md) skill to any prose you write or edit.
 - Never break a line in the middle of a sentence in a Markdown file, including inside list items. Each paragraph and each list item is a single line; only code blocks, tables and deliberate structure span lines.
 

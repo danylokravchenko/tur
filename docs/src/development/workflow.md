@@ -19,6 +19,7 @@ The `justfile` holds every routine task:
 | `just quantize <dir> <out> …` | `tur quantize` |
 | `just bench <case>` | One [benchmark](benchmarks.md) case |
 | `just docs` / `just docs-build` | Serve or build this book |
+| `just site` / `just site-build` | Serve or build the website, which renders this book and charts its tables |
 
 ## Rules
 
