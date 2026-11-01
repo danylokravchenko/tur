@@ -61,6 +61,38 @@ pub struct ChatCompletionRequest {
     /// Prefix-reuse namespace: only requests with the same salt share cached prompts.
     pub cache_salt: Option<String>,
     pub stop: Option<StopSequences>,
+    pub response_format: Option<ResponseFormat>,
+    #[serde(default)]
+    pub logprobs: bool,
+    pub top_logprobs: Option<usize>,
+}
+
+/// `OpenAI`'s `response_format`. Unknown types fail to deserialize.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    Text,
+    JsonObject,
+    JsonSchema {
+        json_schema: JsonSchemaFormat,
+    },
+    /// A Tur extension, shaped like `OpenAI`'s grammar format for custom tools.
+    Grammar {
+        syntax: GrammarSyntax,
+        definition: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrammarSyntax {
+    Regex,
+    Lark,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JsonSchemaFormat {
+    pub schema: serde_json::Value,
 }
 
 /// `OpenAI`'s two forms of the `stop` field.
@@ -140,7 +172,30 @@ pub struct ChatCompletionResponse {
 pub struct ChatChoice {
     pub index: u32,
     pub message: ChatResponseMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
     pub finish_reason: &'static str,
+}
+
+/// `OpenAI`'s `logprobs` object of a choice.
+#[derive(Debug, Serialize)]
+pub struct ChoiceLogprobs {
+    pub content: Vec<LogprobEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LogprobEntry {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
+    pub top_logprobs: Vec<TopLogprob>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TopLogprob {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,6 +256,8 @@ pub struct ChatCompletionChunk {
 pub struct ChunkChoice {
     pub index: u32,
     pub delta: DeltaMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
     pub finish_reason: Option<&'static str>,
 }
 

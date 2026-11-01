@@ -42,6 +42,9 @@ pub struct SamplingOptions {
     pub presence_penalty: Option<f64>,
     /// Subtracted per occurrence from the logit of every token sampled so far.
     pub frequency_penalty: Option<f64>,
+    /// Report each output's log probability with this many likeliest alternatives. Costs one
+    /// logit row copied per output; the sampled tokens are the same either way.
+    pub logprobs: Option<usize>,
 }
 
 impl SamplingOptions {
@@ -135,6 +138,8 @@ struct SamplingMark {
     tokens: usize,
     finished: bool,
     guidance: Option<GuidanceControl>,
+    /// The grammar was waiting for its trigger, which a failed pass may have committed.
+    dormant: bool,
 }
 
 /// One output position's logits as `finish` delivers them.
@@ -320,7 +325,14 @@ impl SamplingState {
                 .as_ref()
                 .filter(|g| g.is_active())
                 .map(GuidanceControl::fork),
+            dormant: self.dormant(),
         }
+    }
+
+    fn dormant(&self) -> bool {
+        self.guidance
+            .as_ref()
+            .is_some_and(GuidanceControl::is_dormant)
     }
 
     fn rollback(&mut self, mark: SamplingMark) {
@@ -339,6 +351,10 @@ impl SamplingState {
         self.finished = mark.finished;
         if let Some(guidance) = mark.guidance {
             self.guidance = Some(guidance);
+        } else if mark.dormant
+            && let Some(guidance) = &mut self.guidance
+        {
+            guidance.sleep();
         }
     }
 
@@ -401,6 +417,13 @@ impl SamplingState {
                 }
             }
         };
+        self.record(token)?;
+        self.draws = next_draw;
+        Ok(Some(token))
+    }
+
+    /// Advance the grammar and history past `token`.
+    fn record(&mut self, token: u32) -> Result<()> {
         if let Some(guidance) = &mut self.guidance
             && guidance.commit(token)?
         {
@@ -409,9 +432,36 @@ impl SamplingState {
         if let Some(history) = &mut self.history {
             *history.counts.entry(token).or_default() += 1;
         }
-        self.draws = next_draw;
         self.tokens.push(token);
-        Ok(Some(token))
+        Ok(())
+    }
+
+    /// Publish the next output without a model pass if its grammar decides it alone. A forced
+    /// token consumes a draw as sampling would have, so later draws, and with them same-seed
+    /// outputs, don't depend on whether this ran. Log probabilities need every position's
+    /// logits, so those requests take their passes.
+    fn force(&mut self) -> Result<Forced> {
+        if self.finished || self.options.logprobs.is_some() {
+            return Ok(Forced::Sample);
+        }
+        let Some(guidance) = &mut self.guidance else {
+            return Ok(Forced::Sample);
+        };
+        if guidance.mask()? == Some(GrammarMask::Stop) {
+            guidance.stop();
+            self.finished = true;
+            return Ok(Forced::Stop);
+        }
+        let Some(token) = guidance.forced()? else {
+            return Ok(Forced::Sample);
+        };
+        let next_draw = self
+            .draws
+            .checked_add(1)
+            .ok_or_else(|| invalid("RNG counter overflow"))?;
+        self.record(token)?;
+        self.draws = next_draw;
+        Ok(Forced::Token(token))
     }
 }
 
@@ -467,16 +517,68 @@ struct Request {
     cancelled: bool,
 }
 
+/// What a request's grammar decides about its next output on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Forced {
+    /// It allows several tokens, or there is no grammar: the output needs a pass.
+    Sample,
+    /// It allows exactly this token, now published.
+    Token(u32),
+    /// It reached its end.
+    Stop,
+}
+
 /// One sampled output, indexed by the original packed token position.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TokenOutput {
     pub request: Uuid,
     pub packed_position: usize,
     pub token: u32,
+    /// Present when the request's [`SamplingOptions::logprobs`] asked for it.
+    pub logprobs: Option<OutputLogprobs>,
+}
+
+/// Log probabilities of one output under the model's own distribution: before penalties,
+/// temperature, truncation and grammar masks, so `top` can name tokens a mask forbade.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutputLogprobs {
+    /// Of the token that was sampled.
+    pub logprob: f32,
+    /// The most likely tokens, most likely first.
+    pub top: Vec<(u32, f32)>,
+}
+
+impl OutputLogprobs {
+    fn new(logits: &[f32], token: u32, top: usize) -> Result<Self> {
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        // Relative to the maximum, so the sum can't overflow.
+        let scale = logits.iter().map(|&v| (v - max).exp()).sum::<f32>().ln();
+        // Rounding can leave a certain token's value just above zero.
+        let logprob = |value: f32| (value - max - scale).min(0.0);
+        let chosen = *logits
+            .get(token as usize)
+            .ok_or_else(|| invalid("sampled token outside the logit row"))?;
+        let mut order: Vec<u32> = (0..logits.len())
+            .map(|index| u32::try_from(index).map_err(|_| invalid("token id exceeds u32")))
+            .collect::<Result<_>>()?;
+        let by_logit = |a: &u32, b: &u32| logits[*b as usize].total_cmp(&logits[*a as usize]);
+        if top > 0 && top < order.len() {
+            order.select_nth_unstable_by(top - 1, by_logit);
+        }
+        order.truncate(top);
+        order.sort_unstable_by(by_logit);
+        Ok(Self {
+            logprob: logprob(chosen),
+            top: order
+                .into_iter()
+                .map(|index| (index, logprob(logits[index as usize])))
+                .collect(),
+        })
+    }
 }
 
 /// What one request published from a completed batch.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SequenceCommit {
     /// New handle; descriptors built from the previous revision are rejected.
     pub handle: StateHandle,
@@ -569,6 +671,11 @@ struct Batch<M> {
     pairs: Option<Tensor>,
     /// Penalized device rows, read back only for samples the device could not settle.
     device_rows: Option<Tensor>,
+    /// Model logits of requests that report log probabilities, read back after the fence,
+    /// and each sequence's first row in them. Separate from `host` so that asking for log
+    /// probabilities leaves the row where it is sampled, and with it the sampled tokens.
+    logprob_rows: Option<Tensor>,
+    logprob_first: Vec<Option<usize>>,
     error: Option<TurError>,
 }
 
@@ -658,6 +765,7 @@ fn sample_sequence(
         .zip(&penalties)
         .enumerate()
     {
+        let dormant = sampling.dormant();
         let Some(token) = sampling.sample(row, penalties.as_ref())? else {
             return Ok((
                 if sequence.speculative {
@@ -672,17 +780,39 @@ fn sample_sequence(
             request: sequence.state.request,
             packed_position: position,
             token,
+            logprobs: None,
         });
         if sequence.speculative {
             let draft = tokens
                 .get(position + 1)
                 .filter(|_| position + 1 < sequence.tokens.end);
-            if sampling.finished || draft != Some(&token) {
+            // A grammar this token woke must mask the next output, whose row wasn't: drop it
+            // as if its draft had been rejected.
+            if sampling.finished || draft != Some(&token) || (dormant && !sampling.dormant()) {
                 return Ok((index + 1, outputs));
             }
         }
     }
     Ok((length, outputs))
+}
+
+/// Fill in `commit`'s log probabilities from the sequence's rows of `values`, starting at
+/// row `first`. Outputs are published in row order, and a rejected draft only ends them early.
+fn attach_logprobs(
+    commit: &mut SequenceCommit,
+    values: &[f32],
+    first: usize,
+    vocab: usize,
+    top: usize,
+) -> Result<()> {
+    let rows = values
+        .get(first * vocab..)
+        .ok_or_else(|| invalid("logit rows outside the copied batch"))?
+        .chunks_exact(vocab.max(1));
+    for (output, row) in commit.outputs.iter_mut().zip(rows) {
+        output.logprobs = Some(OutputLogprobs::new(row, output.token, top)?);
+    }
+    Ok(())
 }
 
 fn boundaries(speculative: bool) -> Boundaries {
@@ -804,6 +934,34 @@ impl<M: HybridModel> HybridEngine<M> {
             .snapshot
             .model
             .demand(tokens, boundaries(speculative))
+    }
+
+    /// Whether the request's grammar constrains its next output, which rules out drafting.
+    /// A dormant grammar doesn't.
+    pub fn constraining(&self, request: Uuid) -> bool {
+        self.requests.get(&request).is_some_and(|request| {
+            request
+                .snapshot
+                .sampling
+                .guidance
+                .as_ref()
+                .is_some_and(GuidanceControl::is_active)
+        })
+    }
+
+    /// Let an idle request's grammar decide its next output without a pass, when it can.
+    /// The token becomes the next input like any other output; fails while a batch is in
+    /// flight, whose outputs aren't published yet.
+    pub fn force_output(&mut self, handle: StateHandle) -> Result<Forced> {
+        if self.pending.is_some() {
+            return Err(invalid("cannot force outputs while a batch is in flight"));
+        }
+        self.request(handle)?;
+        let request = self
+            .requests
+            .get_mut(&handle.request)
+            .ok_or_else(|| invalid("request disappeared"))?;
+        request.snapshot.sampling.force()
     }
 
     /// Allocate request-owned layer state, independent RNG and an optional grammar parser.
@@ -1083,6 +1241,8 @@ impl<M: HybridModel> HybridEngine<M> {
                 host: None,
                 pairs: None,
                 device_rows: None,
+                logprob_rows: None,
+                logprob_first: Vec::new(),
                 error: None,
             },
         );
@@ -1303,6 +1463,9 @@ impl<M: HybridModel> HybridEngine<M> {
         // Device-decided sequences: (index, logits, plans), greedy first.
         let mut device: Vec<(usize, Tensor, Vec<DeviceRow>)> = Vec::new();
         batch.placement = vec![Placement::None; batch.logits.len()];
+        batch.logprob_first = vec![None; batch.logits.len()];
+        let mut logprobs = Vec::new();
+        let mut logprob_rows = 0;
         let kernels = self.has_kernels();
         for (index, sequence) in batch.plan.sequences.iter().enumerate() {
             let logits = match batch.logits.get(index) {
@@ -1316,8 +1479,17 @@ impl<M: HybridModel> HybridEngine<M> {
                 continue;
             }
             let sampling = &mut request.snapshot.sampling;
+            if sampling.options.logprobs.is_some() {
+                batch.logprob_first[index] = Some(logprob_rows);
+                logprob_rows += sequence.outputs.len();
+                logprobs.push(logits.clone());
+            }
             let single = !sequence.speculative && sequence.outputs.len() == 1;
-            if !kernels || (sampling.guidance.is_some() && !single) {
+            let masks_later_rows = sampling
+                .guidance
+                .as_ref()
+                .is_some_and(GuidanceControl::is_active);
+            if !kernels || (masks_later_rows && !single) {
                 batch.placement[index] = Placement::Host(host_rows);
                 host_rows += sequence.outputs.len();
                 host.push(logits);
@@ -1350,6 +1522,9 @@ impl<M: HybridModel> HybridEngine<M> {
         }
         if !host.is_empty() {
             batch.host = Some(Tensor::cat(&host, 0)?);
+        }
+        if !logprobs.is_empty() {
+            batch.logprob_rows = Some(Tensor::cat(&logprobs, 0)?);
         }
         if !device.is_empty() {
             self.decide(batch, device)?;
@@ -1479,6 +1654,13 @@ impl<M: HybridModel> HybridEngine<M> {
                 return Err(error);
             }
         };
+        let logprobs = match (token, request.snapshot.sampling.options.logprobs) {
+            (Some(token), Some(top)) => {
+                let row = logits.flatten_all()?.to_vec1::<f32>()?;
+                Some(OutputLogprobs::new(&row, token, top)?)
+            }
+            _ => None,
+        };
         request.handle.revision = revision;
         Ok(SequenceCommit {
             handle: request.handle,
@@ -1488,6 +1670,7 @@ impl<M: HybridModel> HybridEngine<M> {
                     request: handle.request,
                     packed_position: 0,
                     token,
+                    logprobs,
                 })
                 .into_iter()
                 .collect(),
@@ -1529,6 +1712,8 @@ impl<M: HybridModel> HybridEngine<M> {
             host,
             pairs,
             device_rows,
+            logprob_rows,
+            logprob_first,
             error,
             ..
         } = batch;
@@ -1539,6 +1724,10 @@ impl<M: HybridModel> HybridEngine<M> {
             return Err(error);
         }
         let vocab = self.description.vocab_size;
+        let logprob_rows = logprob_rows
+            .map(|rows| rows.flatten_all()?.to_vec1::<f32>())
+            .transpose()?;
+        let mut logprob_first = logprob_first.into_iter();
         // One host copy of the full rows then the device decisions, made with the fence or
         // here when no notifier ran.
         let host_len = host.as_ref().map_or(0, Tensor::elem_count);
@@ -1567,6 +1756,7 @@ impl<M: HybridModel> HybridEngine<M> {
             .zip(placement)
         {
             let hidden = hidden.next().flatten();
+            let first_logprobs = logprob_first.next().flatten();
             let n = sequence.outputs.len();
             let last = logits
                 .as_ref()
@@ -1610,8 +1800,17 @@ impl<M: HybridModel> HybridEngine<M> {
             let Some(request) = self.requests.get_mut(&id).filter(|r| !r.cancelled) else {
                 continue;
             };
-            let outcome =
-                rows.and_then(|rows| publish(request, sequence, &plan.tokens, reservation, rows));
+            let top = request.snapshot.sampling.options.logprobs;
+            let outcome = rows
+                .and_then(|rows| publish(request, sequence, &plan.tokens, reservation, rows))
+                .and_then(|mut commit| {
+                    if let (Some(top), Some(first), Some(values)) =
+                        (top, first_logprobs, &logprob_rows)
+                    {
+                        attach_logprobs(&mut commit, values, first, vocab, top)?;
+                    }
+                    Ok(commit)
+                });
             results.push(SequenceResult {
                 request: id,
                 outcome,

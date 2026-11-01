@@ -9,6 +9,7 @@
 - [Configuration](guide/configuration.md)
 - [Command line](guide/cli.md)
 - [HTTP API](guide/http-api.md)
+- [Grammars and structured output](guide/grammars.md)
 - [Prepacked weights](guide/quantization.md)
 - [Choosing a quantization](guide/choosing-quantization.md)
 - [Tuning](guide/tuning.md)

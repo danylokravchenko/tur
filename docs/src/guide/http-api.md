@@ -42,7 +42,10 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `presence_penalty`, `frequency_penalty` | number | none | OpenAI semantics over generated tokens |
 | `seed` | integer | 299792458 | Seed of the request's random stream; other requests in the batch don't affect it |
 | `tools` | array | none | `{type:"function",function:{name,description,parameters}}` |
-| `tool_choice` | `"auto"` | `"auto"` | Any other value is rejected |
+| `tool_choice` | `"auto"`, `"none"`, `"required"` or `{"type":"function","function":{"name":...}}` | `"auto"` | See [Structured output](#structured-output) |
+| `response_format` | `{"type":"text"}`, `{"type":"json_object"}`, `{"type":"json_schema","json_schema":{"schema":...}}` or `{"type":"grammar","syntax":...,"definition":...}` | text | See [Structured output](#structured-output) |
+| `logprobs` | bool | false | Return each generated token's log probability |
+| `top_logprobs` | integer, at most 20 | 0 | Also return this many likeliest tokens at each position; needs `logprobs` |
 | `thinking` (alias `enable_thinking`) | bool | template default | Passed to the chat template |
 | `reasoning_effort` | `low`, `medium`, `xhigh` | template default | Passed to the chat template |
 | `preserve_thinking` | bool | template default | Passed to the chat template |
@@ -89,15 +92,56 @@ For gpt-oss, which writes its reasoning on a separate Harmony channel, `message.
 
 When the model emits complete function calls, Tur parses them against each tool's parameter schema and returns them as `tool_calls` with no `content`. Tur never runs the tools itself.
 
+With `logprobs`, `choices[0].logprobs.content` lists a `token`, `logprob`, `bytes` and `top_logprobs` for every generated token except the end-of-turn token. The numbers describe the model's own distribution, before penalties, temperature, truncation and grammar masks, so `top_logprobs` can name a token that a grammar forbade. The list also covers reasoning and any text a stop sequence removed. Asking for log probabilities doesn't change which tokens a seed produces.
+
+### Structured output
+
+A grammar built from the request masks every token the output may not contain, so the result matches its format even at high temperature. [Grammars and structured output](grammars.md) has examples and advice. If `max_tokens` runs out first, the output is cut off and `finish_reason` is `length`.
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "Describe Ada Lovelace as JSON."}],
+    "response_format": {"type": "json_schema", "json_schema": {"name": "person", "schema": {
+      "type": "object",
+      "required": ["name", "born"],
+      "properties": {"name": {"type": "string"}, "born": {"type": "integer"}}
+    }}}
+  }'
+```
+
+`response_format` forces compact JSON in `content`: any object with `json_object`, or a match for the schema with `json_schema`. `grammar`, a Tur extension, forces text matching a definition whose `syntax` is `regex` or `lark`. The model isn't told about the format, so say what you want in a message too. An invalid schema or grammar answers 400. `response_format` can't be combined with `tools`, because the model could never reach them, unless `tool_choice` is `none`.
+
+`tool_choice` decides what happens to `tools`:
+
+| Value | Effect |
+| --- | --- |
+| `auto` | The template lists the tools and the model decides. Its text isn't constrained, but on Qwen and Gemma a grammar holds each call to its schema from the call's opening token. If a tool's schema can't be enforced, as below, calls run unconstrained instead of failing. gpt-oss calls have no such opening token, so they run unconstrained too, and malformed ones come back as text |
+| `none` | The tools are left out of the prompt |
+| `required` | The output is one or more calls to any of the tools. gpt-oss ends its turn after one call |
+| `{"type":"function","function":{"name":"f"}}` | The output is one call to `f` |
+
+Forced calls come back as `tool_calls` and match the tool's parameters: gpt-oss writes them as JSON, and the others in their own formats. On Qwen, a parameter whose `type` isn't `number`, `integer`, `boolean`, `object`, `array` or `null` is free text unless it has a string `enum`. On Gemma, the schema may use only `type`, `enum`, `properties`, `required`, `items` and annotations such as `description`, and any other keyword answers 400 so that nothing goes unenforced.
+
+Forced output can follow reasoning, whose text is unconstrained and counts toward `max_tokens`. gpt-oss reasons first unless `thinking` is `false`. Qwen and Gemma run with thinking off unless `thinking` is `true`. In every case the reasoning comes back in `reasoning_content`, apart from the answer. Allow generous `max_tokens` when reasoning is on.
+
+A mask can't make a model want what it allows. If a schema ends where the model meant to keep writing, it can pick the next legal token again and again, as Gemma E2B did with thinking on by filling an integer with digits until `max_tokens`. Keep schemas close to what you ask for in the prompt, and bound what can grow, with `maximum`, `maxLength` or `maxItems`.
+
+Tokens the grammar alone decides, such as JSON keys, are published without sampling and then run together as one pass, so key-heavy output is several times faster. They arrive in bursts. `logprobs` needs each position's logits, so it turns this off, and it also adds about 6% per token with one request and 25% with eight.
+
+Constrained requests are never drafted (see [Speculative decoding](../architecture/speculation.md)).
+
 ### Streaming
 
 With `"stream": true`, the response is `text/event-stream`:
 
 1. A chunk with `delta: {"role": "assistant"}`.
 2. Text chunks with `delta.content`, one per model pass at most. Reasoning a model separates arrives the same way in `delta.reasoning_content`.
-3. Tool-call chunks, if any.
-4. A final chunk with `finish_reason` and `usage`.
-5. `data: [DONE]`.
+3. With `logprobs`, one chunk holding all of them in `choices[0].logprobs`, because text fragments don't line up with tokens.
+4. Tool-call chunks, if any. A forced call sends only these, without its raw text in `delta.content`.
+5. A final chunk with `finish_reason` and `usage`.
+6. `data: [DONE]`.
 
 The server sends a keep-alive comment every 15 seconds. If generation fails mid-stream, it sends an error object as a data event, then `[DONE]`.
 
@@ -191,7 +235,7 @@ Errors use OpenAI's shape:
 
 | Status | `type` / `code` | Cause |
 | --- | --- | --- |
-| 400 | `invalid_request_error` | Empty messages, unknown role, invalid sampling values, unsupported `tool_choice`, undecodable or unsupported audio, or a request the engine rejects (`invalid_request`) |
+| 400 | `invalid_request_error` | Empty messages, unknown role, invalid sampling values, unsupported `tool_choice`, a schema, grammar or tool choice that can't be honored (a grammar failing during generation has the code `invalid_grammar`), undecodable or unsupported audio, or a request the engine rejects (`invalid_request`) |
 | 400 | `invalid_request_error` / `context_length_exceeded` | The prompt and `max_tokens` don't fit the context the server allows |
 | 404 | `invalid_request_error` | Unknown `model` |
 | 408 | `timeout_error` / `slow_client` | A streaming client stopped reading |

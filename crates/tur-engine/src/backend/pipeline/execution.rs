@@ -248,7 +248,7 @@ impl InferencePipeline {
                 stats.accepted += accepted as u64;
             }
             // Constrained requests never take the head's drafts; it runs for no other.
-            let drafts_from_head = self.pending.get(&id).is_some_and(|p| !p.constrained);
+            let drafts_from_head = self.pending.contains_key(&id) && !self.engine.constraining(id);
             if let (Some(hidden), Ok(commit)) = (&result.hidden, &result.outcome)
                 && commit.accepted_tokens > 0
                 && drafts_from_head

@@ -25,7 +25,11 @@ type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<T = ()> = Result<T, TestError>;
 
 use tur::{
-    backend::{pipeline::GenerationStats, tools::ToolCall},
+    backend::{
+        pipeline::{GenerationStats, TokenLogprob},
+        structured::StructuredOutput,
+        tools::ToolCall,
+    },
     server::{
         AppState, build_router,
         worker::{PipelineWorker, WorkerMsg},
@@ -69,6 +73,7 @@ fn mock_worker(response_text: &'static str) -> PipelineWorker {
                 tool_calls: vec![],
                 generated_text: response_text.to_string(),
                 reasoning_text: String::new(),
+                logprobs: Vec::new(),
             })));
         }
     });
@@ -102,6 +107,7 @@ fn mock_tool_call_worker(
                 tool_calls: vec![tc],
                 generated_text: String::new(),
                 reasoning_text: String::new(),
+                logprobs: Vec::new(),
             })));
         }
     });
@@ -469,5 +475,271 @@ async fn test_mixed_streaming_and_non_streaming_concurrent() -> TestResult {
 
     let ss = stream_resp??;
     assert_text_stream(ss, "mixed result").await?;
+    Ok(())
+}
+
+// ── /v1/chat/completions — structured output ─────────────────────────────────
+
+/// What the worker saw of a request: forced output, log-probability count and tool count.
+type Seen = (Option<StructuredOutput>, Option<usize>, usize);
+
+/// A router whose worker answers with `stats` and forwards each request's forced output and
+/// log-probability choice.
+fn structured_router(
+    stats: fn() -> GenerationStats,
+) -> (axum::Router, mpsc::UnboundedReceiver<Seen>) {
+    let (tx, mut rx) = mpsc::channel::<WorkerMsg>(8);
+    let (seen_tx, seen_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            drop(seen_tx.send((
+                msg.request.structured.clone(),
+                msg.request.sampling.logprobs,
+                msg.request.tools.len(),
+            )));
+            let answer = stats();
+            if let Some(token_tx) = &msg.token_tx {
+                let text = tur::server::worker::TextDelta::Content(answer.generated_text.clone());
+                drop(token_tx.send(text).await);
+            }
+            drop(msg.token_tx);
+            drop(msg.result_tx.send(Ok(answer)));
+        }
+    });
+    let router = build_router(AppState {
+        status: tur::server::ServerStatus::shared(),
+        workers: HashMap::from([("m".to_string(), PipelineWorker::from_sender(tx))]),
+        transcribers: HashMap::new(),
+        default_transcriber: None,
+        default_model: "m".to_string(),
+    });
+    (router, seen_rx)
+}
+
+fn plain_stats() -> GenerationStats {
+    GenerationStats {
+        finish_reason: "stop",
+        generated_tokens: 1,
+        prompt_tokens: 0,
+        cached_tokens: 0,
+        elapsed: Duration::from_millis(1),
+        first_token: Duration::from_millis(1),
+        preemptions: 0,
+        draft_tokens: 0,
+        accepted_draft_tokens: 0,
+        tool_calls: vec![],
+        generated_text: "{}".to_string(),
+        reasoning_text: String::new(),
+        logprobs: Vec::new(),
+    }
+}
+
+fn forced_call_stats() -> GenerationStats {
+    GenerationStats {
+        tool_calls: vec![ToolCall {
+            name: "f".to_string(),
+            arguments: json!({}),
+        }],
+        generated_text: "<function=f></function>".to_string(),
+        ..plain_stats()
+    }
+}
+
+fn logprob_stats() -> GenerationStats {
+    let token = |token: &str, logprob, top| TokenLogprob {
+        token: token.to_string(),
+        bytes: token.as_bytes().to_vec(),
+        logprob,
+        top,
+    };
+    GenerationStats {
+        logprobs: vec![token("{", -0.5, vec![token("{", -0.5, vec![])])],
+        ..plain_stats()
+    }
+}
+
+fn chat_body(extra: &Value) -> Value {
+    let mut body = json!({"messages": [{"role": "user", "content": "x"}]});
+    if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+        body.extend(extra.clone());
+    }
+    body
+}
+
+fn tool(name: &str) -> Value {
+    json!({"type": "function", "function": {"name": name}})
+}
+
+#[tokio::test]
+async fn test_response_format_and_tool_choice_reach_the_worker_as_forced_output() -> TestResult {
+    let schema = json!({"type": "object"});
+    for (extra, forced, tools) in [
+        (json!({"response_format": {"type": "text"}}), None, 0),
+        (
+            json!({"response_format": {"type": "json_object"}}),
+            Some(StructuredOutput::JsonObject),
+            0,
+        ),
+        (
+            json!({"response_format": {"type": "json_schema",
+                "json_schema": {"name": "n", "schema": schema}}}),
+            Some(StructuredOutput::JsonSchema(schema.clone())),
+            0,
+        ),
+        (
+            json!({"tools": [tool("f")], "tool_choice": "auto"}),
+            None,
+            1,
+        ),
+        (
+            json!({"response_format": {"type": "grammar", "syntax": "regex", "definition": "a+"}}),
+            Some(StructuredOutput::Regex("a+".to_string())),
+            0,
+        ),
+        (
+            json!({"response_format": {"type": "grammar", "syntax": "lark",
+                "definition": "start: \"a\""}}),
+            Some(StructuredOutput::Lark("start: \"a\"".to_string())),
+            0,
+        ),
+        // `none` hides the tools from the template, so a response format may join it.
+        (
+            json!({"tools": [tool("f")], "tool_choice": "none",
+                "response_format": {"type": "json_object"}}),
+            Some(StructuredOutput::JsonObject),
+            0,
+        ),
+        (
+            json!({"tools": [tool("f")], "tool_choice": "required"}),
+            Some(StructuredOutput::Tool(None)),
+            1,
+        ),
+        (
+            json!({"tools": [tool("f"), tool("g")],
+                "tool_choice": {"type": "function", "function": {"name": "g"}}}),
+            Some(StructuredOutput::Tool(Some("g".to_string()))),
+            2,
+        ),
+    ] {
+        let (router, mut seen) = structured_router(plain_stats);
+        let request = json_request("/v1/chat/completions", "POST", &chat_body(&extra))?;
+        let response = router.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::OK, "{extra}");
+        let (structured, logprobs, offered) = seen.recv().await.ok_or("no request")?;
+        assert_eq!(structured, forced, "{extra}");
+        assert_eq!(logprobs, None, "{extra}");
+        assert_eq!(offered, tools, "{extra}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_unsatisfiable_structured_requests_return_400() -> TestResult {
+    for extra in [
+        json!({"tool_choice": "required"}),
+        json!({"tool_choice": "sometimes", "tools": [tool("f")]}),
+        json!({"tool_choice": {"type": "function", "function": {"name": "g"}},
+            "tools": [tool("f")]}),
+        json!({"tool_choice": {"type": "function"}, "tools": [tool("f")]}),
+        json!({"response_format": {"type": "json_object"}, "tools": [tool("f")]}),
+        json!({"response_format": {"type": "grammar", "syntax": "lark", "definition": "x"},
+            "tools": [tool("f")]}),
+        json!({"top_logprobs": 2}),
+        json!({"logprobs": true, "top_logprobs": 21}),
+    ] {
+        let (router, mut seen) = structured_router(plain_stats);
+        let request = json_request("/v1/chat/completions", "POST", &chat_body(&extra))?;
+        let response = router.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{extra}");
+        assert!(seen.try_recv().is_err(), "{extra}");
+    }
+    Ok(())
+}
+
+async fn stream_events(router: axum::Router, extra: &Value) -> TestResult<Vec<Value>> {
+    let mut body = chat_body(extra);
+    body["stream"] = json!(true);
+    let response = router
+        .oneshot(json_request("/v1/chat/completions", "POST", &body)?)
+        .await?;
+    let bytes = response.into_body().collect().await?.to_bytes();
+    Ok(String::from_utf8(bytes.to_vec())?
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?)
+}
+
+#[tokio::test]
+async fn test_forced_calls_stream_only_the_parsed_call() -> TestResult {
+    let extra = json!({"tools": [tool("f")], "tool_choice": "required"});
+    let (router, _seen) = structured_router(forced_call_stats);
+    let events = stream_events(router, &extra).await?;
+    assert!(
+        events
+            .iter()
+            .all(|event| event["choices"][0]["delta"]["content"].is_null()),
+        "{events:?}"
+    );
+    let calls: Vec<&Value> = events
+        .iter()
+        .filter(|event| !event["choices"][0]["delta"]["tool_calls"].is_null())
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+        "f"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_logprobs_follow_the_openai_shape_when_blocking_and_streaming() -> TestResult {
+    let extra = json!({"logprobs": true, "top_logprobs": 1});
+    let expected = json!({"content": [{
+        "token": "{", "logprob": -0.5, "bytes": [123],
+        "top_logprobs": [{"token": "{", "logprob": -0.5, "bytes": [123]}],
+    }]});
+    let (router, mut seen) = structured_router(logprob_stats);
+    let request = json_request("/v1/chat/completions", "POST", &chat_body(&extra))?;
+    let response = router.clone().oneshot(request).await?;
+    let json = body_json(response.into_body()).await?;
+    assert_eq!(json["choices"][0]["logprobs"], expected);
+    assert_eq!(seen.recv().await.ok_or("no request")?.1, Some(1));
+
+    let events = stream_events(router, &extra).await?;
+    let carrying: Vec<&Value> = events
+        .iter()
+        .map(|event| &event["choices"][0]["logprobs"])
+        .filter(|logprobs| !logprobs.is_null())
+        .collect();
+    assert_eq!(carrying, [&expected]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_a_grammar_failing_during_generation_is_the_clients_error() -> TestResult {
+    let (tx, mut rx) = mpsc::channel::<WorkerMsg>(8);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let error = tur::TurError::Guidance("too many expressions".to_string());
+            drop(msg.result_tx.send(Err(error)));
+        }
+    });
+    let router = build_router(AppState {
+        status: tur::server::ServerStatus::shared(),
+        workers: HashMap::from([("m".to_string(), PipelineWorker::from_sender(tx))]),
+        transcribers: HashMap::new(),
+        default_transcriber: None,
+        default_model: "m".to_string(),
+    });
+    let extra =
+        json!({"response_format": {"type": "grammar", "syntax": "regex", "definition": "a"}});
+    let request = json_request("/v1/chat/completions", "POST", &chat_body(&extra))?;
+    let response = router.oneshot(request).await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response.into_body()).await?;
+    assert_eq!(json["error"]["code"], "invalid_grammar");
     Ok(())
 }

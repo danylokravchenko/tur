@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{Result, TurError};
-use llguidance::{Constraint, ParserFactory as LlgParserFactory};
+use llguidance::{Constraint, ParserFactory as LlgParserFactory, toktrie::TokTrie};
 use tokenizers::Tokenizer;
 use toktrie_hf_tokenizers::ByteTokenizer;
 use tracing::warn;
@@ -18,9 +18,13 @@ pub enum GrammarMask {
 }
 pub use llguidance::api::TopLevelGrammar;
 
+/// Build the parser factory over `tokenizer`. `eos_tokens` are the checkpoint's ends of
+/// generation, which a finished grammar allows next; llguidance would otherwise guess one
+/// from token names, and a mask would hide the token the model actually ends its turn with.
 pub fn build_llg_factory(
     tokenizer: Tokenizer,
     vocab_size: Option<usize>,
+    eos_tokens: &[u32],
 ) -> Result<Arc<ParserFactory>> {
     let tokenizer_vocab = tokenizer.get_vocab_size(true);
     let target_vocab = vocab_size.map(|v| {
@@ -35,12 +39,26 @@ pub fn build_llg_factory(
             v
         }
     });
-    let env = ByteTokenizer::from_tokenizer(tokenizer)
-        .map_err(|e| TurError::Guidance(e.to_string()))?
+    let mut bytes =
+        ByteTokenizer::from_tokenizer(tokenizer).map_err(|e| TurError::Guidance(e.to_string()))?;
+    if !eos_tokens.is_empty() {
+        bytes.set_eos_tokens(eos_tokens);
+    }
+    let env = bytes
         .into_tok_env(target_vocab)
         .map_err(|e| TurError::Guidance(e.to_string()))?;
     let factory = ParserFactory::new_simple(&env).map_err(|e| TurError::Guidance(e.to_string()))?;
     Ok(Arc::new(factory))
+}
+
+/// The exact bytes of `token`, without the marker llguidance puts before special tokens.
+/// Decoding one token as text would lose bytes of a character split across tokens.
+pub(crate) fn token_bytes(factory: &ParserFactory, token: u32) -> Vec<u8> {
+    let bytes = factory.tok_env().tok_trie().token(token);
+    bytes
+        .strip_prefix(&[TokTrie::SPECIAL_TOKEN_MARKER])
+        .unwrap_or(bytes)
+        .to_vec()
 }
 
 /// Per-request grammar constraint. Activated before prefill, dropped on completion.
@@ -52,6 +70,11 @@ pub struct GuidanceControl {
     /// Set when the grammar reaches an accepting terminal state so we stop
     /// calling `compute_mask()` (which panics if called after stop).
     stopped: bool,
+    /// A dormant grammar and the token that wakes it. The grammar applies only between that
+    /// token and its own end, then sleeps again, so the text around it runs unconstrained.
+    armed: Option<(u32, Constraint)>,
+    /// The mask for the next token, which [`Self::mask`] would otherwise recompute.
+    cached: Option<GrammarMask>,
 }
 
 impl GuidanceControl {
@@ -63,7 +86,8 @@ impl GuidanceControl {
                 "grammar/model vocabulary mismatch".into(),
             ));
         }
-        if let Some(constraint) = &self.constraint {
+        let armed = self.armed.as_ref().map(|(_, constraint)| constraint);
+        for constraint in self.constraint.iter().chain(armed) {
             let caps = &constraint.parser.inference_caps;
             if caps.ff_tokens || caps.conditional_ff_tokens || caps.backtrack || caps.fork {
                 return Err(TurError::Guidance(
@@ -81,6 +105,11 @@ impl GuidanceControl {
             factory: Arc::clone(&self.factory),
             constraint: self.constraint.as_ref().map(Constraint::deep_clone),
             stopped: self.stopped,
+            armed: self
+                .armed
+                .as_ref()
+                .map(|(token, constraint)| (*token, constraint.deep_clone())),
+            cached: self.cached.clone(),
         }
     }
 
@@ -89,7 +118,50 @@ impl GuidanceControl {
             factory,
             constraint: None,
             stopped: false,
+            armed: None,
+            cached: None,
         }
+    }
+
+    /// Compile `grammar` now and leave it dormant until `trigger` is committed. Each time it
+    /// wakes it starts over, and the token that woke it isn't part of its language.
+    pub fn arm(&mut self, grammar: TopLevelGrammar, trigger: u32) -> Result<()> {
+        let parser = self
+            .factory
+            .create_parser(grammar)
+            .map_err(|e| TurError::Guidance(e.to_string()))?;
+        let mut constraint = Constraint::new(parser);
+        constraint.start_without_prompt();
+        self.armed = Some((trigger, constraint));
+        self.constraint = None;
+        self.cached = None;
+        self.stopped = false;
+        Ok(())
+    }
+
+    /// Whether an armed grammar is waiting for its trigger.
+    pub fn is_dormant(&self) -> bool {
+        self.armed.is_some() && self.constraint.is_none()
+    }
+
+    /// Return to dormancy, undoing a wake-up whose pass failed.
+    pub fn sleep(&mut self) {
+        if self.armed.is_some() {
+            self.constraint = None;
+            self.cached = None;
+        }
+    }
+
+    /// The grammar reached its end: an armed one sleeps, any other stops the request.
+    /// Returns whether the request stops.
+    fn ended(&mut self) -> bool {
+        self.cached = None;
+        if self.armed.is_some() {
+            self.constraint = None;
+            return false;
+        }
+        self.stopped = true;
+        true
     }
 
     /// Create and start a new constraint for this grammar. Call once before prefill.
@@ -102,12 +174,15 @@ impl GuidanceControl {
         constraint.start_without_prompt();
         self.constraint = Some(constraint);
         self.stopped = false;
+        self.cached = None;
         Ok(())
     }
 
     /// Drop the active constraint. Call after generation completes or on error.
     pub fn deactivate(&mut self) {
         self.constraint = None;
+        self.armed = None;
+        self.cached = None;
         self.stopped = false;
     }
 
@@ -133,8 +208,7 @@ impl GuidanceControl {
             .map_err(|e| TurError::Guidance(e.to_string()))?;
 
         if step.is_stop() {
-            self.stopped = true;
-            return Ok(true);
+            return Ok(self.ended());
         }
 
         if let Some(mask) = &step.sample_mask {
@@ -163,23 +237,49 @@ impl GuidanceControl {
         if self.stopped {
             return Ok(Some(GrammarMask::Stop));
         }
+        if self.cached.is_some() {
+            return Ok(self.cached.clone());
+        }
         let Some(constraint) = self.constraint.as_mut() else {
             return Ok(None);
         };
         // A stop seen by an earlier mask must not be computed again.
-        if constraint.step_result().is_stop() {
-            return Ok(Some(GrammarMask::Stop));
+        let step = if constraint.step_result().is_stop() {
+            None
+        } else {
+            let step = constraint
+                .compute_mask()
+                .map_err(|e| TurError::Guidance(e.to_string()))?;
+            (!step.is_stop()).then(|| {
+                step.sample_mask
+                    .as_ref()
+                    .map(|mask| GrammarMask::Allowed(mask.as_slice().to_vec()))
+            })
+        };
+        let Some(mask) = step else {
+            return Ok(self.ended().then_some(GrammarMask::Stop));
+        };
+        self.cached.clone_from(&mask);
+        Ok(mask)
+    }
+
+    /// The only token the grammar allows next, if there is exactly one. Sampling it would
+    /// return it with probability 1, whatever the logits, penalties and temperature.
+    pub fn forced(&mut self) -> Result<Option<u32>> {
+        let Some(GrammarMask::Allowed(bits)) = self.mask()? else {
+            return Ok(None);
+        };
+        let mut set = bits.iter().enumerate().filter(|(_, word)| **word != 0);
+        let Some((index, word)) = set.next() else {
+            return Ok(None);
+        };
+        if word.count_ones() != 1 || set.next().is_some() {
+            return Ok(None);
         }
-        let step = constraint
-            .compute_mask()
-            .map_err(|e| TurError::Guidance(e.to_string()))?;
-        if step.is_stop() {
-            return Ok(Some(GrammarMask::Stop));
-        }
-        Ok(step
-            .sample_mask
-            .as_ref()
-            .map(|mask| GrammarMask::Allowed(mask.as_slice().to_vec())))
+        let token = index * 32 + word.trailing_zeros() as usize;
+        u32::try_from(token)
+            .map(Some)
+            .map_err(|_| TurError::Guidance("token id exceeds u32".into()))
     }
 
     /// Record that the grammar stopped before sampling, as [`Self::apply_mask`] does.
@@ -193,15 +293,18 @@ impl GuidanceControl {
         if self.stopped {
             return Ok(true);
         }
+        self.cached = None;
         let Some(constraint) = self.constraint.as_mut() else {
+            if let Some((trigger, armed)) = &self.armed
+                && *trigger == token
+            {
+                self.constraint = Some(armed.deep_clone());
+            }
             return Ok(false);
         };
         let result = constraint
             .commit_token(Some(token))
             .map_err(|e| TurError::Guidance(e.to_string()))?;
-        if result.stop {
-            self.stopped = true;
-        }
-        Ok(result.stop)
+        Ok(result.stop && self.ended())
     }
 }

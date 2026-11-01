@@ -1,18 +1,12 @@
 # Serving technique gaps
 
-Created: 2026-11-01. Status: research backlog; nothing here has been built or measured in Tur.
+Created: 2026-11-01. Status: research backlog; what remains here hasn't been built or measured in Tur.
 
 This page compares Tur with vLLM, llama.cpp, SGLang, oMLX, BaseRT and recent papers, and lists techniques Tur lacks. Tur's existing work (chunked prefill, prefix snapshots, device sampling, exact speculation, the expert cache) is left out. Every number comes from its source, on that source's hardware and models, and doesn't predict Tur's results. The order is a judgment of value against effort.
 
 ## Build first
 
 These keep output exact and cost little to try.
-
-### Structured output over HTTP
-
-The engine supports llguidance grammars, but the server always passes `grammar: None` (`crates/tur/src/server/routes/chat.rs`). It accepts only `tool_choice=auto`, and the code has no `json_schema` or `logprobs`. Exposing `response_format`, required and named tool choice, and `logprobs` closes the largest gap with other OpenAI-compatible servers.
-
-Two techniques make this better than a plain mask. llama.cpp's [lazy grammars](https://docs.rs/llama-cpp-4/0.7.0/llama_cpp_4/chat/) stay dormant until a tool-call marker appears, so reasoning runs unconstrained. [XGrammar](https://arxiv.org/pdf/2411.15100) and [llguidance](https://github.com/guidance-ai/llguidance) also skip sampling when the grammar leaves one possible token. Such a token has probability 1 under the mask, so the shortcut stays exact and a JSON key can run as one multi-token pass. Tur currently rejects grammars that ask for this (`crates/tur-engine/src/backend/guidance.rs`), and it would need a rule for advancing the random stream so that same-seed results stay identical.
 
 ### Request ordering beyond arrival order
 

@@ -17,6 +17,16 @@ The random numbers come from a counter-based generator keyed by the request's se
 
 A request with a `grammar` (an llguidance `TopLevelGrammar`) gets a mask of allowed tokens before every sample, and its grammar state advances after it. The mask is applied on the GPU, so constrained requests sample in the same pass as unconstrained ones. A request ends when its grammar is complete. Constrained requests never draft (see [Speculative decoding](speculation.md)).
 
+The server compiles `response_format` and forced `tool_choice` into such grammars, one form per model family, because each writes tool calls differently. Special tokens appear in the grammar by id, since a grammar can match them only as tokens. A finished grammar allows the checkpoint's own end-of-generation tokens, so a mask can't hide the token a model ends its turn with.
+
+When a mask allows exactly one token, sampling would return it with probability 1, so Tur publishes it without a pass. Forced tokens then run together as the request's next inputs, the way a prompt runs, and the scheduler treats the run as a decode so it doesn't wait for prefill budget. Each forced token consumes one random draw, as sampling it would, so same-seed outputs stay identical.
+
+Under `tool_choice=auto` a grammar is lazy. It sleeps, costing nothing and leaving drafting on, until the model commits the tool-call marker, holds the call to its schema, and sleeps again. If the marker lands inside a drafted pass, the pass's later outputs are dropped as if their draft had been rejected, because their rows weren't masked.
+
+## Log probabilities
+
+The GPU returns only the chosen token, so a request that asks for log probabilities also copies its model logits to the host, one row per output. Sampling still happens where it would have, on the same row, and the copy is read only after that. The request's tokens therefore match a request that didn't ask.
+
 ## When the CPU samples
 
 The CPU sampler handles rows when device sampling is off (`PipelineConfig::device_sampling = false`), when the model runs on the CPU reference, for speculative requests and grammar requests with several output rows, and for rows the GPU couldn't settle. All such rows are gathered before the pass finishes and copied back once.
@@ -27,4 +37,11 @@ The CPU sampler handles rows when device sampling is off (`PipelineConfig::devic
 - There is no sort. Rejection sampling against a rising pivot keeps the kernel to a few passes over the row.
 - Each request has its own random stream, independent of batch order. Device sampling passes chi-square tests against the exact truncated distributions, and repeated runs on Metal produce the same tokens.
 - Grammar masks are applied on the GPU, so constrained passes cost the same as unconstrained ones.
+- JSON grammars allow no free whitespace, which a model can otherwise emit until it runs out of tokens.
+- Forced tokens run in one pass. On JSON with long keys, Qwen3.5-0.8B on an M1 reached 155, 340 and 424 tok/s with 1, 4 and 8 requests, against 52, 150 and 237 sampling each one. With few forced tokens throughput is level, but passes holding runs are longer: at 8 requests the p95 token gap rose from 27 to 47 ms. Whole-document clients care about completion, so forcing stays on.
+- Forced runs schedule as decodes. As prefill, one chunk per pass, they cost 5% of throughput at 8 requests.
+- Reasoning is optional before forced output and off by default on Qwen and Gemma, whose reasoning Tur splits from the answer only for structured requests. A response to any other request is unchanged.
+- Lazy grammars are best effort. A schema they can't enforce falls back to unconstrained calls, because the request may never make a call.
+- Log probabilities cost about 2 ms per token on a 248K vocabulary: at 1, 4 and 8 requests throughput fell 6%, 22% and 25%, with little difference for `top_logprobs`.
+- Log probabilities describe the model's distribution before penalties, temperature, truncation and masks, because that is the same whichever sampler runs.
 - The two paths sample the same distribution, but the same random number can pick different tokens, because the GPU walks tokens in a fixed permuted order. Random numbers have 24 bits, so a token with less than about 2⁻²⁴ of the remaining probability is effectively never drawn.

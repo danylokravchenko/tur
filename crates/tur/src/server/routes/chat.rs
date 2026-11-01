@@ -17,7 +17,8 @@ use crate::audio::Audio;
 use crate::{
     backend::{
         chat_template::{ChatMessage, Content, ContentPart, RenderOptions, Role, ToolCall},
-        pipeline::{GenerationRequest, GenerationStats},
+        pipeline::{GenerationRequest, GenerationStats, TokenLogprob},
+        structured::StructuredOutput,
         tools::ToolDefinition,
     },
     hybrid::SamplingOptions,
@@ -26,9 +27,10 @@ use crate::{
         types::{
             ApiErrorBody, ApiErrorResponse, AssistantFunction, AssistantToolCall, ChatChoice,
             ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
-            ChatResponseMessage, ChunkChoice, ContentPart as Part, DeltaFunction, DeltaMessage,
-            DeltaToolCall, MessageContent, PromptTokensDetails, ResponseFunction, ResponseToolCall,
-            StopSequences, Usage,
+            ChatResponseMessage, ChoiceLogprobs, ChunkChoice, ContentPart as Part, DeltaFunction,
+            DeltaMessage, DeltaToolCall, GrammarSyntax, LogprobEntry, MessageContent,
+            PromptTokensDetails, ResponseFormat, ResponseFunction, ResponseToolCall, StopSequences,
+            TopLogprob, Usage,
         },
         worker::{TextDelta, WorkerMsg},
     },
@@ -62,6 +64,13 @@ pub(crate) fn execution_error(error: &crate::TurError) -> (StatusCode, ApiErrorR
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "context_length_exceeded",
+        ),
+        // Every grammar comes from the request, and one can compile yet exceed the parser's
+        // limits partway through generation.
+        TurError::Guidance(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_grammar",
         ),
         TurError::InvalidExecution(_) => (
             StatusCode::BAD_REQUEST,
@@ -210,6 +219,84 @@ fn to_internal_tools(tools: &[crate::server::types::OpenAITool]) -> Vec<ToolDefi
         .collect()
 }
 
+/// What a request's `response_format` and `tool_choice` force, or why they can't be honored.
+/// `tool_choice=none` also clears the tools, so the model isn't told about them.
+fn structured_output(req: &mut ChatCompletionRequest) -> Result<Option<StructuredOutput>, String> {
+    let tool = match req.tool_choice.as_ref() {
+        None => None,
+        Some(serde_json::Value::String(mode)) => match mode.as_str() {
+            "auto" => None,
+            "none" => {
+                req.tools.clear();
+                None
+            }
+            "required" if req.tools.is_empty() => {
+                return Err("tool_choice=required needs at least one tool".into());
+            }
+            "required" => Some(StructuredOutput::Tool(None)),
+            other => return Err(format!("unsupported tool_choice '{other}'")),
+        },
+        Some(choice) => {
+            let name = choice["function"]["name"]
+                .as_str()
+                .filter(|_| choice["type"] == "function")
+                .ok_or("tool_choice must be a mode or name a function")?;
+            if !req.tools.iter().any(|tool| tool.function.name == name) {
+                return Err(format!("tool_choice names unknown tool '{name}'"));
+            }
+            Some(StructuredOutput::Tool(Some(name.to_owned())))
+        }
+    };
+    let answer = match req.response_format.take() {
+        None | Some(ResponseFormat::Text) => None,
+        Some(ResponseFormat::JsonObject) => Some(StructuredOutput::JsonObject),
+        Some(ResponseFormat::JsonSchema { json_schema }) => {
+            Some(StructuredOutput::JsonSchema(json_schema.schema))
+        }
+        Some(ResponseFormat::Grammar { syntax, definition }) => Some(match syntax {
+            GrammarSyntax::Regex => StructuredOutput::Regex(definition),
+            GrammarSyntax::Lark => StructuredOutput::Lark(definition),
+        }),
+    };
+    // A forced answer leaves a model no way to reach a tool it was told about.
+    if answer.is_some() && !req.tools.is_empty() {
+        return Err("response_format can't be combined with tools; set tool_choice to none".into());
+    }
+    Ok(tool.or(answer))
+}
+
+/// The alternatives count of a request's log probabilities.
+fn logprob_count(req: &ChatCompletionRequest) -> Result<Option<usize>, &'static str> {
+    match (req.logprobs, req.top_logprobs) {
+        (false, None) => Ok(None),
+        (false, Some(_)) => Err("top_logprobs needs logprobs"),
+        (true, Some(count)) if count > 20 => Err("top_logprobs must be at most 20"),
+        (true, count) => Ok(Some(count.unwrap_or(0))),
+    }
+}
+
+fn choice_logprobs(logprobs: &[TokenLogprob]) -> Option<ChoiceLogprobs> {
+    (!logprobs.is_empty()).then(|| ChoiceLogprobs {
+        content: logprobs
+            .iter()
+            .map(|entry| LogprobEntry {
+                token: entry.token.clone(),
+                logprob: entry.logprob,
+                bytes: entry.bytes.clone(),
+                top_logprobs: entry
+                    .top
+                    .iter()
+                    .map(|top| TopLogprob {
+                        token: top.token.clone(),
+                        logprob: top.logprob,
+                        bytes: top.bytes.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    })
+}
+
 pub async fn chat_completions(
     State(state): State<AppState>,
     Json(mut req): Json<ChatCompletionRequest>,
@@ -262,19 +349,23 @@ pub async fn chat_completions(
                 .into_response();
         }
     };
-    if req
-        .tool_choice
-        .as_ref()
-        .is_some_and(|choice| choice != "auto")
-    {
-        return (
+    let bad_request = |message: String| {
+        (
             StatusCode::BAD_REQUEST,
-            Json(ApiErrorResponse::bad_request(
-                "only tool_choice=auto is supported",
-            )),
+            Json(ApiErrorResponse::bad_request(message)),
         )
-            .into_response();
-    }
+            .into_response()
+    };
+    let structured = match structured_output(&mut req) {
+        Ok(structured) => structured,
+        Err(message) => return bad_request(message),
+    };
+    let logprobs = match logprob_count(&req) {
+        Ok(logprobs) => logprobs,
+        Err(message) => return bad_request(message.to_owned()),
+    };
+    // A forced call has no answer: its raw text must not stream as `content`.
+    let forced_call = matches!(structured, Some(StructuredOutput::Tool(_)));
     if req.max_tokens == Some(0)
         || req.temperature.is_some_and(|v| !v.is_finite() || v < 0.0)
         || req
@@ -324,12 +415,14 @@ pub async fn chat_completions(
                 repetition_penalty: req.repetition_penalty,
                 presence_penalty: req.presence_penalty,
                 frequency_penalty: req.frequency_penalty,
+                logprobs,
             },
             seed: req.seed.unwrap_or(299_792_458),
             timeout: None,
             submitted_at: None,
             cache_salt: req.cache_salt,
             grammar: None,
+            structured,
             encoded_audio: Vec::new(),
             render: RenderOptions {
                 add_generation_prompt: true,
@@ -348,7 +441,9 @@ pub async fn chat_completions(
     }
 
     match token_rx {
-        Some(token_rx) => stream_response(model_id, token_rx, result_rx).into_response(),
+        Some(token_rx) => {
+            stream_response(model_id, token_rx, result_rx, forced_call).into_response()
+        }
         None => blocking_response(model_id, result_rx).await.into_response(),
     }
 }
@@ -427,6 +522,7 @@ async fn blocking_response(
                     })
                     .collect(),
             },
+            logprobs: choice_logprobs(&stats.logprobs),
             finish_reason,
         }],
         usage: Usage {
@@ -453,6 +549,7 @@ fn delta_chunk(id: &str, created: u64, model: &str, delta: DeltaMessage) -> Chat
         choices: vec![ChunkChoice {
             index: 0,
             delta,
+            logprobs: None,
             finish_reason: None,
         }],
         usage: None,
@@ -463,6 +560,7 @@ fn stream_response(
     model_id: String,
     mut token_rx: mpsc::Receiver<TextDelta>,
     result_rx: oneshot::Receiver<crate::Result<GenerationStats>>,
+    forced_call: bool,
 ) -> Response {
     let id = new_completion_id();
     let created = unix_now();
@@ -494,6 +592,7 @@ fn stream_response(
         let (mut streamed, mut streamed_reasoning) = (String::new(), String::new());
         while let Some(text) = token_rx.recv().await {
             let piece = match text {
+                TextDelta::Content(_) if forced_call => continue,
                 TextDelta::Content(text) => {
                     streamed.push_str(&text);
                     delta(text)
@@ -531,10 +630,29 @@ fn stream_response(
                 Err(e) => warn!("chunk serialisation error: {e}"),
             }
         }
-        if let Some(rest) = stats.generated_text.strip_prefix(streamed.as_str())
+        if !forced_call
+            && let Some(rest) = stats.generated_text.strip_prefix(streamed.as_str())
             && !rest.is_empty()
         {
             match serde_json::to_string(&delta(rest.to_owned())) {
+                Ok(data) => yield Ok(Event::default().data(data)),
+                Err(e) => warn!("chunk serialisation error: {e}"),
+            }
+        }
+
+        // Log probabilities don't line up with text fragments, which can hold several tokens
+        // or part of one, so they all arrive together.
+        if let Some(logprobs) = choice_logprobs(&stats.logprobs) {
+            let mut chunk = delta_chunk(&id, created, &model_id, DeltaMessage {
+                role: None,
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![],
+            });
+            if let Some(choice) = chunk.choices.first_mut() {
+                choice.logprobs = Some(logprobs);
+            }
+            match serde_json::to_string(&chunk) {
                 Ok(data) => yield Ok(Event::default().data(data)),
                 Err(e) => warn!("chunk serialisation error: {e}"),
             }
@@ -575,6 +693,7 @@ fn stream_response(
             choices: vec![ChunkChoice {
                 index: 0,
                 delta: DeltaMessage { role: None, content: None, reasoning_content: None, tool_calls: vec![] },
+                logprobs: None,
                 finish_reason: Some(finish_reason),
             }],
             usage: Some(Usage {
