@@ -24,15 +24,15 @@ No learned drafter exists for Qwen, and the MTP head turns prefix reuse off. A t
 
 Token Recycling's report of about 2× comes from greedy decoding with a draft tree. Tur's recurrent state favors a single chain, and device sampling returns only the chosen token, so collecting candidates has its own cost. Replaying recorded token traces offline can bound the acceptance rate before any kernel work.
 
-### Reacting to memory pressure while running
-
-The spare-memory check runs only at load, and serving four concurrent requests on a 5.9 GiB plan swapped out 251 MiB. The server already samples system memory every 10 seconds, so it could use that reading to evict snapshots and lower `max_running` before macOS swaps.
-
 ### Keeping state across tool calls
 
 [InferCept](https://arxiv.org/abs/2402.01869v2) reports that recomputing context after external calls takes 37 to 40% of forward time, and [Tokencake](https://arxiv.org/abs/2510.18586v1) targets the same idle state. Tur already keeps a zero-copy snapshot at the end of each request, which removes most of that cost until eviction takes it. A response ending in `finish_reason=tool_calls` is a strong sign that the conversation will return, so eviction could protect that snapshot for a bounded time.
 
 ## Measure before committing
+
+### Smaller passes under memory pressure
+
+Evicting snapshots and lowering `max_running` under pressure were rejected because neither returns memory to macOS (see [Rejected experiments](../design/rejected.md)). Scratch is the part that can shrink: Candle frees idle buffers at each sync, and gpt-oss-20b plans up to 1.28 GB of it, the same at one request or four. Shorter prefill chunks while spare memory is low might lower that peak, at the cost of the slower prefill measured in [Expert cache](../architecture/expert-cache.md). The worker only reads allocations after a pass, so measuring this first needs a reading of the peak within one.
 
 ### Layered prefill for MoE models
 

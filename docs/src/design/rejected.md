@@ -45,6 +45,7 @@ git show 99b073e:<path> > change.patch
 | Reading experts ahead by two or three layers | On gpt-oss-20b with a 1 GiB cache, 160 tokens took 52.5 s and 54.3 s against 51.5 s at one layer, because they read 9% and 13% more bytes for almost no further used experts | none |
 | Serving expert reads through the page cache | On gpt-oss-20b with a 1 GiB cache, 160 tokens took 53 to 55 s against 56 s with `F_NOCACHE`, and 51.5 to 52.9 s against 52.2 to 52.4 s with read-ahead also off | none |
 | Skipping experts with little routing weight | On gpt-oss-20b at floors of 0.1 and 0.2, KL from the exact model was 0.14 to 0.30 nats and top-token agreement 81 to 91%. Decode gained nothing at 0.1 and 8% at 0.2, though prefetch didn't yet honor the floor | none |
+| Evicting snapshots and lowering `max_running` when spare memory runs low | Not built: neither returns memory to macOS. The state pool is zero-filled at startup, so an idle 0.8B server already has a 2,007 MB footprint against 2,005 MB of device allocations, and evicted pages only rejoin the pool's free list. A burst of four requests added 13 MB of allocations after its passes, and gpt-oss-20b plans 1.28 GB of scratch at one request or four. The running limit decides the pool's size at startup, and throttling afterwards would only cost throughput and prefix hits | none |
 
 ## Worth retrying on other hardware
 
