@@ -11,7 +11,9 @@
 //! calls when no unfenced device work can reference them. Reclaiming bumps the id's
 //! generation, so an id captured before reuse no longer resolves.
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, Shape, Tensor};
+#[cfg(feature = "metal")]
+use candle_core::{Storage, metal_backend::MetalStorage};
 use parking_lot::Mutex;
 use std::sync::{
     Arc,
@@ -410,6 +412,31 @@ pub fn allocated_bytes(device: &Device) -> Option<usize> {
     }
 }
 
+/// A zero-filled tensor of exactly `shape`. On Metal it bypasses Candle's pool, which
+/// rounds every buffer up to a power of two and would make the planned state memory
+/// (see `PoolConfig::bytes`) several GiB smaller than what the device really holds.
+fn zeroed(shape: impl Into<Shape>, dtype: DType, device: &Device) -> Result<Tensor> {
+    let shape = shape.into();
+    match device {
+        #[cfg(feature = "metal")]
+        Device::Metal(metal) => {
+            let count = shape.elem_count();
+            let buffer = metal.new_private_buffer(count, dtype, "tur_state_pool")?;
+            if count > 0 {
+                let bytes = count
+                    .checked_mul(dtype.size_in_bytes())
+                    .ok_or_else(|| invalid("pool tensor size overflow"))?;
+                let mut blit = metal.blit_command_encoder()?;
+                blit.set_label("tur_state_pool_zero");
+                blit.fill_buffer(&buffer, (0, bytes), 0);
+            }
+            let storage = MetalStorage::new(buffer, metal.clone(), count, dtype);
+            Ok(Tensor::from((Storage::Metal(storage), shape)))
+        }
+        _ => Ok(Tensor::zeros(shape, dtype, device)?),
+    }
+}
+
 /// Device-resident state storage for one model on one device. Cloning shares the pool.
 #[derive(Clone)]
 pub struct StatePool(Arc<Shared>);
@@ -440,7 +467,7 @@ impl StatePool {
                     };
                     let store = || -> Result<KvPool> {
                         Ok(KvPool {
-                            data: Tensor::zeros(
+                            data: zeroed(
                                 (slots, kv_heads, head_dim),
                                 kv.format.data_dtype(),
                                 device,
@@ -449,11 +476,7 @@ impl StatePool {
                                 .format
                                 .group()
                                 .map(|g| {
-                                    Tensor::zeros(
-                                        (slots, kv_heads, head_dim / g),
-                                        DType::F16,
-                                        device,
-                                    )
+                                    zeroed((slots, kv_heads, head_dim / g), DType::F16, device)
                                 })
                                 .transpose()?,
                         })
@@ -475,16 +498,12 @@ impl StatePool {
                     value_dim,
                     dtype,
                 } => LayerPool::Recurrent(RecurrentPool {
-                    convolution: Tensor::zeros(
+                    convolution: zeroed(
                         (recurrent_slots, conv_width, conv_channels),
                         DType::F32,
                         device,
                     )?,
-                    state: Tensor::zeros(
-                        (recurrent_slots, heads, key_dim, value_dim),
-                        dtype,
-                        device,
-                    )?,
+                    state: zeroed((recurrent_slots, heads, key_dim, value_dim), dtype, device)?,
                 }),
             });
         }
@@ -1076,6 +1095,38 @@ mod tests {
             assert_eq!(flat(&raw)?, flat(&qk.get(4)?.to_dtype(DType::F32)?)?);
             assert!(attention.gather(&pages, 13).is_err());
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_pools_allocate_the_planned_bytes_zeroed() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let model = description(16, KvFormat::F16);
+        let config = PoolConfig {
+            pages: 100,
+            window_pages: 0,
+            recurrent_slots: 3,
+        };
+        let planned = config.bytes(&model)?;
+        let before = allocated_bytes(&device).ok_or_else(|| invalid("no device accounting"))?;
+        let pool = StatePool::new(model, &device, config)?;
+        let held =
+            allocated_bytes(&device).ok_or_else(|| invalid("no device accounting"))? - before;
+        // Candle's pool would round each 400 KiB K/V tensor up to 512 KiB, which alone
+        // reaches the bound; Metal's own page alignment stays below it.
+        assert!(
+            held >= planned && held < 2 * (512 << 10),
+            "held {held} against planned {planned}"
+        );
+        let key = &pool.attention(0)?.key.data;
+        assert!(
+            key.flatten_all()?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?
+                .iter()
+                .all(|v| *v == 0.0)
+        );
         Ok(())
     }
 }

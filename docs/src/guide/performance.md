@@ -415,8 +415,9 @@ Bursts through the full pipeline, with 128-token prompts and 64 output tokens, s
 | 1 | 6.8 | 6.4 to 6.8 | 2.0 s | 115 ms | 119 ms | 121 ms |
 | 2 | 10.3 | 9.8 to 10.3 | 4.1 s | 132 ms | 136 ms | 137 ms |
 | 4 | 15.3 | 14.6 to 15.3 | 7.7 s | 141 ms | 144 ms | 146 ms |
+| 8 | 20.2 | | 15.4 s | 156 ms | 159 ms | 174 ms |
 
-The burst rates are lower than the `model` benchmark's because they include prefill, which takes the 2 s to first token at one request (about 180 tokens at 90 tokens/s), and sampling. Eight concurrent requests ran out of GPU memory in every attempt, though eight sequences at 128 tokens ran in the `model` benchmark. Which part of the serving plan does not fit has not been established.
+The burst rates are lower than the `model` benchmark's because they include prefill, which takes the 2 s to first token at one request (about 180 tokens at 90 tokens/s), and sampling. Eight concurrent requests complete too, at 20.2 tokens/s from a single run. Earlier builds ran out of GPU memory at this burst because the state pool occupied more device memory than the plan counted.
 
 Against llama.cpp 0.8.0 (build 11960, Homebrew) on the same Mac, with unsloth's `Qwen3.8-27B-UD-Q4_K_M` GGUF (revision `4ca720788d1e01f1bff70c033e0d0028fd02e502`, 15.3 GiB) and its defaults: Metal and F16 K/V. The GGUF mixes quantization types per tensor and is not the same format as Tur's RTN Q4K artifact, so this compares engines with their usual 4-bit weights, not kernels on identical bits. Quality was not measured for either. This is a short run: prefill at 512 to 4K tokens is the mean of two `llama-bench` repeats and everything else is one run, so differences of a few percent are within noise. Decode is 32 tokens after the stated context.
 
