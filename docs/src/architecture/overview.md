@@ -1,6 +1,6 @@
 # Overview
 
-This part of the book follows a request from the HTTP server to the GPU and back. This page gives the map: how the crates fit together, what happens to a request, and the few principles that every chapter relies on.
+This part of the book follows a request from the HTTP server to the GPU and back. This page gives the map: how the crates fit together, what happens to a request, and the few principles that every chapter relies on. To decide whether Tur fits your setup, start with [Tur and other engines](comparison.md).
 
 ## Crates
 

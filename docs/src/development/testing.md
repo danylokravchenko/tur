@@ -114,7 +114,7 @@ python -I scripts/audio_reference.py --tiny crates/tur/tests/fixtures/audio
 
 Hosted runners are virtual machines with a paravirtual GPU, which runs real shaders but far more slowly than a Mac and reports no Apple GPU family. Each test process compiles the shaders at startup and a fresh runner starts with no shader cache, so `just ci-hosted` first runs one small kernel test alone to warm it. The `ci` profile in `.config/nextest.toml` then leaves out the test that requires a real GPU family, one that the virtual GPU cannot build a Candle pipeline for, and the heaviest tests. It retries a failed test twice, and reports a test that runs out of time as `TIMEOUT-PASS` rather than as a failure. A passing check is not the full gate: run `just ci` on a Mac before merging a change to kernels or model math, and before tagging a release.
 
-Pushing a tag such as `v0.3.0` runs `.github/workflows/release.yml`. It runs the same CI, checks that the tag matches the workspace version, builds the release binary from `Cargo.lock` and publishes it with its SHA-256 checksum. A tag with a hyphen, such as `v0.3.0-rc.1`, becomes a prerelease.
+Pushing a tag such as `v0.3.0` runs `.github/workflows/release.yml`. It does not run the tests, so tag a commit that already passed CI. It checks that the tag matches the workspace version, builds the release binary from `Cargo.lock`, tests `scripts/install-release.sh` against the packaged files, and publishes the binary with its SHA-256 checksum and that script as `install.sh`. A tag with a hyphen, such as `v0.3.0-rc.1`, becomes a prerelease.
 
 ## Reference scripts
 

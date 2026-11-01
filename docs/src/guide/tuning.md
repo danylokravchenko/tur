@@ -1,6 +1,6 @@
 # Tuning
 
-The defaults suit one model serving interactive users. This page explains what each setting trades, gives recipes for common situations, and shows how to measure the result. The [Architecture](../architecture/overview.md) chapters explain the mechanisms behind them.
+The defaults suit one model serving interactive users. This page explains what each setting trades, gives recipes for common situations, and shows how to measure the result. [Best practice](best-practice.md) has a starting configuration for each model, and the [Architecture](../architecture/overview.md) chapters explain the mechanisms behind them.
 
 ## Keep settings in a file
 

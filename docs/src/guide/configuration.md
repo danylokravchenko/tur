@@ -73,8 +73,8 @@ File keys are the CLI flags in snake_case. See [Command line](cli.md) for values
 | --- | --- | --- |
 | `model` | `source` | `--model` / `TUR_MODEL` |
 | `model` | `revision` | `--revision` / `TUR_REVISION` |
-| `model` | `weight_format`, `kv_format`, `kv_page_tokens`, `recurrent_state`, `audio_encoder` | Same name with hyphens |
-| `engine` | `prefill_chunk_size`, `context_tokens`, `state_memory_mb`, `speculative_draft`, `mtp` | Same name with hyphens |
+| `model` | `weight_format`, `kv_format`, `kv_page_tokens`, `recurrent_state`, `audio_encoder`, `expert_cache_mb` | Same name with hyphens |
+| `engine` | `prefill_chunk_size`, `context_tokens`, `state_memory_mb`, `speculative_draft`, `mtp`, `draft_model`, `draft_revision` | Same name with hyphens |
 | `server` | `listen`, `served_model_name`, `max_batch_size`, `max_batch_tokens`, `max_waiting`, `request_timeout_secs`, `prefix_snapshots`, `transcription_model_name`, `max_waiting_transcriptions`, `shutdown_timeout_secs` | Same name with hyphens |
 | `whisper` | `source`, `revision`, `weight_format` | `--whisper`, `--whisper-revision`, `--whisper-weight-format` |
 | `generation` | `max_tokens`, `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `thinking`, `reasoning_effort`, `preserve_thinking` | Same name with hyphens |
