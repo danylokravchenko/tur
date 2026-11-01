@@ -4,7 +4,10 @@
 //! wall time includes its GPU work. Prints one JSON document.
 //!
 //! `TUR_BENCH_MODEL=<snapshot> cargo bench --offline -p tur --bench perf -- serving > out.json`
-//! narrows with `TUR_BENCH_CONCURRENCY=1,8` and `TUR_BENCH_OUTPUT=64`.
+//! narrows with `TUR_BENCH_CONCURRENCY=1,8` and `TUR_BENCH_OUTPUT=64`. A prepacked
+//! artifact directory in `TUR_BENCH_MODEL` loads as packed; any other checkpoint converts to `Q8_0`.
+//! `TUR_BENCH_EXPERT_CACHE_MB=2048` reads a Qwen `MoE` artifact's experts through an expert cache
+//! of that size instead of keeping them resident.
 //! `TUR_BENCH_SAMPLING=0.7,20,0.95` samples instead of greedy decoding,
 //! `TUR_BENCH_DEVICE_SAMPLING=0` samples on the host, and
 //! `TUR_BENCH_WORKLOADS=prefix TUR_BENCH_SPACING=0,256` runs the prefix-reuse workloads
@@ -37,7 +40,8 @@ use tur_engine::{
     hybrid::SamplingOptions,
 };
 use tur_models::models::{
-    DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, DraftHead, WeightFormat, parse_recurrent_state,
+    DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, DraftHead, WeightFormat, is_artifact,
+    parse_recurrent_state,
 };
 
 const CHUNK: usize = 256;
@@ -986,6 +990,20 @@ fn speculation_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
     Ok(runs)
 }
 
+/// `TUR_BENCH_EXPERT_CACHE_MB` keeps a Qwen `MoE` artifact's experts on disk behind a cache of
+/// this many MiB; unset, every expert stays resident.
+fn expert_cache_bytes() -> Result<Option<usize>> {
+    let Ok(value) = std::env::var("TUR_BENCH_EXPERT_CACHE_MB") else {
+        return Ok(None);
+    };
+    value
+        .parse::<usize>()
+        .ok()
+        .and_then(|mb| mb.checked_mul(1 << 20))
+        .map(Some)
+        .ok_or_else(|| invalid("TUR_BENCH_EXPERT_CACHE_MB".to_owned()))
+}
+
 pub(crate) fn run() -> Result<()> {
     let dir = std::env::var("TUR_BENCH_MODEL")
         .map(PathBuf::from)
@@ -1003,14 +1021,14 @@ pub(crate) fn run() -> Result<()> {
     let factory = ModelFactory {
         source: ModelSource::LocalPath(dir.clone()),
         revision: "bench".into(),
-        format: Some(WeightFormat::Q8_0),
+        format: (!is_artifact(&dir)).then_some(WeightFormat::Q8_0),
         device: candle_core::Device::new_metal(0)?,
         kv: DEFAULT_KV_LAYOUT,
         recurrent: std::env::var("TUR_BENCH_STATE")
             .map_or(Ok(DEFAULT_RECURRENT_STATE), |s| parse_recurrent_state(&s))
             .map_err(TurError::Other)?,
         audio: false,
-        expert_cache: None,
+        expert_cache: expert_cache_bytes()?,
     };
     let bench = Bench {
         factory: &factory,
@@ -1046,10 +1064,16 @@ pub(crate) fn run() -> Result<()> {
     if workloads.contains("speculation") {
         runs.extend(speculation_runs(&bench)?);
     }
+    let weights_label = if is_artifact(&dir) {
+        "prepacked artifact"
+    } else {
+        "q8_0"
+    };
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "benchmark": "serving", "checkpoint": dir, "weights": "q8_0",
+            "benchmark": "serving", "checkpoint": dir, "weights": weights_label,
+            "expert_cache_bytes": factory.expert_cache,
             "kv": format!("{:?}", DEFAULT_KV_LAYOUT), "prefill_chunk": CHUNK,
             "output_tokens": output, "workload": "closed-loop bursts submitted at once",
             "sampling": format!("{options:?}"), "device_sampling": device_sampling,
