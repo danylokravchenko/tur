@@ -16,6 +16,7 @@ use super::{
     harmony::Harmony,
     memory::{BudgetLease, MemoryPlan},
     prefix::{PrefixCache, PrefixKeys, PrefixStats},
+    reasoning::ReasoningSplit,
     scheduler::{Candidate, Chunk, Scheduler},
     speculation::{
         Acceptance, Calibration, DraftCosts, DraftSource, HeadCosts, NgramIndex, SpeculationConfig,
@@ -94,8 +95,8 @@ struct Pending {
     /// Names tokens for the log probabilities it reports, when the request asked for them.
     logprob_tokens: Option<Arc<ParserFactory>>,
     logprobs: Vec<TokenLogprob>,
-    /// Grammar-constrained: never drafted, so masks stay on the device.
-    constrained: bool,
+    /// Separates reasoning from a structured answer, for models whose channels don't.
+    split: Option<ReasoningSplit>,
     /// Greedy decoding: its drafts' acceptance is calibrated separately from sampling's.
     greedy: bool,
     ngrams: NgramIndex,
@@ -143,7 +144,9 @@ impl Pending {
             id,
             pending: replay.unwrap_or(aligned),
             minimum: replay.unwrap_or(1),
-            decoding: self.running && unconsumed == 1 && self.generated() > 0,
+            // Past the prompt, every unconsumed token is an output: the newest sampled one, or
+            // a run its grammar forced.
+            decoding: self.running && self.generated() > 0 && self.consumed >= self.prompt_tokens,
             running: self.running,
             context: self.consumed,
             arrival: self.arrival,

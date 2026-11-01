@@ -28,8 +28,9 @@ use crate::{
             ApiErrorBody, ApiErrorResponse, AssistantFunction, AssistantToolCall, ChatChoice,
             ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
             ChatResponseMessage, ChoiceLogprobs, ChunkChoice, ContentPart as Part, DeltaFunction,
-            DeltaMessage, DeltaToolCall, LogprobEntry, MessageContent, PromptTokensDetails,
-            ResponseFormat, ResponseFunction, ResponseToolCall, StopSequences, TopLogprob, Usage,
+            DeltaMessage, DeltaToolCall, GrammarSyntax, LogprobEntry, MessageContent,
+            PromptTokensDetails, ResponseFormat, ResponseFunction, ResponseToolCall, StopSequences,
+            TopLogprob, Usage,
         },
         worker::{TextDelta, WorkerMsg},
     },
@@ -63,6 +64,13 @@ pub(crate) fn execution_error(error: &crate::TurError) -> (StatusCode, ApiErrorR
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "context_length_exceeded",
+        ),
+        // Every grammar comes from the request, and one can compile yet exceed the parser's
+        // limits partway through generation.
+        TurError::Guidance(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_grammar",
         ),
         TurError::InvalidExecution(_) => (
             StatusCode::BAD_REQUEST,
@@ -245,6 +253,10 @@ fn structured_output(req: &mut ChatCompletionRequest) -> Result<Option<Structure
         Some(ResponseFormat::JsonSchema { json_schema }) => {
             Some(StructuredOutput::JsonSchema(json_schema.schema))
         }
+        Some(ResponseFormat::Grammar { syntax, definition }) => Some(match syntax {
+            GrammarSyntax::Regex => StructuredOutput::Regex(definition),
+            GrammarSyntax::Lark => StructuredOutput::Lark(definition),
+        }),
     };
     // A forced answer leaves a model no way to reach a tool it was told about.
     if answer.is_some() && !req.tools.is_empty() {

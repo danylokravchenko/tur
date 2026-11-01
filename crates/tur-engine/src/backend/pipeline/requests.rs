@@ -3,15 +3,16 @@
 use super::super::{
     guidance::{GuidanceControl, ParserFactory, TopLevelGrammar, build_llg_factory, token_bytes},
     harmony::{Fragment, Harmony},
+    reasoning::{ReasoningSplit, Route},
     speculation::NgramIndex,
     stop::StopMatcher,
-    structured::{self, StructuredOutput},
+    structured::{self, Preamble, StructuredOutput},
     tokenizer::TokenOutputStream,
 };
 use super::{InferencePipeline, Pending};
 use crate::{
     Result, TurError,
-    hybrid::{OutputLogprobs, SamplingOptions, SequenceCommit},
+    hybrid::{Forced, OutputLogprobs, SamplingOptions, SequenceCommit},
 };
 use candle_core::Tensor;
 use std::{
@@ -51,9 +52,9 @@ pub struct GenerationRequest {
     pub cache_salt: Option<String>,
     /// Constrain generation to this grammar; the request completes when it terminates.
     pub grammar: Option<TopLevelGrammar>,
-    /// Force a JSON answer or a tool call in this model's format; excludes `grammar`.
-    /// Models that don't separate their reasoning run with thinking off, and asking for it
-    /// is an error, because the grammar would otherwise force the reasoning too.
+    /// Force a JSON answer or a tool call in this model's format; excludes `grammar`. Qwen and
+    /// Gemma run with thinking off unless `render` asks for it. Reasoning then stays free and
+    /// is returned apart from the answer.
     pub structured: Option<StructuredOutput>,
     /// Soft tokens of every clip of `messages`, in order, when they were encoded before
     /// submission; empty encodes them at submission, on the calling thread.
@@ -205,6 +206,36 @@ fn sampling(overrides: SamplingOptions, defaults: &GenerationDefaults) -> Sampli
 }
 
 impl Pending {
+    /// Take one published output. Returns the finish reason if the request ends on it.
+    fn accept(
+        &mut self,
+        id: Uuid,
+        token: u32,
+        logprobs: Option<OutputLogprobs>,
+        eos_tokens: &[u32],
+        output: &mut BatchStepOutput,
+    ) -> Result<Option<&'static str>> {
+        let sampled_at = Instant::now();
+        output.sampled_tokens.push((id, token, sampled_at));
+        self.tokens.push(token);
+        self.first_token
+            .get_or_insert_with(|| sampled_at.saturating_duration_since(self.arrival));
+        let eos = eos_tokens.contains(&token);
+        if !eos {
+            self.decode_token(id, token, output)?;
+            if let (Some(factory), Some(logprobs)) = (&self.logprob_tokens, logprobs) {
+                self.logprobs
+                    .push(TokenLogprob::of_output(factory, token, logprobs));
+            }
+        }
+        let stopped = eos || self.stop.matched();
+        Ok(if stopped {
+            Some("stop")
+        } else {
+            (self.generated() >= self.max_tokens).then_some("length")
+        })
+    }
+
     /// Hand one request's newly decoded text to its audiences.
     fn publish_fragment(&mut self, id: Uuid, fragment: Fragment, output: &mut BatchStepOutput) {
         if let Some(text) = fragment.reasoning {
@@ -217,9 +248,14 @@ impl Pending {
 
     /// Decode one sampled token and publish whatever text it completes.
     fn decode_token(&mut self, id: Uuid, token: u32, output: &mut BatchStepOutput) -> Result<()> {
-        let fragment = match &mut self.harmony {
-            Some(harmony) => harmony.push(token)?,
-            None => Fragment {
+        let route = match &mut self.split {
+            Some(split) => split.push(token)?,
+            None => Route::Answer,
+        };
+        let fragment = match (route, &mut self.harmony) {
+            (Route::Taken(fragment), _) => fragment,
+            (Route::Answer, Some(harmony)) => harmony.push(token)?,
+            (Route::Answer, None) => Fragment {
                 content: self.stream.next_token(token)?,
                 reasoning: None,
             },
@@ -238,7 +274,12 @@ impl Pending {
             Some(harmony) => harmony.finish()?,
             None => Fragment {
                 content: self.stream.decode_rest()?,
-                reasoning: None,
+                reasoning: self
+                    .split
+                    .as_mut()
+                    .map(ReasoningSplit::take_rest)
+                    .transpose()?
+                    .flatten(),
             },
         };
         self.publish_fragment(id, fragment, output);
@@ -257,7 +298,11 @@ impl Pending {
             } else {
                 ToolCall::parse_from_output(&self.stream.decode_raw()?, &self.tools)
             };
-            (self.stream.decode_all()?, String::new(), tool_calls)
+            let reasoning = self
+                .split
+                .as_ref()
+                .map_or_else(|| Ok(String::new()), ReasoningSplit::reasoning)?;
+            (self.stream.decode_all()?, reasoning, tool_calls)
         };
         self.stop.truncate(&mut content);
         Ok((content, reasoning, tool_calls))
@@ -324,26 +369,74 @@ impl InferencePipeline {
         Ok(factory)
     }
 
-    /// The options a structured request renders with. See [`GenerationRequest::structured`].
-    fn render_options(&self, request: &GenerationRequest) -> Result<RenderOptions> {
+    /// The options a structured request renders with: thinking stays off unless asked for,
+    /// since Harmony alone reasons by default and most answers don't need it.
+    fn render_options(&self, request: &GenerationRequest) -> RenderOptions {
         let mut render = request.render.clone();
-        if request.structured.is_some() && !structured::separates_reasoning(self.tool_syntax()) {
-            if render.enable_thinking == Some(true) {
-                return Err(invalid(
-                    "this model can't think before forced output: set thinking to false",
-                ));
-            }
-            render.enable_thinking = Some(false);
+        if request.structured.is_some() && self.tool_syntax() != ToolSyntax::Harmony {
+            render.enable_thinking.get_or_insert(false);
         }
-        Ok(render)
+        render
     }
 
     fn tool_syntax(&self) -> ToolSyntax {
         self.model.tool_syntax()
     }
 
+    /// Whether structured output may follow reasoning, given the rendered prompt.
+    fn preamble(&self, request: &GenerationRequest, prompt: &[u32]) -> Preamble {
+        let thinking = request.render.enable_thinking;
+        let reasons = match self.tool_syntax() {
+            ToolSyntax::Harmony => thinking != Some(false),
+            ToolSyntax::Gemma => thinking == Some(true),
+            // A template that ignored the request hasn't opened anything to close.
+            ToolSyntax::Xml => thinking == Some(true) && self.prompt_opens_thinking(prompt),
+        };
+        if reasons {
+            Preamble::Reasoning
+        } else {
+            Preamble::None
+        }
+    }
+
+    fn prompt_opens_thinking(&self, prompt: &[u32]) -> bool {
+        let (Some(open), Some(close)) = (
+            self.tokenizer.token_to_id("<think>"),
+            self.tokenizer.token_to_id("</think>"),
+        ) else {
+            return false;
+        };
+        prompt
+            .iter()
+            .rev()
+            .find(|token| **token == open || **token == close)
+            == Some(&open)
+    }
+
+    /// How to tell a structured answer from the reasoning before it. Harmony's channels already
+    /// do; otherwise only a grammar that admits reasoning can produce any.
+    fn reasoning_split(&self, preamble: Preamble) -> Option<ReasoningSplit> {
+        if preamble != Preamble::Reasoning {
+            return None;
+        }
+        let id = |token: &str| self.tokenizer.token_to_id(token);
+        match self.tool_syntax() {
+            ToolSyntax::Harmony => None,
+            ToolSyntax::Xml => Some(ReasoningSplit::opened(&self.tokenizer, id("</think>")?)),
+            ToolSyntax::Gemma => Some(ReasoningSplit::channel(
+                &self.tokenizer,
+                id("<|channel>")?,
+                id("<channel|>")?,
+            )),
+        }
+    }
+
     /// The request's parser, started. A grammar that doesn't compile is the request's fault.
-    fn request_guidance(&mut self, request: &GenerationRequest) -> Result<Option<GuidanceControl>> {
+    fn request_guidance(
+        &mut self,
+        request: &GenerationRequest,
+        preamble: Preamble,
+    ) -> Result<Option<GuidanceControl>> {
         let grammar = match (&request.grammar, &request.structured) {
             (Some(_), Some(_)) => return Err(invalid("grammar excludes structured output")),
             (Some(grammar), None) => grammar.clone(),
@@ -352,15 +445,36 @@ impl InferencePipeline {
                 self.tool_syntax(),
                 &request.tools,
                 &self.tokenizer,
-                request.render.enable_thinking,
+                preamble,
+                &self.defaults.eos_tokens,
             )?,
-            (None, None) => return Ok(None),
+            (None, None) => return Ok(self.lazy_guidance(request)),
         };
         let mut control = GuidanceControl::new(self.parser_factory()?);
         control
             .activate(grammar)
             .map_err(|error| invalid(format!("invalid grammar: {error}")))?;
         Ok(Some(control))
+    }
+
+    /// A dormant grammar holding this request's tool calls to their schemas. It is best effort:
+    /// a schema it can't enforce leaves the calls unconstrained, as they would be anyway, and
+    /// must not fail a request that may never make one.
+    fn lazy_guidance(&mut self, request: &GenerationRequest) -> Option<GuidanceControl> {
+        let attempt = (|| -> Result<Option<GuidanceControl>> {
+            let Some((grammar, trigger)) =
+                structured::lazy_call(self.tool_syntax(), &request.tools, &self.tokenizer)?
+            else {
+                return Ok(None);
+            };
+            let mut control = GuidanceControl::new(self.parser_factory()?);
+            control.arm(grammar, trigger)?;
+            Ok(Some(control))
+        })();
+        attempt.unwrap_or_else(|error| {
+            tracing::debug!(%error, "tool calls run without a grammar");
+            None
+        })
     }
 
     /// Render, tokenize and queue one text conversation with independent sampling state.
@@ -381,7 +495,7 @@ impl InferencePipeline {
         if request.messages.is_empty() || request.max_tokens == 0 {
             return Err(invalid("messages and max_tokens must be nonempty/positive"));
         }
-        let render = self.render_options(request)?;
+        let render = self.render_options(request);
         let prompt = self
             .template
             .render(&request.messages, &request.tools, &render)?;
@@ -431,8 +545,12 @@ impl InferencePipeline {
             return Err(TurError::DeadlineExceeded);
         }
         let options = sampling(request.sampling, &self.defaults);
-        let guidance = self.request_guidance(request)?;
-        let constrained = guidance.is_some();
+        let preamble = if request.structured.is_some() {
+            self.preamble(request, &tokens)
+        } else {
+            Preamble::None
+        };
+        let guidance = self.request_guidance(request, preamble)?;
         let logprob_tokens = options
             .logprobs
             .map(|_| self.parser_factory())
@@ -475,7 +593,7 @@ impl InferencePipeline {
                 tools: request.tools.clone(),
                 logprob_tokens,
                 logprobs: Vec::new(),
-                constrained,
+                split: self.reasoning_split(preamble),
                 greedy: options.greedy(),
                 ngrams: NgramIndex::default(),
                 acceptance: self.acceptance,
@@ -574,25 +692,32 @@ impl InferencePipeline {
         let mut finished = commit.finished;
         let mut reason = "stop";
         for token in commit.outputs {
-            let sampled_at = Instant::now();
-            output.sampled_tokens.push((id, token.token, sampled_at));
-            pending.tokens.push(token.token);
-            pending
-                .first_token
-                .get_or_insert_with(|| sampled_at.saturating_duration_since(pending.arrival));
-            let eos = self.defaults.eos_tokens.contains(&token.token);
-            if !eos {
-                pending.decode_token(id, token.token, output)?;
-                if let (Some(factory), Some(logprobs)) = (&pending.logprob_tokens, token.logprobs) {
-                    let entry = TokenLogprob::of_output(factory, token.token, logprobs);
-                    pending.logprobs.push(entry);
-                }
-            }
-            let stopped = eos || pending.stop.matched();
-            if stopped || pending.generated() >= pending.max_tokens {
+            if let Some(ended) = pending.accept(
+                id,
+                token.token,
+                token.logprobs,
+                &self.defaults.eos_tokens,
+                output,
+            )? {
                 finished = true;
-                reason = if stopped { "stop" } else { "length" };
+                reason = ended;
                 break;
+            }
+        }
+        // Tokens its grammar alone decides join the outputs here, and the next pass reads them
+        // as inputs, as it reads a prompt's.
+        while !finished {
+            match self.engine.force_output(pending.handle)? {
+                Forced::Sample => break,
+                Forced::Stop => finished = true,
+                Forced::Token(token) => {
+                    if let Some(ended) =
+                        pending.accept(id, token, None, &self.defaults.eos_tokens, output)?
+                    {
+                        finished = true;
+                        reason = ended;
+                    }
+                }
             }
         }
         if (self.prefix.is_boundary(pending.consumed)

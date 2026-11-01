@@ -14,7 +14,7 @@ use tur_core::{
 use tur_engine::{
     backend::guidance::{GuidanceControl, TopLevelGrammar, build_llg_factory},
     hybrid::{
-        Boundaries, Checkpoint, HybridEngine, HybridModel, PackedForward, PoolConfig,
+        Boundaries, Checkpoint, Forced, HybridEngine, HybridModel, PackedForward, PoolConfig,
         SamplingOptions, SequenceCommit, SequenceForward, SequenceResult, SequenceStep, StatePool,
         TokenOutput,
     },
@@ -902,6 +902,44 @@ fn test_grammar_parser_fork_speculation_restore_and_terminal_state_are_atomic() 
         tokens(&run(&mut engine, &[(restored, &[2, 3])])?),
         vec![2, 3]
     );
+    Ok(())
+}
+
+#[test]
+fn test_lazy_grammar_wakes_inside_a_drafted_pass_and_masks_only_later_passes() -> Result<()> {
+    let options = SamplingOptions::default();
+    // The fixture's first output after this input becomes the trigger, and the draft that
+    // would otherwise be accepted.
+    let (mut free, _) = engine(fixture())?;
+    let f = free.allocate(42, options, None)?;
+    let first = tokens(&run(&mut free, &[(f, &[2])])?);
+    let trigger = *first
+        .first()
+        .ok_or_else(|| invalid("the fixture sampled nothing"))?;
+
+    let (mut engine, _) = engine(fixture())?;
+    let mut lazy = grammar()?;
+    lazy.deactivate();
+    lazy.arm(TopLevelGrammar::from_regex("bc"), trigger)?;
+    let a = engine.allocate(42, options, Some(lazy))?;
+    assert!(!engine.constraining(a.request));
+    let input = packed(&engine, &[(a, &[2, trigger])], true)?;
+    let commit = commits(submit_all(&mut engine, input)?)?
+        .pop()
+        .ok_or_else(|| invalid("missing commit"))?;
+    // The draft matched, but the row after it carried no mask, so the pass ends at the trigger.
+    assert_eq!(tokens(&commit.outputs), first);
+    assert_eq!(commit.accepted_tokens, 1);
+    assert!(!commit.finished);
+    assert!(engine.constraining(a.request));
+    // The grammar now decides alone, then sleeps instead of ending the request.
+    let a = handle(&engine, a)?;
+    assert_eq!(engine.force_output(a)?, Forced::Token(2));
+    assert_eq!(engine.force_output(a)?, Forced::Token(3));
+    // The next mask finds the grammar's end.
+    assert_eq!(engine.force_output(a)?, Forced::Sample);
+    assert!(!engine.constraining(a.request));
+    assert!(!engine.metadata(a.request)?.finished);
     Ok(())
 }
 

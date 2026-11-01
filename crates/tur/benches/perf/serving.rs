@@ -15,7 +15,8 @@
 //! `TUR_BENCH_WORKLOADS=reuse` runs the prefix-scheduling ones on default pipelines
 //! (`TUR_BENCH_RESTORABLE_FIRST=1` admits restorable prefixes first);
 //! `TUR_BENCH_WORKLOADS=arrivals TUR_BENCH_RATE=2,4` runs open-loop Poisson arrivals, and
-//! `TUR_BENCH_WORKLOADS=grammar` grammar-constrained requests.
+//! `TUR_BENCH_WORKLOADS=grammar` grammar-constrained requests, and
+//! `TUR_BENCH_WORKLOADS=logprobs` the cost of reporting log probabilities.
 //! `TUR_BENCH_WORKLOADS=speculation TUR_BENCH_DRAFT=0,4` compares adaptive prompt lookup
 //! (`TUR_BENCH_MTP=1` adds the native MTP head to drafted configurations, `0,1` runs both)
 //! with ordinary decoding, including acceptance counters, memory and exact token IDs, on
@@ -833,33 +834,78 @@ fn grammar_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
         ..
     } = *bench;
     let concurrency = bench.concurrency.clone();
-    // JSON-like lists that the grammar terminates; every token is masked.
-    let grammar =
-        TopLevelGrammar::from_regex(r#"\{"items": \[("[a-z]{2,10}", ){3,6}"[a-z]{2,10}"\]\}"#);
+    // JSON-like lists that the grammar terminates; every token is masked. The second has long
+    // keys, as schemas do, whose tokens the grammar alone decides.
+    let grammars = [
+        (
+            "grammar",
+            r#"\{"items": \[("[a-z]{2,10}", ){3,6}"[a-z]{2,10}"\]\}"#,
+        ),
+        (
+            "grammar_keys",
+            r#"\{"scientific_classification_name": "[a-z]{2,10}", "preferred_natural_habitat_description": "[a-z]{2,10}", "average_adult_body_weight_in_kilograms": [0-9]{1,3}, "conservation_status_according_to_the_iucn": "[a-z]{2,10}"\}"#,
+        ),
+    ];
     let mut config = PipelineConfig::new(max, CHUNK);
     config.device_sampling = device_sampling;
     // Repeated prompts would otherwise restore from prompt-end snapshots.
     config.prefix = PrefixConfig::DISABLED;
     let mut pipeline = InferencePipeline::new(factory, config)?;
-    for &concurrency in &concurrency {
-        let requests: Vec<GenerationRequest> = (0..concurrency)
-            .map(|i| {
-                let mut request = GenerationRequest::new(
-                    format!("Request {i}. List a few animals as JSON."),
-                    output,
-                );
-                request.seed = i as u64;
-                request.sampling = options;
-                request.render.enable_thinking = Some(false);
-                request.grammar = Some(grammar.clone());
-                request
-            })
-            .collect();
-        // The first run builds the parser factory over the tokenizer; time the second.
-        run_requests(&mut pipeline, &requests)?;
-        let result = run_requests(&mut pipeline, &requests)?;
-        report(&format!("grammar c={concurrency}"), &result);
-        runs.push(json!({"workload": "grammar", "concurrency": concurrency, "result": result}));
+    for (name, grammar) in grammars {
+        let grammar = TopLevelGrammar::from_regex(grammar);
+        for &concurrency in &concurrency {
+            let requests: Vec<GenerationRequest> = (0..concurrency)
+                .map(|i| {
+                    let mut request = GenerationRequest::new(
+                        format!("Request {i}. List a few animals as JSON."),
+                        output,
+                    );
+                    request.seed = i as u64;
+                    request.sampling = options;
+                    request.render.enable_thinking = Some(false);
+                    request.grammar = Some(grammar.clone());
+                    request
+                })
+                .collect();
+            // The first run builds the parser factory over the tokenizer; time the second.
+            run_requests(&mut pipeline, &requests)?;
+            let result = run_requests(&mut pipeline, &requests)?;
+            report(&format!("{name} c={concurrency}"), &result);
+            runs.push(json!({"workload": name, "concurrency": concurrency, "result": result}));
+        }
+    }
+    Ok(runs)
+}
+
+/// The grammar workload's requests again with log probabilities, which need every position's
+/// logits copied to the host and rule out forced tokens: `unconstrained` compares their copy
+/// with plain decoding.
+fn logprob_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
+    let mut runs = Vec::new();
+    let mut config = PipelineConfig::new(bench.max, CHUNK);
+    config.device_sampling = bench.device_sampling;
+    config.prefix = PrefixConfig::DISABLED;
+    let mut pipeline = InferencePipeline::new(bench.factory, config)?;
+    for &concurrency in &bench.concurrency {
+        for top in [None, Some(0), Some(5)] {
+            let requests: Vec<GenerationRequest> = (0..concurrency)
+                .map(|i| {
+                    let mut request = GenerationRequest::new(
+                        format!("Request {i}. Tell a short story about a lighthouse."),
+                        bench.output,
+                    );
+                    request.seed = i as u64;
+                    request.sampling = bench.options;
+                    request.sampling.logprobs = top;
+                    request.render.enable_thinking = Some(false);
+                    request
+                })
+                .collect();
+            run_requests(&mut pipeline, &requests)?;
+            let result = run_requests(&mut pipeline, &requests)?;
+            report(&format!("logprobs={top:?} c={concurrency}"), &result);
+            runs.push(json!({"workload": "logprobs", "top": top, "concurrency": concurrency, "result": result}));
+        }
     }
     Ok(runs)
 }
@@ -1049,6 +1095,9 @@ pub(crate) fn run() -> Result<()> {
     }
     if workloads.contains("grammar") {
         runs.extend(grammar_runs(&bench)?);
+    }
+    if workloads.contains("logprobs") {
+        runs.extend(logprob_runs(&bench)?);
     }
     if workloads.contains("arrivals") {
         runs.extend(arrival_runs(&bench)?);

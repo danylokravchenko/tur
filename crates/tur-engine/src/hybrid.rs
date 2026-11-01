@@ -138,6 +138,8 @@ struct SamplingMark {
     tokens: usize,
     finished: bool,
     guidance: Option<GuidanceControl>,
+    /// The grammar was waiting for its trigger, which a failed pass may have committed.
+    dormant: bool,
 }
 
 /// One output position's logits as `finish` delivers them.
@@ -323,7 +325,14 @@ impl SamplingState {
                 .as_ref()
                 .filter(|g| g.is_active())
                 .map(GuidanceControl::fork),
+            dormant: self.dormant(),
         }
+    }
+
+    fn dormant(&self) -> bool {
+        self.guidance
+            .as_ref()
+            .is_some_and(GuidanceControl::is_dormant)
     }
 
     fn rollback(&mut self, mark: SamplingMark) {
@@ -342,6 +351,10 @@ impl SamplingState {
         self.finished = mark.finished;
         if let Some(guidance) = mark.guidance {
             self.guidance = Some(guidance);
+        } else if mark.dormant
+            && let Some(guidance) = &mut self.guidance
+        {
+            guidance.sleep();
         }
     }
 
@@ -404,6 +417,13 @@ impl SamplingState {
                 }
             }
         };
+        self.record(token)?;
+        self.draws = next_draw;
+        Ok(Some(token))
+    }
+
+    /// Advance the grammar and history past `token`.
+    fn record(&mut self, token: u32) -> Result<()> {
         if let Some(guidance) = &mut self.guidance
             && guidance.commit(token)?
         {
@@ -412,9 +432,36 @@ impl SamplingState {
         if let Some(history) = &mut self.history {
             *history.counts.entry(token).or_default() += 1;
         }
-        self.draws = next_draw;
         self.tokens.push(token);
-        Ok(Some(token))
+        Ok(())
+    }
+
+    /// Publish the next output without a model pass if its grammar decides it alone. A forced
+    /// token consumes a draw as sampling would have, so later draws, and with them same-seed
+    /// outputs, don't depend on whether this ran. Log probabilities need every position's
+    /// logits, so those requests take their passes.
+    fn force(&mut self) -> Result<Forced> {
+        if self.finished || self.options.logprobs.is_some() {
+            return Ok(Forced::Sample);
+        }
+        let Some(guidance) = &mut self.guidance else {
+            return Ok(Forced::Sample);
+        };
+        if guidance.mask()? == Some(GrammarMask::Stop) {
+            guidance.stop();
+            self.finished = true;
+            return Ok(Forced::Stop);
+        }
+        let Some(token) = guidance.forced()? else {
+            return Ok(Forced::Sample);
+        };
+        let next_draw = self
+            .draws
+            .checked_add(1)
+            .ok_or_else(|| invalid("RNG counter overflow"))?;
+        self.record(token)?;
+        self.draws = next_draw;
+        Ok(Forced::Token(token))
     }
 }
 
@@ -468,6 +515,17 @@ struct Request {
     handle: StateHandle,
     snapshot: Snapshot,
     cancelled: bool,
+}
+
+/// What a request's grammar decides about its next output on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Forced {
+    /// It allows several tokens, or there is no grammar: the output needs a pass.
+    Sample,
+    /// It allows exactly this token, now published.
+    Token(u32),
+    /// It reached its end.
+    Stop,
 }
 
 /// One sampled output, indexed by the original packed token position.
@@ -707,6 +765,7 @@ fn sample_sequence(
         .zip(&penalties)
         .enumerate()
     {
+        let dormant = sampling.dormant();
         let Some(token) = sampling.sample(row, penalties.as_ref())? else {
             return Ok((
                 if sequence.speculative {
@@ -727,7 +786,9 @@ fn sample_sequence(
             let draft = tokens
                 .get(position + 1)
                 .filter(|_| position + 1 < sequence.tokens.end);
-            if sampling.finished || draft != Some(&token) {
+            // A grammar this token woke must mask the next output, whose row wasn't: drop it
+            // as if its draft had been rejected.
+            if sampling.finished || draft != Some(&token) || (dormant && !sampling.dormant()) {
                 return Ok((index + 1, outputs));
             }
         }
@@ -873,6 +934,34 @@ impl<M: HybridModel> HybridEngine<M> {
             .snapshot
             .model
             .demand(tokens, boundaries(speculative))
+    }
+
+    /// Whether the request's grammar constrains its next output, which rules out drafting.
+    /// A dormant grammar doesn't.
+    pub fn constraining(&self, request: Uuid) -> bool {
+        self.requests.get(&request).is_some_and(|request| {
+            request
+                .snapshot
+                .sampling
+                .guidance
+                .as_ref()
+                .is_some_and(GuidanceControl::is_active)
+        })
+    }
+
+    /// Let an idle request's grammar decide its next output without a pass, when it can.
+    /// The token becomes the next input like any other output; fails while a batch is in
+    /// flight, whose outputs aren't published yet.
+    pub fn force_output(&mut self, handle: StateHandle) -> Result<Forced> {
+        if self.pending.is_some() {
+            return Err(invalid("cannot force outputs while a batch is in flight"));
+        }
+        self.request(handle)?;
+        let request = self
+            .requests
+            .get_mut(&handle.request)
+            .ok_or_else(|| invalid("request disappeared"))?;
+        request.snapshot.sampling.force()
     }
 
     /// Allocate request-owned layer state, independent RNG and an optional grammar parser.
@@ -1396,7 +1485,11 @@ impl<M: HybridModel> HybridEngine<M> {
                 logprobs.push(logits.clone());
             }
             let single = !sequence.speculative && sequence.outputs.len() == 1;
-            if !kernels || (sampling.guidance.is_some() && !single) {
+            let masks_later_rows = sampling
+                .guidance
+                .as_ref()
+                .is_some_and(GuidanceControl::is_active);
+            if !kernels || (masks_later_rows && !single) {
                 batch.placement[index] = Placement::Host(host_rows);
                 host_rows += sequence.outputs.len();
                 host.push(logits);

@@ -19,30 +19,44 @@ pub enum StructuredOutput {
     JsonObject,
     /// JSON matching this schema.
     JsonSchema(Value),
+    /// Text matching this regular expression.
+    Regex(String),
+    /// Text matching this Lark grammar, which needs its own `start` rule.
+    Lark(String),
     /// A call to the named tool, or one or more calls to any of the request's tools.
     Tool(Option<String>),
 }
 
-/// Whether the model's reasoning stays out of `content` on its own. Other models must not
-/// think under a grammar, since their reasoning would become part of the forced answer.
-#[must_use]
-pub(crate) fn separates_reasoning(syntax: ToolSyntax) -> bool {
-    syntax == ToolSyntax::Harmony
+/// What the grammar lets a model write before the forced output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Preamble {
+    /// Nothing.
+    None,
+    /// Reasoning, in whichever form this model writes it. Its text is unconstrained.
+    Reasoning,
 }
 
-/// Compile `output` for a model writing `syntax`. `thinking` is the request's explicit choice;
-/// Harmony models may reason on their analysis channel first unless it is `false`.
+/// Compile `output` for a model writing `syntax`. `eos_tokens` can't appear in reasoning.
 pub(crate) fn grammar(
     output: &StructuredOutput,
     syntax: ToolSyntax,
     tools: &[ToolDefinition],
     tokenizer: &Tokenizer,
-    thinking: Option<bool>,
+    preamble: Preamble,
+    eos_tokens: &[u32],
 ) -> Result<TopLevelGrammar> {
     let mut lark = Lark::new(tokenizer);
     let body = match output {
         StructuredOutput::JsonObject => lark.answer(syntax, &json!({"type": "object"}))?,
         StructuredOutput::JsonSchema(schema) => lark.answer(syntax, schema)?,
+        StructuredOutput::Regex(regex) => {
+            let rule = lark.rule("", &format!("/{}/", regex_literal(regex)));
+            lark.framed(syntax, rule)?
+        }
+        StructuredOutput::Lark(definition) => {
+            let rule = lark.rule("", &format!("%lark {{\n{definition}\n}}"));
+            lark.framed(syntax, rule)?
+        }
         StructuredOutput::Tool(name) => {
             let offered: Vec<&ToolDefinition> = tools
                 .iter()
@@ -57,12 +71,32 @@ pub(crate) fn grammar(
             lark.calls(syntax, &offered, name.is_none())?
         }
     };
-    let start = if syntax == ToolSyntax::Harmony && thinking != Some(false) {
-        format!("{}? {body}", lark.analysis()?)
+    let start = if preamble == Preamble::Reasoning {
+        format!("{} {body}", lark.reasoning(syntax, eos_tokens)?)
     } else {
         body
     };
     Ok(TopLevelGrammar::from_lark(lark.finish(&start)))
+}
+
+/// A grammar for what follows a tool-call marker, and the marker's token, for the text between
+/// markers to run free under `tool_choice=auto`. Harmony has no such marker: its calls open
+/// like any other message, and only the header names a recipient.
+pub(crate) fn lazy_call(
+    syntax: ToolSyntax,
+    tools: &[ToolDefinition],
+    tokenizer: &Tokenizer,
+) -> Result<Option<(TopLevelGrammar, u32)>> {
+    if syntax == ToolSyntax::Harmony || tools.is_empty() {
+        return Ok(None);
+    }
+    let mut lark = Lark::new(tokenizer);
+    let offered: Vec<&ToolDefinition> = tools.iter().collect();
+    let (body, trigger) = lark.call_after_marker(syntax, &offered)?;
+    Ok(Some((
+        TopLevelGrammar::from_lark(lark.finish(&body)),
+        trigger,
+    )))
 }
 
 /// A Lark grammar under construction. Rules are numbered, so names from a request's schema
@@ -118,29 +152,82 @@ impl<'a> Lark<'a> {
     /// A JSON answer, on Harmony's final channel for models that use channels.
     fn answer(&mut self, syntax: ToolSyntax, schema: &Value) -> Result<String> {
         let json = self.json(schema)?;
-        if syntax != ToolSyntax::Harmony {
-            return Ok(json);
-        }
-        let (channel, message) = (self.token("<|channel|>")?, self.token("<|message|>")?);
-        Ok(format!("{channel} \"final\" {message} {json}"))
+        self.framed(syntax, json)
     }
 
-    /// One optional analysis message, whose text is unconstrained.
-    fn analysis(&mut self) -> Result<String> {
+    /// `answer` where this model's answers go: on Harmony's final channel, for models with
+    /// channels.
+    fn framed(&self, syntax: ToolSyntax, answer: String) -> Result<String> {
+        if syntax != ToolSyntax::Harmony {
+            return Ok(answer);
+        }
         let (channel, message) = (self.token("<|channel|>")?, self.token("<|message|>")?);
-        let (end, start) = (self.token("<|end|>")?, self.token("<|start|>")?);
-        let excluded = ["<|channel|>", "<|message|>", "<|end|>", "<|start|>"]
-            .into_iter()
-            .chain(["<|return|>", "<|call|>"])
-            .map(|token| Ok(self.id(token)?.to_string()))
+        Ok(format!("{channel} \"final\" {message} {answer}"))
+    }
+
+    /// The optional reasoning before forced output. Qwen's is not optional: the prompt has
+    /// already opened it, so it must close.
+    fn reasoning(&mut self, syntax: ToolSyntax, eos_tokens: &[u32]) -> Result<String> {
+        let excluding = |lark: &Self, tokens: &[&str]| -> Result<String> {
+            let mut ids = tokens
+                .iter()
+                .map(|token| lark.id(token))
+                .collect::<Result<Vec<_>>>()?;
+            ids.extend_from_slice(eos_tokens);
+            let ids: Vec<String> = ids.iter().map(u32::to_string).collect();
+            Ok(format!("<[^{}]>*", ids.join(",")))
+        };
+        Ok(match syntax {
+            ToolSyntax::Xml => {
+                let text = excluding(self, &["</think>"])?;
+                format!("{text} {} \"\\n\\n\"", self.token("</think>")?)
+            }
+            ToolSyntax::Gemma => {
+                let text = excluding(self, &["<channel|>"])?;
+                let (open, close) = (self.token("<|channel>")?, self.token("<channel|>")?);
+                let rule = self.rule("", &format!("{open} \"thought\\n\" {text} {close}"));
+                format!("{rule}?")
+            }
+            ToolSyntax::Harmony => {
+                let (channel, message) = (self.token("<|channel|>")?, self.token("<|message|>")?);
+                let (end, start) = (self.token("<|end|>")?, self.token("<|start|>")?);
+                let text = excluding(
+                    self,
+                    &["<|channel|>", "<|message|>", "<|end|>", "<|start|>"],
+                )?;
+                let rule = self.rule(
+                    "",
+                    &format!("{channel} \"analysis\" {message} {text} {end} {start} \"assistant\""),
+                );
+                format!("{rule}?")
+            }
+        })
+    }
+
+    /// One call as it continues after its opening marker, and that marker's token.
+    fn call_after_marker(
+        &mut self,
+        syntax: ToolSyntax,
+        tools: &[&ToolDefinition],
+    ) -> Result<(String, u32)> {
+        let calls = tools
+            .iter()
+            .map(|tool| match syntax {
+                ToolSyntax::Gemma => self.gemma_call(tool),
+                _ => self.xml_call(tool),
+            })
             .collect::<Result<Vec<_>>>()?
-            .join(",");
-        Ok(self.rule(
-            "",
-            &format!(
-                "{channel} \"analysis\" {message} <[^{excluded}]>* {end} {start} \"assistant\""
-            ),
-        ))
+            .join(" | ");
+        Ok(if syntax == ToolSyntax::Gemma {
+            let close = self.token("<tool_call|>")?;
+            (format!("({calls}) {close}"), self.id("<|tool_call>")?)
+        } else {
+            let close = self.token("</tool_call>")?;
+            (
+                format!("\"\\n\" ({calls}) \"\\n\" {close}"),
+                self.id("<tool_call>")?,
+            )
+        })
     }
 
     fn calls(
@@ -350,6 +437,25 @@ impl<'a> Lark<'a> {
     }
 }
 
+/// `regex` as the body of a Lark `/.../` literal, which ends at an unescaped slash or line end.
+fn regex_literal(regex: &str) -> String {
+    let mut literal = String::with_capacity(regex.len());
+    let mut chars = regex.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                literal.push(c);
+                literal.extend(chars.next());
+            }
+            '/' => literal.push_str("\\/"),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            other => literal.push(other),
+        }
+    }
+    literal
+}
+
 /// A Lark string literal; JSON's escapes are a subset of what it reads.
 fn quoted(text: &str) -> Result<String> {
     Ok(serde_json::to_string(text)?)
@@ -404,7 +510,7 @@ mod tests {
     use std::sync::Arc;
     use tur_models::backend::tools::ToolCall;
 
-    const SPECIALS: [&str; 15] = [
+    const SPECIALS: [&str; 18] = [
         "<eos>",
         "<tool_call>",
         "</tool_call>",
@@ -420,6 +526,9 @@ mod tests {
         "<|constrain|>",
         "<|im_end|>",
         "<unused>",
+        "</think>",
+        "<|channel>",
+        "<channel|>",
     ];
 
     /// One token per printable ASCII byte, after the formats' special tokens.
@@ -527,9 +636,9 @@ mod tests {
     fn compile(
         output: &StructuredOutput,
         syntax: ToolSyntax,
-        thinking: Option<bool>,
+        preamble: Preamble,
     ) -> Result<TopLevelGrammar> {
-        grammar(output, syntax, &[weather()], &tokenizer()?, thinking)
+        grammar(output, syntax, &[weather()], &tokenizer()?, preamble, &[0])
     }
 
     #[test]
@@ -545,10 +654,14 @@ mod tests {
             (r#"{"b":1}"#, false),
             ("prose", false),
         ] {
-            let grammar = compile(&schema, ToolSyntax::Xml, None)?;
+            let grammar = compile(&schema, ToolSyntax::Xml, Preamble::None)?;
             assert_eq!(admits(grammar, text)?, expected, "{text}");
         }
-        let object = compile(&StructuredOutput::JsonObject, ToolSyntax::Gemma, None)?;
+        let object = compile(
+            &StructuredOutput::JsonObject,
+            ToolSyntax::Gemma,
+            Preamble::None,
+        )?;
         assert!(admits(object, r#"{"any":[1,2]}"#)?);
         Ok(())
     }
@@ -561,19 +674,19 @@ mod tests {
             "⟦<|channel|>⟧analysis⟦<|message|>⟧free text!⟦<|end|>⟧⟦<|start|>⟧assistant{direct}"
         );
         assert!(admits(
-            compile(&schema, ToolSyntax::Harmony, None)?,
+            compile(&schema, ToolSyntax::Harmony, Preamble::Reasoning)?,
             direct
         )?);
         assert!(admits(
-            compile(&schema, ToolSyntax::Harmony, None)?,
+            compile(&schema, ToolSyntax::Harmony, Preamble::Reasoning)?,
             &reasoned
         )?);
         assert!(!admits(
-            compile(&schema, ToolSyntax::Harmony, Some(false))?,
+            compile(&schema, ToolSyntax::Harmony, Preamble::None)?,
             &reasoned
         )?);
         assert!(!admits(
-            compile(&schema, ToolSyntax::Harmony, None)?,
+            compile(&schema, ToolSyntax::Harmony, Preamble::Reasoning)?,
             r#"{"a":1}"#
         )?);
         Ok(())
@@ -583,7 +696,7 @@ mod tests {
     fn assert_call(syntax: ToolSyntax, text: &str, arguments: &Value) -> Result<()> {
         let forced = StructuredOutput::Tool(Some("weather".into()));
         assert!(
-            admits(compile(&forced, syntax, Some(false))?, text)?,
+            admits(compile(&forced, syntax, Preamble::None)?, text)?,
             "{text}"
         );
         let raw = text.replace(['⟦', '⟧'], "");
@@ -615,7 +728,7 @@ mod tests {
             call(&format!("{city}<parameter=days>\ntwo\n</parameter>\n")),
             call(&format!("{city}<parameter=unit>\nk\n</parameter>\n")),
         ] {
-            let grammar = compile(&forced, ToolSyntax::Xml, Some(false))?;
+            let grammar = compile(&forced, ToolSyntax::Xml, Preamble::None)?;
             assert!(!admits(grammar, &bad)?, "{bad}");
         }
         Ok(())
@@ -642,7 +755,7 @@ mod tests {
             call(&format!("{city},days:x")),
             call(&format!("{city},unit:{quote}k{quote}")),
         ] {
-            let grammar = compile(&forced, ToolSyntax::Gemma, None)?;
+            let grammar = compile(&forced, ToolSyntax::Gemma, Preamble::None)?;
             assert!(!admits(grammar, &bad)?, "{bad}");
         }
         Ok(())
@@ -656,7 +769,14 @@ mod tests {
             json!({"type": "object", "properties": {"n": {"type": "integer", "minimum": 3}}}),
         );
         let forced = StructuredOutput::Tool(None);
-        let refused = grammar(&forced, ToolSyntax::Gemma, &[tool], &tokenizer()?, None);
+        let refused = grammar(
+            &forced,
+            ToolSyntax::Gemma,
+            &[tool],
+            &tokenizer()?,
+            Preamble::None,
+            &[0],
+        );
         assert!(refused.is_err_and(|error| error.to_string().contains("minimum")));
         Ok(())
     }
@@ -668,7 +788,7 @@ mod tests {
         let forced = StructuredOutput::Tool(None);
         let missing = r#"⟦<|channel|>⟧commentary to=functions.weather ⟦<|constrain|>⟧json⟦<|message|>⟧{"days":1}"#;
         assert!(!admits(
-            compile(&forced, ToolSyntax::Harmony, None)?,
+            compile(&forced, ToolSyntax::Harmony, Preamble::Reasoning)?,
             missing
         )?);
         Ok(())
@@ -680,10 +800,147 @@ mod tests {
         let two = format!("{one}{one}");
         let required = StructuredOutput::Tool(None);
         let named = StructuredOutput::Tool(Some("weather".into()));
-        assert!(admits(compile(&required, ToolSyntax::Gemma, None)?, &two)?);
-        assert!(!admits(compile(&named, ToolSyntax::Gemma, None)?, &two)?);
+        assert!(admits(
+            compile(&required, ToolSyntax::Gemma, Preamble::None)?,
+            &two
+        )?);
+        assert!(!admits(
+            compile(&named, ToolSyntax::Gemma, Preamble::None)?,
+            &two
+        )?);
         let unknown = StructuredOutput::Tool(Some("other".into()));
-        assert!(compile(&unknown, ToolSyntax::Gemma, None).is_err());
+        assert!(compile(&unknown, ToolSyntax::Gemma, Preamble::None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_qwen_and_gemma_may_reason_before_forced_output() -> Result<()> {
+        let json = StructuredOutput::JsonObject;
+        let qwen = |text: &str| -> Result<bool> {
+            admits(compile(&json, ToolSyntax::Xml, Preamble::Reasoning)?, text)
+        };
+        assert!(qwen("free <text>!⟦</think>⟧\n\n{\"a\":1}")?);
+        assert!(!qwen("{\"a\":1}")?);
+        assert!(!qwen("free⟦</think>⟧\n\nprose")?);
+        let gemma = |text: &str| -> Result<bool> {
+            admits(
+                compile(&json, ToolSyntax::Gemma, Preamble::Reasoning)?,
+                text,
+            )
+        };
+        assert!(gemma("⟦<|channel>⟧thought\nfree!⟦<channel|>⟧{\"a\":1}")?);
+        assert!(gemma("{\"a\":1}")?);
+        assert!(!gemma("⟦<|channel>⟧thought\nfree⟦<channel|>⟧prose")?);
+        Ok(())
+    }
+
+    /// Drive a lazy grammar through `text`, and report whether each marked position allowed
+    /// the next token.
+    fn lazy_admits(syntax: ToolSyntax, text: &str) -> Result<bool> {
+        let tokenizer = tokenizer()?;
+        let factory = build_llg_factory(tokenizer.clone(), Some(SPECIALS.len() + 96), &[0])?;
+        let mut control = GuidanceControl::new(factory);
+        let (grammar, trigger) = lazy_call(syntax, &[weather()], &tokenizer)?
+            .ok_or_else(|| TurError::Other("no lazy grammar".into()))?;
+        control.arm(grammar, trigger)?;
+        for token in tokens(&tokenizer, text)? {
+            if let Some(GrammarMask::Allowed(bits)) = control.mask()?
+                && bits
+                    .get((token / 32) as usize)
+                    .is_none_or(|word| word >> (token % 32) & 1 == 0)
+            {
+                return Ok(false);
+            }
+            if control.commit(token)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    #[test]
+    fn test_lazy_grammars_constrain_only_calls_and_rearm_after_each() -> Result<()> {
+        let quote = "⟦<|\"|>⟧";
+        let call = format!("⟦<|tool_call>⟧call:weather{{city:{quote}a{quote}}}⟦<tool_call|>⟧");
+        assert!(lazy_admits(ToolSyntax::Gemma, "free text")?);
+        assert!(lazy_admits(
+            ToolSyntax::Gemma,
+            &format!("free {call} more free {call} end")
+        )?);
+        // A second call is held to the schema as firmly as the first.
+        let bad = "⟦<|tool_call>⟧call:weather{days:1}";
+        assert!(!lazy_admits(ToolSyntax::Gemma, bad)?);
+        assert!(!lazy_admits(
+            ToolSyntax::Gemma,
+            &format!("{call} then {bad}")
+        )?);
+        let xml = "⟦<tool_call>⟧\n<function=weather>\n<parameter=city>\nKyiv\n</parameter>\n</function>\n⟦</tool_call>⟧";
+        assert!(lazy_admits(ToolSyntax::Xml, &format!("free {xml} free"))?);
+        assert!(!lazy_admits(ToolSyntax::Xml, "⟦<tool_call>⟧\nprose")?);
+        assert!(lazy_call(ToolSyntax::Harmony, &[weather()], &tokenizer()?)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_forced_reports_only_a_single_allowed_token() -> Result<()> {
+        let tokenizer = tokenizer()?;
+        let factory = build_llg_factory(tokenizer.clone(), Some(SPECIALS.len() + 96), &[0])?;
+        let mut control = GuidanceControl::new(factory);
+        control.activate(TopLevelGrammar::from_regex("ab(c|d)"))?;
+        let id = |text: &str| -> Result<u32> {
+            tokens(&tokenizer, text)?
+                .first()
+                .copied()
+                .ok_or_else(|| TurError::Other("empty".into()))
+        };
+        assert_eq!(control.forced()?, Some(id("a")?));
+        control.commit(id("a")?)?;
+        assert_eq!(control.forced()?, Some(id("b")?));
+        control.commit(id("b")?)?;
+        assert_eq!(control.forced()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_regex_and_lark_answers_keep_the_models_framing() -> Result<()> {
+        let date = StructuredOutput::Regex(r"[0-9]{2}/[0-9]{2}".into());
+        let sql = StructuredOutput::Lark("start: \"SELECT \" NAME \";\"\nNAME: /[a-z]+/\n".into());
+        for (output, valid, invalid) in [
+            (&date, "12/31", "12-31"),
+            (&sql, "SELECT name;", "DROP name;"),
+        ] {
+            for (syntax, frame) in [
+                (ToolSyntax::Xml, ""),
+                (ToolSyntax::Gemma, ""),
+                (ToolSyntax::Harmony, "⟦<|channel|>⟧final⟦<|message|>⟧"),
+            ] {
+                let check = |text: &str| -> Result<bool> {
+                    admits(
+                        compile(output, syntax, Preamble::None)?,
+                        &format!("{frame}{text}"),
+                    )
+                };
+                assert!(check(valid)?, "{valid}");
+                assert!(!check(invalid)?, "{invalid}");
+            }
+        }
+        let reasoned = "free⟦</think>⟧\n\n12/31";
+        assert!(admits(
+            compile(&date, ToolSyntax::Xml, Preamble::Reasoning)?,
+            reasoned
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_regex_literals_escape_what_would_end_them() -> Result<()> {
+        assert_eq!(regex_literal(r"a/b\/c\\/d"), r"a\/b\/c\\\/d");
+        assert_eq!(regex_literal("a\nb"), r"a\nb");
+        let newline = StructuredOutput::Regex("a\nb".into());
+        assert!(admits(
+            compile(&newline, ToolSyntax::Xml, Preamble::None)?,
+            "a\nb"
+        )?);
         Ok(())
     }
 }

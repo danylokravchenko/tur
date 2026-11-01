@@ -4,6 +4,7 @@ mod harmony;
 pub mod memory;
 pub mod pipeline;
 pub mod prefix;
+mod reasoning;
 pub mod scheduler;
 pub mod speculation;
 mod stop;

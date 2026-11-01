@@ -8,14 +8,6 @@ This page compares Tur with vLLM, llama.cpp, SGLang, oMLX, BaseRT and recent pap
 
 These keep output exact and cost little to try.
 
-### Faster structured output
-
-The server now exposes `response_format`, required and named tool choice, and `logprobs` (see [HTTP API](../guide/http-api.md#structured-output)). Two techniques from other engines remain.
-
-llama.cpp's [lazy grammars](https://docs.rs/llama-cpp-4/0.7.0/llama_cpp_4/chat/) stay dormant until a tool-call marker appears, so reasoning runs unconstrained. Tur could use this to enforce arguments under `tool_choice=auto`, and to let Qwen and Gemma think before forced output, which would first need their reasoning split from `content` as Harmony's already is.
-
-[XGrammar](https://arxiv.org/pdf/2411.15100) and [llguidance](https://github.com/guidance-ai/llguidance) also skip sampling when the grammar leaves one possible token. Such a token has probability 1 under the mask, so the shortcut stays exact and a JSON key can run as one multi-token pass. Tur currently rejects grammars that ask for this (`crates/tur-engine/src/backend/guidance.rs`), and it would need a rule for advancing the random stream so that same-seed results stay identical.
-
 ### Request ordering beyond arrival order
 
 Prompts run in arrival order, with no priorities or per-client fairness. The tenant only namespaces the prefix cache, so one client's 8K-token prompts can hold back another's short question.

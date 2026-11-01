@@ -591,6 +591,17 @@ async fn test_response_format_and_tool_choice_reach_the_worker_as_forced_output(
             None,
             1,
         ),
+        (
+            json!({"response_format": {"type": "grammar", "syntax": "regex", "definition": "a+"}}),
+            Some(StructuredOutput::Regex("a+".to_string())),
+            0,
+        ),
+        (
+            json!({"response_format": {"type": "grammar", "syntax": "lark",
+                "definition": "start: \"a\""}}),
+            Some(StructuredOutput::Lark("start: \"a\"".to_string())),
+            0,
+        ),
         // `none` hides the tools from the template, so a response format may join it.
         (
             json!({"tools": [tool("f")], "tool_choice": "none",
@@ -631,6 +642,8 @@ async fn test_unsatisfiable_structured_requests_return_400() -> TestResult {
             "tools": [tool("f")]}),
         json!({"tool_choice": {"type": "function"}, "tools": [tool("f")]}),
         json!({"response_format": {"type": "json_object"}, "tools": [tool("f")]}),
+        json!({"response_format": {"type": "grammar", "syntax": "lark", "definition": "x"},
+            "tools": [tool("f")]}),
         json!({"top_logprobs": 2}),
         json!({"logprobs": true, "top_logprobs": 21}),
     ] {
@@ -702,5 +715,31 @@ async fn test_logprobs_follow_the_openai_shape_when_blocking_and_streaming() -> 
         .filter(|logprobs| !logprobs.is_null())
         .collect();
     assert_eq!(carrying, [&expected]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_a_grammar_failing_during_generation_is_the_clients_error() -> TestResult {
+    let (tx, mut rx) = mpsc::channel::<WorkerMsg>(8);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let error = tur::TurError::Guidance("too many expressions".to_string());
+            drop(msg.result_tx.send(Err(error)));
+        }
+    });
+    let router = build_router(AppState {
+        status: tur::server::ServerStatus::shared(),
+        workers: HashMap::from([("m".to_string(), PipelineWorker::from_sender(tx))]),
+        transcribers: HashMap::new(),
+        default_transcriber: None,
+        default_model: "m".to_string(),
+    });
+    let extra =
+        json!({"response_format": {"type": "grammar", "syntax": "regex", "definition": "a"}});
+    let request = json_request("/v1/chat/completions", "POST", &chat_body(&extra))?;
+    let response = router.oneshot(request).await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response.into_body()).await?;
+    assert_eq!(json["error"]["code"], "invalid_grammar");
     Ok(())
 }

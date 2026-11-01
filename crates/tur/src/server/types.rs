@@ -73,7 +73,21 @@ pub struct ChatCompletionRequest {
 pub enum ResponseFormat {
     Text,
     JsonObject,
-    JsonSchema { json_schema: JsonSchemaFormat },
+    JsonSchema {
+        json_schema: JsonSchemaFormat,
+    },
+    /// A Tur extension, shaped like `OpenAI`'s grammar format for custom tools.
+    Grammar {
+        syntax: GrammarSyntax,
+        definition: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrammarSyntax {
+    Regex,
+    Lark,
 }
 
 #[derive(Debug, Deserialize)]
