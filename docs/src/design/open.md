@@ -2,12 +2,14 @@
 
 ## Models and hardware
 
-- Run a real Qwen MoE checkpoint through the expert cache.
+- Check the real Qwen3.6-35B-A3B artifact against Transformers. It generates on a 36 GB M3 Pro, resident and through a 4 GiB expert cache ([Qwen3.6-35B-A3B](../guide/performance.md#qwen36-35b-a3b)), but its logits haven't been compared with a reference or with the resident run, and only an RTN Q4K artifact exists. Q8_0 and GPTQ artifacts would show how much quality the 4-bit rounding costs.
+- Fit sixteen sequences of Qwen3.6-35B-A3B resident on a 36 GB Mac. llama.cpp completes that burst with all weights in memory, while Tur's resident plan fails with a Metal out-of-memory error even though the planned 27.0 GB is below the 30.2 GB working set ([Qwen3.6-35B-A3B](../guide/performance.md#qwen36-35b-a3b)). Find where the plan and the real allocation differ.
+- Report the expert cache's hit rate and read time in the serving benchmark. The sixteen-request burst varies from 20.7 to 25.7 tokens/s between runs, and the JSON doesn't say whether misses explain it.
 - Make pruning generalize. Search on KL now exists and overfits its calibration text, so the next step is far more varied calibration, or recovery training, judged by task benchmarks rather than KL.
-- Run the larger models. Qwen3.8-27B and the Qwen3.6-35B MoE need Macs that fit them, and then measurements of quality, the K/V format choice (Q8 is the likely default under 16 GB), and the wide MoE tier, which trails Candle by 1.2 to 1.5× and needs real routing traces.
-- Run a real expert checkpoint's MTP head and measure its draft acceptance. Only a tiny Transformers fixture has run it so far.
+- Run the larger models. Qwen3.8-27B needs a Mac that fits it. For both it and the Qwen3.6-35B MoE, quality, the K/V format choice (Q8 is the likely default under 16 GB) and the wide MoE tier, which trails Candle by 1.2 to 1.5× and needs real routing traces, are still unmeasured.
+- Run the Qwen3.6-35B-A3B MTP head through the expert cache and with eight or more requests. It is measured with resident experts at one to four requests ([Qwen3.6-35B-A3B](../guide/performance.md#qwen36-35b-a3b)); whether its own expert reads pay off behind a cache, and why a second pipeline in one process ran out of GPU memory, are open.
 - Finish Gemma 4. Run the larger checkpoints on suitable Macs and set held-out quality budgets. Assistant chains pay only with one request decoding (see [Speculative decoding](../architecture/speculation.md#decisions)); several requests need a cheaper chained step, for example gathering candidate heads in a batch without a CPU round trip per step. Calibrated Gemma artifacts (`imatrix`, GPTQ) need layer-by-layer calibration that handles PLE and shared K/V.
-- More Macs. Every number so far comes from one M1. Launch shapes and crossover points need per-device sweeps, and the minimum supported macOS and chip still has to be decided.
+- More Macs. Most numbers come from one M1; the Qwen3.6-35B-A3B section is the only one from an M3 Pro. Launch shapes and crossover points need per-device sweeps, and the minimum supported macOS and chip still has to be decided.
 
 ## Audio
 
@@ -19,7 +21,7 @@
 
 - Long-prompt prefill. llama.cpp prefills 8K-token prompts 6 to 11% faster than Tur, while 2K-token prompts are level ([Compared with llama.cpp](../guide/performance.md#compared-with-llamacpp)). Tiled attention is about 2.4 s of an 8K-token prefill across six layers, and the other 6 s grows linearly with tokens, so that remainder is the larger target. Chunk size isn't the lever: 256- and 512-token chunks match a single pass at 8K.
 - Tiled prefill attention reaches about 30% of the matrix units' F32 peak, with eight barriers per 32-key block at head dimension 256 over F32 and F16 pools, and sixteen over Q8. Barriers aren't the limit, since cutting them to two made it slower. Removing K/V reads would save about 17%, the softmax 10% and query loads about 13%, and the multiplies themselves take most of the rest.
-- Broader comparisons. llama.cpp is measured for Q8_0 and Q4_K_M at up to 16 sequences. Still to do: MLX-LM on this Mac, 32K-token prompts, cached and uncached prefixes, and sustained load.
+- Broader comparisons. llama.cpp is measured for Q8_0 and Q4_K_M at up to 16 sequences. Qwen3.6-35B-A3B is measured against llama.cpp on an M3 Pro, and against a reported oMLX figure. Still to do: MLX-LM on this Mac, 32K-token prompts, cached and uncached prefixes, and sustained load.
 - Quality budgets. Held-out budgets, declared in advance, for language, code, tool calls and JSON, and long-context retrieval, with confidence intervals.
 - Chained MTP drafts, estimated at about 10% with one request.
 - Layer-by-layer sensitivity measurement for `--budget-bits`, which still needs the whole F32 model in memory.

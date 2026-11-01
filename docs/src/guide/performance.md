@@ -240,6 +240,76 @@ E2B with Q8_0 weights encoding clips on their own queue, while a 400-token greed
 | Text pass, alone: median, slowest | 47 ms, 109 ms |
 | Text pass beside that clip: median, slowest | 48 ms, 165 ms |
 
+## Qwen3.6-35B-A3B
+
+Qwen3.6-35B-A3B is a mixture-of-experts model with 35 billion parameters, of which 3 billion are active for each token. Every layer routes a token to 8 of its 256 experts, so decode reads only a small part of the expert weights per step, while the full bank has to be resident or read from the SSD. The rows below use a Q4K artifact made with `tur quantize --method rtn` from the pinned `Qwen/Qwen3.6-35B-A3B` snapshot. Its weights take 20.3 GB.
+
+These runs use an Apple M3 Pro with an 18-core GPU and 36 GB of unified memory, on macOS 27.0.1, on AC power with low-power mode off. The GPU's recommended working set is 30.2 GB, so the model fits but leaves little room for long batches. Serving rows are the best of three runs.
+
+Single sequence, from the `model` benchmark (median of 12 decode steps or 2 to 4 prefill passes, F16 K/V):
+
+| Case | Result |
+| --- | --- |
+| Prefill, 512 tokens | 647 tokens/s |
+| Prefill, 2,048 tokens | 717 tokens/s |
+| Decode, 1 sequence at 128 tokens | 47.1 tokens/s (21.2 ms per step) |
+| Decode, 1 sequence at 2K tokens | 45.7 tokens/s |
+| Decode, 4 sequences at 128 tokens | 86.0 tokens/s |
+| Decode, 4 sequences at 2K tokens | 89.0 tokens/s |
+| Decode, 8 sequences at 128 tokens | 142 tokens/s |
+| Load time | 9.2 s |
+
+Bursts through the full pipeline: N requests arrive at once, each with a 128-token prompt and 64 output tokens, sampled at temperature 0.7, top-k 20 and top-p 0.95:
+
+| Concurrent | Output tok/s | TTFT p50 | ITL p50 | ITL p95 | ITL p99 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 39.2 | 0.31 s | 20.8 ms | 21.8 ms | 21.9 ms |
+| 2 | 50.8 | 0.49 s | 32.4 ms | 33.8 ms | 34.0 ms |
+| 4 | 73.1 | 0.87 s | 43.8 ms | 46.2 ms | 46.7 ms |
+| 8 | 101.5 | 1.61 s | 54.4 ms | 65.2 ms | 75.4 ms |
+
+Sixteen concurrent requests cannot run with every expert resident: each attempt failed with a Metal out-of-memory error. With `TUR_BENCH_EXPERT_CACHE_MB=4096`, the experts stay on the SSD behind a 4 GiB cache and the same burst completes at 25.7 output tokens/s, with a range of 20.7 to 25.7 across runs. TTFT p50 is 5.9 s, and ITL p50 is 315 ms, because each sequence waits for its experts to be read on every step. The cache is the only way this burst runs on this Mac, and its figures are for a different configuration from the resident rows above.
+
+Against llama.cpp and a reported MLX-family result on the same chip class:
+
+| Engine, weights | Prefill | Decode, 1 sequence |
+| --- | --- | --- |
+| Tur, Q4K artifact | 647 tokens/s at 512, 717 at 2K | 47.1 tokens/s at 128 tokens, 45.7 at 2K |
+| llama.cpp, unsloth UD-Q4_K_M | 665 tokens/s at 512, 650 at 2K | 35.6 tokens/s at 128 tokens, 34.8 at 2K |
+| oMLX v0.7.0.dev2, 4-bit | 632 tokens/s at 1K | 39.2 tokens/s at 1K |
+
+llama.cpp 0.8.0 (build 11960, Homebrew) ran on this Mac with `llama-bench -r 3` and its defaults: Metal and F16 K/V, flash attention chosen automatically. The GGUF is unsloth's `Qwen3.6-35B-A3B-UD-Q4_K_M` (revision `a483e9e6cbd595906af30beda3187c2663a1118c`, 22.1 GB). It mixes quantization types per tensor and is not the same format as Tur's RTN Q4K artifact, so the comparison is between engines with their usual 4-bit weights, not between kernels on identical bits. Quality was not measured for either. The oMLX row is a reported result from an M3 Pro with an 18-core GPU, not a rerun here, and it uses a 1K prompt.
+
+Batched decode with 128-token prompts and 64 generated tokens, as output tokens per second over the whole burst. llama.cpp comes from `llama-batched-bench -c 8192 -ub 512` and is the best of three runs for 1 to 8 sequences and one run for 16; Tur is the serving benchmark above:
+
+| Concurrent | Tur | llama.cpp |
+| --- | --- | --- |
+| 1 | 39.2 | 31.3 |
+| 2 | 50.8 | 45.8 |
+| 4 | 73.1 | 62.1 |
+| 8 | 101.5 | 75.0 |
+| 16 | 25.7 with a 4 GiB expert cache | 81.4 |
+
+Tur is ahead of llama.cpp from 1 to 8 sequences, by 25% at one and 35% at eight. At 16 sequences llama.cpp keeps every weight resident and completes the burst, while Tur ran out of GPU memory and only completes it through the expert cache, so that row compares different configurations. Tur samples at temperature 0.7, top-k 20 and top-p 0.95 on the device, and `llama-batched-bench` has its own sampling, so the harnesses are not identical.
+
+Speculative decoding with the model's own MTP head (`--mtp`, with prompt lookup and 4 drafts) speeds up decoding on this checkpoint. Each row is a burst of N requests with 128 output tokens, sampled at temperature 0.7, top-k 20 and top-p 0.95, as the best of three runs. Normal is decoding without speculation. These prompts are a repeated pattern, a new prose question and a code request, so they are not the burst prompts in the serving table above:
+
+| Requests | Prompt | Normal tok/s | Lookup + MTP tok/s | Speedup |
+| --- | --- | --- | --- | --- |
+| 1 | Repetitive | 43.5 | 82.0 | 1.89× |
+| 1 | New prose | 45.3 | 49.2 | 1.09× |
+| 1 | Code | 44.6 | 52.1 | 1.17× |
+| 2 | Repetitive | 58.4 | 116.5 | 1.99× |
+| 2 | New prose | 58.6 | 74.8 | 1.28× |
+| 2 | Code | 58.5 | 77.4 | 1.32× |
+| 4 | Repetitive | 99.1 | 156.7 | 1.58× |
+| 4 | New prose | 88.5 | 107.5 | 1.21× |
+| 4 | Code | 89.3 | 119.7 | 1.34× |
+
+On repetitive text prompt lookup supplies every draft and all of them are accepted. On new prose and code, MTP supplies nearly all the drafts, and 84% of its drafts were accepted on prose at one request (139 of 166), about 80% on prose at two and four requests, and 88 to 92% on code. A pass with drafts costs more than a normal pass, about 33 ms against 21 ms for one request, so the gain on new text is smaller than the acceptance suggests. Time to first token is unchanged. The output matched normal decoding's tokens for every request compared. The head also adds 0.8 to 1.7 GB to the resident plan for its draft slots at one to four requests.
+
+In one process, the MTP configuration ran out of GPU memory after the normal-decoding configuration had run first, though it runs alone. Each configuration therefore ran in its own process. Whether the first pipeline's memory is released late or the two plans genuinely do not fit together is not established.
+
 ## Compared with llama.cpp
 
 llama.cpp 0.7.0 (build 11669, Homebrew) on the same Mac, with unsloth's Qwen3.5-0.8B GGUF files (revision `6ab461498e2023f6e3c1baea90a8f0fe38ab64d0`) and its defaults: Metal and F16 K/V. Its figures are the best of three runs. Q8_0 is the like-for-like format. GGUF's Q4_K_M mixes Q4_K and Q6_K blocks (497 MiB), while Tur's Q4K uses Q4_K for every projection.
