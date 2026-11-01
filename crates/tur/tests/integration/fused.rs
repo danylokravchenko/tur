@@ -1122,7 +1122,7 @@ fn letters_grammar(regex: &str) -> Result<tur_engine::backend::guidance::Guidanc
     });
     let tokenizer = tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&tokenizer)?)
         .map_err(|error| TurError::Tokenizer(error.to_string()))?;
-    let mut guidance = GuidanceControl::new(build_llg_factory(tokenizer, Some(160))?);
+    let mut guidance = GuidanceControl::new(build_llg_factory(tokenizer, Some(160), &[])?);
     guidance.activate(TopLevelGrammar::from_regex(regex))?;
     Ok(guidance)
 }

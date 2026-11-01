@@ -90,8 +90,9 @@ fn serve_batch(pipeline: &mut InferencePipeline, prompts: Vec<String>) -> Result
 | `timeout` | Deadline measured from submission |
 | `cache_salt` | Prefix-reuse namespace |
 | `grammar` | A `TopLevelGrammar` (llguidance) the output must match; the request ends when the grammar does |
+| `structured` | A `StructuredOutput`: a JSON answer or tool call compiled for this model's format, as in the [HTTP API](http-api.md#structured-output). Excludes `grammar` |
 
-A finished request returns `GenerationStats`, with the generated text and any parsed `tool_calls`, prompt, generated and cached token counts, time to first token and total time, how often it was preempted, how many tokens were drafted and accepted, and the `finish_reason`.
+A finished request returns `GenerationStats`, with the generated text and any parsed `tool_calls`, any `logprobs` the request's `SamplingOptions` asked for, prompt, generated and cached token counts, time to first token and total time, how often it was preempted, how many tokens were drafted and accepted, and the `finish_reason`.
 
 ## Configuration
 

@@ -9,7 +9,7 @@ mod requests;
 mod scheduling;
 
 pub use config::PipelineConfig;
-pub use requests::{BatchStepOutput, GenerationRequest, GenerationStats, PassTiming};
+pub use requests::{BatchStepOutput, GenerationRequest, GenerationStats, PassTiming, TokenLogprob};
 
 use super::{
     guidance::ParserFactory,
@@ -91,6 +91,9 @@ struct Pending {
     last_run: u64,
     preemptions: usize,
     tools: Vec<ToolDefinition>,
+    /// Names tokens for the log probabilities it reports, when the request asked for them.
+    logprob_tokens: Option<Arc<ParserFactory>>,
+    logprobs: Vec<TokenLogprob>,
     /// Grammar-constrained: never drafted, so masks stay on the device.
     constrained: bool,
     /// Greedy decoding: its drafts' acceptance is calibrated separately from sampling's.

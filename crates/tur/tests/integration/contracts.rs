@@ -506,6 +506,7 @@ fn test_deterministic_drafts_preserve_target_sampling_rng_penalties_and_every_la
         repetition_penalty: Some(1.2),
         presence_penalty: Some(0.3),
         frequency_penalty: Some(0.2),
+        logprobs: None,
     };
     let mut accepted_total = 0;
     for seed in 0..256 {
@@ -866,7 +867,7 @@ fn grammar() -> Result<GuidanceControl> {
     });
     let tokenizer = tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&tokenizer)?)
         .map_err(|error| TurError::Tokenizer(error.to_string()))?;
-    let mut guidance = GuidanceControl::new(build_llg_factory(tokenizer, Some(8))?);
+    let mut guidance = GuidanceControl::new(build_llg_factory(tokenizer, Some(8), &[])?);
     guidance.activate(TopLevelGrammar::from_regex("abc"))?;
     Ok(guidance)
 }

@@ -1,16 +1,17 @@
 //! Request admission, cancellation and publication of committed outputs.
 
 use super::super::{
-    guidance::{GuidanceControl, TopLevelGrammar, build_llg_factory},
+    guidance::{GuidanceControl, ParserFactory, TopLevelGrammar, build_llg_factory, token_bytes},
     harmony::{Fragment, Harmony},
     speculation::NgramIndex,
     stop::StopMatcher,
+    structured::{self, StructuredOutput},
     tokenizer::TokenOutputStream,
 };
 use super::{InferencePipeline, Pending};
 use crate::{
     Result, TurError,
-    hybrid::{SamplingOptions, SequenceCommit},
+    hybrid::{OutputLogprobs, SamplingOptions, SequenceCommit},
 };
 use candle_core::Tensor;
 use std::{
@@ -21,7 +22,7 @@ use tur_core::execution::invalid;
 use tur_models::{
     backend::{
         chat_template::{ChatMessage, RenderOptions, Role},
-        tools::{ToolCall, ToolDefinition},
+        tools::{ToolCall, ToolDefinition, ToolSyntax},
     },
     models::GenerationDefaults,
 };
@@ -50,6 +51,10 @@ pub struct GenerationRequest {
     pub cache_salt: Option<String>,
     /// Constrain generation to this grammar; the request completes when it terminates.
     pub grammar: Option<TopLevelGrammar>,
+    /// Force a JSON answer or a tool call in this model's format; excludes `grammar`.
+    /// Models that don't separate their reasoning run with thinking off, and asking for it
+    /// is an error, because the grammar would otherwise force the reasoning too.
+    pub structured: Option<StructuredOutput>,
     /// Soft tokens of every clip of `messages`, in order, when they were encoded before
     /// submission; empty encodes them at submission, on the calling thread.
     pub encoded_audio: Vec<Tensor>,
@@ -74,6 +79,7 @@ impl GenerationRequest {
             submitted_at: None,
             cache_salt: None,
             grammar: None,
+            structured: None,
             encoded_audio: Vec::new(),
         }
     }
@@ -85,6 +91,38 @@ impl GenerationRequest {
                 .messages
                 .iter()
                 .any(|m| m.content.audio().next().is_some())
+    }
+}
+
+/// One generated token's log probability, or one of its likeliest alternatives.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenLogprob {
+    /// The token's text, lossy where it holds part of a character.
+    pub token: String,
+    pub bytes: Vec<u8>,
+    pub logprob: f32,
+    /// Empty on the alternatives themselves.
+    pub top: Vec<Self>,
+}
+
+impl TokenLogprob {
+    fn new(factory: &ParserFactory, id: u32, logprob: f32, top: Vec<Self>) -> Self {
+        let bytes = token_bytes(factory, id);
+        Self {
+            token: String::from_utf8_lossy(&bytes).into_owned(),
+            bytes,
+            logprob,
+            top,
+        }
+    }
+
+    fn of_output(factory: &ParserFactory, id: u32, output: OutputLogprobs) -> Self {
+        let top = output
+            .top
+            .into_iter()
+            .map(|(id, logprob)| Self::new(factory, id, logprob, Vec::new()))
+            .collect();
+        Self::new(factory, id, output.logprob, top)
     }
 }
 
@@ -108,6 +146,9 @@ pub struct GenerationStats {
     pub generated_text: String,
     /// Reasoning the model separates from its answer; empty for models that don't.
     pub reasoning_text: String,
+    /// Every generated token except EOS, in order, when the request asked for them. This
+    /// includes reasoning and tokens a stop sequence cut from `generated_text`.
+    pub logprobs: Vec<TokenLogprob>,
     /// `stop` for EOS, `length` for the request limit.
     pub finish_reason: &'static str,
 }
@@ -226,11 +267,16 @@ impl Pending {
 impl InferencePipeline {
     /// Predict where a new user turn would first rewrite this prompt. Only token
     /// equality at lookup authorizes a restore; the probe just chooses a pass end.
-    fn turn_boundary(&self, request: &GenerationRequest, tokens: &[u32]) -> Option<usize> {
+    fn turn_boundary(
+        &self,
+        request: &GenerationRequest,
+        render: &RenderOptions,
+        tokens: &[u32],
+    ) -> Option<usize> {
         // A first turn has no demonstrated conversational reuse; splitting it adds a
         // pass to ordinary single-turn requests. Start predicting once history exists.
         if !self.prefix.config().enabled()
-            || !request.render.add_generation_prompt
+            || !render.add_generation_prompt
             || !request
                 .messages
                 .iter()
@@ -245,7 +291,7 @@ impl InferencePipeline {
         ]);
         let options = RenderOptions {
             add_generation_prompt: false,
-            ..request.render.clone()
+            ..render.clone()
         };
         // A template may reject synthetic empty turns. That makes the prediction
         // unavailable, without invalidating the actual request that already rendered.
@@ -261,6 +307,60 @@ impl InferencePipeline {
             .count();
         (boundary > 0 && boundary < tokens.len() && !self.prefix.is_boundary(boundary))
             .then_some(boundary)
+    }
+
+    /// The parser factory over the tokenizer, built on first use.
+    fn parser_factory(&mut self) -> Result<Arc<ParserFactory>> {
+        if let Some(factory) = &self.guidance {
+            return Ok(Arc::clone(factory));
+        }
+        let vocab = self.engine.pool().description().vocab_size;
+        let factory = build_llg_factory(
+            self.tokenizer.clone(),
+            Some(vocab),
+            &self.defaults.eos_tokens,
+        )?;
+        self.guidance = Some(Arc::clone(&factory));
+        Ok(factory)
+    }
+
+    /// The options a structured request renders with. See [`GenerationRequest::structured`].
+    fn render_options(&self, request: &GenerationRequest) -> Result<RenderOptions> {
+        let mut render = request.render.clone();
+        if request.structured.is_some() && !structured::separates_reasoning(self.tool_syntax()) {
+            if render.enable_thinking == Some(true) {
+                return Err(invalid(
+                    "this model can't think before forced output: set thinking to false",
+                ));
+            }
+            render.enable_thinking = Some(false);
+        }
+        Ok(render)
+    }
+
+    fn tool_syntax(&self) -> ToolSyntax {
+        self.model.tool_syntax()
+    }
+
+    /// The request's parser, started. A grammar that doesn't compile is the request's fault.
+    fn request_guidance(&mut self, request: &GenerationRequest) -> Result<Option<GuidanceControl>> {
+        let grammar = match (&request.grammar, &request.structured) {
+            (Some(_), Some(_)) => return Err(invalid("grammar excludes structured output")),
+            (Some(grammar), None) => grammar.clone(),
+            (None, Some(output)) => structured::grammar(
+                output,
+                self.tool_syntax(),
+                &request.tools,
+                &self.tokenizer,
+                request.render.enable_thinking,
+            )?,
+            (None, None) => return Ok(None),
+        };
+        let mut control = GuidanceControl::new(self.parser_factory()?);
+        control
+            .activate(grammar)
+            .map_err(|error| invalid(format!("invalid grammar: {error}")))?;
+        Ok(Some(control))
     }
 
     /// Render, tokenize and queue one text conversation with independent sampling state.
@@ -281,9 +381,10 @@ impl InferencePipeline {
         if request.messages.is_empty() || request.max_tokens == 0 {
             return Err(invalid("messages and max_tokens must be nonempty/positive"));
         }
+        let render = self.render_options(request)?;
         let prompt = self
             .template
-            .render(&request.messages, &request.tools, &request.render)?;
+            .render(&request.messages, &request.tools, &render)?;
         let tokens = self
             .tokenizer
             .encode(prompt, false)
@@ -325,28 +426,16 @@ impl InferencePipeline {
             });
         self.scheduler
             .admit(waiting, waiting_tokens, tokens.len())?;
-        let turn_boundary = self.turn_boundary(request, &tokens);
+        let turn_boundary = self.turn_boundary(request, &render, &tokens);
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(TurError::DeadlineExceeded);
         }
-        let constrained = request.grammar.is_some();
         let options = sampling(request.sampling, &self.defaults);
-        let guidance = request
-            .grammar
-            .clone()
-            .map(|grammar| -> Result<GuidanceControl> {
-                let factory = if let Some(factory) = &self.guidance {
-                    Arc::clone(factory)
-                } else {
-                    let vocab = self.engine.pool().description().vocab_size;
-                    let factory = build_llg_factory(self.tokenizer.clone(), Some(vocab))?;
-                    self.guidance = Some(Arc::clone(&factory));
-                    factory
-                };
-                let mut control = GuidanceControl::new(factory);
-                control.activate(grammar)?;
-                Ok(control)
-            })
+        let guidance = self.request_guidance(request)?;
+        let constrained = guidance.is_some();
+        let logprob_tokens = options
+            .logprobs
+            .map(|_| self.parser_factory())
             .transpose()?;
         let handle = self.engine.allocate(request.seed, options, guidance)?;
         // Audio positions are not tokens the repetition penalty could see repeated.
@@ -373,9 +462,7 @@ impl InferencePipeline {
                 prefix_checked: None,
                 running: false,
                 stream: TokenOutputStream::new(self.tokenizer.clone()),
-                harmony: self
-                    .model
-                    .speaks_harmony()
+                harmony: (self.tool_syntax() == ToolSyntax::Harmony)
                     .then(|| Harmony::new(&self.tokenizer))
                     .flatten(),
                 stop,
@@ -386,6 +473,8 @@ impl InferencePipeline {
                 last_run: 0,
                 preemptions: 0,
                 tools: request.tools.clone(),
+                logprob_tokens,
+                logprobs: Vec::new(),
                 constrained,
                 greedy: options.greedy(),
                 ngrams: NgramIndex::default(),
@@ -494,6 +583,10 @@ impl InferencePipeline {
             let eos = self.defaults.eos_tokens.contains(&token.token);
             if !eos {
                 pending.decode_token(id, token.token, output)?;
+                if let (Some(factory), Some(logprobs)) = (&pending.logprob_tokens, token.logprobs) {
+                    let entry = TokenLogprob::of_output(factory, token.token, logprobs);
+                    pending.logprobs.push(entry);
+                }
             }
             let stopped = eos || pending.stop.matched();
             if stopped || pending.generated() >= pending.max_tokens {
@@ -539,6 +632,7 @@ impl InferencePipeline {
             accepted_draft_tokens: pending.accepted_drafts,
             generated_text,
             reasoning_text,
+            logprobs: std::mem::take(&mut pending.logprobs),
             tool_calls,
             finish_reason: reason,
         };

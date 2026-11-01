@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{Result, TurError};
-use llguidance::{Constraint, ParserFactory as LlgParserFactory};
+use llguidance::{Constraint, ParserFactory as LlgParserFactory, toktrie::TokTrie};
 use tokenizers::Tokenizer;
 use toktrie_hf_tokenizers::ByteTokenizer;
 use tracing::warn;
@@ -18,9 +18,13 @@ pub enum GrammarMask {
 }
 pub use llguidance::api::TopLevelGrammar;
 
+/// Build the parser factory over `tokenizer`. `eos_tokens` are the checkpoint's ends of
+/// generation, which a finished grammar allows next; llguidance would otherwise guess one
+/// from token names, and a mask would hide the token the model actually ends its turn with.
 pub fn build_llg_factory(
     tokenizer: Tokenizer,
     vocab_size: Option<usize>,
+    eos_tokens: &[u32],
 ) -> Result<Arc<ParserFactory>> {
     let tokenizer_vocab = tokenizer.get_vocab_size(true);
     let target_vocab = vocab_size.map(|v| {
@@ -35,12 +39,26 @@ pub fn build_llg_factory(
             v
         }
     });
-    let env = ByteTokenizer::from_tokenizer(tokenizer)
-        .map_err(|e| TurError::Guidance(e.to_string()))?
+    let mut bytes =
+        ByteTokenizer::from_tokenizer(tokenizer).map_err(|e| TurError::Guidance(e.to_string()))?;
+    if !eos_tokens.is_empty() {
+        bytes.set_eos_tokens(eos_tokens);
+    }
+    let env = bytes
         .into_tok_env(target_vocab)
         .map_err(|e| TurError::Guidance(e.to_string()))?;
     let factory = ParserFactory::new_simple(&env).map_err(|e| TurError::Guidance(e.to_string()))?;
     Ok(Arc::new(factory))
+}
+
+/// The exact bytes of `token`, without the marker llguidance puts before special tokens.
+/// Decoding one token as text would lose bytes of a character split across tokens.
+pub(crate) fn token_bytes(factory: &ParserFactory, token: u32) -> Vec<u8> {
+    let bytes = factory.tok_env().tok_trie().token(token);
+    bytes
+        .strip_prefix(&[TokTrie::SPECIAL_TOKEN_MARKER])
+        .unwrap_or(bytes)
+        .to_vec()
 }
 
 /// Per-request grammar constraint. Activated before prefill, dropped on completion.

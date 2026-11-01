@@ -7,4 +7,5 @@ pub mod prefix;
 pub mod scheduler;
 pub mod speculation;
 mod stop;
+pub mod structured;
 pub mod tokenizer;
