@@ -321,6 +321,106 @@ static inline void block_weights8(device const uchar *w, ulong row, uint chunk, 
     }
 }
 
+// Sixteen K-quant weights from element 32 * chunk + start (0 or 16), which share a scale: as
+// ggml's dequantizers, the block's fields load once for all of them.
+static inline void kquant_weights16(device const uchar *w, ulong row, uint chunk, uint start, uint width,
+    thread float4 (&v)[4]) {
+    uint f = BLOCK_FORMAT, size = f == B_Q2K ? 84 : f == B_Q3K ? 110 : f == B_Q4K ? 144 : f == B_Q5K ? 176 : 210;
+    device const uchar *b = w + (row * (width / 256) + chunk / 8) * size;
+    uint sub = chunk % 8, e0 = sub * 32 + start, group = e0 / 128, x0 = e0 % 128, step = x0 / 32;
+    uint at = (x0 % 32) / 16 * 16;
+    if (f == B_Q2K) {
+        uint scale = b[e0 / 16], shift = 2 * step;
+        float dl = block_half(b, 80) * float(scale & 15u), ml = block_half(b, 82) * float(scale >> 4);
+        device const uchar *qs = b + 16 + group * 32 + at;
+        for (uint i = 0; i < 4; ++i) v[i] = dl * block_word_quants((block_u32(qs, 4 * i) >> shift) & 0x03030303u) - ml;
+    } else if (f == B_Q3K) {
+        uint bit = group * 4 + step, shift = 2 * step;
+        float dl = block_half(b, 108) * q3k_scale(b + 96, e0 / 16);
+        device const uchar *qs = b + 32 + group * 32 + at, *hm = b + at;
+        for (uint i = 0; i < 4; ++i) {
+            uint q = ((block_u32(qs, 4 * i) >> shift) & 0x03030303u) | (((block_u32(hm, 4 * i) >> bit) & 0x01010101u) << 2);
+            v[i] = dl * (block_word_quants(q) - 4.0f);
+        }
+    } else if (f == B_Q4K || f == B_Q5K) {
+        uchar2 sm = q4k_scale_min(sub, b + 4);
+        float dl = block_half(b, 0) * float(sm.x), ml = block_half(b, 2) * float(sm.y);
+        uint nibble = 4 * (sub % 2), offset = e0 % 32;
+        device const uchar *qs = b + (f == B_Q5K ? 48 : 16) + e0 / 64 * 32 + offset, *high = b + 16 + offset;
+        for (uint i = 0; i < 4; ++i) {
+            uint q = (block_u32(qs, 4 * i) >> nibble) & 0x0F0F0F0Fu;
+            if (f == B_Q5K) q |= ((block_u32(high, 4 * i) >> sub) & 0x01010101u) << 4;
+            v[i] = dl * block_word_quants(q) - ml;
+        }
+    } else {
+        uint l0 = x0 % 32, nibble = step < 2 ? 0 : 4, top = 2 * step;
+        device const uchar *low = b + group * 64 + l0 + (step % 2) * 32, *high = b + 128 + group * 32 + l0;
+        float dl = block_half(b, 208) * float(as_type<char>(b[192 + group * 8 + l0 / 16 + 2 * step]));
+        for (uint i = 0; i < 4; ++i) {
+            uint q = ((block_u32(low, 4 * i) >> nibble) & 0x0F0F0F0Fu) | (((block_u32(high, 4 * i) >> top) & 0x03030303u) << 4);
+            v[i] = dl * (block_word_quants(q) - 32.0f);
+        }
+    }
+}
+
+// All 32 weights of a codebook chunk, reading its scale and sign fields once: as ggml's IQ
+// kernels, where one lane owns a whole chunk.
+static inline void iq_weights32(device const uchar *w, ulong row, uint chunk, uint width, thread float4 (&v)[8]) {
+    uint f = BLOCK_FORMAT;
+    uint size = f == B_IQ2XXS ? 66 : f == B_IQ2XS ? 74 : f == B_IQ2S ? 82 : f == B_IQ3XXS ? 98 : 110;
+    device const uchar *b = w + (row * (width / 256) + chunk / 8) * size;
+    uint sub = chunk % 8;
+    float d = block_half(b, 0);
+    if (f == B_IQ2XXS) {
+        uint q = block_u32(b, 2 + sub * 8), high = block_u32(b, 6 + sub * 8);
+        float db = d * (0.5f + float(high >> 28)) * 0.25f;
+        for (uint l = 0; l < 4; ++l) {
+            uint index = (q >> (8 * l)) & 255u, signs = iq_signs((high >> (7 * l)) & 127u);
+            v[2 * l] = block_signed4(signs, 0, db * float4(as_type<uchar4>(IQ2XXS_GRID[2 * index])));
+            v[2 * l + 1] = block_signed4(signs, 4, db * float4(as_type<uchar4>(IQ2XXS_GRID[2 * index + 1])));
+        }
+    } else if (f == B_IQ2XS || f == B_IQ2S) {
+        bool xs = f == B_IQ2XS;
+        uint scale = b[(xs ? 66 : 74) + sub];
+        float db0 = d * (0.5f + float(scale & 15u)) * 0.25f, db1 = d * (0.5f + float(scale >> 4)) * 0.25f;
+        uint q = xs ? 0 : block_u32(b, 2 + sub * 4), s = xs ? 0 : block_u32(b, 34 + sub * 4), high = xs ? 0 : b[66 + sub];
+        for (uint l = 0; l < 4; ++l) {
+            float db = l < 2 ? db0 : db1;
+            uint index, signs;
+            constant uint *grid = xs ? IQ2XS_GRID : IQ2S_GRID;
+            if (xs) {
+                uint word = block_u16(b, 2 + 2 * (4 * sub + l));
+                index = word & 511u;
+                signs = iq_signs(word >> 9);
+            } else {
+                index = ((q >> (8 * l)) & 255u) | ((high << (8 - 2 * l)) & 0x300u);
+                signs = (s >> (8 * l)) & 255u;
+            }
+            v[2 * l] = block_signed4(signs, 0, db * float4(as_type<uchar4>(grid[2 * index])));
+            v[2 * l + 1] = block_signed4(signs, 4, db * float4(as_type<uchar4>(grid[2 * index + 1])));
+        }
+    } else {
+        bool xxs = f == B_IQ3XXS;
+        uint aux = xxs ? block_u32(b, 66 + 4 * sub) : 0, high = xxs ? 0 : b[66 + sub];
+        uint s = xxs ? 0 : block_u32(b, 74 + sub * 4);
+        float db = xxs ? d * (0.5f + float(aux >> 28)) * 0.5f
+                       : d * float(1 + 2 * ((uint(b[106 + sub / 2]) >> (4 * (sub % 2))) & 15u));
+        constant uint *grid = xxs ? IQ3XXS_GRID : IQ3S_GRID;
+        uint q0 = block_u32(b, 2 + sub * 8), q1 = block_u32(b, 6 + sub * 8);
+        for (uint l = 0; l < 4; ++l) {
+            uint pair = ((l < 2 ? q0 : q1) >> (16 * (l % 2))) & 0xFFFFu;
+            uint first = pair & 255u, second = pair >> 8;
+            if (!xxs) {
+                first |= (high << (8 - 2 * l)) & 256u;
+                second |= (high << (7 - 2 * l)) & 256u;
+            }
+            uint signs = xxs ? iq_signs((aux >> (7 * l)) & 127u) : (s >> (8 * l)) & 255u;
+            v[2 * l] = block_signed4(signs, 0, db * float4(as_type<uchar4>(grid[first])));
+            v[2 * l + 1] = block_signed4(signs, 4, db * float4(as_type<uchar4>(grid[second])));
+        }
+    }
+}
+
 // Eight consecutive dequantized weights of `row` from element 32 * chunk + start, where
 // start is a multiple of four below 32. FORMAT: 0 F32, 1 Q8_0, 2 Q4_K, 3 MXFP4, whose scale
 // bytes follow the blocks at byte offset `scales`, 4 the pipeline's specialized block format.
@@ -725,24 +825,53 @@ kernel void qmv_blocks_f32(
     if (row0 >= p.n) {
         return;
     }
-    uint start = (lane % 4) * 8;
     float acc[NR][3];
     for (uint r = 0; r < NR; ++r) {
         for (uint b = 0; b < 3; ++b) {
             acc[r][b] = 0.0f;
         }
     }
-    for (uint chunk = lane / 4; chunk < p.k / 32; chunk += 8) {
-        float4 lo[NR], hi[NR];
-        for (uint r = 0; r < NR; ++r) {
-            packed_weights8<4>(w, min(row0 + r, p.n - 1), chunk, start, p.k, lo[r], hi[r]);
-        }
-        for (uint b = 0; b < p.rows; ++b) {
-            device const float4 *xb =
-                (device const float4 *)(x + ulong(b) * p.x_stride + chunk * 32 + start);
-            float4 x_lo = xb[0], x_hi = xb[1];
+    uint f = BLOCK_FORMAT;
+    bool codebook = f == B_IQ2XXS || f == B_IQ2XS || f == B_IQ2S || f == B_IQ3XXS || f == B_IQ3S;
+    if (p.rows == 1 && (codebook || f == B_Q2K)) {
+        // One lane owns each chunk, folding each output row straight into its sum so only
+        // one row's weights occupy registers.
+        for (uint chunk = lane; chunk < p.k / 32; chunk += 32) {
+            device const float4 *xb = (device const float4 *)(x + chunk * 32);
+            float4 xi[8];
+            for (uint i = 0; i < 8; ++i) {
+                xi[i] = xb[i];
+            }
             for (uint r = 0; r < NR; ++r) {
-                acc[r][b] += dot(lo[r], x_lo) + dot(hi[r], x_hi);
+                float4 v[8];
+                ulong row = min(row0 + r, p.n - 1);
+                if (codebook) {
+                    iq_weights32(w, row, chunk, p.k, v);
+                } else {
+                    thread float4 (&first)[4] = reinterpret_cast<thread float4 (&)[4]>(v[0]);
+                    thread float4 (&second)[4] = reinterpret_cast<thread float4 (&)[4]>(v[4]);
+                    kquant_weights16(w, row, chunk, 0, p.k, first);
+                    kquant_weights16(w, row, chunk, 16, p.k, second);
+                }
+                for (uint i = 0; i < 8; ++i) {
+                    acc[r][0] += dot(v[i], xi[i]);
+                }
+            }
+        }
+    } else {
+        uint start = (lane % 4) * 8;
+        for (uint chunk = lane / 4; chunk < p.k / 32; chunk += 8) {
+            float4 lo[NR], hi[NR];
+            for (uint r = 0; r < NR; ++r) {
+                packed_weights8<4>(w, min(row0 + r, p.n - 1), chunk, start, p.k, lo[r], hi[r]);
+            }
+            for (uint b = 0; b < p.rows; ++b) {
+                device const float4 *xb =
+                    (device const float4 *)(x + ulong(b) * p.x_stride + chunk * 32 + start);
+                float4 x_lo = xb[0], x_hi = xb[1];
+                for (uint r = 0; r < NR; ++r) {
+                    acc[r][b] += dot(lo[r], x_lo) + dot(hi[r], x_hi);
+                }
             }
         }
     }

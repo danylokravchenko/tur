@@ -19,7 +19,7 @@ Other projects' features come from their documentation as of November 2026 and c
 
 ### llama.cpp
 
-Tur reads llama.cpp's GGUF files for the models it supports, so you can compare them on the same weights: Tur decodes 1.2 to 1.5× faster with several sequences, while one sequence differs by up to 10% and prefill by up to 4%, either way by file ([numbers](../guide/performance.md#on-the-same-gguf-files)). llama.cpp still covers far more models. Tur's GGUF support also has [limits](../guide/gguf.md#limitations).
+Tur reads llama.cpp's GGUF files for the models it supports, so you can compare them on the same weights: on the two files measured, Tur decodes 1.2 to 1.4× faster with several sequences and level to 6% faster with one, and prefill is within 2% either way ([numbers](../guide/performance.md#on-the-same-gguf-files)). llama.cpp still covers far more models. Tur's GGUF support also has [limits](../guide/gguf.md#limitations).
 
 llama.cpp runs on the CPUs and GPUs of most vendors and loads a very broad range of models as GGUF. On a Mac it uses its own Metal backend and serves concurrent requests through parallel slots. It keeps prompt caches [in slots and host memory](https://github.com/ggml-org/llama.cpp/pull/16391), handles larger-than-memory weights by memory-mapping them, takes images through its multimodal library, and offers structured output over HTTP.
 

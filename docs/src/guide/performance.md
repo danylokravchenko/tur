@@ -200,14 +200,14 @@ Both engines loading the same file, on the same M1 with F16 K/V: `Q3_K_M` (Q3_K,
 
 | GGUF test | Tur Q3_K_M | llama.cpp Q3_K_M | Tur UD-Q2_K_XL | llama.cpp UD-Q2_K_XL |
 | --- | --- | --- | --- | --- |
-| Decode, 1 sequence, 128 tokens | 68 | 65.7 | 62 | 69.0 |
-| Decode, 1 sequence, 2K | 66 | 62.5 | 60 | 66.1 |
-| Decode, 4 sequences | 165 | 135 | 167 | 134 |
-| Decode, 8 sequences | 285 | 200 | 299 | 204 |
-| Prefill 512 | 1,220 | 1,237 | 1,291 | 1,263 |
-| Prefill 2K | 1,165 | 1,208 | 1,230 | 1,233 |
+| Decode, 1 sequence, 128 tokens | 68 | 65.7 | 69 | 69.0 |
+| Decode, 1 sequence, 2K | 66 | 62.5 | 67 | 66.1 |
+| Decode, 4 sequences | 165 | 135 | 171 | 134 |
+| Decode, 8 sequences | 286 | 200 | 296 | 204 |
+| Prefill 512 | 1,247 | 1,237 | 1,287 | 1,263 |
+| Prefill 2K | 1,184 | 1,208 | 1,228 | 1,233 |
 
-With several sequences Tur decodes 1.2× faster at 4 and 1.4 to 1.5× at 8 on both files. With one, it is 4 to 6% ahead on `Q3_K_M` and about 10% behind on `UD-Q2_K_XL`. Prefill is within 4% either way: llama.cpp leads `Q3_K_M` by 1 to 4%, while `UD-Q2_K_XL` is level at 2K and 2% ahead for Tur at 512. Tur's figures are the mean of two runs. Both files load in about a second, against 9 s for converting SafeTensors to Q4K.
+With several sequences Tur decodes 1.2 to 1.3× faster at 4 and about 1.4× at 8 on both files. With one, it is 4 to 6% ahead on `Q3_K_M` and level to 1% ahead on `UD-Q2_K_XL`. Prefill is within 2% either way, and llama.cpp's only lead is `Q3_K_M` at 2K tokens. Tur's figures are the mean of two runs. Both files load in about a second, against 9 s for converting SafeTensors to Q4K.
 
 ```sh
 llama-bench -m <gguf> -p 2048,8192 -n 0 -r 3

@@ -20,8 +20,7 @@
 
 ## Performance
 
-- Single-sequence decode on GGUF files with codebook blocks. `UD-Q2_K_XL` decodes about 10% behind llama.cpp with one sequence while `Q3_K_M` is ahead, and pure IQ files are unmeasured end to end. One-row IQ2 and IQ3 still run at about 0.8× of Candle's Q3_K.
-- `Q3_K` in the wide block kernel, at 0.77× of Candle's tiles, which leaves `Q3_K_M` prefill 1 to 4% behind llama.cpp.
+- Measure pure IQ GGUF files end to end. Only `Q3_K_M` and `UD-Q2_K_XL` have engine comparisons, and `Q3_K` in the wide block kernel remains about 0.9× of Candle's tiles.
 - The expert kernels' wide tier could take the same ggml tile structure as `qmm_blocks_wide`; it is still unmeasured there.
 - Run real Qwen3.6-35B-A3B and Qwen3.8-27B GGUF files. Only their headers and sampled blocks are checked, and the MTP head's norm convention is inferred.
 - Explain why Gemma 4 logits differ between Tur and llama.cpp on the same GGUF file. Tur's GGUF path matches its validated SafeTensors path.

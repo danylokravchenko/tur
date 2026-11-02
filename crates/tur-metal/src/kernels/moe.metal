@@ -442,8 +442,13 @@ kernel void qmm_blocks_wide_f32(device const uchar *w [[buffer(0)]],
     threadgroup float *lsmb0 = sb + 2 * 64 * (sg / 2);
     for (uint chunk = 0; chunk < p.k / 32; ++chunk) {
         float4 v[4];
-        packed_weights8<4>(w, w_global, chunk, w_half * 16, p.k, v[0], v[1]);
-        packed_weights8<4>(w, w_global, chunk, w_half * 16 + 8, p.k, v[2], v[3]);
+        uint f = BLOCK_FORMAT;
+        if (f == B_Q2K || f == B_Q3K || f == B_Q4K || f == B_Q5K || f == B_Q6K) {
+            kquant_weights16(w, w_global, chunk, w_half * 16, p.k, v);
+        } else {
+            packed_weights8<4>(w, w_global, chunk, w_half * 16, p.k, v[0], v[1]);
+            packed_weights8<4>(w, w_global, chunk, w_half * 16 + 8, p.k, v[2], v[3]);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         #pragma clang loop unroll(full)
         for (uint i = 0; i < 16; ++i) {

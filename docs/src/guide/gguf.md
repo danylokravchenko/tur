@@ -54,11 +54,11 @@ Other Gemma 4 sizes should share E2B's tensor names, but we haven't checked thei
 
 ## Performance
 
-With several sequences Tur decodes 1.2 to 1.5× faster than llama.cpp on the same file. With one, it is slightly ahead on files without codebook blocks and about 10% behind on the one measured file that has them. Prefill is within 4% either way. See [Compared with llama.cpp](performance.md#compared-with-llamacpp). If you can convert the checkpoint yourself, [`tur quantize`](quantization.md) gives faster single-sequence decode, because Q4K and Q8_0 have kernels specialized further.
+On the two files measured, with several sequences Tur decodes 1.2 to 1.4× faster than llama.cpp on the same file, with one it is level to 6% ahead, and prefill is within 2% either way. Pure IQ files are unmeasured end to end. See [Compared with llama.cpp](performance.md#compared-with-llamacpp). If you can convert the checkpoint yourself, [`tur quantize`](quantization.md) gives faster single-sequence decode, because Q4K and Q8_0 have kernels specialized further.
 
 ## Decisions
 
 - Tensors load as stored. Decoding to one format would cost memory and fidelity the user chose, and re-encoding would change the quant they picked.
-- Mixed matrices run per part. Up to eight rows, each part takes its own fastest kernel and the outputs concatenate, which brought one-row decode from 0.43 to 0.54× of Candle's one-format speed to 0.84 to 0.98×. Above eight rows every part writes its columns of one output through the wide block kernel, with no copy, which raised `UD-Q2_K_XL` prefill from 1,137 to 1,291 tokens/s at 512 tokens. This costs `Q3_K` parts some kernel speed, at 0.77× of Candle's, but no real file measured got slower.
+- Mixed matrices run per part. Up to eight rows, each part takes its own fastest kernel and the outputs concatenate, which brought one-row decode from 0.43 to 0.54× of Candle's one-format speed to 0.84 to 0.98×. Above eight rows every part writes its columns of one output through the wide block kernel, with no copy, which raised `UD-Q2_K_XL` prefill from 1,137 to 1,287 tokens/s at 512 tokens. This costs `Q3_K` parts some kernel speed, at about 0.9× of Candle's, but no real file measured got slower.
 - The model's config, tokenizer and template come from its own checkpoint rather than the file's metadata, so shape validation and templates share one path with SafeTensors.
 - Decoders are checked against ggml's own `dequantize_row_*`, on host and device, in every packed format (`scripts/gguf_blocks_reference.py`).
