@@ -11,6 +11,7 @@ mod contracts;
 mod engine;
 mod fused;
 mod gemma4;
+mod gguf;
 mod gpt_oss;
 mod kernels;
 mod model_common;

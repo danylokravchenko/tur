@@ -2,7 +2,7 @@
 
 mod loading;
 mod packing;
-use super::WeightFormat;
+use super::{WeightFormat, gguf::GgufTensor};
 use candle_core::quantized::GgmlDType;
 pub(crate) use loading::{Embeddings, Tensors};
 pub(crate) use packing::STAGING_BYTES;
@@ -67,6 +67,26 @@ pub trait WeightLayout {
     fn loads_mtp(&self) -> bool {
         false
     }
+    /// `general.architecture` values of the GGUF files this model reads; none by default.
+    fn gguf_architectures(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// What this model reads from the GGUF tensor `name`, or `None` for one it cannot use.
+    fn gguf_tensor(&self, _name: &str) -> Option<GgufTensor> {
+        None
+    }
+    /// Whether a GGUF file may hold the checkpoint tensor `name` that this model never reads.
+    fn gguf_redundant(&self, _name: &str) -> bool {
+        false
+    }
+    /// Every checkpoint tensor's name and shape, for matching a GGUF file against.
+    fn stored_shapes(&self) -> Result<BTreeMap<String, Vec<usize>>> {
+        Err(invalid("this model has no GGUF layout"))
+    }
+    /// Checkpoint name of the input embedding.
+    fn embedding_tensor_name(&self) -> String {
+        String::new()
+    }
 }
 
 /// Storage of one weight matrix.
@@ -82,6 +102,8 @@ pub enum Precision {
     Q6k,
     Q5k,
     Q4k,
+    /// As a GGUF file stores it, possibly mixing formats; the plan records its bytes.
+    Stored,
 }
 
 impl Precision {
@@ -91,7 +113,7 @@ impl Precision {
     /// GGML block format, or `None` for unpacked storage.
     pub fn ggml(self) -> Option<GgmlDType> {
         match self {
-            Self::F32 | Self::Bf16 => None,
+            Self::F32 | Self::Bf16 | Self::Stored => None,
             Self::Q8_0 => Some(GgmlDType::Q8_0),
             Self::Q6k => Some(GgmlDType::Q6K),
             Self::Q5k => Some(GgmlDType::Q5K),
@@ -120,6 +142,7 @@ impl Precision {
             Self::Q6k => "q6k",
             Self::Q5k => "q5k",
             Self::Q4k => "q4k",
+            Self::Stored => "stored",
         }
     }
 }
@@ -168,6 +191,9 @@ pub enum Embedding {
 pub struct WeightPlan {
     pub projections: BTreeMap<String, Precision>,
     pub embedding: Embedding,
+    /// Exact bytes of what is [`Precision::Stored`], by projection or embedding tensor name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stored: BTreeMap<String, usize>,
 }
 
 impl WeightPlan {
@@ -187,7 +213,30 @@ impl WeightPlan {
                 .map(|p| (p.name, precision))
                 .collect(),
             embedding,
+            stored: BTreeMap::new(),
         })
+    }
+
+    /// Bytes of the first `rows` of projection `name`, of `total` rows and `cols` columns.
+    pub(crate) fn leading_bytes(
+        &self,
+        name: &str,
+        (rows, total, cols): (usize, usize, usize),
+    ) -> Result<usize> {
+        match self.precision(name)? {
+            Precision::Stored => self
+                .stored
+                .get(name)
+                .and_then(|bytes| bytes.checked_mul(rows))
+                .map(|bytes| bytes.div_ceil(total.max(1)))
+                .ok_or_else(|| invalid(format!("{name} has no stored size"))),
+            precision => precision.bytes(rows, cols),
+        }
+    }
+
+    /// Whether this plan loads a GGUF file's tensors as stored.
+    pub(crate) fn is_stored(&self) -> bool {
+        !self.stored.is_empty()
     }
 
     /// Precision of projection `name`.
@@ -216,6 +265,12 @@ impl WeightPlan {
         }
         for p in &projections {
             let precision = self.precision(&p.name)?;
+            if precision == Precision::Stored {
+                if !self.stored.contains_key(&p.name) {
+                    return Err(invalid(format!("{} has no stored size", p.name)));
+                }
+                continue;
+            }
             if !Precision::PROJECTIONS.contains(&precision) {
                 return Err(invalid(format!(
                     "{} cannot use {}: projections are f32, q8_0 or q4k",
@@ -229,10 +284,10 @@ impl WeightPlan {
             Embedding::Head if !config.embeddings_tied() => Err(invalid(
                 "an untied checkpoint has no head to gather embeddings from",
             )),
+            Embedding::Table(Precision::Stored) | Embedding::Head => Ok(()),
             Embedding::Table(precision) => precision
                 .bytes(config.vocabulary(), config.residual_width())
                 .map(|_| ()),
-            Embedding::Head => Ok(()),
         }
     }
 
@@ -240,13 +295,26 @@ impl WeightPlan {
     pub fn bytes(&self, config: &impl WeightLayout) -> Result<usize> {
         let mut total = match self.embedding {
             Embedding::Head => 0,
+            Embedding::Table(Precision::Stored) => self
+                .stored
+                .get(&config.embedding_tensor_name())
+                .copied()
+                .ok_or_else(|| invalid("stored embedding has no size"))?,
             Embedding::Table(precision) => {
                 precision.bytes(config.vocabulary(), config.residual_width())?
             }
         };
         for p in config.projection_layout()? {
+            let bytes = match self.precision(&p.name)? {
+                Precision::Stored => self
+                    .stored
+                    .get(&p.name)
+                    .copied()
+                    .ok_or_else(|| invalid(format!("{} has no stored size", p.name)))?,
+                precision => precision.bytes(p.rows, p.cols)?,
+            };
             total = total
-                .checked_add(self.precision(&p.name)?.bytes(p.rows, p.cols)?)
+                .checked_add(bytes)
                 .ok_or_else(|| invalid("weight total overflow"))?;
         }
         Ok(total)

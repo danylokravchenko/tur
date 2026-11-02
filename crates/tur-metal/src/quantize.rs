@@ -10,11 +10,17 @@ use candle_core::{
 use tur_core::{Result, execution::invalid};
 
 /// Block formats a projection may be packed in.
-pub const FORMATS: [GgmlDType; 4] = [
+pub const FORMATS: [GgmlDType; 10] = [
     GgmlDType::Q8_0,
     GgmlDType::Q6K,
     GgmlDType::Q5K,
+    GgmlDType::Q5_0,
+    GgmlDType::Q5_1,
     GgmlDType::Q4K,
+    GgmlDType::Q4_0,
+    GgmlDType::Q4_1,
+    GgmlDType::Q3K,
+    GgmlDType::Q2K,
 ];
 
 /// Values one MXFP4 nibble selects, before its block's power-of-two scale.

@@ -3,7 +3,7 @@
   <h1>Tur</h1>
   <p><strong>Local inference with a little muscle.</strong></p>
   <p>A Rust inference engine for hybrid language models on Apple Silicon.</p>
-  <p>Built to get the most out of your Mac.</p>
+  <p><strong>Serve models bigger than your Mac's memory.</strong></p>
   <p> <a href="#why-tur">Why Tur</a> · <a href="#how-it-works">How it works</a> · <a href="#performance">Performance</a> · <a href="#models">Models</a> · <a href="#get-started">Get started</a> · <a href="docs/src/SUMMARY.md">Read the book</a> </p>
   <p><strong>Rust · Metal · Apple Silicon · Apache-2.0</strong></p>
 </div>
@@ -19,6 +19,8 @@ Choose Tur if you want one of these on an Apple Silicon Mac:
 - Several clients or agents sharing one model. Requests share each model pass, so eight sequences decode 60% faster than on llama.cpp on the same Mac.
 - A mixture-of-experts model larger than your Mac's memory. Tur keeps most experts on the SSD and reads them into a fixed cache, with several requests at once and no SSD writes during a run.
 - A server you can leave running. Tur plans all its memory before loading a weight, so a configuration that doesn't fit fails at startup, and one failed request doesn't affect the others.
+
+Already have a GGUF quant you like? Tur loads it directly from a path or Hugging Face with `--gguf`, in any mix of K-quant, legacy, IQ and MXFP4 blocks, for the Qwen and Gemma 4 models it supports ([GGUF files](docs/src/guide/gguf.md)).
 
 Tur supports few models and doesn't accept images or video. It has no embeddings and serves one chat model per process. For those, or for other hardware, look at oMLX, llama.cpp, Ollama, SGLang or Strata. [Tur and other engines](docs/src/architecture/comparison.md) compares them.
 
@@ -48,7 +50,7 @@ Tur against llama.cpp on an M3 Pro with 36 GB, in tokens per second. 4-bit rows 
 | Qwen3.5-0.8B, 8-bit, prefill, 2K tokens | 3,799 | 3,383 | +12% |
 | Qwen3.6-35B, 4-bit, decode, 1 sequence | 47.1 | 35.6 | +32% |
 
-Tur doesn't win everywhere: on a 16 GB M1, llama.cpp prefills 8K-token prompts 6 to 11% faster. Prefill is mostly compute, so Tur's savings on memory reads help less there.
+Tur doesn't win everywhere: on a 16 GB M1, llama.cpp prefills 8K-token prompts 6 to 11% faster, and on GGUF files with IQ blocks it decodes one sequence about 12% faster. Prefill is mostly compute, so Tur's savings on memory reads help less there.
 
 Other results for Qwen3.5-0.8B on that 16 GB M1:
 
@@ -95,6 +97,13 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"qwen","messages":[{"role":"user","content":"Say hi"}],"max_tokens":32,"thinking":false}'
 ```
 
+Serve a model your Mac can't hold by giving its experts a cache:
+
+```sh
+tur serve --model openai/gpt-oss-20b --revision 6cee5e81ee83917806bbde320786a8fb61efebee \
+  --expert-cache-mb 2048 --served-model-name gpt-oss
+```
+
 ## Documentation
 
 The [Tur book](https://danylokravchenko.github.io/tur/docs/) covers usage, architecture and the measurements behind each decision, and the [benchmarks page](https://danylokravchenko.github.io/tur/benchmarks/) lets you explore them. Run `just docs` to read the book locally.
@@ -104,7 +113,7 @@ The [Tur book](https://danylokravchenko.github.io/tur/docs/) covers usage, archi
 | Run my first model, offline use included | [Quickstart](docs/src/guide/quickstart.md) |
 | Configure the CLI or server | [Configuration](docs/src/guide/configuration.md), [Command line](docs/src/guide/cli.md) |
 | Connect an app | [HTTP API](docs/src/guide/http-api.md), [Rust library](docs/src/guide/library.md) |
-| Make weights smaller | [Choosing a quantization](docs/src/guide/choosing-quantization.md), [Prepacked weights](docs/src/guide/quantization.md) |
+| Make weights smaller | [Choosing a quantization](docs/src/guide/choosing-quantization.md), [GGUF files](docs/src/guide/gguf.md), [Prepacked weights](docs/src/guide/quantization.md) |
 | Match settings to my workload | [Tuning](docs/src/guide/tuning.md), [Best practice](docs/src/guide/best-practice.md) |
 | Understand the engine | [Architecture](docs/src/architecture/overview.md), [Scope](docs/src/design/scope.md) |
 | See what's next | [Open work](docs/src/design/open.md), [Rejected experiments](docs/src/design/rejected.md) |

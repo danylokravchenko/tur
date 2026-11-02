@@ -230,6 +230,12 @@ code, pre, kbd { font-family: var(--mono); }
 
 .fit { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; }
 .fit p { max-width: 62ch; }
+.offload { align-self: start; margin: 0; padding: 20px; background: var(--code-bg); border-radius: var(--radius); }
+.offload figcaption { margin-bottom: 10px; color: var(--muted); font-size: 14.5px; }
+.offload i { display: block; height: 14px; border-radius: 2px; background: var(--line); }
+.offload .on, .offload__cache i { background: var(--s1); }
+.offload__experts, .offload__cache { display: grid; grid-template-columns: repeat(12, 1fr); gap: 4px; }
+.offload__experts { margin-bottom: 24px; }
 .plain { margin: 0 0 16px; padding-left: 20px; }
 .plain li { margin-bottom: 6px; }
 

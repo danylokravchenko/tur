@@ -322,6 +322,7 @@ fn factory(fixture: &crate::common::Checkpoint) -> tur::ModelFactory {
         recurrent: DType::F32,
         audio: true,
         expert_cache: None,
+        gguf: None,
     }
 }
 

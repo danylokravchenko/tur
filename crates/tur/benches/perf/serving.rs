@@ -1075,6 +1075,7 @@ pub(crate) fn run() -> Result<()> {
             .map_err(TurError::Other)?,
         audio: false,
         expert_cache: expert_cache_bytes()?,
+        gguf: None,
     };
     let bench = Bench {
         factory: &factory,

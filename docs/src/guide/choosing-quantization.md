@@ -11,6 +11,7 @@ Three questions decide the format: does the model fit, how much quality can you 
 | `q4k`, plain rounding | 4.5 | `--weight-format q4k`, or `quantize --method rtn` | Noticeable loss |
 | `q4k`, GPTQ | 4.5 | `quantize` (the default method) | About half the loss of plain rounding |
 | Mixed Q4K and Q8_0 | your budget, e.g. 5.5 | `quantize --budget-bits 5.5` | A third to half less again |
+| Any GGUF mix, down to about 1.6 | whatever the file holds | [`--gguf`](gguf.md) | Whatever you picked; Tur doesn't measure it |
 
 Qwen3.5's small models share one matrix between the input embedding and the output layer. Artifacts take advantage of that and keep no separate embedding table, while load-time conversion keeps one.
 
@@ -57,7 +58,7 @@ Each running request also needs state. Recurrent state is fixed per request (20 
 2. If you need memory, prepack Q4K with GPTQ on text that resembles your traffic. On models with shared embeddings that's about a third of Q8_0's weight memory, and it keeps most of Q8_0's quality.
 3. If quality matters at a Q4K budget, add `--budget-bits 5.5`. It costs about 23% more memory and 14% of single-conversation speed.
 4. If you restart often or run several instances, prepack even at Q8_0 (`tur quantize --weight-format q8_0 --method rtn`). It loads in a fraction of the time and, with shared embeddings, saves the separate embedding table.
-5. Q4K is the floor. Tur has no fast kernels for narrower formats, and 4-bit K/V failed its quality budget.
+5. Q4K is the floor for Tur's own quantizer, and 4-bit K/V failed its quality budget. For narrower weights, load a [GGUF file](gguf.md) in the format you want.
 
 ## Check quality on your own text
 

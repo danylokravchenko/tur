@@ -36,6 +36,9 @@ impl Fused {
 
     pub(super) fn new(model: &Qwen35) -> Result<Self> {
         let kernels = Kernels::new(&model.device)?;
+        for layer in model.projection_refs() {
+            kernels.prepare(layer)?;
+        }
         let d = model.dims;
         let page = model.description.kv.page_tokens;
         Ok(Self {

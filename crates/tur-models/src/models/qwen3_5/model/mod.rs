@@ -486,6 +486,11 @@ fn open_cache(
 impl Tensors {
     fn open(dir: &Path, config: &Config, weights: &Weights, device: &Device) -> Result<Self> {
         let (checkpoint, plan, prepacked) = match weights {
+            Weights::Gguf(file) => {
+                let plan = weights.plan(config)?;
+                plan.validate(config)?;
+                (file.checkpoint(config)?, plan, false)
+            }
             Weights::Prepacked(manifest) => {
                 let (checkpoint, found) = artifact::open_for(dir, config)?;
                 if found != **manifest {
@@ -553,8 +558,7 @@ impl Qwen35 {
         }
         if let Some(rows) = draft_vocab(config, options)? {
             weights = plan
-                .precision("lm_head")?
-                .bytes(rows, config.hidden_size())
+                .leading_bytes("lm_head", (rows, config.vocab_size(), config.hidden_size()))
                 .ok()
                 .and_then(|bytes| weights.checked_add(bytes))
                 .ok_or_else(|| invalid("weight total overflow"))?;

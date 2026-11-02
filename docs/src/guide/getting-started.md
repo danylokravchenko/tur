@@ -55,7 +55,7 @@ The binary is `target/release/tur`. Metal support is on by default. `--no-defaul
 
 ## Get a checkpoint
 
-Tur loads SafeTensors checkpoints from a local directory or from Hugging Face. A checkpoint directory contains:
+Tur loads SafeTensors checkpoints from a local directory or from Hugging Face, and can take its weights from a [GGUF file](gguf.md) instead. A checkpoint directory contains:
 
 | File | Required | Purpose |
 | --- | --- | --- |

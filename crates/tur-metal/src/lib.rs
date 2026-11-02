@@ -1,4 +1,6 @@
 //! Device resource ownership, paged state pools, packed weights and Metal kernels.
+mod block_tables;
+pub mod blocks;
 pub mod completion;
 #[cfg(feature = "metal")]
 pub mod experts;

@@ -1,5 +1,6 @@
 //! Validated Gemma 4 text architecture and checkpoint tensor contract.
 use crate::models::weights::{Projection, WeightLayout};
+use crate::models::{checkpoint::Adjust, gguf::GgufTensor};
 use candle_core::DType;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -574,6 +575,65 @@ impl Config {
 }
 
 impl WeightLayout for Config {
+    fn gguf_architectures(&self) -> &'static [&'static str] {
+        &["gemma4"]
+    }
+    fn gguf_tensor(&self, name: &str) -> Option<GgufTensor> {
+        let stored = |name: String, adjust| Some(GgufTensor::Stored { name, adjust });
+        let prefix = &self.prefix;
+        let top = match name {
+            "rope_freqs.weight" => return Some(GgufTensor::Ignored),
+            "output.weight" => return stored("lm_head.weight".into(), Adjust::None),
+            "token_embd.weight" => "embed_tokens.weight",
+            "output_norm.weight" => "norm.weight",
+            "per_layer_token_embd.weight" => "embed_tokens_per_layer.weight",
+            "per_layer_model_proj.weight" => "per_layer_model_projection.weight",
+            "per_layer_proj_norm.weight" => "per_layer_projection_norm.weight",
+            _ => "",
+        };
+        if !top.is_empty() {
+            return stored(format!("{prefix}.{top}"), Adjust::None);
+        }
+        let (layer, tensor) = name.strip_prefix("blk.")?.split_once('.')?;
+        let suffix = match tensor {
+            "attn_norm.weight" => "input_layernorm.weight",
+            "post_attention_norm.weight" => "post_attention_layernorm.weight",
+            "ffn_norm.weight" => "pre_feedforward_layernorm.weight",
+            "post_ffw_norm.weight" => "post_feedforward_layernorm.weight",
+            "post_norm.weight" => "post_per_layer_input_norm.weight",
+            "layer_output_scale.weight" => "layer_scalar",
+            "inp_gate.weight" => "per_layer_input_gate.weight",
+            "proj.weight" => "per_layer_projection.weight",
+            "attn_q.weight" => "self_attn.q_proj.weight",
+            "attn_k.weight" => "self_attn.k_proj.weight",
+            "attn_v.weight" => "self_attn.v_proj.weight",
+            "attn_output.weight" => "self_attn.o_proj.weight",
+            "attn_q_norm.weight" => "self_attn.q_norm.weight",
+            "attn_k_norm.weight" => "self_attn.k_norm.weight",
+            "ffn_gate.weight" => "mlp.gate_proj.weight",
+            "ffn_up.weight" => "mlp.up_proj.weight",
+            "ffn_down.weight" => "mlp.down_proj.weight",
+            _ => return None,
+        };
+        stored(format!("{prefix}.layers.{layer}.{suffix}"), Adjust::None)
+    }
+    // llama.cpp writes keys and values for every layer, including those that reuse an
+    // earlier layer's and so hold neither in the checkpoint.
+    fn gguf_redundant(&self, name: &str) -> bool {
+        [
+            ".self_attn.k_proj.weight",
+            ".self_attn.v_proj.weight",
+            ".self_attn.k_norm.weight",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+    }
+    fn stored_shapes(&self) -> Result<BTreeMap<String, Vec<usize>>> {
+        self.weight_shapes()
+    }
+    fn embedding_tensor_name(&self) -> String {
+        format!("{}.embed_tokens.weight", self.prefix)
+    }
     fn embeddings_tied(&self) -> bool {
         self.text.tie_word_embeddings
     }

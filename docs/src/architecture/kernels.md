@@ -17,6 +17,9 @@ Custom kernels pay off in three places. Fusing small steps such as norms, gates 
 | --- | --- | --- |
 | Q8_0 projection | 1 / 2–3 / 4–16 / >16 rows | Candle `mul_mv` / `qmv_q8_0` / `qmm_q8_0` / Candle F16 tiles |
 | Q4K projection | 1 / 2–16 / >16 rows | Candle `mul_mv` / `qmm_q4k` / Candle F16 tiles |
+| Q2_K projection | 1–8 / >8 rows | `qmv_blocks` to 3 rows, then `qmm_blocks` / Candle |
+| Q3_K, Q5_K, Q6_K and legacy projections | 1 / 2–8 / >8 rows | Candle `mul_mv` / `qmv_blocks` to 3 rows, then `qmm_blocks` / Candle F16 tiles |
+| Codebook, MXFP4, F16 and BF16 runs | 1–3 / 4–16 / >16 rows | `qmv_blocks` / `qmm_blocks` / `qmm_blocks_wide` |
 | Recurrent decode | one-token sequences | `delta_step`, 16 key rows per simdgroup |
 | Recurrent prefill and verification | multi-token sequences | `delta_prepare` (scales only), then the transposed `delta_scan` |
 | Convolution | rows aligned to float4 / otherwise | `delta_conv4` / `delta_conv` |
@@ -25,6 +28,8 @@ Custom kernels pay off in three places. Fusing small steps such as norms, gates 
 | Decode attention, F32/F16 pools | below the tiled crossover | `attention_r*`, split over ranges of at least 64 keys |
 | MoE experts | ≤ 3 / 4–16 / > 16 rows per expert | GEMV / matrix units / wide F16-staged tiles |
 | Sampling | device sampling on | `penalize_f32`, `sample_f32` (see [Sampling](sampling.md)) |
+
+One decoder, `block_weights8`, reads every GGUF block format, and a function constant specializes each pipeline to one format, so the compiler removes the rest. Those pipelines build when a model that needs them loads, so other models don't pay for them. MoE experts use the same decoder.
 
 Norms, residual additions, rotary embeddings, activations and gates are fused into neighbouring kernels where profiling showed a gain. Attention never builds the full attention matrix. Softmax runs online and every accumulator stays F32, and Q8 keys and values are dequantized once per staged tile.
 
@@ -44,6 +49,7 @@ Measured on an M1:
 - Q8 decode attention processes two heads per simdgroup. It is up to 1.25× faster in attention and 1.09× in model decode at 8K tokens. F32 and F16 pools don't use it because it ties or loses there, and four heads lose everywhere.
 - Tiled attention over F32 and F16 pools prefetches the next chunk. It makes chunks after a long context 3 to 20% faster and 8K prefill 2% faster, with short prompts unchanged. Removing the K/V reads entirely would be much faster still, so read latency is only partly hidden. Q8 pools keep single-buffered staging (see [Rejected experiments](../design/rejected.md)).
 - Activations stay F32. F16 or BF16 activations would be faster at 9 to 16 rows, but wait until there are held-out quality budgets to check them against.
+- Block kernels replace Candle only at 2 to 8 rows for formats Candle knows, where they run 1.3 to 1.9× faster. At one row and above eight, Candle stays 1.1 to 2.4× ahead, except that Q2_K's one-row GEMV leads on the 0.8B's shapes and raised `UD-Q2_K_XL` decode 10%. Candle can't read codebook formats, which stay on the block kernels at every shape.
 - Launch shapes are M1 tuning, not constants for every Mac.
 - Rejected: chunked (WY/UT) DeltaNet prefill, TensorOps GEMM and seven kernel variants (see [Rejected experiments](../design/rejected.md)).
 - Tiled attention over F16 pools stages F16 and scales scores once per block. Attention at 2K tokens is 7 to 10% faster, and 8K prefill up to 8% depending on chunk size, while 2K and 4K prefill don't change beyond noise. Q8 pools gain up to 4% from the scale alone. F32 pools keep the scale on each query fragment, because moving it made them 9% slower.

@@ -57,6 +57,8 @@ Throughput counts tokens through the model, prompts and speculative drafts inclu
 | `--model <dir or org/name>` | required (flag, `TUR_MODEL` or file) | An existing directory loads locally; anything else names a Hugging Face repository |
 | `--revision <rev>` | required (flag, `TUR_REVISION` or file) | A 40-character commit for remote models, or a name you choose for local ones |
 | `--weight-format f32\|q8_0\|q4k` | `q8_0` | Convert SafeTensors weights to this format while loading. Leave it out for a [prepacked artifact](quantization.md) |
+| `--gguf <path or org/name/file.gguf>` | none (flag or `TUR_GGUF`) | Load weights from a [GGUF file](gguf.md) as stored; `--model` then supplies only the config, tokenizer and template |
+| `--gguf-revision <commit>` | none (flag or `TUR_GGUF_REVISION`) | 40-character commit of a remote `--gguf` file |
 | `--kv-format f32\|f16\|q8\|q8_<group>` | `f16` | Storage for attention keys and values; `q8` uses one scale per 32 values |
 | `--kv-page-tokens <n>` | 16 | Tokens per K/V page |
 | `--recurrent-state f32\|f16` | `f32` | Storage for DeltaNet recurrent state |

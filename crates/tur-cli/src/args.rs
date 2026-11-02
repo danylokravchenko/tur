@@ -11,7 +11,7 @@ use serde::Deserialize;
 use tur::{
     ModelFactory, ModelSource, Result, TurError,
     backend::{
-        factory::{WhisperFactory, resolve_checkpoint, resolve_drafter},
+        factory::{GgufSource, WhisperFactory, resolve_checkpoint, resolve_drafter},
         pipeline::PipelineConfig,
         speculation::SpeculationConfig,
     },
@@ -61,6 +61,14 @@ pub(crate) struct ModelArgs {
     #[arg(long)]
     #[serde(deserialize_with = "optional_from_str")]
     weight_format: Option<WeightFormat>,
+    /// Load weights from this GGUF file as stored: a local path, or
+    /// `organization/repository/file.gguf` at `--gguf-revision`. `--model` then supplies only
+    /// the config, tokenizer and template, and its weights are not downloaded.
+    #[arg(long, env = "TUR_GGUF")]
+    gguf: Option<String>,
+    /// Commit of a remote `--gguf` file.
+    #[arg(long, env = "TUR_GGUF_REVISION")]
+    gguf_revision: Option<String>,
     /// K/V storage: f32, f16, q8 (one scale per 32 dimensions, half of F16's memory) or
     /// `q8_<group>` (default: f16).
     #[arg(long)]
@@ -102,12 +110,40 @@ impl ModelArgs {
         model,
         revision,
         weight_format,
+        gguf,
+        gguf_revision,
         kv_format,
         kv_page_tokens,
         recurrent_state,
         audio_encoder,
         expert_cache_mb
     );
+
+    /// A `--gguf` value is local when the path exists, and a Hub file otherwise.
+    fn gguf_source(&self) -> Result<Option<GgufSource>> {
+        let Some(gguf) = self.gguf.as_ref().filter(|value| !value.trim().is_empty()) else {
+            return Ok(None);
+        };
+        if Path::new(gguf).is_file() {
+            return Ok(Some(GgufSource::LocalPath(gguf.into())));
+        }
+        let parts: Vec<&str> = gguf.splitn(3, '/').collect();
+        let &[organization, repository, file] = parts.as_slice() else {
+            return Err(TurError::Other(format!(
+                "no GGUF file at {gguf}; a Hub file is organization/repository/file.gguf"
+            )));
+        };
+        let revision = self
+            .gguf_revision
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| TurError::Other("a remote --gguf needs --gguf-revision".into()))?;
+        Ok(Some(GgufSource::HuggingFace {
+            repository: format!("{organization}/{repository}"),
+            file: file.to_owned(),
+            revision,
+        }))
+    }
 
     pub(crate) fn factory(&self) -> Result<ModelFactory> {
         let model = self
@@ -130,6 +166,7 @@ impl ModelArgs {
             source,
             revision: revision.clone(),
             format: self.weight_format,
+            gguf: self.gguf_source()?,
             device: tur::shared::inference_device(self.cpu_reference)?,
             kv: self.kv_layout(),
             recurrent: self.recurrent_state.unwrap_or(DType::F32),

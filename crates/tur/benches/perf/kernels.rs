@@ -5,7 +5,7 @@
 //! `cargo bench --offline -p tur --bench perf -- kernels > out.json`
 //! `TUR_BENCH_ONLY=delta|linear|paged|tiled|sample|moe` restricts the run to one group;
 //! `TUR_BENCH_MOE=q8_0,q4k,f32` selects expert weight formats.
-//! `TUR_BENCH_LINEAR=q8_0,q4k,q5k,q6k` selects projection formats (default `q8_0,q4k`);
+//! `TUR_BENCH_LINEAR=q8_0,q4k,q6k,q5k,q3k,q2k` selects projection formats (default `q8_0,q4k`);
 //! Q5K and Q6K have no Tur kernels and measure Candle's only.
 //! `TUR_BENCH_SHAPE=<substring>` selects tiled attention shapes for focused tuning.
 
@@ -14,9 +14,11 @@ use serde_json::{Value, json};
 use std::time::Instant;
 use tur_core::{Result, execution::KvFormat};
 use tur_metal::{
+    blocks::BlockFormat,
     kernels::{DeltaShape, Heads, Kernels, PagedKv, RecurrentSpan, Tuning},
-    packed::PackedLinear,
+    packed::{PackedLinear, StoredPart},
     pool::{AttentionPool, KvPool},
+    quantize::quantize,
     sampling::{self, PenaltyEntry, PenaltyParams, SampleParams},
 };
 
@@ -122,6 +124,42 @@ fn candle_nn_free_softmax(x: &Tensor) -> Result<Tensor> {
     Ok(e.broadcast_div(&e.sum_keepdim(D::Minus1)?)?)
 }
 
+/// `weight` in two runs differing in format, the second in F32 for one row, so it stays on
+/// the block kernels; `None` for formats whose rows Candle's kernels and Tur's already cover.
+fn mixed_copy(
+    weight: &Tensor,
+    format: GgmlDType,
+    cols: usize,
+    device: &Device,
+) -> Result<Option<PackedLinear>> {
+    let block = match format {
+        GgmlDType::Q3K => BlockFormat::Q3K,
+        GgmlDType::Q5K => BlockFormat::Q5K,
+        GgmlDType::Q6K => BlockFormat::Q6K,
+        GgmlDType::Q2K => BlockFormat::Q2K,
+        _ => return Ok(None),
+    };
+    let rows = weight.dim(0)? - 1;
+    let values = weight.narrow(0, 0, rows)?.flatten_all()?.to_vec1::<f32>()?;
+    let last = weight.narrow(0, rows, 1)?.flatten_all()?.to_vec1::<f32>()?;
+    Ok(Some(PackedLinear::from_parts(
+        vec![
+            StoredPart {
+                format: block,
+                rows,
+                bytes: quantize(&values, cols, format, None)?,
+            },
+            StoredPart {
+                format: BlockFormat::F32,
+                rows: 1,
+                bytes: last.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            },
+        ],
+        cols,
+        device,
+    )?))
+}
+
 fn gemv_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     // (label, out, in): Qwen3.5-0.8B projections and Qwen3.8-27B MLP shapes.
     let shapes = [
@@ -152,6 +190,8 @@ fn gemv_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
             "q4k" => Ok(GgmlDType::Q4K),
             "q5k" => Ok(GgmlDType::Q5K),
             "q6k" => Ok(GgmlDType::Q6K),
+            "q3k" => Ok(GgmlDType::Q3K),
+            "q2k" => Ok(GgmlDType::Q2K),
             _ => Err(tur_core::execution::invalid(format!(
                 "unknown format {name}"
             ))),
@@ -162,8 +202,9 @@ fn gemv_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
         let weight = random(&Device::Cpu, &[n, k], 1, 0.05)?;
         for &format in &formats {
             let layer = PackedLinear::quantized(&weight, format, device)?;
+            let mixed = mixed_copy(&weight, format, k, device)?;
             let tur = matches!(format, GgmlDType::Q8_0 | GgmlDType::Q4K);
-            for rows in [1usize, 2, 3, 4, 5, 6, 7, 8, 16, 128] {
+            for rows in [1usize, 2, 3, 4, 5, 6, 7, 8, 12, 16, 128] {
                 let x = random(device, &[rows, k], 2, 1.0)?;
                 let existing = time(device, || layer.forward(&x))?;
                 let seconds = existing["median_seconds"].as_f64().unwrap_or(f64::INFINITY);
@@ -175,6 +216,13 @@ fn gemv_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
                     "candle_weight_gb_per_s": layer.resident_bytes() as f64 / seconds / 1e9,
                     "candle_kernel": if rows == 1 { "mul_mv" } else { "mul_mm (F16 tiles)" },
                 });
+                if let Some(mixed) = &mixed {
+                    // Two runs of this format force the block kernels at any batch size, as
+                    // a matrix mixing formats or a codebook format always uses them.
+                    let custom = time(device, || kernels.linear(mixed, &x))?;
+                    case["speedup"] = json!(speedup(&custom, &existing));
+                    case["tur_blocks"] = custom;
+                }
                 if tur && rows <= 16 {
                     let custom = time(device, || qmm.linear(&layer, &x))?;
                     let seconds = custom["median_seconds"].as_f64().unwrap_or(f64::INFINITY);

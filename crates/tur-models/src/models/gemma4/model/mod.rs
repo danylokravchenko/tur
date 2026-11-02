@@ -109,6 +109,7 @@ fn audio_precision(config: &Config, options: &LoadOptions) -> Option<crate::mode
         Weights::Prepacked(manifest) => plan_is_f32(&manifest.plan),
         Weights::Uniform(format) => *format == crate::models::WeightFormat::F32,
         Weights::Plan(_) => false,
+        Weights::Gguf(_) => return None,
     };
     (options.audio && config.audio.is_some()).then(|| audio::precision(text_f32))
 }
@@ -322,6 +323,7 @@ impl Gemma4 {
         }
         let plan = format_plan(&config, options)?;
         let (checkpoint, prepacked) = match &options.weights {
+            Weights::Gguf(file) => (file.checkpoint(&config)?, false),
             Weights::Prepacked(manifest) => {
                 let (checkpoint, found) = artifact::open_for(dir, &config)?;
                 if found != **manifest {
@@ -466,8 +468,15 @@ impl Gemma4 {
             })
             .collect::<Result<Vec<_>>>()?;
         let widest = c.text.head_dim.max(c.text.global_head_dim);
+        let kernels = tur_metal::kernels::Kernels::new(&self.device)?;
+        kernels.prepare(&self.head)?;
+        for layer in &self.layers {
+            for projection in [&layer.qkv, &layer.o, &layer.gate_up, &layer.down] {
+                kernels.prepare(projection)?;
+            }
+        }
         Ok(Fused {
-            kernels: tur_metal::kernels::Kernels::new(&self.device)?,
+            kernels,
             rope,
             ones: Tensor::ones(widest, DType::F32, &self.device)?,
             unrotated: Tensor::zeros(1, DType::F32, &self.device)?,

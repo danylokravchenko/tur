@@ -1,12 +1,19 @@
 //! Shared immutable weight loading and embedding storage.
 use super::{Embedding, Packer, Precision, Projection, STAGING_BYTES, WeightPlan};
-use crate::models::checkpoint::Checkpoint;
+use crate::models::{
+    checkpoint::Checkpoint,
+    gguf::{bank_format, stored_parts},
+};
 use candle_core::{DType, Device, Tensor};
 use std::collections::BTreeMap;
 #[cfg(feature = "metal")]
 use std::sync::Arc;
 use tur_core::{Result, execution::invalid};
-use tur_metal::packed::PackedLinear;
+use tur_metal::{
+    blocks::BlockFormat,
+    packed::{PackedLinear, StoredPart},
+    quantize::quantize,
+};
 
 /// Input embedding storage.
 pub(crate) enum Embeddings {
@@ -34,8 +41,20 @@ impl Embeddings {
         }
     }
 }
+/// `part` decoded and packed again in `target`, which must have a Candle format.
+fn repacked(part: &StoredPart, target: BlockFormat, cols: usize) -> Result<StoredPart> {
+    let format = target
+        .candle()
+        .ok_or_else(|| invalid("cannot pack into this block format"))?;
+    Ok(StoredPart {
+        format: target,
+        rows: part.rows,
+        bytes: quantize(&part.format.decode(&part.bytes, cols)?, cols, format, None)?,
+    })
+}
+
 /// Validated weight source of one load: a `SafeTensors` checkpoint converted by a plan,
-/// or a prepacked artifact uploaded as stored.
+/// a prepacked artifact uploaded as stored, or a GGUF file's tensors uploaded as stored.
 pub(crate) struct Tensors {
     pub(crate) checkpoint: Checkpoint,
     pub(crate) prepacked: bool,
@@ -61,12 +80,78 @@ impl Tensors {
             .ok_or_else(|| invalid(format!("model has no projection {name}")))?;
         let precision = self.plan.precision(name)?;
         let shape = (projection.rows, projection.cols);
+        if self.plan.is_stored() {
+            return self.stored_parts(projection);
+        }
         if self.prepacked {
             return self.stored(name, precision, shape);
         }
         Packer::RTN
             .pack(&self.checkpoint, projection, precision)?
             .upload(precision, shape, &self.device)
+    }
+
+    /// A projection from a GGUF file, its parts uploaded in their stored formats.
+    fn stored_parts(&self, projection: &Projection) -> Result<PackedLinear> {
+        let names = stored_parts(projection);
+        let cols = projection.cols;
+        if let ([gate, up], true) = (names.as_slice(), projection.experts > 1) {
+            return self.stored_bank(gate, up, projection);
+        }
+        let parts = names
+            .iter()
+            .map(|name| self.stored_part(name, cols))
+            .collect::<Result<Vec<_>>>()?;
+        PackedLinear::from_parts(parts, cols, &self.device)
+    }
+
+    fn stored_part(&self, name: &str, cols: usize) -> Result<StoredPart> {
+        let (entry, bytes) = self.checkpoint.take_raw(name)?;
+        let format = entry.stored_format()?;
+        let rows = bytes.len() / format.bytes(1, cols)?;
+        Ok(StoredPart {
+            format,
+            rows,
+            bytes,
+        })
+    }
+
+    /// A stacked gate-and-up expert bank from its two GGUF tensors. Each expert's gate rows
+    /// precede its up rows, and a bank whose tensors differ is packed again ([`bank_format`]).
+    fn stored_bank(&self, gate: &str, up: &str, bank: &Projection) -> Result<PackedLinear> {
+        let (gate, up) = (
+            self.stored_part(gate, bank.cols)?,
+            self.stored_part(up, bank.cols)?,
+        );
+        let per_expert = bank.rows / bank.experts / 2;
+        let target = bank_format(gate.format, up.format);
+        let (gate, up) = if gate.format == up.format {
+            (gate, up)
+        } else {
+            (
+                repacked(&gate, target, bank.cols)?,
+                repacked(&up, target, bank.cols)?,
+            )
+        };
+        let row = gate.format.bytes(1, bank.cols)?;
+        let mut bytes = Vec::with_capacity(gate.bytes.len() + up.bytes.len());
+        for (gate, up) in gate
+            .bytes
+            .chunks_exact(per_expert * row)
+            .zip(up.bytes.chunks_exact(per_expert * row))
+        {
+            bytes.extend_from_slice(gate);
+            bytes.extend_from_slice(up);
+        }
+        PackedLinear::from_parts(
+            vec![StoredPart {
+                format: gate.format,
+                rows: bank.rows,
+                bytes,
+            }],
+            bank.cols,
+            &self.device,
+        )
     }
 
     /// An artifact matrix uploaded exactly as stored; its layout was validated on open.
@@ -100,6 +185,14 @@ impl Tensors {
             Embedding::Table(precision) => precision,
         };
         let dtype = match precision {
+            Precision::Stored => {
+                let table = self.stored_part(&name, cols)?;
+                return Ok(Embeddings::Packed(PackedLinear::from_parts(
+                    vec![table],
+                    cols,
+                    &self.device,
+                )?));
+            }
             Precision::F32 => DType::F32,
             Precision::Bf16 => DType::BF16,
             _ if self.prepacked => {

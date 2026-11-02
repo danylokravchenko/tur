@@ -228,6 +228,7 @@ pub fn allocate(
             .map(|p| (p.name, base))
             .collect(),
         embedding,
+        stored: BTreeMap::new(),
     };
     let mut current: BTreeMap<&str, &Sensitivity> = BTreeMap::new();
     for (name, list) in &options {

@@ -2,12 +2,16 @@
 mod artifact;
 mod checkpoint;
 mod generation;
+mod gguf;
 mod math;
 mod options;
 #[cfg(feature = "metal")]
 mod paging;
 pub use artifact::{ARTIFACT_FILE, CalibrationInfo, Conversion, Manifest, Quantizer, is_artifact};
+pub use checkpoint::Adjust;
 pub use generation::GenerationDefaults;
+pub use gguf::{GgufFile, GgufTensor};
+pub(crate) use gguf::{shard_name, split_name};
 pub(crate) use weights::STAGING_BYTES;
 pub mod weights;
 pub use options::{

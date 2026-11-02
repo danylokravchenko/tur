@@ -3,14 +3,14 @@ layout: base.njk
 labs: true
 permalink: index.html
 title: "Tur: local inference with a little muscle"
-description: "A Rust inference engine for hybrid language models on Apple Silicon. One binary for generation, an OpenAI-compatible server, Whisper transcription and quantization."
+description: "A Rust inference engine for Apple Silicon that serves mixture-of-experts models bigger than your Mac's memory. One binary for generation, an OpenAI-compatible server, Whisper transcription and quantization."
 ---
 <section class="hero">
   <div class="hero__inner">
     <div class="hero__copy">
       <p class="eyebrow eyebrow--hero">Rust · Metal · Apple Silicon</p>
       <h1>Local inference with a little muscle</h1>
-      <p class="hero__tag">Use the maximum of your Mac</p>
+      <p class="hero__tag">Serve models bigger than your Mac's memory</p>
       <p class="hero__lead">Tur runs language models on your Mac's GPU with Metal kernels fitted to those models. One binary handles generation, an OpenAI-compatible server, Whisper transcription and quantization.</p>
       <div class="install"><code>{{ readme.install }}</code><button type="button" data-copy="{{ readme.install }}">Copy</button></div>
       <div class="hero__cta">
@@ -29,10 +29,26 @@ description: "A Rust inference engine for hybrid language models on Apple Silico
 
 <main id="main">
   <section class="stats wrap" aria-label="Headline measurements">
+    <a class="stat" href="/docs/architecture/expert-cache/"><b>12.8 GiB</b><span>of weights served on a 16 GB Mac whose GPU can't hold them, through a {{ perf.expertCache.size }} expert cache</span></a>
     <a class="stat" href="/benchmarks/#batching"><b>+{{ perf.stats.batched }}%</b><span>eight-sequence decode against llama.cpp, {{ perf.stats.batchedTok }} tok/s to {{ perf.stats.batchedBase }} on an M3 Pro</span></a>
     <a class="stat" href="/benchmarks/#reuse"><b>{{ perf.stats.prefixCached }}</b><span>to first token behind a cached system prompt, against {{ perf.stats.prefixCold }} without reuse</span></a>
     <a class="stat" href="/benchmarks/#reuse"><b>{{ perf.stats.speculation }}</b><span>speculative decoding on repetitive text, with output identical to normal decoding</span></a>
-    <a class="stat" href="/benchmarks/#start"><b>{{ perf.stats.load }}</b><span>to load 4-bit prepacked weights for a 0.8B model on a 16 GB M1</span></a>
+  </section>
+
+  <section class="wrap band fit">
+    <div>
+      <h2>Bigger than your memory</h2>
+      <p>Your Mac doesn't have to hold a mixture-of-experts model to serve it. Each token uses only a few of the model's experts, so Tur keeps them on the SSD and reads the ones a token needs into a cache whose size you choose. Memory only has to hold the rest of the model, that cache and the request state.</p>
+      <p>gpt-oss-20b runs this way on a 16 GB Mac at {{ perf.expertCache.decode }} tokens/s for one request, and several requests can share the cache. The cache doesn't change what the model computes, it never writes to the SSD, and Tur refuses a cache so large that it would push other apps into swap.</p>
+      <p>Reads cost speed, which suits batch work and short answers, so keep every expert in memory when the model fits.</p>
+      <a class="btn btn--small" href="/docs/architecture/expert-cache/">How the expert cache works</a>
+    </div>
+    <figure class="offload">
+      <figcaption>On the SSD: 9.5 GiB of experts</figcaption>
+      <div class="offload__experts" aria-hidden="true">{% for n in range(0, 60) %}<i{% if n % 7 == 3 %} class="on"{% endif %}></i>{% endfor %}</div>
+      <figcaption>In memory: a {{ perf.expertCache.size }} cache of the experts in use</figcaption>
+      <div class="offload__cache" aria-hidden="true">{% for n in range(0, 9) %}<i></i>{% endfor %}</div>
+    </figure>
   </section>
 
   <section class="wrap band">
@@ -40,14 +56,14 @@ description: "A Rust inference engine for hybrid language models on Apple Silico
     <p class="band__lead">Pick Tur if you want one of these on an Apple Silicon Mac.</p>
     <div class="cards">
       <article class="card">
-        <h3>Many clients, one model</h3>
-        <p>Several clients or agents share each model pass, so eight sequences decode {{ perf.stats.batched }}% faster than on llama.cpp on the same Mac.</p>
-        <a href="/docs/architecture/scheduling/">Scheduling</a>
-      </article>
-      <article class="card">
         <h3>Models larger than memory</h3>
         <p>Tur keeps most of a mixture-of-experts model on the SSD and reads experts into a fixed cache, with several requests at once and no SSD writes during a run.</p>
         <a href="/docs/architecture/expert-cache/">Expert cache</a>
+      </article>
+      <article class="card">
+        <h3>Many clients, one model</h3>
+        <p>Several clients or agents share each model pass, so eight sequences decode {{ perf.stats.batched }}% faster than on llama.cpp on the same Mac.</p>
+        <a href="/docs/architecture/scheduling/">Scheduling</a>
       </article>
       <article class="card">
         <h3>A server you can leave running</h3>
