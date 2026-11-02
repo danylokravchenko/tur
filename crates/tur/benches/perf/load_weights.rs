@@ -47,6 +47,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             mtp: None,
             audio: false,
             vision: false,
+            video: false,
             expert_cache: None,
         },
     )?;

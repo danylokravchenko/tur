@@ -431,23 +431,22 @@ impl VisionTower {
     /// Each sampled frame's patches and pixels, in order.
     pub(super) fn video_frames(&self, video: &Video) -> Result<Vec<Patches>> {
         let (height, width) = self.video_target(video);
-        video
-            .frames(&self.video_indices(video))?
-            .iter()
-            .map(|frame| {
-                let resized = if (height, width) == (video.height(), video.width()) {
-                    frame.clone()
-                } else {
-                    crate::image::resize::bicubic(
-                        frame,
-                        (video.height(), video.width()),
-                        (height, width),
-                    )
-                };
-                // A video's values rescale and normalize in one step, unlike an image's.
-                self.frame_patches(&resized, height, width, |v| f32::from(v) / 255.0)
-            })
-            .collect()
+        let mut patches = Vec::new();
+        video.each_frame(&self.video_indices(video), |frame| {
+            let resized = if (height, width) == (video.height(), video.width()) {
+                frame
+            } else {
+                crate::image::resize::bicubic(
+                    &frame,
+                    (video.height(), video.width()),
+                    (height, width),
+                )
+            };
+            // A video's values rescale and normalize in one step, unlike an image's.
+            patches.push(self.frame_patches(&resized, height, width, |v| f32::from(v) / 255.0)?);
+            Ok(())
+        })?;
+        Ok(patches)
     }
 
     /// `[patches, hidden]` projected patches with their learned positions.

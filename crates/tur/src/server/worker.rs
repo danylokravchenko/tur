@@ -141,6 +141,8 @@ pub struct PipelineWorker {
     report: Option<Arc<ModelReport>>,
     telemetry: Arc<WorkerTelemetry>,
     exit: watch::Receiver<()>,
+    /// Whether this model takes video. The route checks before any decoder sees a file.
+    video: bool,
 }
 
 const MAX_ADMISSIONS_PER_PASS: usize = 32;
@@ -533,6 +535,7 @@ impl PipelineWorker {
     pub fn spawn(config: WorkerConfig) -> Result<Self> {
         let timeout = config.request_timeout;
         let stream = config.stream;
+        let video = config.factory.video;
         let (tx, rx) = mpsc::channel(256);
         let intake = tx.downgrade();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -587,6 +590,7 @@ impl PipelineWorker {
             report: Some(Arc::new(report)),
             telemetry,
             exit,
+            video,
         })
     }
 
@@ -599,7 +603,20 @@ impl PipelineWorker {
             report: None,
             telemetry: Arc::default(),
             exit: watch::channel(()).1,
+            video: true,
         }
+    }
+
+    /// This worker with video refused, as `--video-input=false` starts one.
+    #[must_use]
+    pub fn without_video(mut self) -> Self {
+        self.video = false;
+        self
+    }
+
+    /// Whether this model takes video in requests.
+    pub fn accepts_video(&self) -> bool {
+        self.video
     }
 
     /// Whether the worker still takes requests. A stopped one never comes back.
@@ -678,6 +695,7 @@ mod tests {
             report: None,
             telemetry: Arc::default(),
             exit: watch::channel(()).1,
+            video: true,
         };
         let message = || {
             let (token_tx, token_rx) = mpsc::channel(1);
@@ -730,6 +748,7 @@ mod tests {
                 recurrent: DEFAULT_RECURRENT_STATE,
                 audio: false,
                 vision: false,
+                video: false,
                 expert_cache: None,
                 gguf: None,
             },

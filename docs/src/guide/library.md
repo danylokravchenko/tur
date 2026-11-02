@@ -28,6 +28,7 @@ fn main() -> Result<()> {
         recurrent: DEFAULT_RECURRENT_STATE,
         audio: false,        // load the audio encoder of a model that has one
         vision: false,       // load the vision encoder of a model that has one
+        video: false,        // accept video through that encoder
         expert_cache: None,  // Some(bytes) keeps experts on disk, see the expert cache chapter
     };
     let mut pipeline = InferencePipeline::new(&factory, PipelineConfig::new(1, 256))?;

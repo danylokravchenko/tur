@@ -339,6 +339,8 @@ Qwen3.5-0.8B with Q8_0 weights, encoding on the tower's own queue, while a 400-t
 | Encoding a 5 s 320×320 clip, 500 soft tokens | 0.47 s |
 | Encoding a 5 s 640×640 clip, 2000 soft tokens | 2.35 s |
 | Encoding a 30 s 640×640 clip, 1920 soft tokens | 1.95 s |
+| Decoding 1080p H.264, one thread | 98 frames/s |
+| Decoding 1080p HEVC, one thread | 88 frames/s (78 at 10-bit) |
 | Repeating an encoded input, rows reused | under 10 µs |
 | Text pass, alone: median, slowest | 17.6 ms, 86 ms |
 | Text pass beside that image: median, slowest | 18.4 ms, 80 ms |

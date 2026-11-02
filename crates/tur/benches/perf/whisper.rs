@@ -165,6 +165,7 @@ fn gemma(device: &Device, dir: &Path, wav: &Path) -> Result<()> {
             mtp: None,
             audio: true,
             vision: false,
+            video: false,
             expert_cache: None,
         },
     )?;
@@ -194,6 +195,7 @@ fn gemma_contention(dir: &Path, wav: &Path) -> Result<()> {
         recurrent: DType::F32,
         audio: true,
         vision: false,
+        video: false,
         expert_cache: None,
         gguf: None,
     };

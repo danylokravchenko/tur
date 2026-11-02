@@ -2,7 +2,8 @@
 //! what an input costs to encode at its sizes, what reusing its rows saves, and what its
 //! encoding costs a stream beside it.
 //!
-//! `TUR_QWEN35_0_8B=<dir>` adds the checkpoint measurements.
+//! `TUR_QWEN35_0_8B=<dir>` adds the checkpoint measurements, and `TUR_VIDEO=<mp4,...>` the time
+//! to decode every frame of each file.
 use candle_core::{DType, Device, Tensor};
 use serde_json::json;
 use std::{path::PathBuf, sync::Arc, time::Instant};
@@ -194,8 +195,26 @@ fn contention(pipeline: &mut InferencePipeline, model: &Arc<TextModel>) -> Resul
     Ok(())
 }
 
+fn decoding() -> Result<()> {
+    let files = std::env::var("TUR_VIDEO").unwrap_or_default();
+    for file in files.split(',').filter(|file| !file.is_empty()) {
+        let video = Video::decode(&std::fs::read(file)?)?;
+        let indices: Vec<usize> = (0..video.frame_count()).collect();
+        let start = Instant::now();
+        video.each_frame(&indices, |_| Ok(()))?;
+        println!(
+            "{}",
+            json!({"op": "decode", "file": file, "frames": video.frame_count(),
+                   "width": video.width(), "height": video.height(),
+                   "frames_per_second": video.frame_count() as f64 / start.elapsed().as_secs_f64()})
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn run() -> Result<()> {
     rotary()?;
+    decoding()?;
     let Some(dir) = std::env::var_os("TUR_QWEN35_0_8B").map(PathBuf::from) else {
         return Ok(());
     };
@@ -208,6 +227,7 @@ pub(crate) fn run() -> Result<()> {
         recurrent: DType::F32,
         audio: false,
         vision: true,
+        video: true,
         expert_cache: None,
         gguf: None,
     };

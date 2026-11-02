@@ -48,6 +48,7 @@ fn gemma(device: &Device, execution: Execution, audio: bool) -> Result<Gemma4> {
             mtp: None,
             audio,
             vision: false,
+            video: false,
             expert_cache: None,
         },
     )
@@ -147,6 +148,7 @@ fn test_gemma4_artifacts_carry_the_audio_encoder_packed() -> Result<()> {
             mtp: None,
             audio,
             vision: false,
+            video: false,
             expert_cache: None,
         };
         let converted = Gemma4::load(&source, &options(true))?;
@@ -200,6 +202,7 @@ fn test_gemma4_audio_is_optional_and_bounded() -> Result<()> {
                 mtp: None,
                 audio: true,
                 vision: false,
+                video: false,
                 expert_cache: None,
             },
             1,
@@ -255,6 +258,7 @@ fn test_gemma4_e2b_audio_encoder_matches_transformers() -> Result<()> {
             mtp: None,
             audio: true,
             vision: false,
+            video: false,
             expert_cache: None,
         },
     )?;
@@ -324,6 +328,7 @@ fn factory(fixture: &crate::common::Checkpoint) -> tur::ModelFactory {
         recurrent: DType::F32,
         audio: true,
         vision: false,
+        video: false,
         expert_cache: None,
         gguf: None,
     }
@@ -1073,6 +1078,37 @@ Content-Type: audio/wav\r\n\r\n",
         ] {
             assert_eq!(send(chat(&bad)?).await?.0, 400, "{bad}");
         }
+        Ok(())
+    }
+
+    /// `--video-input=false` refuses a part before reading it: this one isn't even a valid
+    /// file, and the error names the setting's effect rather than the file.
+    #[tokio::test]
+    async fn test_video_off_refuses_parts_before_any_decoder_runs() -> Result<()> {
+        let request = chat(&serde_json::json!({
+            "type": "video_url", "video_url": {"url": "data:video/mp4;base64,aGk="}
+        }))?;
+        let response = build_router(AppState {
+            workers: HashMap::from([("tur".to_owned(), chat_worker().without_video())]),
+            default_model: "tur".into(),
+            transcribers: HashMap::new(),
+            default_transcriber: None,
+            status: tur::server::ServerStatus::shared(),
+        })
+        .oneshot(request)
+        .await
+        .map_err(|e| TurError::Other(e.to_string()))?;
+        assert_eq!(response.status(), 400);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| TurError::Other(e.to_string()))?
+            .to_bytes();
+        assert!(
+            String::from_utf8_lossy(&body).contains("does not accept video"),
+            "{body:?}"
+        );
         Ok(())
     }
 

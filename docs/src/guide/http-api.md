@@ -81,7 +81,7 @@ Videos go in a `video_url` part, also holding a `data:` URL:
 {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,<base64 file>"}}
 ```
 
-Videos must be H.264 in an MP4 file, within the 64 MiB body limit once encoded. Each sampled step adds its soft tokens and a timestamp to `prompt_tokens`: up to 2048 soft tokens on Qwen3.5, and 70 per frame for up to 32 frames on Gemma 4.
+Videos must be H.264 or HEVC in an MP4 file, within the 64 MiB body limit once encoded. `tur serve --video-input=false` answers these parts with 400 before reading them. Each sampled step adds its soft tokens and a timestamp to `prompt_tokens`: up to 2048 soft tokens on Qwen3.5, and 70 per frame for up to 32 frames on Gemma 4.
 
 Prompts containing a placeholder token without its image, video or clip are rejected.
 

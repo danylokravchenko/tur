@@ -1,4 +1,4 @@
-//! Video input: H.264 in MP4, decoded only as far as the frames a model samples need.
+//! Video input: H.264 or HEVC in MP4, decoded only as far as the frames a model samples need.
 use crate::media::{Digest, digest};
 use mp4::{Mp4Reader, TrackType};
 use openh264::{
@@ -6,6 +6,8 @@ use openh264::{
     decoder::{Decoder, DecoderConfig, Flush},
     formats::YUVSource,
 };
+mod hevc;
+
 use std::{io::Cursor, panic::AssertUnwindSafe, sync::Arc};
 use tur_core::{Result, execution::invalid};
 
@@ -14,10 +16,79 @@ pub const MAX_SIDE: usize = 4096;
 /// Most frames a video may hold: an hour at 30 fps.
 const MAX_FRAMES: usize = 108_000;
 
+/// How a file's samples decode.
+#[derive(Clone, Debug, PartialEq)]
+enum Codec {
+    H264,
+    Hevc(hevc::Config),
+}
+
+/// Quarter turns clockwise a file asks a player to apply, which phones record portrait with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Turn {
+    None,
+    Quarter,
+    Half,
+    ThreeQuarters,
+}
+
+impl Turn {
+    /// The turn a track header's matrix holds, from its leading 2×2 in 16.16 fixed point.
+    /// Anything but a pure rotation shows as stored.
+    fn of(a: i32, b: i32, c: i32, d: i32) -> Self {
+        const ONE: i32 = 1 << 16;
+        const MINUS: i32 = -ONE;
+        match (a, b, c, d) {
+            (0, ONE, MINUS, 0) => Self::Quarter,
+            (MINUS, 0, 0, MINUS) => Self::Half,
+            (0, MINUS, ONE, 0) => Self::ThreeQuarters,
+            _ => Self::None,
+        }
+    }
+
+    fn swaps_sides(self) -> bool {
+        matches!(self, Self::Quarter | Self::ThreeQuarters)
+    }
+
+    /// `rgb` of a `width` × `height` frame, turned.
+    fn apply(self, rgb: Vec<u8>, width: usize, height: usize) -> Vec<u8> {
+        if self == Self::None {
+            return rgb;
+        }
+        let mut out = Vec::with_capacity(rgb.len());
+        let pixel = |x: usize, y: usize| {
+            let at = (y * width + x) * 3;
+            &rgb[at..at + 3]
+        };
+        match self {
+            Self::Half => {
+                for pixel in rgb.as_chunks::<3>().0.iter().rev() {
+                    out.extend_from_slice(pixel);
+                }
+            }
+            Self::Quarter => {
+                for x in 0..width {
+                    for y in (0..height).rev() {
+                        out.extend_from_slice(pixel(x, y));
+                    }
+                }
+            }
+            _ => {
+                for x in (0..width).rev() {
+                    for y in 0..height {
+                        out.extend_from_slice(pixel(x, y));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Where a video's frames come from.
 #[derive(Clone, Debug, PartialEq)]
 enum Source {
-    Mp4(Arc<[u8]>),
+    Mp4(Arc<[u8]>, Codec),
     /// RGB frames, as a caller that decoded them passes them.
     Frames(Arc<[Vec<u8>]>),
 }
@@ -31,6 +102,7 @@ pub struct Video {
     height: usize,
     frames: usize,
     fps: f64,
+    turn: Turn,
     digest: Digest,
 }
 
@@ -70,11 +142,21 @@ impl Video {
                 .tracks()
                 .get(&id)
                 .ok_or_else(|| invalid("the file has no video track"))?;
-            if track.box_type().map_err(bad_file)? != mp4::BoxType::Avc1Box.into() {
-                return Err(invalid(
-                    "unsupported video codec: send H.264 in an MP4 file",
-                ));
-            }
+            // The MP4 reader knows H.264; HEVC's sample entries it skips or reads only in part.
+            let (codec, stored) = match hevc::Config::find(bytes, id)? {
+                Some((config, stored)) => (Codec::Hevc(config), stored),
+                None if track.box_type().ok() == Some(mp4::BoxType::Avc1Box.into()) => (
+                    Codec::H264,
+                    (usize::from(track.width()), usize::from(track.height())),
+                ),
+                None => {
+                    return Err(invalid(
+                        "unsupported video codec: send H.264 or HEVC in an MP4 file",
+                    ));
+                }
+            };
+            let matrix = &track.trak.tkhd.matrix;
+            let turn = Turn::of(matrix.a, matrix.b, matrix.c, matrix.d);
             let frames = track.sample_count() as usize;
             // The commonest frame duration: an edit list or a long last frame skews the track's
             // total, and timestamps should read as the file's nominal rate.
@@ -91,13 +173,20 @@ impl Video {
             if frames < 2 || delta == 0 {
                 return Err(invalid("a video needs at least two frames and a rate"));
             }
-            Self::checked(
-                Source::Mp4(bytes.into()),
-                (usize::from(track.width()), usize::from(track.height())),
+            let shown = if turn.swaps_sides() {
+                (stored.1, stored.0)
+            } else {
+                stored
+            };
+            let mut video = Self::checked(
+                Source::Mp4(bytes.into(), codec),
+                shown,
                 frames,
                 f64::from(track.timescale()) / f64::from(delta),
                 digest(&[b"video", bytes]),
-            )
+            )?;
+            video.turn = turn;
+            Ok(video)
         })
     }
 
@@ -153,6 +242,7 @@ impl Video {
             height,
             frames,
             fps,
+            turn: Turn::None,
             digest,
         })
     }
@@ -181,14 +271,52 @@ impl Video {
 
     /// RGB frames at nondecreasing `indices`, in that order.
     pub fn frames(&self, indices: &[usize]) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::with_capacity(indices.len());
+        self.each_frame(indices, |frame| {
+            out.push(frame);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Hand `take` the RGB frame at each of the nondecreasing `indices`, in that order. One frame
+    /// is alive at a time, so a caller that shrinks them never holds them all at full size.
+    pub fn each_frame(
+        &self,
+        indices: &[usize],
+        mut take: impl FnMut(Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
         if indices.windows(2).any(|pair| pair[0] > pair[1])
             || indices.last().is_some_and(|&last| last >= self.frames)
         {
             return Err(invalid("video frame indices out of order or range"));
         }
         match &self.source {
-            Source::Frames(frames) => Ok(indices.iter().map(|&at| frames[at].clone()).collect()),
-            Source::Mp4(bytes) => guarded(|| decode_frames(bytes, indices, self.frames)),
+            Source::Frames(frames) => indices.iter().try_for_each(|&at| take(frames[at].clone())),
+            Source::Mp4(bytes, codec) => guarded(|| {
+                let stored = if self.turn.swaps_sides() {
+                    (self.height, self.width)
+                } else {
+                    (self.width, self.height)
+                };
+                let mut collector = Collector {
+                    indices,
+                    wanted: 0,
+                    next: 0,
+                    stored,
+                    turn: self.turn,
+                    take: &mut take,
+                };
+                match codec {
+                    Codec::H264 => decode_h264(bytes, self.frames, &mut collector),
+                    Codec::Hevc(config) => decode_hevc(bytes, self.frames, config, &mut collector),
+                }?;
+                if collector.done() {
+                    Ok(())
+                } else {
+                    Err(bad_file("fewer decoded frames than samples"))
+                }
+            }),
         }
     }
 }
@@ -211,12 +339,16 @@ fn annex_b(sample: &[u8], out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// Collects decoded frames in presentation order, keeping the ones asked for.
+/// Passes on decoded frames in display order, keeping the ones asked for.
 struct Collector<'a> {
     indices: &'a [usize],
     wanted: usize,
     next: usize,
-    out: Vec<Vec<u8>>,
+    /// Frame size before turning, which every decoded frame must have: the header announced it,
+    /// and prompts and buffers were sized by it.
+    stored: (usize, usize),
+    turn: Turn,
+    take: &'a mut dyn FnMut(Vec<u8>) -> Result<()>,
 }
 
 impl Collector<'_> {
@@ -224,29 +356,39 @@ impl Collector<'_> {
         self.wanted >= self.indices.len()
     }
 
-    fn take(&mut self, frame: &impl Frame) {
+    fn accept(&mut self, frame: &impl Frame) -> Result<()> {
+        if frame.size() != self.stored {
+            return Err(bad_file("a frame's size differs from the file's header"));
+        }
         while self.indices.get(self.wanted) == Some(&self.next) {
-            self.out.push(frame.rgb());
+            let (width, height) = self.stored;
+            (self.take)(self.turn.apply(frame.rgb()?, width, height))?;
             self.wanted += 1;
         }
         self.next += 1;
+        Ok(())
     }
 }
 
 trait Frame {
-    fn rgb(&self) -> Vec<u8>;
+    fn size(&self) -> (usize, usize);
+    fn rgb(&self) -> Result<Vec<u8>>;
 }
 
 impl Frame for openh264::decoder::DecodedYUV<'_> {
-    fn rgb(&self) -> Vec<u8> {
+    fn size(&self) -> (usize, usize) {
+        self.dimensions()
+    }
+
+    fn rgb(&self) -> Result<Vec<u8>> {
         let (width, height) = self.dimensions();
         let mut rgb = vec![0u8; width * height * 3];
         self.write_rgb8(&mut rgb);
-        rgb
+        Ok(rgb)
     }
 }
 
-fn decode_frames(bytes: &[u8], indices: &[usize], frames: usize) -> Result<Vec<Vec<u8>>> {
+fn decode_h264(bytes: &[u8], frames: usize, collector: &mut Collector<'_>) -> Result<()> {
     let (mut reader, id) = open(bytes)?;
     let track = reader
         .tracks()
@@ -267,15 +409,9 @@ fn decode_frames(bytes: &[u8], indices: &[usize], frames: usize) -> Result<Vec<V
         packet.extend_from_slice(&[0, 0, 0, 1]);
         packet.extend_from_slice(parameters);
     }
-    let mut collector = Collector {
-        indices,
-        wanted: 0,
-        next: 0,
-        out: Vec::with_capacity(indices.len()),
-    };
     for sample in 1..=u32::try_from(frames).map_err(|_| bad_file("too many frames"))? {
         if collector.done() {
-            return Ok(collector.out);
+            return Ok(());
         }
         let sample = reader
             .read_sample(id, sample)
@@ -283,17 +419,48 @@ fn decode_frames(bytes: &[u8], indices: &[usize], frames: usize) -> Result<Vec<V
             .ok_or_else(|| bad_file("missing sample"))?;
         annex_b(&sample.bytes, &mut packet)?;
         if let Some(frame) = decoder.decode(&packet).map_err(bad_file)? {
-            collector.take(&frame);
+            collector.accept(&frame)?;
         }
         packet.clear();
     }
     for frame in decoder.flush_remaining().map_err(bad_file)? {
-        collector.take(&frame);
+        collector.accept(&frame)?;
     }
-    if !collector.done() {
-        return Err(bad_file("fewer decoded frames than samples"));
+    Ok(())
+}
+
+/// One thread: the crate's only `unsafe` serves its worker threads, and uploads are untrusted.
+fn decode_hevc(
+    bytes: &[u8],
+    frames: usize,
+    config: &hevc::Config,
+    collector: &mut Collector<'_>,
+) -> Result<()> {
+    let (mut reader, id) = open(bytes)?;
+    let mut decoder = rust_h265::Decoder::new().with_display_order();
+    for unit in rust_h265::parse_annex_b(&config.parameters) {
+        if let Some(frame) = decoder.decode_nal(&unit).map_err(|e| hevc::error(&e))? {
+            collector.accept(&hevc::Picture(&frame))?;
+        }
     }
-    Ok(collector.out)
+    for sample in 1..=u32::try_from(frames).map_err(|_| bad_file("too many frames"))? {
+        if collector.done() {
+            return Ok(());
+        }
+        let sample = reader
+            .read_sample(id, sample)
+            .map_err(bad_file)?
+            .ok_or_else(|| bad_file("missing sample"))?;
+        for unit in rust_h265::parse_hvcc(&sample.bytes, config.length_size) {
+            if let Some(frame) = decoder.decode_nal(&unit).map_err(|e| hevc::error(&e))? {
+                collector.accept(&hevc::Picture(&frame))?;
+            }
+        }
+    }
+    while let Some(frame) = decoder.flush() {
+        collector.accept(&hevc::Picture(&frame))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -308,6 +475,23 @@ mod tests {
     fn test_garbage_and_truncated_files_are_rejected_as_errors() {
         assert!(Video::decode(b"not a video at all").is_err());
         assert!(Video::decode(&[0u8; 4096]).is_err());
+    }
+
+    /// A 2×3 picture, numbered in raster order, turned each way as a player shows it.
+    #[test]
+    fn test_turns_rotate_clockwise() {
+        let rgb: Vec<u8> = (0..6u8).flat_map(|v| [v, v, v]).collect();
+        let first = |turn: Turn| -> Vec<u8> {
+            turn.apply(rgb.clone(), 2, 3)
+                .iter()
+                .step_by(3)
+                .copied()
+                .collect()
+        };
+        assert_eq!(first(Turn::None), [0, 1, 2, 3, 4, 5]);
+        assert_eq!(first(Turn::Quarter), [4, 2, 0, 5, 3, 1]);
+        assert_eq!(first(Turn::Half), [5, 4, 3, 2, 1, 0]);
+        assert_eq!(first(Turn::ThreeQuarters), [1, 3, 5, 0, 2, 4]);
     }
 
     #[test]

@@ -38,6 +38,7 @@ fn load(path: &Path, device: &Device, format: WeightFormat) -> Result<Qwen35> {
             mtp: None,
             audio: false,
             vision: false,
+            video: false,
             expert_cache: None,
         },
     )
@@ -180,6 +181,7 @@ fn test_moe_fused_packed_prefill_decode_and_rollback_match_reference() -> Result
                 mtp: None,
                 audio: false,
                 vision: false,
+                video: false,
                 expert_cache: None,
             },
             32,
@@ -277,6 +279,7 @@ fn test_expert_cache_over_artifacts_is_bit_identical_to_resident() -> Result<()>
                 mtp: None,
                 audio: false,
                 vision: false,
+                video: false,
                 expert_cache,
             };
             let resident = Qwen35::load(&output, &options(None))?;
@@ -326,6 +329,7 @@ fn test_expert_cache_over_artifacts_is_bit_identical_to_resident() -> Result<()>
                 mtp: None,
                 audio: false,
                 vision: false,
+                video: false,
                 expert_cache: Some(1 << 20),
             },
         )
@@ -394,6 +398,7 @@ fn test_layered_pass_over_recurrent_layers_matches_one_pass() -> Result<()> {
             mtp: None,
             audio: false,
             vision: false,
+            video: false,
             expert_cache: factory.expert_cache,
         },
     )?;
@@ -629,6 +634,7 @@ fn head_options(device: &Device, execution: Execution) -> LoadOptions {
         mtp: Some(tur_models::models::DraftHead::default()),
         audio: false,
         vision: false,
+        video: false,
         expert_cache: None,
     }
 }

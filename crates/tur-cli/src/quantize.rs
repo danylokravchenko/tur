@@ -286,6 +286,7 @@ fn mixed_plan(
             mtp: None,
             audio: false,
             vision: false,
+            video: false,
             expert_cache: None,
         },
     )?;

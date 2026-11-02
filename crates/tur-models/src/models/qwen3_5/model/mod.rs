@@ -281,6 +281,8 @@ pub struct Qwen35 {
     vision: Option<vision::VisionTower>,
     /// How text rotary reads an image's grid, beside a loaded tower.
     axial: Option<AxialTable>,
+    /// Whether video is accepted through the tower.
+    video: bool,
     media_cache: MediaCache,
     #[cfg(feature = "metal")]
     fused: Option<fused::Fused>,
@@ -823,6 +825,7 @@ impl Qwen35 {
             )?,
             vision,
             axial,
+            video: options.video,
             media_cache: MediaCache::default(),
             config,
             device: device.clone(),
@@ -1151,6 +1154,9 @@ impl Qwen35 {
     /// placeholder, and every step of the video writes its own frame inside that one, as
     /// Transformers' processor does.
     pub fn video_prompt(&self) -> Option<MediaPrompt> {
+        if !self.video {
+            return None;
+        }
         let settings = self
             .config
             .vision

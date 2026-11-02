@@ -90,6 +90,7 @@ fn load_state(
             mtp: None,
             audio: false,
             vision: false,
+            video: false,
             expert_cache: None,
         },
     )
@@ -496,6 +497,7 @@ fn test_execution_selection_and_declared_workspace() -> Result<()> {
             mtp: None,
             audio: false,
             vision: false,
+            video: false,
             expert_cache: None,
         },
         512,
@@ -544,6 +546,7 @@ fn test_preload_weight_plans_match_every_format_and_tied_embedding_layout() -> R
                 mtp: None,
                 audio: false,
                 vision: false,
+                video: false,
                 expert_cache: None,
             };
             let (description, weights, scratch) =
@@ -884,6 +887,7 @@ fn real(format: WeightFormat, execution: Execution, kv: KvLayout) -> Result<Qwen
             mtp: None,
             audio: false,
             vision: false,
+            video: false,
             expert_cache: None,
         },
     )

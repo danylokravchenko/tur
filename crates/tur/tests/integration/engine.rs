@@ -65,6 +65,7 @@ fn load(dir: &Path, format: WeightFormat, device: Device) -> Result<Arc<Qwen35>>
             mtp: None,
             audio: false,
             vision: false,
+            video: false,
             expert_cache: None,
         },
     )?))
@@ -394,6 +395,7 @@ fn real(format: WeightFormat) -> Result<Real> {
             mtp: None,
             audio: false,
             vision: false,
+            video: false,
             expert_cache: None,
         },
     )?);
@@ -541,6 +543,7 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
                 }),
                 audio: false,
                 vision: false,
+                video: false,
                 expert_cache: None,
             },
         )?;

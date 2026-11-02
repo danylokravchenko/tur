@@ -532,18 +532,15 @@ impl VisionTower {
     pub(super) fn video_patches(&self, video: &Video) -> Result<Patches> {
         let indices = Self::video_indices(video);
         let (height, width) = self.video_target(video, indices.len())?;
-        let decoded = video.frames(&indices)?;
-        let mut resized: Vec<Vec<u8>> = decoded
-            .iter()
-            .map(|frame| {
-                crate::image::resize::bicubic(
-                    frame,
-                    (video.height(), video.width()),
-                    (height, width),
-                )
-            })
-            .collect();
-        drop(decoded);
+        let mut resized: Vec<Vec<u8>> = Vec::with_capacity(indices.len() + 1);
+        video.each_frame(&indices, |frame| {
+            resized.push(crate::image::resize::bicubic(
+                &frame,
+                (video.height(), video.width()),
+                (height, width),
+            ));
+            Ok(())
+        })?;
         // An odd frame count repeats the last frame to fill its step.
         if let Some(last) = resized.last().filter(|_| !indices.len().is_multiple_of(2)) {
             resized.push(last.clone());

@@ -52,6 +52,7 @@ tikv-jemallocator = "0.7.0"
 safetensors = "0.8.0"
 openh264 = "0.9.9"
 mp4 = "0.14.0"
+rust_h265 = "0.4.0"
 sha2 = "0.10"
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 flate2 = "1.1.10"

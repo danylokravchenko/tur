@@ -56,6 +56,7 @@ fn options(weights: Weights, device: &Device) -> LoadOptions {
         mtp: None,
         audio: false,
         vision: false,
+        video: false,
         expert_cache: None,
     }
 }

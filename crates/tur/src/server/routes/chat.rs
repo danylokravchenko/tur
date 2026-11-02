@@ -135,7 +135,7 @@ fn video(url: &str) -> crate::Result<ContentPart> {
 
 /// Decode a request's content; audio and images are decoded (and audio resampled) here, so
 /// callers run this off the async executor.
-fn to_internal_content(content: &MessageContent) -> crate::Result<Content> {
+fn to_internal_content(content: &MessageContent, video_allowed: bool) -> crate::Result<Content> {
     let parts = match content {
         MessageContent::Text(text) => return Ok(Content::Text(text.clone())),
         MessageContent::Parts(parts) => parts,
@@ -170,6 +170,11 @@ fn to_internal_content(content: &MessageContent) -> crate::Result<Content> {
                 wav(&bytes)?
             }
             Part::ImageUrl { image_url } => image(&image_url.url)?,
+            Part::VideoUrl { .. } if !video_allowed => {
+                return Err(crate::core::execution::invalid(
+                    "this server does not accept video input",
+                ));
+            }
             Part::VideoUrl { video_url } => video(&video_url.url)?,
         });
     }
@@ -190,6 +195,7 @@ fn to_internal_content(content: &MessageContent) -> crate::Result<Content> {
 
 fn to_internal_messages(
     msgs: &[crate::server::types::ChatMessage],
+    video_allowed: bool,
 ) -> crate::Result<Vec<ChatMessage>> {
     msgs.iter()
         .map(|m| {
@@ -222,10 +228,10 @@ fn to_internal_messages(
                 .collect::<crate::Result<Vec<_>>>()?;
             Ok(ChatMessage {
                 role,
-                content: m
-                    .content
-                    .as_ref()
-                    .map_or_else(|| Ok(Content::Text(String::new())), to_internal_content)?,
+                content: m.content.as_ref().map_or_else(
+                    || Ok(Content::Text(String::new())),
+                    |content| to_internal_content(content, video_allowed),
+                )?,
                 reasoning_content: m.reasoning_content.clone(),
                 tool_calls,
             })
@@ -356,7 +362,9 @@ pub async fn chat_completions(
     };
 
     let input = std::mem::take(&mut req.messages);
-    let converted = tokio::task::spawn_blocking(move || to_internal_messages(&input)).await;
+    let video_allowed = worker.accepts_video();
+    let converted =
+        tokio::task::spawn_blocking(move || to_internal_messages(&input, video_allowed)).await;
     let messages = match converted {
         Ok(Ok(messages)) => messages,
         Ok(Err(error)) => {

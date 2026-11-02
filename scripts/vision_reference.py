@@ -5,7 +5,7 @@ Tiny fixtures are offline numerical oracles, not evidence that a real model work
 Real checkpoints (immutable revisions), on any image file:
   python -I scripts/vision_reference.py --qwen <dir> --image photo.png --golden /tmp/qwen-image.safetensors
   python -I scripts/vision_reference.py --gemma <dir> --image photo.png --golden /tmp/gemma-image.safetensors
-Add --video clip.mp4 (H.264, decoded with PyAV) to either for a video answer or tower outputs instead.
+Add --video clip.mp4 (H.264 or HEVC, decoded with PyAV) to either for a video answer or tower outputs instead.
 """
 import argparse
 import json
@@ -43,11 +43,13 @@ def moving(frames, width, height):
     return np.stack([base[:, 3 * t:3 * t + width] for t in range(frames)])
 
 
-def write_clip(path, frames, fps):
-    """An H.264 MP4 with B-frames, and what PyAV decodes from it."""
+def write_clip(path, frames, fps, codec="libx264"):
+    """An MP4 with B-frames, and what PyAV decodes from it. HEVC gets phones' `hvc1` entry."""
     import av
     with av.open(str(path), "w") as container:
-        stream = container.add_stream("libx264", rate=fps)
+        stream = container.add_stream(codec, rate=fps)
+        if codec == "libx265":
+            stream.codec_context.codec_tag = "hvc1"
         stream.width, stream.height, stream.pix_fmt = frames.shape[2], frames.shape[1], "yuv420p"
         for frame in frames:
             for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
@@ -287,6 +289,8 @@ def tiny(root):
     root.mkdir(parents=True, exist_ok=True)
     frames = write_clip(root / "clip.mp4", moving(20, 64, 48), 10)
     save_file({"frames": torch.from_numpy(frames).contiguous()}, root / "clip.safetensors")
+    frames = write_clip(root / "clip-hevc.mp4", moving(20, 64, 48), 10, "libx265")
+    save_file({"frames": torch.from_numpy(frames).contiguous()}, root / "clip-hevc.safetensors")
     small, large = pattern(61, 93), pattern(800, 533)
     small.save(root / "small.png")
     large.save(root / "large.png")

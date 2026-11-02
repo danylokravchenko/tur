@@ -48,6 +48,7 @@ fn options(device: &Device, execution: Execution) -> LoadOptions {
         mtp: None,
         audio: false,
         vision: true,
+        video: true,
         expert_cache: None,
     }
 }
@@ -278,6 +279,7 @@ fn factory(checkpoint: &crate::common::Checkpoint, device: &Device) -> tur::Mode
         recurrent: DType::F32,
         audio: false,
         vision: true,
+        video: true,
         expert_cache: None,
         gguf: None,
     }
@@ -452,6 +454,7 @@ fn test_images_need_a_tower_and_one_placeholder_each() -> Result<()> {
     // Nor is one allowed in through a model without the tower.
     let without = tur::ModelFactory {
         vision: false,
+        video: false,
         ..factory(&checkpoint, &device)
     };
     let mut text = InferencePipeline::new(&without, PipelineConfig::new(1, 256))?;
@@ -707,18 +710,18 @@ fn test_gemma4_video_metal_matches_transformers() -> Result<()> {
     gemma_video_conformance(&Device::new_metal(0)?, Execution::Fused)
 }
 
-/// H.264 is lossy, and decoders agree only up to their YUV conversion, so frames are compared
-/// with `PyAV`'s within what that conversion moves. B-frames must come back in display order.
-#[test]
-fn test_mp4_frames_decode_in_display_order_near_pyav() -> Result<()> {
-    let bytes = std::fs::read(fixture("clip.mp4"))?;
+/// Video codecs are lossy, and decoders agree only up to their YUV conversion, so frames are
+/// compared with `PyAV`'s within what that conversion moves. B-frames must come back in display
+/// order, which a frame from the wrong position would fail by far more than this.
+fn clip_matches_pyav(file: &str, golden: &str) -> Result<()> {
+    let bytes = std::fs::read(fixture(file))?;
     let video = Video::decode(&bytes)?;
     assert_eq!(
         (video.width(), video.height(), video.frame_count()),
         (64, 48, 20)
     );
     assert!((video.fps() - 10.0).abs() < 1e-6);
-    let expected = candle_core::safetensors::load(fixture("clip.safetensors"), &Device::Cpu)?;
+    let expected = candle_core::safetensors::load(fixture(golden), &Device::Cpu)?;
     let expected = tensor(&expected, "frames")?;
     let indices: Vec<usize> = (0..20).collect();
     let decoded = video.frames(&indices)?;
@@ -730,7 +733,7 @@ fn test_mp4_frames_decode_in_display_order_near_pyav() -> Result<()> {
             .map(|(a, b)| f64::from(a.abs_diff(*b)))
             .sum::<f64>()
             / frame.len() as f64;
-        assert!(mean < 4.0, "frame {at}: mean difference {mean}");
+        assert!(mean < 4.0, "{file} frame {at}: mean difference {mean}");
     }
     // A subset decodes to the same frames as the whole.
     let sampled = video.frames(&[3, 11])?;
@@ -738,6 +741,86 @@ fn test_mp4_frames_decode_in_display_order_near_pyav() -> Result<()> {
     assert_eq!(sampled[1], decoded[11]);
     assert!(video.frames(&[20]).is_err());
     assert!(Video::decode(&bytes[..bytes.len() / 2]).is_err());
+    Ok(())
+}
+
+#[test]
+fn test_h264_frames_decode_in_display_order_near_pyav() -> Result<()> {
+    clip_matches_pyav("clip.mp4", "clip.safetensors")
+}
+
+#[test]
+fn test_hevc_frames_decode_in_display_order_near_pyav() -> Result<()> {
+    clip_matches_pyav("clip-hevc.mp4", "clip-hevc.safetensors")
+}
+
+fn position(bytes: &[u8], kind: [u8; 4]) -> Result<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == kind.as_slice())
+        .ok_or_else(|| invalid("box not found"))
+}
+
+/// A track header's rotation turns frames and swaps sides, for both codecs.
+#[test]
+fn test_rotated_tracks_decode_upright() -> Result<()> {
+    for file in ["clip.mp4", "clip-hevc.mp4"] {
+        let mut bytes = std::fs::read(fixture(file))?;
+        let upright = Video::decode(&bytes)?.frames(&[5])?;
+        // `tkhd`'s matrix, past its version 0 fields: a quarter turn clockwise.
+        let matrix = position(&bytes, *b"tkhd")? + 4 + 40;
+        bytes[matrix..matrix + 4].copy_from_slice(&0i32.to_be_bytes());
+        bytes[matrix + 4..matrix + 8].copy_from_slice(&(1i32 << 16).to_be_bytes());
+        bytes[matrix + 12..matrix + 16].copy_from_slice(&(-1i32 << 16).to_be_bytes());
+        bytes[matrix + 16..matrix + 20].copy_from_slice(&0i32.to_be_bytes());
+        let video = Video::decode(&bytes)?;
+        assert_eq!((video.width(), video.height()), (48, 64), "{file}");
+        let turned = video.frames(&[5])?;
+        // The picture's bottom-left corner becomes its top-left.
+        assert_eq!(
+            turned[0][..3],
+            upright[0][47 * 64 * 3..47 * 64 * 3 + 3],
+            "{file}"
+        );
+        assert_eq!(turned[0].len(), upright[0].len());
+    }
+    Ok(())
+}
+
+/// Prompts and buffers are sized by the header, so a stream of another size must not get through.
+#[test]
+fn test_frames_that_differ_from_the_header_are_rejected() -> Result<()> {
+    let mut bytes = std::fs::read(fixture("clip-hevc.mp4"))?;
+    let width = position(&bytes, *b"hvc1")? + 4 + 24;
+    bytes[width..width + 2].copy_from_slice(&96u16.to_be_bytes());
+    let video = Video::decode(&bytes)?;
+    assert_eq!(video.width(), 96);
+    assert!(video.frames(&[0]).is_err());
+    Ok(())
+}
+
+/// With video off, a model has no prompt for it, and a request says so.
+#[test]
+fn test_video_can_be_turned_off_apart_from_images() -> Result<()> {
+    use tur::{InferencePipeline, TurError, backend::pipeline::PipelineConfig};
+    let checkpoint = qwen_chat()?;
+    let off = tur::ModelFactory {
+        video: false,
+        ..factory(&checkpoint, &Device::Cpu)
+    };
+    let mut pipeline = InferencePipeline::new(&off, PipelineConfig::new(1, 256))?;
+    let golden = golden("qwen3_5")?;
+    assert!(matches!(
+        pipeline.submit_request(&video_request(golden_video(&golden)?, 1)),
+        Err(TurError::InvalidExecution(message)) if message.contains("no video")
+    ));
+    assert_eq!(pipeline.active_request_count(), 0);
+    assert!(
+        pipeline
+            .run(&qwen_request(image("small.png")?, 1), |_| {})?
+            .generated_tokens
+            > 0
+    );
     Ok(())
 }
 
@@ -862,6 +945,7 @@ fn test_qwen_0_8b_image_answer_matches_transformers() -> Result<()> {
         recurrent: DType::F32,
         audio: false,
         vision: true,
+        video: true,
         expert_cache: None,
         gguf: None,
     };
@@ -897,6 +981,7 @@ fn test_qwen_0_8b_video_answer_matches_transformers() -> Result<()> {
         recurrent: DType::F32,
         audio: false,
         vision: true,
+        video: true,
         expert_cache: None,
         gguf: None,
     };

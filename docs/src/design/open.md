@@ -14,7 +14,7 @@
 
 ## Images
 
-- HEVC, which most phone video is. It needs a decoder Tur can build, and MP4 rotation metadata to go with it.
+- Tone mapping for phones' 10-bit HDR video, and honoring a stream's colour matrix: both decoders convert as BT.601.
 - An E4B checkpoint run, and a real run of the larger Qwen and Gemma towers, whose 72-wide heads run on Candle's attention rather than the tiled kernel.
 
 ## Audio

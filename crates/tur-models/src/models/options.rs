@@ -144,6 +144,9 @@ pub struct LoadOptions {
     /// Load the checkpoint's vision encoder, when it declares one. Artifacts written before
     /// vision support hold none, and GGUF text files never do.
     pub vision: bool,
+    /// Accept video through a loaded vision encoder. Off, video is refused before any decoder
+    /// runs, which keeps untrusted files away from them.
+    pub video: bool,
     /// Device bytes of a bounded expert cache: routed experts stay on disk and are read on
     /// demand into this many bytes of slots. Serves gpt-oss checkpoints, and Qwen `MoE`
     /// artifacts and GGUF files. `None` keeps every expert resident.

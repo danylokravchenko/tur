@@ -78,6 +78,8 @@ pub struct Gemma4 {
     audio: Option<audio::AudioTower>,
     /// The vision tower, when the checkpoint has one and the load requested it.
     vision: Option<vision::VisionTower>,
+    /// Whether video is accepted through the tower.
+    video: bool,
     media_cache: MediaCache,
     #[cfg(feature = "metal")]
     fused: Option<Fused>,
@@ -498,6 +500,7 @@ impl Gemma4 {
             assistant,
             audio,
             vision,
+            video: options.video,
             media_cache: MediaCache::default(),
             #[cfg(feature = "metal")]
             fused: None,
@@ -593,6 +596,9 @@ impl Gemma4 {
     }
     /// How a video appears in prompts, when the vision tower is loaded.
     pub fn video_prompt(&self) -> Option<MediaPrompt> {
+        if !self.video {
+            return None;
+        }
         let settings = self
             .config
             .vision

@@ -24,6 +24,7 @@ safetensors.workspace = true
 image.workspace = true
 openh264.workspace = true
 mp4.workspace = true
+rust_h265.workspace = true
 sha2.workspace = true
 
 [features]

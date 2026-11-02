@@ -703,6 +703,7 @@ pub(crate) fn run() -> Result<()> {
         recurrent: DEFAULT_RECURRENT_STATE,
         audio: false,
         vision: false,
+        video: false,
         expert_cache: None,
         gguf: None,
     };
