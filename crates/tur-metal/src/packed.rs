@@ -144,9 +144,10 @@ impl PackedLinear {
         if rows == 0 {
             return Err(invalid("a projection needs at least one row"));
         }
+        let stacked = runs.len() > 1;
         let mut layers = runs
             .iter()
-            .map(|run| Self::from_run(run, cols, device))
+            .map(|run| Self::from_run(run, cols, stacked, device))
             .collect::<Result<Vec<_>>>()?;
         if layers.len() == 1 {
             return layers.pop().ok_or_else(|| invalid("no projection run"));
@@ -161,13 +162,14 @@ impl PackedLinear {
 
     /// One format's rows: an ordinary tensor where Candle knows the format, blocks for the
     /// block kernels on Metal when rows tile into 32-value chunks, and dense F32 otherwise.
-    fn from_run(run: &StoredPart, cols: usize, device: &Device) -> Result<Self> {
+    /// F32 stays blocks within a stack, so wide batches can write the stack's one output.
+    fn from_run(run: &StoredPart, cols: usize, stacked: bool, device: &Device) -> Result<Self> {
         if let Some(format) = run.format.candle() {
             return Self::from_blocks(&run.bytes, format, (run.rows, cols), device);
         }
         #[cfg(feature = "metal")]
         if let Device::Metal(metal) = device
-            && run.format != BlockFormat::F32
+            && (stacked || run.format != BlockFormat::F32)
             && run.format.tiles(cols)
         {
             return Ok(Self {
@@ -180,6 +182,8 @@ impl PackedLinear {
                 resident_bytes: run.bytes.len(),
             });
         }
+        #[cfg(not(feature = "metal"))]
+        let _ = stacked;
         let values = run.format.decode(&run.bytes, cols)?;
         Self::dense(
             &Tensor::from_vec(values, (run.rows, cols), &Device::Cpu)?,

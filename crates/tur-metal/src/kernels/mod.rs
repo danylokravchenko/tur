@@ -1940,6 +1940,7 @@ impl Kernels {
                 self.blocks(layer, buffer, format, x)
             }
             None => match (layer.stack(), layer.block_buffer()) {
+                (Some(parts), _) if rows > BLOCK_CANDLE_ROWS.1 => self.stack_wide(layer, parts, x),
                 (Some(parts), _) => {
                     let outputs = parts
                         .iter()
@@ -1951,6 +1952,77 @@ impl Kernels {
                 (None, None) => layer.forward(x),
             },
         }
+    }
+
+    /// Wide batch through a stack of formats: every part's tiles write their own columns of
+    /// one output, so joining the parts costs no copy.
+    fn stack_wide(
+        &self,
+        layer: &PackedLinear,
+        parts: &[PackedLinear],
+        x: &Tensor,
+    ) -> Result<Tensor> {
+        let xv = self.view(x)?;
+        let n = layer.out_features();
+        if xv.cols != layer.in_features() || xv.rows == 0 {
+            return Err(invalid("block projection input does not match"));
+        }
+        if !xv.row_stride.is_multiple_of(4) || !xv.offset().is_multiple_of(16) {
+            drop(xv);
+            return self.stack_wide(layer, parts, &x.copy()?);
+        }
+        let out = self.output(xv.rows, n)?;
+        let mut first = 0;
+        for part in parts {
+            let (weights, format) = part
+                .packed_buffer()
+                .and_then(|(buffer, format)| Some((buffer, block_format(format)?)))
+                .or(part.block_buffer())
+                .ok_or_else(|| invalid("stacked weights have no block format"))?;
+            self.wide_part(weights, format, (part.out_features(), n, first), &xv, &out)?;
+            first += part.out_features();
+        }
+        self.finish(out, (xv.rows, n))
+    }
+
+    /// F16-staged tiles of one run of `rows` outputs, written from column `first` of an
+    /// output `width` wide.
+    fn wide_part(
+        &self,
+        weights: &candle_metal_kernels::metal::Buffer,
+        format: BlockFormat,
+        (rows, width, first): (usize, usize, usize),
+        xv: &View<'_>,
+        out: &Output,
+    ) -> Result<()> {
+        let k = xv.cols;
+        if !format.tiles(k)
+            || format.bytes(rows, k)? > weights.length()
+            || first.checked_add(rows).is_none_or(|end| end > width)
+        {
+            return Err(invalid("block weights are smaller than their shape"));
+        }
+        if WIDE_STAGE_BYTES > self.capabilities().threadgroup_memory_bytes {
+            return Err(invalid("block projection exceeds threadgroup memory"));
+        }
+        let params = QmmParams {
+            n: to_u32(rows, "rows")?,
+            k: to_u32(k, "columns")?,
+            x_stride: to_u32(xv.row_stride, "row stride")?,
+            y_stride: to_u32(width, "output stride")?,
+            rows: to_u32(xv.rows, "batch rows")?,
+        };
+        let pipeline = self.runtime.specialized("qmm_blocks_wide_f32", format)?;
+        let grid = (rows.div_ceil(64), xv.rows.div_ceil(32));
+        self.runtime
+            .dispatch_grid(&pipeline, "tur_blocks_wide", grid, 128, |e| {
+                e.set_input_buffer(0, Some(weights), 0);
+                xv.bind(e, 1)?;
+                out.bind_at(e, 2, first * 4);
+                e.set_bytes(3, &params);
+                e.set_threadgroup_memory_length(0, WIDE_STAGE_BYTES);
+                Ok(())
+            })
     }
 
     /// Project through weights in one GGUF block format, at any batch size: the GEMV for up
@@ -2012,12 +2084,11 @@ impl Kernels {
                     simdgroups * 16 * tiles * 8 * 4,
                 )
             }
-            _ => (
-                "qmm_blocks_wide_f32",
-                (n.div_ceil(64), xv.rows.div_ceil(32)),
-                128,
-                WIDE_STAGE_BYTES,
-            ),
+            _ => {
+                let out = self.output(xv.rows, n)?;
+                self.wide_part(weights, format, (n, n, 0), &xv, &out)?;
+                return self.finish(out, (xv.rows, n));
+            }
         };
         if memory > self.capabilities().threadgroup_memory_bytes {
             return Err(invalid("block projection exceeds threadgroup memory"));

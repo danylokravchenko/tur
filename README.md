@@ -50,7 +50,7 @@ Tur against llama.cpp on an M3 Pro with 36 GB, in tokens per second. 4-bit rows 
 | Qwen3.5-0.8B, 8-bit, prefill, 2K tokens | 3,799 | 3,383 | +12% |
 | Qwen3.6-35B, 4-bit, decode, 1 sequence | 47.1 | 35.6 | +32% |
 
-Tur doesn't win everywhere: on a 16 GB M1, llama.cpp prefills 8K-token prompts 6 to 11% faster, and on GGUF files with IQ blocks it decodes one sequence about 12% faster. Prefill is mostly compute, so Tur's savings on memory reads help less there.
+Tur doesn't win everywhere: on a 16 GB M1, llama.cpp prefills 8K-token prompts 6 to 11% faster, and on GGUF files with IQ blocks it decodes one sequence about 10% faster. Prefill is mostly compute, so Tur's savings on memory reads help less there.
 
 Other results for Qwen3.5-0.8B on that 16 GB M1:
 

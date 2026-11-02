@@ -417,49 +417,70 @@ template <uint FORMAT> kernel void moe_gemm_wide(device const uchar *w [[buffer(
     }
 }
 
-// Projection tiles above sixteen rows over weights in a specialized block format: the
-// staging of moe_gemm_wide, with grid height selecting a tile of 32 activation rows.
+// Projection tiles above sixteen rows over weights in a specialized block format, in the
+// layout of ggml's mul_mm: 64 outputs × 32 activation rows per threadgroup. Each thread decodes
+// 16 weights into registers before the first barrier, then stages them as F16 in matrix
+// order, so simdgroups load them without transposing. Full tiles store straight to the output.
 kernel void qmm_blocks_wide_f32(device const uchar *w [[buffer(0)]],
     device const float *x [[buffer(1)]], device float *y [[buffer(2)]],
     constant QmmParams &p [[buffer(3)]], threadgroup char *stage [[threadgroup(0)]],
     uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]) {
     uint col0 = tg.x * 64, base = tg.y * 32;
-    threadgroup half *ws = (threadgroup half *)stage;                  // [64][32] outputs × k
-    threadgroup float *xs = (threadgroup float *)(stage + 64 * 32 * 2); // [32][32] rows × k
-    uint w_row = tid / 2, w_start = (tid % 2) * 16;
+    threadgroup half *sa = (threadgroup half *)stage;
+    threadgroup float *sb = (threadgroup float *)(stage + 64 * 32 * 2);
+    uint w_row = tid / 2, w_half = tid % 2;
     ulong w_global = min(col0 + w_row, p.n - 1);
-    uint x_row = tid / 4, x_start = (tid % 4) * 8;
-    bool x_live = base + x_row < p.rows;
-    device const float *x_src = x + ulong(min(base + x_row, p.rows - 1)) * p.x_stride + x_start;
-    uint out0 = (sg % 2) * 32, row0 = (sg / 2) * 16;
-    simdgroup_float8x8 acc[4][2];
-    for (uint t = 0; t < 4; ++t) for (uint b = 0; b < 2; ++b) acc[t][b] = simdgroup_float8x8(0.0f);
+    uint x_col = tid / 4, x_part = tid % 4;
+    device const float *xr = x + ulong(min(base + x_col, p.rows - 1)) * p.x_stride + x_part * 8;
+    simdgroup_half8x8 ma[4];
+    simdgroup_float8x8 mb[2], mc[8];
+    for (uint i = 0; i < 8; ++i) mc[i] = simdgroup_float8x8(0.0f);
+    threadgroup half *wd = sa + 64 * (w_row / 8 + w_half * 16) + w_row % 8;
+    threadgroup float *xd = sb + x_part * 8 * 32 + 8 * x_col;
+    threadgroup half *lsma0 = sa + 4 * 64 * (sg % 2);
+    threadgroup float *lsmb0 = sb + 2 * 64 * (sg / 2);
     for (uint chunk = 0; chunk < p.k / 32; ++chunk) {
-        for (uint h = 0; h < 2; ++h) {
-            float4 lo, hi;
-            packed_weights8<4>(w, w_global, chunk, w_start + 8 * h, p.k, lo, hi);
-            threadgroup half *wd = ws + w_row * 32 + w_start + 8 * h;
-            *((threadgroup half4 *)wd) = half4(lo); *((threadgroup half4 *)(wd + 4)) = half4(hi);
-        }
-        device const float *v = x_src + chunk * 32;
-        threadgroup float *xd = xs + x_row * 32 + x_start;
-        for (uint i = 0; i < 8; ++i) xd[i] = x_live ? v[i] : 0.0f;
+        float4 v[4];
+        packed_weights8<4>(w, w_global, chunk, w_half * 16, p.k, v[0], v[1]);
+        packed_weights8<4>(w, w_global, chunk, w_half * 16 + 8, p.k, v[2], v[3]);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint k = 0; k < 32; k += 8) {
-            simdgroup_float8x8 xm[2];
-            for (uint b = 0; b < 2; ++b) simdgroup_load(xm[b], xs + (row0 + b * 8) * 32 + k, 32);
-            for (uint t = 0; t < 4; ++t) {
-                simdgroup_half8x8 wm;
-                simdgroup_load(wm, ws + (out0 + t * 8) * 32 + k, 32, ulong2(0, 0), true);
-                for (uint b = 0; b < 2; ++b) simdgroup_multiply_accumulate(acc[t][b], xm[b], wm, acc[t][b]);
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 16; ++i) {
+            wd[64 * (i / 8) * 8 + (i & 7) * 8] = half(v[i / 4][i % 4]);
+        }
+        *(threadgroup float2x4 *)xd = *(device const float2x4 *)(xr + chunk * 32);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup half *lsma = lsma0;
+        threadgroup float *lsmb = lsmb0;
+        #pragma clang loop unroll(full)
+        for (uint ik = 0; ik < 4; ++ik) {
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i);
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i);
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    if (col0 + 64 <= p.n && base + 32 <= p.rows) {
+        device float *out = y + ulong(base + 16 * (sg >> 1)) * p.y_stride + col0 + 32 * (sg & 1);
+        for (uint i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], out + 8 * (i % 4) + ulong(8 * (i / 4)) * p.y_stride, p.y_stride);
+        }
+        return;
+    }
+    // A partial tile must not write past the output: stage, then copy guarded.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     threadgroup float *result = (threadgroup float *)stage;             // [32][64]
-    for (uint t = 0; t < 4; ++t) {
-        for (uint b = 0; b < 2; ++b) simdgroup_store(acc[t][b], result + (row0 + b * 8) * 64 + out0 + t * 8, 64);
+    threadgroup float *own = result + 32 * (sg & 1) + 16 * (sg >> 1) * 64;
+    for (uint i = 0; i < 8; ++i) {
+        simdgroup_store(mc[i], own + 8 * (i % 4) + 8 * 64 * (i / 4), 64);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < 32 * 64; i += 128) {

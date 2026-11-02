@@ -3,7 +3,7 @@
 //! enqueues `reps` operations and then synchronizes.
 //!
 //! `cargo bench --offline -p tur --bench perf -- kernels > out.json`
-//! `TUR_BENCH_ONLY=delta|linear|paged|tiled|sample|moe` restricts the run to one group;
+//! `TUR_BENCH_ONLY=delta|linear|paged|tiled|sample|moe|blocks` restricts the run to one group;
 //! `TUR_BENCH_MOE=q8_0,q4k,f32` selects expert weight formats.
 //! `TUR_BENCH_LINEAR=q8_0,q4k,q6k,q5k,q3k,q2k` selects projection formats (default `q8_0,q4k`);
 //! Q5K and Q6K have no Tur kernels and measure Candle's only.
@@ -122,6 +122,60 @@ fn candle_nn_free_softmax(x: &Tensor) -> Result<Tensor> {
     let max = x.max_keepdim(D::Minus1)?;
     let e = x.broadcast_sub(&max)?.exp()?;
     Ok(e.broadcast_div(&e.sum_keepdim(D::Minus1)?)?)
+}
+
+/// Every block format the block kernels alone read, plus Q3K for a baseline, timed through
+/// those kernels against Candle's `Q3K` at the `DeltaNet` input shape; decoding cost does not
+/// depend on the values, so codebook formats use deterministic bytes with a sane scale.
+fn block_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+    let (n, k) = (8224usize, 1024usize);
+    let weight = random(&Device::Cpu, &[n, k], 1, 0.05)?;
+    let candle = PackedLinear::quantized(&weight, GgmlDType::Q3K, device)?;
+    let mut cases = Vec::new();
+    for format in [
+        BlockFormat::Iq2Xxs,
+        BlockFormat::Iq2Xs,
+        BlockFormat::Iq2S,
+        BlockFormat::Iq3Xxs,
+        BlockFormat::Iq3S,
+        BlockFormat::Iq4Nl,
+        BlockFormat::Iq4Xs,
+        BlockFormat::Iq1S,
+        BlockFormat::Mxfp4,
+        BlockFormat::Bf16,
+    ] {
+        let bytes = format.bytes(n, k)?;
+        let mut data: Vec<u8> = (0..bytes)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        for block in data.chunks_exact_mut(format.block_bytes()) {
+            block[0] = 0;
+            if format == BlockFormat::Mxfp4 {
+                block[0] = 120;
+            } else if block.len() > 2 {
+                block[1] = 0x20;
+            }
+        }
+        let layer = PackedLinear::from_parts(
+            vec![StoredPart {
+                format,
+                rows: n,
+                bytes: data,
+            }],
+            k,
+            device,
+        )?;
+        for rows in [1usize, 2, 8, 16, 128, 512] {
+            let x = random(device, &[rows, k], 2, 1.0)?;
+            let baseline = time(device, || candle.forward(&x))?;
+            let custom = time(device, || kernels.linear(&layer, &x))?;
+            cases.push(json!({
+                "operation": "block_format", "format": format.name(), "rows": rows,
+                "speedup": speedup(&custom, &baseline), "tur_blocks": custom, "candle_q3k": baseline,
+            }));
+        }
+    }
+    Ok(cases)
 }
 
 /// `weight` in two runs differing in format, the second in F32 for one row, so it stays on
@@ -952,6 +1006,7 @@ pub(crate) fn run() -> Result<()> {
         "warmup": WARMUP, "samples": SAMPLES,
         "timing": "host wall time per operation over an adaptive batch of reps ending at Device::synchronize; outputs are recycled through the pool between reps",
         "cases": {
+            "blocks": if skip("blocks") { json!([]) } else { json!(block_cases(&device, &kernels)?) },
             "norm": if skip("delta") { json!([]) } else { json!(norm_cases(&device, &kernels)?) },
             "delta_net": if skip("delta") { json!([]) } else { json!(delta_cases(&device, &kernels)?) },
             "attention": if skip("paged") { json!([]) } else { json!(attention_cases(&device, &kernels)?) },

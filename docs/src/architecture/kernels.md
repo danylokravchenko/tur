@@ -20,6 +20,7 @@ Custom kernels pay off in three places. Fusing small steps such as norms, gates 
 | Q2_K projection | 1–8 / >8 rows | `qmv_blocks` to 3 rows, then `qmm_blocks` / Candle |
 | Q3_K, Q5_K, Q6_K and legacy projections | 1 / 2–8 / >8 rows | Candle `mul_mv` / `qmv_blocks` to 3 rows, then `qmm_blocks` / Candle F16 tiles |
 | Codebook, MXFP4, F16 and BF16 runs | 1–3 / 4–16 / >16 rows | `qmv_blocks` / `qmm_blocks` / `qmm_blocks_wide` |
+| Every part of a matrix mixing formats | >8 rows | `qmm_blocks_wide`, into one output |
 | Recurrent decode | one-token sequences | `delta_step`, 16 key rows per simdgroup |
 | Recurrent prefill and verification | multi-token sequences | `delta_prepare` (scales only), then the transposed `delta_scan` |
 | Convolution | rows aligned to float4 / otherwise | `delta_conv4` / `delta_conv` |
@@ -50,6 +51,8 @@ Measured on an M1:
 - Tiled attention over F32 and F16 pools prefetches the next chunk. It makes chunks after a long context 3 to 20% faster and 8K prefill 2% faster, with short prompts unchanged. Removing the K/V reads entirely would be much faster still, so read latency is only partly hidden. Q8 pools keep single-buffered staging (see [Rejected experiments](../design/rejected.md)).
 - Activations stay F32. F16 or BF16 activations would be faster at 9 to 16 rows, but wait until there are held-out quality budgets to check them against.
 - Block kernels replace Candle only at 2 to 8 rows for formats Candle knows, where they run 1.3 to 1.9× faster. At one row and above eight, Candle stays 1.1 to 2.4× ahead, except that Q2_K's one-row GEMV leads on the 0.8B's shapes and raised `UD-Q2_K_XL` decode 10%. Candle can't read codebook formats, which stay on the block kernels at every shape.
+- The wide block kernel follows ggml's `mul_mm`: decode into registers before the barrier, stage F16 in matrix order so simdgroups load without transposing, and store full tiles straight to the output. Against the first version, which staged results through threadgroup memory, this raised it from 0.72× of Candle's Q3_K tiles to level across codebook formats, even though the decoders changed little.
+- Codebook signs flip the float's sign bit rather than multiply, and the eighth sign is computed from parity rather than read from ggml's table. One-row IQ2 and IQ3 rose from 0.7× of Candle's Q3_K to 0.77 to 0.84×.
 - Launch shapes are M1 tuning, not constants for every Mac.
 - Rejected: chunked (WY/UT) DeltaNet prefill, TensorOps GEMM and seven kernel variants (see [Rejected experiments](../design/rejected.md)).
 - Tiled attention over F16 pools stages F16 and scales scores once per block. Attention at 2K tokens is 7 to 10% faster, and 8K prefill up to 8% depending on chunk size, while 2K and 4K prefill don't change beyond noise. Q8 pools gain up to 4% from the scale alone. F32 pools keep the scale on each query fragment, because moving it made them 9% slower.

@@ -95,24 +95,33 @@ enum : uint {
     B_IQ1S, B_IQ1M, B_IQ2XXS, B_IQ2XS, B_IQ2S, B_IQ3XXS, B_IQ3S, B_IQ4NL, B_IQ4XS, B_MXFP4,
 };
 
+// Every format these read has an even block size, so its 16-bit fields load directly.
 static inline uint block_u16(device const uchar *b, uint at) {
-    return uint(b[at]) | (uint(b[at + 1]) << 8);
+    return *((device const ushort *)(b + at));
 }
 static inline uint block_u32(device const uchar *b, uint at) {
-    return block_u16(b, at) | (block_u16(b, at + 2) << 16);
+    return as_type<uint>(uchar4(*((device const packed_uchar4 *)(b + at))));
 }
 static inline float block_half(device const uchar *b, uint at) {
-    return float(as_type<half>(ushort(block_u16(b, at))));
+    return float(*((device const half *)(b + at)));
 }
 // Four consecutive bytes as one vector load. Blocks sit at any byte offset, and a whole-word
 // load extracts all four quants at once where ggml's kernels and ours differ most in speed.
 static inline uint4 block_bytes4(device const uchar *b) {
     return uint4(uchar4(*((device const packed_uchar4 *)b)));
 }
+// Four quants packed in one word's bytes, as floats.
+static inline float4 block_word_quants(uint word) {
+    return float4(as_type<uchar4>(word));
+}
+// Eight sign bits from seven stored ones: the eighth makes their parity even (ksigns_iq2xs).
+static inline uint iq_signs(uint bits) {
+    return bits | ((popcount(bits) & 1u) << 7);
+}
 // `value` with each lane negated where its bit of `signs`, from `first`, is set.
 static inline float4 block_signed4(uint signs, uint first, float4 value) {
-    uint4 bits = (uint4(signs) >> (uint4(0, 1, 2, 3) + first)) & 1u;
-    return value * (1.0f - 2.0f * float4(bits));
+    uint4 bits = uint4(signs) << (uint4(31, 30, 29, 28) - first);
+    return as_type<float4>(as_type<uint4>(value) ^ (bits & 0x80000000u));
 }
 
 // Signed scale `i` of Q3_K's 16, whose 12 bytes hold 4 low bits then 2 high bits each.
@@ -192,39 +201,39 @@ static inline void block_weights8(device const uchar *w, ulong row, uint chunk, 
         float dl = block_half(b, 80) * float(scale & 15u), ml = block_half(b, 82) * float(scale >> 4);
         uint shift = 2 * (x0 / 32);
         device const uchar *qs = b + 16 + group * 32 + (x0 % 32) / 16 * 16 + x0 % 16;
-        lo = dl * float4((block_bytes4(qs) >> shift) & 3u) - ml;
-        hi = dl * float4((block_bytes4(qs + 4) >> shift) & 3u) - ml;
+        lo = dl * block_word_quants((block_u32(qs, 0) >> shift) & 0x03030303u) - ml;
+        hi = dl * block_word_quants((block_u32(qs, 4) >> shift) & 0x03030303u) - ml;
     } else if (f == B_Q3K) {
         uint e0 = sub * 32 + start, group = e0 / 128, x0 = e0 % 128, step = x0 / 32;
         uint at = (x0 % 32) / 16 * 16 + x0 % 16, bit = group * 4 + step, shift = 2 * step;
         float dl = block_half(b, 108) * q3k_scale(b + 96, e0 / 16);
         device const uchar *qs = b + 32 + group * 32 + at, *hm = b + at;
         // A clear high bit subtracts four, so the three bits read as an offset value.
-        uint4 q0 = ((block_bytes4(qs) >> shift) & 3u) | (((block_bytes4(hm) >> bit) & 1u) << 2);
-        uint4 q1 = ((block_bytes4(qs + 4) >> shift) & 3u) | (((block_bytes4(hm + 4) >> bit) & 1u) << 2);
-        lo = dl * (float4(q0) - 4.0f);
-        hi = dl * (float4(q1) - 4.0f);
+        uint q0 = ((block_u32(qs, 0) >> shift) & 0x03030303u) | (((block_u32(hm, 0) >> bit) & 0x01010101u) << 2);
+        uint q1 = ((block_u32(qs, 4) >> shift) & 0x03030303u) | (((block_u32(hm, 4) >> bit) & 0x01010101u) << 2);
+        lo = dl * (block_word_quants(q0) - 4.0f);
+        hi = dl * (block_word_quants(q1) - 4.0f);
     } else if (f == B_Q4K || f == B_Q5K) {
         uchar2 sm = q4k_scale_min(sub, b + 4);
         float dl = block_half(b, 0) * float(sm.x), ml = block_half(b, 2) * float(sm.y);
         uint e0 = sub * 32 + start, nibble = 4 * (sub % 2);
         device const uchar *qs = b + (f == B_Q5K ? 48 : 16) + e0 / 64 * 32 + e0 % 32, *high = b + 16 + e0 % 32;
-        uint4 q0 = (block_bytes4(qs) >> nibble) & 15u, q1 = (block_bytes4(qs + 4) >> nibble) & 15u;
+        uint q0 = (block_u32(qs, 0) >> nibble) & 0x0F0F0F0Fu, q1 = (block_u32(qs, 4) >> nibble) & 0x0F0F0F0Fu;
         if (f == B_Q5K) {
-            q0 |= ((block_bytes4(high) >> sub) & 1u) << 4;
-            q1 |= ((block_bytes4(high + 4) >> sub) & 1u) << 4;
+            q0 |= ((block_u32(high, 0) >> sub) & 0x01010101u) << 4;
+            q1 |= ((block_u32(high, 4) >> sub) & 0x01010101u) << 4;
         }
-        lo = dl * float4(q0) - ml;
-        hi = dl * float4(q1) - ml;
+        lo = dl * block_word_quants(q0) - ml;
+        hi = dl * block_word_quants(q1) - ml;
     } else if (f == B_Q6K) {
         uint e0 = sub * 32 + start, group = e0 / 128, x0 = e0 % 128, step = x0 / 32, l0 = x0 % 32;
         device const uchar *low = b + group * 64 + l0 + (step % 2) * 32, *high = b + 128 + group * 32 + l0;
         float dl = block_half(b, 208) * float(as_type<char>(b[192 + group * 8 + l0 / 16 + 2 * step]));
         uint nibble = step < 2 ? 0 : 4, top = 2 * step;
-        uint4 q0 = ((block_bytes4(low) >> nibble) & 15u) | (((block_bytes4(high) >> top) & 3u) << 4);
-        uint4 q1 = ((block_bytes4(low + 4) >> nibble) & 15u) | (((block_bytes4(high + 4) >> top) & 3u) << 4);
-        lo = dl * (float4(q0) - 32.0f);
-        hi = dl * (float4(q1) - 32.0f);
+        uint q0 = ((block_u32(low, 0) >> nibble) & 0x0F0F0F0Fu) | (((block_u32(high, 0) >> top) & 0x03030303u) << 4);
+        uint q1 = ((block_u32(low, 4) >> nibble) & 0x0F0F0F0Fu) | (((block_u32(high, 4) >> top) & 0x03030303u) << 4);
+        lo = dl * (block_word_quants(q0) - 32.0f);
+        hi = dl * (block_word_quants(q1) - 32.0f);
     } else if (f == B_IQ1S || f == B_IQ1M) {
         uint index;
         float dl, delta;
@@ -253,13 +262,13 @@ static inline void block_weights8(device const uchar *w, ulong row, uint chunk, 
             uint high = block_u32(b, 6 + sub * 8);
             db = d * (0.5f + float(high >> 28)) * 0.25f;
             index = b[2 + sub * 8 + l];
-            signs = KSIGNS[(high >> (7 * l)) & 127u];
+            signs = iq_signs((high >> (7 * l)) & 127u);
             grid = IQ2XXS_GRID;
         } else if (f == B_IQ2XS) {
             uint word = block_u16(b, 2 + 2 * (4 * sub + l));
             db = d * (0.5f + float((uint(b[66 + sub]) >> (4 * (l / 2))) & 15u)) * 0.25f;
             index = word & 511u;
-            signs = KSIGNS[word >> 9];
+            signs = iq_signs(word >> 9);
             grid = IQ2XS_GRID;
         } else {
             db = d * (0.5f + float((uint(b[74 + sub]) >> (4 * (l / 2))) & 15u)) * 0.25f;
@@ -276,7 +285,7 @@ static inline void block_weights8(device const uchar *w, ulong row, uint chunk, 
         if (f == B_IQ3XXS) {
             uint aux = block_u32(b, 66 + 4 * sub);
             db = d * (0.5f + float(aux >> 28)) * 0.5f;
-            signs = KSIGNS[(aux >> (7 * l)) & 127u];
+            signs = iq_signs((aux >> (7 * l)) & 127u);
             grid = IQ3XXS_GRID;
         } else {
             uint high = b[66 + sub];

@@ -644,7 +644,12 @@ impl Output {
     }
 
     pub(super) fn bind(&self, encoder: &ComputeCommandEncoder, index: usize) {
-        encoder.set_output_buffer(index, Some(&self.buffer), 0);
+        self.bind_at(encoder, index, 0);
+    }
+
+    /// Bind from byte `offset`, for dispatches that fill one part of each row.
+    pub(super) fn bind_at(&self, encoder: &ComputeCommandEncoder, index: usize, offset: usize) {
+        encoder.set_output_buffer(index, Some(&self.buffer), offset);
     }
 
     /// Wrap as an F32 tensor of `shape`, which must have exactly `rows × cols` elements.
