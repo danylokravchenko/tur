@@ -264,6 +264,8 @@ pub(crate) struct PipelineArgs {
     #[arg(skip)]
     max_queue_wait_ms: Option<u64>,
     #[arg(skip)]
+    shortest_prompt_first: Option<bool>,
+    #[arg(skip)]
     prefix_spacing: Option<usize>,
     #[arg(skip)]
     prefix_restorable_first: Option<bool>,
@@ -292,6 +294,7 @@ impl PipelineArgs {
         min_prefill_tokens,
         target_pass_ms,
         max_queue_wait_ms,
+        shortest_prompt_first,
         prefix_spacing,
         prefix_restorable_first
     );
@@ -346,6 +349,9 @@ impl PipelineArgs {
         scheduler.max_queue_wait = self
             .max_queue_wait_ms
             .map_or(scheduler.max_queue_wait, Duration::from_millis);
+        scheduler.shortest_prompt_first = self
+            .shortest_prompt_first
+            .unwrap_or(scheduler.shortest_prompt_first);
         Ok(config)
     }
 }

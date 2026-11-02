@@ -6,13 +6,11 @@ This page compares Tur with vLLM, llama.cpp, SGLang, oMLX, BaseRT and recent pap
 
 ## Build first
 
-This keeps output exact and costs little to try.
+Reordering requests keeps output exact, so only latency and throughput are at stake.
 
-### Request ordering beyond arrival order
+### Priorities and per-client fairness
 
-Prompts run in arrival order, with no priorities or per-client fairness. The tenant only namespaces the prefix cache, so one client's 8K-token prompts can hold back another's short question.
-
-Remaining prompt length is known exactly, so the scheduler could run the shortest remaining prompt first and keep `max_queue_wait` as the bound on starvation. This is a proposal for Tur rather than a published result. The nearest evidence is [Learning to Rank](https://arxiv.org/abs/2408.15792v1), which reports 2.8× lower chatbot latency by approximating shortest-job-first, using a small helper model to rank output lengths.
+Tur has no priorities or per-client fairness. The tenant only namespaces the prefix cache, so one client's 8K-token prompts can hold back another's short question. The opt-in [`engine.shortest_prompt_first`](../architecture/scheduling.md#decisions) helps only at light load and doesn't separate clients.
 
 If several clients share one Mac, three designs apply. [Niyama](https://arxiv.org/abs/2503.22562v1) blends earliest-deadline-first with shortest-job-first across service classes, which would separate interactive from batch work. [VTC](https://arxiv.org/pdf/2401.00588) gives per-client fairness counted in tokens, with a 2× bound on the service gap between backlogged clients. [Autellix](https://arxiv.org/abs/2502.13965v1) favors agent programs that have received the least total service, and reports 4 to 15× higher program throughput at the same latency.
 

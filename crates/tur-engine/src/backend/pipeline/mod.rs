@@ -143,6 +143,7 @@ impl Pending {
         Candidate {
             id,
             pending: replay.unwrap_or(aligned),
+            remaining: unconsumed,
             minimum: replay.unwrap_or(1),
             // Past the prompt, every unconsumed token is an output: the newest sampled one, or
             // a run its grammar forced.

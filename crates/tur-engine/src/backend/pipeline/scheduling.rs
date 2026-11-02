@@ -38,9 +38,35 @@ impl InferencePipeline {
         })
     }
 
-    /// For the oldest waiting requests without state, while running slots remain, restore
-    /// their deepest verified snapshot, or let them wait for a producer (see
-    /// [`Self::awaits`]); a waiting one takes no slot. With
+    /// Waiting requests without state in prefill order, counting the tokens a snapshot would
+    /// save, and the earliest arrival among them. Only ordering reads that count, so a replay
+    /// that could not use the snapshot merely ranks too early.
+    fn waiting_order(&self, now: Instant) -> (Vec<Uuid>, Option<Instant>) {
+        let shortest = self.scheduler.config().shortest_prompt_first;
+        let mut ranked = Vec::new();
+        let mut oldest: Option<Instant> = None;
+        for (id, pending) in &self.pending {
+            if pending.running || pending.consumed > 0 {
+                continue;
+            }
+            let cached = if shortest {
+                self.prefix.depth(&pending.keys, &pending.tokens)
+            } else {
+                0
+            };
+            let remaining = pending.tokens.len() - cached;
+            let rank = self.scheduler.prefill_rank(remaining, pending.arrival, now);
+            ranked.push((rank, *id));
+            oldest = Some(oldest.map_or(pending.arrival, |o| o.min(pending.arrival)));
+        }
+        ranked.sort_unstable();
+        (ranked.into_iter().map(|(_, id)| id).collect(), oldest)
+    }
+
+    /// For the first waiting requests without state in prefill order, while running slots
+    /// remain, restore their deepest verified
+    /// snapshot, or let them wait for a producer (see [`Self::awaits`]); a waiting one takes
+    /// no slot. With
     /// [`PrefixConfig::restorable_first`](crate::backend::prefix::PrefixConfig) and the
     /// oldest waiting request younger than the queue-age limit, only restored requests take
     /// slots here, so they pass older misses. Restored requests run their remaining prompt;
@@ -53,26 +79,24 @@ impl InferencePipeline {
         let now = Instant::now();
         self.awaiting.clear();
         let mut producers = Vec::with_capacity(self.scheduler.config().max_running);
-        let mut waiting = Vec::new();
-        for (id, pending) in &self.pending {
-            if pending.running {
-                producers.push(*id);
-            } else if pending.consumed == 0 {
-                waiting.push((pending.arrival, *id));
-            }
-        }
-        waiting.sort_unstable();
+        producers.extend(
+            self.pending
+                .iter()
+                .filter(|(_, p)| p.running)
+                .map(|(id, _)| *id),
+        );
+        let (waiting, oldest) = self.waiting_order(now);
         let mut free = self
             .scheduler
             .config()
             .max_running
             .saturating_sub(producers.len());
         let restorable_first = self.prefix.config().restorable_first
-            && waiting.first().is_some_and(|(arrival, _)| {
-                now.saturating_duration_since(*arrival) < self.scheduler.config().max_queue_wait
+            && oldest.is_some_and(|arrival| {
+                now.saturating_duration_since(arrival) < self.scheduler.config().max_queue_wait
             });
         let inserted = self.prefix.stats().inserted;
-        for (_, id) in waiting {
+        for id in waiting {
             if free == 0 {
                 break;
             }
@@ -133,23 +157,27 @@ impl InferencePipeline {
         Ok(())
     }
 
-    /// Evict snapshots while they keep the oldest admissible waiting request's next chunk
+    /// Evict snapshots while they keep the first admissible waiting request's next chunk
     /// (with one page of headroom per running sequence) from fitting.
     fn relieve_admission(&mut self, candidates: &[Candidate]) -> Result<()> {
         let running = candidates.iter().filter(|c| c.running).count();
-        let Some(oldest) = candidates
+        let now = Instant::now();
+        let Some(first) = candidates
             .iter()
             .filter(|c| !c.running && running < self.scheduler.config().max_running)
-            .min_by_key(|c| (c.arrival, c.id))
+            .min_by_key(|c| {
+                let rank = self.scheduler.prefill_rank(c.remaining, c.arrival, now);
+                (rank, c.id)
+            })
         else {
             return Ok(());
         };
         let handle = self
             .pending
-            .get(&oldest.id)
+            .get(&first.id)
             .ok_or_else(|| invalid("missing pipeline request"))?
             .handle;
-        let tokens = oldest.pending.min(self.scheduler.config().max_chunk);
+        let tokens = first.pending.min(self.scheduler.config().max_chunk);
         let headroom = growth(self.engine.pool().description(), running);
         let mut usage = self.engine.memory()?;
         while self.prefix.stats().entries > 0 {

@@ -16,6 +16,9 @@
 //! (`TUR_BENCH_RESTORABLE_FIRST=1` admits restorable prefixes first);
 //! `TUR_BENCH_WORKLOADS=tools` compares tool-call follow-ups with and without a snapshot hold;
 //! `TUR_BENCH_WORKLOADS=arrivals TUR_BENCH_RATE=2,4` runs open-loop Poisson arrivals, and
+//! `TUR_BENCH_WORKLOADS=ordering TUR_BENCH_RATE=2,4` the same arrivals with one 2K-token prompt
+//! per three 64-token ones, on four running slots (`TUR_BENCH_SHORTEST_FIRST=1` orders prefill
+//! by remaining prompt length), and
 //! `TUR_BENCH_WORKLOADS=grammar` grammar-constrained requests, and
 //! `TUR_BENCH_WORKLOADS=logprobs` the cost of reporting log probabilities.
 //! `TUR_BENCH_WORKLOADS=speculation TUR_BENCH_DRAFT=0,4` compares adaptive prompt lookup
@@ -776,12 +779,14 @@ fn reuse_runs(
 fn arrivals(
     factory: &ModelFactory,
     tokenizer: &Tokenizer,
+    config: PipelineConfig,
+    lengths: &[usize],
     rate: f64,
-    count: usize,
     overlapped: bool,
     options: SamplingOptions,
 ) -> Result<Value> {
-    let mut pipeline = InferencePipeline::new(factory, PipelineConfig::new(16, CHUNK))?;
+    let count = lengths.len();
+    let mut pipeline = InferencePipeline::new(factory, config)?;
     burst(
         &mut pipeline,
         &Burst {
@@ -790,8 +795,10 @@ fn arrivals(
         },
         options,
     )?;
-    let prompts: Vec<String> = (0..count)
-        .map(|i| prompt(tokenizer, 512, 5000 + i))
+    let prompts: Vec<String> = lengths
+        .iter()
+        .enumerate()
+        .map(|(i, &length)| prompt(tokenizer, length, 5000 + i))
         .collect::<Result<_>>()?;
     // Deterministic exponential gaps.
     let mut state = 0x2545_f491_4f6c_dd1du64;
@@ -825,7 +832,7 @@ fn arrivals(
         Ok(begin.elapsed().as_secs_f64())
     };
     let (mut ttft, mut emitted, mut intake, mut idle) =
-        (Vec::new(), vec![Vec::new(); count], Vec::new(), 0.0);
+        (vec![0.0; count], vec![Vec::new(); count], Vec::new(), 0.0);
     let mut generated = 0;
     while next < count || pipeline.active_request_count() > 0 {
         if pipeline.active_request_count() == 0 {
@@ -850,9 +857,11 @@ fn arrivals(
                 emitted[index].push(at.saturating_duration_since(start).as_secs_f64());
             }
         }
-        for (_, result) in output.completed {
+        for (id, result) in output.completed {
             let stats = result?;
-            ttft.push(stats.first_token.as_secs_f64());
+            if let Some(&index) = ids.get(&id) {
+                ttft[index] = stats.first_token.as_secs_f64();
+            }
             generated += stats.generated_tokens;
         }
     }
@@ -862,7 +871,24 @@ fn arrivals(
         .flat_map(|t| t.windows(2).map(|w| w[1] - w[0]))
         .collect();
     intake.retain(|&seconds| seconds > 0.0);
+    let mut distinct = lengths.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let by_length: serde_json::Map<_, _> = distinct
+        .iter()
+        .map(|&length| {
+            let samples: Vec<f64> = lengths
+                .iter()
+                .zip(&ttft)
+                .filter(|(l, _)| **l == length)
+                .map(|(_, &seconds)| seconds)
+                .collect();
+            let row = json!({"p50": percentile(&samples, 0.5), "p95": percentile(&samples, 0.95), "max": percentile(&samples, 1.0)});
+            (length.to_string(), row)
+        })
+        .collect();
     Ok(json!({
+        "ttft_by_prompt_length": by_length,
         "rate": rate, "requests": count, "overlapped": overlapped, "wall_seconds": wall,
         "output_tokens_per_second": generated as f64 / wall,
         "ttft_seconds": {"p50": percentile(&ttft, 0.5), "p95": percentile(&ttft, 0.95), "max": percentile(&ttft, 1.0)},
@@ -1040,7 +1066,15 @@ fn arrival_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
         .unwrap_or(48);
     for rate in env_sizes("TUR_BENCH_RATE", "2,4")? {
         for overlapped in [false, true] {
-            let result = arrivals(factory, tokenizer, rate as f64, count, overlapped, options)?;
+            let result = arrivals(
+                factory,
+                tokenizer,
+                PipelineConfig::new(16, CHUNK),
+                &vec![512; count],
+                rate as f64,
+                overlapped,
+                options,
+            )?;
             eprintln!(
                 "arrivals {rate}/s, {}: {:.1} out tok/s, TTFT p50/p95 {:.0}/{:.0} ms, ITL p50/p95/p99 {:.1}/{:.1}/{:.1} ms, intake p50 {:.2} ms (sum {:.0} ms), idle {:.2}%",
                 if overlapped { "overlapped" } else { "serial" },
@@ -1059,6 +1093,41 @@ fn arrival_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
             );
             runs.push(json!({"workload": "arrivals", "result": result}));
         }
+    }
+    Ok(runs)
+}
+
+/// Short and long prompts arriving at random on fewer running slots than requests, the case
+/// where prefill order decides who waits.
+fn ordering_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
+    let mut runs = Vec::new();
+    let count = env_sizes("TUR_BENCH_REQUESTS", "48")?
+        .first()
+        .copied()
+        .unwrap_or(48);
+    let lengths: Vec<usize> = (0..count)
+        .map(|i| if i % 4 == 0 { 2048 } else { 64 })
+        .collect();
+    for rate in env_sizes("TUR_BENCH_RATE", "2,4")? {
+        let mut config = PipelineConfig::new(4, CHUNK);
+        config.scheduler.shortest_prompt_first =
+            std::env::var("TUR_BENCH_SHORTEST_FIRST").is_ok_and(|v| v == "1");
+        let result = arrivals(
+            bench.factory,
+            bench.tokenizer,
+            config,
+            &lengths,
+            rate as f64,
+            true,
+            bench.options,
+        )?;
+        eprintln!(
+            "ordering {rate}/s: {:.1} out tok/s, TTFT by prompt {}, ITL p95 {:.1} ms",
+            result["output_tokens_per_second"].as_f64().unwrap_or(0.0),
+            result["ttft_by_prompt_length"],
+            result["itl_seconds"]["p95"].as_f64().unwrap_or(0.0) * 1e3,
+        );
+        runs.push(json!({"workload": "ordering", "result": result}));
     }
     Ok(runs)
 }
@@ -1216,6 +1285,9 @@ pub(crate) fn run() -> Result<()> {
     }
     if workloads.contains("arrivals") {
         runs.extend(arrival_runs(&bench)?);
+    }
+    if workloads.contains("ordering") {
+        runs.extend(ordering_runs(&bench)?);
     }
     if workloads.contains("prefix") {
         for spacing in env_sizes("TUR_BENCH_SPACING", "0,64,128,256,512")? {

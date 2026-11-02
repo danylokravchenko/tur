@@ -448,6 +448,36 @@ fn test_aged_requests_and_other_namespaces_never_wait() -> Result<()> {
 }
 
 #[test]
+fn test_shortest_first_ranks_a_cached_prompt_by_the_tokens_left_to_run() -> Result<()> {
+    let fixture = Checkpoint::random()?;
+    // The second request's prompt is longer, but all except its last tokens are cached.
+    let requests = [request(prompt(0, 40, 0), 40), request(prompt(48, 3, 3), 43)];
+    let expected = cold(&fixture, &requests)?;
+    let mut config = PipelineConfig::new(1, 64);
+    config.prefix = PrefixConfig {
+        entries: 16,
+        ..cached(16).prefix
+    };
+    config.scheduler.max_queue_wait = Duration::from_secs(60);
+    config.scheduler.shortest_prompt_first = true;
+    let mut pipeline = InferencePipeline::new(&fixture.factory(), config)?;
+    pipeline.run(&request(prompt(48, 5, 9), 44), |_| {})?;
+    let mut ids = HashMap::new();
+    for (index, request) in requests.iter().enumerate() {
+        ids.insert(pipeline.submit_request(request)?, index);
+    }
+    let mut order = Vec::new();
+    while pipeline.active_request_count() > 0 {
+        for (id, result) in pipeline.step_streaming()?.completed {
+            assert_eq!(result?.generated_text, expected[ids[&id]]);
+            order.push(ids[&id]);
+        }
+    }
+    assert_eq!(order, [1, 0]);
+    Ok(())
+}
+
+#[test]
 fn test_restorable_requests_pass_older_cold_ones_only_when_enabled() -> Result<()> {
     let fixture = Checkpoint::random()?;
     // Three cold prompts sharing no aligned prefix with the warmed one, then a request that
