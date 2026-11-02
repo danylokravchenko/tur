@@ -47,7 +47,14 @@ A cache shares its slots between requests, so more of them mean more misses per 
 | 2 | 2.5 | 1.4 | 0.64 s |
 | 4 | 2.7 | 0.7 | 1.1 s |
 
-A long prompt can arrive while another request is streaming. In that case the stream kept going at 1.6 tokens/s, with a 1.1 s 95th-percentile gap, while the 2,000-token prompt reached its first token in 21 s.
+A long prompt can arrive while another request is streaming, and on a small cache one full prefill chunk takes many seconds. So while something is decoding, gpt-oss and Qwen run each chunk of at least 128 tokens a group of layers at a time, with one group per 256 tokens, and a decode pass after each group. The stream waits for a group instead of the whole chunk. The chunk still commits once at its usual boundary, so snapshots and recomputation don't change, and on a test fixture outputs match solo runs. A prompt on an idle server runs in whole passes as before. Other prompts wait while a chunk is split, and if decodes need its pages, the chunk gives them back and runs again later. Recurrent layers need nothing extra: each writes its reserved slot once and reads the committed one until the chunk commits. To turn this off, see [Tuning](../guide/tuning.md#layered-prefill).
+
+With a 1,328-token prompt arriving during a stream, on a 1 GiB cache:
+
+| | Worst gap between visible tokens | Prompt finished |
+| --- | ---: | ---: |
+| One pass per chunk | 14.4 s | 14.7 s |
+| Layer groups | 5.7 s | 16.7 s |
 
 A cancelled request needs no special handling, because reads and copies finish inside the pass that started them and never outlive it. Disconnecting a client during decode, during prefill, or three at once left the server running, and the next request's answer was identical to one from an untouched server.
 
@@ -71,7 +78,9 @@ Measured on gpt-oss-20b on an M1 with 16 GB:
 - The MXFP4 kernels stay on a lookup table. It is as fast as Q8_0 at the bank's shape, and an arithmetic decode is 1.3 to 2.1× slower. A GPU round trip costs about 0.2 ms, so the wait at each of 24 layers isn't worth removing.
 - A Qwen artifact through the cache gives bit-identical logits to keeping its banks resident, in Q8_0 and Q4K under eviction. This is checked on a small fixture. The real Qwen3.6-35B-A3B Q4K artifact has also run through a 4 GiB cache, serving 16 requests at once where keeping every expert resident runs out of GPU memory on a 36 GB Mac (see [Measured performance](../guide/performance.md#qwen36-35b-a3b)); its logits haven't been compared with the resident run.
 - A GGUF file gets one arena per pair of bank formats rather than repacking to one format, because that keeps logits bit-identical to keeping the experts resident, which a small fixture with formats mixed across layers and gate and up rows in separate shards confirms. Of 24 unsloth Qwen3.6-35B-A3B files, 22 mix formats across layers, and in all 24 gate and up share a format in every layer, so the cache rejects a bank where they differ rather than packing it again on every read.
-- Serving four concurrent requests on a 5.9 GiB plan swapped out 251 MiB over a run of several minutes, where single requests swapped nothing. The spare-memory check sees the machine at load time only, so keep `--max-batch-size` small on a tight machine.
+- Serving four concurrent requests on a 5.9 GiB plan swapped out 251 MiB over a run of several minutes, where single requests swapped nothing. The spare-memory check sees the machine at load time only, so keep `--max-batch-size` small on a tight machine. That flag sets the state pool at startup, where it stays resident: with a 1 GiB cache, four requests instead of one add 740 MiB to the pool and nothing to planned scratch.
 - Below one token's experts (96 on gpt-oss-20b), eviction takes the expert needed furthest ahead, since passes visit layers in order. At or above it, eviction is LRU, which keeps what routing repeats.
 - The arena sits outside Candle's buffer pool, which rounds sizes up to a power of two.
+- Layer groups come from the existing chunks, not a whole-prompt pass, so snapshot boundaries stay where they are. A benchmark on a 2,048-token prompt, with a one-token pass on separate state as the decode, took 20.5 s with a 10.5 s worst gap at one group per 1,024-token chunk, and 22.8 s with 3.2 s at four. Through `tur serve`, one group and its decode took about 2.8 s; the 5.7 s gap probably spans a token with no visible text, since only 70 of the stream's 90 tokens produced any. Decodes between groups evict experts the prompt reads again, so at 1 GiB the extra groups read more (27.5 against 20.0 GiB).
+- Qwen behind a cache uses the same rule, which hasn't been measured on a real checkpoint because none fits this Mac's disk. A small fixture shows logits and later decodes bit-identical to one pass, including recurrent state.
 - Pruning isn't recommended. Keeping 16 of 32 experts, held-out KL on code and documentation, then prose: routing mass 0.21 and 1.41 nats; output-movement search on 512 tokens 0.26 and 1.45; on 4,096 mixed tokens 0.18 and 1.11; plus 48 KL-tested swaps 0.19 and 1.14, even though those lowered calibration KL by 28%. These rest on 256 held-out tokens per text, and no task benchmark has run. Keeping 24 of 32 on 512 tokens gave 0.05 and 0.71.

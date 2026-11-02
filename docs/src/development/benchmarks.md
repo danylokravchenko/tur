@@ -15,7 +15,8 @@ Each case prints one JSON document to stdout and progress to stderr. Timed regio
 | --- | --- | --- |
 | `kernels` | Each custom kernel against Candle's path at Qwen3.5 shapes | `TUR_BENCH_ONLY=delta\|linear\|paged\|tiled\|sample\|moe`, `TUR_BENCH_LINEAR`, `TUR_BENCH_MOE`, `TUR_BENCH_SHAPE` |
 | `model` | Model-level prefill and batched decode at several contexts, per weight and K/V format; engine overhead | `TUR_BENCH_FORMATS` (formats or artifact dirs), `TUR_BENCH_KV`, `TUR_BENCH_PAGES`, `TUR_BENCH_PREFILL`, `TUR_BENCH_CONTEXTS`, `TUR_BENCH_BATCHES`, `TUR_BENCH_CONTEXT_BATCHES`, `TUR_BENCH_REFERENCE=1`, `TUR_BENCH_ONLY=prefill,decode,engine` |
-| `serving` | Throughput, time to first token and inter-token latency through the pipeline | `TUR_BENCH_WORKLOADS=decode,mixed,grammar,arrivals,prefix,reuse,speculation`, `TUR_BENCH_CONCURRENCY`, `TUR_BENCH_OUTPUT`, `TUR_BENCH_SAMPLING=0.7,20,0.95`, `TUR_BENCH_EXPERT_CACHE_MB` |
+| `serving` | Throughput, time to first token and inter-token latency through the pipeline | `TUR_BENCH_WORKLOADS=decode,mixed,grammar,arrivals,ordering,prefix,reuse,tools,speculation`, `TUR_BENCH_CONCURRENCY`, `TUR_BENCH_OUTPUT`, `TUR_BENCH_SAMPLING=0.7,20,0.95`, `TUR_BENCH_EXPERT_CACHE_MB` |
+| `drafter` | Replays table-based drafters over recorded tokens and top candidates, and compares real lookup and lookup plus MTP with normal decoding, in rotation | `TUR_BENCH_CONCURRENCY`, `TUR_BENCH_OUTPUT`, `TUR_BENCH_SAMPLING` |
 | `prefix` | CPU cost of prefix keys, lookups and eviction (no checkpoint) | none |
 | `kv_quality` | Teacher-forced KL, top-1 and NLL of K/V, state and weight variants against an F32 reference | `TUR_EVAL_TEXT`, `TUR_EVAL_KV`, `TUR_EVAL_STATE`, `TUR_EVAL_WEIGHTS`, `TUR_EVAL_TOKENS`, `TUR_EVAL_GENERATE` |
 | `tensorops` | Metal 4 TensorOps availability and F32 GEMM against Candle | none |
@@ -28,8 +29,10 @@ The module doc of each case in `crates/tur/benches/perf/` lists every variable. 
 - `mixed`: 128- and 2K-token prompts together.
 - `grammar`: every token masked.
 - `arrivals`: requests arriving at random, with serial or overlapped intake.
+- `ordering`: 64- and 2K-token prompts arriving at random on 4 running slots. `TUR_BENCH_SHORTEST_FIRST=1` runs the shortest remaining prompt first.
 - `prefix`: a shared system prompt and four six-turn conversations at several snapshot spacings. `TUR_BENCH_PREFIX_ENTRIES` sets the snapshot capacity (16 by default; use 8 to match default serving).
 - `reuse`: shared uncached prompts, contention, agent loops, churn and a no-reuse control. `TUR_BENCH_RESTORABLE_FIRST=1` lets cached prefixes jump the queue.
+- `tools`: a six-step tool loop with other users between calls, with and without the snapshot hold.
 - `speculation`: prompt lookup and MTP over repetitive, novel and code prompts. `TUR_BENCH_DRAFT_MODEL=<dir>` drafts with a Gemma 4 assistant instead.
 
 Gemma 4 E2B does about three times the work per token of the 0.8B Qwen, and its default sweep prefills 32K tokens in one case. `just bench-gemma` runs a short profile on the local checkpoint in `TUR_GEMMA4_E2B`: Q8_0 weights, F16 K/V, a 512-token prefill, decode at batches 1 and 4 at 128 tokens and one sequence at 4K (past the 512-token window), and 16 engine tokens. Any `TUR_BENCH_*` variable overrides its default:

@@ -1,8 +1,15 @@
 //! Independent `MoE` conformance and packed execution over real hybrid state.
 
+#[cfg(feature = "metal")]
+use crate::common::Checkpoint;
 use crate::model_common::{checkpoint, max_relative};
 use candle_core::{DType, Device, Tensor};
 use std::path::Path;
+#[cfg(feature = "metal")]
+use tur::{
+    InferencePipeline,
+    backend::pipeline::{GenerationRequest, PipelineConfig},
+};
 use tur_core::{
     Result,
     execution::{KvFormat, KvLayout, invalid},
@@ -320,6 +327,219 @@ fn test_expert_cache_over_artifacts_is_bit_identical_to_resident() -> Result<()>
         )
         .is_err()
     );
+    Ok(())
+}
+
+/// A `Q8_0` artifact of the `MoE` fixture beside a tokenizer, for a pipeline behind a cache.
+#[cfg(feature = "metal")]
+fn cached_artifact() -> Result<(Checkpoint, tur_models::backend::factory::ModelFactory)> {
+    use tur_models::models::{
+        Conversion, Packer, WeightPlan,
+        qwen3_5::{artifact_config, write_artifact},
+    };
+    let served = Checkpoint::new()?;
+    let weights = checkpoint(CONFIG, 0.03, 0.1)?;
+    std::fs::write(served.0.join("config.json"), CONFIG)?;
+    std::fs::copy(
+        weights.0.join("model.safetensors"),
+        served.0.join("model.safetensors"),
+    )?;
+    let source = served.0.with_extension("source");
+    std::fs::rename(&served.0, &source)?;
+    write_artifact(
+        &Conversion {
+            source: &source,
+            identity: "moe-fixture-v1",
+            output: &served.0,
+            calibration: "",
+        },
+        &WeightPlan::uniform(&artifact_config(&source)?, WeightFormat::Q8_0)?,
+        &Packer::RTN,
+    )?;
+    drop(std::fs::remove_dir_all(&source));
+    let factory = tur_models::backend::factory::ModelFactory {
+        format: None,
+        device: Device::new_metal(0)?,
+        // Ten of the fixture's 16 experts.
+        expert_cache: Some(2 << 20),
+        ..served.factory()
+    };
+    Ok((served, factory))
+}
+
+/// A layered pass computes what one pass does, and leaves the same recurrent state and keys:
+/// a token decoded after it gives bit-identical logits.
+#[cfg(feature = "metal")]
+#[test]
+fn test_layered_pass_over_recurrent_layers_matches_one_pass() -> Result<()> {
+    use crate::model_common::{pool, prefill, rows};
+    use tur_engine::hybrid::{HybridModel, LayerStep, PackedForward, SequenceForward};
+    use tur_models::models::{Manifest, Weights};
+    let (served, factory) = cached_artifact()?;
+    let (ids, _, _) = golden()?;
+    let (prefix, next) = ids.split_at(ids.len() - 1);
+    let model = Qwen35::load(
+        &served.0,
+        &LoadOptions {
+            revision: "moe-fixture-v1".into(),
+            weights: Weights::Prepacked(std::sync::Arc::new(Manifest::read(&served.0)?)),
+            device: factory.device.clone(),
+            execution: Execution::Fused,
+            kv: KvLayout::new(16, KvFormat::F32),
+            recurrent: DType::F32,
+            mtp: None,
+            audio: false,
+            expert_cache: factory.expert_cache,
+        },
+    )?;
+    let layers = model
+        .pausable_layers()
+        .ok_or_else(|| invalid("a cached model pauses between layers"))?;
+    let control = pool(&model, 16, 8)?;
+    let (whole, state) = prefill(&model, ModelState::new(&control), prefix, prefix.len())?;
+    let (decoded, _) = prefill(&model, state, next, 1)?;
+    let split = pool(&model, 16, 8)?;
+    let mut reservation = ModelState::new(&split).reserve(prefix.len(), Boundaries::Final)?;
+    reservation.prepare()?;
+    let binding = reservation.binding();
+    let positions: Vec<usize> = (0..prefix.len()).collect();
+    let sequences = [SequenceForward {
+        tokens: 0..prefix.len(),
+        state: &binding,
+        logits: &positions,
+        hidden: false,
+    }];
+    let batch = PackedForward {
+        embeddings: &[],
+        tokens: prefix,
+        positions: &positions,
+        sequences: &sequences,
+        pool: &split,
+    };
+    let LayerStep::Paused(carry) = model.forward_layers(&batch, None, 1)? else {
+        return Err(invalid("a group before the last layer must pause"));
+    };
+    assert_eq!(carry.next, 1);
+    factory.device.synchronize()?;
+    let LayerStep::Done(step) = model.forward_layers(&batch, Some(carry), layers)? else {
+        return Err(invalid("the last layer must finish"));
+    };
+    let actual = rows(&step.logits)?;
+    let (after, _) = prefill(&model, reservation.commit(prefix.len())?, next, 1)?;
+    for (a, e) in actual
+        .iter()
+        .chain(&after)
+        .flatten()
+        .zip(whole.iter().chain(&decoded).flatten())
+    {
+        assert_eq!(a.to_bits(), e.to_bits());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn long_prompt(tokens: usize) -> String {
+    (0..tokens)
+        .map(|i| format!("t{}", 10 + i % 80))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Runs `short` until it is decoding, submits `long`, and drains both. Returns their texts
+/// and how many tokens `short` streamed before `long`'s first.
+#[cfg(feature = "metal")]
+fn stream_beside_prompt(pipeline: &mut InferencePipeline) -> Result<(String, String, usize)> {
+    let short = pipeline.submit_request(&GenerationRequest::new("t10 t11 t12".into(), 30))?;
+    let mut streamed = 0;
+    while streamed < 2 {
+        let step = pipeline.step_streaming()?;
+        streamed += step.sampled_tokens.iter().filter(|t| t.0 == short).count();
+    }
+    let long = pipeline.submit_request(&GenerationRequest::new(long_prompt(300), 4))?;
+    let (mut before, mut started) = (0, false);
+    let mut texts = std::collections::HashMap::new();
+    while pipeline.active_request_count() > 0 {
+        let step = pipeline.step_streaming()?;
+        for (id, _, _) in &step.sampled_tokens {
+            started |= *id == long;
+            before += usize::from(*id == short && !started);
+        }
+        for (id, result) in step.completed {
+            texts.insert(id, result?.generated_text);
+        }
+    }
+    let mut text = |id| {
+        texts
+            .remove(&id)
+            .ok_or_else(|| invalid("missing completion"))
+    };
+    Ok((text(short)?, text(long)?, before))
+}
+
+#[cfg(feature = "metal")]
+fn solo_texts(factory: &tur::ModelFactory, config: PipelineConfig) -> Result<(String, String)> {
+    let mut solo = InferencePipeline::new(factory, config)?;
+    solo.clear_prefix_cache();
+    let short = solo.run(&GenerationRequest::new("t10 t11 t12".into(), 30), |_| {})?;
+    solo.clear_prefix_cache();
+    let long = solo.run(&GenerationRequest::new(long_prompt(300), 4), |_| {})?;
+    Ok((short.generated_text, long.generated_text))
+}
+
+/// A stream runs between layer groups of a hybrid model's prompt, every output is what a
+/// solo run produces, and the chunk's snapshot, with its recurrent state, serves a repeat.
+#[cfg(feature = "metal")]
+#[test]
+fn test_layered_prefill_over_recurrent_layers_keeps_outputs_and_snapshots() -> Result<()> {
+    let (_served, factory) = cached_artifact()?;
+    let config = || PipelineConfig::new(2, 256);
+    let (short, long) = solo_texts(&factory, config())?;
+    let mut pipeline = InferencePipeline::new(&factory, config())?;
+    let (short_text, long_text, before) = stream_beside_prompt(&mut pipeline)?;
+    assert_eq!(short_text, short);
+    assert_eq!(long_text, long);
+    // Two groups of the first chunk: one decode between them and one after.
+    assert!(before >= 2, "{before} tokens before the prompt's first");
+    let repeat = pipeline.run(&GenerationRequest::new(long_prompt(300), 4), |_| {})?;
+    assert_eq!(repeat.generated_text, long);
+    assert!(repeat.cached_tokens >= 256, "{}", repeat.cached_tokens);
+    // Switched off, nothing pauses and the outputs are the same.
+    let mut off = config();
+    off.scheduler.layered_prefill = false;
+    let mut pipeline = InferencePipeline::new(&factory, off)?;
+    assert!(!pipeline.scheduler().layered_prefill());
+    let (short_text, long_text, _) = stream_beside_prompt(&mut pipeline)?;
+    assert_eq!(short_text, short);
+    assert_eq!(long_text, long);
+    Ok(())
+}
+
+/// Cancelling between groups returns the chunk's pages and recurrent slot.
+#[cfg(feature = "metal")]
+#[test]
+fn test_cancelling_between_layer_groups_releases_recurrent_slots() -> Result<()> {
+    let (_served, factory) = cached_artifact()?;
+    let mut pipeline = InferencePipeline::new(&factory, PipelineConfig::new(2, 256))?;
+    let short = pipeline.submit_request(&GenerationRequest::new("t10 t11 t12".into(), 12))?;
+    pipeline.step_streaming()?;
+    pipeline.step_streaming()?;
+    let idle = pipeline.memory()?;
+    let long = pipeline.submit_request(&GenerationRequest::new(long_prompt(256), 4))?;
+    pipeline.step_streaming()?;
+    let paused = pipeline.memory()?;
+    assert!(paused.pages.leased >= idle.pages.leased + 16);
+    assert!(paused.slots.leased > idle.slots.leased);
+    pipeline.cancel(long)?;
+    let mut finished = false;
+    while pipeline.active_request_count() > 0 {
+        for (id, result) in pipeline.step_streaming()?.completed {
+            finished |= id == short && result.is_ok();
+        }
+    }
+    assert!(finished);
+    pipeline.clear_prefix_cache();
+    let usage = pipeline.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
     Ok(())
 }
 

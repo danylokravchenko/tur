@@ -5,6 +5,8 @@ use super::prune::ExpertProbe;
 #[cfg(feature = "metal")]
 use super::prune::LayerProbe;
 #[cfg(feature = "metal")]
+use crate::hybrid::{LayerCarry, LayerStep};
+#[cfg(feature = "metal")]
 use crate::models::paging::Paging;
 use crate::{
     hybrid::{
@@ -626,15 +628,7 @@ impl GptOss {
             tokens.extend_from_slice(&batch.tokens[s.sequence.tokens.clone()]);
             positions.extend_from_slice(&batch.positions[s.sequence.tokens.clone()]);
         }
-        let x = match &self.embedding {
-            Embedding::Resident(table) => {
-                table.rows(&Tensor::new(tokens.as_slice(), &self.device)?, &self.head)?
-            }
-            Embedding::OnDisk(checkpoint) => checkpoint
-                .gather_rows("model.embed_tokens.weight", &tokens)?
-                .to_dtype(DType::F32)?
-                .to_device(&self.device)?,
-        };
+        let x = self.embed(&tokens)?;
         let pass = Pass {
             pool: batch.pool,
             spans,
@@ -647,35 +641,46 @@ impl GptOss {
         };
         #[cfg(not(feature = "metal"))]
         let hidden = self.run_reference(&pass, x, trace)?;
-        spans
+        spans.iter().map(|s| self.step(s, &hidden)).collect()
+    }
+
+    fn embed(&self, tokens: &[u32]) -> Result<Tensor> {
+        match &self.embedding {
+            Embedding::Resident(table) => {
+                table.rows(&Tensor::new(tokens, &self.device)?, &self.head)
+            }
+            Embedding::OnDisk(checkpoint) => Ok(checkpoint
+                .gather_rows("model.embed_tokens.weight", tokens)?
+                .to_dtype(DType::F32)?
+                .to_device(&self.device)?),
+        }
+    }
+
+    /// One sequence's outputs from the final-normed rows of its pass.
+    fn step(&self, s: &Span<'_>, hidden: &Tensor) -> Result<SequenceStep> {
+        let rows = s
+            .sequence
+            .logits
             .iter()
-            .map(|s| {
-                let rows = s
-                    .sequence
-                    .logits
-                    .iter()
-                    .map(|r| {
-                        u32::try_from(s.start + r - s.sequence.tokens.start)
-                            .map_err(|_| invalid("logit row overflow"))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let logits = if rows.is_empty() {
-                    Tensor::zeros((0, self.config.vocab_size()), DType::F32, &self.device)?
-                } else {
-                    let selected =
-                        hidden.index_select(&Tensor::new(rows.as_slice(), &self.device)?, 0)?;
-                    self.linear(&self.head, &selected)?
-                };
-                Ok(SequenceStep {
-                    logits,
-                    hidden: s
-                        .sequence
-                        .hidden
-                        .then(|| hidden.narrow(0, s.start, s.len))
-                        .transpose()?,
-                })
+            .map(|r| {
+                u32::try_from(s.start + r - s.sequence.tokens.start)
+                    .map_err(|_| invalid("logit row overflow"))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        let logits = if rows.is_empty() {
+            Tensor::zeros((0, self.config.vocab_size()), DType::F32, &self.device)?
+        } else {
+            let selected = hidden.index_select(&Tensor::new(rows.as_slice(), &self.device)?, 0)?;
+            self.linear(&self.head, &selected)?
+        };
+        Ok(SequenceStep {
+            logits,
+            hidden: s
+                .sequence
+                .hidden
+                .then(|| hidden.narrow(0, s.start, s.len))
+                .transpose()?,
+        })
     }
 
     fn linear(&self, w: &PackedLinear, x: &Tensor) -> Result<Tensor> {
@@ -1021,11 +1026,31 @@ impl GptOss {
         &self,
         k: &tur_metal::kernels::Kernels,
         pass: &Pass<'_, '_>,
-        mut x: Tensor,
-        mut trace: Option<&mut Vec<Tensor>>,
+        x: Tensor,
+        trace: Option<&mut Vec<Tensor>>,
     ) -> Result<Tensor> {
-        let eps = self.config.text.rms_norm_eps;
-        let tokens = x.dim(0)?;
+        let h = self.first_norm(k, &x)?;
+        let (paging, positions) = self.addressing(k, pass, x.dim(0)?)?;
+        let span = 0..self.layers.len();
+        let (_, h) = self.fused_layers(k, pass, (&paging, &positions), span, (x, h), trace)?;
+        Ok(h)
+    }
+
+    fn first_norm(&self, k: &tur_metal::kernels::Kernels, x: &Tensor) -> Result<Tensor> {
+        let first = self
+            .layers
+            .first()
+            .ok_or_else(|| invalid("model has no layers"))?;
+        k.rms_norm(x, &first.input_norm, self.config.text.rms_norm_eps)
+    }
+
+    /// Page tables and positions of a pass's rows.
+    fn addressing(
+        &self,
+        k: &tur_metal::kernels::Kernels,
+        pass: &Pass<'_, '_>,
+        tokens: usize,
+    ) -> Result<(Paging, Tensor)> {
         let paging = Paging::new(
             k,
             &self.description,
@@ -1038,14 +1063,26 @@ impl GptOss {
             .iter()
             .map(|&p| u32::try_from(p).map_err(|_| invalid("position exceeds u32")))
             .collect::<Result<Vec<_>>>()?;
-        let positions = Tensor::new(positions.as_slice(), &self.device)?;
-        let first = self
-            .layers
-            .first()
-            .ok_or_else(|| invalid("model has no layers"))?;
-        let mut h = k.rms_norm(&x, &first.input_norm, eps)?;
-        for (i, layer) in self.layers.iter().enumerate() {
-            let attended = self.fused_attention(k, layer, i, &h, &positions, pass.pool, &paging)?;
+        Ok((paging, Tensor::new(positions.as_slice(), &self.device)?))
+    }
+
+    /// Run `(x, h)` through `layers`, with residual updates fused into the following norm.
+    fn fused_layers(
+        &self,
+        k: &tur_metal::kernels::Kernels,
+        pass: &Pass<'_, '_>,
+        (paging, positions): (&Paging, &Tensor),
+        layers: std::ops::Range<usize>,
+        (mut x, mut h): (Tensor, Tensor),
+        mut trace: Option<&mut Vec<Tensor>>,
+    ) -> Result<(Tensor, Tensor)> {
+        let eps = self.config.text.rms_norm_eps;
+        for i in layers {
+            let layer = self
+                .layers
+                .get(i)
+                .ok_or_else(|| invalid("layer outside the model"))?;
+            let attended = self.fused_attention(k, layer, i, &h, positions, pass.pool, paging)?;
             let (sum, normed) = k.add_rms_norm(&x, &attended, &layer.post_norm, eps)?;
             let routed = self.fused_experts(k, i, &layer.experts, &normed)?;
             let next = self.layers.get(i + 1).map_or(&self.norm, |n| &n.input_norm);
@@ -1054,7 +1091,46 @@ impl GptOss {
                 trace.push(x.clone());
             }
         }
-        Ok(h)
+        Ok((x, h))
+    }
+
+    fn fused_range(
+        &self,
+        k: &tur_metal::kernels::Kernels,
+        batch: &PackedForward<'_>,
+        carry: Option<LayerCarry>,
+        end: usize,
+    ) -> Result<LayerStep> {
+        let [sequence] = batch.sequences else {
+            return Err(invalid("a paused pass runs one sequence"));
+        };
+        let spans = [self.check(batch, sequence, 0)?];
+        let tokens = spans[0].len;
+        let pass = Pass {
+            pool: batch.pool,
+            spans: &spans,
+            positions: batch
+                .positions
+                .get(sequence.tokens.clone())
+                .ok_or_else(|| invalid("missing packed positions"))?,
+        };
+        let (paging, positions) = self.addressing(k, &pass, tokens)?;
+        let (start, x, h) = if let Some(carry) = carry {
+            (carry.next, carry.x, carry.h)
+        } else {
+            let x = self.embed(&batch.tokens[sequence.tokens.clone()])?;
+            let h = self.first_norm(k, &x)?;
+            (0, x, h)
+        };
+        if start >= end || end > self.layers.len() {
+            return Err(invalid("paused pass must advance within the model"));
+        }
+        let (x, h) =
+            self.fused_layers(k, &pass, (&paging, &positions), start..end, (x, h), None)?;
+        if end == self.layers.len() {
+            return Ok(LayerStep::Done(self.step(&spans[0], &h)?));
+        }
+        Ok(LayerStep::Paused(LayerCarry { x, h, next: end }))
     }
 
     #[allow(
@@ -1206,6 +1282,25 @@ impl HybridModel for GptOss {
     #[cfg(feature = "metal")]
     fn kernels(&self) -> Option<tur_metal::kernels::Kernels> {
         self.kernels.clone()
+    }
+    /// Only behind an expert cache, where a pass costs enough to stall streams: see
+    /// `InferencePipeline`'s layered prefill.
+    #[cfg(feature = "metal")]
+    fn pausable_layers(&self) -> Option<usize> {
+        (self.cache.is_some() && self.kernels.is_some()).then_some(self.layers.len())
+    }
+    #[cfg(feature = "metal")]
+    fn forward_layers(
+        &self,
+        batch: &PackedForward<'_>,
+        carry: Option<LayerCarry>,
+        end: usize,
+    ) -> Result<LayerStep> {
+        let k = self
+            .kernels
+            .as_ref()
+            .ok_or_else(|| invalid("a paused pass runs on the Metal kernels"))?;
+        self.fused_range(k, batch, carry, end)
     }
     fn forward(&self, batch: &PackedForward<'_>) -> Result<Vec<Result<SequenceStep>>> {
         if batch.pool.description() != &self.description

@@ -5,6 +5,7 @@ mod audio;
 mod config;
 mod drafting;
 mod execution;
+mod layered;
 mod requests;
 mod scheduling;
 
@@ -53,6 +54,8 @@ struct InFlight {
     /// feeds the draft cost fit.
     decodes: usize,
     context: usize,
+    /// Finishes a chunk split by layers: its time covers only the last group.
+    layered: bool,
     started: Instant,
     submitted: Instant,
     timing: PassTiming,
@@ -117,6 +120,11 @@ impl Pending {
         self.tokens.len() - self.prompt_tokens
     }
 
+    /// Its unconsumed tokens are outputs: the newest sampled one, or a run its grammar forced.
+    fn decoding(&self) -> bool {
+        self.running && self.generated() > 0 && self.consumed >= self.prompt_tokens
+    }
+
     /// Scheduling view. Prefill chunks stop at aligned and predicted turn boundaries,
     /// so each snapshot has the recurrent state written at exactly its position.
     fn candidate(&self, id: Uuid, boundary: Option<usize>) -> Candidate {
@@ -143,10 +151,9 @@ impl Pending {
         Candidate {
             id,
             pending: replay.unwrap_or(aligned),
+            remaining: unconsumed,
             minimum: replay.unwrap_or(1),
-            // Past the prompt, every unconsumed token is an output: the newest sampled one, or
-            // a run its grammar forced.
-            decoding: self.running && self.generated() > 0 && self.consumed >= self.prompt_tokens,
+            decoding: self.decoding(),
             running: self.running,
             context: self.consumed,
             arrival: self.arrival,
@@ -177,6 +184,10 @@ pub struct InferencePipeline {
     /// Waiting requests left unscheduled this pass for a producer of a shared prefix.
     awaiting: HashSet<Uuid>,
     in_flight: Option<InFlight>,
+    /// The prefill chunk paused between layer groups, while decodes run between them.
+    layered: Option<layered::LayeredChunk>,
+    /// The last pass finished such a chunk, so decodes run before any more prefill.
+    decode_next: bool,
     /// Outcomes produced before or without a pass, returned by the next `finish_step`.
     staged: BatchStepOutput,
     /// Grammar parser factory over the tokenizer, built on the first constrained request.
@@ -188,8 +199,10 @@ pub struct InferencePipeline {
     /// count after which one explores anyway.
     head_skips: usize,
     head_explore: usize,
-    /// Pipeline-wide acceptance, the starting estimate of new requests, per source.
-    acceptance: Acceptance,
+    /// The same for planning: proposals planned away, and the count that explores anyway.
+    draft_skips: usize,
+    draft_explore: usize,
+    /// Pipeline-wide head acceptance, the starting estimate of new requests.
     mtp_acceptance: Acceptance,
     /// Draft-head acceptance by confidence, for sampled and greedy requests.
     calibration: [Calibration; 2],

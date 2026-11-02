@@ -2,47 +2,23 @@
 
 Created: 2026-11-01. Status: research backlog; what remains here hasn't been built or measured in Tur.
 
-This page compares Tur with vLLM, llama.cpp, SGLang, oMLX, BaseRT and recent papers, and lists techniques Tur lacks. Tur's existing work (chunked prefill, prefix snapshots, device sampling, exact speculation, the expert cache) is left out. Every number comes from its source, on that source's hardware and models, and doesn't predict Tur's results. The order is a judgment of value against effort.
+This page compares Tur with vLLM, llama.cpp, SGLang, oMLX, BaseRT and recent papers, and lists techniques Tur lacks. Tur's existing work (chunked prefill, prefix snapshots and their [hold across tool calls](../architecture/prefix-reuse.md#retention-and-eviction), device sampling, exact speculation, the expert cache and [layered prefill](../architecture/expert-cache.md#serving-several-requests)) is left out, and so are table-based drafters, which were tried and [rejected](../design/rejected.md). Every number comes from its source, on that source's hardware and models, and doesn't predict Tur's results. The order is a judgment of value against effort.
 
 ## Build first
 
-These keep output exact and cost little to try.
+Reordering requests keeps output exact, so only latency and throughput are at stake.
 
-### Request ordering beyond arrival order
+### Priorities and per-client fairness
 
-Prompts run in arrival order, with no priorities or per-client fairness. The tenant only namespaces the prefix cache, so one client's 8K-token prompts can hold back another's short question.
-
-Remaining prompt length is known exactly, so the scheduler could run the shortest remaining prompt first and keep `max_queue_wait` as the bound on starvation. This is a proposal for Tur rather than a published result. The nearest evidence is [Learning to Rank](https://arxiv.org/abs/2408.15792v1), which reports 2.8× lower chatbot latency by approximating shortest-job-first, using a small helper model to rank output lengths.
+Tur has no priorities or per-client fairness. The tenant only namespaces the prefix cache, so one client's 8K-token prompts can hold back another's short question. The opt-in [`engine.shortest_prompt_first`](../architecture/scheduling.md#decisions) helps only at light load and doesn't separate clients.
 
 If several clients share one Mac, three designs apply. [Niyama](https://arxiv.org/abs/2503.22562v1) blends earliest-deadline-first with shortest-job-first across service classes, which would separate interactive from batch work. [VTC](https://arxiv.org/pdf/2401.00588) gives per-client fairness counted in tokens, with a 2× bound on the service gap between backlogged clients. [Autellix](https://arxiv.org/abs/2502.13965v1) favors agent programs that have received the least total service, and reports 4 to 15× higher program throughput at the same latency.
 
-### A drafter that needs no model
-
-No learned drafter exists for Qwen, and the MTP head turns prefix reuse off. A table-based drafter avoids both problems.
-
-[Token Recycling](https://arxiv.org/abs/2408.08696v1) keeps the 8 most likely next tokens for each vocabulary token, in under 2 MB, and refreshes them from the logits of every verified position. llama.cpp's [`ngram-mod`](https://huggingface.co/OpenTransformer/llama.cpp-prismml/blob/main/docs/speculative.md) shares a hash pool of n-grams across slots. Tur should split any shared table by `cache_salt`, so that one tenant's text can't influence another's drafts or timing.
-
-Token Recycling's report of about 2× comes from greedy decoding with a draft tree. Tur's recurrent state favors a single chain, and device sampling returns only the chosen token, so collecting candidates has its own cost. Replaying recorded token traces offline can bound the acceptance rate before any kernel work.
-
-### Reacting to memory pressure while running
-
-The spare-memory check runs only at load, and serving four concurrent requests on a 5.9 GiB plan swapped out 251 MiB. The server already samples system memory every 10 seconds, so it could use that reading to evict snapshots and lower `max_running` before macOS swaps.
-
-### Keeping state across tool calls
-
-[InferCept](https://arxiv.org/abs/2402.01869v2) reports that recomputing context after external calls takes 37 to 40% of forward time, and [Tokencake](https://arxiv.org/abs/2510.18586v1) targets the same idle state. Tur already keeps a zero-copy snapshot at the end of each request, which removes most of that cost until eviction takes it. A response ending in `finish_reason=tool_calls` is a strong sign that the conversation will return, so eviction could protect that snapshot for a bounded time.
-
 ## Measure before committing
 
-### Layered prefill for MoE models
+### Smaller passes under memory pressure
 
-Chunked prefill sends every chunk through every layer, so each chunk reads the experts again. On gpt-oss-20b, chunking at 1,024 instead of 256 tokens cut a 2,037-token prompt from 32 s to 18 s (see [Expert cache](../architecture/expert-cache.md)). [Layered prefill](https://arxiv.org/abs/2510.08055) splits the work by layers instead: each pass advances the whole prompt through one group of layers while decodes run through all of them, so each layer sees the prompt once. On H100s it reports up to 39% less expert-load traffic, with mean first-token time falling from 2.80 s to 1.23 s and mean token gaps from 32.9 ms to 21.5 ms.
-
-The paper doesn't size the buffers that hold activations between groups, and those would enter the memory plan. Tur would also need recurrent state at every snapshot boundary, since prefix reuse depends on it. Gains are largest on long prompts, and dense models have no expert reads to save.
-
-### A shorter path from SSD to GPU
-
-Expert reads go into host memory, then a new staging buffer, then a blit into a private arena (`crates/tur-metal/src/experts.rs`). Uploads and copies took 31 s of an earlier 83 s run, before uploads moved into the read threads. [`MTLIOCommandQueue`](https://developer.apple.com/documentation/metal/resource-loading.md) loads files directly into GPU resources, and reading into a shared arena would drop the blit. Either may need bindings that conflict with the ban on `unsafe`, so this needs a decision on dependencies first. Re-measure the current split before starting.
+Evicting snapshots and lowering `max_running` under pressure were rejected because neither returns memory to macOS (see [Rejected experiments](../design/rejected.md)). Scratch is the part that can shrink: Candle frees idle buffers at each sync, and gpt-oss-20b plans up to 1.28 GB of it, the same at one request or four. Shorter prefill chunks while spare memory is low might lower that peak, at the cost of the slower prefill measured in [Expert cache](../architecture/expert-cache.md). The worker only reads allocations after a pass, so measuring this first needs a reading of the peak within one.
 
 ### M5 Neural Accelerators
 
@@ -60,6 +36,7 @@ MLX exposes a [wired limit](https://github.com/ml-explore/mlx-lm/issues/883) tha
 
 - Running predicted experts without checking them, as [Speculating Experts](https://arxiv.org/abs/2603.19289) does, breaks Tur's exactness rule. Its better predictor adds under a point on gpt-oss (0.857 against 0.849) over the next-layer router signal Tur already reads ahead with.
 - A general SSD tier for K/V, as in [oMLX](https://jimmysong.io/ai/omlx) and vLLM, adds steady SSD writes and conflicts with the expert cache's rule of making none. Saving pinned prefixes on request is the most this could justify.
+- `MTLIOCommandQueue` loads files directly into GPU resources, but it can't beat the SSD's own speed, and [reading directly into a shared arena](../design/rejected.md) gained only 6% on the same copies. It would also need `unsafe` bindings.
 - [Purgeable buffers](https://developer.apple.com/documentation/metal/mtlpurgeablestate.md) suit resources unused for some time, [according to Apple](https://developer.apple.com/forums/thread/698161), and the expert arena is one large buffer in constant use.
 - Prefill/decode disaggregation and Mooncake-style connectors move state between machines, and one Mac is Tur's unit of deployment.
 

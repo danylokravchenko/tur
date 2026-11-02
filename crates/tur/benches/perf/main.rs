@@ -7,6 +7,7 @@
     reason = "benchmarks emit JSON artifacts and timing summaries"
 )]
 
+mod drafter;
 mod experts;
 mod kernels;
 mod kv_quality;
@@ -19,7 +20,7 @@ mod whisper;
 
 use tur_core::{Result, TurError};
 
-const CASES: &str = "experts <dir> <cache MiB> <text> [reference dir] | kernels | model | serving | prefix | kv_quality | tensorops | whisper | load_weights <dir> <variant>";
+const CASES: &str = "drafter | experts <dir> <cache MiB> <text> [reference dir] | kernels | model | serving | prefix | kv_quality | tensorops | whisper | load_weights <dir> <variant>";
 
 fn main() -> Result<()> {
     // `cargo bench` passes `--bench`; every other argument belongs to the case.
@@ -32,6 +33,7 @@ fn main() -> Result<()> {
         return Ok(());
     };
     match case.as_str() {
+        "drafter" => drafter::run(),
         "experts" => experts::run(rest),
         "kernels" => kernels::run(),
         "model" => model::run(),
