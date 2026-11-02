@@ -7,6 +7,7 @@ use super::{
 };
 use crate::{
     audio::{Audio, AudioPrompt},
+    backend::tools::ToolSyntax,
     hybrid::{DraftForward, HybridModel, PackedForward, SequenceStep},
 };
 use std::path::Path;
@@ -144,9 +145,14 @@ impl TextModel {
             Self::GptOss(m) => m.config().max_position(),
         }
     }
-    /// Whether this model writes its output in Harmony channels.
-    pub fn speaks_harmony(&self) -> bool {
-        matches!(self, Self::GptOss(_))
+    /// How this model writes tool calls. [`ToolSyntax::Harmony`] models write all of their
+    /// output in Harmony channels.
+    pub fn tool_syntax(&self) -> ToolSyntax {
+        match self {
+            Self::Qwen35(_) => ToolSyntax::Xml,
+            Self::Gemma4(_) => ToolSyntax::Gemma,
+            Self::GptOss(_) => ToolSyntax::Harmony,
+        }
     }
     /// How a clip appears in prompts, when the model has an audio encoder loaded.
     pub fn audio_prompt(&self) -> Option<AudioPrompt> {

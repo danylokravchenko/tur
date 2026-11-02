@@ -260,6 +260,7 @@ async fn test_http_preserves_limits_sampling_thinking_and_tool_history() -> Resu
                     accepted_draft_tokens: 0,
                     generated_text: String::new(),
                     reasoning_text: String::new(),
+                    logprobs: Vec::new(),
                     tool_calls: Vec::new(),
                     finish_reason: "stop",
                 })),

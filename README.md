@@ -20,7 +20,7 @@ Choose Tur if you want one of these on an Apple Silicon Mac:
 - A mixture-of-experts model larger than your Mac's memory. Tur keeps most experts on the SSD and reads them into a fixed cache, with several requests at once and no SSD writes during a run.
 - A server you can leave running. Tur plans all its memory before loading a weight, so a configuration that doesn't fit fails at startup, and one failed request doesn't affect the others.
 
-Tur supports few models and doesn't accept images or video. It has no embeddings, it serves one chat model per process, and its HTTP API doesn't offer structured output yet. For those, or for other hardware, look at oMLX, llama.cpp, Ollama, SGLang or Strata. [Tur and other engines](docs/src/architecture/comparison.md) compares them.
+Tur supports few models and doesn't accept images or video. It has no embeddings and serves one chat model per process. For those, or for other hardware, look at oMLX, llama.cpp, Ollama, SGLang or Strata. [Tur and other engines](docs/src/architecture/comparison.md) compares them.
 
 ## How it works
 

@@ -1,6 +1,17 @@
 mod gemma;
 use serde::{Deserialize, Serialize};
 
+/// How a model writes tool calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolSyntax {
+    /// `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`
+    Xml,
+    /// `<|tool_call>call:name{key:value}<tool_call|>`
+    Gemma,
+    /// `<|channel|>commentary to=functions.name <|constrain|>json<|message|>{...}`
+    Harmony,
+}
+
 /// Definition of a callable tool (function) that the model can invoke.
 ///
 /// Passed to the checkpoint chat template when rendering a conversation.

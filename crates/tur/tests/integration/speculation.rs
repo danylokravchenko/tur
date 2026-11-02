@@ -34,6 +34,7 @@ fn test_lookup_verification_matches_target_sampling_and_request_limits() -> Resu
             repetition_penalty: Some(1.2),
             presence_penalty: Some(0.2),
             frequency_penalty: Some(0.1),
+            logprobs: None,
         },
     ] {
         let mut plain = InferencePipeline::new(&fixture.factory(), config(0, 1))?;
@@ -194,6 +195,7 @@ fn test_speculative_device_sampling_preserves_seeded_penalties_and_outputs() -> 
         repetition_penalty: Some(1.1),
         presence_penalty: Some(0.2),
         frequency_penalty: Some(0.05),
+        logprobs: None,
     };
     for seed in 0..3 {
         request.seed = seed;

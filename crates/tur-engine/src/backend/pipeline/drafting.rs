@@ -149,13 +149,14 @@ impl InferencePipeline {
         id: Uuid,
         room: usize,
     ) -> Result<Option<(Vec<u32>, Acceptance, DraftSource)>> {
+        // A grammar's masks stay on the device, which needs one output per pass.
+        if self.engine.constraining(id) {
+            return Ok(None);
+        }
         let pending = self
             .pending
             .get_mut(&id)
             .ok_or_else(|| invalid("missing pipeline request"))?;
-        if pending.constrained {
-            return Ok(None);
-        }
         // Outputs number drafts + 1 and occupy positions up to consumed + drafts.
         let remaining = pending.max_tokens.saturating_sub(pending.generated());
         let mut cap = self

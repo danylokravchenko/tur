@@ -128,4 +128,4 @@ Offloading is the fallback in either engine. If the whole model fits, keep it re
 
 ## What Tur leaves out
 
-Tur rejects images and video, serves one chat model per process, and has no embeddings or Anthropic-style API. Grammar-constrained output works in the engine, but the HTTP server doesn't expose it, so `response_format` and forced tool choice aren't available to clients yet. Qwen3.6-35B and Qwen3.8-27B run on real checkpoints, though their quality against Transformers hasn't been measured. If you need any of these today, choose oMLX or llama.cpp on a Mac. [Scope and principles](../design/scope.md) has the evidence for each model, and [Open work](../design/open.md) tracks what's next.
+Tur rejects images and video, serves one chat model per process, and has no embeddings or Anthropic-style API. Qwen3.6-35B and Qwen3.8-27B run on real checkpoints, though their quality against Transformers hasn't been measured. If you need any of these today, choose oMLX or llama.cpp on a Mac. [Scope and principles](../design/scope.md) has the evidence for each model, and [Open work](../design/open.md) tracks what's next.

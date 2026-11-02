@@ -76,13 +76,14 @@ impl SchedulerConfig {
 #[derive(Clone, Copy, Debug)]
 pub struct Candidate {
     pub id: Uuid,
-    /// Tokens available for the next chunk: one for a decode, remaining prompt tokens,
-    /// or the next original chunk during recomputation.
+    /// Tokens available for the next chunk: one for a decode, or more when a grammar forced
+    /// some, remaining prompt tokens, or the next original chunk during recomputation.
     pub pending: usize,
     /// Minimum indivisible chunk. Recompute uses the original pass boundary so narrow
     /// recurrent state is rounded at the same positions as before preemption.
     pub minimum: usize,
-    /// Its single pending token is a sampled output.
+    /// Its pending tokens are outputs, which run with the decodes instead of waiting for
+    /// prefill budget.
     pub decoding: bool,
     /// Holds model state; otherwise admitting it counts against `max_running`.
     pub running: bool,
@@ -297,10 +298,19 @@ impl Scheduler {
             0
         };
         let mut chunks = Vec::new();
-        for decode in decodes.iter().take(self.config.max_batch_tokens - reserve) {
+        let room = self.config.max_batch_tokens - reserve;
+        let mut used = 0usize;
+        for (index, decode) in decodes.iter().enumerate().take(room) {
+            // Later decodes keep their one token each. A recomputed run too long for what's
+            // left waits for a later pass, so it stays on its original boundaries.
+            let spare = room - used - (decodes.len() - index - 1).min(room - used - 1);
+            let tokens = decode.pending.min(self.config.max_chunk).min(spare);
+            if tokens < decode.minimum {
+                continue;
+            }
             let chunk = Chunk {
                 id: decode.id,
-                tokens: 1,
+                tokens,
                 admit: false,
                 ticket: 0,
             };
@@ -310,11 +320,15 @@ impl Scheduler {
                     _ => Decision::Stall(decode.id),
                 });
             }
+            used += tokens;
             chunks.push(chunk);
+            if used == room {
+                break;
+            }
         }
 
         if let Some(oldest) = prefills.first() {
-            let cap = self.config.max_batch_tokens - chunks.len();
+            let cap = self.config.max_batch_tokens - used;
             let context = candidates
                 .iter()
                 .map(|c| {
@@ -323,7 +337,7 @@ impl Scheduler {
                 })
                 .max()
                 .unwrap_or(0);
-            let mut budget = self.prefill_budget(chunks.len(), context, cap);
+            let mut budget = self.prefill_budget(used, context, cap);
             budget = budget.max(oldest.minimum.min(cap));
             if now.saturating_duration_since(oldest.arrival) >= self.config.max_queue_wait {
                 budget = budget.max(self.config.max_chunk.min(cap));
@@ -493,6 +507,39 @@ mod tests {
         let chunks = run(scheduler.plan(&many, start, |_| Ok(true))?)?;
         assert_eq!(chunks.iter().filter(|(_, n)| *n == 1).count(), 16);
         assert_eq!(chunks.last(), Some(&(30, 4)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_forced_runs_decode_whole_and_leave_each_later_decode_a_token() -> Result<()> {
+        let start = Instant::now();
+        let mut config = SchedulerConfig::new(4, 8);
+        config.max_batch_tokens = 8;
+        config.min_prefill_tokens = 2;
+        let mut scheduler = Scheduler::new(config)?;
+        let forced = |index, pending| Candidate {
+            decoding: true,
+            ..candidate(index, start, pending, true)
+        };
+        let run = |scheduler: &mut Scheduler, candidates: &[Candidate]| {
+            chunks(scheduler.plan(candidates, start, |_| Ok(true))?)
+        };
+        let lengths = |chunks: Vec<Chunk>| chunks.iter().map(|c| c.tokens).collect::<Vec<_>>();
+        // A short run goes whole, in the same pass as a plain decode.
+        assert_eq!(
+            lengths(run(&mut scheduler, &[forced(1, 3), forced(2, 1)])?),
+            [3, 1]
+        );
+        // A long one stops where the batch ends, one token short for the decode after it.
+        assert_eq!(
+            lengths(run(&mut scheduler, &[forced(1, 100), forced(2, 1)])?),
+            [7, 1]
+        );
+        // Prefill keeps its reserve beside a run.
+        let prefill = candidate(3, start, 50, false);
+        let selected = run(&mut scheduler, &[forced(1, 100), prefill])?;
+        assert_eq!(selected[0].tokens, 6);
+        assert_eq!(selected[1].id, prefill.id);
         Ok(())
     }
 

@@ -108,6 +108,7 @@ impl Args {
             repetition_penalty: self.repetition_penalty,
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
+            logprobs: None,
         };
         request.render.enable_thinking = self.thinking;
         request.render.reasoning_effort = self.reasoning_effort;
