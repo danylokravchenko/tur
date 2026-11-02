@@ -24,7 +24,7 @@ tur quantize \
 Then load it without `--weight-format`, which is an error with an artifact:
 
 ```sh
-tur serve --model /models/qwen3.5-0.8b-q4k-gptq --revision q4k-gptq-v1
+tur serve /models/qwen3.5-0.8b-q4k-gptq
 ```
 
 The artifact is one `tur-weights.safetensors` file next to copies of the source's config, tokenizer, template and generation defaults. Its header holds a manifest with the format version, the source checkpoint's identity and a fingerprint of its `config.json`, the quantizer settings, a fingerprint of the calibration data, and the format chosen for each projection. Tur checks all of it before reading any weights, so an artifact can't be loaded against the wrong config. The file is written under a temporary name and renamed when complete, so a failed run never leaves a half-written artifact.

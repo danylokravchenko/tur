@@ -11,14 +11,19 @@ use serde::Deserialize;
 use tur::{
     ModelFactory, ModelSource, Result, TurError,
     backend::{
-        factory::{GgufSource, WhisperFactory, resolve_checkpoint, resolve_drafter},
+        factory::{
+            GgufSource, WhisperFactory, latest_revision, resolve_checkpoint, resolve_drafter,
+        },
         pipeline::PipelineConfig,
         speculation::SpeculationConfig,
     },
     core::execution::{KvFormat, KvLayout},
 };
 
-use crate::config::{inherit, optional_from_str, optional_recurrent};
+use crate::{
+    catalog,
+    config::{inherit, optional_from_str, optional_recurrent},
+};
 
 /// Explicit paths and existing directories load locally; other values name a Hugging Face
 /// repository.
@@ -43,17 +48,60 @@ pub(crate) fn checkpoint_dir(model: &Path, revision: &str) -> Result<PathBuf> {
     resolve_checkpoint(&source, revision)
 }
 
+/// Where `model` loads from and the revision naming it. An omitted revision is a local
+/// directory's own name, or a repository's latest commit, reported so a run can be repeated.
+pub(crate) fn identity(model: &str, revision: Option<&str>) -> Result<(ModelSource, String)> {
+    let source = model_source(model);
+    if matches!(&source, ModelSource::HuggingFace(id) if !id.contains('/')) {
+        return Err(TurError::Other(format!(
+            "unknown model '{model}'; `tur list` shows the names, and a checkpoint is a \
+             directory or an organization/name repository"
+        )));
+    }
+    let revision = match (&source, revision.filter(|value| !value.trim().is_empty())) {
+        (_, Some(revision)) => revision.to_owned(),
+        (ModelSource::LocalPath(path), None) => directory_name(path),
+        (ModelSource::HuggingFace(id), None) => latest_commit(id, "--revision")?,
+    };
+    Ok((source, revision))
+}
+
+fn directory_name(path: &Path) -> String {
+    let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    absolute.file_name().map_or_else(
+        || absolute.to_string_lossy().into_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+fn latest_commit(repository: &str, flag: &str) -> Result<String> {
+    let commit = latest_revision(repository).map_err(|error| {
+        TurError::Other(format!(
+            "cannot look up the latest commit of {repository}: {}; give one with {flag}",
+            crate::ui::describe(&error)
+        ))
+    })?;
+    tracing::warn!("Using {repository} at its latest commit; {flag} {commit} keeps these weights");
+    Ok(commit)
+}
+
 /// Checkpoint and state storage.
 #[derive(Debug, Default, Deserialize, clap::Args)]
 #[serde(default, deny_unknown_fields)]
 #[command(next_help_heading = "Model")]
 pub(crate) struct ModelArgs {
-    /// Local checkpoint directory, or a fully qualified Hugging Face repository.
-    #[arg(long, env = "TUR_MODEL")]
+    /// A name from `tur list`, a checkpoint directory, or an organization/name Hugging Face
+    /// repository. Default: `[model].source` in tur.toml.
+    #[arg(value_name = "MODEL")]
     #[serde(rename = "source")]
     model: Option<String>,
-    /// Remote commit, or an explicit immutable identity for a local checkpoint.
-    #[arg(long, env = "TUR_REVISION")]
+    /// What MODEL was called, for clients of a server.
+    #[arg(skip)]
+    #[serde(skip)]
+    named: Option<String>,
+    /// Commit of a repository, or a name for a directory's weights. Default: the commit a
+    /// name from `tur list` is pinned to, a repository's latest, or the directory's name.
+    #[arg(long)]
     revision: Option<String>,
     /// Convert `SafeTensors` projections into this resident format: f32, `q8_0`, q4k.
     /// Omitted, a prepacked artifact loads as stored and any other checkpoint converts
@@ -62,11 +110,11 @@ pub(crate) struct ModelArgs {
     #[serde(deserialize_with = "optional_from_str")]
     weight_format: Option<WeightFormat>,
     /// Load weights from this GGUF file as stored: a local path, or
-    /// `organization/repository/file.gguf` at `--gguf-revision`. `--model` then supplies only
-    /// the config, tokenizer and template, and its weights are not downloaded.
+    /// `organization/repository/file.gguf` at `--gguf-revision`. MODEL then supplies only the
+    /// config, tokenizer and template, and its weights are not downloaded.
     #[arg(long, env = "TUR_GGUF")]
     gguf: Option<String>,
-    /// Commit of a remote `--gguf` file.
+    /// Commit of a remote `--gguf` file. Default: the repository's latest.
     #[arg(long, env = "TUR_GGUF_REVISION")]
     gguf_revision: Option<String>,
     /// K/V storage: f32, f16, q8 (one scale per 32 dimensions, half of F16's memory) or
@@ -119,6 +167,30 @@ impl ModelArgs {
         expert_cache_mb
     );
 
+    /// Settle which model runs. A model on the command line replaces the file's along with its
+    /// revision, which names a commit of that other model. A catalog name then brings its
+    /// commit and limits beneath anything set explicitly.
+    pub(crate) fn select(&mut self, mut file: Self) -> Option<&'static catalog::Model> {
+        if self.model.is_some() {
+            file.model = None;
+            file.revision = None;
+        }
+        self.inherit(file);
+        self.named.clone_from(&self.model);
+        let entry = catalog::find(self.model.as_deref()?)?;
+        self.model = Some(entry.repository.into());
+        self.revision
+            .get_or_insert_with(|| entry.revision.to_owned());
+        self.expert_cache_mb = self.expert_cache_mb.or(entry.expert_cache_mb);
+        Some(entry)
+    }
+
+    /// The model ID a server offers unless told otherwise: the last part of what the user wrote.
+    pub(crate) fn served_name(&self) -> Option<String> {
+        let name = Path::new(self.named.as_deref()?).file_name()?;
+        Some(name.to_string_lossy().into_owned())
+    }
+
     /// A `--gguf` value is local when the path exists, and a Hub file otherwise.
     fn gguf_source(&self) -> Result<Option<GgufSource>> {
         let Some(gguf) = self.gguf.as_ref().filter(|value| !value.trim().is_empty()) else {
@@ -133,13 +205,17 @@ impl ModelArgs {
                 "no GGUF file at {gguf}; a Hub file is organization/repository/file.gguf"
             )));
         };
-        let revision = self
+        let repository = format!("{organization}/{repository}");
+        let revision = match self
             .gguf_revision
             .clone()
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| TurError::Other("a remote --gguf needs --gguf-revision".into()))?;
+        {
+            Some(revision) => revision,
+            None => latest_commit(&repository, "--gguf-revision")?,
+        };
         Ok(Some(GgufSource::HuggingFace {
-            repository: format!("{organization}/{repository}"),
+            repository,
             file: file.to_owned(),
             revision,
         }))
@@ -152,19 +228,16 @@ impl ModelArgs {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 TurError::Other(
-                    "model is required: set --model, TUR_MODEL or [model].source in tur.toml"
-                        .into(),
+                    "which model? For example `tur run qwen`; `tur list` shows the names".into(),
                 )
             })?;
-        let revision = self.revision.as_ref().filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| TurError::Other("revision is required: set --revision, TUR_REVISION or [model].revision in tur.toml".into()))?;
-        let source = model_source(model);
+        let (source, revision) = identity(model, self.revision.as_deref())?;
         if self.kv_layout().page_tokens == 0 {
             return Err(TurError::Other("K/V page tokens must be positive".into()));
         }
         Ok(ModelFactory {
             source,
-            revision: revision.clone(),
+            revision,
             format: self.weight_format,
             gguf: self.gguf_source()?,
             device: tur::shared::inference_device(self.cpu_reference)?,
@@ -432,10 +505,18 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_model_file_formats_paths_and_cli_precedence() -> Result<()> {
+    /// Flags as a command line would give them.
+    fn model_flags(values: &[&str]) -> Result<ModelArgs> {
         use clap::{Args as _, FromArgMatches as _};
 
+        let matches = ModelArgs::augment_args(clap::Command::new("model"))
+            .try_get_matches_from(values)
+            .map_err(|error| TurError::Other(error.to_string()))?;
+        ModelArgs::from_arg_matches(&matches).map_err(|error| TurError::Other(error.to_string()))
+    }
+
+    #[test]
+    fn test_model_file_formats_paths_and_cli_precedence() -> Result<()> {
         let defaults: ModelArgs = toml::from_str(
             r#"
             source = "./models/checkpoint"
@@ -447,14 +528,8 @@ mod tests {
         "#,
         )
         .map_err(|error| TurError::Other(error.to_string()))?;
-        let matches = ModelArgs::augment_args(clap::Command::new("model"))
-            .mut_arg("model", |arg| arg.env(None::<&str>))
-            .mut_arg("revision", |arg| arg.env(None::<&str>))
-            .try_get_matches_from(["model", "--revision", "cli-revision", "--cpu-reference"])
-            .map_err(|error| TurError::Other(error.to_string()))?;
-        let mut args = ModelArgs::from_arg_matches(&matches)
-            .map_err(|error| TurError::Other(error.to_string()))?;
-        args.inherit(defaults);
+        let mut args = model_flags(&["model", "--revision", "cli-revision", "--cpu-reference"])?;
+        assert!(args.select(defaults).is_none());
         args.relative_to(Path::new("/tmp/tur-settings"));
         let factory = args.factory()?;
         assert!(
@@ -468,40 +543,90 @@ mod tests {
     }
 
     #[test]
-    fn test_environment_overrides_file_and_cli_overrides_environment() -> Result<()> {
-        use clap::{Args as _, FromArgMatches as _};
+    fn test_named_model_replaces_the_files_model_and_revision() -> Result<()> {
+        let file = || ModelArgs {
+            model: Some("org/other".into()),
+            revision: Some("commit-of-other".into()),
+            kv_page_tokens: Some(32),
+            ..ModelArgs::default()
+        };
+        let mut args = model_flags(&["model", "gpt-oss", "--cpu-reference"])?;
+        assert_eq!(
+            args.select(file()).map(|entry| entry.name),
+            Some("gpt-oss:20b")
+        );
+        let factory = args.factory()?;
+        assert!(
+            matches!(&factory.source, ModelSource::HuggingFace(id) if id == "openai/gpt-oss-20b")
+        );
+        assert_eq!(factory.revision, "6cee5e81ee83917806bbde320786a8fb61efebee");
+        assert_eq!(factory.expert_cache, Some(2048 << 20));
+        assert_eq!(
+            factory.kv.page_tokens, 32,
+            "other file settings still apply"
+        );
+        assert_eq!(args.served_name().as_deref(), Some("gpt-oss"));
 
-        // Bind to an existing variable rather than mutating this multithreaded test
-        // process's environment (which would require unsafe in edition 2024).
-        let expected = std::env::var("PATH").map_err(|error| TurError::Other(error.to_string()))?;
-        for (values, expected_model) in [
-            (vec!["model"], expected.as_str()),
-            (vec!["model", "--model", "cli-model"], "cli-model"),
+        let mut args = model_flags(&[
+            "model",
+            "gpt-oss:20b",
+            "--revision",
+            "cli-revision",
+            "--expert-cache-mb",
+            "4096",
+            "--cpu-reference",
+        ])?;
+        args.select(ModelArgs::default());
+        let factory = args.factory()?;
+        assert_eq!(factory.revision, "cli-revision");
+        assert_eq!(factory.expert_cache, Some(4096 << 20));
+        assert_eq!(args.served_name().as_deref(), Some("gpt-oss:20b"));
+
+        let mut args = model_flags(&["model", "--revision", "cli-revision"])?;
+        args.select(file());
+        assert_eq!(args.revision.as_deref(), Some("cli-revision"));
+        assert_eq!(args.model.as_deref(), Some("org/other"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_served_name_is_the_last_part_of_what_the_user_wrote() -> Result<()> {
+        for (written, served) in [
+            ("org/name", "name"),
+            ("./models/mine/", "mine"),
+            ("qwen", "qwen"),
         ] {
-            let matches = ModelArgs::augment_args(clap::Command::new("model"))
-                .mut_arg("model", |arg| arg.env("PATH"))
-                .try_get_matches_from(values)
-                .map_err(|error| TurError::Other(error.to_string()))?;
-            let mut args = ModelArgs::from_arg_matches(&matches)
-                .map_err(|error| TurError::Other(error.to_string()))?;
-            args.inherit(ModelArgs {
-                model: Some("file-model".into()),
-                ..ModelArgs::default()
-            });
-            assert_eq!(args.model.as_deref(), Some(expected_model));
+            let mut args = model_flags(&["model", written])?;
+            args.select(ModelArgs::default());
+            assert_eq!(args.served_name().as_deref(), Some(served), "{written}");
         }
         Ok(())
     }
 
     #[test]
-    fn test_missing_model_identity_and_zero_page_size_are_rejected() -> Result<()> {
+    fn test_directories_name_themselves_and_unknown_names_are_refused() -> Result<()> {
+        let (source, revision) = identity("/absent/mine", None)?;
+        assert!(matches!(source, ModelSource::LocalPath(_)));
+        assert_eq!(revision, "mine");
+        assert_eq!(identity("/absent/mine", Some("v1"))?.1, "v1");
+        let error = identity("llama", Some("v1"))
+            .err()
+            .ok_or_else(|| TurError::Other("an unknown name was accepted".into()))?;
+        assert!(
+            error.to_string().contains("unknown model 'llama'"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_missing_model_and_zero_page_size_are_rejected() -> Result<()> {
         let mut args: ModelArgs =
             toml::from_str("").map_err(|error| TurError::Other(error.to_string()))?;
         args.cpu_reference = true;
         assert!(args.factory().is_err());
-        args.model = Some("org/checkpoint".into());
-        assert!(args.factory().is_err());
-        args.revision = Some("revision".into());
+        args.model = Some("/absent/mine".into());
+        args.factory()?;
         args.kv_page_tokens = Some(0);
         assert!(args.factory().is_err());
         Ok(())

@@ -1,6 +1,6 @@
 # Quickstart
 
-This walkthrough installs Tur, downloads a model, chats with it and serves it. Then it quantizes the model and serves the smaller version. It uses Qwen3.5-0.8B, which runs on any Apple Silicon Mac.
+This walkthrough installs Tur, chats with a model and serves it. Then it quantizes the model and serves the smaller version. It uses Qwen3.5-0.8B, which runs on any Apple Silicon Mac.
 
 ## 1. Install
 
@@ -11,59 +11,39 @@ tur --help
 
 The script installs the prebuilt binary into `~/.local/bin`, so you don't need Rust. If that directory isn't on your `PATH`, the script adds it to `~/.zshrc` or `~/.bash_profile`; open a new terminal if `tur` isn't found. Running the script again replaces an existing installation. [Requirements and checkpoints](getting-started.md#download) lists its settings and explains how to build from source.
 
-## 2. Pick and pin a model
-
-Tur asks for an exact revision of every model, so the same command always loads the same weights. To look up the current commit of a Hugging Face repository:
+## 2. Chat
 
 ```sh
-curl -s https://huggingface.co/api/models/Qwen/Qwen3.5-0.8B | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
+tur run qwen
 ```
 
-This book uses `2fc06364715b967f1860aea9cf38778875588b17`. Keep it in your shell:
+The first run downloads the model into the Hugging Face cache (`~/.cache/huggingface`, or `HF_HOME`), and later runs load it from there. Then you get a prompt. `/clear` forgets the conversation, and `/bye` or Ctrl-D leaves.
+
+`tur list` shows the other models and which ones you already have, and `tur pull gemma` downloads one without running it. Each name is pinned to an exact commit, so it always loads the same weights. Gated models need `HF_TOKEN`.
+
+## 3. Ask for one answer
+
+Give a prompt, or pipe one in, and Tur prints the answer and exits:
 
 ```sh
-export TUR_MODEL=Qwen/Qwen3.5-0.8B
-export TUR_REVISION=2fc06364715b967f1860aea9cf38778875588b17
-```
-
-`tur` reads both variables, so later commands can leave out `--model` and `--revision`.
-
-## 3. Download
-
-The simplest option is to let Tur download. Give it the repository name, and the files go to the Hugging Face cache (`~/.cache/huggingface`, or `HF_HOME`). Gated models need `HF_TOKEN`.
-
-```sh
-tur run --prompt 'Hello'      # downloads on first use
-```
-
-For offline use and for quantization, download into a directory instead. This needs the Hugging Face CLI (`pip install -U huggingface_hub`):
-
-```sh
-hf download Qwen/Qwen3.5-0.8B --revision "$TUR_REVISION" --local-dir ~/models/qwen3.5-0.8b
-export TUR_MODEL=~/models/qwen3.5-0.8b    # a directory loads locally
-export TUR_REVISION=qwen3.5-0.8b@2fc0636  # for a local directory, any stable name you choose
-```
-
-Older versions of `huggingface_hub` call the command `huggingface-cli download`.
-
-## 4. Generate
-
-```sh
-# Greedy and short, with thinking off for a direct answer.
-tur run --prompt 'Write one sentence about the Moon.' --temperature 0 -n 64 --thinking false
+# Thinking off for a direct answer.
+tur run qwen 'Write one sentence about the Moon.' --thinking false
 
 # Sampled with the checkpoint's own defaults, thinking on (the template's default).
-tur run --prompt 'Explain why the sky is blue.' -n 512
+tur run qwen 'Explain why the sky is blue.'
+
+# Piped input is the prompt.
+cat notes.txt | tur run qwen
 
 # Tools: the model may answer with a function call.
 cat > tools.json <<'EOF'
 [{"name": "get_weather", "description": "Current weather for a city",
   "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
 EOF
-tur run --prompt 'What is the weather in Kyiv?' --tools tools.json --thinking false
+tur run qwen 'What is the weather in Kyiv?' --tools tools.json --thinking false
 ```
 
-Text goes to stdout. Loading progress and a timing summary go to stderr:
+The answer goes to stdout. Reasoning, loading progress and a timing summary go to stderr:
 
 ```text
   ✓ Loading weights  24/24 layers in 1.6 s
@@ -72,13 +52,13 @@ Text goes to stdout. Loading progress and a timing summary go to stderr:
 
 Set `RUST_LOG=info` to also see the memory plan. See [Command line](cli.md) for how every command reports its work.
 
-## 5. Serve
+## 4. Serve
 
 ```sh
-tur serve --served-model-name qwen --max-batch-size 8
+tur serve qwen
 ```
 
-When it prints `Listening on http://127.0.0.1:8080`, the model is loaded and ready.
+When it prints `Listening on http://127.0.0.1:8080`, the model is loaded and ready. Clients call it by the name you gave it, `qwen` here.
 
 ```sh
 # One response.
@@ -105,13 +85,31 @@ reply = client.chat.completions.create(
 print(reply.choices[0].message.content)
 ```
 
+## 5. Run a model that has no name
+
+`tur list` holds only models Tur has generated from. Anything else that Tur supports loads from a Hugging Face repository or a directory:
+
+```sh
+tur run Qwen/Qwen3.5-4B
+tur run ./models/my-checkpoint
+```
+
+A repository loads at its latest commit, and Tur prints that commit with the `--revision` flag that keeps it. Add the flag when a later run must load the same weights. For offline use, download into a directory with the Hugging Face CLI (`pip install -U huggingface_hub`) and run that directory:
+
+```sh
+hf download Qwen/Qwen3.5-0.8B --revision 2fc06364715b967f1860aea9cf38778875588b17 --local-dir ~/models/qwen3.5-0.8b
+tur run ~/models/qwen3.5-0.8b
+```
+
+Older versions of `huggingface_hub` call the command `huggingface-cli download`.
+
 ## 6. Quantize
 
 `tur quantize` writes a prepacked copy of the model. It loads almost instantly, and with calibration its 4-bit weights lose about half as much quality as plain rounding on most text. Calibration needs text that resembles your traffic, roughly 16K tokens (about 60 KB of English), so mix the kinds of text you serve:
 
 ```sh
 cat my-docs/*.md my-code/*.rs > calib.txt
-tur quantize --model ~/models/qwen3.5-0.8b --revision "$TUR_REVISION" \
+tur quantize --model ~/models/qwen3.5-0.8b --revision 2fc06364715b967f1860aea9cf38778875588b17 \
   --output ~/models/qwen3.5-0.8b-q4k-gptq --calibration calib.txt \
   --report ~/models/qwen3.5-0.8b-q4k-gptq.json
 ```
@@ -121,7 +119,7 @@ Without calibration text, `--method rtn` uses plain rounding. You still get the 
 ## 7. Serve the quantized model
 
 ```sh
-tur serve --model ~/models/qwen3.5-0.8b-q4k-gptq --revision q4k-gptq-v1 --served-model-name qwen
+tur serve ~/models/qwen3.5-0.8b-q4k-gptq --served-model-name qwen
 ```
 
 Leave out `--weight-format`, because the artifact loads exactly as stored. The memory plan should now show about 425 MB of weights, a third of the default 8-bit load.

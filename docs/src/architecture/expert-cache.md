@@ -3,8 +3,7 @@
 Routed experts are most of a large MoE model, yet each token uses only a few of them. The expert cache keeps a bounded subset in memory and reads the rest from the SSD when a token routes to them, so a model that doesn't fit in the GPU's working set can still run. gpt-oss-20b holds 9.5 GiB of experts in 12.8 GiB of weights, and it generates on a 16 GB Mac with a 1 GiB cache:
 
 ```sh
-tur run --model openai/gpt-oss-20b --revision 6cee5e81ee83917806bbde320786a8fb61efebee \
-  --expert-cache-mb 2048 --prompt 'Hello'
+tur run gpt-oss 'Hello'    # brings --expert-cache-mb 2048
 ```
 
 The cache also serves Qwen3.5-family MoE checkpoints, from a [GGUF file](../guide/gguf.md) or a prepacked artifact written by `tur quantize`, because their banks are on disk as the kernels read them. A native MTP head reads its own expert bank through the same cache. Dense models and Gemma 4 reject the flag, and so do Qwen checkpoints converted at load time.

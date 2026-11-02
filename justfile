@@ -3,7 +3,7 @@
 set positional-arguments
 set shell := ["bash", "-cu"]
 
-# Pinned development checkpoint; override with TUR_MODEL / TUR_REVISION.
+# Pinned development checkpoint; these two variables are the recipes' own, not `tur`'s.
 model := env("TUR_MODEL", "Qwen/Qwen3.5-0.8B")
 revision := env("TUR_REVISION", "2fc06364715b967f1860aea9cf38778875588b17")
 
@@ -46,13 +46,13 @@ build:
 install *args:
     ./install.sh "$@"
 
-# One completion: `just run --prompt 'Hello' -n 64`.
+# One completion: `just run 'Hello' -n 64`; no prompt opens a chat.
 run *args:
-    cargo run --release --bin tur -- run --model {{model}} --revision {{revision}} "$@"
+    cargo run --release --bin tur -- run {{model}} --revision {{revision}} "$@"
 
 # HTTP server on 127.0.0.1:8080 unless --listen is given.
 serve *args:
-    cargo run --release --bin tur -- serve --model {{model}} --revision {{revision}} "$@"
+    cargo run --release --bin tur -- serve {{model}} --revision {{revision}} "$@"
 
 # One reading of a running server; `just top` watches it live.
 status *args:

@@ -23,12 +23,12 @@ thinking = false
 Then:
 
 ```sh
-tur run --prompt 'Write one sentence about the Moon.'
+tur run --prompt 'Write one sentence about the Moon.'    # the file picks the model
 tur serve
 
 tur serve --config ./deploy/mac.toml       # use a different file
 tur serve --config ./deploy/mac.toml --listen 127.0.0.1:9000
-tur run --no-config --model ./models/qwen --revision local-v1 --prompt 'Hello'
+tur run --no-config ./models/qwen 'Hello'
 ```
 
 `--config` and `--no-config` can go before or after the command, but not together. Tur looks only for `./tur.toml`, never in parent or home directories, and runs fine without it. A file you name with `--config` must exist. Unreadable files, malformed TOML, unknown sections or keys and wrong types are errors, so a typo can't silently drop a setting. Tur reads the file once at startup, so restart to apply changes.
@@ -38,13 +38,13 @@ tur run --no-config --model ./models/qwen --revision local-v1 --prompt 'Hello'
 For each setting, the first value found wins:
 
 1. An explicit CLI argument.
-2. `TUR_MODEL` or `TUR_REVISION`, for the model source and revision.
-3. The TOML file.
+2. The TOML file.
+3. What a model name from `tur list` brings.
 4. Tur's default, or the checkpoint's.
 
-Every key is optional, but the model source and revision must come from one of the first three. Zero and false count as values: `--prefix-snapshots 0` turns off prefix reuse that the file enabled, and `--mtp false` turns off MTP that the file enabled. Plain `--mtp` turns it on.
+Every key is optional, and `tur run qwen` needs no file. A model on the command line replaces the file's `source` and `revision` together. `source` also accepts a name from `tur list`. Without `revision`, a name uses its commit, a repository its latest commit and a directory its own name. Zero and false count as values: `--prefix-snapshots 0` turns off prefix reuse that the file enabled, and `--mtp false` turns off MTP that the file enabled. Plain `--mtp` turns it on.
 
-Local model paths in the file are relative to the file's directory. Start a relative path with `./` or `../` to mark it as local; an existing directory is also recognized. Anything else, such as `Qwen/Qwen3.5-0.8B`, names a Hugging Face repository. Paths given on the command line or in the environment are relative to the working directory. TOML strings don't expand `~` or environment variables, so use a plain absolute or relative path.
+Local model paths in the file are relative to the file's directory. Start a relative path with `./` or `../` to mark it as local; an existing directory is also recognized. `qwen` and the other names from `tur list` come first, and `organization/name` names a Hugging Face repository. Paths given on the command line are relative to the working directory. TOML strings don't expand `~` or environment variables, so use a plain absolute or relative path.
 
 The development recipes `just run` and `just serve` pass the pinned checkpoint as arguments, which override the file's model. Use the `tur` binary directly when you want the file to choose the model.
 
@@ -61,7 +61,7 @@ Defaults that depend on other settings are worked out after merging. If you leav
 | `[whisper]` | Speech-to-text checkpoint for `serve` and `transcribe`: source, revision, weight format |
 | CLI only | Command, config selection, prompt, tools file, CPU reference mode, quantization jobs |
 | HTTP request | Sampling, output limit, seed, thinking, tools, grammar, cache salt and other per-request controls |
-| Environment | `RUST_LOG`, Hugging Face cache and token (`HF_HOME`, `HF_TOKEN`), optional `TUR_MODEL` and `TUR_REVISION` |
+| Environment | `RUST_LOG`, Hugging Face cache and token (`HF_HOME`, `HF_TOKEN`), optional `TUR_GGUF` and `TUR_GGUF_REVISION` |
 
 `[generation]` applies only to `run`. The server takes generation settings from each HTTP request and falls back to the checkpoint's defaults. `quantize` takes only explicit arguments and rejects `--config`, so a server's file can never pick a quantization source or output by accident.
 
@@ -71,8 +71,8 @@ File keys are the CLI flags in snake_case. See [Command line](cli.md) for values
 
 | Section | Keys | CLI flag |
 | --- | --- | --- |
-| `model` | `source` | `--model` / `TUR_MODEL` |
-| `model` | `revision` | `--revision` / `TUR_REVISION` |
+| `model` | `source` | The model argument |
+| `model` | `revision` | `--revision` |
 | `model` | `weight_format`, `gguf`, `gguf_revision`, `kv_format`, `kv_page_tokens`, `recurrent_state`, `audio_encoder`, `expert_cache_mb` | Same name with hyphens |
 | `engine` | `prefill_chunk_size`, `context_tokens`, `state_memory_mb`, `speculative_draft`, `mtp`, `draft_model`, `draft_revision` | Same name with hyphens |
 | `server` | `listen`, `served_model_name`, `max_batch_size`, `max_batch_tokens`, `max_waiting`, `request_timeout_secs`, `prefix_snapshots`, `transcription_model_name`, `max_waiting_transcriptions`, `shutdown_timeout_secs` | Same name with hyphens |

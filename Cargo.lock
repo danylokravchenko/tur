@@ -4780,7 +4780,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tur"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-stream",
  "axum",
@@ -4808,7 +4808,7 @@ dependencies = [
 
 [[package]]
 name = "tur-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "candle-core",
  "clap",
@@ -4828,7 +4828,7 @@ dependencies = [
 
 [[package]]
 name = "tur-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "candle-core",
  "serde_json",
@@ -4839,7 +4839,7 @@ dependencies = [
 
 [[package]]
 name = "tur-engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "candle-core",
  "llguidance",
@@ -4855,7 +4855,7 @@ dependencies = [
 
 [[package]]
 name = "tur-metal"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -4868,7 +4868,7 @@ dependencies = [
 
 [[package]]
 name = "tur-models"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "candle-core",
  "candle-nn",

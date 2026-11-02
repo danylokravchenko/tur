@@ -3,16 +3,14 @@
 Tur loads GGUF files directly, so you can run the quant you already like from Hugging Face, whatever its size or mix of formats. The file's tensors go to the GPU as stored, with nothing converted, and memory use stays close to the file's size. You choose the file, so you also choose the quality: Tur doesn't check it.
 
 ```sh
-tur run \
-  --model Qwen/Qwen3.5-0.8B --revision 2fc06364715b967f1860aea9cf38778875588b17 \
+tur run qwen 'What is the capital of France?' \
   --gguf unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_M.gguf \
-  --gguf-revision 6ab461498e2023f6e3c1baea90a8f0fe38ab64d0 \
-  --prompt 'What is the capital of France?'
+  --gguf-revision 6ab461498e2023f6e3c1baea90a8f0fe38ab64d0
 ```
 
-`--gguf` takes a local path or `organization/repository/file.gguf`. A remote file needs `--gguf-revision`, a 40-character commit, for the same reason `--revision` does: branches can move. Give the first shard of a split file (`-00001-of-00003.gguf`) and Tur finds the others.
+`--gguf` takes a local path or `organization/repository/file.gguf`. A remote file loads at `--gguf-revision`, a 40-character commit, because branches can move. Without the flag, Tur uses the repository's latest commit and prints it. Give the first shard of a split file (`-00001-of-00003.gguf`) and Tur finds the others.
 
-`--model` still names the original checkpoint, because the config, tokenizer and chat template come from there. Tur downloads only those files, not its weights. A local directory holding just `config.json`, `tokenizer.json`, `tokenizer_config.json` and the template works too. `--weight-format` is an error with `--gguf`.
+The model argument still names the original checkpoint, because the config, tokenizer and chat template come from there. Tur downloads only those files, not its weights. A local directory holding just `config.json`, `tokenizer.json`, `tokenizer_config.json` and the template works too. `--weight-format` is an error with `--gguf`.
 
 Before reading any weights, Tur checks the file's architecture and every tensor's name, shape and format against the config, so a file for the wrong model fails at once.
 

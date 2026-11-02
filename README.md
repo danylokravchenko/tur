@@ -74,19 +74,22 @@ curl -fsSL https://github.com/danylokravchenko/tur/releases/latest/download/inst
 
 To build from source instead, or to see the installer's options, read [Requirements and checkpoints](docs/src/guide/getting-started.md).
 
-Generate some text. The first run downloads the model into your Hugging Face cache, and pinning the revision means every run loads the same weights:
+Chat with a model. The first run downloads it:
 
 ```sh
-export TUR_MODEL=Qwen/Qwen3.5-0.8B
-export TUR_REVISION=2fc06364715b967f1860aea9cf38778875588b17
+tur run qwen
+```
 
-tur run --prompt 'Write one sentence about the Moon.' --temperature 0 -n 64 --thinking false
+Pass a prompt for one answer, which also works in scripts:
+
+```sh
+tur run qwen 'Write one sentence about the Moon.'
 ```
 
 Serve it as an API:
 
 ```sh
-tur serve --served-model-name qwen
+tur serve qwen
 ```
 
 Any OpenAI client then works with the base URL `http://127.0.0.1:8080/v1` and the model `qwen`:
@@ -94,15 +97,16 @@ Any OpenAI client then works with the base URL `http://127.0.0.1:8080/v1` and th
 ```sh
 curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen","messages":[{"role":"user","content":"Say hi"}],"max_tokens":32,"thinking":false}'
+  -d '{"model":"qwen","messages":[{"role":"user","content":"Say hi"}]}'
 ```
 
-Serve a model your Mac can't hold by giving its experts a cache:
+Serve a model your Mac can't hold. `gpt-oss` keeps its experts on the SSD and reads them into a 2 GiB cache:
 
 ```sh
-tur serve --model openai/gpt-oss-20b --revision 6cee5e81ee83917806bbde320786a8fb61efebee \
-  --expert-cache-mb 2048 --served-model-name gpt-oss
+tur serve gpt-oss
 ```
+
+`tur list` shows every name. Each one is pinned to an exact commit, so it loads the same weights every time. Tur also takes a Hugging Face repository (`tur run openai/gpt-oss-20b`) or a checkpoint directory (`tur run ./my-model`).
 
 ## Documentation
 

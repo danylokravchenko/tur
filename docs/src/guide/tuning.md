@@ -123,7 +123,7 @@ K/V memory grows with context while recurrent state doesn't, so long contexts ar
 
 ```sh
 tur quantize --model ~/models/m --revision m1 --output ~/models/m-q4k --calibration calib.txt
-tur serve --model ~/models/m-q4k --revision m1-q4k --kv-format q8 --recurrent-state f16 --max-batch-size 2
+tur serve ~/models/m-q4k --kv-format q8 --recurrent-state f16 --max-batch-size 2
 ```
 
 This shrinks every part of the plan. F16 recurrent state costs some accuracy on long outputs and disables speculation, so [check quality on your own text](choosing-quantization.md#check-quality-on-your-own-text) first.

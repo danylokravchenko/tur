@@ -344,6 +344,10 @@ fn hub_repository(id: &str, revision: &str) -> Result<HFRepositorySync<RepoTypeM
             "remote --revision must be an immutable 40-character commit",
         ));
     }
+    hub_model(id)
+}
+
+fn hub_model(id: &str) -> Result<HFRepositorySync<RepoTypeModel>> {
     let (Some((owner, name)), 2) = (id.split_once('/'), id.split('/').count()) else {
         return Err(hub_error(
             "use a fully qualified Hugging Face repository (organization/model)",
@@ -355,6 +359,36 @@ fn hub_repository(id: &str, revision: &str) -> Result<HFRepositorySync<RepoTypeM
         ));
     }
     Ok(HFClientSync::new().map_err(hub_error)?.model(owner, name))
+}
+
+/// The commit a repository's default branch points at now, to pin for a load.
+pub fn latest_revision(id: &str) -> Result<String> {
+    hub_model(id)?
+        .info()
+        .send()
+        .map_err(hub_error)?
+        .sha
+        .ok_or_else(|| hub_error(format!("{id} reported no commit")))
+}
+
+/// Whether the Hugging Face cache already holds every weight file of `id` at `revision`.
+#[must_use]
+pub fn is_downloaded(id: &str, revision: &str) -> bool {
+    let snapshot = hf_hub::resolve_cache_dir()
+        .join(format!("models--{}", id.replace('/', "--")))
+        .join("snapshots")
+        .join(revision);
+    let Ok(index) = std::fs::read_to_string(snapshot.join("model.safetensors.index.json")) else {
+        return snapshot.join("model.safetensors").is_file();
+    };
+    serde_json::from_str::<serde_json::Value>(&index).is_ok_and(|index| {
+        index["weight_map"].as_object().is_some_and(|files| {
+            files
+                .values()
+                .filter_map(serde_json::Value::as_str)
+                .all(|file| snapshot.join(file).is_file())
+        })
+    })
 }
 
 /// The cached copy of `name`, or a download that reports its progress.
