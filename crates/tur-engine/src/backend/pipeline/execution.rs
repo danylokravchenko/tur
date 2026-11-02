@@ -14,7 +14,11 @@ impl InferencePipeline {
     /// Pack the selected chunks: each sequence's next unconsumed tokens, with logits at its
     /// last known token. A drafted decode appends its drafts and needs logits at every
     /// position, for verification. Returns the plan and its longest resulting context.
-    fn pack(&self, chunks: &[Chunk], drafts: &[Vec<u32>]) -> Result<(PackedExecution, usize)> {
+    pub(super) fn pack(
+        &self,
+        chunks: &[Chunk],
+        drafts: &[Vec<u32>],
+    ) -> Result<(PackedExecution, usize)> {
         let mut plan = PackedExecution {
             embeddings: Vec::new(),
             tokens: Vec::new(),
@@ -94,12 +98,23 @@ impl InferencePipeline {
         if chunks.is_empty() {
             return Ok(false);
         }
+        let grouping = Instant::now();
+        let (chunks, layered) = self.layer_prefill(chunks)?;
+        // Layer groups are device work: neither scheduling nor idle time.
+        let grouping = grouping.elapsed();
+        if chunks.is_empty() {
+            return Ok(false);
+        }
         let (drafts, sources, decodes) = self.draft(&chunks)?;
         let chunk_tokens = chunks.iter().map(|chunk| chunk.tokens).sum::<usize>();
         let (plan, context) = self.pack(&chunks, &drafts)?;
         let (tokens, sequences) = (plan.tokens.len(), plan.sequences.len());
         let started = Instant::now();
-        self.engine.submit(plan)?;
+        if layered {
+            self.engine.submit_layered()?;
+        } else {
+            self.engine.submit(plan)?;
+        }
         let submitted = Instant::now();
         self.in_flight = Some(InFlight {
             chunks,
@@ -107,18 +122,22 @@ impl InferencePipeline {
             sources,
             decodes,
             context,
+            layered,
             started,
             submitted,
             timing: PassTiming {
                 tokens,
                 sequences,
                 drafts: tokens - chunk_tokens,
-                schedule: started.saturating_duration_since(begin),
+                schedule: started
+                    .saturating_duration_since(begin)
+                    .saturating_sub(grouping),
                 encode: submitted.saturating_duration_since(started),
-                idle_before: self
-                    .engine
-                    .completed_at()
-                    .map(|at| started.saturating_duration_since(at)),
+                idle_before: self.engine.completed_at().map(|at| {
+                    started
+                        .saturating_duration_since(at)
+                        .saturating_sub(grouping)
+                }),
                 ..PassTiming::default()
             },
         });
@@ -154,7 +173,7 @@ impl InferencePipeline {
                 .map(|(_, per_draft)| per_draft.mul_add(-(drafts as f64), device))
                 .filter(|&seconds| seconds > 0.0),
         };
-        if let Some(seconds) = undrafted {
+        if let Some(seconds) = undrafted.filter(|_| !flight.layered) {
             self.scheduler.record(
                 timing.tokens - timing.drafts,
                 flight.context,

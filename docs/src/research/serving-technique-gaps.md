@@ -2,7 +2,7 @@
 
 Created: 2026-11-01. Status: research backlog; what remains here hasn't been built or measured in Tur.
 
-This page compares Tur with vLLM, llama.cpp, SGLang, oMLX, BaseRT and recent papers, and lists techniques Tur lacks. Tur's existing work (chunked prefill, prefix snapshots and their [hold across tool calls](../architecture/prefix-reuse.md#retention-and-eviction), device sampling, exact speculation, the expert cache) is left out, and so are table-based drafters, which were tried and [rejected](../design/rejected.md). Every number comes from its source, on that source's hardware and models, and doesn't predict Tur's results. The order is a judgment of value against effort.
+This page compares Tur with vLLM, llama.cpp, SGLang, oMLX, BaseRT and recent papers, and lists techniques Tur lacks. Tur's existing work (chunked prefill, prefix snapshots and their [hold across tool calls](../architecture/prefix-reuse.md#retention-and-eviction), device sampling, exact speculation, the expert cache and [layered prefill](../architecture/expert-cache.md#serving-several-requests)) is left out, and so are table-based drafters, which were tried and [rejected](../design/rejected.md). Every number comes from its source, on that source's hardware and models, and doesn't predict Tur's results. The order is a judgment of value against effort.
 
 ## Build first
 
@@ -19,12 +19,6 @@ If several clients share one Mac, three designs apply. [Niyama](https://arxiv.or
 ### Smaller passes under memory pressure
 
 Evicting snapshots and lowering `max_running` under pressure were rejected because neither returns memory to macOS (see [Rejected experiments](../design/rejected.md)). Scratch is the part that can shrink: Candle frees idle buffers at each sync, and gpt-oss-20b plans up to 1.28 GB of it, the same at one request or four. Shorter prefill chunks while spare memory is low might lower that peak, at the cost of the slower prefill measured in [Expert cache](../architecture/expert-cache.md). The worker only reads allocations after a pass, so measuring this first needs a reading of the peak within one.
-
-### Layered prefill for MoE models
-
-Chunked prefill sends every chunk through every layer, so each chunk reads the experts again. On gpt-oss-20b, chunking at 1,024 instead of 256 tokens cut a 2,037-token prompt from 32 s to 18 s (see [Expert cache](../architecture/expert-cache.md)). [Layered prefill](https://arxiv.org/abs/2510.08055) splits the work by layers instead: each pass advances the whole prompt through one group of layers while decodes run through all of them, so each layer sees the prompt once. On H100s it reports up to 39% less expert-load traffic, with mean first-token time falling from 2.80 s to 1.23 s and mean token gaps from 32.9 ms to 21.5 ms.
-
-The paper doesn't size the buffers that hold activations between groups, and those would enter the memory plan. Tur would also need recurrent state at every snapshot boundary, since prefix reuse depends on it. Gains are largest on long prompts, and dense models have no expert reads to save.
 
 ### A shorter path from SSD to GPU
 

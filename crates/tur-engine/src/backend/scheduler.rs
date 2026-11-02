@@ -175,6 +175,8 @@ pub struct Scheduler {
     budget: usize,
     iteration: u64,
     tickets: u64,
+    /// Prefill beside decodes runs in layer groups, so a whole chunk no longer stalls them.
+    layered: bool,
 }
 
 impl Scheduler {
@@ -186,7 +188,13 @@ impl Scheduler {
             costs: CostModel::default(),
             iteration: 0,
             tickets: 0,
+            layered: false,
         })
+    }
+
+    /// Grant prefill a whole chunk beside decodes: the pipeline splits it by layers.
+    pub fn enable_layered_prefill(&mut self) {
+        self.layered = true;
     }
 
     pub fn config(&self) -> &SchedulerConfig {
@@ -365,7 +373,9 @@ impl Scheduler {
                 .unwrap_or(0);
             let mut budget = self.prefill_budget(used, context, cap);
             budget = budget.max(oldest.minimum.min(cap));
-            if now.saturating_duration_since(oldest.arrival) >= self.config.max_queue_wait {
+            if self.layered
+                || now.saturating_duration_since(oldest.arrival) >= self.config.max_queue_wait
+            {
                 budget = budget.max(self.config.max_chunk.min(cap));
             }
             let mut admitted = running;
@@ -472,6 +482,24 @@ mod tests {
             .iter()
             .map(|c| (c.id.as_u128(), c.tokens))
             .collect())
+    }
+
+    #[test]
+    fn test_layered_prefill_gets_a_whole_chunk_beside_decodes() -> Result<()> {
+        let start = Instant::now();
+        let candidates = [candidate(1, start, 1, true), candidate(2, start, 16, false)];
+        let mut plain = Scheduler::new(config())?;
+        // A slow measured pass holds an ordinary young prompt to the prefill minimum.
+        plain.record(1, 10, Duration::from_secs(1));
+        let mut layered = plain.clone();
+        layered.enable_layered_prefill();
+        for _ in 0..8 {
+            let chosen = run(plain.plan(&candidates, start, |_| Ok(true))?)?;
+            assert!(chosen[1].1 < 16, "{chosen:?}");
+        }
+        let chosen = run(layered.plan(&candidates, start, |_| Ok(true))?)?;
+        assert_eq!(chosen, [(1, 1), (2, 16)]);
+        Ok(())
     }
 
     #[test]

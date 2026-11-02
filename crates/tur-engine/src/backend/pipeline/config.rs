@@ -9,7 +9,10 @@ use super::super::{
     },
 };
 use super::{BatchStepOutput, InferencePipeline};
-use crate::{Result, hybrid::HybridEngine};
+use crate::{
+    Result,
+    hybrid::{HybridEngine, HybridModel},
+};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -110,7 +113,7 @@ impl InferencePipeline {
         config: PipelineConfig,
         budget: &DeviceBudget,
     ) -> Result<Self> {
-        let scheduler = Scheduler::new(config.scheduler)?;
+        let mut scheduler = Scheduler::new(config.scheduler)?;
         let config = config.resolve(factory.recurrent)?;
         let draft = config
             .speculation
@@ -189,6 +192,9 @@ impl InferencePipeline {
                 "loaded weights disagree with the pre-load memory plan",
             ));
         }
+        if model.pausable_layers().is_some() {
+            scheduler.enable_layered_prefill();
+        }
         let model = Arc::new(model);
         let mut engine = HybridEngine::new(Arc::clone(&model), factory.device.clone(), pool)?;
         engine.set_device_sampling(config.device_sampling);
@@ -212,6 +218,8 @@ impl InferencePipeline {
             }),
             awaiting: HashSet::new(),
             in_flight: None,
+            layered: None,
+            decode_next: false,
             staged: BatchStepOutput::default(),
             guidance: None,
             speculation: config.speculation,

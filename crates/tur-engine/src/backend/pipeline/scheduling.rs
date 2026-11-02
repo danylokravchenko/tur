@@ -209,6 +209,8 @@ impl InferencePipeline {
                 .pending
                 .iter()
                 .filter(|(id, _)| !self.awaiting.contains(*id))
+                // A paused chunk holds the pass's prefill work until it finishes.
+                .filter(|(_, p)| self.layered.is_none() || p.decoding())
                 .map(|(id, p)| p.candidate(*id, self.prefix.next_boundary(p.consumed)))
                 .collect();
             self.relieve_admission(&candidates)?;
@@ -236,6 +238,8 @@ impl InferencePipeline {
             match decision {
                 Decision::Run(chunks) => return Ok(chunks),
                 Decision::Preempt(_) | Decision::Stall(_) if self.prefix.evict() => {}
+                // Its pages come back without costing anyone their committed work.
+                Decision::Preempt(_) | Decision::Stall(_) if self.abort_layered() => {}
                 Decision::Preempt(id) => self.preempt(id)?,
                 Decision::Stall(id) => self.fail(
                     id,

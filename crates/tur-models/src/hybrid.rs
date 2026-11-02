@@ -45,6 +45,21 @@ pub struct SequenceStep {
     pub hidden: Option<Tensor>,
 }
 
+/// Activations of one sequence paused between layers of a pass.
+pub struct LayerCarry {
+    /// Residual stream and its normalized form, both F32 `[tokens, hidden]`.
+    pub x: Tensor,
+    pub h: Tensor,
+    /// The first layer still to run.
+    pub next: usize,
+}
+
+/// Where [`HybridModel::forward_layers`] left its sequence.
+pub enum LayerStep {
+    Paused(LayerCarry),
+    Done(SequenceStep),
+}
+
 /// One request's slice of a draft-head pass over committed positions `p`: the head pairs
 /// each position's final hidden state with the token that followed it, and predicts the
 /// token after that.
@@ -96,6 +111,23 @@ pub trait HybridModel: Send + Sync + 'static {
     /// each inner result is one sequence, in order, so one request's failure is isolated.
     /// Implementations should only enqueue device work; the engine fences before reading.
     fn forward(&self, batch: &PackedForward<'_>) -> Result<Vec<Result<SequenceStep>>>;
+
+    /// Layers of a pass that can pause between them ([`Self::forward_layers`]), if it can.
+    fn pausable_layers(&self) -> Option<usize> {
+        None
+    }
+
+    /// Encode one sequence's pass from `carry` (or its first layer) up to layer `end`, the
+    /// same computation as [`Self::forward`] whatever the pauses. Reaching the last layer
+    /// returns the sequence's outputs.
+    fn forward_layers(
+        &self,
+        _batch: &PackedForward<'_>,
+        _carry: Option<LayerCarry>,
+        _end: usize,
+    ) -> Result<LayerStep> {
+        Err(invalid("model cannot pause between layers"))
+    }
 
     /// Encode a draft-head pass (native multi-token prediction): per sequence, the F32
     /// `[n, vocab]` logits of up to [`DraftSequence::drafts`] chained drafts after its last

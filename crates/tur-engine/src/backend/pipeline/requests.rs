@@ -615,6 +615,7 @@ impl InferencePipeline {
             .get(&id)
             .ok_or_else(|| TurError::RequestNotFound(id.to_string()))?;
         self.engine.cancel(pending.handle)?;
+        self.layered.take_if(|layered| layered.id() == id);
         self.pending.remove(&id);
         Ok(())
     }
