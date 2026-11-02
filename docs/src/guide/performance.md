@@ -194,6 +194,21 @@ Bursts of N requests with 128-token prompts and 64 output tokens, in output toke
 
 Tur decodes 1.1 to 1.4× faster with one sequence and up to 1.55× faster with 8 to 16, and finishes bursts of 8 to 16 requests 1.2× faster end to end. Prefill is level at 2K tokens; at 8K, llama.cpp is 6 to 11% faster.
 
+#### On the same GGUF files
+
+Both engines loading the same file, on the same M1 with F16 K/V: `Q3_K_M` (Q3_K, Q4_K, Q5_K, Q6_K and Q8_0) and `UD-Q2_K_XL` (which adds Q2_K and IQ2, IQ3 and IQ4 blocks). Both files hold identical weights in each engine, so these rows compare engines alone. llama.cpp 0.7.0 is the mean of three repeats, with standard deviations of at most 3.4 tokens/s; Tur's decode is the median of timed steps and its prefill the median of 2 to 4 passes.
+
+| GGUF test | Tur Q3_K_M | llama.cpp Q3_K_M | Tur UD-Q2_K_XL | llama.cpp UD-Q2_K_XL |
+| --- | --- | --- | --- | --- |
+| Decode, 1 sequence, 128 tokens | 68 | 65.7 | 69 | 69.0 |
+| Decode, 1 sequence, 2K | 66 | 62.5 | 67 | 66.1 |
+| Decode, 4 sequences | 165 | 135 | 171 | 134 |
+| Decode, 8 sequences | 286 | 200 | 296 | 204 |
+| Prefill 512 | 1,247 | 1,237 | 1,287 | 1,263 |
+| Prefill 2K | 1,184 | 1,208 | 1,228 | 1,233 |
+
+With several sequences Tur decodes 1.2 to 1.3× faster at 4 and about 1.4× at 8 on both files. With one, it is 4 to 6% ahead on `Q3_K_M` and level to 1% ahead on `UD-Q2_K_XL`. Prefill is within 2% either way, and llama.cpp's only lead is `Q3_K_M` at 2K tokens. Tur's figures are the mean of two runs. Both files load in about a second, against 9 s for converting SafeTensors to Q4K.
+
 ```sh
 llama-bench -m <gguf> -p 2048,8192 -n 0 -r 3
 llama-bench -m <gguf> -p 0 -n 64 -d 128,2048,8192 -r 3

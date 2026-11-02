@@ -3,17 +3,18 @@
 Routed experts are most of a large MoE model, yet each token uses only a few of them. The expert cache keeps a bounded subset in memory and reads the rest from the SSD when a token routes to them, so a model that doesn't fit in the GPU's working set can still run. gpt-oss-20b holds 9.5 GiB of experts in 12.8 GiB of weights, and it generates on a 16 GB Mac with a 1 GiB cache:
 
 ```sh
-tur run --model openai/gpt-oss-20b --revision 6cee5e81ee83917806bbde320786a8fb61efebee \
-  --expert-cache-mb 2048 --prompt 'Hello'
+tur run gpt-oss 'Hello'    # brings --expert-cache-mb 2048
 ```
 
-The cache also serves Qwen3.5-family MoE checkpoints, from a prepacked artifact: the banks have to be on disk exactly as the kernels read them, so write one with `tur quantize` first. Its banks can be Q8_0 or Q4K, with one format per projection across layers. A native MTP head reads its own expert bank through the same cache. Dense models and Gemma 4 reject the flag, and so do Qwen checkpoints converted at load time.
+The cache also serves Qwen3.5-family MoE checkpoints, from a [GGUF file](../guide/gguf.md) or a prepacked artifact written by `tur quantize`, because their banks are on disk as the kernels read them. A native MTP head reads its own expert bank through the same cache. Dense models and Gemma 4 reject the flag, and so do Qwen checkpoints converted at load time.
 
 ## How it works
 
 The weights outside the routed experts stay resident. Experts live in one fixed arena of slots, and the kernels read them in place. After a layer's router runs, the host reads that layer's routes, loads any missing experts into slots, and rewrites only the expert number in the routes' tiles to a slot number. Biases and accumulation order keep using original expert IDs, so logits are bit-identical to keeping every expert resident.
 
 Reading the routes waits for all earlier GPU work, so no kernel can be using a slot while it is overwritten, and copies complete before the layer's kernels are encoded. A failed read fails that pass and leaves the slot without an owner, and a later pass reads it again.
+
+A GGUF file needs two more things. It stores each bank's gate and up rows in separate tensors, sometimes in separate shards, so a miss reads both into one slot. It also often mixes formats across layers: a typical Q4_K_M file has 37 layers with Q4_K and Q5_K banks and 3 with Q4_K and Q6_K. A kernel reads one format at one stride, so each distinct pair of formats gets its own arena, and an expert is only evicted by another expert of its pair.
 
 Reading ahead overlaps the SSD with the GPU. When a layer routes, the next layer's router also scores the same hidden state, and the experts it ranks highest are read in the background while the GPU works and while the routed layer's own reads and copies finish. Those reads only fill staging buffers and never touch a slot, so they can't race a kernel. Four in five turn out to be used.
 
@@ -25,7 +26,7 @@ SSD wear comes from writes, and the cache makes none. Checkpoint files open read
 
 ## Choosing a size
 
-The cache must hold every expert of one layer, which is 423 MiB on gpt-oss-20b, because one pass can route to all of them. Beyond that, more memory means fewer reads. Generating 160 tokens from a 91-token prompt on an M1 with 16 GB:
+The cache must hold every expert of one layer, which is 423 MiB on gpt-oss-20b, because one pass can route to all of them. A file that mixes formats needs that much for each pair of formats. The rest of the budget goes to layers evenly, so layers in a rare format don't get a worse hit rate than the others. Beyond that, more memory means fewer reads. Generating 160 tokens from a 91-token prompt on an M1 with 16 GB:
 
 | Cache | Hit rate | Tokens/s |
 | --- | ---: | ---: |
@@ -76,6 +77,7 @@ Measured on gpt-oss-20b on an M1 with 16 GB:
 - Eviction stays as it is. Replaying a real trace reproduced the live hit rates, and LFU and LRU-2 gained at most two points. Only foreknowledge does better (55% at 81 slots, 89% at 324), which is why reading ahead pays off.
 - The MXFP4 kernels stay on a lookup table. It is as fast as Q8_0 at the bank's shape, and an arithmetic decode is 1.3 to 2.1× slower. A GPU round trip costs about 0.2 ms, so the wait at each of 24 layers isn't worth removing.
 - A Qwen artifact through the cache gives bit-identical logits to keeping its banks resident, in Q8_0 and Q4K under eviction. This is checked on a small fixture. The real Qwen3.6-35B-A3B Q4K artifact has also run through a 4 GiB cache, serving 16 requests at once where keeping every expert resident runs out of GPU memory on a 36 GB Mac (see [Measured performance](../guide/performance.md#qwen36-35b-a3b)); its logits haven't been compared with the resident run.
+- A GGUF file gets one arena per pair of bank formats rather than repacking to one format, because that keeps logits bit-identical to keeping the experts resident, which a small fixture with formats mixed across layers and gate and up rows in separate shards confirms. Of 24 unsloth Qwen3.6-35B-A3B files, 22 mix formats across layers, and in all 24 gate and up share a format in every layer, so the cache rejects a bank where they differ rather than packing it again on every read.
 - Serving four concurrent requests on a 5.9 GiB plan swapped out 251 MiB over a run of several minutes, where single requests swapped nothing. The spare-memory check sees the machine at load time only, so keep `--max-batch-size` small on a tight machine. That flag sets the state pool at startup, where it stays resident: with a 1 GiB cache, four requests instead of one add 740 MiB to the pool and nothing to planned scratch.
 - Below one token's experts (96 on gpt-oss-20b), eviction takes the expert needed furthest ahead, since passes visit layers in order. At or above it, eviction is LRU, which keeps what routing repeats.
 - The arena sits outside Candle's buffer pool, which rounds sizes up to a power of two.

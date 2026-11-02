@@ -24,7 +24,7 @@ use tur_core::{
 use crate::{
     Result, TurError,
     backend::chat_template::ChatTemplate,
-    models::{Manifest, ModelConfig, TextModel, is_artifact},
+    models::{GgufFile, Manifest, ModelConfig, TextModel, is_artifact, shard_name, split_name},
 };
 
 /// A local `SafeTensors` directory or a fully qualified Hugging Face repository.
@@ -52,6 +52,47 @@ pub struct ModelFactory {
     pub audio: bool,
     /// Device bytes of a bounded expert cache ([`LoadOptions::expert_cache`]).
     pub expert_cache: Option<usize>,
+    /// Load weights from this GGUF file instead; `source` then supplies only the config,
+    /// tokenizer and template.
+    pub gguf: Option<GgufSource>,
+}
+
+/// Where a GGUF file lives.
+#[derive(Debug, Clone)]
+pub enum GgufSource {
+    LocalPath(PathBuf),
+    /// `file` in a Hugging Face `repository` at an immutable commit.
+    HuggingFace {
+        repository: String,
+        file: String,
+        revision: String,
+    },
+}
+
+impl GgufSource {
+    /// Local path of the file, downloading it and any other shards of a split file.
+    fn resolve(&self) -> Result<PathBuf> {
+        let (repository, file, revision) = match self {
+            Self::LocalPath(path) => return Ok(path.clone()),
+            Self::HuggingFace {
+                repository,
+                file,
+                revision,
+            } => (repository, file, revision),
+        };
+        let repo = hub_repository(repository, revision)?;
+        let names = match split_name(file) {
+            Some((stem, count)) => (1..=count)
+                .map(|index| shard_name(stem, index, count))
+                .collect(),
+            None => vec![file.clone()],
+        };
+        let mut paths = names
+            .iter()
+            .map(|name| fetch(&repo, revision, name))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(paths.swap_remove(0))
+    }
 }
 
 fn hub_error(error: impl std::fmt::Display) -> TurError {
@@ -69,13 +110,18 @@ fn checkpoint_file(name: &str) -> Result<()> {
 impl ModelFactory {
     /// Resolve the source, rejecting unsupported architectures before downloading weights.
     pub fn resolve(&self) -> Result<PathBuf> {
-        resolve_checkpoint(&self.source, &self.revision)
+        resolve(
+            &self.source,
+            &self.revision,
+            |json| ModelConfig::from_json(json).map(drop),
+            &["tokenizer.json", "tokenizer_config.json"],
+            self.gguf.is_none(),
+        )
     }
 
     /// Load the text model and serving metadata. Missing or invalid templates are errors.
     /// `Q8_0/Q4K` explicitly convert `SafeTensors` matrices into packed resident weights;
-    /// a prepacked artifact is uploaded as stored. Legacy ordinary-attention GGUF
-    /// checkpoints are unsupported.
+    /// a prepacked artifact and a GGUF file are uploaded as stored.
     pub fn create_model(&self) -> Result<(TextModel, Tokenizer, ChatTemplate, GenerationDefaults)> {
         let (model, tokenizer, template, defaults, ()) =
             self.create_model_with(None, |_, _| Ok(()))?;
@@ -128,6 +174,16 @@ impl ModelFactory {
         }
         let template = ChatTemplate::from_model_dir(&dir)?;
         let weights = match (self.format, is_artifact(&dir)) {
+            (Some(_), _) if self.gguf.is_some() => {
+                return Err(TurError::Other(
+                    "a GGUF file loads as stored; omit the weight format".into(),
+                ));
+            }
+            _ if self.gguf.is_some() => {
+                let path = self.gguf.as_ref().map(GgufSource::resolve).transpose()?;
+                let path = path.ok_or_else(|| TurError::Other("no GGUF file".into()))?;
+                Weights::Gguf(Arc::new(GgufFile::open(&path)?))
+            }
             (None, true) => Weights::Prepacked(Arc::new(Manifest::read(&dir)?)),
             (None, false) => WeightFormat::Q8_0.into(),
             (Some(_), true) => {
@@ -150,7 +206,8 @@ impl ModelFactory {
             kv: self.kv,
             recurrent: self.recurrent,
             mtp: draft,
-            audio: self.audio,
+            // A GGUF text file has no audio encoder; llama.cpp keeps it in a separate one.
+            audio: self.audio && self.gguf.is_none(),
             expert_cache: self.expert_cache,
         };
         let config = if options.mtp.is_some() {
@@ -172,6 +229,7 @@ pub fn resolve_checkpoint(source: &ModelSource, revision: &str) -> Result<PathBu
         revision,
         |json| ModelConfig::from_json(json).map(drop),
         &["tokenizer.json", "tokenizer_config.json"],
+        true,
     )
 }
 
@@ -191,6 +249,7 @@ pub fn resolve_drafter(source: &ModelSource, revision: &str) -> Result<PathBuf> 
             }
         },
         &[],
+        true,
     )
 }
 
@@ -213,6 +272,7 @@ impl WhisperFactory {
             &self.revision,
             |json| crate::models::whisper::Config::from_json(json).map(drop),
             &["tokenizer.json", "generation_config.json"],
+            true,
         )
     }
 
@@ -235,12 +295,14 @@ impl WhisperFactory {
 }
 
 /// Snapshot directory of `source`: validate `config.json` with `validate` before any
-/// weight file downloads, and require the repository to report exactly `revision`.
+/// weight file downloads, and require the repository to report exactly `revision`. Without
+/// `weights`, only the serving metadata downloads.
 fn resolve(
     source: &ModelSource,
     revision: &str,
     validate: impl Fn(&str) -> Result<()>,
     required: &[&str],
+    weights: bool,
 ) -> Result<PathBuf> {
     if revision.trim().is_empty() {
         return Err(hub_error("checkpoint revision must not be empty"));
@@ -249,22 +311,7 @@ fn resolve(
         ModelSource::LocalPath(path) => return Ok(path.clone()),
         ModelSource::HuggingFace(id) => id,
     };
-    if revision.len() != 40 || !revision.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err(hub_error(
-            "remote --revision must be an immutable 40-character commit",
-        ));
-    }
-    let (Some((owner, name)), 2) = (id.split_once('/'), id.split('/').count()) else {
-        return Err(hub_error(
-            "use a fully qualified Hugging Face repository (organization/model)",
-        ));
-    };
-    if owner.is_empty() || name.is_empty() {
-        return Err(hub_error(
-            "use a fully qualified Hugging Face repository (organization/model)",
-        ));
-    }
-    let repo = HFClientSync::new().map_err(hub_error)?.model(owner, name);
+    let repo = hub_repository(id, revision)?;
     let fetch = |name: &str| fetch(&repo, revision, name);
     let config_path = fetch("config.json")?;
     validate(&std::fs::read_to_string(&config_path)?)?;
@@ -279,7 +326,7 @@ fn resolve(
     }
     for file in info.siblings.iter().flatten() {
         let name = file.rfilename.as_str();
-        if serving_file(name) {
+        if serving_file(name) && (weights || !weight_file(name)) {
             checkpoint_file(name)?;
             fetch(name)?;
         }
@@ -288,6 +335,60 @@ fn resolve(
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| hub_error("checkpoint has no directory"))
+}
+
+/// A repository handle, once `id` is fully qualified and `revision` an immutable commit.
+fn hub_repository(id: &str, revision: &str) -> Result<HFRepositorySync<RepoTypeModel>> {
+    if revision.len() != 40 || !revision.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(hub_error(
+            "remote --revision must be an immutable 40-character commit",
+        ));
+    }
+    hub_model(id)
+}
+
+fn hub_model(id: &str) -> Result<HFRepositorySync<RepoTypeModel>> {
+    let (Some((owner, name)), 2) = (id.split_once('/'), id.split('/').count()) else {
+        return Err(hub_error(
+            "use a fully qualified Hugging Face repository (organization/model)",
+        ));
+    };
+    if owner.is_empty() || name.is_empty() {
+        return Err(hub_error(
+            "use a fully qualified Hugging Face repository (organization/model)",
+        ));
+    }
+    Ok(HFClientSync::new().map_err(hub_error)?.model(owner, name))
+}
+
+/// The commit a repository's default branch points at now, to pin for a load.
+pub fn latest_revision(id: &str) -> Result<String> {
+    hub_model(id)?
+        .info()
+        .send()
+        .map_err(hub_error)?
+        .sha
+        .ok_or_else(|| hub_error(format!("{id} reported no commit")))
+}
+
+/// Whether the Hugging Face cache already holds every weight file of `id` at `revision`.
+#[must_use]
+pub fn is_downloaded(id: &str, revision: &str) -> bool {
+    let snapshot = hf_hub::resolve_cache_dir()
+        .join(format!("models--{}", id.replace('/', "--")))
+        .join("snapshots")
+        .join(revision);
+    let Ok(index) = std::fs::read_to_string(snapshot.join("model.safetensors.index.json")) else {
+        return snapshot.join("model.safetensors").is_file();
+    };
+    serde_json::from_str::<serde_json::Value>(&index).is_ok_and(|index| {
+        index["weight_map"].as_object().is_some_and(|files| {
+            files
+                .values()
+                .filter_map(serde_json::Value::as_str)
+                .all(|file| snapshot.join(file).is_file())
+        })
+    })
 }
 
 /// The cached copy of `name`, or a download that reports its progress.
@@ -348,6 +449,10 @@ impl ProgressHandler for Download {
 
 /// Files a load needs from a repository. Repositories may keep other copies of the weights
 /// in subdirectories (gpt-oss has `original/` and `metal/`), which are never downloaded.
+fn weight_file(name: &str) -> bool {
+    name.ends_with(".safetensors") || name == "model.safetensors.index.json"
+}
+
 fn serving_file(name: &str) -> bool {
     !name.contains('/')
         && (name.ends_with(".safetensors")
@@ -403,6 +508,7 @@ mod tests {
             recurrent: crate::models::DEFAULT_RECURRENT_STATE,
             audio: false,
             expert_cache: None,
+            gguf: None,
         };
         let error = factory
             .resolve()

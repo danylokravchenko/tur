@@ -7,7 +7,7 @@ You can pack a SafeTensors checkpoint in two ways:
 - At load time, with `--weight-format f32|q8_0|q4k` on `run` or `serve` (the default is `q8_0`). This uses plain rounding and repeats the work on every start.
 - Offline, with `tur quantize`, which writes a prepacked artifact. It can calibrate the rounding on your text, give sensitive projections more bits, and it loads as stored in a fraction of a second.
 
-These are not GGUF files, and `q4k` means Q4_K blocks for every projection, not llama.cpp's Q4_K_M mix.
+These are not GGUF files, and `q4k` means Q4_K blocks for every projection, not llama.cpp's Q4_K_M mix. To run a GGUF file you already have, see [GGUF files](gguf.md).
 
 Calibration (`imatrix`, `gptq` and `--budget-bits`) is available for the Qwen family. Gemma 4 artifacts use plain rounding: `tur quantize --method rtn --weight-format q8_0`. An E2B Q8_0 artifact loads in about 5 s, against about 12 s for converting at load time.
 
@@ -24,7 +24,7 @@ tur quantize \
 Then load it without `--weight-format`, which is an error with an artifact:
 
 ```sh
-tur serve --model /models/qwen3.5-0.8b-q4k-gptq --revision q4k-gptq-v1
+tur serve /models/qwen3.5-0.8b-q4k-gptq
 ```
 
 The artifact is one `tur-weights.safetensors` file next to copies of the source's config, tokenizer, template and generation defaults. Its header holds a manifest with the format version, the source checkpoint's identity and a fingerprint of its `config.json`, the quantizer settings, a fingerprint of the calibration data, and the format chosen for each projection. Tur checks all of it before reading any weights, so an artifact can't be loaded against the wrong config. The file is written under a temporary name and renamed when complete, so a failed run never leaves a half-written artifact.
@@ -65,7 +65,7 @@ Measured on Qwen3.5-0.8B on an M1:
 - Mixed precision is opt-in. At 5.5 bits per weight it cuts KL by another third to half, but costs 23% more memory and 14% of single-sequence decode speed.
 - Tied checkpoints read embeddings from the packed output layer (`--embedding head`, the artifact default). That drops the separate embedding table at unchanged quality: a Q4K artifact of the 0.8B holds 425 MB of weights instead of 933 MB.
 - Prepacked artifacts load directly, byte-identical to load-time conversion. The 0.8B Q4K artifact loads in 0.2 s instead of 9 s, with half the peak memory.
-- Projections are F32, Q8_0 or Q4K only. Candle's Q5K and Q6K kernels at 2 to 16 rows are 2.5 to 3.5× slower than Tur's Q8_0 and Q4K kernels, so those formats are offered only for embedding tables.
+- Tur's own quantizer packs projections as F32, Q8_0 or Q4K only. Candle's Q5K and Q6K kernels at 2 to 16 rows are 2.5 to 3.5× slower than Tur's Q8_0 and Q4K kernels, so those formats are offered only for embedding tables. GGUF files can hold any of them.
 - AWQ-style rescaling and DWQ are not implemented.
 - Artifacts are written in one pass, into a reserved header and payload in the final file, so a conversion costs its size in SSD writes rather than twice that.
 - Artifacts of expert checkpoints that declare an MTP head include its bank, as they do for dense checkpoints, which adds about one layer of experts. That is about 0.4 GiB on Qwen3.6-35B at Q4K.

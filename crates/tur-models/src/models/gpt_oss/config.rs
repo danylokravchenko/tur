@@ -294,7 +294,7 @@ impl Config {
     ) -> Result<tur_metal::experts::ExpertSources> {
         use tur_metal::experts::{BankSource, ExpertSources};
         let (experts, gate_up, down) = self.bank_shapes();
-        let bank = |layer: usize, name: &str| -> Result<BankSource> {
+        let bank = |layer: usize, name: &str, shape| -> Result<BankSource> {
             let e = format!("model.layers.{layer}.mlp.experts.{name}");
             let (file, blocks) = checkpoint.location(&format!("{e}_blocks"))?;
             let (scales_file, scales) = checkpoint.location(&format!("{e}_scales"))?;
@@ -302,18 +302,20 @@ impl Config {
                 return Err(invalid(format!("{e} spans checkpoint files")));
             }
             Ok(BankSource {
-                file: file.to_path_buf(),
-                blocks,
-                scales,
+                shape,
+                parts: vec![(file.to_path_buf(), blocks), (file.to_path_buf(), scales)],
             })
         };
         Ok(ExpertSources {
             experts,
             top_k: self.text.num_experts_per_tok,
-            gate_up,
-            down,
             layers: (0..self.layers())
-                .map(|i| Ok([bank(i, "gate_up_proj")?, bank(i, "down_proj")?]))
+                .map(|i| {
+                    Ok([
+                        bank(i, "gate_up_proj", gate_up)?,
+                        bank(i, "down_proj", down)?,
+                    ])
+                })
                 .collect::<Result<_>>()?,
         })
     }

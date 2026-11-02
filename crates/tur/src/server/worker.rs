@@ -193,7 +193,14 @@ fn model_report(factory: &ModelFactory, pipeline: &InferencePipeline) -> ModelRe
         },
         revision: factory.revision.clone(),
         weight_format: factory.format.map_or_else(
-            || "as stored".into(),
+            || {
+                if factory.gguf.is_some() {
+                    "gguf"
+                } else {
+                    "as stored"
+                }
+                .into()
+            },
             |format| format!("{format:?}").to_lowercase(),
         ),
         kv: format!("{}/{}", factory.kv.format, factory.kv.page_tokens),
@@ -723,6 +730,7 @@ mod tests {
                 recurrent: DEFAULT_RECURRENT_STATE,
                 audio: false,
                 expert_cache: None,
+                gguf: None,
             },
             pipeline: PipelineConfig::new(1, 64),
             budget: DeviceBudget::new(None),

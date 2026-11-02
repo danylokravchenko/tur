@@ -38,7 +38,8 @@ pub(crate) struct Args {
     #[command(flatten)]
     #[serde(skip)]
     whisper: WhisperArgs,
-    /// Model ID accepted by /v1/chat/completions and listed by /v1/models (default: qwen-hybrid).
+    /// Model ID accepted by /v1/chat/completions and listed by /v1/models. Default: MODEL's
+    /// last part, so `tur serve qwen` serves `qwen`.
     #[arg(long)]
     served_model_name: Option<String>,
     /// Model ID of `--whisper` at /v1/audio/transcriptions and /v1/models (default:
@@ -101,10 +102,13 @@ impl Args {
     );
 
     pub(crate) fn configure(&mut self, settings: crate::config::FileSettings) {
-        self.model.inherit(settings.model);
+        let entry = self.model.select(settings.model);
         self.pipeline.inherit(settings.engine);
         self.whisper.inherit(settings.whisper);
         self.inherit(settings.server);
+        self.max_batch_size = self
+            .max_batch_size
+            .or(entry.and_then(|entry| entry.max_batch_size));
     }
 
     /// Where the listener binds.
@@ -157,7 +161,8 @@ pub(crate) async fn serve(mut args: Args, console: Console) -> Result<()> {
     let pipeline = args.pipeline_config()?;
     let default_model = args
         .served_model_name
-        .unwrap_or_else(|| "qwen-hybrid".into());
+        .or_else(|| args.model.served_name())
+        .unwrap_or_else(|| "tur".into());
     if default_model.trim().is_empty() {
         return Err(TurError::Other(
             "served model name must not be empty".into(),

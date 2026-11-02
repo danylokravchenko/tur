@@ -10,6 +10,7 @@ mod runtime;
 pub use moe::{ExpertRoutes, SharedExpert};
 
 use crate::{
+    blocks::BlockFormat,
     packed::PackedLinear,
     pool::{AttentionPool, KvPool},
     sampling::{MAX_ROUNDS, PenaltyEntry, PenaltyParams, SampleParams},
@@ -229,6 +230,25 @@ fn qmm_columns(format: GgmlDType) -> usize {
         _ => 16,
     }
 }
+
+/// Every kernel with a block-format specialization.
+const BLOCK_KERNELS: [&str; 7] = [
+    "qmv_blocks_f32",
+    "qmm_blocks_wide_f32",
+    "qmm_blocks_t1_f32",
+    "qmm_blocks_t2_f32",
+    "moe_gemv_blocks",
+    "moe_gemm_blocks",
+    "moe_gemm_wide_blocks",
+];
+
+/// The block format of a Candle format.
+/// Rows at which the block kernels beat Candle's over a format Candle also reads; see
+/// `docs/src/architecture/kernels.md`.
+const BLOCK_CANDLE_ROWS: (usize, usize) = (2, 8);
+/// Staged F16 weights `[64, 32]` and F32 activations `[32, 32]`, reused for the
+/// `[32, 64]` F32 result.
+const WIDE_STAGE_BYTES: usize = 64 * 32 * 2 + 32 * 32 * 4;
 
 #[repr(C)]
 struct QmvParams {
@@ -1864,6 +1884,24 @@ impl Kernels {
         self.finish(out, (kv.tokens, heads * dim))
     }
 
+    /// Build the block-format pipelines `layer` needs now, so no request pays for them.
+    pub fn prepare(&self, layer: &PackedLinear) -> Result<()> {
+        if let Some(parts) = layer.stack() {
+            return parts.iter().try_for_each(|part| self.prepare(part));
+        }
+        let packed = layer.packed_buffer().and_then(|(_, format)| match format {
+            GgmlDType::Q8_0 | GgmlDType::Q4K => None,
+            format => BlockFormat::from_candle(format),
+        });
+        let format = packed.or(layer.block_buffer().map(|(_, format)| format));
+        if let Some(format) = format {
+            for name in BLOCK_KERNELS {
+                self.runtime.specialized(name, format)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Project `x` (`[rows, in]`) through `layer`. Packed `Q8_0/Q4K` weights with a row count
     /// in the tuned matrix range use the matrix-unit kernel, and in the GEMV range the
     /// small-batch GEMV; both read each weight once for all rows. Everything else uses
@@ -1884,8 +1922,185 @@ impl Kernels {
             Some((buffer, format @ GgmlDType::Q4K)) if range(self.tuning.gemv_q4k_rows) => {
                 self.gemv(layer, buffer, format, x)
             }
-            _ => layer.forward(x),
+            Some((_, GgmlDType::Q8_0 | GgmlDType::Q4K)) => layer.forward(x),
+            Some((buffer, format)) => {
+                // Candle's one-row Q2_K kernel loses to the block GEMV, unlike its others.
+                let block_gemv = rows == 1 && format == GgmlDType::Q2K;
+                if !block_gemv && !range(BLOCK_CANDLE_ROWS) {
+                    return layer.forward(x);
+                }
+                let format = BlockFormat::from_candle(format)
+                    .ok_or_else(|| invalid("no block kernels for this format"))?;
+                self.blocks(layer, buffer, format, x)
+            }
+            None => match (layer.stack(), layer.block_buffer()) {
+                (Some(parts), _) if rows > BLOCK_CANDLE_ROWS.1 => self.stack_wide(layer, parts, x),
+                (Some(parts), _) => {
+                    let outputs = parts
+                        .iter()
+                        .map(|part| self.linear(part, x))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Tensor::cat(&outputs, candle_core::D::Minus1)?)
+                }
+                (None, Some((buffer, format))) => self.blocks(layer, buffer, format, x),
+                (None, None) => layer.forward(x),
+            },
         }
+    }
+
+    /// Wide batch through a stack of formats: every part's tiles write their own columns of
+    /// one output, so joining the parts costs no copy.
+    fn stack_wide(
+        &self,
+        layer: &PackedLinear,
+        parts: &[PackedLinear],
+        x: &Tensor,
+    ) -> Result<Tensor> {
+        let xv = self.view(x)?;
+        let n = layer.out_features();
+        if xv.cols != layer.in_features() || xv.rows == 0 {
+            return Err(invalid("block projection input does not match"));
+        }
+        if !xv.row_stride.is_multiple_of(4) || !xv.offset().is_multiple_of(16) {
+            drop(xv);
+            return self.stack_wide(layer, parts, &x.copy()?);
+        }
+        let out = self.output(xv.rows, n)?;
+        let mut first = 0;
+        for part in parts {
+            let (weights, format) = part
+                .packed_buffer()
+                .and_then(|(buffer, format)| Some((buffer, BlockFormat::from_candle(format)?)))
+                .or(part.block_buffer())
+                .ok_or_else(|| invalid("stacked weights have no block format"))?;
+            self.wide_part(weights, format, (part.out_features(), n, first), &xv, &out)?;
+            first += part.out_features();
+        }
+        self.finish(out, (xv.rows, n))
+    }
+
+    /// F16-staged tiles of one run of `rows` outputs, written from column `first` of an
+    /// output `width` wide.
+    fn wide_part(
+        &self,
+        weights: &candle_metal_kernels::metal::Buffer,
+        format: BlockFormat,
+        (rows, width, first): (usize, usize, usize),
+        xv: &View<'_>,
+        out: &Output,
+    ) -> Result<()> {
+        let k = xv.cols;
+        if !format.tiles(k)
+            || format.bytes(rows, k)? > weights.length()
+            || first.checked_add(rows).is_none_or(|end| end > width)
+        {
+            return Err(invalid("block weights are smaller than their shape"));
+        }
+        if WIDE_STAGE_BYTES > self.capabilities().threadgroup_memory_bytes {
+            return Err(invalid("block projection exceeds threadgroup memory"));
+        }
+        let params = QmmParams {
+            n: to_u32(rows, "rows")?,
+            k: to_u32(k, "columns")?,
+            x_stride: to_u32(xv.row_stride, "row stride")?,
+            y_stride: to_u32(width, "output stride")?,
+            rows: to_u32(xv.rows, "batch rows")?,
+        };
+        let pipeline = self.runtime.specialized("qmm_blocks_wide_f32", format)?;
+        let grid = (rows.div_ceil(64), xv.rows.div_ceil(32));
+        self.runtime
+            .dispatch_grid(&pipeline, "tur_blocks_wide", grid, 128, |e| {
+                e.set_input_buffer(0, Some(weights), 0);
+                xv.bind(e, 1)?;
+                out.bind_at(e, 2, first * 4);
+                e.set_bytes(3, &params);
+                e.set_threadgroup_memory_length(0, WIDE_STAGE_BYTES);
+                Ok(())
+            })
+    }
+
+    /// Project through weights in one GGUF block format, at any batch size: the GEMV for up
+    /// to three rows, the matrix units for up to sixteen and F16-staged tiles beyond.
+    fn blocks(
+        &self,
+        layer: &PackedLinear,
+        weights: &candle_metal_kernels::metal::Buffer,
+        format: BlockFormat,
+        x: &Tensor,
+    ) -> Result<Tensor> {
+        let xv = self.view(x)?;
+        let (n, k) = (layer.out_features(), layer.in_features());
+        if xv.cols != k || xv.rows == 0 {
+            return Err(invalid("block projection input does not match"));
+        }
+        // The kernels load activations as float4.
+        if !xv.row_stride.is_multiple_of(4) || !xv.offset().is_multiple_of(16) {
+            drop(xv);
+            return self.blocks(layer, weights, format, &x.copy()?);
+        }
+        if !format.tiles(k) || format.bytes(n, k)? > weights.length() {
+            return Err(invalid("block weights are smaller than their shape"));
+        }
+        let params = QmmParams {
+            n: to_u32(n, "rows")?,
+            k: to_u32(k, "columns")?,
+            x_stride: to_u32(xv.row_stride, "row stride")?,
+            y_stride: to_u32(n, "output stride")?,
+            rows: to_u32(xv.rows, "batch rows")?,
+        };
+        let simdgroups = |name| -> Result<usize> {
+            let pipeline = self.runtime.specialized(name, format)?;
+            Ok(pipeline.simdgroups(self.tuning.simdgroups).max(1))
+        };
+        // (kernel, threadgroup grid, threads, threadgroup memory)
+        let (name, grid, threads, memory) = match xv.rows {
+            1..=3 => {
+                let simdgroups = simdgroups("qmv_blocks_f32")?;
+                (
+                    "qmv_blocks_f32",
+                    (n.div_ceil(4 * simdgroups), 1),
+                    simdgroups * 32,
+                    0,
+                )
+            }
+            4..=16 => {
+                let tiles = xv.rows.div_ceil(8);
+                let name = if tiles == 1 {
+                    "qmm_blocks_t1_f32"
+                } else {
+                    "qmm_blocks_t2_f32"
+                };
+                let simdgroups = simdgroups(name)?;
+                (
+                    name,
+                    (n.div_ceil(16), 1),
+                    simdgroups * 32,
+                    simdgroups * 16 * tiles * 8 * 4,
+                )
+            }
+            _ => {
+                let out = self.output(xv.rows, n)?;
+                self.wide_part(weights, format, (n, n, 0), &xv, &out)?;
+                return self.finish(out, (xv.rows, n));
+            }
+        };
+        if memory > self.capabilities().threadgroup_memory_bytes {
+            return Err(invalid("block projection exceeds threadgroup memory"));
+        }
+        let pipeline = self.runtime.specialized(name, format)?;
+        let out = self.output(xv.rows, n)?;
+        self.runtime
+            .dispatch_grid(&pipeline, "tur_blocks", grid, threads, |e| {
+                e.set_input_buffer(0, Some(weights), 0);
+                xv.bind(e, 1)?;
+                out.bind(e, 2);
+                e.set_bytes(3, &params);
+                if memory > 0 {
+                    e.set_threadgroup_memory_length(0, memory);
+                }
+                Ok(())
+            })?;
+        self.finish(out, (xv.rows, n))
     }
 
     /// Small-batch `Q8_0` or Q4K projection on the matrix units: up to 16 rows, each

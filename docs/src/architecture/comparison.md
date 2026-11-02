@@ -7,7 +7,8 @@ Pick Tur to serve several requests at once from a supported model on an Apple Si
 | Fast batched decode and low memory use on a Mac serving Qwen3.5-family models to several clients or agents | Tur |
 | An MoE model larger than GPU memory on a Mac, with bounded memory, no SSD writes and more than one request at a time | Tur |
 | Prompt caches that survive a restart, a menu bar app, several models, or images and embeddings on a Mac | oMLX |
-| The widest choice of models and hardware, GGUF files, or a library that runs everywhere | llama.cpp |
+| Fast batched decode from a GGUF file you already have, on a Qwen3.5-family or Gemma 4 model | Tur |
+| The widest choice of models and hardware, or a library that runs everywhere | llama.cpp |
 | A model running in one command, with switching handled for you | Ollama |
 | Production serving on NVIDIA, AMD or TPU clusters | SGLang |
 | The largest MoE models on consumer GPUs or a large Mac, one request at a time | Strata |
@@ -17,6 +18,8 @@ Other projects' features come from their documentation as of November 2026 and c
 ## The other engines
 
 ### llama.cpp
+
+Tur reads llama.cpp's GGUF files for the models it supports, so you can compare them on the same weights: on the two files measured, Tur decodes 1.2 to 1.4× faster with several sequences and level to 6% faster with one, and prefill is within 2% either way ([numbers](../guide/performance.md#on-the-same-gguf-files)). llama.cpp still covers far more models. Tur's GGUF support also has [limits](../guide/gguf.md#limitations).
 
 llama.cpp runs on the CPUs and GPUs of most vendors and loads a very broad range of models as GGUF. On a Mac it uses its own Metal backend and serves concurrent requests through parallel slots. It keeps prompt caches [in slots and host memory](https://github.com/ggml-org/llama.cpp/pull/16391), handles larger-than-memory weights by memory-mapping them, takes images through its multimodal library, and offers structured output over HTTP.
 
@@ -72,7 +75,7 @@ Recurrent state is read in the order the GPU prefers. This cut an eight-sequence
 
 Attention reads state where it lives. Keys and values stay in fixed pages that kernels read in place, and norms, gates and residual additions are fused into neighbouring kernels, which saves a trip through memory for each step.
 
-Weights hold fewer bytes. Tur's Q4K uses Q4_K for every projection, while GGUF's Q4_K_M mixes in Q6_K blocks. With one sequence, reading weights is the limit, so Q4K decodes about 1.6× faster than Q8_0 inside Tur. The cost is quality, which [Choosing a quantization](../guide/choosing-quantization.md) measures.
+Weights hold fewer bytes. Tur's Q4K uses Q4_K for every projection, while GGUF's Q4_K_M mixes in Q6_K blocks. Tur can also load those GGUF files as they are, keeping their mix. With one sequence, reading weights is the limit, so Q4K decodes about 1.6× faster than Q8_0 inside Tur. The cost is quality, which [Choosing a quantization](../guide/choosing-quantization.md) measures.
 
 Two more features skip work and don't appear in the kernel numbers below. [Prefix reuse](prefix-reuse.md) shares state without copying it, and [speculative decoding](speculation.md) reaches up to 2.9× on repetitive text, with output identical to normal decoding.
 

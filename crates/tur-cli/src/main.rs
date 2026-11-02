@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! The `tur` command: generation, the HTTP server and its monitor, and weight preparation.
 mod args;
+mod catalog;
 mod config;
 mod monitor;
 mod prune;
@@ -24,13 +25,15 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
     version,
     about = "Tur hybrid text inference for Apple Silicon",
     after_help = "Examples:\n  \
-        tur run --model ./model --revision local --prompt 'Hello'\n  \
-        tur serve --model ./model --revision local\n  \
+        tur run qwen            chat in this terminal\n  \
+        tur run qwen 'Hello'    one answer\n  \
+        tur serve qwen          an OpenAI-compatible API on 127.0.0.1:8080\n  \
+        tur list                the model names\n  \
         tur top                 watch a running server\n  \
         tur status --json       one reading, for scripts"
 )]
 struct Cli {
-    /// Read this TOML file instead of ./tur.toml (not for quantize and prune).
+    /// Read this TOML file instead of ./tur.toml (not for list, pull, quantize and prune).
     #[arg(long, global = true, conflicts_with = "no_config")]
     config: Option<PathBuf>,
     /// Ignore ./tur.toml and use only flags, environment and built-in defaults.
@@ -45,10 +48,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Generate one completion: the answer to stdout, any separate reasoning to stderr.
+    /// Chat with a model, or answer one prompt: the answer to stdout, reasoning to stderr.
     Run(run::Args),
     /// Serve one resident model over an OpenAI-style HTTP API, with a live dashboard.
     Serve(serve::Args),
+    /// List the model names and which are downloaded.
+    List,
+    /// Download a model ahead of its first run.
+    Pull(catalog::PullArgs),
     /// Print a running server's state once. Exits nonzero unless it is ready.
     Status(monitor::StatusArgs),
     /// Watch a running server's traffic, memory and efficiency live.
@@ -101,8 +108,8 @@ fn parse_failure(error: &clap::Error, arguments: &[String]) -> ExitCode {
     if lacks_command(error, arguments) {
         report(
             "\nThese flags belong to a command, for example:\n  \
-             tur run --model <dir or org/name> --revision <rev> --prompt 'Hello'\n  \
-             tur serve --model <dir or org/name> --revision <rev>\n\n\
+             tur run qwen 'Hello'\n  \
+             tur serve qwen\n\n\
              Run `tur` to list every command.",
         );
     }
@@ -156,6 +163,14 @@ fn execute(cli: Cli, console: &ui::Console) -> Result<()> {
                 .build()?
                 .block_on(serve::serve(args, console.clone()))
         }
+        Command::List => {
+            job_arguments_only(cli.config.as_deref(), "list")?;
+            catalog::list()
+        }
+        Command::Pull(args) => {
+            job_arguments_only(cli.config.as_deref(), "pull")?;
+            catalog::pull(&args)
+        }
         Command::Status(args) => monitor::status(&args, &monitored(args.url(), &settings()?)?),
         Command::Top(args) => monitor::top(&args, &monitored(args.url(), &settings()?)?),
         Command::Stop(args) => monitor::stop(&args, &monitored(args.url(), &settings()?)?, console),
@@ -203,7 +218,7 @@ fn introduce(console: &ui::Console) -> Result<()> {
         .collect();
     let rows: Vec<(&str, String)> = rows.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
     console.rows(&rows);
-    console.line("\n  tur <command> --help prints every flag.");
+    console.line("\n  Start with `tur run qwen`. tur <command> --help prints every flag.");
     Ok(())
 }
 
@@ -232,15 +247,7 @@ impl Command {
 fn parse_cli(arguments: &[&str]) -> Result<Cli> {
     use clap::{CommandFactory as _, FromArgMatches as _};
 
-    // Tests must not inherit the developer's selected checkpoint.
     let mut command = Cli::command();
-    for name in ["run", "serve"] {
-        command = command.mut_subcommand(name, |command| {
-            command
-                .mut_arg("model", |arg| arg.env(None::<&str>))
-                .mut_arg("revision", |arg| arg.env(None::<&str>))
-        });
-    }
     for name in ["status", "top", "stop"] {
         command = command.mut_subcommand(name, |command| {
             command.mut_arg("url", |arg| arg.env(None::<&str>))
@@ -305,7 +312,7 @@ mod tests {
                 .ok_or_else(|| TurError::Other("arguments were accepted".into()))?;
             Ok(lacks_command(&error, &arguments))
         };
-        assert!(failure(&["tur", "--model", "m", "--revision", "r"])?);
+        assert!(failure(&["tur", "--revision", "r"])?);
         assert!(!failure(&["tur", "serve", "--nonsense"])?);
         Ok(())
     }

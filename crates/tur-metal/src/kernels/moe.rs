@@ -1,15 +1,17 @@
 //! Device-owned routing and grouped expert projections. No routing readback or padding.
-use super::{Kernels, PackedLinear, runtime::to_u32};
+use super::{
+    Kernels, PackedLinear, WIDE_STAGE_BYTES,
+    runtime::{Pipeline, to_u32},
+};
+use crate::blocks::BlockFormat;
 use candle_core::{Tensor, quantized::GgmlDType};
+use std::sync::Arc;
 use tur_core::{Result, execution::invalid};
 
 /// Assignments per histogram block and threads of the block-wide routing kernels.
 const BLOCK: usize = 256;
 /// Rows of one expert tile; groups above it use wider tiles (32 rows, fewer tiles).
 const TILE: usize = 16;
-/// Staged F16 weights `[64, 32]` and F32 activations `[32, 32]`, reused for the
-/// `[32, 64]` F32 result.
-const WIDE_STAGE_BYTES: usize = 64 * 32 * 2 + 32 * 32 * 4;
 /// Simdgroups of one matrix-unit threadgroup, each owning 32 outputs of a tile.
 const GEMM_SIMDGROUPS: usize = 2;
 
@@ -341,6 +343,7 @@ impl Kernels {
         }
         let mut p = routes.params(width, xv.row_stride, out_width, routed)?;
         // GEMV outputs per simdgroup match the dense GEMV kernels.
+        let mut block = None;
         let (suffix, gemv_rows, packed) = match (layer.packed_buffer(), layer.mxfp4_buffer()) {
             (_, Some((buffer, scales))) => {
                 p.scales = scales as u64;
@@ -348,8 +351,26 @@ impl Kernels {
             }
             (Some((buffer, GgmlDType::Q8_0)), _) => ("q8_0", 4, Some(buffer)),
             (Some((buffer, GgmlDType::Q4K)), _) => ("q4k", 4, Some(buffer)),
-            (None, None) if layer.format().is_none() => ("f32", 4, None),
-            _ => return Err(invalid("unsupported expert weight format")),
+            (Some((buffer, format)), _) => {
+                block = BlockFormat::from_candle(format);
+                ("blocks", 4, Some(buffer))
+            }
+            (None, None) => match layer.block_buffer() {
+                // Expert kernels read one format, which the loader guarantees per bank.
+                Some((buffer, format)) => {
+                    block = Some(format);
+                    ("blocks", 4, Some(buffer))
+                }
+                None if layer.dense_tensor().is_some() => ("f32", 4, None),
+                None => return Err(invalid("unsupported expert weight format")),
+            },
+        };
+        // A function constant selects the decoder, so each format gets its own pipelines.
+        let pipeline = |family: &'static str, plain: &str| -> Result<Arc<Pipeline>> {
+            block.map_or_else(
+                || self.runtime.shared(plain),
+                |format| self.runtime.specialized(family, format),
+            )
         };
         let dense = layer.dense_tensor().map(|t| self.view(t)).transpose()?;
         if let Some(dense) = &dense {
@@ -369,7 +390,7 @@ impl Kernels {
         // Every tile goes to exactly one kernel: within groups of at most sixteen rows, GEMV
         // for at most three rows and F32 matrix units otherwise; larger groups' wide tiles
         // use F16-staged weights. Each launches over all tiles and skips the others.
-        let gemv = self.pipeline(&format!("moe_gemv_{suffix}"))?;
+        let gemv = pipeline("moe_gemv_blocks", &format!("moe_gemv_{suffix}"))?;
         let gemv_simdgroups = gemv.simdgroups(self.tuning.simdgroups).max(1);
         // A token selects each expert at most once, so no group has more rows than the
         // pass has tokens: the GEMM (4–16 rows) and wide (17+) tiers are skipped when no
@@ -377,14 +398,14 @@ impl Kernels {
         let tiers = [
             (gemv, gemv_simdgroups, gemv_rows * gemv_simdgroups, 0, 1),
             (
-                self.pipeline(&format!("moe_gemm_{suffix}"))?,
+                pipeline("moe_gemm_blocks", &format!("moe_gemm_{suffix}"))?,
                 GEMM_SIMDGROUPS,
                 32 * GEMM_SIMDGROUPS,
                 0,
                 4,
             ),
             (
-                self.pipeline(&format!("moe_gemm_wide_{suffix}"))?,
+                pipeline("moe_gemm_wide_blocks", &format!("moe_gemm_wide_{suffix}"))?,
                 4,
                 64,
                 WIDE_STAGE_BYTES,
@@ -401,7 +422,7 @@ impl Kernels {
                 .ok_or_else(|| invalid("expert GEMM grid overflow"))?;
             to_u32(launch, "expert tiles")?;
             self.runtime
-                .dispatch(pipeline, "tur_moe_gemm", launch, simdgroups * 32, |e| {
+                .dispatch(&pipeline, "tur_moe_gemm", launch, simdgroups * 32, |e| {
                     if let Some(buffer) = packed {
                         e.set_input_buffer(0, Some(buffer), 0);
                     } else {

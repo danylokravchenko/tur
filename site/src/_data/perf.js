@@ -244,8 +244,9 @@ const stats = {
   prefixCached: `${reuseCell(cachedLabel)} s`,
   prefixCold: `${reuseCell(coldLabel)} s`,
   speculation: `${(toNumber(repetitive[3]) / toNumber(repetitive[2])).toFixed(1)}×`,
-  load: `${loading.num("Q4K GPTQ artifact", "Load time")} s`,
 };
+
+const expertCacheRow = "2 GiB";
 
 const servingScenario = (name, section, nth = 0) => {
   const table = perf.table(section, "Concurrent", nth);
@@ -338,6 +339,10 @@ const lab = {
 export default {
   lab,
   stats,
+  expertCache: {
+    size: expertCacheRow,
+    decode: perf.table("gpt-oss-20b", "Cache").num(expertCacheRow, "Decode, tokens/s"),
+  },
   moe: {
     load: moeCases.num("Load time", "Result"),
     sixteenTur: toNumber(moeSixteen[1]),

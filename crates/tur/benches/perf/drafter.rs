@@ -703,6 +703,7 @@ pub(crate) fn run() -> Result<()> {
         recurrent: DEFAULT_RECURRENT_STATE,
         audio: false,
         expert_cache: None,
+        gguf: None,
     };
     let (traces, mapped) = record(&factory, &tokenizer, output, options)?;
     eprintln!("candidate text mapped back to its id for {mapped:.4} of tokens");

@@ -174,6 +174,7 @@ impl Checkpoint {
             recurrent: DType::F32,
             audio: false,
             expert_cache: None,
+            gguf: None,
         }
     }
 }

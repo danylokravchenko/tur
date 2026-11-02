@@ -4,15 +4,18 @@
 //! kernels share Candle's command ordering, hazard barriers, pooled-buffer reuse rules and
 //! the [`crate::completion::Completion`] fence. No separate queue or synchronization exists.
 
+use crate::blocks::BlockFormat;
 use candle_core::{
     DType, Device, MetalDevice, Shape, Storage, Tensor, metal_backend::MetalStorage,
 };
-use candle_metal_kernels::metal::{Buffer, ComputeCommandEncoder, ComputePipeline};
+use candle_metal_kernels::metal::{
+    Buffer, ComputeCommandEncoder, ComputePipeline, ConstantValues, Function, Library, Value,
+};
 use objc2_metal::{
     MTLCompileOptions, MTLComputePipelineState as _, MTLDevice as _, MTLGPUFamily, MTLMathMode,
     MTLSize,
 };
-use parking_lot::RwLockReadGuard;
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::{collections::HashMap, sync::Arc};
 use tur_core::{Result, TurError, execution::invalid};
 
@@ -34,6 +37,8 @@ const SOURCE: &str = concat!(
     include_str!("delta.metal"),
     "\n",
     include_str!("attention.metal"),
+    "\n",
+    include_str!("block_tables.metal"),
     "\n",
     include_str!("quantized.metal"),
     "\n",
@@ -340,7 +345,11 @@ pub(super) struct Runtime {
     pub(super) metal: MetalDevice,
     pub(super) capabilities: Capabilities,
     pub(super) tuning: Tuning,
-    pipelines: HashMap<&'static str, Pipeline>,
+    pipelines: HashMap<&'static str, Arc<Pipeline>>,
+    library: Library,
+    /// Kernels specialized to one block format, built when a model first needs them: most
+    /// models read none, and specializing all of them at startup would cost every model.
+    specialized: RwLock<HashMap<(&'static str, BlockFormat), Arc<Pipeline>>>,
 }
 
 impl Runtime {
@@ -364,26 +373,7 @@ impl Runtime {
         let mut pipelines = HashMap::with_capacity(FUNCTIONS.len());
         for &name in FUNCTIONS {
             let function = library.get_function(name, None).map_err(device_error)?;
-            let pipeline = metal
-                .metal_device()
-                .new_compute_pipeline_state_with_function(&function)
-                .map_err(device_error)?;
-            let raw = pipeline.as_ref();
-            let width = raw.threadExecutionWidth();
-            if width != SIMD_WIDTH {
-                return Err(device_error(format!(
-                    "{name} executes {width} threads per SIMD group; kernels assume {SIMD_WIDTH}"
-                )));
-            }
-            let max_threads = raw.maxTotalThreadsPerThreadgroup();
-            pipelines.insert(
-                name,
-                Pipeline {
-                    pipeline,
-                    width,
-                    max_threads,
-                },
-            );
+            pipelines.insert(name, Arc::new(Self::build(metal, name, &function)?));
         }
         Ok(Self {
             tuning: Tuning::for_device(&capabilities),
@@ -391,12 +381,64 @@ impl Runtime {
             metal: metal.clone(),
             capabilities,
             pipelines,
+            library,
+            specialized: RwLock::new(HashMap::new()),
         })
+    }
+
+    fn build(metal: &MetalDevice, name: &str, function: &Function) -> Result<Pipeline> {
+        let pipeline = metal
+            .metal_device()
+            .new_compute_pipeline_state_with_function(function)
+            .map_err(device_error)?;
+        let raw = pipeline.as_ref();
+        let width = raw.threadExecutionWidth();
+        if width != SIMD_WIDTH {
+            return Err(device_error(format!(
+                "{name} executes {width} threads per SIMD group; kernels assume {SIMD_WIDTH}"
+            )));
+        }
+        let max_threads = raw.maxTotalThreadsPerThreadgroup();
+        Ok(Pipeline {
+            pipeline,
+            width,
+            max_threads,
+        })
+    }
+
+    /// A shared handle to the compiled kernel `name`.
+    pub(super) fn shared(&self, name: &str) -> Result<Arc<Pipeline>> {
+        self.pipelines
+            .get(name)
+            .cloned()
+            .ok_or_else(|| device_error(format!("kernel {name} is not compiled")))
+    }
+
+    /// Kernel `name` specialized to `format`, built on first use.
+    pub(super) fn specialized(
+        &self,
+        name: &'static str,
+        format: BlockFormat,
+    ) -> Result<Arc<Pipeline>> {
+        if let Some(pipeline) = self.specialized.read().get(&(name, format)) {
+            return Ok(Arc::clone(pipeline));
+        }
+        let constants = ConstantValues::new(vec![(0, Value::U16(format as u16))]);
+        let function = self
+            .library
+            .get_function(name, Some(&constants))
+            .map_err(device_error)?;
+        let pipeline = Arc::new(Self::build(&self.metal, name, &function)?);
+        self.specialized
+            .write()
+            .insert((name, format), Arc::clone(&pipeline));
+        Ok(pipeline)
     }
 
     pub(super) fn pipeline(&self, name: &str) -> Result<&Pipeline> {
         self.pipelines
             .get(name)
+            .map(Arc::as_ref)
             .ok_or_else(|| device_error(format!("kernel {name} is not compiled")))
     }
 
@@ -409,7 +451,19 @@ impl Runtime {
         threads: usize,
         bind: impl FnOnce(&ComputeCommandEncoder) -> Result<()>,
     ) -> Result<()> {
-        if groups == 0 || threads == 0 || threads > pipeline.max_threads {
+        self.dispatch_grid(pipeline, label, (groups, 1), threads, bind)
+    }
+
+    /// [`Self::dispatch`] over a two-dimensional grid of threadgroups.
+    pub(super) fn dispatch_grid(
+        &self,
+        pipeline: &Pipeline,
+        label: &str,
+        (groups, height): (usize, usize),
+        threads: usize,
+        bind: impl FnOnce(&ComputeCommandEncoder) -> Result<()>,
+    ) -> Result<()> {
+        if groups == 0 || height == 0 || threads == 0 || threads > pipeline.max_threads {
             return Err(invalid(format!("invalid {label} launch shape")));
         }
         let guard = self.metal.command_encoder()?;
@@ -420,7 +474,7 @@ impl Runtime {
         encoder.dispatch_thread_groups(
             MTLSize {
                 width: groups,
-                height: 1,
+                height,
                 depth: 1,
             },
             MTLSize {
@@ -590,7 +644,12 @@ impl Output {
     }
 
     pub(super) fn bind(&self, encoder: &ComputeCommandEncoder, index: usize) {
-        encoder.set_output_buffer(index, Some(&self.buffer), 0);
+        self.bind_at(encoder, index, 0);
+    }
+
+    /// Bind from byte `offset`, for dispatches that fill one part of each row.
+    pub(super) fn bind_at(&self, encoder: &ComputeCommandEncoder, index: usize, offset: usize) {
+        encoder.set_output_buffer(index, Some(&self.buffer), offset);
     }
 
     /// Wrap as an F32 tensor of `shape`, which must have exactly `rows × cols` elements.

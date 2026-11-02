@@ -55,7 +55,7 @@ The Qwen parser rejects any setting Tur doesn't implement, rather than running t
 
 Gemma checks its own head widths, K/V sharing layout, PLE and expert dimensions, activation, attention mask and RoPE settings, and rejects attention biases, dropout, arbitrary RoPE scaling, bidirectional text attention and external quantization configs. Gemma's assistant drafter (`gemma4_assistant`) is a separate checkpoint, checked against its target model: same vocabulary, head widths, K/V heads, window and rotary settings (see [Speculative decoding](speculation.md)).
 
-Tur derives and checks every weight shape before reading any data. It finds SafeTensors files through the index, validates their headers, and reads payloads without memory-mapping. For a remote model, it downloads and validates `config.json` before any weights, and the repository must report exactly the requested commit.
+Tur derives and checks every weight shape before reading any data, for GGUF files too, whose tensors each model maps onto its checkpoint names, undoing what llama.cpp's converter changed (RMS norms store `weight + 1` and DeltaNet decay stores `-exp(A_log)`). It finds SafeTensors files through the index, validates their headers, and reads payloads without memory-mapping. For a remote model, it downloads and validates `config.json` before any weights, and the repository must report exactly the requested commit.
 
 ## Tokens and templates
 
@@ -66,7 +66,7 @@ Tur derives and checks every weight shape before reading any data. It finds Safe
 
 ## Weights
 
-Projections are stored as F32, Q8_0 or Q4K blocks (`PackedLinear`). Embedding tables can also be BF16, Q6K or Q5K, or read from the packed output layer on checkpoints that share it. [Prepacked weights](../guide/quantization.md) covers the formats and the offline quantizer. Gemma converts to F32, Q8_0 or Q4K at load time where a matrix's width fits the block format; the 26B expert width supports Q8_0 but not Q4K. Gemma's PLE tables stay BF16 in packed modes.
+Projections are stored as F32, Q8_0 or Q4K blocks (`PackedLinear`), or in whatever mix of formats a [GGUF file](../guide/gguf.md) holds. Embedding tables can also be BF16, Q6K or Q5K, or read from the packed output layer on checkpoints that share it. [Prepacked weights](../guide/quantization.md) covers the formats and the offline quantizer. Gemma converts to F32, Q8_0 or Q4K at load time where a matrix's width fits the block format; the 26B expert width supports Q8_0 but not Q4K. Gemma's PLE tables stay BF16 in packed modes.
 
 ## Decisions
 

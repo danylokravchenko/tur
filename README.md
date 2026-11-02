@@ -3,7 +3,7 @@
   <h1>Tur</h1>
   <p><strong>Local inference with a little muscle.</strong></p>
   <p>A Rust inference engine for hybrid language models on Apple Silicon.</p>
-  <p>Built to get the most out of your Mac.</p>
+  <p><strong>Serve models bigger than your Mac's memory.</strong></p>
   <p> <a href="#why-tur">Why Tur</a> · <a href="#how-it-works">How it works</a> · <a href="#performance">Performance</a> · <a href="#models">Models</a> · <a href="#get-started">Get started</a> · <a href="docs/src/SUMMARY.md">Read the book</a> </p>
   <p><strong>Rust · Metal · Apple Silicon · Apache-2.0</strong></p>
 </div>
@@ -19,6 +19,8 @@ Choose Tur if you want one of these on an Apple Silicon Mac:
 - Several clients or agents sharing one model. Requests share each model pass, so eight sequences decode 60% faster than on llama.cpp on the same Mac.
 - A mixture-of-experts model larger than your Mac's memory. Tur keeps most experts on the SSD and reads them into a fixed cache, with several requests at once and no SSD writes during a run.
 - A server you can leave running. Tur plans all its memory before loading a weight, so a configuration that doesn't fit fails at startup, and one failed request doesn't affect the others.
+
+Already have a GGUF quant you like? Tur loads it directly from a path or Hugging Face with `--gguf`, in any mix of K-quant, legacy, IQ and MXFP4 blocks, for the Qwen and Gemma 4 models it supports ([GGUF files](docs/src/guide/gguf.md)).
 
 Tur supports few models and doesn't accept images or video. It has no embeddings and serves one chat model per process. For those, or for other hardware, look at oMLX, llama.cpp, Ollama, SGLang or Strata. [Tur and other engines](docs/src/architecture/comparison.md) compares them.
 
@@ -72,19 +74,22 @@ curl -fsSL https://github.com/danylokravchenko/tur/releases/latest/download/inst
 
 To build from source instead, or to see the installer's options, read [Requirements and checkpoints](docs/src/guide/getting-started.md).
 
-Generate some text. The first run downloads the model into your Hugging Face cache, and pinning the revision means every run loads the same weights:
+Chat with a model. The first run downloads it:
 
 ```sh
-export TUR_MODEL=Qwen/Qwen3.5-0.8B
-export TUR_REVISION=2fc06364715b967f1860aea9cf38778875588b17
+tur run qwen
+```
 
-tur run --prompt 'Write one sentence about the Moon.' --temperature 0 -n 64 --thinking false
+Pass a prompt for one answer, which also works in scripts:
+
+```sh
+tur run qwen 'Write one sentence about the Moon.'
 ```
 
 Serve it as an API:
 
 ```sh
-tur serve --served-model-name qwen
+tur serve qwen
 ```
 
 Any OpenAI client then works with the base URL `http://127.0.0.1:8080/v1` and the model `qwen`:
@@ -92,8 +97,16 @@ Any OpenAI client then works with the base URL `http://127.0.0.1:8080/v1` and th
 ```sh
 curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen","messages":[{"role":"user","content":"Say hi"}],"max_tokens":32,"thinking":false}'
+  -d '{"model":"qwen","messages":[{"role":"user","content":"Say hi"}]}'
 ```
+
+Serve a model your Mac can't hold. `gpt-oss` keeps its experts on the SSD and reads them into a 2 GiB cache:
+
+```sh
+tur serve gpt-oss
+```
+
+`tur list` shows every name. Each one is pinned to an exact commit, so it loads the same weights every time. Tur also takes a Hugging Face repository (`tur run openai/gpt-oss-20b`) or a checkpoint directory (`tur run ./my-model`).
 
 ## Documentation
 
@@ -104,7 +117,7 @@ The [Tur book](https://danylokravchenko.github.io/tur/docs/) covers usage, archi
 | Run my first model, offline use included | [Quickstart](docs/src/guide/quickstart.md) |
 | Configure the CLI or server | [Configuration](docs/src/guide/configuration.md), [Command line](docs/src/guide/cli.md) |
 | Connect an app | [HTTP API](docs/src/guide/http-api.md), [Rust library](docs/src/guide/library.md) |
-| Make weights smaller | [Choosing a quantization](docs/src/guide/choosing-quantization.md), [Prepacked weights](docs/src/guide/quantization.md) |
+| Make weights smaller | [Choosing a quantization](docs/src/guide/choosing-quantization.md), [GGUF files](docs/src/guide/gguf.md), [Prepacked weights](docs/src/guide/quantization.md) |
 | Match settings to my workload | [Tuning](docs/src/guide/tuning.md), [Best practice](docs/src/guide/best-practice.md) |
 | Understand the engine | [Architecture](docs/src/architecture/overview.md), [Scope](docs/src/design/scope.md) |
 | See what's next | [Open work](docs/src/design/open.md), [Rejected experiments](docs/src/design/rejected.md) |

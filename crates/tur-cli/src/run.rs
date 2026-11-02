@@ -1,10 +1,13 @@
-use std::{io::Write, path::PathBuf};
+use std::{
+    io::{IsTerminal as _, Read as _, Write},
+    path::PathBuf,
+};
 
 use tur::{
-    Result,
+    Result, TurError,
     audio::Audio,
     backend::{
-        chat_template::{Content, ContentPart},
+        chat_template::{ChatMessage, Content, ContentPart, Role},
         pipeline::{GenerationRequest, InferencePipeline},
     },
     hybrid::SamplingOptions,
@@ -13,7 +16,7 @@ use tur::{
 use crate::{
     args::{ModelArgs, PipelineArgs},
     config::inherit,
-    ui::{Console, seconds},
+    ui::{Console, describe, seconds},
 };
 
 #[derive(Debug, Default, serde::Deserialize, clap::Args)]
@@ -25,15 +28,21 @@ pub(crate) struct Args {
     #[command(flatten)]
     #[serde(skip)]
     pipeline: PipelineArgs,
-    #[arg(long, default_value = "Who are you?")]
+    /// One user turn, for one answer. Without it, piped input is the prompt and a terminal
+    /// opens a chat.
+    #[arg(value_name = "PROMPT", conflicts_with = "prompt")]
     #[serde(skip)]
-    prompt: String,
+    words: Vec<String>,
+    /// PROMPT as a flag, for when tur.toml selects the model.
+    #[arg(long)]
+    #[serde(skip)]
+    prompt: Option<String>,
     /// WAV clip placed before the prompt, for models with an audio encoder (Gemma 4 E2B
     /// and E4B).
     #[arg(long)]
     #[serde(skip)]
     audio: Option<PathBuf>,
-    /// Generated-token limit, including EOS (default: 128).
+    /// Generated-token limit, including EOS. Default: 1024, or what the context leaves.
     #[arg(short = 'n', long)]
     max_tokens: Option<usize>,
     /// Unset sampling controls inherit `generation_config.json`; zero is greedy.
@@ -85,20 +94,41 @@ impl Args {
     );
 
     pub(crate) fn configure(&mut self, settings: crate::config::FileSettings) {
-        self.model.inherit(settings.model);
+        self.model.select(settings.model);
         self.pipeline.inherit(settings.engine);
         self.inherit(settings.generation);
     }
 
-    fn request(self) -> Result<GenerationRequest> {
-        let mut request =
-            GenerationRequest::new(self.prompt.clone(), self.max_tokens.unwrap_or(128));
+    /// What this invocation asks. `None` is a chat, which needs a terminal to read turns from.
+    fn prompt(&mut self) -> Result<Option<String>> {
+        if !self.words.is_empty() {
+            return Ok(Some(self.words.join(" ")));
+        }
+        if let Some(prompt) = self.prompt.take() {
+            return Ok(Some(prompt));
+        }
+        if std::io::stdin().is_terminal() {
+            if self.audio.is_some() {
+                return Err(TurError::Other("--audio needs a prompt".into()));
+            }
+            return Ok(None);
+        }
+        let mut prompt = String::new();
+        std::io::stdin().read_to_string(&mut prompt)?;
+        if prompt.trim().is_empty() {
+            return Err(TurError::Other("no prompt on standard input".into()));
+        }
+        Ok(Some(prompt))
+    }
+
+    fn request(self, prompt: String) -> Result<GenerationRequest> {
+        let mut request = GenerationRequest::new(prompt.clone(), self.max_tokens.unwrap_or(1024));
+        // A limit nobody chose must not fail a long conversation.
+        request.fit_context = self.max_tokens.is_none();
         if let Some(path) = &self.audio {
             let clip = Audio::from_wav(&std::fs::read(path)?)?;
-            request.messages[0].content = Content::Parts(vec![
-                ContentPart::Audio(clip),
-                ContentPart::Text(self.prompt),
-            ]);
+            request.messages[0].content =
+                Content::Parts(vec![ContentPart::Audio(clip), ContentPart::Text(prompt)]);
         }
         request.seed = self.seed.unwrap_or(299_792_458);
         request.sampling = SamplingOptions {
@@ -125,17 +155,76 @@ pub(crate) fn run(mut args: Args, console: &Console) -> Result<()> {
         args.pipeline.prefer_large_passes();
     }
     let factory = args.model.factory()?;
+    let prompt = args.prompt()?;
     let config = args.pipeline.config(1)?;
     config.scheduler.validate()?;
     config.prefix.validate(factory.kv.page_tokens)?;
     let mut pipeline = InferencePipeline::new(&factory, config)?;
-    let request = args.request()?;
+    match prompt {
+        Some(prompt) => {
+            let request = args.request(prompt)?;
+            generate(&mut pipeline, &request, console).map(drop)
+        }
+        None => chat(&mut pipeline, args.request(String::new())?, console),
+    }
+}
+
+/// Answer turns from the terminal until `/bye` or the end of input. Each turn sends the whole
+/// conversation, and prefix reuse keeps that from recomputing what the last turn already did.
+fn chat(
+    pipeline: &mut InferencePipeline,
+    mut request: GenerationRequest,
+    console: &Console,
+) -> Result<()> {
+    console.line("  /clear forgets the conversation; /bye or Ctrl-D leaves.");
+    request.messages.clear();
+    loop {
+        let mut stdout = std::io::stdout();
+        write!(stdout, "{}", console.paint("1", ">>> "))?;
+        stdout.flush()?;
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            writeln!(stdout)?;
+            return Ok(());
+        }
+        match line.trim() {
+            "" => continue,
+            "/bye" => return Ok(()),
+            "/clear" => {
+                request.messages.clear();
+                continue;
+            }
+            turn => request.messages.push(ChatMessage::new(Role::User, turn)),
+        }
+        match generate(pipeline, &request, console) {
+            Ok(answer) => request
+                .messages
+                .push(ChatMessage::new(Role::Assistant, answer)),
+            Err(error) => {
+                // The conversation stays usable: the failed turn is simply not part of it.
+                request.messages.pop();
+                let label = console.paint("1;31", "error:");
+                console.line(&format!("{label} {}", describe(&error)));
+            }
+        }
+        request.seed = request.seed.wrapping_add(1);
+    }
+}
+
+/// Stream one answer to stdout, and any reasoning to stderr, then return the answer's text.
+fn generate(
+    pipeline: &mut InferencePipeline,
+    request: &GenerationRequest,
+    console: &Console,
+) -> Result<String> {
     let mut stdout = std::io::stdout().lock();
     let mut output_error = None;
     let mut reasoned = false;
+    let mut answer = String::new();
     let stats = pipeline.run_channels(
-        &request,
+        request,
         |text| {
+            answer.push_str(text);
             if output_error.is_none() {
                 output_error = stdout
                     .write_all(text.as_bytes())
@@ -174,7 +263,7 @@ pub(crate) fn run(mut args: Args, console: &Console) -> Result<()> {
             ),
         ));
     }
-    Ok(())
+    Ok(answer)
 }
 
 #[cfg(test)]
@@ -184,7 +273,7 @@ pub(crate) fn run(mut args: Args, console: &Console) -> Result<()> {
 )]
 mod tests {
     use super::*;
-    use crate::{Command, TurError, config::FileSettings, parse_cli};
+    use crate::{Command, config::FileSettings, parse_cli};
 
     fn arguments(values: &[&str]) -> Result<Args> {
         match parse_cli(values)?.command {
@@ -195,8 +284,9 @@ mod tests {
 
     #[test]
     fn test_generation_defaults_preserve_checkpoint_settings() -> Result<()> {
-        let request = arguments(&["tur", "run"])?.request()?;
-        assert_eq!(request.max_tokens, 128);
+        let request = arguments(&["tur", "run"])?.request("hello".into())?;
+        assert_eq!(request.max_tokens, 1024);
+        assert!(request.fit_context);
         assert_eq!(request.seed, 299_792_458);
         assert!(request.sampling.temperature.is_none());
         assert!(request.render.enable_thinking.is_none());
@@ -223,8 +313,9 @@ mod tests {
         let mut args = arguments(&[
             "tur",
             "run",
-            "--prompt",
+            "qwen",
             "hello",
+            "world",
             "-n",
             "32",
             "--temperature",
@@ -236,14 +327,24 @@ mod tests {
         ])?;
         args.configure(settings);
         assert_eq!(args.pipeline.config(1)?.scheduler.max_chunk, 64);
-        let request = args.request()?;
+        assert_eq!(args.prompt()?.as_deref(), Some("hello world"));
+        let request = args.request("hello world".into())?;
         assert_eq!(request.max_tokens, 32);
+        assert!(!request.fit_context);
         assert_eq!(request.seed, 0);
         assert_eq!(request.sampling.temperature, Some(0.0));
         assert_eq!(request.sampling.top_k, Some(12));
         assert_eq!(request.render.enable_thinking, Some(false));
         assert_eq!(request.render.reasoning_effort.as_deref(), Some("low"));
         assert_eq!(request.render.preserve_thinking, Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn test_prompt_flag_serves_a_model_from_the_file_and_excludes_words() -> Result<()> {
+        let mut args = arguments(&["tur", "run", "--prompt", "hello"])?;
+        assert_eq!(args.prompt()?.as_deref(), Some("hello"));
+        assert!(parse_cli(&["tur", "run", "qwen", "hello", "--prompt", "hi"]).is_err());
         Ok(())
     }
 }

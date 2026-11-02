@@ -7,7 +7,7 @@
 Lists the served chat model, and the transcription model when one is loaded:
 
 ```json
-{"object":"list","data":[{"id":"qwen-hybrid","object":"model","created":1792867193,"owned_by":"tur","revision":"2fc06364715b967f1860aea9cf38778875588b17"}]}
+{"object":"list","data":[{"id":"qwen","object":"model","created":1792867193,"owned_by":"tur","revision":"2fc06364715b967f1860aea9cf38778875588b17"}]}
 ```
 
 `revision` is the checkpoint's immutable revision, so a client can tell exactly what is answering it.
@@ -18,7 +18,7 @@ Lists the served chat model, and the transcription model when one is loaded:
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen-hybrid",
+    "model": "qwen",
     "messages": [{"role": "user", "content": "Say hi"}],
     "max_tokens": 16,
     "temperature": 0,
@@ -73,7 +73,7 @@ Image and video parts are rejected, and so are prompts containing the model's im
   "id": "chatcmpl-5973f2662efe4acba8df912a7343688c",
   "object": "chat.completion",
   "created": 1792867193,
-  "model": "qwen-hybrid",
+  "model": "qwen",
   "choices": [{
     "index": 0,
     "message": {"role": "assistant", "content": "Hello! How can I help you today?"},

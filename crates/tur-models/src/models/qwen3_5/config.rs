@@ -2,6 +2,7 @@
 
 use crate::models::generation::{GenerationDefaults, parse_tokens};
 use crate::models::weights::{Projection, WeightLayout};
+use crate::models::{checkpoint::Adjust, gguf::GgufTensor};
 use candle_core::DType;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -891,6 +892,87 @@ impl WeightLayout for Config {
     }
     fn loads_mtp(&self) -> bool {
         self.mtp()
+    }
+    fn gguf_architectures(&self) -> &'static [&'static str] {
+        if self.moe.is_some() {
+            &["qwen35moe"]
+        } else {
+            &["qwen35"]
+        }
+    }
+    fn gguf_tensor(&self, name: &str) -> Option<GgufTensor> {
+        let stored = |name: String, adjust| Some(GgufTensor::Stored { name, adjust });
+        let prefix = self.text_prefix();
+        match name {
+            "token_embd.weight" => return stored(self.embedding_name(), Adjust::None),
+            "output.weight" => return stored("lm_head.weight".into(), Adjust::None),
+            "output_norm.weight" => {
+                return stored(format!("{prefix}.norm.weight"), Adjust::Uncenter);
+            }
+            _ => {}
+        }
+        let (layer, tensor) = name.strip_prefix("blk.")?.split_once('.')?;
+        // llama.cpp stores the MTP head as one block past the text layers.
+        let draft = layer.parse::<usize>().ok()? == self.layer_kinds().len();
+        if draft && !self.mtp() {
+            return Some(GgufTensor::Ignored);
+        }
+        let p = if draft {
+            "mtp.layers.0".to_owned()
+        } else {
+            format!("{prefix}.layers.{layer}")
+        };
+        match tensor {
+            "nextn.eh_proj.weight" => return stored("mtp.fc.weight".into(), Adjust::None),
+            "nextn.enorm.weight" => {
+                return stored("mtp.pre_fc_norm_embedding.weight".into(), Adjust::Uncenter);
+            }
+            "nextn.hnorm.weight" => {
+                return stored("mtp.pre_fc_norm_hidden.weight".into(), Adjust::Uncenter);
+            }
+            "nextn.shared_head_norm.weight" => {
+                return stored("mtp.norm.weight".into(), Adjust::Uncenter);
+            }
+            _ => {}
+        }
+        let (suffix, adjust) = match tensor {
+            "attn_norm.weight" => ("input_layernorm.weight", Adjust::Uncenter),
+            "post_attention_norm.weight" => ("post_attention_layernorm.weight", Adjust::Uncenter),
+            "attn_q.weight" => ("self_attn.q_proj.weight", Adjust::None),
+            "attn_k.weight" => ("self_attn.k_proj.weight", Adjust::None),
+            "attn_v.weight" => ("self_attn.v_proj.weight", Adjust::None),
+            "attn_output.weight" => ("self_attn.o_proj.weight", Adjust::None),
+            "attn_q_norm.weight" => ("self_attn.q_norm.weight", Adjust::Uncenter),
+            "attn_k_norm.weight" => ("self_attn.k_norm.weight", Adjust::Uncenter),
+            "attn_qkv.weight" => ("linear_attn.in_proj_qkv.weight", Adjust::None),
+            "attn_gate.weight" => ("linear_attn.in_proj_z.weight", Adjust::None),
+            "ssm_beta.weight" => ("linear_attn.in_proj_b.weight", Adjust::None),
+            "ssm_alpha.weight" => ("linear_attn.in_proj_a.weight", Adjust::None),
+            "ssm_out.weight" => ("linear_attn.out_proj.weight", Adjust::None),
+            "ssm_conv1d.weight" => ("linear_attn.conv1d.weight", Adjust::None),
+            "ssm_norm.weight" => ("linear_attn.norm.weight", Adjust::None),
+            "ssm_dt.bias" => ("linear_attn.dt_bias", Adjust::None),
+            "ssm_a" => ("linear_attn.A_log", Adjust::LogNegated),
+            "ffn_gate.weight" => ("mlp.gate_proj.weight", Adjust::None),
+            "ffn_up.weight" => ("mlp.up_proj.weight", Adjust::None),
+            "ffn_down.weight" => ("mlp.down_proj.weight", Adjust::None),
+            "ffn_gate_inp.weight" => ("mlp.gate.weight", Adjust::None),
+            "ffn_gate_exps.weight" => ("mlp.experts.gate_proj", Adjust::None),
+            "ffn_up_exps.weight" => ("mlp.experts.up_proj", Adjust::None),
+            "ffn_down_exps.weight" => ("mlp.experts.down_proj", Adjust::None),
+            "ffn_gate_inp_shexp.weight" => ("mlp.shared_expert_gate.weight", Adjust::None),
+            "ffn_gate_shexp.weight" => ("mlp.shared_expert.gate_proj.weight", Adjust::None),
+            "ffn_up_shexp.weight" => ("mlp.shared_expert.up_proj.weight", Adjust::None),
+            "ffn_down_shexp.weight" => ("mlp.shared_expert.down_proj.weight", Adjust::None),
+            _ => return None,
+        };
+        stored(format!("{p}.{suffix}"), adjust)
+    }
+    fn stored_shapes(&self) -> Result<BTreeMap<String, Vec<usize>>> {
+        self.weight_shapes()
+    }
+    fn embedding_tensor_name(&self) -> String {
+        self.embedding_name()
     }
 }
 

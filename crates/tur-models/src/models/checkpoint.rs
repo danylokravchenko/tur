@@ -7,6 +7,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 use tur_core::{Result, execution::invalid};
+use tur_metal::blocks::BlockFormat;
 
 /// Headers larger than this are rejected before allocation.
 const MAX_HEADER_BYTES: u64 = 256 << 20;
@@ -19,9 +20,59 @@ pub(crate) struct Entry {
     pub(crate) dtype: safetensors::Dtype,
     offset: u64,
     pub(crate) bytes: usize,
+    /// GGUF block format of a tensor stored as blocks; `dtype` then says nothing.
+    blocks: Option<BlockFormat>,
+    adjust: Adjust,
+}
+
+/// What undoes a conversion llama.cpp applies to a small tensor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Adjust {
+    None,
+    /// RMS norms hold `weight + 1` in GGUF, where checkpoints hold the centered weight.
+    Uncenter,
+    /// `DeltaNet` decay holds `-exp(A_log)` in GGUF.
+    LogNegated,
 }
 
 impl Entry {
+    /// A GGUF tensor: F32, F16 and BF16 read as ordinary tensors, others as blocks.
+    pub(crate) fn stored(
+        file: usize,
+        shape: Vec<usize>,
+        format: BlockFormat,
+        offset: u64,
+        bytes: usize,
+        adjust: Adjust,
+    ) -> Self {
+        let (dtype, blocks) = match format {
+            BlockFormat::F32 => (safetensors::Dtype::F32, None),
+            BlockFormat::F16 => (safetensors::Dtype::F16, None),
+            BlockFormat::Bf16 => (safetensors::Dtype::BF16, None),
+            packed => (safetensors::Dtype::U8, Some(packed)),
+        };
+        Self {
+            file,
+            shape,
+            dtype,
+            offset,
+            bytes,
+            blocks,
+            adjust,
+        }
+    }
+
+    /// The format this tensor's bytes are stored in.
+    pub(crate) fn stored_format(&self) -> Result<BlockFormat> {
+        match (self.blocks, self.dtype) {
+            (Some(format), _) => Ok(format),
+            (None, safetensors::Dtype::F32) => Ok(BlockFormat::F32),
+            (None, safetensors::Dtype::F16) => Ok(BlockFormat::F16),
+            (None, safetensors::Dtype::BF16) => Ok(BlockFormat::Bf16),
+            (None, dtype) => Err(invalid(format!("no block format for {dtype:?}"))),
+        }
+    }
+
     /// Candle element type of a readable tensor.
     pub(crate) fn candle_dtype(&self, name: &str) -> Result<DType> {
         match self.dtype {
@@ -124,6 +175,8 @@ impl Checkpoint {
                         .checked_add(info.data_offsets.0 as u64)
                         .ok_or_else(|| invalid("weight offset overflow"))?,
                     bytes: info.data_offsets.1 - info.data_offsets.0,
+                    blocks: None,
+                    adjust: Adjust::None,
                 };
                 if entries.insert(name.clone(), entry).is_some() {
                     return Err(invalid(format!("duplicate tensor {name}")));
@@ -169,8 +222,19 @@ impl Checkpoint {
         Ok(checkpoint)
     }
 
+    /// Tensors already located in `files`, as a GGUF header lists them.
+    pub(crate) fn from_entries(files: Vec<PathBuf>, entries: BTreeMap<String, Entry>) -> Self {
+        Self { files, entries }
+    }
+
     pub(crate) fn entries(&self) -> &BTreeMap<String, Entry> {
         &self.entries
+    }
+
+    pub(crate) fn entry(&self, name: &str) -> Result<&Entry> {
+        self.entries
+            .get(name)
+            .ok_or_else(|| invalid(format!("missing tensor {name}")))
     }
 
     fn locate(&self, name: &str) -> Result<(Entry, std::fs::File)> {
@@ -222,12 +286,27 @@ impl Checkpoint {
     /// Read this tensor onto the host in its stored element type.
     pub(crate) fn take(&self, name: &str) -> Result<Tensor> {
         let (entry, bytes) = self.take_raw(name)?;
-        Ok(Tensor::from_raw_buffer(
-            &bytes,
-            entry.candle_dtype(name)?,
-            &entry.shape,
-            &Device::Cpu,
-        )?)
+        let tensor = match entry.blocks {
+            Some(format) => {
+                let cols = entry.shape.last().copied().unwrap_or(1);
+                Tensor::from_vec(
+                    format.decode(&bytes, cols)?,
+                    entry.shape.as_slice(),
+                    &Device::Cpu,
+                )?
+            }
+            None => Tensor::from_raw_buffer(
+                &bytes,
+                entry.candle_dtype(name)?,
+                &entry.shape,
+                &Device::Cpu,
+            )?,
+        };
+        Ok(match entry.adjust {
+            Adjust::None => tensor,
+            Adjust::Uncenter => (tensor.to_dtype(DType::F32)? - 1.0)?,
+            Adjust::LogNegated => tensor.to_dtype(DType::F32)?.neg()?.log()?,
+        })
     }
 
     /// Gather only requested embedding rows, preserving token order and repetitions.
@@ -269,13 +348,20 @@ impl Checkpoint {
     /// projection needs its full-precision payload in host memory at once.
     pub(crate) fn take_rows(&self, name: &str, chunk: usize) -> Result<Rows> {
         let (entry, file) = self.locate(name)?;
-        let dtype = entry.candle_dtype(name)?;
         let (rows, cols) = match entry.shape.as_slice() {
             [rows, cols] => (*rows, *cols),
             [count, rows, cols] => (count * rows, *cols),
             _ => return Err(invalid(format!("{name} is not a matrix"))),
         };
-        if chunk == 0 || rows * cols * dtype.size_in_bytes() != entry.bytes {
+        let dtype = match entry.blocks {
+            Some(_) => DType::F32,
+            None => entry.candle_dtype(name)?,
+        };
+        let row_bytes = match entry.blocks {
+            Some(format) => format.bytes(1, cols)?,
+            None => cols * dtype.size_in_bytes(),
+        };
+        if chunk == 0 || rows * row_bytes != entry.bytes {
             return Err(invalid(format!("{name} cannot be read in row chunks")));
         }
         Ok(Rows {
@@ -284,6 +370,8 @@ impl Checkpoint {
             cols,
             chunk,
             remaining: rows,
+            blocks: entry.blocks,
+            row_bytes,
         })
     }
 }
@@ -295,6 +383,9 @@ pub(crate) struct Rows {
     cols: usize,
     chunk: usize,
     remaining: usize,
+    /// Decoded to F32 as they are read.
+    blocks: Option<BlockFormat>,
+    row_bytes: usize,
 }
 
 impl Iterator for Rows {
@@ -306,18 +397,23 @@ impl Iterator for Rows {
         }
         let rows = self.chunk.min(self.remaining);
         self.remaining -= rows;
-        let mut bytes = vec![0u8; rows * self.cols * self.dtype.size_in_bytes()];
+        let mut bytes = vec![0u8; rows * self.row_bytes];
         Some(
             self.file
                 .read_exact(&mut bytes)
                 .map_err(Into::into)
-                .and_then(|()| {
-                    Ok(Tensor::from_raw_buffer(
+                .and_then(|()| match self.blocks {
+                    Some(format) => Ok(Tensor::from_vec(
+                        format.decode(&bytes, self.cols)?,
+                        (rows, self.cols),
+                        &Device::Cpu,
+                    )?),
+                    None => Ok(Tensor::from_raw_buffer(
                         &bytes,
                         self.dtype,
                         &[rows, self.cols],
                         &Device::Cpu,
-                    )?)
+                    )?),
                 }),
         )
     }

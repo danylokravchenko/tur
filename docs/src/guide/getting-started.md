@@ -55,7 +55,7 @@ The binary is `target/release/tur`. Metal support is on by default. `--no-defaul
 
 ## Get a checkpoint
 
-Tur loads SafeTensors checkpoints from a local directory or from Hugging Face. A checkpoint directory contains:
+Tur loads SafeTensors checkpoints from a local directory or from Hugging Face, and can take its weights from a [GGUF file](gguf.md) instead. A checkpoint directory contains:
 
 | File | Required | Purpose |
 | --- | --- | --- |
@@ -68,26 +68,32 @@ Tur loads SafeTensors checkpoints from a local directory or from Hugging Face. A
 
 Tur identifies the architecture from the config's `model_type` and `architectures` fields, never from the model's name. An unsupported architecture, setting or tensor layout fails before any weight is read.
 
-For a remote checkpoint, give the repository as `organization/name` and pin a 40-character commit. Branch names are rejected because they can move. Downloads use the standard Hugging Face cache and honor `HF_HOME` and `HF_TOKEN`. For a local directory, the revision is a name you choose; Tur records it with prefix-cache entries and prepacked artifacts so they never mix with another model's.
+`tur run` and `tur serve` take one of three things:
+
+| You write | Tur loads | Revision |
+| --- | --- | --- |
+| A name from `tur list`, such as `qwen` | That model, with settings measured for it | The commit the name is pinned to |
+| `organization/name` | That Hugging Face repository | Its latest commit, printed so you can pin it with `--revision` |
+| A directory | The checkpoint in it | The directory's name |
+
+`--revision` overrides any of these. A remote revision must be a 40-character commit: branch names are rejected because they can move. Downloads use the standard Hugging Face cache and honor `HF_HOME` and `HF_TOKEN`. Starting a remote model needs the network even once it is cached, because Tur confirms the commit with Hugging Face, so run a directory for offline use. For a directory, the revision is only a label: Tur records it with prefix-cache entries and prepacked artifacts so they never mix with another model's.
+
+A name wins over a directory of the same name, so write `./qwen` for a directory called `qwen`.
 
 ## First generation
 
 ```sh
-tur run \
-  --model Qwen/Qwen3.5-0.8B \
-  --revision 2fc06364715b967f1860aea9cf38778875588b17 \
-  --prompt 'Write one sentence about the Moon.' \
-  --temperature 0 --max-tokens 64
+tur run qwen 'Write one sentence about the Moon.' --temperature 0 --max-tokens 64
 ```
 
-Text streams to stdout. Logs, including the memory plan and timing, go to stderr; set `RUST_LOG=debug` for more.
+Text streams to stdout. Logs, including the memory plan and timing, go to stderr; set `RUST_LOG=debug` for more. Leave out the prompt to chat instead.
 
-The `justfile` pins the same checkpoint, so `just run --prompt 'Hello' -n 32` does the same thing. `TUR_MODEL` and `TUR_REVISION` override it.
+The `justfile` pins the same checkpoint, so `just run 'Hello' -n 32` does the same thing. `TUR_MODEL` and `TUR_REVISION` change which checkpoint its recipes pass; `tur` itself doesn't read them.
 
 ## First server
 
 ```sh
-tur serve --model /path/to/checkpoint --revision my-checkpoint
+tur serve qwen
 
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
@@ -100,3 +106,5 @@ The server loads and validates the model before it opens the port, so once it is
 
 - The toolchain is pinned to Rust 1.99 with rustfmt and Clippy. That matches the workspace's minimum Rust version and supplies every tool `just ci` uses.
 - Installation goes through `cargo install --locked`, so the CLI builds from the checked-in dependency graph and honors Cargo's usual destination options.
+- Short names map to pinned commits rather than to a branch, so a name keeps the reproducibility that a typed commit gave. The list holds only checkpoints Tur has generated from on full weights at those commits, because a name implies that it works. Qwen3.8-27B and Qwen3.6-35B-A3B also ran, but only as prepacked artifacts, and they stay out until a command that needs no separate quantization step has run.
+- A repository without `--revision` resolves to its latest commit once per start and prints it. Refusing would send people back to looking up a commit by hand, and the printed flag is one paste away from the old guarantee.

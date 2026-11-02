@@ -4,7 +4,7 @@
 //! device completion.
 //!
 //! `TUR_BENCH_MODEL=<snapshot> cargo bench --offline -p tur --bench perf -- model > out.json`
-//! narrows with `TUR_BENCH_FORMATS=q8_0,q4k` (entries may also be prepacked artifact directories), `TUR_BENCH_KV=f32,q8`, `TUR_BENCH_PAGES=16,64`,
+//! narrows with `TUR_BENCH_FORMATS=q8_0,q4k` (entries may also be prepacked artifact directories or `.gguf` files), `TUR_BENCH_KV=f32,q8`, `TUR_BENCH_PAGES=16,64`,
 //! `TUR_BENCH_PREFILL=128,2048` and `TUR_BENCH_CONTEXTS=2048,8192`. `TUR_BENCH_REFERENCE=1`
 //! adds the F32 reference execution with F32 K/V. `TUR_BENCH_ONLY=prefill,decode,engine`
 //! selects cases and `TUR_BENCH_ENGINE_TOKENS=32` sets the engine case's length.
@@ -29,7 +29,7 @@ use tur_engine::hybrid::{
 };
 use tur_models::models::TextModel;
 use tur_models::models::{Execution, LoadOptions, WeightFormat, Weights, parse_recurrent_state};
-use tur_models::models::{Manifest, is_artifact};
+use tur_models::models::{GgufFile, Manifest, is_artifact};
 
 const SHORT_CONTEXT: usize = 128;
 const DECODE_STEPS: usize = 12;
@@ -351,7 +351,13 @@ pub(crate) fn run() -> Result<()> {
         .ok_or_else(|| invalid("TUR_BENCH_ENGINE_TOKENS"))?;
     let mut runs = Vec::new();
     for name in env_list("TUR_BENCH_FORMATS", "q8_0,q4k") {
-        let (source, weights) = if is_artifact(Path::new(&name)) {
+        let (source, weights) = if Path::new(&name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        {
+            let file = GgufFile::open(Path::new(&name))?;
+            (dir.clone(), Weights::Gguf(Arc::new(file)))
+        } else if is_artifact(Path::new(&name)) {
             let source = PathBuf::from(&name);
             let manifest = Manifest::read(&source)?;
             (source, Weights::Prepacked(Arc::new(manifest)))

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Projection weights kept in their packed storage format.
 
+use crate::blocks::BlockFormat;
 use candle_core::{
     DType, Device, Module, Tensor,
     quantized::{GgmlDType, QMatMul, QStorage, QTensor},
@@ -27,12 +28,28 @@ enum Weights {
         buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
         scales: usize,
     },
-    /// GGML blocks in an arena the expert cache fills; the expert kernels read them in place.
+    /// Blocks in an arena the expert cache fills; the expert kernels read them in place.
     #[cfg(feature = "metal")]
     Arena {
         buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
-        format: GgmlDType,
+        format: BlockFormat,
     },
+    /// Blocks in a format Candle does not know, which only the block kernels read.
+    #[cfg(feature = "metal")]
+    Blocks {
+        buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
+        format: BlockFormat,
+    },
+    /// Runs of rows in differing formats, each its own weights on its own fastest kernel;
+    /// their outputs concatenate.
+    Stack(Vec<PackedLinear>),
+}
+
+/// One stored part of a projection, as a GGUF file holds it.
+pub struct StoredPart {
+    pub format: BlockFormat,
+    pub rows: usize,
+    pub bytes: Vec<u8>,
 }
 
 /// A `[out, in]` projection whose weights stay packed on the device; never expanded.
@@ -102,6 +119,78 @@ impl PackedLinear {
         })
     }
 
+    /// A projection of stored `parts` stacked along output rows, keeping each part's bytes
+    /// and so its memory. Adjacent parts in one format join into one run.
+    pub fn from_parts(parts: Vec<StoredPart>, cols: usize, device: &Device) -> Result<Self> {
+        let mut runs: Vec<StoredPart> = Vec::with_capacity(parts.len());
+        for part in parts {
+            if part.bytes.len() != part.format.bytes(part.rows, cols)? {
+                return Err(invalid(format!(
+                    "{} bytes do not form {} rows of {cols} {} values",
+                    part.bytes.len(),
+                    part.rows,
+                    part.format.name()
+                )));
+            }
+            match runs.last_mut() {
+                Some(run) if run.format == part.format => {
+                    run.rows += part.rows;
+                    run.bytes.extend_from_slice(&part.bytes);
+                }
+                _ => runs.push(part),
+            }
+        }
+        let rows = runs.iter().map(|run| run.rows).sum::<usize>();
+        if rows == 0 {
+            return Err(invalid("a projection needs at least one row"));
+        }
+        let stacked = runs.len() > 1;
+        let mut layers = runs
+            .iter()
+            .map(|run| Self::from_run(run, cols, stacked, device))
+            .collect::<Result<Vec<_>>>()?;
+        if layers.len() == 1 {
+            return layers.pop().ok_or_else(|| invalid("no projection run"));
+        }
+        Ok(Self {
+            resident_bytes: layers.iter().map(Self::resident_bytes).sum(),
+            weights: Weights::Stack(layers),
+            out_features: rows,
+            in_features: cols,
+        })
+    }
+
+    /// One format's rows: an ordinary tensor where Candle knows the format, blocks for the
+    /// block kernels on Metal when rows tile into 32-value chunks, and dense F32 otherwise.
+    /// F32 stays blocks within a stack, so wide batches can write the stack's one output.
+    fn from_run(run: &StoredPart, cols: usize, stacked: bool, device: &Device) -> Result<Self> {
+        if let Some(format) = run.format.candle() {
+            return Self::from_blocks(&run.bytes, format, (run.rows, cols), device);
+        }
+        #[cfg(feature = "metal")]
+        if let Device::Metal(metal) = device
+            && (stacked || run.format != BlockFormat::F32)
+            && run.format.tiles(cols)
+        {
+            return Ok(Self {
+                weights: Weights::Blocks {
+                    buffer: metal.new_buffer_with_data(&run.bytes)?,
+                    format: run.format,
+                },
+                out_features: run.rows,
+                in_features: cols,
+                resident_bytes: run.bytes.len(),
+            });
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = stacked;
+        let values = run.format.decode(&run.bytes, cols)?;
+        Self::dense(
+            &Tensor::from_vec(values, (run.rows, cols), &Device::Cpu)?,
+            device,
+        )
+    }
+
     /// A `[rows, cols]` expert bank in MXFP4 on `device`: read in place by the expert
     /// kernels on Metal, and decoded to F32 for host reference execution.
     pub fn mxfp4(
@@ -162,14 +251,14 @@ impl PackedLinear {
         })
     }
 
-    /// GGML-block weights over an arena the expert cache fills after this returns.
+    /// Block weights over an arena the expert cache fills after this returns.
     #[cfg(feature = "metal")]
     pub(crate) fn packed_arena(
         buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
-        format: GgmlDType,
+        format: BlockFormat,
         (rows, cols): (usize, usize),
     ) -> Result<Self> {
-        let resident_bytes = crate::quantize::packed_bytes(format, rows, cols)?;
+        let resident_bytes = format.bytes(rows, cols)?;
         if rows == 0 || buffer.length() < resident_bytes {
             return Err(invalid("expert arena is smaller than its projection"));
         }
@@ -290,7 +379,7 @@ impl PackedLinear {
         match &self.weights {
             Weights::Packed { format, .. } => Some(*format),
             #[cfg(feature = "metal")]
-            Weights::Arena { format, .. } => Some(*format),
+            Weights::Arena { format, .. } => format.candle(),
             _ => None,
         }
     }
@@ -301,7 +390,16 @@ impl PackedLinear {
             Weights::Dense(weight) => x.matmul(&weight.t()?)?,
             Weights::Packed { matmul, .. } => matmul.forward(x)?,
             #[cfg(feature = "metal")]
-            Weights::Mxfp4 { .. } | Weights::Arena { .. } => return Err(host_read()),
+            Weights::Mxfp4 { .. } | Weights::Arena { .. } | Weights::Blocks { .. } => {
+                return Err(host_read());
+            }
+            Weights::Stack(parts) => {
+                let outputs = parts
+                    .iter()
+                    .map(|part| part.forward(x))
+                    .collect::<Result<Vec<_>>>()?;
+                Tensor::cat(&outputs, candle_core::D::Minus1)?
+            }
         })
     }
 
@@ -335,7 +433,22 @@ impl PackedLinear {
             }
             Weights::Packed { matmul, .. } => matmul.forward(x)?.narrow(1, start, rows)?,
             #[cfg(feature = "metal")]
-            Weights::Mxfp4 { .. } | Weights::Arena { .. } => return Err(host_read()),
+            Weights::Mxfp4 { .. } | Weights::Arena { .. } | Weights::Blocks { .. } => {
+                return Err(host_read());
+            }
+            Weights::Stack(parts) => {
+                let (mut first, mut outputs) = (0, Vec::new());
+                for part in parts {
+                    let end = first + part.out_features;
+                    if first < start + rows && start < end {
+                        let from = start.max(first);
+                        let count = (start + rows).min(end) - from;
+                        outputs.push(part.forward_rows(x, from - first, count)?);
+                    }
+                    first = end;
+                }
+                Tensor::cat(&outputs, candle_core::D::Minus1)?
+            }
         })
     }
 
@@ -395,7 +508,7 @@ impl PackedLinear {
                 format,
                 ..
             } => Some((buffer, *format)),
-            Weights::Arena { buffer, format } => Some((buffer.as_ref(), *format)),
+            Weights::Arena { buffer, format } => Some((buffer.as_ref(), format.candle()?)),
             _ => None,
         }
     }
@@ -403,6 +516,27 @@ impl PackedLinear {
 
 #[cfg(feature = "metal")]
 impl PackedLinear {
+    /// Buffer and format of weights only the block kernels read.
+    pub(crate) fn block_buffer(
+        &self,
+    ) -> Option<(&candle_metal_kernels::metal::Buffer, BlockFormat)> {
+        match &self.weights {
+            Weights::Blocks { buffer, format } => Some((buffer.as_ref(), *format)),
+            Weights::Arena { buffer, format } if format.candle().is_none() => {
+                Some((buffer.as_ref(), *format))
+            }
+            _ => None,
+        }
+    }
+
+    /// Runs of a projection mixing formats, each with its own weights.
+    pub(crate) fn stack(&self) -> Option<&[Self]> {
+        match &self.weights {
+            Weights::Stack(parts) => Some(parts),
+            _ => None,
+        }
+    }
+
     /// MXFP4 buffer and the byte offset of its scales, when these weights are in MXFP4.
     pub(crate) fn mxfp4_buffer(&self) -> Option<(&candle_metal_kernels::metal::Buffer, usize)> {
         match &self.weights {

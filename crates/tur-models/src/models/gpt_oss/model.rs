@@ -358,12 +358,11 @@ impl GptOss {
         if let (Placement::Cached, Some(cache)) = (placement, options.expert_cache) {
             use tur_metal::experts::ExpertCache;
             let (experts, gate_up, down) = config.bank_shapes();
-            let slots = ExpertCache::planned_slots(cache, experts, gate_up, down)?;
-            let arena = checked_elements(&[slots, ExpertCache::expert_bytes(gate_up, down)?])?;
+            let layers = vec![[gate_up, down]; config.layers()];
             weights = weights
-                .checked_add(arena)
+                .checked_add(ExpertCache::planned_bytes(cache, experts, &layers)?)
                 .ok_or_else(|| invalid("gpt-oss weight bytes overflow"))?;
-            staging = ExpertCache::staging_bytes(gate_up, down)?;
+            staging = ExpertCache::staging_bytes(&layers)?;
         }
         #[cfg(feature = "metal")]
         let split = if options.device.is_metal() {
@@ -959,11 +958,10 @@ impl GptOss {
         let experts = t.num_local_experts;
         let routes = k.route(logits, experts)?;
         let (routes, gate_up_bank, down_bank) = match (&self.cache, &e.banks) {
-            (Some(cache), _) => (
-                cache.route(k, index, routes, None)?,
-                cache.gate_up(),
-                cache.down(),
-            ),
+            (Some(cache), _) => {
+                let [gate_up, down] = cache.arenas(index)?;
+                (cache.route(k, index, routes, None)?, gate_up, down)
+            }
             (None, Some((gate_up, down))) => (routes, gate_up, down),
             (None, None) => return Err(invalid("experts have no weights")),
         };
@@ -1228,11 +1226,11 @@ impl GptOss {
             _ => None,
         };
         let (routes, gate_up_bank, down_bank) = match (&self.cache, &e.banks) {
-            (Some(cache), _) => (
-                cache.route(k, index, routes, next_logits.as_ref())?,
-                cache.gate_up(),
-                cache.down(),
-            ),
+            (Some(cache), _) => {
+                let [gate_up, down] = cache.arenas(index)?;
+                let routes = cache.route(k, index, routes, next_logits.as_ref())?;
+                (routes, gate_up, down)
+            }
             (None, Some((gate_up, down))) => (routes, gate_up, down),
             (None, None) => return Err(invalid("experts have no weights")),
         };

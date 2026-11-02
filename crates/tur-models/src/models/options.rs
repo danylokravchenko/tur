@@ -1,6 +1,7 @@
 //! Placement and execution settings shared by text models.
 use super::{
     artifact::Manifest,
+    gguf::GgufFile,
     weights::{WeightLayout, WeightPlan},
 };
 use candle_core::{DType, Device};
@@ -54,6 +55,8 @@ pub enum Weights {
     /// Upload the directory's prepacked artifact as stored. The manifest, read when the
     /// load was planned, must still describe the artifact.
     Prepacked(Arc<Manifest>),
+    /// Upload a GGUF file's tensors as stored, in whatever formats it mixes.
+    Gguf(Arc<GgufFile>),
 }
 
 impl From<WeightFormat> for Weights {
@@ -69,6 +72,7 @@ impl Weights {
             Self::Uniform(format) => WeightPlan::uniform(config, *format),
             Self::Plan(plan) => Ok(plan.as_ref().clone()),
             Self::Prepacked(manifest) => Ok(manifest.plan.clone()),
+            Self::Gguf(file) => file.plan(config),
         }
     }
 
@@ -78,6 +82,7 @@ impl Weights {
             Self::Uniform(format) => format.tag().to_owned(),
             Self::Plan(plan) => plan.tag(),
             Self::Prepacked(manifest) => manifest.identity(),
+            Self::Gguf(file) => file.identity(),
         }
     }
 }
@@ -137,8 +142,8 @@ pub struct LoadOptions {
     /// hold the text tower only and load without it.
     pub audio: bool,
     /// Device bytes of a bounded expert cache: routed experts stay on disk and are read on
-    /// demand into this many bytes of slots. Serves gpt-oss checkpoints and Qwen `MoE`
-    /// artifacts. `None` keeps every expert resident.
+    /// demand into this many bytes of slots. Serves gpt-oss checkpoints, and Qwen `MoE`
+    /// artifacts and GGUF files. `None` keeps every expert resident.
     pub expert_cache: Option<usize>,
 }
 
