@@ -40,6 +40,7 @@ fn cached(entries: usize) -> PipelineConfig {
             entries,
             state_share: None,
             restorable_first: false,
+            tool_hold: Duration::ZERO,
         },
         ..PipelineConfig::new(4, 64)
     }
@@ -465,6 +466,7 @@ fn test_restorable_requests_pass_older_cold_ones_only_when_enabled() -> Result<(
                 entries: 16,
                 state_share: None,
                 restorable_first,
+                tool_hold: Duration::ZERO,
             },
             ..PipelineConfig::new(2, 64)
         };

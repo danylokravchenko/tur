@@ -51,6 +51,7 @@ impl PipelineConfig {
                 entries: max_batch_size,
                 state_share: Some(PrefixConfig::DEFAULT_STATE_SHARE),
                 restorable_first: false,
+                tool_hold: PrefixConfig::DEFAULT_TOOL_HOLD,
             },
             device_sampling: true,
             speculation: SpeculationConfig::DISABLED,

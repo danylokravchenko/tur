@@ -4,7 +4,11 @@
 
 use candle_core::{DType, Device};
 use serde_json::{Value, json};
-use std::{hint::black_box, sync::Arc, time::Instant};
+use std::{
+    hint::black_box,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tur_core::{
     Result,
     execution::{KvFormat, KvLayout, LayerStateKind, Modality, ModelDescription, ModelIdentity},
@@ -90,6 +94,7 @@ pub(crate) fn run() -> Result<()> {
                 entries,
                 state_share: None,
                 restorable_first: false,
+                tool_hold: Duration::ZERO,
             });
             // Fill the cache with snapshots of other prompts at their deepest boundary,
             // and one of the probed prompt's own first half.

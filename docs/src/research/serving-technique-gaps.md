@@ -2,11 +2,11 @@
 
 Created: 2026-11-01. Status: research backlog; what remains here hasn't been built or measured in Tur.
 
-This page compares Tur with vLLM, llama.cpp, SGLang, oMLX, BaseRT and recent papers, and lists techniques Tur lacks. Tur's existing work (chunked prefill, prefix snapshots, device sampling, exact speculation, the expert cache) is left out, and so are table-based drafters, which were tried and [rejected](../design/rejected.md). Every number comes from its source, on that source's hardware and models, and doesn't predict Tur's results. The order is a judgment of value against effort.
+This page compares Tur with vLLM, llama.cpp, SGLang, oMLX, BaseRT and recent papers, and lists techniques Tur lacks. Tur's existing work (chunked prefill, prefix snapshots and their [hold across tool calls](../architecture/prefix-reuse.md#retention-and-eviction), device sampling, exact speculation, the expert cache) is left out, and so are table-based drafters, which were tried and [rejected](../design/rejected.md). Every number comes from its source, on that source's hardware and models, and doesn't predict Tur's results. The order is a judgment of value against effort.
 
 ## Build first
 
-These keep output exact and cost little to try.
+This keeps output exact and costs little to try.
 
 ### Request ordering beyond arrival order
 
@@ -15,10 +15,6 @@ Prompts run in arrival order, with no priorities or per-client fairness. The ten
 Remaining prompt length is known exactly, so the scheduler could run the shortest remaining prompt first and keep `max_queue_wait` as the bound on starvation. This is a proposal for Tur rather than a published result. The nearest evidence is [Learning to Rank](https://arxiv.org/abs/2408.15792v1), which reports 2.8× lower chatbot latency by approximating shortest-job-first, using a small helper model to rank output lengths.
 
 If several clients share one Mac, three designs apply. [Niyama](https://arxiv.org/abs/2503.22562v1) blends earliest-deadline-first with shortest-job-first across service classes, which would separate interactive from batch work. [VTC](https://arxiv.org/pdf/2401.00588) gives per-client fairness counted in tokens, with a 2× bound on the service gap between backlogged clients. [Autellix](https://arxiv.org/abs/2502.13965v1) favors agent programs that have received the least total service, and reports 4 to 15× higher program throughput at the same latency.
-
-### Keeping state across tool calls
-
-[InferCept](https://arxiv.org/abs/2402.01869v2) reports that recomputing context after external calls takes 37 to 40% of forward time, and [Tokencake](https://arxiv.org/abs/2510.18586v1) targets the same idle state. Tur already keeps a zero-copy snapshot at the end of each request, which removes most of that cost until eviction takes it. A response ending in `finish_reason=tool_calls` is a strong sign that the conversation will return, so eviction could protect that snapshot for a bounded time.
 
 ## Measure before committing
 

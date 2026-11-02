@@ -357,16 +357,18 @@ fn run_counting_passes(
     }
 }
 
-#[test]
-fn test_forced_tokens_skip_passes_and_leave_same_seed_outputs_unchanged() -> Result<()> {
-    use tur::backend::guidance::TopLevelGrammar;
+/// A fused checkpoint whose tokenizer can spell forced text and tool-call markup.
+fn spelling_checkpoint() -> Result<common::Checkpoint> {
     let checkpoint = common::Checkpoint::fused()?;
     // Forcing tokenizes the forced text, which the fixture's whole-word tokenizer can't do.
     // Letters as tokens can, at the same vocabulary size.
     let letters: Vec<String> = (b'a'..=b'z').map(|c| (c as char).to_string()).collect();
     let mut vocab = serde_json::Map::new();
     vocab.insert("<eos>".into(), 0.into());
-    let words = letters.iter().cloned().chain(
+    // The fixture's EOS ids are the lowest, so spelled tokens start above them.
+    let reserved = (b'A'..=b'H').map(|c| (c as char).to_string());
+    let markup = ["<", ">", "/", "=", "_"].map(str::to_owned);
+    let words = reserved.chain(letters.iter().cloned()).chain(markup).chain(
         letters
             .iter()
             .flat_map(|a| letters.iter().map(move |b| format!("{a}{b}"))),
@@ -388,6 +390,13 @@ fn test_forced_tokens_skip_passes_and_leave_same_seed_outputs_unchanged() -> Res
         "model": {"type":"BPE", "merges":[], "vocab": vocab, "unk_token":"<eos>"}
     });
     std::fs::write(checkpoint.0.join("tokenizer.json"), tokenizer.to_string())?;
+    Ok(checkpoint)
+}
+
+#[test]
+fn test_forced_tokens_skip_passes_and_leave_same_seed_outputs_unchanged() -> Result<()> {
+    use tur::backend::guidance::TopLevelGrammar;
+    let checkpoint = spelling_checkpoint()?;
     let mut factory = checkpoint.factory();
     factory.device = Device::new_metal(0)?;
     let mut config = PipelineConfig::new(2, 8);
@@ -410,6 +419,69 @@ fn test_forced_tokens_skip_passes_and_leave_same_seed_outputs_unchanged() -> Res
             forced_passes < sampled_passes,
             "seed {seed}: {forced_passes} forced passes, {sampled_passes} sampled"
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_forced_outputs_wait_for_the_prompt_and_leave_its_snapshot() -> Result<()> {
+    use tur::backend::guidance::TopLevelGrammar;
+    let checkpoint = spelling_checkpoint()?;
+    let mut factory = checkpoint.factory();
+    factory.device = Device::new_metal(0)?;
+    let mut pipeline = InferencePipeline::new(&factory, PipelineConfig::new(2, 8))?;
+    // Several 8-token chunks, so outputs forced after the first would precede most of it.
+    let mut request = GenerationRequest::new("abcdefgh".repeat(5), 8);
+    request.grammar = Some(TopLevelGrammar::from_regex("cdef"));
+    let first = pipeline.run(&request, |_| {})?;
+    let repeat = pipeline.run(&request, |_| {})?;
+    assert_eq!(repeat.generated_text, first.generated_text);
+    assert_eq!(first.cached_tokens, 0);
+    assert_eq!(repeat.cached_tokens, repeat.prompt_tokens);
+    Ok(())
+}
+
+#[test]
+fn test_a_tool_calling_reply_keeps_its_snapshots_through_other_traffic() -> Result<()> {
+    use std::time::Duration;
+    use tur::backend::{guidance::TopLevelGrammar, tools::ToolDefinition};
+    let checkpoint = spelling_checkpoint()?;
+    let mut factory = checkpoint.factory();
+    factory.device = Device::new_metal(0)?;
+    let tool = ToolDefinition::new("f", "", serde_json::json!({"type": "object"}));
+    for (tools, hold, kept) in [
+        (vec![tool.clone()], Duration::from_secs(600), true),
+        (vec![tool], Duration::ZERO, false),
+        // A reply that calls no tool earns no hold.
+        (Vec::new(), Duration::from_secs(600), false),
+    ] {
+        let mut config = PipelineConfig::new(2, 8);
+        config.prefix.entries = 4;
+        config.prefix.state_share = None;
+        config.prefix.tool_hold = hold;
+        let mut pipeline = InferencePipeline::new(&factory, config)?;
+        let mut call = GenerationRequest::new("abcdefgh".repeat(3), 48);
+        call.tools = tools;
+        call.grammar = Some(TopLevelGrammar::from_regex(
+            "<tool_call><function=f></function></tool_call>",
+        ));
+        let first = pipeline.run(&call, |_| {})?;
+        assert_eq!(first.tool_calls.len(), usize::from(!call.tools.is_empty()));
+        // The same forced reply behind longer prompts: each snapshot saves more than the
+        // call's own, so only a hold keeps those.
+        for start in 0..8u8 {
+            let mut other = GenerationRequest::new(
+                (0..40)
+                    .map(|i| (b'i' + (start * 2 + i) % 18) as char)
+                    .collect(),
+                48,
+            );
+            other.grammar.clone_from(&call.grammar);
+            pipeline.run(&other, |_| {})?;
+        }
+        let again = pipeline.run(&call, |_| {})?;
+        let expected = if kept { again.prompt_tokens } else { 0 };
+        assert_eq!(again.cached_tokens, expected, "hold {hold:?}");
     }
     Ok(())
 }

@@ -705,8 +705,8 @@ impl InferencePipeline {
             }
         }
         // Tokens its grammar alone decides join the outputs here, and the next pass reads them
-        // as inputs, as it reads a prompt's.
-        while !finished {
+        // as inputs, as it reads a prompt's. Outputs start only once the prompt is consumed.
+        while !finished && pending.consumed >= pending.prompt_tokens {
             match self.engine.force_output(pending.handle)? {
                 Forced::Sample => break,
                 Forced::Stop => finished = true,
@@ -769,6 +769,19 @@ impl InferencePipeline {
             self.prefix.extend(&mut pending.keys, consumed);
             let state = self.engine.model_state(pending.handle)?;
             self.prefix.insert(&pending.keys, consumed, &state, None)?;
+            if !stats.tool_calls.is_empty() {
+                // The caller is coming back once the tools ran. How far it matches depends on
+                // how its template renders this reply: to the reply's end if unchanged, to the
+                // prompt's end if only the reply changes, and otherwise to where history is
+                // rewritten, or the aligned snapshot before a first turn's prompt end.
+                let rewrite = pending.turn_boundary.unwrap_or_else(|| {
+                    let last = pending.prompt_tokens.saturating_sub(1);
+                    self.prefix.reachable(last, pending.prompt_tokens)
+                });
+                let lengths = [pending.consumed, pending.prompt_tokens, rewrite];
+                let until = Instant::now() + self.prefix.config().tool_hold;
+                self.prefix.hold(&pending.keys, consumed, &lengths, until);
+            }
         }
         self.engine.cancel(pending.handle)?;
         self.pending.remove(&id);

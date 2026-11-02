@@ -14,6 +14,7 @@
 //! (`TUR_BENCH_PREFIX_ENTRIES=8` changes their snapshot capacity; default 16), and
 //! `TUR_BENCH_WORKLOADS=reuse` runs the prefix-scheduling ones on default pipelines
 //! (`TUR_BENCH_RESTORABLE_FIRST=1` admits restorable prefixes first);
+//! `TUR_BENCH_WORKLOADS=tools` compares tool-call follow-ups with and without a snapshot hold;
 //! `TUR_BENCH_WORKLOADS=arrivals TUR_BENCH_RATE=2,4` runs open-loop Poisson arrivals, and
 //! `TUR_BENCH_WORKLOADS=grammar` grammar-constrained requests, and
 //! `TUR_BENCH_WORKLOADS=logprobs` the cost of reporting log probabilities.
@@ -26,17 +27,23 @@
 //! assistant) instead of the checkpoint's own head.
 
 use serde_json::{Value, json};
-use std::{collections::HashMap, path::PathBuf, time::Instant};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use tokenizers::Tokenizer;
 use tur_core::{Result, TurError, execution::invalid};
 use tur_engine::{
     backend::{
-        chat_template::{ChatMessage, Role},
+        chat_template::{ChatMessage, Role, ToolCall},
         factory::{ModelFactory, ModelSource},
         guidance::TopLevelGrammar,
         pipeline::{GenerationRequest, InferencePipeline, PipelineConfig},
         prefix::PrefixConfig,
         speculation::SpeculationConfig,
+        structured::StructuredOutput,
+        tools::ToolDefinition,
     },
     hybrid::SamplingOptions,
 };
@@ -296,6 +303,7 @@ fn prefix_runs(
             entries,
             state_share: None,
             restorable_first: false,
+            tool_hold: Duration::ZERO,
         }
     };
     let mut pipeline = InferencePipeline::new(factory, config)?;
@@ -579,6 +587,111 @@ fn churn_run(
     )
 }
 
+/// One tool loop at `hold`: an agent behind a 1K-token manual forces a tool call, and while
+/// the tool runs, other traffic churns the cache: three users behind a shared 1K-token system
+/// prompt. Reports the tokens each follow-up restored against the prompt before it, and what
+/// the other traffic restored and took, which a hold could worsen by taking snapshots from it.
+fn tool_loop(
+    factory: &ModelFactory,
+    tokenizer: &Tokenizer,
+    options: SamplingOptions,
+    hold: Duration,
+) -> Result<Value> {
+    let mut config = PipelineConfig::new(4, CHUNK);
+    config.prefix.tool_hold = hold;
+    let mut pipeline = InferencePipeline::new(factory, config)?;
+    let warm = Burst {
+        prompts: vec![prompt(tokenizer, 300, 99)?],
+        output: 8,
+    };
+    burst(&mut pipeline, &warm, options)?;
+    pipeline.clear_prefix_cache();
+    let tools = vec![ToolDefinition {
+        name: "search".into(),
+        description: "Search the project's files for a phrase.".into(),
+        parameters: json!({"type": "object", "required": ["query"],
+            "properties": {"query": {"type": "string"}}}),
+    }];
+    let mut messages = vec![
+        ChatMessage::new(Role::System, prompt(tokenizer, 1024, 23)?),
+        ChatMessage::new(Role::User, prompt(tokenizer, 64, 5000)?),
+    ];
+    let shared = prompt(tokenizer, 1024, 24)?;
+    let (mut steps, mut cold_wall, mut cold_cached) = (Vec::new(), 0.0, 0);
+    let mut before = 0;
+    for step in 0..6 {
+        let mut request = GenerationRequest::new(String::new(), 48);
+        request.messages.clone_from(&messages);
+        request.tools.clone_from(&tools);
+        request.structured = Some(StructuredOutput::Tool(None));
+        request.seed = step as u64;
+        request.sampling = options;
+        let id = pipeline.submit_request(&request)?;
+        let mut done = None;
+        while pipeline.active_request_count() > 0 {
+            for (finished, result) in pipeline.step_streaming()?.completed {
+                if finished == id {
+                    done = Some(result?);
+                }
+            }
+        }
+        let stats = done.ok_or_else(|| invalid("tool request did not complete"))?;
+        eprintln!(
+            "  step {step}: {} of {} cached (previous prompt {before}), {:.0} ms to first token, {} calls",
+            stats.cached_tokens,
+            stats.prompt_tokens,
+            stats.first_token.as_secs_f64() * 1e3,
+            stats.tool_calls.len(),
+        );
+        steps.push(json!({"step": step, "previous_prompt_tokens": before,
+            "prompt_tokens": stats.prompt_tokens, "cached_tokens": stats.cached_tokens,
+            "ttft_seconds": stats.first_token.as_secs_f64(),
+            "tool_calls": stats.tool_calls.len()}));
+        before = stats.prompt_tokens;
+        let mut assistant = ChatMessage::new(Role::Assistant, stats.generated_text);
+        assistant.tool_calls = stats
+            .tool_calls
+            .into_iter()
+            .map(|call| ToolCall {
+                name: call.name,
+                arguments: call.arguments.as_object().cloned().unwrap_or_default(),
+            })
+            .collect();
+        messages.push(assistant);
+        messages.push(ChatMessage::new(
+            Role::Tool,
+            prompt(tokenizer, 128, 5100 + step)?,
+        ));
+        let cold = (0..3)
+            .map(|c| {
+                turn(
+                    tokenizer,
+                    Some(&shared),
+                    32,
+                    5200 + step * 10 + c,
+                    16,
+                    options,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let result = run_requests(&mut pipeline, &cold)?;
+        cold_wall += result["wall_seconds"].as_f64().unwrap_or(0.0);
+        cold_cached += (0..3)
+            .map(|i| result["cached_each"][i].as_u64().unwrap_or(0))
+            .sum::<u64>();
+    }
+    let prefix = pipeline.prefix_stats();
+    eprintln!(
+        "tools hold {hold:?}: others {cold_cached} cached, {cold_wall:.2} s, {} retained; {prefix:?}",
+        pipeline.memory_plan().retained
+    );
+    Ok(
+        json!({"workload": "tools", "hold_seconds": hold.as_secs(), "steps": steps,
+        "other_cached_tokens": cold_cached, "other_wall_seconds": cold_wall, "prefix": format!("{prefix:?}"),
+        "retained_entries": pipeline.memory_plan().retained}),
+    )
+}
+
 fn reuse_runs(
     factory: &ModelFactory,
     tokenizer: &Tokenizer,
@@ -705,8 +818,7 @@ fn arrivals(
             let mut request = GenerationRequest::new(prompts[*next].clone(), 64);
             request.seed = *next as u64;
             request.sampling = options;
-            request.submitted_at =
-                start.checked_add(std::time::Duration::from_secs_f64(schedule[*next]));
+            request.submitted_at = start.checked_add(Duration::from_secs_f64(schedule[*next]));
             ids.insert(pipeline.submit_request(&request)?, *next);
             *next += 1;
         }
@@ -719,7 +831,7 @@ fn arrivals(
         if pipeline.active_request_count() == 0 {
             let wait = schedule[next] - start.elapsed().as_secs_f64();
             if wait > 0.0 {
-                std::thread::sleep(std::time::Duration::from_secs_f64(wait));
+                std::thread::sleep(Duration::from_secs_f64(wait));
             }
         }
         if !overlapped || pipeline.active_request_count() == 0 {
@@ -1112,6 +1224,11 @@ pub(crate) fn run() -> Result<()> {
     }
     if workloads.contains("reuse") {
         runs.extend(reuse_runs(&factory, &tokenizer, options)?);
+    }
+    if workloads.contains("tools") {
+        for hold in [Duration::ZERO, PrefixConfig::DEFAULT_TOOL_HOLD] {
+            runs.push(tool_loop(&factory, &tokenizer, options, hold)?);
+        }
     }
     if workloads.contains("speculation") {
         runs.extend(speculation_runs(&bench)?);
