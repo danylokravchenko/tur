@@ -8,7 +8,7 @@ use super::{
 use crate::{
     audio::{Audio, AudioPrompt},
     backend::tools::ToolSyntax,
-    hybrid::{DraftForward, HybridModel, PackedForward, SequenceStep},
+    hybrid::{DraftForward, HybridModel, LayerCarry, LayerStep, PackedForward, SequenceStep},
 };
 use std::path::Path;
 use tur_core::{
@@ -192,6 +192,17 @@ impl HybridModel for TextModel {
     }
     fn forward(&self, batch: &PackedForward<'_>) -> Result<Vec<Result<SequenceStep>>> {
         self.model().forward(batch)
+    }
+    fn pausable_layers(&self) -> Option<usize> {
+        self.model().pausable_layers()
+    }
+    fn forward_layers(
+        &self,
+        batch: &PackedForward<'_>,
+        carry: Option<LayerCarry>,
+        end: usize,
+    ) -> Result<LayerStep> {
+        self.model().forward_layers(batch, carry, end)
     }
     fn draft(&self, batch: &DraftForward<'_>) -> Result<Vec<Result<Option<candle_core::Tensor>>>> {
         self.model().draft(batch)

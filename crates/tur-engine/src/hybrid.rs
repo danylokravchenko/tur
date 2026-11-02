@@ -24,8 +24,8 @@ pub use tur_metal::{
     state::{Demand, ModelState, Reservation},
 };
 pub use tur_models::hybrid::{
-    Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward, SequenceForward,
-    SequenceState, SequenceStep,
+    Boundaries, DraftForward, DraftSequence, HybridModel, LayerCarry, LayerStep, PackedForward,
+    SequenceForward, SequenceState, SequenceStep,
 };
 use uuid::Uuid;
 
@@ -717,9 +717,20 @@ pub struct HybridEngine<M: HybridModel> {
     device_sampling: bool,
     /// Return every sequence's final hidden states for the model's draft head.
     draft_head: bool,
+    /// A pass paused between layers; nothing of it is in flight between calls.
+    layered: Option<Layered>,
     /// The model's kernels, for penalizing and sampling rows on the device.
     #[cfg(feature = "metal")]
     kernels: Option<tur_metal::kernels::Kernels>,
+}
+
+/// One sequence's pass between its layer groups: leased and validated, its finished layers
+/// written and fenced, its results not yet committed.
+struct Layered {
+    plan: PackedExecution,
+    reservations: Vec<Reservation>,
+    requirements: ExecutionRequirements,
+    carry: Option<LayerCarry>,
 }
 
 fn validate_logits(logits: &Tensor, rows: usize, vocab: usize, device: &Device) -> Result<()> {
@@ -889,6 +900,7 @@ impl<M: HybridModel> HybridEngine<M> {
             requests: HashMap::new(),
             pending: None,
             pending_handles: HashSet::new(),
+            layered: None,
             notifier: Notifier::new()?,
             completed_at: None,
             stats: SamplingStats::default(),
@@ -1150,6 +1162,9 @@ impl<M: HybridModel> HybridEngine<M> {
                 request.cancelled = true;
             }
         } else {
+            if self.layered_request() == Some(handle.request) {
+                self.layered = None;
+            }
             self.requests.remove(&handle.request);
         }
         Ok(())
@@ -1166,6 +1181,96 @@ impl<M: HybridModel> HybridEngine<M> {
     /// [`TurError::MemoryAllocation`] before any work is enqueued, leaving every request
     /// unchanged. Per-request execution errors are reported by `finish`.
     pub fn submit(&mut self, plan: PackedExecution) -> Result<ExecutionRequirements> {
+        let (plan, reservations, requirements) = self.admit(plan)?;
+        self.launch(plan, reservations, requirements, None)
+    }
+
+    /// The request of the paused pass, if any.
+    pub fn layered_request(&self) -> Option<Uuid> {
+        self.layered
+            .as_ref()
+            .and_then(|layered| layered.plan.sequences.first())
+            .map(|sequence| sequence.state.request)
+    }
+
+    /// Validate and lease a one-sequence pass that will run in layer groups. Other passes
+    /// may run between [`Self::advance_layered`] calls.
+    pub fn begin_layered(&mut self, plan: PackedExecution) -> Result<()> {
+        if self.layered.is_some() || plan.sequences.len() != 1 || !plan.embeddings.is_empty() {
+            return Err(invalid("a layered pass runs alone, on one text sequence"));
+        }
+        let (plan, mut reservations, requirements) = self.admit(plan)?;
+        reservations.iter_mut().try_for_each(Reservation::prepare)?;
+        self.layered = Some(Layered {
+            plan,
+            reservations,
+            requirements,
+            carry: None,
+        });
+        Ok(())
+    }
+
+    /// Run the paused pass up to layer `end`, before the last, and wait for it. Waiting means
+    /// no group is ever in flight, so dropping the pass between groups needs no fence, and
+    /// the next pass's timing excludes this work. Expert reads block encoding anyway.
+    pub fn advance_layered(&mut self, end: usize) -> Result<()> {
+        if self.pending.is_some() {
+            return Err(invalid("layer groups run between passes"));
+        }
+        let layered = self
+            .layered
+            .as_mut()
+            .ok_or_else(|| invalid("no layered pass"))?;
+        let bindings: Vec<_> = layered
+            .reservations
+            .iter()
+            .map(Reservation::binding)
+            .collect();
+        let step = self.model.forward_layers(
+            &PackedForward {
+                embeddings: &layered.plan.embeddings,
+                tokens: &layered.plan.tokens,
+                positions: &layered.plan.positions,
+                sequences: &forwards(&layered.plan, &bindings, self.draft_head),
+                pool: &self.pool,
+            },
+            layered.carry.take(),
+            end,
+        )?;
+        let LayerStep::Paused(carry) = step else {
+            return Err(invalid("a layer group must stop before the last layer"));
+        };
+        layered.carry = Some(carry);
+        self.device.synchronize()?;
+        Ok(())
+    }
+
+    /// Submit the paused pass's remaining layers as an ordinary pass: `finish` samples and
+    /// commits it like any other.
+    pub fn submit_layered(&mut self) -> Result<ExecutionRequirements> {
+        let layered = self
+            .layered
+            .take()
+            .ok_or_else(|| invalid("no layered pass"))?;
+        self.launch(
+            layered.plan,
+            layered.reservations,
+            layered.requirements,
+            layered.carry,
+        )
+    }
+
+    /// Drop the paused pass and its leases; its request's committed state is unchanged, so
+    /// the chunk can run again. Nothing of it is in flight.
+    pub fn abort_layered(&mut self) {
+        self.layered = None;
+    }
+
+    /// Validate a pass against current requests and lease its state.
+    fn admit(
+        &mut self,
+        plan: PackedExecution,
+    ) -> Result<(PackedExecution, Vec<Reservation>, ExecutionRequirements)> {
         if self.pending.is_some() {
             return Err(invalid("one batch is already in flight"));
         }
@@ -1228,6 +1333,21 @@ impl<M: HybridModel> HybridEngine<M> {
             pool: &self.pool,
         })?;
         requirements.total_bytes()?;
+        Ok((plan, reservations, requirements))
+    }
+
+    /// Encode an admitted pass, from `carry` when its first layers already ran, and submit it.
+    fn launch(
+        &mut self,
+        plan: PackedExecution,
+        reservations: Vec<Reservation>,
+        requirements: ExecutionRequirements,
+        carry: Option<LayerCarry>,
+    ) -> Result<ExecutionRequirements> {
+        if self.pending.is_some() {
+            return Err(invalid("one batch is already in flight"));
+        }
+        let bindings: Vec<_> = reservations.iter().map(Reservation::binding).collect();
         let mut completion = Completion::new(
             self.device.clone(),
             &self.quarantine,
@@ -1255,13 +1375,26 @@ impl<M: HybridModel> HybridEngine<M> {
             .iter_mut()
             .try_for_each(Reservation::prepare);
         let result = prepared.and_then(|()| {
-            batch.model.forward(&PackedForward {
+            let forward = PackedForward {
                 embeddings: &batch.plan.embeddings,
                 tokens: &batch.plan.tokens,
                 positions: &batch.plan.positions,
                 sequences: &forwards(&batch.plan, &bindings, self.draft_head),
                 pool: &self.pool,
-            })
+            };
+            match carry {
+                None => batch.model.forward(&forward),
+                Some(carry) => {
+                    let end = batch
+                        .model
+                        .pausable_layers()
+                        .ok_or_else(|| invalid("model cannot pause between layers"))?;
+                    match batch.model.forward_layers(&forward, Some(carry), end)? {
+                        LayerStep::Done(step) => Ok(vec![Ok(step)]),
+                        LayerStep::Paused(_) => Err(invalid("a paused pass did not finish")),
+                    }
+                }
+            }
         });
         match result {
             Ok(steps) if steps.len() == batch.plan.sequences.len() => {

@@ -3,7 +3,8 @@
 //!
 //! Each iteration selects one packed pass. Running decodes come first, one token each,
 //! rotated by when they last ran when the token budget cannot hold them all. Prefill chunks
-//! follow in arrival order within a budget sized from measured pass costs. While prefill
+//! follow in priority order (see [`Scheduler::prefill_rank`]) within a budget sized from
+//! measured pass costs. While prefill
 //! work fits every pass reserves at least `min_prefill_tokens`, or an indivisible replay
 //! chunk. The oldest prefill beyond `max_queue_wait` ignores the cost target within the
 //! token cap and may reclaim resources from younger running requests. The caller checks memory
@@ -35,6 +36,12 @@ pub struct SchedulerConfig {
     pub target_pass: Duration,
     /// Queue age after which a request's next chunk ignores the cost target.
     pub max_queue_wait: Duration,
+    /// Prefill and admission favor the fewest remaining prompt tokens over arrival order,
+    /// until a request reaches `max_queue_wait`.
+    pub shortest_prompt_first: bool,
+    /// Split prefill beside decodes by layers on models that can pause between them.
+    /// Off, such a prompt shares passes with decodes as on any other model.
+    pub layered_prefill: bool,
 }
 
 impl SchedulerConfig {
@@ -50,6 +57,8 @@ impl SchedulerConfig {
             min_prefill_tokens: max_chunk.min(32),
             target_pass: Duration::from_millis(60),
             max_queue_wait: Duration::from_secs(2),
+            shortest_prompt_first: false,
+            layered_prefill: true,
         }
     }
 
@@ -79,6 +88,8 @@ pub struct Candidate {
     /// Tokens available for the next chunk: one for a decode, or more when a grammar forced
     /// some, remaining prompt tokens, or the next original chunk during recomputation.
     pub pending: usize,
+    /// All unconsumed tokens, which `pending` may stop short of at a chunk boundary.
+    pub remaining: usize,
     /// Minimum indivisible chunk. Recompute uses the original pass boundary so narrow
     /// recurrent state is rounded at the same positions as before preemption.
     pub minimum: usize,
@@ -168,6 +179,8 @@ pub struct Scheduler {
     budget: usize,
     iteration: u64,
     tickets: u64,
+    /// Prefill beside decodes runs in layer groups, so a whole chunk no longer stalls them.
+    layered: bool,
 }
 
 impl Scheduler {
@@ -179,7 +192,19 @@ impl Scheduler {
             costs: CostModel::default(),
             iteration: 0,
             tickets: 0,
+            layered: false,
         })
+    }
+
+    /// The model can pause between layers: unless configured off, grant prefill a whole
+    /// chunk beside decodes, which the pipeline splits by layers.
+    pub fn allow_layered_prefill(&mut self) {
+        self.layered = self.config.layered_prefill;
+    }
+
+    /// Whether prefill beside decodes runs in layer groups.
+    pub fn layered_prefill(&self) -> bool {
+        self.layered
     }
 
     pub fn config(&self) -> &SchedulerConfig {
@@ -193,6 +218,25 @@ impl Scheduler {
     /// Number of passes selected so far.
     pub fn iteration(&self) -> u64 {
         self.iteration
+    }
+
+    /// Sort key of a prefill: lowest goes first. Requests at the queue-age limit lead, oldest
+    /// first, which is what bounds starvation; younger ones follow by `remaining` tokens with
+    /// [`SchedulerConfig::shortest_prompt_first`], otherwise by arrival. The head of this
+    /// order is therefore the oldest request whenever any has aged.
+    pub fn prefill_rank(
+        &self,
+        remaining: usize,
+        arrival: Instant,
+        now: Instant,
+    ) -> (bool, usize, Instant) {
+        let young = now.saturating_duration_since(arrival) < self.config.max_queue_wait;
+        let length = if young && self.config.shortest_prompt_first {
+            remaining
+        } else {
+            0
+        };
+        (young, length, arrival)
     }
 
     /// Reject a submission that would exceed the waiting queue's request or token limits.
@@ -272,7 +316,7 @@ impl Scheduler {
             .iter()
             .filter(|c| !c.decoding && c.pending > 0)
             .collect();
-        prefills.sort_by_key(|c| (c.arrival, c.id));
+        prefills.sort_by_key(|c| (self.prefill_rank(c.remaining, c.arrival, now), c.id));
         let aged = prefills.first().copied().filter(|oldest| {
             now.saturating_duration_since(oldest.arrival) >= self.config.max_queue_wait
         });
@@ -339,7 +383,9 @@ impl Scheduler {
                 .unwrap_or(0);
             let mut budget = self.prefill_budget(used, context, cap);
             budget = budget.max(oldest.minimum.min(cap));
-            if now.saturating_duration_since(oldest.arrival) >= self.config.max_queue_wait {
+            if self.layered
+                || now.saturating_duration_since(oldest.arrival) >= self.config.max_queue_wait
+            {
                 budget = budget.max(self.config.max_chunk.min(cap));
             }
             let mut admitted = running;
@@ -416,6 +462,8 @@ mod tests {
             min_prefill_tokens: 4,
             target_pass: Duration::from_millis(10),
             max_queue_wait: Duration::from_secs(1),
+            shortest_prompt_first: false,
+            layered_prefill: true,
         }
     }
 
@@ -423,6 +471,7 @@ mod tests {
         Candidate {
             id: Uuid::from_u128(index),
             pending,
+            remaining: pending,
             minimum: 1,
             decoding: running && pending == 1,
             running,
@@ -444,6 +493,31 @@ mod tests {
             .iter()
             .map(|c| (c.id.as_u128(), c.tokens))
             .collect())
+    }
+
+    #[test]
+    fn test_layered_prefill_gets_a_whole_chunk_beside_decodes() -> Result<()> {
+        let start = Instant::now();
+        let candidates = [candidate(1, start, 1, true), candidate(2, start, 16, false)];
+        let mut plain = Scheduler::new(config())?;
+        // A slow measured pass holds an ordinary young prompt to the prefill minimum.
+        plain.record(1, 10, Duration::from_secs(1));
+        let mut layered = plain.clone();
+        layered.allow_layered_prefill();
+        assert!(layered.layered_prefill());
+        let mut off = Scheduler::new(SchedulerConfig {
+            layered_prefill: false,
+            ..config()
+        })?;
+        off.allow_layered_prefill();
+        assert!(!off.layered_prefill());
+        for _ in 0..8 {
+            let chosen = run(plain.plan(&candidates, start, |_| Ok(true))?)?;
+            assert!(chosen[1].1 < 16, "{chosen:?}");
+        }
+        let chosen = run(layered.plan(&candidates, start, |_| Ok(true))?)?;
+        assert_eq!(chosen, [(1, 1), (2, 16)]);
+        Ok(())
     }
 
     #[test]
@@ -714,6 +788,56 @@ mod tests {
         let selected = chunks(scheduler.plan(&[younger, waiting], now, |_| Ok(true))?)?;
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, younger.id);
+        Ok(())
+    }
+
+    #[test]
+    fn test_shortest_prompt_leads_until_an_older_one_ages() -> Result<()> {
+        let start = Instant::now();
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            shortest_prompt_first: true,
+            max_running: 1,
+            ..config()
+        })?;
+        // `remaining` decides, not `pending`, which a snapshot boundary can cut short.
+        let long = Candidate {
+            remaining: 5000,
+            ..candidate(1, start, 8, false)
+        };
+        let short = Candidate {
+            remaining: 20,
+            ..candidate(2, start, 16, false)
+        };
+        let shorter_first = run(scheduler.plan(&[long, short], start, |_| Ok(true))?)?;
+        assert_eq!(shorter_first, [(2, 16)]);
+        // Equal lengths keep arrival order.
+        let twin = Candidate {
+            remaining: 20,
+            ..candidate(3, start, 16, false)
+        };
+        let earlier_first = run(scheduler.plan(&[twin, short], start, |_| Ok(true))?)?;
+        assert_eq!(earlier_first, [(2, 16)]);
+        // At the age limit the long prompt leads, and takes back a younger request's slot.
+        let aged = start + Duration::from_secs(1) + Duration::from_millis(1);
+        let waiting = [long, short];
+        assert_eq!(
+            run(scheduler.plan(&waiting, aged, |_| Ok(true))?)?,
+            [(1, 8)]
+        );
+        let running = Candidate {
+            running: true,
+            ..short
+        };
+        assert_eq!(
+            scheduler.plan(&[long, running], aged, |_| Ok(true))?,
+            Decision::Preempt(short.id)
+        );
+        // The default stays in arrival order.
+        let mut arrival = Scheduler::new(SchedulerConfig {
+            max_running: 1,
+            ..config()
+        })?;
+        assert_eq!(run(arrival.plan(&waiting, start, |_| Ok(true))?)?, [(1, 8)]);
         Ok(())
     }
 

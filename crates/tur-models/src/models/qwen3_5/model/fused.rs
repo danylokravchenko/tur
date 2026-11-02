@@ -9,7 +9,7 @@
 //! committed key is copied.
 
 use super::{Attention, Config, DeltaNet, Dims, LayerKind, Mixer, Mlp, MtpHead, Pass, Qwen35};
-use crate::hybrid::PackedForward;
+use crate::hybrid::{LayerCarry, PackedForward};
 use candle_core::{DType, Tensor};
 use tur_core::{
     Result,
@@ -27,6 +27,19 @@ pub(super) struct Fused {
     inv_freq: Tensor,
     page: usize,
     delta: DeltaShape,
+}
+
+/// Addressing shared by every layer of one pass.
+struct Addressing {
+    positions: Tensor,
+    paging: Option<PagedKv>,
+    recurrent: Option<RecurrentSpans>,
+}
+
+/// How far [`Qwen35::fused_range`] took its pass.
+pub(super) enum LayerProgress {
+    Paused(LayerCarry),
+    Done((Tensor, Option<Tensor>)),
 }
 
 impl Fused {
@@ -89,11 +102,70 @@ impl Qwen35 {
         &self,
         fused: &Fused,
         pass: &Pass<'_, '_>,
-        mut trace: Option<&mut Vec<Tensor>>,
+        trace: Option<&mut Vec<Tensor>>,
     ) -> Result<(Tensor, Option<Tensor>)> {
-        let k = &fused.kernels;
-        let d = self.dims;
-        let positions = self.position_tensor(pass)?;
+        let addressing = self.addressing(fused, pass)?;
+        let rows = self.first_rows(fused, pass)?;
+        let span = 0..self.layers.len();
+        let (_, h) = self.fused_layers(fused, pass, &addressing, span, rows, trace)?;
+        self.fused_outputs(fused, pass, &h)
+    }
+
+    /// One sequence's pass from `carry` (or its first layer) up to layer `end`. Each layer
+    /// writes its own recurrent slots and keys once, and reads the sequence's committed
+    /// state until the chunk commits, so a pause between layers changes nothing they see.
+    pub(super) fn fused_range(
+        &self,
+        fused: &Fused,
+        pass: &Pass<'_, '_>,
+        carry: Option<LayerCarry>,
+        end: usize,
+    ) -> Result<LayerProgress> {
+        let (start, rows) = if let Some(carry) = carry {
+            (carry.next, (carry.x, carry.h))
+        } else {
+            (0, self.first_rows(fused, pass)?)
+        };
+        if start >= end || end > self.layers.len() {
+            return Err(invalid("paused pass must advance within the model"));
+        }
+        let addressing = self.addressing(fused, pass)?;
+        let (x, h) = self.fused_layers(fused, pass, &addressing, start..end, rows, None)?;
+        if end == self.layers.len() {
+            return Ok(LayerProgress::Done(self.fused_outputs(fused, pass, &h)?));
+        }
+        Ok(LayerProgress::Paused(LayerCarry { x, h, next: end }))
+    }
+
+    fn fused_outputs(
+        &self,
+        fused: &Fused,
+        pass: &Pass<'_, '_>,
+        h: &Tensor,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let hidden = pass.hidden.then(|| h.clone());
+        Ok((
+            self.row_logits(&fused.kernels, &self.lm_head, h, pass)?,
+            hidden,
+        ))
+    }
+
+    /// Embedded rows and their first norm.
+    fn first_rows(&self, fused: &Fused, pass: &Pass<'_, '_>) -> Result<(Tensor, Tensor)> {
+        let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
+        let x = self.embedding(&ids)?;
+        let first = self
+            .layers
+            .first()
+            .ok_or_else(|| invalid("model has no layers"))?;
+        let h = fused
+            .kernels
+            .rms_norm(&x, &first.input_norm, self.dims.eps)?;
+        Ok((x, h))
+    }
+
+    /// Positions, page tables and recurrent slots of a pass's rows.
+    fn addressing(&self, fused: &Fused, pass: &Pass<'_, '_>) -> Result<Addressing> {
         let has_attention = self
             .layers
             .iter()
@@ -119,27 +191,46 @@ impl Qwen35 {
                     writes: &span.addresses.writes,
                 })
                 .collect();
-            Some(k.recurrent_spans(&spans)?)
+            Some(fused.kernels.recurrent_spans(&spans)?)
         } else {
             None
         };
-        let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
-        let mut x = self.embedding(&ids)?;
-        let first = self
-            .layers
-            .first()
-            .ok_or_else(|| invalid("model has no layers"))?;
-        let mut h = k.rms_norm(&x, &first.input_norm, d.eps)?;
-        for (index, layer) in self.layers.iter().enumerate() {
+        Ok(Addressing {
+            positions: self.position_tensor(pass)?,
+            paging,
+            recurrent,
+        })
+    }
+
+    /// Run `(x, h)` through `layers`.
+    fn fused_layers(
+        &self,
+        fused: &Fused,
+        pass: &Pass<'_, '_>,
+        addressing: &Addressing,
+        layers: std::ops::Range<usize>,
+        (mut x, mut h): (Tensor, Tensor),
+        mut trace: Option<&mut Vec<Tensor>>,
+    ) -> Result<(Tensor, Tensor)> {
+        let k = &fused.kernels;
+        let d = self.dims;
+        for index in layers {
+            let layer = self
+                .layers
+                .get(index)
+                .ok_or_else(|| invalid("layer outside the model"))?;
             let mixed = match &layer.mixer {
                 Mixer::Attention(a) => {
-                    let paging = paging
+                    let paging = addressing
+                        .paging
                         .as_ref()
                         .ok_or_else(|| invalid("attention layer without page addressing"))?;
-                    self.fused_attention(fused, a, &h, &positions, pass, paging, index)?
+                    let positions = &addressing.positions;
+                    self.fused_attention(fused, a, &h, positions, pass, paging, index)?
                 }
                 Mixer::Delta(net) => {
-                    let spans = recurrent
+                    let spans = addressing
+                        .recurrent
                         .as_ref()
                         .ok_or_else(|| invalid("recurrent layer without slot addressing"))?;
                     self.fused_delta(fused, net, &h, pass, spans, index)?
@@ -168,8 +259,7 @@ impl Qwen35 {
                 trace.push(x.clone());
             }
         }
-        let hidden = pass.hidden.then(|| h.clone());
-        Ok((self.row_logits(k, &self.lm_head, &h, pass)?, hidden))
+        Ok((x, h))
     }
 
     /// Fused draft-head pass: logits for `pass.rows`; writes the head's keys and values.

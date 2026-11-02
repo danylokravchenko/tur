@@ -30,6 +30,7 @@
 //! it covers beyond the deepest retained entry it extends, times how often its prefix was
 //! recently computed or restored, over its recurrent slot and the pages only it holds.
 //! Counts are halved periodically, so prefixes that stop recurring lose their protection.
+//! Entries on hold (see [`PrefixCache::hold`]) go only once no other entry is left.
 //! A new entry is always kept. Pages and slots return to the pool only when no request
 //! still shares them and no unfenced work references them (see [`tur_metal::pool`]).
 
@@ -38,6 +39,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     hash::{BuildHasher, RandomState},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tur_core::{Result, execution::invalid};
 use tur_metal::state::ModelState;
@@ -56,6 +58,9 @@ pub struct PrefixConfig {
     /// requests without one, until the oldest waiting request reaches the queue-age limit.
     /// It trades cold latency and throughput for warm latency, so it is off by default.
     pub restorable_first: bool,
+    /// How long a reply that ended in tool calls keeps its snapshots ahead of other entries
+    /// for eviction, while the caller runs the tools. Zero holds nothing.
+    pub tool_hold: Duration,
 }
 
 impl PrefixConfig {
@@ -68,10 +73,14 @@ impl PrefixConfig {
         entries: 0,
         state_share: None,
         restorable_first: false,
+        tool_hold: Duration::ZERO,
     };
 
     /// Default share of state memory for snapshots.
     pub const DEFAULT_STATE_SHARE: f64 = 0.125;
+
+    /// Default hold on a tool-calling reply's snapshots.
+    pub const DEFAULT_TOOL_HOLD: Duration = Duration::from_secs(60);
 
     pub fn enabled(&self) -> bool {
         self.entries > 0
@@ -112,6 +121,8 @@ struct Entry {
     /// `[1, vocab]` model logits after the last token, for prompt-end snapshots.
     logits: Option<Tensor>,
     last_use: u64,
+    /// Until when eviction takes this entry only after every entry not on hold.
+    held_until: Option<Instant>,
 }
 
 /// Events (insertions and hits) per entry of capacity between halvings of the reuse
@@ -396,6 +407,7 @@ impl PrefixCache {
                 state: state.clone(),
                 logits: logits.cloned(),
                 last_use: self.tick,
+                held_until: None,
             },
         );
         *self.lengths.entry(tokens.len()).or_default() += 1;
@@ -423,15 +435,64 @@ impl PrefixCache {
         (length - ancestor) as f64 * f64::from(reuse) / bytes.max(1) as f64
     }
 
+    /// Keep the retained snapshots of `tokens`' first `lengths` tokens, most wanted first,
+    /// ahead of other entries for eviction until `until`. At most half the capacity is on
+    /// hold, because other traffic needs the rest: with three of four entries held, a shared
+    /// system prompt lost its snapshots and its users took 1.7× as long. Older holds end first
+    /// to make room. A hold reserves nothing, so memory pressure can still take held entries.
+    pub fn hold(&mut self, keys: &PrefixKeys, tokens: &[u32], lengths: &[usize], until: Instant) {
+        let budget = (self.config.entries / 2).max(1);
+        let mut chosen: Vec<u64> = Vec::with_capacity(budget);
+        for &length in lengths {
+            if chosen.len() < budget
+                && let Some(key) = keys.get(length)
+                && !chosen.contains(&key)
+                && self
+                    .map
+                    .get(&key)
+                    .is_some_and(|entry| tokens.get(..length) == Some(&entry.tokens[..]))
+            {
+                chosen.push(key);
+            }
+        }
+        let now = Instant::now();
+        let mut others: Vec<(Instant, u64)> = self
+            .map
+            .iter()
+            .filter(|(key, _)| !chosen.contains(key))
+            .filter_map(|(key, entry)| {
+                let held = entry.held_until.filter(|&held| held > now)?;
+                Some((held, *key))
+            })
+            .collect();
+        others.sort_unstable_by(|a, b| b.cmp(a));
+        for (_, key) in others.iter().skip(budget - chosen.len()) {
+            if let Some(entry) = self.map.get_mut(key) {
+                entry.held_until = None;
+            }
+        }
+        for key in chosen {
+            if let Some(entry) = self.map.get_mut(&key) {
+                entry.held_until = Some(until);
+            }
+        }
+    }
+
     /// Drop the entry saving the fewest tokens per retained byte, the least recently used
-    /// among equals. Returns whether one was dropped.
+    /// among equals. Entries on hold go only when no other remains, soonest-ending hold
+    /// first: a newer tool call is likelier to return than an older one of the same loop.
+    /// Returns whether one was dropped.
     pub fn evict(&mut self) -> bool {
+        let now = Instant::now();
         let Some(key) = self
             .map
             .iter()
-            .map(|(key, entry)| (self.value(*key, entry), entry.last_use, *key))
-            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
-            .map(|(_, _, key)| key)
+            .map(|(key, entry)| {
+                let held = entry.held_until.filter(|&until| until > now);
+                (held, self.value(*key, entry), entry.last_use, *key)
+            })
+            .min_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)))
+            .map(|(_, _, _, key)| key)
         else {
             return false;
         };
@@ -522,6 +583,7 @@ mod tests {
             entries,
             state_share: None,
             restorable_first: false,
+            tool_hold: Duration::ZERO,
         })
     }
 
@@ -715,6 +777,103 @@ mod tests {
         Ok(())
     }
 
+    /// Four distinct eight-token prompts with their keys, in a cache of four.
+    fn held_fixture() -> (PrefixCache, Vec<Vec<u32>>, Vec<PrefixKeys>) {
+        let cache = cache(4);
+        let prompts: Vec<Vec<u32>> = (0..5u32)
+            .map(|p| (0..8).map(|t| t + p * 8).collect())
+            .collect();
+        let keys = prompts.iter().map(|p| cache.keys(None, p)).collect();
+        (cache, prompts, keys)
+    }
+
+    #[test]
+    fn test_held_entries_are_evicted_last_and_only_until_their_hold_ends() -> Result<()> {
+        let pool = pool()?;
+        for (until, held_survives) in [
+            (Instant::now() + Duration::from_secs(600), true),
+            (Instant::now(), false),
+        ] {
+            let (mut cache, prompts, keys) = held_fixture();
+            cache.insert(&keys[0], &prompts[0][..4], &state(&pool, 4)?, None)?;
+            // The others cover more tokens, so without the hold the first entry goes.
+            for p in 1..4 {
+                cache.insert(&keys[p], &prompts[p][..6], &state(&pool, 6)?, None)?;
+            }
+            // A length with no entry holds nothing.
+            cache.hold(&keys[0], &prompts[0], &[7, 4], until);
+            cache.insert(&keys[4], &prompts[4][..6], &state(&pool, 6)?, None)?;
+            assert_eq!(cache.depth(&keys[0], &prompts[0]) == 4, held_survives);
+            // Once only held entries remain, pressure still takes them.
+            while cache.evict() {}
+            assert_eq!(cache.stats().entries, 0);
+            pool.reclaim();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_holds_take_half_the_capacity_and_the_oldest_ends_first() -> Result<()> {
+        let pool = pool()?;
+        let (mut cache, prompts, keys) = held_fixture();
+        for p in 0..4 {
+            cache.insert(&keys[p], &prompts[p][..4], &state(&pool, 4)?, None)?;
+        }
+        let soon = Instant::now() + Duration::from_secs(600);
+        let later = soon + Duration::from_secs(600);
+        cache.hold(&keys[0], &prompts[0], &[4], soon);
+        cache.hold(&keys[1], &prompts[1], &[4], soon + Duration::from_secs(1));
+        // The third hold ends the first one's, which leaves the two newest.
+        cache.hold(&keys[2], &prompts[2], &[4], later);
+        assert!(cache.evict());
+        assert!(cache.evict());
+        assert_eq!(cache.depth(&keys[0], &prompts[0]), 0);
+        assert_eq!(cache.depth(&keys[3], &prompts[3]), 0);
+        // Among holds, the one ending soonest goes first.
+        assert!(cache.evict());
+        assert_eq!(cache.depth(&keys[1], &prompts[1]), 0);
+        assert_eq!(cache.depth(&keys[2], &prompts[2]), 4);
+        // One call holds only its most wanted lengths within the budget.
+        cache.clear();
+        pool.reclaim();
+        let prompt: Vec<u32> = (0..8).collect();
+        let chain = cache.keys(None, &prompt);
+        for length in [2, 4, 6] {
+            cache.insert(&chain, &prompt[..length], &state(&pool, length)?, None)?;
+        }
+        cache.insert(&keys[3], &prompts[3][..6], &state(&pool, 6)?, None)?;
+        cache.hold(&chain, &prompt, &[6, 2, 4], later);
+        assert!(cache.evict());
+        assert!(cache.evict());
+        assert_eq!(cache.depth(&chain, &prompt), 6);
+        assert_eq!(cache.depth(&chain, &prompt[..4]), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_a_hold_applies_only_to_verified_tokens() -> Result<()> {
+        let pool = pool()?;
+        let mut cache = cache(2);
+        let prompt: Vec<u32> = (0..8).collect();
+        let forged: Vec<u32> = (8..16).collect();
+        let keys = cache.keys(None, &prompt);
+        cache.insert(&keys, &prompt[..4], &state(&pool, 4)?, None)?;
+        // A key match over different tokens must not hold the entry.
+        cache.hold(
+            &keys,
+            &forged,
+            &[4],
+            Instant::now() + Duration::from_secs(600),
+        );
+        let other = cache.keys(None, &forged);
+        cache.insert(&other, &forged[..6], &state(&pool, 6)?, None)?;
+        let third: Vec<u32> = (16..24).collect();
+        let third_keys = cache.keys(None, &third);
+        cache.insert(&third_keys, &third[..6], &state(&pool, 6)?, None)?;
+        assert_eq!(cache.depth(&keys, &prompt), 0);
+        Ok(())
+    }
+
     #[test]
     fn test_reuse_counts_age_away() -> Result<()> {
         let pool = pool()?;
@@ -762,6 +921,7 @@ mod tests {
                 entries: 1,
                 state_share: None,
                 restorable_first: false,
+                tool_hold: Duration::ZERO,
             }
             .validate(16)
             .is_err()

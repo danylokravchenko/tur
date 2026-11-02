@@ -277,6 +277,8 @@ mod tests {
             prefill_chunk_size = 512
             target_pass_ms = 80
             max_queue_wait_ms = 350
+            shortest_prompt_first = true
+            layered_prefill = false
             min_prefill_tokens = 16
             max_waiting_tokens = 10000
             prefix_spacing = 512
@@ -318,6 +320,8 @@ mod tests {
         assert_eq!(scheduler.min_prefill_tokens, 16);
         assert_eq!(scheduler.target_pass, Duration::from_millis(80));
         assert_eq!(scheduler.max_queue_wait, Duration::from_millis(350));
+        assert!(scheduler.shortest_prompt_first);
+        assert!(!scheduler.layered_prefill);
         assert!(!pipeline.device_sampling);
         assert!(!pipeline.speculation.enabled());
         assert_eq!(pipeline.prefix.entries, 0);

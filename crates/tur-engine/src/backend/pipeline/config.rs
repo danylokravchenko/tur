@@ -9,7 +9,10 @@ use super::super::{
     },
 };
 use super::{BatchStepOutput, InferencePipeline};
-use crate::{Result, hybrid::HybridEngine};
+use crate::{
+    Result,
+    hybrid::{HybridEngine, HybridModel},
+};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -51,6 +54,7 @@ impl PipelineConfig {
                 entries: max_batch_size,
                 state_share: Some(PrefixConfig::DEFAULT_STATE_SHARE),
                 restorable_first: false,
+                tool_hold: PrefixConfig::DEFAULT_TOOL_HOLD,
             },
             device_sampling: true,
             speculation: SpeculationConfig::DISABLED,
@@ -109,7 +113,7 @@ impl InferencePipeline {
         config: PipelineConfig,
         budget: &DeviceBudget,
     ) -> Result<Self> {
-        let scheduler = Scheduler::new(config.scheduler)?;
+        let mut scheduler = Scheduler::new(config.scheduler)?;
         let config = config.resolve(factory.recurrent)?;
         let draft = config
             .speculation
@@ -188,6 +192,9 @@ impl InferencePipeline {
                 "loaded weights disagree with the pre-load memory plan",
             ));
         }
+        if model.pausable_layers().is_some() {
+            scheduler.allow_layered_prefill();
+        }
         let model = Arc::new(model);
         let mut engine = HybridEngine::new(Arc::clone(&model), factory.device.clone(), pool)?;
         engine.set_device_sampling(config.device_sampling);
@@ -211,6 +218,8 @@ impl InferencePipeline {
             }),
             awaiting: HashSet::new(),
             in_flight: None,
+            layered: None,
+            decode_next: false,
             staged: BatchStepOutput::default(),
             guidance: None,
             speculation: config.speculation,
@@ -218,7 +227,8 @@ impl InferencePipeline {
             head_costs: HeadCosts::default(),
             head_skips: 0,
             head_explore: speculation::HEAD_EXPLORE_PASSES,
-            acceptance: Acceptance::default(),
+            draft_skips: 0,
+            draft_explore: speculation::HEAD_EXPLORE_PASSES,
             mtp_acceptance: Acceptance::default(),
             calibration: [Calibration::default(); 2],
             speculation_stats: SpeculationStats::default(),

@@ -97,7 +97,18 @@ impl InferencePipeline {
             })
             .collect();
         let limit = self.speculation.max_pass_drafts.min(room);
-        let counts = speculation::plan(&proposals, decodes, &self.draft_costs, limit, mixed);
+        let mut counts = speculation::plan(&proposals, decodes, &self.draft_costs, limit, mixed);
+        if counts.iter().any(|&count| count > 0) {
+            (self.draft_skips, self.draft_explore) = (0, speculation::HEAD_EXPLORE_PASSES);
+        } else if decode_only && self.draft_costs.line(decodes).is_some() {
+            self.draft_skips += 1;
+            if self.draft_skips >= self.draft_explore {
+                self.draft_skips = 0;
+                self.draft_explore =
+                    (self.draft_explore * 2).min(speculation::HEAD_EXPLORE_MAX_PASSES);
+                counts = speculation::explore(&proposals, limit);
+            }
+        }
         let usage = self.engine.memory()?;
         let mut demand = Demand::default();
         let mut plain = Vec::with_capacity(chunks.len());
@@ -132,7 +143,7 @@ impl InferencePipeline {
             }
             if count == 0 {
                 match source {
-                    DraftSource::Lookup => pending.acceptance.recover(self.acceptance),
+                    DraftSource::Lookup => pending.acceptance.recover(Acceptance::default()),
                     DraftSource::Mtp => pending.mtp_acceptance.recover(Acceptance::default()),
                 }
             }

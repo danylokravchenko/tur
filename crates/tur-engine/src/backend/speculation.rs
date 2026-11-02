@@ -216,8 +216,8 @@ impl NgramIndex {
 
 /// Weight of one observation in an acceptance estimate.
 const ACCEPTANCE_SMOOTHING: f64 = 0.2;
-/// How far an idle estimate moves back towards the pipeline-wide rate per pass without
-/// drafts, so a request whose early proposals failed is eventually retried.
+/// How far an idle estimate moves back towards its neutral start per pass without drafts,
+/// so a request whose early proposals failed is eventually retried.
 const ACCEPTANCE_RECOVERY: f64 = 0.05;
 
 /// Online estimate of the probability that one more draft is accepted, given that the
@@ -263,6 +263,9 @@ impl Acceptance {
 
 /// Weight kept by older samples of a cost fit per new sample (a window of about twenty).
 const COST_DECAY: f64 = 0.95;
+/// Predicted throughput gain a pass's drafts must exceed: the line counts device time only,
+/// and verified rows also cost host work after it.
+const PLAN_MARGIN: f64 = 1.05;
 /// Variance of drafted tokens below which a fit cannot separate base and draft costs.
 /// Passes alternating zero and one draft (single-token proposals) reach 0.25.
 const MIN_DRAFT_VARIANCE: f64 = 0.1;
@@ -439,7 +442,8 @@ pub fn plan(
         .map(|(base, per_draft)| (base + prefill.unwrap_or(0.0), per_draft));
     let take = match line {
         Some((base, per_draft)) => {
-            let (mut best, mut best_rate, mut gain) = (0, decodes as f64 / base, 0.0);
+            let undrafted = decodes as f64 / base;
+            let (mut best, mut best_rate, mut gain) = (0, undrafted, 0.0);
             for (taken, (expected, _, _)) in depths.iter().enumerate() {
                 gain += expected;
                 let rate = (decodes as f64 + gain) / per_draft.mul_add((taken + 1) as f64, base);
@@ -447,7 +451,11 @@ pub fn plan(
                     (best, best_rate) = (taken + 1, rate);
                 }
             }
-            best
+            if best_rate > PLAN_MARGIN * undrafted {
+                best
+            } else {
+                0
+            }
         }
         None if prefill.is_some() || costs.explore_without(decodes) => 0,
         None => depths.len(),
@@ -457,6 +465,21 @@ pub fn plan(
         counts[index] += 1;
     }
     counts
+}
+
+/// Drafts for a pass that re-measures draft costs: every proposal in full, up to `limit`.
+/// A whole proposal gives the fit enough variation to replace its slope. Without this, a
+/// slope measured too high stops drafting, and with no drafts nothing can correct it.
+pub fn explore(proposals: &[Proposal], limit: usize) -> Vec<usize> {
+    let mut left = limit;
+    proposals
+        .iter()
+        .map(|proposal| {
+            let count = proposal.tokens.min(left);
+            left -= count;
+            count
+        })
+        .collect()
 }
 
 /// Confidence bins of a [`Calibration`].
@@ -528,9 +551,9 @@ impl Calibration {
 
 /// Weight of one observation in a draft-head cost estimate.
 const HEAD_SMOOTHING: f64 = 0.2;
-/// Draft-head passes skipped as unprofitable before one computes drafts anyway, so the
-/// acceptance and cost estimates that decided it stay current. The interval doubles while
-/// exploring keeps finding no gain, up to the maximum.
+/// Passes skipped as unprofitable, by the draft head or by planning, before one drafts
+/// anyway, so the acceptance and cost estimates that decided it stay current. The interval
+/// doubles while exploring keeps finding no gain, up to the maximum.
 pub const HEAD_EXPLORE_PASSES: usize = 16;
 pub const HEAD_EXPLORE_MAX_PASSES: usize = 256;
 /// Predicted throughput gain head drafts must exceed. Within it, the draft cost fit (often
@@ -795,6 +818,33 @@ mod tests {
         costs.record(1, 0, 0.018);
         costs.record(1, 0, 0.018);
         assert!(costs.line(1).is_some());
+    }
+
+    #[test]
+    fn test_exploring_replaces_a_slope_that_stopped_drafting() -> Result<()> {
+        // A draft cost measured far too high: planning stops drafting, and undrafted passes
+        // alone keep that slope.
+        let mut costs = costs(1, 0.020, 0.100);
+        let proposal = Proposal {
+            tokens: 4,
+            acceptance: Acceptance(0.5),
+        };
+        for _ in 0..200 {
+            costs.record(1, 0, 0.020);
+        }
+        assert_eq!(plan(&[proposal], 1, &costs, 8, None), [0]);
+        assert_eq!(explore(&[proposal, proposal], 6), [4, 2]);
+        // One explored pass per sixteen, at the true cost of a millisecond per draft.
+        for _ in 0..4 {
+            costs.record(1, explore(&[proposal], 8)[0], 0.024);
+            for _ in 0..15 {
+                costs.record(1, 0, 0.020);
+            }
+        }
+        let (_, slope) = costs.line(1).ok_or_else(|| invalid("unfitted"))?;
+        assert!((slope - 0.001).abs() < 1e-6);
+        assert_eq!(plan(&[proposal], 1, &costs, 8, None), [3]);
+        Ok(())
     }
 
     #[test]
