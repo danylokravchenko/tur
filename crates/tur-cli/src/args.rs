@@ -266,6 +266,8 @@ pub(crate) struct PipelineArgs {
     #[arg(skip)]
     shortest_prompt_first: Option<bool>,
     #[arg(skip)]
+    layered_prefill: Option<bool>,
+    #[arg(skip)]
     prefix_spacing: Option<usize>,
     #[arg(skip)]
     prefix_restorable_first: Option<bool>,
@@ -295,6 +297,7 @@ impl PipelineArgs {
         target_pass_ms,
         max_queue_wait_ms,
         shortest_prompt_first,
+        layered_prefill,
         prefix_spacing,
         prefix_restorable_first
     );
@@ -352,6 +355,7 @@ impl PipelineArgs {
         scheduler.shortest_prompt_first = self
             .shortest_prompt_first
             .unwrap_or(scheduler.shortest_prompt_first);
+        scheduler.layered_prefill = self.layered_prefill.unwrap_or(scheduler.layered_prefill);
         Ok(config)
     }
 }

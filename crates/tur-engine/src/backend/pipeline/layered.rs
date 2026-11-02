@@ -35,7 +35,8 @@ impl InferencePipeline {
     /// pack, and whether they are a paused chunk's last group, submitted alone because its
     /// rows join no other request's layers. Other prefill waits for a paused chunk.
     pub(super) fn layer_prefill(&mut self, chunks: Vec<Chunk>) -> Result<(Vec<Chunk>, bool)> {
-        let Some(layers) = self.model.pausable_layers() else {
+        let layers = self.model.pausable_layers();
+        let Some(layers) = layers.filter(|_| self.scheduler.layered_prefill()) else {
             return Ok((chunks, false));
         };
         let decoding = |chunk: &&Chunk| {

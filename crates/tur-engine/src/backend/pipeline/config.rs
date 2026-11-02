@@ -193,7 +193,7 @@ impl InferencePipeline {
             ));
         }
         if model.pausable_layers().is_some() {
-            scheduler.enable_layered_prefill();
+            scheduler.allow_layered_prefill();
         }
         let model = Arc::new(model);
         let mut engine = HybridEngine::new(Arc::clone(&model), factory.device.clone(), pool)?;

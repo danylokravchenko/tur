@@ -12,6 +12,8 @@ use crate::hybrid::{
     Addresses, Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward,
     SequenceForward, SequenceStep, StatePool,
 };
+#[cfg(feature = "metal")]
+use crate::hybrid::{LayerCarry, LayerStep};
 use crate::models::weights::{Embeddings, Tensors};
 use crate::models::{Execution, LoadOptions, Weights, artifact};
 use crate::quantization::{Calibration, Recorder};
@@ -1172,6 +1174,19 @@ impl Qwen35 {
         trace: Option<&mut Vec<Tensor>>,
         recorder: Option<&Recorder>,
     ) -> Result<Vec<SequenceStep>> {
+        let pass = Self::pass(batch, spans)?;
+        #[cfg(feature = "metal")]
+        let (logits, hidden) = match &self.fused {
+            Some(fused) if recorder.is_none() => self.run_fused(fused, &pass, trace)?,
+            _ => self.run_reference(&pass, trace, recorder)?,
+        };
+        #[cfg(not(feature = "metal"))]
+        let (logits, hidden) = self.run_reference(&pass, trace, recorder)?;
+        Self::steps(spans, &logits, hidden.as_ref())
+    }
+
+    /// The packed rows of live spans.
+    fn pass<'a, 'b>(batch: &'a PackedForward<'_>, spans: &'a [Span<'b>]) -> Result<Pass<'a, 'b>> {
         let mut ids = Vec::new();
         let mut positions = Vec::new();
         for span in spans {
@@ -1206,20 +1221,22 @@ impl Qwen35 {
             spans,
             pool: batch.pool,
         };
-        #[cfg(feature = "metal")]
-        let (logits, hidden) = match &self.fused {
-            Some(fused) if recorder.is_none() => self.run_fused(fused, &pass, trace)?,
-            _ => self.run_reference(&pass, trace, recorder)?,
-        };
-        #[cfg(not(feature = "metal"))]
-        let (logits, hidden) = self.run_reference(&pass, trace, recorder)?;
+        Ok(pass)
+    }
+
+    /// Split a pass's outputs back into its spans.
+    fn steps(
+        spans: &[Span<'_>],
+        logits: &Tensor,
+        hidden: Option<&Tensor>,
+    ) -> Result<Vec<SequenceStep>> {
         let mut offset = 0;
         let mut steps = Vec::with_capacity(spans.len());
         for span in spans {
             let rows = span.sequence.logits.len();
             steps.push(SequenceStep {
                 logits: logits.narrow(0, offset, rows)?.contiguous()?,
-                hidden: match (&hidden, span.sequence.hidden) {
+                hidden: match (hidden, span.sequence.hidden) {
                     (Some(hidden), true) => Some(hidden.narrow(0, span.start, span.len)?),
                     _ => None,
                 },
@@ -1379,6 +1396,42 @@ impl HybridModel for Qwen35 {
         }
         let _ = batch;
         Ok(0)
+    }
+
+    /// Only behind an expert cache, where a pass costs enough to stall streams: see
+    /// `InferencePipeline`'s layered prefill.
+    #[cfg(feature = "metal")]
+    fn pausable_layers(&self) -> Option<usize> {
+        (self.cache.is_some() && self.fused.is_some()).then_some(self.layers.len())
+    }
+
+    #[cfg(feature = "metal")]
+    fn forward_layers(
+        &self,
+        batch: &PackedForward<'_>,
+        carry: Option<LayerCarry>,
+        end: usize,
+    ) -> Result<LayerStep> {
+        let fused = self
+            .fused
+            .as_ref()
+            .ok_or_else(|| invalid("a paused pass runs on the Metal kernels"))?;
+        let [sequence] = batch.sequences else {
+            return Err(invalid("a paused pass runs one sequence"));
+        };
+        if batch.pool.description() != &self.description || !batch.embeddings.is_empty() {
+            return Err(invalid("a paused pass runs text on this model's own pool"));
+        }
+        let spans = [self.check(batch, sequence, 0)?];
+        let pass = Self::pass(batch, &spans)?;
+        match self.fused_range(fused, &pass, carry, end)? {
+            fused::LayerProgress::Paused(carry) => Ok(LayerStep::Paused(carry)),
+            fused::LayerProgress::Done((logits, hidden)) => {
+                let mut steps = Self::steps(&spans, &logits, hidden.as_ref())?;
+                let step = steps.pop().ok_or_else(|| invalid("missing Qwen output"))?;
+                Ok(LayerStep::Done(step))
+            }
+        }
     }
 
     fn forward(&self, batch: &PackedForward<'_>) -> Result<Vec<Result<SequenceStep>>> {

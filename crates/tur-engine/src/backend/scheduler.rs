@@ -39,6 +39,9 @@ pub struct SchedulerConfig {
     /// Prefill and admission favor the fewest remaining prompt tokens over arrival order,
     /// until a request reaches `max_queue_wait`.
     pub shortest_prompt_first: bool,
+    /// Split prefill beside decodes by layers on models that can pause between them.
+    /// Off, such a prompt shares passes with decodes as on any other model.
+    pub layered_prefill: bool,
 }
 
 impl SchedulerConfig {
@@ -55,6 +58,7 @@ impl SchedulerConfig {
             target_pass: Duration::from_millis(60),
             max_queue_wait: Duration::from_secs(2),
             shortest_prompt_first: false,
+            layered_prefill: true,
         }
     }
 
@@ -192,9 +196,15 @@ impl Scheduler {
         })
     }
 
-    /// Grant prefill a whole chunk beside decodes: the pipeline splits it by layers.
-    pub fn enable_layered_prefill(&mut self) {
-        self.layered = true;
+    /// The model can pause between layers: unless configured off, grant prefill a whole
+    /// chunk beside decodes, which the pipeline splits by layers.
+    pub fn allow_layered_prefill(&mut self) {
+        self.layered = self.config.layered_prefill;
+    }
+
+    /// Whether prefill beside decodes runs in layer groups.
+    pub fn layered_prefill(&self) -> bool {
+        self.layered
     }
 
     pub fn config(&self) -> &SchedulerConfig {
@@ -453,6 +463,7 @@ mod tests {
             target_pass: Duration::from_millis(10),
             max_queue_wait: Duration::from_secs(1),
             shortest_prompt_first: false,
+            layered_prefill: true,
         }
     }
 
@@ -492,7 +503,14 @@ mod tests {
         // A slow measured pass holds an ordinary young prompt to the prefill minimum.
         plain.record(1, 10, Duration::from_secs(1));
         let mut layered = plain.clone();
-        layered.enable_layered_prefill();
+        layered.allow_layered_prefill();
+        assert!(layered.layered_prefill());
+        let mut off = Scheduler::new(SchedulerConfig {
+            layered_prefill: false,
+            ..config()
+        })?;
+        off.allow_layered_prefill();
+        assert!(!off.layered_prefill());
         for _ in 0..8 {
             let chosen = run(plain.plan(&candidates, start, |_| Ok(true))?)?;
             assert!(chosen[1].1 < 16, "{chosen:?}");

@@ -22,7 +22,7 @@ The scheduler measures how long each pass took on the GPU, by shape and context 
 - The share changes by at most a factor of two per pass and never drops below the minimum, so one noisy timing can't starve prompts.
 - If the oldest waiting prompt has waited longer than `max_queue_wait`, it ignores the time target, within the pass's token cap. If younger requests hold the memory or places it needs, the newest of them is preempted.
 - Chunks stop at prefix snapshot positions, so recurrent state exists at each exact boundary.
-- Behind a gpt-oss expert cache, a prompt beside decodes takes a whole chunk and runs it in [layer groups](expert-cache.md#serving-several-requests), with decodes between them, because a group rather than the pass's token count then bounds the wait.
+- Behind an expert cache, a prompt beside decodes takes a whole chunk and runs it in [layer groups](expert-cache.md#serving-several-requests), with decodes between them, because a group rather than the pass's token count then bounds the wait.
 
 ## Preemption
 

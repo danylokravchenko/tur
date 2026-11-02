@@ -132,6 +132,17 @@ This shrinks every part of the plan. F16 recurrent state costs some accuracy on 
 
 Batching can change logits in their last bits, because kernels add numbers in a different order at different batch shapes. The same seed with different neighbours can therefore pick a different token now and then. For bit-for-bit reproducible output, use the library's `PipelineConfig::reproducible`, which runs one request at a time in fixed chunks, without prefix reuse or speculation. Making concurrent batches bit-exact was tried and cost up to half the speed (see [Rejected experiments](../design/rejected.md)).
 
+### Layered prefill
+
+Behind an expert cache, a long prompt arriving while another request streams runs a group of layers at a time, with that stream's next token between groups. It's on by default, and it does nothing without an expert cache or when nothing else is decoding.
+
+Turn it off when nobody watches tokens arrive, as in batch jobs and agents that read whole replies. Prompts then finish sooner: on gpt-oss-20b with a 1 GiB cache, a 1,328-token prompt took 14.7 s instead of 16.7 s, while the stream's worst gap grew from 5.7 s to 14.4 s. Turning it off also helps when many prompts arrive together, because other prompts wait while one chunk is split. Keep it on for interactive use.
+
+```toml
+[engine]
+layered_prefill = false
+```
+
 ## Measure the result
 
 For a single request, the HTTP `usage` block and the library's `GenerationStats` report prompt, cached and generated tokens, and the CLI logs elapsed time and finish reason.

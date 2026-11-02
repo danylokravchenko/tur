@@ -20,10 +20,6 @@ If several clients share one Mac, three designs apply. [Niyama](https://arxiv.or
 
 Evicting snapshots and lowering `max_running` under pressure were rejected because neither returns memory to macOS (see [Rejected experiments](../design/rejected.md)). Scratch is the part that can shrink: Candle frees idle buffers at each sync, and gpt-oss-20b plans up to 1.28 GB of it, the same at one request or four. Shorter prefill chunks while spare memory is low might lower that peak, at the cost of the slower prefill measured in [Expert cache](../architecture/expert-cache.md). The worker only reads allocations after a pass, so measuring this first needs a reading of the peak within one.
 
-### A shorter path from SSD to GPU
-
-Expert reads go into host memory, then a new staging buffer, then a blit into a private arena (`crates/tur-metal/src/experts.rs`). Uploads and copies took 31 s of an earlier 83 s run, before uploads moved into the read threads. [`MTLIOCommandQueue`](https://developer.apple.com/documentation/metal/resource-loading.md) loads files directly into GPU resources, and reading into a shared arena would drop the blit. Either may need bindings that conflict with the ban on `unsafe`, so this needs a decision on dependencies first. Re-measure the current split before starting.
-
 ### M5 Neural Accelerators
 
 [BaseRT](https://arxiv.org/abs/2607.19438) routes prefill matrix work through Metal 4 tensor kernels and reports up to 6.4× prompt speed over llama.cpp and 3.9× over MLX on an M5 Pro, while decode stays on existing kernels. [Apple's MLX write-up](https://machinelearning.apple.com/research/exploring-llms-mlx-m5) reports up to 4× faster first tokens against an M4. BaseRT is a self-reported preprint, and only its abstract was read for this page. Both support retrying TensorOps and chunked DeltaNet prefill (see [Rejected experiments](../design/rejected.md#worth-retrying-on-other-hardware)), which needs an M5 to test.
@@ -40,6 +36,7 @@ MLX exposes a [wired limit](https://github.com/ml-explore/mlx-lm/issues/883) tha
 
 - Running predicted experts without checking them, as [Speculating Experts](https://arxiv.org/abs/2603.19289) does, breaks Tur's exactness rule. Its better predictor adds under a point on gpt-oss (0.857 against 0.849) over the next-layer router signal Tur already reads ahead with.
 - A general SSD tier for K/V, as in [oMLX](https://jimmysong.io/ai/omlx) and vLLM, adds steady SSD writes and conflicts with the expert cache's rule of making none. Saving pinned prefixes on request is the most this could justify.
+- `MTLIOCommandQueue` loads files directly into GPU resources, but it can't beat the SSD's own speed, and [reading directly into a shared arena](../design/rejected.md) gained only 6% on the same copies. It would also need `unsafe` bindings.
 - [Purgeable buffers](https://developer.apple.com/documentation/metal/mtlpurgeablestate.md) suit resources unused for some time, [according to Apple](https://developer.apple.com/forums/thread/698161), and the expert arena is one large buffer in constant use.
 - Prefill/decode disaggregation and Mooncake-style connectors move state between machines, and one Mac is Tur's unit of deployment.
 

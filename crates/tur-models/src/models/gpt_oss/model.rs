@@ -5,11 +5,12 @@ use super::prune::ExpertProbe;
 #[cfg(feature = "metal")]
 use super::prune::LayerProbe;
 #[cfg(feature = "metal")]
+use crate::hybrid::{LayerCarry, LayerStep};
+#[cfg(feature = "metal")]
 use crate::models::paging::Paging;
 use crate::{
     hybrid::{
-        Addresses, Boundaries, HybridModel, LayerCarry, LayerStep, PackedForward, SequenceForward,
-        SequenceStep, StatePool,
+        Addresses, Boundaries, HybridModel, PackedForward, SequenceForward, SequenceStep, StatePool,
     },
     models::{
         Execution, LoadOptions, Precision, WeightPlan, Weights, artifact,
