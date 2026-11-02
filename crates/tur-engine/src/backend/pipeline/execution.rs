@@ -220,7 +220,6 @@ impl InferencePipeline {
                 let stats = &mut self.speculation_stats;
                 match source {
                     DraftSource::Lookup => {
-                        self.acceptance.observe(drafted, accepted);
                         stats.observe_depths(drafted, accepted);
                     }
                     DraftSource::Mtp => {

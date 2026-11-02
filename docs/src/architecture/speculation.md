@@ -27,9 +27,10 @@ Undoing rejected drafts means picking a boundary. Every recurrent layer keeps a 
 
 Verifying drafts costs GPU time, and a wrong draft wastes it. Tur keeps track of both sides:
 
-- Each request estimates how often its drafts are accepted, separately for each draft source.
+- Each request estimates how often its drafts are accepted, separately for each draft source. Lookup's estimate starts neutral for every request, so one request's rejected drafts can't stop drafting for later ones.
 - `DraftCosts` fits measured GPU time against the number of drafted tokens, separately for each number of decoding requests.
-- Planning drafts the most likely tokens first and stops where expected tokens per second would start to fall. When a larger batch makes verification more expensive, speculation turns itself off.
+- Planning drafts the most likely tokens first and stops where expected tokens per second would start to fall. A pass drafts only if the predicted gain exceeds 5%, because the cost fit sees device time and verified rows also cost host work. When a larger batch makes verification more expensive, speculation turns itself off.
+- When planning has turned drafting off, a pass drafts anyway after 16 skipped passes, and the interval doubles up to 256. Without new drafts, a per-draft cost measured too high could never be corrected.
 
 The MTP head and the Gemma assistant have extra gates:
 
@@ -53,8 +54,12 @@ Measured on Qwen3.5-0.8B on an M1 unless noted:
 - Speculation is an opt-in throughput mode. Prompt lookup ran 3.25× faster on repetitive single-request output, but tokens arrive in bursts with longer pauses between them, which hurts the slowest token gaps.
 - The MTP head drafts from a reduced vocabulary: the 32,768 lowest token IDs, through a copy of the output layer's first rows. Byte-level BPE numbers tokens in merge order, so these are the most frequent ones. This cut a head pass from about 6.5 ms to under 3 ms with unchanged acceptance; 16K tokens lost prose drafts and 64K added cost.
 - Calibrated confidence makes MTP useful with sampling. Drafts with confidence of at least 0.8 were 99% accepted, and those below 0.4 only 20%.
+- Lookup's acceptance starts neutral for each request instead of from a pipeline-wide rate. The shared rate fell after early rejections and new requests inherited it: over 16 mixed prose, code, JSON and chat requests, 13 verified no drafts and lookup stayed at 1.00×. With neutral starts, lookup gave 1.19× greedy and 1.14× sampled with one request, and up to 1.5× on JSON. Tokens matched normal decoding.
+- Planning requires a 5% predicted gain. Without it, lookup lost 2 to 3% with four requests, and with it lookup is level at about 1.00×. Lookup plus MTP on the same requests gave 1.25 to 1.32× greedy and 1.25 to 1.27× sampled with one request, and 1.10 to 1.24× with four.
+- Planning re-tests drafting after it has turned off. Some long runs stayed at 1.00× while others on the same code reached 1.14 to 1.20×. A stale per-draft cost is the suspected cause. This recovery has a unit test but no measured real-run gain yet.
 - Lookup plus MTP gives 1.12 to 1.38× normal decoding on new prose and code with one to four requests, greedy and sampled.
 - The head turns off above four decoding requests. At eight, its upkeep costs 3 to 5% and a draft costs nearly as much as decoding the token. For the same reason, a finer cost model wasn't built: it could gain at most about 10%.
+- Table-based drafters aren't used (see [Rejected experiments](../design/rejected.md)). `just bench drafter` replays them over recorded tokens.
 - There is no learned drafter for Qwen. No smaller Qwen3.5 checkpoint exists to draft with, and no EAGLE-3, DFlash or DSpark drafter targets these checkpoints.
 - The Gemma assistant drafts one token per pass for several requests. On E2B (Q8_0, F16 K/V, greedy), lookup plus the assistant beat normal decoding by 1.42× on prose and 1.17 to 1.30× on code with one request, and 1.23× and 1.35× with four. On repetitive prompts, where lookup alone gives 3.2×, it changes little. About two thirds of its drafts were accepted, at about 2.9 ms each against a 47 ms decode, and all 36 runs reproduced normal decoding's tokens.
 - The Gemma assistant chains drafts with one request decoding. Against one draft per pass, chains were 1.14× faster on prose and 1.50× on repetitive text, and level on code. With four requests they lost 6% on prose and 13% on code, so chaining is limited to one request. Every run reproduced the single-draft tokens.

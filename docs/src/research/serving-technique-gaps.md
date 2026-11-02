@@ -2,7 +2,7 @@
 
 Created: 2026-11-01. Status: research backlog; what remains here hasn't been built or measured in Tur.
 
-This page compares Tur with vLLM, llama.cpp, SGLang, oMLX, BaseRT and recent papers, and lists techniques Tur lacks. Tur's existing work (chunked prefill, prefix snapshots, device sampling, exact speculation, the expert cache) is left out. Every number comes from its source, on that source's hardware and models, and doesn't predict Tur's results. The order is a judgment of value against effort.
+This page compares Tur with vLLM, llama.cpp, SGLang, oMLX, BaseRT and recent papers, and lists techniques Tur lacks. Tur's existing work (chunked prefill, prefix snapshots, device sampling, exact speculation, the expert cache) is left out, and so are table-based drafters, which were tried and [rejected](../design/rejected.md). Every number comes from its source, on that source's hardware and models, and doesn't predict Tur's results. The order is a judgment of value against effort.
 
 ## Build first
 
@@ -15,14 +15,6 @@ Prompts run in arrival order, with no priorities or per-client fairness. The ten
 Remaining prompt length is known exactly, so the scheduler could run the shortest remaining prompt first and keep `max_queue_wait` as the bound on starvation. This is a proposal for Tur rather than a published result. The nearest evidence is [Learning to Rank](https://arxiv.org/abs/2408.15792v1), which reports 2.8× lower chatbot latency by approximating shortest-job-first, using a small helper model to rank output lengths.
 
 If several clients share one Mac, three designs apply. [Niyama](https://arxiv.org/abs/2503.22562v1) blends earliest-deadline-first with shortest-job-first across service classes, which would separate interactive from batch work. [VTC](https://arxiv.org/pdf/2401.00588) gives per-client fairness counted in tokens, with a 2× bound on the service gap between backlogged clients. [Autellix](https://arxiv.org/abs/2502.13965v1) favors agent programs that have received the least total service, and reports 4 to 15× higher program throughput at the same latency.
-
-### A drafter that needs no model
-
-No learned drafter exists for Qwen, and the MTP head turns prefix reuse off. A table-based drafter avoids both problems.
-
-[Token Recycling](https://arxiv.org/abs/2408.08696v1) keeps the 8 most likely next tokens for each vocabulary token, in under 2 MB, and refreshes them from the logits of every verified position. llama.cpp's [`ngram-mod`](https://huggingface.co/OpenTransformer/llama.cpp-prismml/blob/main/docs/speculative.md) shares a hash pool of n-grams across slots. Tur should split any shared table by `cache_salt`, so that one tenant's text can't influence another's drafts or timing.
-
-Token Recycling's report of about 2× comes from greedy decoding with a draft tree. Tur's recurrent state favors a single chain, and device sampling returns only the chosen token, so collecting candidates has its own cost. Replaying recorded token traces offline can bound the acceptance rate before any kernel work.
 
 ### Keeping state across tool calls
 

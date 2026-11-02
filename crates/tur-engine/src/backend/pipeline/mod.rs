@@ -188,8 +188,10 @@ pub struct InferencePipeline {
     /// count after which one explores anyway.
     head_skips: usize,
     head_explore: usize,
-    /// Pipeline-wide acceptance, the starting estimate of new requests, per source.
-    acceptance: Acceptance,
+    /// The same for planning: proposals planned away, and the count that explores anyway.
+    draft_skips: usize,
+    draft_explore: usize,
+    /// Pipeline-wide head acceptance, the starting estimate of new requests.
     mtp_acceptance: Acceptance,
     /// Draft-head acceptance by confidence, for sampled and greedy requests.
     calibration: [Calibration; 2],

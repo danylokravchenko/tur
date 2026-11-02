@@ -47,7 +47,7 @@ use tur_models::models::{
 
 const CHUNK: usize = 256;
 
-fn env_sizes(name: &str, default: &str) -> Result<Vec<usize>> {
+pub(crate) fn env_sizes(name: &str, default: &str) -> Result<Vec<usize>> {
     std::env::var(name)
         .unwrap_or_else(|_| default.into())
         .split(',')
@@ -55,7 +55,7 @@ fn env_sizes(name: &str, default: &str) -> Result<Vec<usize>> {
         .collect()
 }
 
-fn percentile(samples: &[f64], p: f64) -> f64 {
+pub(crate) fn percentile(samples: &[f64], p: f64) -> f64 {
     if samples.is_empty() {
         return 0.0;
     }
@@ -94,7 +94,7 @@ struct Burst {
 }
 
 /// Sampling of every benchmark request: `greedy` or `temperature,top_k,top_p`.
-fn sampling() -> Result<SamplingOptions> {
+pub(crate) fn sampling() -> Result<SamplingOptions> {
     let spec = std::env::var("TUR_BENCH_SAMPLING").unwrap_or_else(|_| "greedy".into());
     if spec == "greedy" {
         return Ok(SamplingOptions {
@@ -120,7 +120,10 @@ fn summary(samples: &[f64]) -> Value {
 }
 
 /// Submit every request at once and step until all finish, timing each pass's phases.
-fn run_requests(pipeline: &mut InferencePipeline, requests: &[GenerationRequest]) -> Result<Value> {
+pub(crate) fn run_requests(
+    pipeline: &mut InferencePipeline,
+    requests: &[GenerationRequest],
+) -> Result<Value> {
     let start = Instant::now();
     let mut ids = HashMap::new();
     for (index, request) in requests.iter().enumerate() {
