@@ -59,6 +59,21 @@ struct RopeParams {
 }
 
 #[repr(C)]
+struct AxialRopeParams {
+    tokens: u32,
+    heads: u32,
+    dim: u32,
+    row_stride: u32,
+    head_stride: u32,
+    col_offset: u32,
+    run: u32,
+    runs: u32,
+    axes: u32,
+    normalize: u32,
+    eps: f32,
+}
+
+#[repr(C)]
 struct GluParams {
     rows: u32,
     width: u32,
@@ -266,6 +281,17 @@ pub struct Heads {
     pub dim: usize,
     pub head_stride: usize,
     pub col_offset: usize,
+}
+
+/// How [`Kernels::axial_rope`] rotates a head: `runs` leading runs of `run` columns, each
+/// rotated by split halves, with one frequency and position coordinate per half-run entry.
+#[derive(Clone, Debug)]
+pub struct AxialRotation {
+    inv_freq: Tensor,
+    axis: Tensor,
+    run: usize,
+    runs: usize,
+    axes: usize,
 }
 
 /// Gated `DeltaNet` geometry. The projection row holds `[q | k | v | z | b | a]`, with the
@@ -805,6 +831,103 @@ impl Kernels {
             })?;
         let shape = (xv.rows, heads.count, heads.dim);
         self.finish(out, shape)
+    }
+
+    /// Tables for [`Self::axial_rope`]: `inv_freq` and `axis` hold `run * runs / 2` entries.
+    pub fn axial_rotation(
+        &self,
+        inv_freq: &[f32],
+        axis: &[u32],
+        run: usize,
+        runs: usize,
+    ) -> Result<AxialRotation> {
+        let frequencies = (run / 2)
+            .checked_mul(runs)
+            .ok_or_else(|| invalid("rotary size overflow"))?;
+        if frequencies == 0
+            || !run.is_multiple_of(2)
+            || inv_freq.len() != frequencies
+            || axis.len() != frequencies
+        {
+            return Err(invalid("rotary tables do not match their runs"));
+        }
+        let axes = axis.iter().max().map_or(0, |&a| a as usize + 1);
+        Ok(AxialRotation {
+            inv_freq: Tensor::new(inv_freq, self.device())?,
+            axis: Tensor::new(axis, self.device())?,
+            run,
+            runs,
+            axes,
+        })
+    }
+
+    /// Per-head optional `RMSNorm` then split-half rotary, where each frequency reads its own
+    /// coordinate of the token's position: angle `positions[t][axis[f]] * inv_freq[f]`.
+    /// `x` is `[tokens, width]` and `positions` U32 `[tokens, axes]`; returns contiguous
+    /// `[tokens, heads, dim]`.
+    pub fn axial_rope(
+        &self,
+        x: &Tensor,
+        heads: Heads,
+        norm: Option<(&Tensor, f64)>,
+        positions: &Tensor,
+        rotation: &AxialRotation,
+    ) -> Result<Tensor> {
+        let xv = self.view(x)?;
+        let pv = self.runtime.view(positions, DType::U32)?;
+        let fv = self.view(&rotation.inv_freq)?;
+        let av = self.runtime.view(&rotation.axis, DType::U32)?;
+        let wv = norm.map(|(weight, _)| self.view(weight)).transpose()?;
+        if let Some(wv) = &wv {
+            wv.expect(1, heads.dim, "head norm weight")?;
+        }
+        let (tokens, axes) = (pv.rows, pv.cols);
+        let last = heads
+            .count
+            .checked_sub(1)
+            .and_then(|h| h.checked_mul(heads.head_stride))
+            .and_then(|o| o.checked_add(heads.col_offset))
+            .and_then(|o| o.checked_add(heads.dim))
+            .ok_or_else(|| invalid("invalid head geometry"))?;
+        if tokens != xv.rows
+            || last > xv.cols
+            || rotation.run * rotation.runs > heads.dim
+            || rotation.axes > axes
+        {
+            return Err(invalid("heads or rotary tables exceed their inputs"));
+        }
+        let params = AxialRopeParams {
+            tokens: to_u32(tokens, "tokens")?,
+            heads: to_u32(heads.count, "heads")?,
+            dim: to_u32(heads.dim, "head dim")?,
+            row_stride: to_u32(xv.row_stride, "row stride")?,
+            head_stride: to_u32(heads.head_stride, "head stride")?,
+            col_offset: to_u32(heads.col_offset, "column offset")?,
+            run: to_u32(rotation.run, "rotary run")?,
+            runs: to_u32(rotation.runs, "rotary runs")?,
+            axes: to_u32(axes, "position axes")?,
+            normalize: u32::from(norm.is_some()),
+            eps: norm.map_or(0.0, |(_, eps)| eps as f32),
+        };
+        let items = tokens
+            .checked_mul(heads.count)
+            .ok_or_else(|| invalid("head count overflow"))?;
+        let pipeline = self.pipeline("axial_rope_f32")?;
+        let out = self.output(items, heads.dim)?;
+        let (groups, threads) = self.simdgroup_launch(pipeline, items);
+        self.runtime
+            .dispatch(pipeline, "tur_axial_rope", groups, threads, |e| {
+                xv.bind(e, 0)?;
+                // Unread without a norm, but every declared buffer needs a binding.
+                wv.as_ref().unwrap_or(&fv).bind(e, 1)?;
+                pv.bind(e, 2)?;
+                fv.bind(e, 3)?;
+                av.bind(e, 4)?;
+                out.bind(e, 5);
+                e.set_bytes(6, &params);
+                Ok(())
+            })?;
+        self.finish(out, (tokens, heads.count, heads.dim))
     }
 
     /// Split-half rotary of every head at angle `position * inv_freq[i]`, with `cos` and

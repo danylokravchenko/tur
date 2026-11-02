@@ -160,6 +160,9 @@ fn run_layer(
         hidden: false,
         spans: &[span],
         pool: &pool,
+        axial: Vec::new(),
+        table: None,
+        embeddings: &[],
     };
     let result = layer.reference(dims, x, &pass, 0, Some(recorder));
     // The pool must outlive all commands, including when reference execution fails.

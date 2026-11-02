@@ -34,6 +34,9 @@ pub struct PackedForward<'a> {
     /// Rows replacing the input embeddings of packed token ranges, validated by
     /// [`tur_core::execution::PackedExecution::validate`].
     pub embeddings: &'a [EmbeddedInput],
+    /// Rotary positions, parallel to `tokens`, when they are not the token's own position
+    /// ([`tur_core::execution::PackedExecution::axial`]).
+    pub axial: &'a [[u32; 3]],
     /// Persistent state of every sequence; built from the model's own description.
     pub pool: &'a StatePool,
 }

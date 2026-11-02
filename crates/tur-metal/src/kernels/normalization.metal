@@ -168,6 +168,74 @@ kernel void qk_norm_rope_f32(
     }
 }
 
+struct AxialRopeParams {
+    uint tokens;
+    uint heads;
+    uint dim;
+    uint row_stride;
+    uint head_stride;
+    uint col_offset;
+    // Columns of the rotated runs: `runs` of `run` columns each, rotated by split halves.
+    uint run;
+    uint runs;
+    // Coordinates per token in `positions`.
+    uint axes;
+    uint normalize;
+    float eps;
+};
+
+// Per-head optional RMSNorm, then split-half rotary whose frequencies each read their own
+// coordinate of the token's position: a text token's (t, h, w) in multimodal rotary, or a
+// patch's row and column. `inv_freq` and `axis` hold run * runs / 2 entries.
+kernel void axial_rope_f32(
+    device const float *x [[buffer(0)]],
+    device const float *w [[buffer(1)]],
+    device const uint *positions [[buffer(2)]],
+    device const float *inv_freq [[buffer(3)]],
+    device const uint *axis [[buffer(4)]],
+    device float *y [[buffer(5)]],
+    constant AxialRopeParams &p [[buffer(6)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgs [[simdgroups_per_threadgroup]]) {
+    uint item = tg * sgs + sg;
+    if (item >= p.tokens * p.heads) {
+        return;
+    }
+    uint t = item / p.heads;
+    uint h = item % p.heads;
+    device const float *xr = x + ulong(t) * p.row_stride + p.col_offset + ulong(h) * p.head_stride;
+    float inv = 1.0f;
+    if (p.normalize != 0) {
+        float acc = 0.0f;
+        for (uint i = lane; i < p.dim; i += SIMD) {
+            float v = xr[i];
+            acc += v * v;
+        }
+        inv = 1.0f / sqrt(simd_sum(acc) / float(p.dim) + p.eps);
+    }
+    uint half_run = p.run / 2;
+    device const uint *position = positions + ulong(t) * p.axes;
+    device float *yr = y + (ulong(t) * p.heads + h) * p.dim;
+    for (uint i = lane; i < p.dim; i += SIMD) {
+        float v = xr[i] * inv * (p.normalize != 0 ? w[i] : 1.0f);
+        if (i < p.run * p.runs) {
+            uint group = i / p.run;
+            uint offset = i % p.run;
+            bool left = offset < half_run;
+            uint f = group * half_run + (left ? offset : offset - half_run);
+            uint partner = group * p.run + (left ? offset + half_run : offset - half_run);
+            float u = xr[partner] * inv * (p.normalize != 0 ? w[partner] : 1.0f);
+            float angle = float(position[axis[f]]) * inv_freq[f];
+            float c = precise::cos(angle);
+            float s = precise::sin(angle);
+            v = left ? v * c - u * s : v * c + u * s;
+        }
+        yr[i] = v;
+    }
+}
+
 struct GluParams {
     uint rows;
     uint width;

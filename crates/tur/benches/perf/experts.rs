@@ -52,6 +52,7 @@ fn load(dir: &Path, cache_mib: usize, device: &Device) -> Result<GptOss> {
             recurrent: DType::F32,
             mtp: None,
             audio: false,
+            vision: false,
             expert_cache: Some(cache_mib << 20),
         },
     )

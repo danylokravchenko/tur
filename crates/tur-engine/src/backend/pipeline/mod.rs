@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 //! Chat admission and scheduled packed execution over the single-owner hybrid engine.
 
-mod audio;
 mod config;
 mod drafting;
 mod execution;
 mod layered;
+mod media;
 mod requests;
 mod scheduling;
 
@@ -64,10 +64,10 @@ struct InFlight {
 struct Pending {
     handle: StateHandle,
     /// The prompt, then every sampled token; the first `consumed` are in model state.
-    /// Audio positions hold clip identities (see [`audio`]).
+    /// Soft-token positions hold input identities (see [`media`]).
     tokens: Vec<u32>,
     /// Encoded clips of the prompt, kept until completion so recomputation reuses them.
-    audio: Vec<audio::AudioSpan>,
+    media: Vec<media::MediaSpan>,
     prompt_tokens: usize,
     /// Predicted last shared token before the template rewrites this turn as history.
     turn_boundary: Option<usize>,
@@ -170,7 +170,7 @@ impl Pending {
 /// A request that cannot fit even alone fails with [`crate::TurError::MemoryAllocation`].
 pub struct InferencePipeline {
     engine: HybridEngine<TextModel>,
-    /// The engine's model, shared to encode prompt audio at submission.
+    /// The engine's model, shared to encode prompt media at submission.
     model: Arc<TextModel>,
     tokenizer: Tokenizer,
     template: ChatTemplate,

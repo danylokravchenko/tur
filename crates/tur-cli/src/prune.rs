@@ -80,6 +80,7 @@ pub(crate) fn run(args: &mut Args, console: &Console) -> Result<()> {
             recurrent: DType::F32,
             mtp: None,
             audio: false,
+            vision: false,
             expert_cache: Some(expert_cache),
         },
     )?;

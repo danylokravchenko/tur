@@ -21,10 +21,18 @@ impl InferencePipeline {
     ) -> Result<(PackedExecution, usize)> {
         let mut plan = PackedExecution {
             embeddings: Vec::new(),
+            axial: Vec::new(),
             tokens: Vec::new(),
             positions: Vec::new(),
             sequences: Vec::with_capacity(chunks.len()),
         };
+        // One image in a pass moves all of its rows to the axial kernel, which at a text token's
+        // equal coordinates computes the same rotation.
+        let axial = chunks.iter().any(|chunk| {
+            self.pending
+                .get(&chunk.id)
+                .is_some_and(|pending| pending.media.iter().any(|span| span.grid.is_some()))
+        });
         let mut context = 0;
         for (chunk, draft) in chunks.iter().zip(drafts) {
             let pending = self
@@ -40,11 +48,11 @@ impl InferencePipeline {
                 .get(pending.consumed..end)
                 .ok_or_else(|| invalid("chunk beyond the request's tokens"))?;
             let start = plan.tokens.len();
-            if pending.audio.is_empty() {
+            if pending.media.is_empty() {
                 plan.tokens.extend_from_slice(input);
             } else {
                 self.embedded(
-                    &pending.audio,
+                    &pending.media,
                     input,
                     (pending.consumed, start),
                     (&mut plan.tokens, &mut plan.embeddings),
@@ -55,6 +63,13 @@ impl InferencePipeline {
                 .checked_add(draft.len())
                 .ok_or_else(|| invalid("draft position overflow"))?;
             plan.positions.extend(pending.consumed..end);
+            if axial {
+                super::media::axial_positions(
+                    &pending.media,
+                    pending.consumed..end,
+                    &mut plan.axial,
+                )?;
+            }
             let speculative = !draft.is_empty();
             plan.sequences.push(SequenceDescriptor {
                 state: pending.handle,

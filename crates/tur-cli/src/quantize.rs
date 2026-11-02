@@ -285,6 +285,7 @@ fn mixed_plan(
             recurrent: DEFAULT_RECURRENT_STATE,
             mtp: None,
             audio: false,
+            vision: false,
             expert_cache: None,
         },
     )?;

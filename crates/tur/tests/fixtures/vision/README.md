@@ -1,0 +1,5 @@
+# Image references
+
+`small.png` is 61×93 and `large.png` 800×533: colour ramps with a stripe and a deterministic hiss. `qwen3_5/` and `gemma4/` are small models with two-layer vision towers and deterministic weights. `scripts/vision_reference.py --tiny` generates all of them with Transformers 5.20.2, torch 2.14.1 and torchvision 0.29.2 on the CPU in F32, together with each model's preprocessed pixels, tower states, soft tokens, per-layer states and logits in `golden.safetensors`, and for Qwen the rotary positions from `get_rope_index`. They are numerical architecture oracles, not real model checkpoints.
+
+Real-checkpoint goldens are generated separately from any image file, with `--qwen` for `Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17` and `--gemma` for `google/gemma-4-E2B-it@3e22461f65e89153144f8adb70e3b8c2cc9845a7`. The ignored tests read them from `TUR_QWEN_IMAGE_GOLDEN` and `TUR_GEMMA4_IMAGE_GOLDEN`, the checkpoints from `TUR_QWEN35_0_8B` and `TUR_GEMMA4_E2B`, and the image from `TUR_IMAGE`.

@@ -26,6 +26,7 @@ Integration tests for every crate are linked into one binary, `crates/tur/tests/
 | `pipeline`, `scheduling`, `scheduling_metal` | Admission, stress, preemption, deadlines, budgets |
 | `prefix_reuse`, `speculation`, `prepacked` | Reuse, drafting and artifact loading through the pipeline |
 | `serving`, `server` | The worker and the HTTP API |
+| `vision` | Image preprocessing, both vision towers and the text layers reading them, image prompts, prefix isolation, text beside images in one pass and artifacts carrying a tower |
 | `audio` | Gemma 4 audio encoder and prompts, Whisper conformance, audio prefix isolation, chat audio parts and the transcription endpoints |
 
 `common.rs` builds tiny random checkpoints for pipeline and serving tests, and `model_common.rs` holds model and engine fixtures. Add a module rather than a new test target.
@@ -83,6 +84,15 @@ python -I scripts/gpt_oss_reference.py --model "$TUR_GPT_OSS_20B" --golden "$TUR
 just test-checkpoint -E 'test(gpt_oss_20b)'
 ```
 
+The image tests need an image file and goldens from `scripts/vision_reference.py`. The Qwen test compares F32 soft tokens and the whole greedy answer with Transformers; the Gemma test compares the Q8_0 tower by cosine similarity.
+
+```sh
+export TUR_IMAGE=/tmp/picture.png TUR_QWEN_IMAGE_GOLDEN=/tmp/qwen-image.safetensors TUR_GEMMA4_IMAGE_GOLDEN=/tmp/gemma-image.safetensors
+python -I scripts/vision_reference.py --qwen "$TUR_QWEN35_0_8B" --image "$TUR_IMAGE" --golden "$TUR_QWEN_IMAGE_GOLDEN"
+python -I scripts/vision_reference.py --gemma "$TUR_GEMMA4_E2B" --image "$TUR_IMAGE" --golden "$TUR_GEMMA4_IMAGE_GOLDEN"
+just test-checkpoint -E 'test(qwen_0_8b_image) or test(e2b_vision)'
+```
+
 The audio tests need a speech clip, the Whisper checkpoint and goldens from `scripts/audio_reference.py`. The Gemma test compares the Q8_0 encoder with Transformers' F32 encoder by cosine similarity (mean above 0.999, minimum above 0.99); the Whisper tests require Transformers' exact transcript in F32 and in Q8_0, and on a clip beyond 30 s its exact tokens and segment times, prompted and conditioned tokens and word times in F32, and all but 2% of its words in Q8_0:
 
 ```sh
@@ -106,6 +116,7 @@ python -I scripts/gemma4_reference.py --tiny crates/tur/tests/fixtures/gemma4
 python -I scripts/gemma4_assistant_reference.py --tiny crates/tur/tests/fixtures/gemma4
 python -I scripts/gemma4_reference.py --templates crates/tur/tests/fixtures/gemma4/templates.json
 python -I scripts/audio_reference.py --tiny crates/tur/tests/fixtures/audio
+python -I scripts/vision_reference.py --tiny crates/tur/tests/fixtures/vision
 ```
 
 ## Continuous integration
@@ -129,6 +140,7 @@ Pushing a tag such as `v0.3.0` runs `.github/workflows/release.yml`. It does not
 | `qwen3_5_moe_mtp_reference.py` | The MTP head over routed experts, on a tiny random checkpoint |
 | `gemma4_assistant_reference.py` | The assistant drafter over the dense fixture, and teacher-forced E2B assistant drafts past the sliding window |
 | `qwen3_6_reference_headers.py` | Qwen3.6 tensor headers via byte-range requests, without downloading weights |
+| `vision_reference.py` | Qwen3.5 and Gemma 4 vision F32 fixtures with test images; real greedy answers on 0.8B, and E2B vision-tower outputs, for an image file |
 | `audio_reference.py` | Gemma 4 audio and Whisper F32 fixtures with a test tone; real Whisper transcripts, long-form segments and E2B audio-encoder outputs for a WAV clip |
 
 Run them with `python -I` and treat downloaded files as data.

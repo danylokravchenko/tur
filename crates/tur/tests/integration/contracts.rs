@@ -240,6 +240,7 @@ fn packed(
 ) -> Result<PackedExecution> {
     let mut packed = PackedExecution {
         embeddings: Vec::new(),
+        axial: Vec::new(),
         tokens: Vec::new(),
         positions: Vec::new(),
         sequences: Vec::new(),
@@ -830,6 +831,7 @@ fn test_position_overflow_and_limit_are_checked() -> Result<()> {
     let a = allocate(&mut engine, 1)?;
     let input = PackedExecution {
         embeddings: Vec::new(),
+        axial: Vec::new(),
         tokens: vec![1],
         positions: vec![usize::MAX],
         sequences: vec![SequenceDescriptor {

@@ -39,6 +39,7 @@ fn options(
         recurrent: DType::F32,
         mtp: None,
         audio: false,
+        vision: false,
         expert_cache: None,
     }
 }
@@ -230,6 +231,7 @@ fn test_gemma4_batched_assistant_chains_keep_their_rows() -> Result<()> {
     let prompts: [&[u32]; 2] = [&[2, 7, 5, 9, 3, 12, 7], &[4, 11, 17, 7, 12]];
     let mut plan = PackedExecution {
         embeddings: Vec::new(),
+        axial: Vec::new(),
         tokens: Vec::new(),
         positions: Vec::new(),
         sequences: Vec::new(),
@@ -609,6 +611,7 @@ fn assistant_drafts(device: &Device, execution: Execution) -> Result<()> {
         let step = model
             .forward(&PackedForward {
                 embeddings: &[],
+                axial: &[],
                 tokens: &tokens[p..=p],
                 positions: &[p],
                 sequences: &[SequenceForward {
@@ -724,6 +727,7 @@ fn test_gemma4_e2b_assistant_drafts_agree_with_transformers_past_the_window() ->
         let step = model
             .forward(&PackedForward {
                 embeddings: &[],
+                axial: &[],
                 tokens: piece,
                 positions: &packed,
                 sequences: &[SequenceForward {

@@ -1,6 +1,6 @@
 # HTTP API
 
-`tur serve` exposes an OpenAI-compatible API for one chat model and, with `--whisper`, one speech-to-text model. Chat requests carry text, plus audio for models with an audio encoder (Gemma 4 E2B and E4B). Requests and responses follow OpenAI's shapes, with a few extra fields for the chat template and prefix reuse. Request bodies may be up to 64 MiB.
+`tur serve` exposes an OpenAI-compatible API for one chat model and, with `--whisper`, one speech-to-text model. Chat requests carry text, plus images for models with a vision encoder (Qwen3.5 and Gemma 4) and audio for models with an audio encoder (Gemma 4 E2B and E4B). Requests and responses follow OpenAI's shapes, with a few extra fields for the chat template and prefix reuse. Request bodies may be up to 64 MiB.
 
 ## `GET /v1/models`
 
@@ -64,7 +64,18 @@ User content may also hold audio parts, in OpenAI's `input_audio` form or as an 
 
 Audio must be WAV (integer PCM or float, any rate and channel count) and 40 ms to 30 s long. Only models with an audio encoder accept it; others answer 400. Remote URLs are rejected, since the server never fetches media. Audio positions count toward `prompt_tokens`, 25 per second. See [Audio](../architecture/audio.md).
 
-Image and video parts are rejected, and so are prompts containing the model's image placeholder tokens or an audio placeholder without a clip.
+Images go in OpenAI's `image_url` part, holding a `data:` URL:
+
+```json
+{"role": "user", "content": [
+  {"type": "image_url", "image_url": {"url": "data:image/png;base64,<base64 file>"}},
+  {"type": "text", "text": "What is in this picture?"}
+]}
+```
+
+Images must be PNG, JPEG, WebP or GIF, and are scaled down to 1,048,576 pixels at most. Only models with a vision encoder accept them; others answer 400. `detail` is accepted and ignored. Image positions count toward `prompt_tokens`: one per 32×32 pixels on Qwen3.5, and up to 280 on Gemma 4. See [Images](../architecture/vision.md).
+
+Video parts are rejected, and so are prompts containing a placeholder token without its image or clip.
 
 ### Response
 
@@ -235,7 +246,7 @@ Errors use OpenAI's shape:
 
 | Status | `type` / `code` | Cause |
 | --- | --- | --- |
-| 400 | `invalid_request_error` | Empty messages, unknown role, invalid sampling values, unsupported `tool_choice`, a schema, grammar or tool choice that can't be honored (a grammar failing during generation has the code `invalid_grammar`), undecodable or unsupported audio, or a request the engine rejects (`invalid_request`) |
+| 400 | `invalid_request_error` | Empty messages, unknown role, invalid sampling values, unsupported `tool_choice`, a schema, grammar or tool choice that can't be honored (a grammar failing during generation has the code `invalid_grammar`), undecodable or unsupported audio or images, or a request the engine rejects (`invalid_request`) |
 | 400 | `invalid_request_error` / `context_length_exceeded` | The prompt and `max_tokens` don't fit the context the server allows |
 | 404 | `invalid_request_error` | Unknown `model` |
 | 408 | `timeout_error` / `slow_client` | A streaming client stopped reading |

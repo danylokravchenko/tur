@@ -141,6 +141,9 @@ pub struct LoadOptions {
     /// Load the checkpoint's audio encoder, when it declares one. Prepacked artifacts
     /// hold the text tower only and load without it.
     pub audio: bool,
+    /// Load the checkpoint's vision encoder, when it declares one. Artifacts written before
+    /// vision support hold none, and GGUF text files never do.
+    pub vision: bool,
     /// Device bytes of a bounded expert cache: routed experts stay on disk and are read on
     /// demand into this many bytes of slots. Serves gpt-oss checkpoints, and Qwen `MoE`
     /// artifacts and GGUF files. `None` keeps every expert resident.

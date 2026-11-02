@@ -11,7 +11,6 @@ use uuid::Uuid;
 
 use crate::{
     ModelFactory, ModelSource, Result, TurError,
-    audio::Audio,
     backend::{
         memory::DeviceBudget,
         pipeline::{
@@ -263,14 +262,15 @@ fn encode_clips(
         telemetry.record_cancelled();
         return;
     }
-    let clips: Vec<&Audio> = msg
+    let encoded = msg
         .request
         .messages
         .iter()
-        .flat_map(|m| m.content.audio())
+        .flat_map(|m| m.content.media())
+        .map(|media| model.encode_media(media))
         .collect();
-    match clips.iter().map(|clip| model.encode_audio(clip)).collect() {
-        Ok(rows) => msg.request.encoded_audio = rows,
+    match encoded {
+        Ok(rows) => msg.request.encoded_media = rows,
         Err(error) => return reply(telemetry, msg.result_tx, Err(error)),
     }
     // A worker that stopped drops the request, which tells its client.
@@ -314,13 +314,13 @@ fn admit(
         telemetry.record_cancelled();
         return;
     }
-    if let Some(encoder) = encoder.filter(|_| msg.request.needs_audio_encoding()) {
+    if let Some(encoder) = encoder.filter(|_| msg.request.needs_media_encoding()) {
         match encoder.tx.try_send(msg) {
             Ok(()) => {}
             Err(std_mpsc::TrySendError::Full(msg)) => reply(
                 telemetry,
                 msg.result_tx,
-                Err(TurError::QueueFull("audio encoding queue is full".into())),
+                Err(TurError::QueueFull("media encoding queue is full".into())),
             ),
             Err(std_mpsc::TrySendError::Disconnected(msg)) => {
                 reply(telemetry, msg.result_tx, Err(TurError::WorkerUnavailable));
@@ -494,7 +494,7 @@ fn serve(
     device: &candle_core::Device,
 ) -> Result<()> {
     let encoder = pipeline
-        .audio_model()
+        .media_model()
         .map(|model| ClipEncoder::spawn(model, intake, Arc::clone(telemetry)))
         .transpose()?;
     let encoder = encoder.as_ref();
@@ -729,6 +729,7 @@ mod tests {
                 kv: DEFAULT_KV_LAYOUT,
                 recurrent: DEFAULT_RECURRENT_STATE,
                 audio: false,
+                vision: false,
                 expert_cache: None,
                 gguf: None,
             },

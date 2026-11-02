@@ -16,9 +16,10 @@ use crate::{
     audio::{self, GemmaFeatures, gemma_frames},
     models::{
         Precision,
-        artifact::Companion,
+        artifact::{Companion, Part},
         checkpoint::Checkpoint,
-        weights::{tiled, upload_projection},
+        encoder::Loader,
+        weights::tiled,
     },
 };
 use candle_core::{D, DType, Device, Tensor};
@@ -32,13 +33,13 @@ use tur_metal::packed::PackedLinear;
 const DEFAULT_EPS: f64 = 1e-6;
 
 /// A projection whose input and output are clamped to calibrated bounds.
-struct Clipped {
+pub(super) struct Clipped {
     linear: PackedLinear,
     bounds: Option<[f32; 4]>,
 }
 
 impl Clipped {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let Some([in_min, in_max, out_min, out_max]) = self.bounds else {
             return self.linear.forward(x);
         };
@@ -97,6 +98,11 @@ pub(super) struct AudioTower {
     bytes: usize,
 }
 
+/// The clamp bounds a clipped projection stores beside its matrix.
+pub(super) fn clipped_tensor_names(name: &str) -> [String; 4] {
+    ["input_min", "input_max", "output_min", "output_max"].map(|bound| format!("{name}.{bound}"))
+}
+
 /// Soft tokens of a clip of `samples` at 16 kHz: two stride-2 convolutions over its
 /// valid feature frames.
 pub(super) fn soft_tokens(samples: usize) -> usize {
@@ -131,7 +137,14 @@ pub(super) fn stored_tensors(
                 }
                 _ => None,
             };
-            (name, Companion { shape, packed })
+            (
+                name,
+                Companion {
+                    shape,
+                    packed,
+                    part: Part::Audio,
+                },
+            )
         })
         .collect()
 }
@@ -204,48 +217,7 @@ fn validate_processor(dir: &Path) -> Result<()> {
 }
 
 /// The checkpoint's tensors for one encoder, uploaded to `device`.
-struct Loader<'a> {
-    checkpoint: &'a Checkpoint,
-    device: &'a Device,
-    precision: Precision,
-    bytes: usize,
-    /// Input width of each projection, which packed bytes alone do not say.
-    packed_cols: BTreeMap<String, usize>,
-}
-
 impl Loader<'_> {
-    fn dense(&mut self, name: &str) -> Result<Tensor> {
-        let tensor = self
-            .checkpoint
-            .take(name)?
-            .to_dtype(DType::F32)?
-            .to_device(self.device)?;
-        self.bytes += tensor.elem_count() * 4;
-        Ok(tensor)
-    }
-    fn linear(&mut self, name: &str) -> Result<PackedLinear> {
-        let entry = self
-            .checkpoint
-            .entries()
-            .get(name)
-            .ok_or_else(|| invalid(format!("missing tensor {name}")))?;
-        let linear = if entry.dtype == safetensors::Dtype::U8 {
-            // A prepacked artifact's blocks, uploaded as stored.
-            let (entry, bytes) = self.checkpoint.take_raw(name)?;
-            let (&[rows, _], Some(format), Some(cols)) = (
-                entry.shape.as_slice(),
-                self.precision.ggml(),
-                self.packed_cols.get(name),
-            ) else {
-                return Err(invalid(format!("{name} is not a packed matrix")));
-            };
-            PackedLinear::from_blocks(&bytes, format, (rows, *cols), self.device)?
-        } else {
-            upload_projection(&self.checkpoint.take(name)?, self.precision, self.device)?
-        };
-        self.bytes += linear.resident_bytes();
-        Ok(linear)
-    }
     fn scalar(&self, name: &str) -> Result<f32> {
         Ok(self
             .checkpoint
@@ -253,7 +225,7 @@ impl Loader<'_> {
             .to_dtype(DType::F32)?
             .to_scalar::<f32>()?)
     }
-    fn clipped(&mut self, name: &str, clip: bool) -> Result<Clipped> {
+    pub(super) fn clipped(&mut self, name: &str, clip: bool) -> Result<Clipped> {
         let bounds = if clip {
             Some([
                 self.scalar(&format!("{name}.input_min"))?,
@@ -265,7 +237,7 @@ impl Loader<'_> {
             None
         };
         Ok(Clipped {
-            linear: self.linear(&format!("{name}.linear.weight"))?,
+            linear: self.projection(&format!("{name}.linear.weight"))?,
             bounds,
         })
     }
@@ -332,6 +304,7 @@ impl AudioTower {
             checkpoint,
             device,
             precision,
+            eps: 0.0,
             bytes: 0,
             packed_cols,
         };
@@ -347,7 +320,7 @@ impl AudioTower {
                 t.dense(&format!("{sub}.layer1.norm.weight"))?,
             ),
         ];
-        let input = t.linear(&format!("{sub}.input_proj_linear.weight"))?;
+        let input = t.projection(&format!("{sub}.input_proj_linear.weight"))?;
         let positions = sinusoids(c.attention_context_left, c.hidden_size, device)?;
         let dim = audio.head_dim();
         #[allow(clippy::cast_precision_loss, reason = "head widths are small")]
@@ -389,9 +362,9 @@ impl AudioTower {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let output = t.linear(&format!("{tower}.output_proj.weight"))?;
+        let output = t.projection(&format!("{tower}.output_proj.weight"))?;
         let output_bias = t.dense(&format!("{tower}.output_proj.bias"))?;
-        let projection = t.linear("model.embed_audio.embedding_projection.weight")?;
+        let projection = t.projection("model.embed_audio.embedding_projection.weight")?;
         Ok(Self {
             features: GemmaFeatures::new(Audio::MELS, device)?,
             config: c,

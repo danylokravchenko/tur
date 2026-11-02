@@ -37,6 +37,7 @@ fn load(path: &Path, device: &Device, format: WeightFormat) -> Result<Qwen35> {
             recurrent: DType::F32,
             mtp: None,
             audio: false,
+            vision: false,
             expert_cache: None,
         },
     )
@@ -178,6 +179,7 @@ fn test_moe_fused_packed_prefill_decode_and_rollback_match_reference() -> Result
                 recurrent: DType::F32,
                 mtp: None,
                 audio: false,
+                vision: false,
                 expert_cache: None,
             },
             32,
@@ -274,6 +276,7 @@ fn test_expert_cache_over_artifacts_is_bit_identical_to_resident() -> Result<()>
                 recurrent: DType::F32,
                 mtp: None,
                 audio: false,
+                vision: false,
                 expert_cache,
             };
             let resident = Qwen35::load(&output, &options(None))?;
@@ -322,6 +325,7 @@ fn test_expert_cache_over_artifacts_is_bit_identical_to_resident() -> Result<()>
                 recurrent: DType::F32,
                 mtp: None,
                 audio: false,
+                vision: false,
                 expert_cache: Some(1 << 20),
             },
         )
@@ -389,6 +393,7 @@ fn test_layered_pass_over_recurrent_layers_matches_one_pass() -> Result<()> {
             recurrent: DType::F32,
             mtp: None,
             audio: false,
+            vision: false,
             expert_cache: factory.expert_cache,
         },
     )?;
@@ -411,6 +416,7 @@ fn test_layered_pass_over_recurrent_layers_matches_one_pass() -> Result<()> {
     }];
     let batch = PackedForward {
         embeddings: &[],
+        axial: &[],
         tokens: prefix,
         positions: &positions,
         sequences: &sequences,
@@ -572,6 +578,7 @@ fn head_logits(model: &Qwen35, ids: &[u32]) -> Result<Vec<Vec<f32>>> {
     let hidden = model
         .forward(&PackedForward {
             embeddings: &[],
+            axial: &[],
             tokens: &ids[..count],
             positions: &positions,
             sequences: &[SequenceForward {
@@ -621,6 +628,7 @@ fn head_options(device: &Device, execution: Execution) -> LoadOptions {
         recurrent: DType::F32,
         mtp: Some(tur_models::models::DraftHead::default()),
         audio: false,
+        vision: false,
         expert_cache: None,
     }
 }

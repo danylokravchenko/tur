@@ -249,6 +249,125 @@ impl Audio {
     }
 }
 
+/// The vision tower of Gemma 4 checkpoints; `Gemma4VisionModel` in Transformers.
+#[derive(Clone, Debug, Deserialize)]
+pub(super) struct VisionConfig {
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub patch_size: usize,
+    pub pooling_kernel_size: usize,
+    pub position_embedding_size: usize,
+    pub hidden_activation: String,
+    pub rms_norm_eps: f64,
+    pub standardize: bool,
+    pub use_clipped_linears: bool,
+    /// `rope_parameters.rope_theta`.
+    #[serde(skip)]
+    pub theta: f64,
+}
+
+/// The vision tower's settings and the prompt tokens that frame its soft tokens.
+#[derive(Clone, Debug)]
+pub(super) struct Vision {
+    pub config: VisionConfig,
+    /// `<|image|>`, rendered once per image.
+    pub token: u32,
+    /// `<|image>` and `<image|>` around an image's soft tokens.
+    pub begin: u32,
+    pub end: u32,
+}
+
+impl Vision {
+    /// The tower a checkpoint declares, when it is one this implementation runs; anything
+    /// else leaves the model without images.
+    fn parse(raw: &serde_json::Value, vocab_size: usize) -> Option<Self> {
+        let section = raw.get("vision_config").filter(|v| !v.is_null())?;
+        let mut config: VisionConfig = serde_json::from_value(section.clone()).ok()?;
+        config.theta = section["rope_parameters"]["rope_theta"].as_f64()?;
+        let token = |key: &str| {
+            let id = u32::try_from(raw.get(key)?.as_u64()?).ok()?;
+            ((id as usize) < vocab_size).then_some(id)
+        };
+        let dims = [
+            config.hidden_size,
+            config.intermediate_size,
+            config.num_hidden_layers,
+            config.num_attention_heads,
+            config.head_dim,
+            config.patch_size,
+            config.pooling_kernel_size,
+            config.position_embedding_size,
+        ];
+        (section["model_type"].as_str() == Some("gemma4_vision")
+            && !dims.contains(&0)
+            && config.num_key_value_heads == config.num_attention_heads
+            && config.num_attention_heads * config.head_dim == config.hidden_size
+            && config.head_dim.is_multiple_of(4)
+            && config.hidden_activation == "gelu_pytorch_tanh"
+            && config.rms_norm_eps.is_finite()
+            && config.rms_norm_eps > 0.0
+            && config.theta > 0.0)
+            .then_some(())?;
+        Some(Self {
+            token: token("image_token_id")?,
+            begin: token("boi_token_id")?,
+            end: token("eoi_token_id")?,
+            config,
+        })
+    }
+
+    /// Checkpoint tensors of the tower and its projector into the text model, with shapes.
+    pub(super) fn weight_shapes(&self, text_hidden: usize) -> BTreeMap<String, Vec<usize>> {
+        use super::model::vision::clipped_shapes;
+        let c = &self.config;
+        let (h, clip) = (c.hidden_size, c.use_clipped_linears);
+        let tower = "model.vision_tower";
+        let mut shapes = BTreeMap::new();
+        shapes.insert(
+            format!("{tower}.patch_embedder.input_proj.weight"),
+            vec![h, 3 * c.patch_size * c.patch_size],
+        );
+        shapes.insert(
+            format!("{tower}.patch_embedder.position_embedding_table"),
+            vec![2, c.position_embedding_size, h],
+        );
+        for i in 0..c.num_hidden_layers {
+            let p = format!("{tower}.encoder.layers.{i}");
+            for name in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                clipped_shapes(&mut shapes, &format!("{p}.self_attn.{name}"), h, h, clip);
+            }
+            let inner = c.intermediate_size;
+            clipped_shapes(&mut shapes, &format!("{p}.mlp.gate_proj"), inner, h, clip);
+            clipped_shapes(&mut shapes, &format!("{p}.mlp.up_proj"), inner, h, clip);
+            clipped_shapes(&mut shapes, &format!("{p}.mlp.down_proj"), h, inner, clip);
+            for norm in ["q_norm", "k_norm"] {
+                shapes.insert(format!("{p}.self_attn.{norm}.weight"), vec![c.head_dim]);
+            }
+            for norm in [
+                "input_layernorm",
+                "post_attention_layernorm",
+                "pre_feedforward_layernorm",
+                "post_feedforward_layernorm",
+            ] {
+                shapes.insert(format!("{p}.{norm}.weight"), vec![h]);
+            }
+        }
+        if c.standardize {
+            shapes.insert(format!("{tower}.std_bias"), vec![h]);
+            shapes.insert(format!("{tower}.std_scale"), vec![h]);
+        }
+        shapes.insert(
+            "model.embed_vision.embedding_projection.weight".into(),
+            vec![text_hidden, h],
+        );
+        shapes
+    }
+}
+
 /// Settings belonging to the Gemma 4 text tower, validated before weights are read.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -260,6 +379,8 @@ pub struct Config {
     pub(super) owners: Vec<usize>,
     /// The audio encoder, when the checkpoint declares one.
     pub(super) audio: Option<Audio>,
+    /// The vision tower, when the checkpoint declares one this implementation runs.
+    pub(super) vision: Option<Vision>,
 }
 
 impl Config {
@@ -362,6 +483,7 @@ impl Config {
             owners.push(owner);
         }
         let audio = Audio::parse(&raw, settings.vocab_size)?;
+        let vision = Vision::parse(&raw, settings.vocab_size);
         let config = Self {
             text: settings,
             prefix: prefix.into(),
@@ -369,6 +491,7 @@ impl Config {
             eos,
             owners,
             audio,
+            vision,
         };
         config.weight_shapes()?;
         Ok(config)
@@ -444,12 +567,12 @@ impl Config {
             .filter(|(j, owner)| **owner == *j)
             .count()
     }
-    /// The model's state and limits; `audio` declares that the encoder is loaded.
+    /// The model's state and limits; `modalities` lists the loaded encoders' inputs beside text.
     pub(super) fn description(
         &self,
         revision: String,
         kv: KvLayout,
-        audio: bool,
+        modalities: &[Modality],
     ) -> Result<ModelDescription> {
         let description = ModelDescription {
             identity: ModelIdentity {
@@ -470,11 +593,7 @@ impl Config {
                 })
                 .collect(),
             kv,
-            modalities: if audio {
-                vec![Modality::Text, Modality::Audio]
-            } else {
-                vec![Modality::Text]
-            },
+            modalities: [Modality::Text].iter().chain(modalities).copied().collect(),
             vocab_size: self.vocab_size(),
             max_position: self.max_position(),
         };

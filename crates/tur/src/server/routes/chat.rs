@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::audio::Audio;
+use crate::{audio::Audio, image::Image};
 use crate::{
     backend::{
         chat_template::{ChatMessage, Content, ContentPart, RenderOptions, Role, ToolCall},
@@ -110,8 +110,19 @@ fn wav(bytes: &[u8]) -> crate::Result<ContentPart> {
     Ok(ContentPart::Audio(Audio::from_wav(bytes)?))
 }
 
-/// Decode a request's content; audio parts are decoded and resampled here, so callers run
-/// this off the async executor.
+/// An image part's bytes, which only a `data:` URL carries: decoding happens by content.
+fn image(url: &str) -> crate::Result<ContentPart> {
+    let (media_type, bytes) = media::data_url(url)?;
+    if !media_type.starts_with("image/") {
+        return Err(crate::core::execution::invalid(
+            "image_url must hold a data: URL of an image",
+        ));
+    }
+    Ok(ContentPart::Image(Image::decode(&bytes)?))
+}
+
+/// Decode a request's content; audio and images are decoded (and audio resampled) here, so
+/// callers run this off the async executor.
 fn to_internal_content(content: &MessageContent) -> crate::Result<Content> {
     let parts = match content {
         MessageContent::Text(text) => return Ok(Content::Text(text.clone())),
@@ -146,6 +157,7 @@ fn to_internal_content(content: &MessageContent) -> crate::Result<Content> {
                 }
                 wav(&bytes)?
             }
+            Part::ImageUrl { image_url } => image(&image_url.url)?,
         });
     }
     // Text-only parts render exactly like string content.
@@ -155,7 +167,7 @@ fn to_internal_content(content: &MessageContent) -> crate::Result<Content> {
                 .into_iter()
                 .filter_map(|p| match p {
                     ContentPart::Text(text) => Some(text),
-                    ContentPart::Audio(_) => None,
+                    ContentPart::Audio(_) | ContentPart::Image(_) => None,
                 })
                 .collect(),
         ));
@@ -423,7 +435,7 @@ pub async fn chat_completions(
             cache_salt: req.cache_salt,
             grammar: None,
             structured,
-            encoded_audio: Vec::new(),
+            encoded_media: Vec::new(),
             render: RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.thinking,

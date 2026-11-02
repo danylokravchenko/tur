@@ -137,6 +137,10 @@ pub(crate) struct ModelArgs {
     /// audio (Gemma 4 E2B and E4B). `--audio-encoder=false` saves its memory (default: true).
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     audio_encoder: Option<bool>,
+    /// Load the checkpoint's vision encoder when it has one, so chat requests may carry
+    /// images (Qwen3.5 and Gemma 4). `--vision-encoder=false` saves its memory (default: true).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    vision_encoder: Option<bool>,
     /// Keep routed experts on disk and read them on demand into this many MiB of device
     /// memory, for gpt-oss checkpoints or Qwen `MoE` artifacts larger than the GPU's working
     /// set. Reads only: the cache never writes to disk (default: every expert resident).
@@ -164,6 +168,7 @@ impl ModelArgs {
         kv_page_tokens,
         recurrent_state,
         audio_encoder,
+        vision_encoder,
         expert_cache_mb
     );
 
@@ -244,6 +249,7 @@ impl ModelArgs {
             kv: self.kv_layout(),
             recurrent: self.recurrent_state.unwrap_or(DType::F32),
             audio: self.audio_encoder.unwrap_or(true),
+            vision: self.vision_encoder.unwrap_or(true),
             expert_cache: self
                 .expert_cache_mb
                 .map(|mb| {

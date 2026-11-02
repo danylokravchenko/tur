@@ -75,6 +75,7 @@ const FUNCTIONS: &[&str] = &[
     "rms_norm_f32",
     "add_rms_norm_f32",
     "qk_norm_rope_f32",
+    "axial_rope_f32",
     "swiglu_f32",
     "residual_rms_norm_f32",
     "gelu_mul_f32",

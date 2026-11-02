@@ -8,6 +8,7 @@ use tur_core::{
 };
 use tur_models::{
     audio::Audio,
+    media::Media,
     models::{Execution, LoadOptions, WeightFormat, gemma4::Gemma4},
 };
 
@@ -46,6 +47,7 @@ fn gemma(device: &Device, execution: Execution, audio: bool) -> Result<Gemma4> {
             recurrent: DType::F32,
             mtp: None,
             audio,
+            vision: false,
             expert_cache: None,
         },
     )
@@ -72,17 +74,14 @@ fn conformance(device: &Device, execution: Execution) -> Result<()> {
         .iter()
         .position(|&t| t == prompt.placeholder)
         .ok_or_else(|| invalid("no audio placeholder"))?;
-    assert_eq!(reference[first - 1], prompt.begin);
-    assert_eq!(reference[first + soft.dim(0)?], prompt.end);
+    assert_eq!(Some(reference[first - 1]), prompt.begin);
+    assert_eq!(Some(reference[first + soft.dim(0)?]), prompt.end);
+    let slot = model
+        .media_slot()
+        .ok_or_else(|| invalid("audio encoder not loaded"))?;
     let tokens: Vec<u32> = reference
         .iter()
-        .map(|&t| {
-            if t == prompt.placeholder {
-                prompt.slot
-            } else {
-                t
-            }
-        })
+        .map(|&t| if t == prompt.placeholder { slot } else { t })
         .collect();
     let all: Vec<usize> = (0..tokens.len()).collect();
     let embedded = [EmbeddedInput {
@@ -147,6 +146,7 @@ fn test_gemma4_artifacts_carry_the_audio_encoder_packed() -> Result<()> {
             recurrent: DType::F32,
             mtp: None,
             audio,
+            vision: false,
             expert_cache: None,
         };
         let converted = Gemma4::load(&source, &options(true))?;
@@ -199,6 +199,7 @@ fn test_gemma4_audio_is_optional_and_bounded() -> Result<()> {
                 recurrent: DType::F32,
                 mtp: None,
                 audio: true,
+                vision: false,
                 expert_cache: None,
             },
             1,
@@ -253,6 +254,7 @@ fn test_gemma4_e2b_audio_encoder_matches_transformers() -> Result<()> {
             recurrent: DType::F32,
             mtp: None,
             audio: true,
+            vision: false,
             expert_cache: None,
         },
     )?;
@@ -321,6 +323,7 @@ fn factory(fixture: &crate::common::Checkpoint) -> tur::ModelFactory {
         kv: KvLayout::new(4, KvFormat::F32),
         recurrent: DType::F32,
         audio: true,
+        vision: false,
         expert_cache: None,
         gguf: None,
     }
@@ -384,18 +387,18 @@ fn test_clips_encoded_before_submission_replace_encoding_and_must_match() -> Res
     let mut pipeline = InferencePipeline::new(&factory(&fixture), PipelineConfig::new(1, 256))?;
     let inline = pipeline.run(&audio_request(tone()?, 3), |_| {})?;
     let model = pipeline
-        .audio_model()
+        .media_model()
         .ok_or_else(|| invalid("no audio model"))?;
     let mut fresh = InferencePipeline::new(&factory(&fixture), PipelineConfig::new(1, 256))?;
     let mut encoded = audio_request(tone()?, 3);
-    assert!(encoded.needs_audio_encoding());
-    encoded.encoded_audio = vec![model.encode_audio(&tone()?)?];
-    assert!(!encoded.needs_audio_encoding());
+    assert!(encoded.needs_media_encoding());
+    encoded.encoded_media = vec![model.encode_media(Media::Audio(&tone()?))?];
+    assert!(!encoded.needs_media_encoding());
     assert_eq!(
         fresh.run(&encoded, |_| {})?.generated_text,
         inline.generated_text
     );
-    encoded.encoded_audio = vec![model.encode_audio(&tone()?)?; 2];
+    encoded.encoded_media = vec![model.encode_media(Media::Audio(&tone()?))?; 2];
     assert!(fresh.submit_request(&encoded).is_err());
     Ok(())
 }
@@ -864,7 +867,7 @@ mod http {
         out
     }
 
-    /// Answers each chat request with the durations of its clips, in milliseconds.
+    /// Answers each chat request with its clips' durations in milliseconds and its images' sizes.
     fn chat_worker() -> PipelineWorker {
         let (tx, mut rx) = mpsc::channel::<WorkerMsg>(8);
         tokio::spawn(async move {
@@ -873,8 +876,11 @@ mod http {
                     .request
                     .messages
                     .iter()
-                    .flat_map(|m| m.content.audio())
-                    .map(|clip| clip.duration().as_millis().to_string())
+                    .flat_map(|m| m.content.media())
+                    .map(|media| match media {
+                        Media::Audio(clip) => clip.duration().as_millis().to_string(),
+                        Media::Image(image) => format!("{}x{}", image.width(), image.height()),
+                    })
                     .collect();
                 drop(msg.result_tx.send(Ok(GenerationStats {
                     finish_reason: "stop",
@@ -1029,6 +1035,28 @@ Content-Type: audio/wav\r\n\r\n",
             serde_json::json!({"type": "input_audio", "input_audio": {"data": base64(&wav), "format": "mp3"}}),
             serde_json::json!({"type": "input_audio", "input_audio": {"data": "not base64!"}}),
             serde_json::json!({"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}}),
+        ] {
+            assert_eq!(send(chat(&bad)?).await?.0, 400, "{bad}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_chat_image_parts_reach_the_worker_decoded() -> Result<()> {
+        let png = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vision/small.png"),
+        )?;
+        let url = format!("data:image/png;base64,{}", base64(&png));
+        let (status, body) = send(chat(&serde_json::json!({
+            "type": "image_url", "image_url": {"url": url, "detail": "high"}
+        }))?)
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"61x93\""), "{body}");
+        for bad in [
+            serde_json::json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}),
+            serde_json::json!({"type": "image_url", "image_url": {"url": "data:text/plain;base64,aGk="}}),
+            serde_json::json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}),
         ] {
             assert_eq!(send(chat(&bad)?).await?.0, 400, "{bad}");
         }

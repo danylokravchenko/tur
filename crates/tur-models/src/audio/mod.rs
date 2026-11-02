@@ -17,18 +17,6 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// window, so this bounds host memory, not model work per pass.
 pub const MAX_DURATION: Duration = Duration::from_mins(30);
 
-/// How a model frames one clip in its prompt. The chat template renders `placeholder`
-/// once per audio part; the clip then occupies `begin`, one position per soft token and
-/// `end`. Each soft-token position feeds the model `slot`, whose input embedding the
-/// encoder's row replaces.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AudioPrompt {
-    pub placeholder: u32,
-    pub begin: u32,
-    pub end: u32,
-    pub slot: u32,
-}
-
 /// One mono clip at [`SAMPLE_RATE`], shared cheaply between a request and its model.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Audio {

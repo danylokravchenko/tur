@@ -21,6 +21,7 @@ tokenizers.workspace = true
 minijinja.workspace = true
 hf-hub.workspace = true
 safetensors.workspace = true
+image.workspace = true
 
 [features]
 default = ["metal"]

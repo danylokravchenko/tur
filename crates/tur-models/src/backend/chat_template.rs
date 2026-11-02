@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::{fmt::Write as _, path::Path};
 
 use crate::backend::tools::ToolDefinition;
-use crate::{Result, TurError, audio::Audio};
+use crate::{Result, TurError, audio::Audio, image::Image, media::Media};
 
 /// Renders a checkpoint's own Hugging Face-compatible Jinja2 chat template.
 pub struct ChatTemplate {
@@ -47,6 +47,8 @@ pub enum ContentPart {
     /// A clip, rendered as Hugging Face's `{"type": "audio"}` part; the template emits
     /// the model's audio placeholder for it.
     Audio(Audio),
+    /// An image, rendered as Hugging Face's `{"type": "image"}` part.
+    Image(Image),
 }
 
 /// A turn's content: plain text, or typed parts as Hugging Face templates receive them.
@@ -66,14 +68,15 @@ impl Content {
         }
     }
 
-    /// Clips in the order the template renders their placeholders.
-    pub fn audio(&self) -> impl Iterator<Item = &Audio> {
+    /// Clips and images in the order the template renders their placeholders.
+    pub fn media(&self) -> impl Iterator<Item = Media<'_>> {
         let parts = match self {
             Self::Text(_) => &[][..],
             Self::Parts(parts) => parts,
         };
         parts.iter().filter_map(|part| match part {
-            ContentPart::Audio(clip) => Some(clip),
+            ContentPart::Audio(clip) => Some(Media::Audio(clip)),
+            ContentPart::Image(image) => Some(Media::Image(image)),
             ContentPart::Text(_) => None,
         })
     }
@@ -91,6 +94,7 @@ impl Serialize for Content {
                 .map(|part| match part {
                     ContentPart::Text(text) => serde_json::json!({"type": "text", "text": text}),
                     ContentPart::Audio(_) => serde_json::json!({"type": "audio"}),
+                    ContentPart::Image(_) => serde_json::json!({"type": "image"}),
                 })
                 .collect::<Vec<_>>()
                 .serialize(serializer),

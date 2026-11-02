@@ -702,6 +702,7 @@ pub(crate) fn run() -> Result<()> {
         kv: DEFAULT_KV_LAYOUT,
         recurrent: DEFAULT_RECURRENT_STATE,
         audio: false,
+        vision: false,
         expert_cache: None,
         gguf: None,
     };

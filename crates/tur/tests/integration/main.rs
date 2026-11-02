@@ -27,3 +27,4 @@ mod scheduling_metal;
 mod server;
 mod serving;
 mod speculation;
+mod vision;

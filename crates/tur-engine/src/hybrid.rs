@@ -1196,7 +1196,11 @@ impl<M: HybridModel> HybridEngine<M> {
     /// Validate and lease a one-sequence pass that will run in layer groups. Other passes
     /// may run between [`Self::advance_layered`] calls.
     pub fn begin_layered(&mut self, plan: PackedExecution) -> Result<()> {
-        if self.layered.is_some() || plan.sequences.len() != 1 || !plan.embeddings.is_empty() {
+        if self.layered.is_some()
+            || plan.sequences.len() != 1
+            || !plan.embeddings.is_empty()
+            || !plan.axial.is_empty()
+        {
             return Err(invalid("a layered pass runs alone, on one text sequence"));
         }
         let (plan, mut reservations, requirements) = self.admit(plan)?;
@@ -1229,6 +1233,7 @@ impl<M: HybridModel> HybridEngine<M> {
         let step = self.model.forward_layers(
             &PackedForward {
                 embeddings: &layered.plan.embeddings,
+                axial: &layered.plan.axial,
                 tokens: &layered.plan.tokens,
                 positions: &layered.plan.positions,
                 sequences: &forwards(&layered.plan, &bindings, self.draft_head),
@@ -1327,6 +1332,7 @@ impl<M: HybridModel> HybridEngine<M> {
         let bindings: Vec<_> = reservations.iter().map(Reservation::binding).collect();
         requirements.workspace_bytes = self.model.workspace_bytes(&PackedForward {
             embeddings: &plan.embeddings,
+            axial: &plan.axial,
             tokens: &plan.tokens,
             positions: &plan.positions,
             sequences: &forwards(&plan, &bindings, self.draft_head),
@@ -1377,6 +1383,7 @@ impl<M: HybridModel> HybridEngine<M> {
         let result = prepared.and_then(|()| {
             let forward = PackedForward {
                 embeddings: &batch.plan.embeddings,
+                axial: &batch.plan.axial,
                 tokens: &batch.plan.tokens,
                 positions: &batch.plan.positions,
                 sequences: &forwards(&batch.plan, &bindings, self.draft_head),
@@ -2024,6 +2031,7 @@ mod tests {
             .handle = handle;
         let plan = PackedExecution {
             embeddings: Vec::new(),
+            axial: Vec::new(),
             tokens: vec![1],
             positions: vec![0],
             sequences: vec![SequenceDescriptor {

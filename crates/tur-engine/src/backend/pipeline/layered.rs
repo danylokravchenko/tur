@@ -52,7 +52,14 @@ impl InferencePipeline {
         if self.layered.is_none() {
             let long = chunks
                 .iter()
-                .find(|chunk| !decodes.contains(chunk) && chunk.tokens >= MIN_TOKENS)
+                .find(|chunk| {
+                    !decodes.contains(chunk)
+                        && chunk.tokens >= MIN_TOKENS
+                        && self
+                            .pending
+                            .get(&chunk.id)
+                            .is_some_and(|pending| pending.media.is_empty())
+                })
                 .copied();
             let Some(chunk) = long.filter(|_| !decodes.is_empty()) else {
                 return Ok((chunks, false));
