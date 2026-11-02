@@ -3,6 +3,7 @@ use super::{
     Kernels, PackedLinear, WIDE_STAGE_BYTES,
     runtime::{Pipeline, to_u32},
 };
+use crate::blocks::BlockFormat;
 use candle_core::{Tensor, quantized::GgmlDType};
 use std::sync::Arc;
 use tur_core::{Result, execution::invalid};
@@ -351,7 +352,7 @@ impl Kernels {
             (Some((buffer, GgmlDType::Q8_0)), _) => ("q8_0", 4, Some(buffer)),
             (Some((buffer, GgmlDType::Q4K)), _) => ("q4k", 4, Some(buffer)),
             (Some((buffer, format)), _) => {
-                block = super::block_format(format);
+                block = BlockFormat::from_candle(format);
                 ("blocks", 4, Some(buffer))
             }
             (None, None) => match layer.block_buffer() {

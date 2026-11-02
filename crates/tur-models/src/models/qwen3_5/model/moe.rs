@@ -36,7 +36,7 @@ impl Moe {
         #[cfg(feature = "metal")]
         let cached = cache
             .as_ref()
-            .map(|(cache, _)| cache.arena_handles())
+            .map(|(cache, _)| cache.arena_handles(index))
             .transpose()?;
         #[cfg(not(feature = "metal"))]
         let cached: Option<[PackedLinear; 2]> = None;

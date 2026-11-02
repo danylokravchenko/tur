@@ -193,6 +193,13 @@ impl BlockFormat {
             .ok_or_else(|| invalid("block size overflows"))
     }
 
+    /// The block format equivalent to a Candle format.
+    pub fn from_candle(format: GgmlDType) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|block| block.candle() == Some(format))
+    }
+
     /// The equivalent Candle format, whose kernels and host conversions can also read it.
     pub fn candle(self) -> Option<GgmlDType> {
         Some(match self {

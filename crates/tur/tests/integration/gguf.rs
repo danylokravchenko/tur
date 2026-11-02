@@ -505,6 +505,113 @@ fn test_expert_banks_mixing_formats_are_packed_again_within_their_plan() -> Resu
     Ok(())
 }
 
+/// Reformat a file's expert banks to mix formats across layers as real files do, with a block
+/// format Candle cannot read in the last layer, and return each layer's bytes per expert.
+fn mix_bank_formats(tensors: &mut [Written], experts: usize) -> Result<Vec<usize>> {
+    let mut per_expert = Vec::new();
+    for (name, dims, ggml_type, bytes) in tensors {
+        let Some(layer) = name
+            .strip_prefix("blk.")
+            .filter(|_| name.ends_with("_exps.weight"))
+            .and_then(|rest| rest.split('.').next())
+            .and_then(|layer| layer.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let cols = dims[0] as usize;
+        let rows = (dims[1] * dims[2]) as usize;
+        let format = BlockFormat::from_ggml(*ggml_type).ok_or_else(|| invalid("bank format"))?;
+        let values = format.decode(&bytes[..format.bytes(rows, cols)?], cols)?;
+        (*ggml_type, *bytes) = if layer == 3 {
+            // BF16 is the upper half of F32.
+            let halves = values
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes());
+            (30, halves.collect())
+        } else if name.contains("ffn_down") {
+            (13, quantize(&values, cols, GgmlDType::Q5K, None)?)
+        } else {
+            (12, quantize(&values, cols, GgmlDType::Q4K, None)?)
+        };
+        per_expert.resize(per_expert.len().max(layer + 1), 0);
+        per_expert[layer] += bytes.len() / experts;
+    }
+    Ok(per_expert)
+}
+
+/// Experts behind a cache read a GGUF file's blocks as stored: with formats mixed across
+/// layers, gate and up rows in separate shards, and eviction between and within passes, every
+/// logit is bit-identical to keeping all of them resident.
+#[test]
+fn test_expert_cache_over_gguf_files_is_bit_identical_to_resident() -> Result<()> {
+    let device = Device::new_metal(0)?;
+    let experts = 8;
+    let json = MOE
+        .replace("\"num_hidden_layers\": 2", "\"num_hidden_layers\": 4")
+        .replace(
+            "[\"linear_attention\", \"full_attention\"]",
+            "[\"linear_attention\", \"full_attention\", \"linear_attention\", \"full_attention\"]",
+        );
+    let config = Config::from_json(&json)?;
+    let vocab = config.vocab_size() as u32;
+    let source = checkpoint(&json, 0.03, 0.1)?;
+    let (holder, path, _decoded) = convert(&source.0, &config, 0, true)?;
+    let mut tensors = read_written(&path)?;
+    let per_expert = mix_bank_formats(&mut tensors, experts)?;
+    let split = tensors
+        .iter()
+        .position(|tensor| tensor.0 == "blk.1.ffn_up_exps.weight")
+        .ok_or_else(|| invalid("fixture has no second layer's up bank"))?;
+    let shard = |index: usize| holder.0.join(format!("mixed-{index:05}-of-00002.gguf"));
+    let architecture = config.gguf_architectures()[0];
+    write_gguf(&shard(1), architecture, &tensors[..split])?;
+    write_gguf(&shard(2), architecture, &tensors[split..])?;
+    let weights = Weights::Gguf(Arc::new(GgufFile::open(&shard(1))?));
+    let load = |expert_cache| LoadOptions {
+        expert_cache,
+        ..options(weights.clone(), &device)
+    };
+    let resident = Qwen35::load(&source.0, &load(None))?;
+    let expected = logits(&resident, vocab)?;
+    // One format class for the first three layers and one for the last.
+    let floor = experts * (per_expert[0] + per_expert[3]);
+    assert!(Qwen35::memory_requirements(&config, &load(Some(floor - 1)), 64, &[64]).is_err());
+    let cached = load(Some(floor + 3 * per_expert[0]));
+    let model = Qwen35::load(&source.0, &cached)?;
+    for pass in 0..2 {
+        let actual = logits(&model, vocab)?;
+        for (a, e) in actual.iter().flatten().zip(expected.iter().flatten()) {
+            assert_eq!(a.to_bits(), e.to_bits(), "pass {pass}");
+        }
+    }
+    let stats = model
+        .expert_stats()
+        .ok_or_else(|| invalid("missing expert stats"))?;
+    assert!(stats.misses > 0 && stats.evictions > 0, "{stats:?}");
+    let (_, planned, _) = Qwen35::memory_requirements(&config, &cached, 64, &[64])?;
+    assert_eq!(planned, model.weight_bytes());
+    assert!(model.weight_bytes() < resident.weight_bytes());
+    Ok(())
+}
+
+/// A bank whose gate and up rows differ would have to be packed again on every read.
+#[test]
+fn test_expert_cache_rejects_banks_whose_gate_and_up_differ() -> Result<()> {
+    let device = Device::new_metal(0)?;
+    let config = Config::from_json(MOE)?;
+    let source = checkpoint(MOE, 0.08, 0.1)?;
+    let (_holder, path, _decoded) = convert(&source.0, &config, 0, false)?;
+    let options = LoadOptions {
+        expert_cache: Some(1 << 24),
+        ..options(Weights::Gguf(Arc::new(GgufFile::open(&path)?)), &device)
+    };
+    let error = Qwen35::memory_requirements(&config, &options, 64, &[64])
+        .err()
+        .ok_or_else(|| invalid("mixed gate and up were accepted"))?;
+    assert!(error.to_string().contains("different formats"), "{error}");
+    Ok(())
+}
+
 #[test]
 fn test_gemma_gguf_with_shared_keys_and_per_layer_inputs_matches_decoded_weights() -> Result<()> {
     let device = Device::new_metal(0)?;

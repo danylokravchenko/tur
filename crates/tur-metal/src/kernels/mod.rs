@@ -243,12 +243,6 @@ const BLOCK_KERNELS: [&str; 7] = [
 ];
 
 /// The block format of a Candle format.
-fn block_format(format: GgmlDType) -> Option<BlockFormat> {
-    BlockFormat::ALL
-        .into_iter()
-        .find(|block| block.candle() == Some(format))
-}
-
 /// Rows at which the block kernels beat Candle's over a format Candle also reads; see
 /// `docs/src/architecture/kernels.md`.
 const BLOCK_CANDLE_ROWS: (usize, usize) = (2, 8);
@@ -1897,7 +1891,7 @@ impl Kernels {
         }
         let packed = layer.packed_buffer().and_then(|(_, format)| match format {
             GgmlDType::Q8_0 | GgmlDType::Q4K => None,
-            format => block_format(format),
+            format => BlockFormat::from_candle(format),
         });
         let format = packed.or(layer.block_buffer().map(|(_, format)| format));
         if let Some(format) = format {
@@ -1935,7 +1929,7 @@ impl Kernels {
                 if !block_gemv && !range(BLOCK_CANDLE_ROWS) {
                     return layer.forward(x);
                 }
-                let format = block_format(format)
+                let format = BlockFormat::from_candle(format)
                     .ok_or_else(|| invalid("no block kernels for this format"))?;
                 self.blocks(layer, buffer, format, x)
             }
@@ -1976,7 +1970,7 @@ impl Kernels {
         for part in parts {
             let (weights, format) = part
                 .packed_buffer()
-                .and_then(|(buffer, format)| Some((buffer, block_format(format)?)))
+                .and_then(|(buffer, format)| Some((buffer, BlockFormat::from_candle(format)?)))
                 .or(part.block_buffer())
                 .ok_or_else(|| invalid("stacked weights have no block format"))?;
             self.wide_part(weights, format, (part.out_features(), n, first), &xv, &out)?;

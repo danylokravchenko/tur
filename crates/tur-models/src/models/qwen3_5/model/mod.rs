@@ -12,6 +12,8 @@ use crate::hybrid::{
     Addresses, Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward,
     SequenceForward, SequenceStep, StatePool,
 };
+#[cfg(feature = "metal")]
+use crate::models::gguf::stored_parts;
 use crate::models::weights::{Embeddings, Tensors};
 use crate::models::{Execution, LoadOptions, Weights, artifact};
 use crate::quantization::{Calibration, Recorder};
@@ -343,61 +345,90 @@ fn centred(tensor: &Tensor, device: &Device) -> Result<Tensor> {
     Ok((tensor.to_dtype(DType::F32)? + 1.0)?.to_device(device)?)
 }
 
-/// Experts per layer and the bank shapes of a checkpoint whose experts a cache can serve: a
-/// prepacked artifact on the Metal kernels, whose banks are on disk as the kernels read them.
+/// Checkpoint name of bank `name` in `layer`, counting a native MTP head as one more layer.
+#[cfg(feature = "metal")]
+fn bank_name(config: &Config, layer: usize, name: &str) -> String {
+    if layer < config.layer_kinds().len() {
+        format!("{}.layers.{layer}.mlp.experts.{name}", config.text_prefix())
+    } else {
+        format!("mtp.layers.0.mlp.experts.{name}")
+    }
+}
+
+/// How `bank` is stored on disk: `checkpoint` is a GGUF file's view, and without one the bank
+/// is an artifact's single tensor in its planned precision.
+#[cfg(feature = "metal")]
+fn cached_format(
+    bank: &crate::models::weights::Projection,
+    plan: &crate::models::WeightPlan,
+    checkpoint: Option<&crate::models::checkpoint::Checkpoint>,
+) -> Result<tur_metal::experts::BankFormat> {
+    use tur_metal::{blocks::BlockFormat, experts::BankFormat};
+    let Some(checkpoint) = checkpoint else {
+        return plan
+            .precision(&bank.name)?
+            .ggml()
+            .and_then(BlockFormat::from_candle)
+            .map(BankFormat::Packed)
+            .ok_or_else(|| invalid("the expert cache needs packed expert banks"));
+    };
+    let parts = stored_parts(bank)
+        .iter()
+        .map(|part| checkpoint.entry(part)?.stored_format())
+        .collect::<Result<Vec<_>>>()?;
+    match *parts.as_slice() {
+        [format] => Ok(BankFormat::Packed(format)),
+        [gate, up] if gate == up => Ok(BankFormat::Split(gate)),
+        _ => Err(invalid(format!(
+            "{} stores its gate and up rows in different formats, which only load resident: \
+             the expert cache reads experts as stored, and this bank would need packing again",
+            bank.name
+        ))),
+    }
+}
+
+/// Experts per layer and each layer's `[gate_up, down]` shapes, for a checkpoint whose experts
+/// a cache can serve: an artifact or a GGUF file on the Metal kernels, whose banks are on disk
+/// as the kernels read them.
 #[cfg(feature = "metal")]
 fn cache_banks(
     config: &Config,
     plan: &crate::models::WeightPlan,
     options: &LoadOptions,
-) -> Result<(
-    usize,
-    tur_metal::experts::BankShape,
-    tur_metal::experts::BankShape,
-)> {
-    use tur_metal::experts::{BankFormat, BankShape};
+) -> Result<(usize, Vec<[tur_metal::experts::BankShape; 2]>)> {
+    use tur_metal::experts::BankShape;
     let moe = config
         .moe
         .ok_or_else(|| invalid("the expert cache needs a checkpoint with experts"))?;
-    if !matches!(options.weights, Weights::Prepacked(_))
-        || options.execution != Execution::Fused
-        || !options.device.is_metal()
-    {
-        return Err(invalid(
-            "the Qwen expert cache reads a prepacked artifact on the Metal kernels",
-        ));
-    }
-    let banks: Vec<_> = config
-        .projections()?
-        .into_iter()
-        .filter(|p| p.experts > 1)
-        .collect();
-    let format = |suffix: &str| -> Result<(BankFormat, usize, usize)> {
-        let mut shape = None;
-        for bank in banks.iter().filter(|p| p.name.ends_with(suffix)) {
-            let ggml = plan
-                .precision(&bank.name)?
-                .ggml()
-                .ok_or_else(|| invalid("the expert cache needs packed expert banks"))?;
-            let found = (
-                BankFormat::Packed(ggml),
-                bank.rows / bank.experts,
-                bank.cols,
-            );
-            if *shape.get_or_insert(found) != found {
-                return Err(invalid(
-                    "the expert cache needs one bank format per projection",
-                ));
-            }
+    let checkpoint = match &options.weights {
+        Weights::Gguf(file) => Some(file.checkpoint(config)?),
+        Weights::Prepacked(_) => None,
+        _ => {
+            return Err(invalid(
+                "the Qwen expert cache reads a prepacked artifact or a GGUF file",
+            ));
         }
-        shape.ok_or_else(|| invalid("checkpoint has no expert banks"))
     };
-    let bank = |(format, rows, cols)| BankShape { rows, cols, format };
-    Ok((
-        moe.num_experts,
-        bank(format("gate_up_proj")?),
-        bank(format("down_proj")?),
-    ))
+    if options.execution != Execution::Fused || !options.device.is_metal() {
+        return Err(invalid("the Qwen expert cache needs the Metal kernels"));
+    }
+    let projections = config.projections()?;
+    let shape = |layer: usize, name: &str| -> Result<BankShape> {
+        let name = bank_name(config, layer, name);
+        let bank = projections
+            .iter()
+            .find(|p| p.name == name)
+            .ok_or_else(|| invalid(format!("checkpoint has no expert bank {name}")))?;
+        Ok(BankShape {
+            rows: bank.rows / bank.experts,
+            cols: bank.cols,
+            format: cached_format(bank, plan, checkpoint.as_ref())?,
+        })
+    };
+    let layers = (0..config.layer_kinds().len() + usize::from(config.mtp()))
+        .map(|i| Ok([shape(i, "gate_up_proj")?, shape(i, "down_proj")?]))
+        .collect::<Result<_>>()?;
+    Ok((moe.num_experts, layers))
 }
 
 /// `weights` with the expert banks replaced by a cache of `budget` bytes.
@@ -410,14 +441,12 @@ fn cached_weights(
 ) -> Result<usize> {
     #[cfg(feature = "metal")]
     {
-        use tur_metal::experts::ExpertCache;
-        let (experts, gate_up, down) = cache_banks(config, plan, options)?;
-        let slots = ExpertCache::planned_slots(budget, experts, gate_up, down)?;
-        let arena = checked_elements(&[slots, ExpertCache::expert_bytes(gate_up, down)?])?;
+        let (experts, layers) = cache_banks(config, plan, options)?;
+        let arena = tur_metal::experts::ExpertCache::planned_bytes(budget, experts, &layers)?;
         let mut total = weights;
         for bank in config.projections()?.iter().filter(|p| p.experts > 1) {
             total = total
-                .checked_sub(plan.precision(&bank.name)?.bytes(bank.rows, bank.cols)?)
+                .checked_sub(plan.leading_bytes(&bank.name, (bank.rows, bank.rows, bank.cols))?)
                 .ok_or_else(|| invalid("expert banks exceed the planned weights"))?;
         }
         total
@@ -431,7 +460,7 @@ fn cached_weights(
     }
 }
 
-/// A cache over the expert banks of the open artifact behind `tensors`.
+/// A cache over the expert banks of the open checkpoint behind `tensors`.
 #[cfg(feature = "metal")]
 fn open_cache(
     tensors: &Tensors,
@@ -439,31 +468,43 @@ fn open_cache(
     budget: usize,
     options: &LoadOptions,
 ) -> Result<Arc<tur_metal::experts::ExpertCache>> {
-    use tur_metal::experts::{BankSource, ExpertCache, ExpertSources};
-    let text_layers = config.layer_kinds().len();
-    let (experts, gate_up, down) = cache_banks(config, &tensors.plan, options)?;
+    use tur_metal::experts::{BankShape, BankSource, ExpertCache, ExpertSources};
+    let (experts, layers) = cache_banks(config, &tensors.plan, options)?;
     let moe = config
         .moe
         .ok_or_else(|| invalid("the expert cache needs a checkpoint with experts"))?;
-    let bank = |layer: usize, name: &str| -> Result<BankSource> {
-        let (file, blocks) = tensors.checkpoint.location(&if layer < text_layers {
-            format!("{}.layers.{layer}.mlp.experts.{name}", config.text_prefix())
+    let bank = |layer: usize, name: &str, shape: BankShape| -> Result<BankSource> {
+        let name = bank_name(config, layer, name);
+        let projection = tensors
+            .projections
+            .get(&name)
+            .ok_or_else(|| invalid(format!("checkpoint has no expert bank {name}")))?;
+        let stored = if tensors.plan.is_stored() {
+            stored_parts(projection)
         } else {
-            format!("mtp.layers.0.mlp.experts.{name}")
-        })?;
-        Ok(BankSource {
-            file: file.to_path_buf(),
-            blocks,
-            scales: 0,
-        })
+            vec![name]
+        };
+        let parts = stored
+            .iter()
+            .map(|part| {
+                let (file, offset) = tensors.checkpoint.location(part)?;
+                Ok((file.to_path_buf(), offset))
+            })
+            .collect::<Result<_>>()?;
+        Ok(BankSource { shape, parts })
     };
     let sources = ExpertSources {
         experts,
         top_k: moe.num_experts_per_tok,
-        gate_up,
-        down,
-        layers: (0..text_layers + usize::from(config.mtp()))
-            .map(|i| Ok([bank(i, "gate_up_proj")?, bank(i, "down_proj")?]))
+        layers: layers
+            .iter()
+            .enumerate()
+            .map(|(i, &[gate_up, down])| {
+                Ok([
+                    bank(i, "gate_up_proj", gate_up)?,
+                    bank(i, "down_proj", down)?,
+                ])
+            })
             .collect::<Result<_>>()?,
     };
     // Weights besides the arena, which the budget bounds from above.

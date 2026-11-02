@@ -44,10 +44,10 @@ Other Gemma 4 sizes should share E2B's tensor names, but we haven't checked thei
 ## Limitations
 
 - gpt-oss: GGUF files don't load, and fail at load with an error. gpt-oss checkpoints ship their experts in MXFP4 inside SafeTensors and run them as stored, so use those; [Expert cache](../architecture/expert-cache.md) covers running them from disk.
-- `--expert-cache-mb` needs a prepacked artifact, because GGUF stores each bank's gate and up rows in separate tensors, so experts aren't laid out as the cache reads them. Every expert stays resident.
+- `--expert-cache-mb` keeps a Qwen file's experts on disk, and needs at least every expert of one layer for each pair of formats the file's banks use; see [Expert cache](../architecture/expert-cache.md). It rejects a bank whose gate and up tensors differ in format.
 - Audio: a GGUF holds only the text model, so Gemma's audio encoder isn't loaded and audio requests are rejected.
 - MTP drafting works only when the file carries the head, as Qwen3.8's do; the 0.8B files don't. The head's norm convention is inferred from llama.cpp's converter and hasn't run on real weights.
-- An expert bank whose gate and up tensors differ in format is packed again, because expert kernels read one format per bank. This rounds its weights again and costs memory. Bytes are planned exactly.
+- Without a cache, an expert bank whose gate and up tensors differ in format is packed again, because expert kernels read one format per bank. This rounds its weights again and costs memory. Bytes are planned exactly.
 - Gemma's per-layer embedding table is expanded to BF16, as it is for SafeTensors, so E2B's weights take about 5.8 GB from a 2.4 GB file.
 - Calibration (`tur quantize`) reads SafeTensors. GGUF files are used as they are.
 - Tur's Gemma output differs from llama.cpp's on the same file. Tur's matches its validated path on the decoded weights, so this comes from the two engines' Gemma code, and we haven't traced it further.

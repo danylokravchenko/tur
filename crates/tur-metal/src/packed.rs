@@ -28,11 +28,11 @@ enum Weights {
         buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
         scales: usize,
     },
-    /// GGML blocks in an arena the expert cache fills; the expert kernels read them in place.
+    /// Blocks in an arena the expert cache fills; the expert kernels read them in place.
     #[cfg(feature = "metal")]
     Arena {
         buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
-        format: GgmlDType,
+        format: BlockFormat,
     },
     /// Blocks in a format Candle does not know, which only the block kernels read.
     #[cfg(feature = "metal")]
@@ -251,14 +251,14 @@ impl PackedLinear {
         })
     }
 
-    /// GGML-block weights over an arena the expert cache fills after this returns.
+    /// Block weights over an arena the expert cache fills after this returns.
     #[cfg(feature = "metal")]
     pub(crate) fn packed_arena(
         buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
-        format: GgmlDType,
+        format: BlockFormat,
         (rows, cols): (usize, usize),
     ) -> Result<Self> {
-        let resident_bytes = crate::quantize::packed_bytes(format, rows, cols)?;
+        let resident_bytes = format.bytes(rows, cols)?;
         if rows == 0 || buffer.length() < resident_bytes {
             return Err(invalid("expert arena is smaller than its projection"));
         }
@@ -379,7 +379,7 @@ impl PackedLinear {
         match &self.weights {
             Weights::Packed { format, .. } => Some(*format),
             #[cfg(feature = "metal")]
-            Weights::Arena { format, .. } => Some(*format),
+            Weights::Arena { format, .. } => format.candle(),
             _ => None,
         }
     }
@@ -508,7 +508,7 @@ impl PackedLinear {
                 format,
                 ..
             } => Some((buffer, *format)),
-            Weights::Arena { buffer, format } => Some((buffer.as_ref(), *format)),
+            Weights::Arena { buffer, format } => Some((buffer.as_ref(), format.candle()?)),
             _ => None,
         }
     }
@@ -522,6 +522,9 @@ impl PackedLinear {
     ) -> Option<(&candle_metal_kernels::metal::Buffer, BlockFormat)> {
         match &self.weights {
             Weights::Blocks { buffer, format } => Some((buffer.as_ref(), *format)),
+            Weights::Arena { buffer, format } if format.candle().is_none() => {
+                Some((buffer.as_ref(), *format))
+            }
             _ => None,
         }
     }
