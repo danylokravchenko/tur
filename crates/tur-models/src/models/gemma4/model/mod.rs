@@ -3,9 +3,11 @@ use super::config::Audio as AudioSettings;
 use super::{Config, config::LayerKind};
 use crate::audio::Audio;
 use crate::image::Image;
-use crate::media::MediaPrompt;
+use crate::media::{MediaLayout, MediaPrompt, MediaSegment};
+use crate::models::media_cache::{MediaCache, RESERVED_BYTES};
 #[cfg(feature = "metal")]
 use crate::models::paging::Paging;
+use crate::video::Video;
 use crate::{
     hybrid::{
         Addresses, Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward,
@@ -76,6 +78,7 @@ pub struct Gemma4 {
     audio: Option<audio::AudioTower>,
     /// The vision tower, when the checkpoint has one and the load requested it.
     vision: Option<vision::VisionTower>,
+    media_cache: MediaCache,
     #[cfg(feature = "metal")]
     fused: Option<Fused>,
 }
@@ -495,6 +498,7 @@ impl Gemma4 {
             assistant,
             audio,
             vision,
+            media_cache: MediaCache::default(),
             #[cfg(feature = "metal")]
             fused: None,
         }
@@ -586,6 +590,63 @@ impl Gemma4 {
     pub fn media_slot(&self) -> Option<u32> {
         (self.audio.is_some() || self.vision.is_some())
             .then(|| self.config.text.pad_token_id.unwrap_or(0))
+    }
+    /// How a video appears in prompts, when the vision tower is loaded.
+    pub fn video_prompt(&self) -> Option<MediaPrompt> {
+        let settings = self
+            .config
+            .vision
+            .as_ref()
+            .filter(|_| self.vision.is_some())?;
+        Some(MediaPrompt {
+            placeholder: settings.video_token?,
+            begin: Some(settings.begin),
+            end: Some(settings.end),
+        })
+    }
+    /// One run of soft tokens per sampled frame, labelled `mm:ss` and spaced as Transformers'
+    /// processor writes them.
+    pub fn video_layout(&self, video: &Video) -> Result<MediaLayout> {
+        let (stamps, tokens) = self.tower()?.video_steps(video);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "timestamps are non-negative and small"
+        )]
+        let segments = stamps
+            .into_iter()
+            .enumerate()
+            .map(|(index, stamp)| {
+                let seconds = stamp as u64;
+                let lead = if index == 0 { "" } else { " " };
+                MediaSegment {
+                    label: format!("{lead}{:02}:{:02} ", seconds / 60, seconds % 60),
+                    tokens,
+                    grid: None,
+                }
+            })
+            .collect();
+        Ok(MediaLayout { segments })
+    }
+    /// F32 `[soft tokens, hidden]` rows of a video's frames in order. Frames don't attend to
+    /// one another, so each is its own tower pass.
+    pub fn encode_video(&self, video: &Video) -> Result<Tensor> {
+        let [_, rows] = self.trace_video(video)?;
+        Ok(rows.to_device(&Device::Cpu)?.to_device(&self.device)?)
+    }
+    /// A video's patches and soft tokens, for comparing with a reference.
+    pub fn trace_video(&self, video: &Video) -> Result<[Tensor; 2]> {
+        let tower = self.tower()?;
+        let (mut pixels, mut rows) = (Vec::new(), Vec::new());
+        for frame in tower.video_frames(video)? {
+            let (_, encoded) = tower.forward(&frame)?;
+            pixels.push(frame.pixels);
+            rows.push(encoded);
+        }
+        Ok([Tensor::stack(&pixels, 0)?, Tensor::cat(&rows, 0)?])
+    }
+    pub(crate) fn media_cache(&self) -> &MediaCache {
+        &self.media_cache
     }
     /// Soft tokens an image occupies in the prompt.
     pub fn image_tokens(&self, image: &Image) -> Result<usize> {
@@ -722,6 +783,11 @@ impl Gemma4 {
                 .map_or(0, assistant::Assistant::bytes)
             + self.audio.as_ref().map_or(0, audio::AudioTower::bytes)
             + self.vision.as_ref().map_or(0, vision::VisionTower::bytes)
+            + if self.audio.is_some() || self.vision.is_some() {
+                RESERVED_BYTES
+            } else {
+                0
+            }
     }
 
     /// Plan packed weights, per-layer embedding storage and peak activations before loading.
@@ -758,6 +824,11 @@ impl Gemma4 {
         {
             weights = vision::planned_bytes(settings, config.hidden_size(), precision)?
                 .checked_add(weights)
+                .ok_or_else(|| invalid("Gemma 4 weight bytes overflow"))?;
+        }
+        if !loaded_modalities(config, options).is_empty() {
+            weights = weights
+                .checked_add(RESERVED_BYTES)
                 .ok_or_else(|| invalid("Gemma 4 weight bytes overflow"))?;
         }
         if let Some(head) = &options.mtp {

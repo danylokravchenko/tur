@@ -880,6 +880,7 @@ mod http {
                     .map(|media| match media {
                         Media::Audio(clip) => clip.duration().as_millis().to_string(),
                         Media::Image(image) => format!("{}x{}", image.width(), image.height()),
+                        Media::Video(video) => format!("{}f", video.frame_count()),
                     })
                     .collect();
                 drop(msg.result_tx.send(Ok(GenerationStats {
@@ -1053,10 +1054,22 @@ Content-Type: audio/wav\r\n\r\n",
         .await?;
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("\"61x93\""), "{body}");
+        let mp4 = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vision/clip.mp4"),
+        )?;
+        let url = format!("data:video/mp4;base64,{}", base64(&mp4));
+        let (status, body) = send(chat(&serde_json::json!({
+            "type": "video_url", "video_url": {"url": url}
+        }))?)
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"20f\""), "{body}");
         for bad in [
             serde_json::json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}),
             serde_json::json!({"type": "image_url", "image_url": {"url": "data:text/plain;base64,aGk="}}),
             serde_json::json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}),
+            serde_json::json!({"type": "video_url", "video_url": {"url": "data:video/mp4;base64,aGk="}}),
+            serde_json::json!({"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}),
         ] {
             assert_eq!(send(chat(&bad)?).await?.0, 400, "{bad}");
         }

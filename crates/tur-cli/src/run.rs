@@ -12,6 +12,7 @@ use tur::{
     },
     hybrid::SamplingOptions,
     image::Image,
+    video::Video,
 };
 
 use crate::{
@@ -48,6 +49,11 @@ pub(crate) struct Args {
     #[arg(long)]
     #[serde(skip)]
     image: Vec<PathBuf>,
+    /// Video placed before the prompt, for models with a vision encoder (Qwen3.5 and
+    /// Gemma 4): H.264 in an MP4 file. Repeat for several.
+    #[arg(long)]
+    #[serde(skip)]
+    video: Vec<PathBuf>,
     /// Generated-token limit, including EOS. Default: 1024, or what the context leaves.
     #[arg(short = 'n', long)]
     max_tokens: Option<usize>,
@@ -114,8 +120,10 @@ impl Args {
             return Ok(Some(prompt));
         }
         if std::io::stdin().is_terminal() {
-            if self.audio.is_some() || !self.image.is_empty() {
-                return Err(TurError::Other("--audio and --image need a prompt".into()));
+            if self.audio.is_some() || !self.image.is_empty() || !self.video.is_empty() {
+                return Err(TurError::Other(
+                    "--audio, --image and --video need a prompt".into(),
+                ));
             }
             return Ok(None);
         }
@@ -137,6 +145,9 @@ impl Args {
         }
         for path in &self.image {
             parts.push(ContentPart::Image(Image::decode(&std::fs::read(path)?)?));
+        }
+        for path in &self.video {
+            parts.push(ContentPart::Video(Video::decode(&std::fs::read(path)?)?));
         }
         if !parts.is_empty() {
             parts.push(ContentPart::Text(prompt));

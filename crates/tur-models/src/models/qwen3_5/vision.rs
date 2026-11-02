@@ -17,6 +17,7 @@ use crate::{
         math::AxialTable,
         weights::tiled,
     },
+    video::Video,
 };
 use candle_core::{DType, Device, Tensor};
 use std::{collections::BTreeMap, path::Path};
@@ -32,6 +33,16 @@ const HEAD_GROUP: usize = 4;
 /// with the square of the patches, and this size already reads small print. See the book's
 /// Images chapter for its cost.
 pub(crate) const MAX_PIXELS: usize = 1 << 20;
+/// Most pixels across a video's frames, against the checkpoint's 25 million: 2048 soft tokens
+/// at most, which with labels stays within a default context.
+const MAX_VIDEO_PIXELS: usize = 1 << 22;
+/// Most frames sampled from a video. With the budget above, this many frames are still 181
+/// pixels on a side; longer videos are sampled more sparsely than the checkpoint's 2 per second.
+const MAX_VIDEO_FRAMES: usize = 128;
+/// Fewest frames sampled from a video, as the reference does.
+const MIN_VIDEO_FRAMES: usize = 4;
+/// Frames sampled per second of video, the reference's default.
+const VIDEO_FPS: f64 = 2.0;
 /// Longest ratio of an image's sides that the reference processor accepts.
 const MAX_ASPECT: usize = 200;
 
@@ -98,6 +109,28 @@ impl Processor {
     }
 }
 
+/// Pixel bounds across a video's frames from `video_preprocessor_config.json`, within Tur's
+/// limit; the checkpoint family's shipped minimum without the file.
+fn video_bounds(dir: &Path) -> Result<(usize, usize)> {
+    let raw = match std::fs::read_to_string(dir.join("video_preprocessor_config.json")) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((4096, MAX_VIDEO_PIXELS));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let raw: serde_json::Value = serde_json::from_str(&raw)?;
+    let edge = |key: &str| {
+        raw["size"][key]
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+    };
+    Ok((
+        edge("shortest_edge").unwrap_or(4096),
+        edge("longest_edge").map_or(MAX_VIDEO_PIXELS, |max| max.min(MAX_VIDEO_PIXELS)),
+    ))
+}
+
 /// Transformers' `smart_resize`: each side a multiple of `factor`, the area inside the
 /// bounds, and the aspect ratio kept as closely as that allows.
 fn smart_resize(
@@ -106,7 +139,34 @@ fn smart_resize(
     factor: usize,
     bounds: (usize, usize),
 ) -> Result<(usize, usize)> {
+    resize_frames(1, height, width, factor, bounds)
+}
+
+/// `smart_resize` over `frames` frames, whose pixels the bounds count together. A video's frames
+/// round up to pairs, as its temporal patches do. Sides under `factor` scale up first.
+fn resize_frames(
+    frames: usize,
+    height: usize,
+    width: usize,
+    factor: usize,
+    bounds: (usize, usize),
+) -> Result<(usize, usize)> {
     let (min_pixels, max_pixels) = bounds;
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "image sides are far below 2^52 and the results are non-negative"
+    )]
+    let (height, width) = if frames > 1 && height.min(width) < factor {
+        let scale = factor as f64 / height.min(width) as f64;
+        (
+            (height as f64 * scale) as usize,
+            (width as f64 * scale) as usize,
+        )
+    } else {
+        (height, width)
+    };
     if height.max(width) > MAX_ASPECT * height.min(width) {
         return Err(invalid(format!(
             "image aspect ratio must be under {MAX_ASPECT}; this one is {width}×{height}"
@@ -120,19 +180,25 @@ fn smart_resize(
     )]
     let sides = {
         let (h, w, f) = (height as f64, width as f64, factor as f64);
+        let count = frames as f64;
+        let rounded = if frames > 1 {
+            (count / 2.0).round_ties_even() as usize * 2
+        } else {
+            1
+        };
         // Python's `round` breaks ties to even.
         let (bar_h, bar_w) = (
             (h / f).round_ties_even() as usize * factor,
             (w / f).round_ties_even() as usize * factor,
         );
-        if bar_h * bar_w > max_pixels {
-            let beta = (h * w / max_pixels as f64).sqrt();
+        if rounded * bar_h * bar_w > max_pixels {
+            let beta = (count * h * w / max_pixels as f64).sqrt();
             (
                 factor.max((h / beta / f).floor() as usize * factor),
                 factor.max((w / beta / f).floor() as usize * factor),
             )
-        } else if bar_h * bar_w < min_pixels {
-            let beta = (min_pixels as f64 / (h * w)).sqrt();
+        } else if rounded * bar_h * bar_w < min_pixels {
+            let beta = (min_pixels as f64 / (count * h * w)).sqrt();
             (
                 (h * beta / f).ceil() as usize * factor,
                 (w * beta / f).ceil() as usize * factor,
@@ -157,8 +223,9 @@ struct Block {
 pub(super) struct VisionTower {
     config: VisionConfig,
     processor: Processor,
-    /// `[hidden, 3 · patch²]`: the 3D patch projection summed over its two frames, since a
-    /// still image repeats one frame.
+    /// Pixel bounds across a video's frames.
+    video_pixels: (usize, usize),
+    /// `[hidden, 3 · 2 · patch²]`: the 3D patch projection over a step's two frames.
     patch: Linear,
     /// Host `[positions, hidden]`: each image reads its own bilinear resampling.
     positions: Vec<f32>,
@@ -173,12 +240,15 @@ pub(super) struct VisionTower {
     bytes: usize,
 }
 
-/// A preprocessed image: patches in merge-block order, each `[C, H, W]` flattened.
+/// Preprocessed frames: patches by step, then merge block, each `[C, T, H, W]` flattened.
 pub(super) struct Patches {
     pub(super) pixels: Tensor,
     positions: Vec<u32>,
     rows: usize,
     columns: usize,
+    /// Temporal steps. Attention stays within a step, so patches of two frames of a video
+    /// never see each other until the text model reads them.
+    steps: usize,
 }
 
 /// Storage of the tower's projections: F32 beside an F32 text model, `Q8_0` otherwise.
@@ -219,16 +289,12 @@ fn stored_precision(name: &str, shape: &[usize], precision: Precision) -> Option
     }
 }
 
-/// Resident bytes of the tower in `precision`. The folded patch projection holds half of
-/// its checkpoint tensor.
+/// Resident bytes of the tower in `precision`.
 pub(super) fn planned_bytes(vision: &Vision, precision: Precision) -> Result<usize> {
     let mut total = 0usize;
     for (name, shape) in vision.weight_shapes() {
         let bytes = match stored_precision(&name, &shape, precision) {
             Some(packed) => packed.bytes(shape[0], shape[1])?,
-            None if name.ends_with("patch_embed.proj.weight") => {
-                shape.iter().product::<usize>() * 2
-            }
             None => shape.iter().product::<usize>() * 4,
         };
         total = total
@@ -248,6 +314,7 @@ impl VisionTower {
     ) -> Result<Self> {
         let config = vision.config.clone();
         let processor = Processor::load(dir, &config)?;
+        let video_pixels = video_bounds(dir)?;
         let mut packed_cols = BTreeMap::new();
         for (name, shape) in vision.weight_shapes() {
             let entry = checkpoint.entry(&name)?;
@@ -270,16 +337,15 @@ impl VisionTower {
         };
         let tower = "model.visual";
         let patch_side = config.patch_size;
-        let folded = checkpoint
+        let flat = checkpoint
             .take(&format!("{tower}.patch_embed.proj.weight"))?
             .to_dtype(DType::F32)?
-            .sum(2)?
-            .reshape((config.hidden_size, 3 * patch_side * patch_side))?;
+            .reshape((config.hidden_size, 3 * 2 * patch_side * patch_side))?;
         let patch = Linear {
-            weight: tur_metal::packed::PackedLinear::dense(&folded, device)?,
+            weight: tur_metal::packed::PackedLinear::dense(&flat, device)?,
             bias: Some(t.dense(&format!("{tower}.patch_embed.proj.bias"))?),
         };
-        t.bytes += folded.elem_count() * 4;
+        t.bytes += flat.elem_count() * 4;
         let positions = checkpoint
             .take(&format!("{tower}.pos_embed.weight"))?
             .to_dtype(DType::F32)?
@@ -320,6 +386,7 @@ impl VisionTower {
         Ok(Self {
             config,
             processor,
+            video_pixels,
             patch,
             positions,
             blocks,
@@ -355,46 +422,134 @@ impl VisionTower {
         Ok((height / block, width / block))
     }
 
-    /// Resize, normalize and cut `image` into patches, grouped by the block they merge into.
+    /// Resize, normalize and cut `image` into patches: one step of two equal frames.
     pub(super) fn patches(&self, image: &Image) -> Result<Patches> {
         let (height, width) = self.target(image)?;
+        let values = image.resized(height, width)?;
+        self.frame_patches(&[&values, &values], height, width)
+    }
+
+    /// Normalize and cut resized frames, two per step, into patches grouped by step and the
+    /// block they merge into.
+    fn frame_patches(&self, frames: &[&[u8]], height: usize, width: usize) -> Result<Patches> {
         let side = self.config.patch_size;
         let merge = self.config.spatial_merge_size;
         let (rows, columns) = (height / side, width / side);
-        let values = image.resized(height, width)?;
-        let (mean, std) = (self.processor.mean, self.processor.std);
-        let offset = mean.map(|m| m * 255.0);
-        let scale = std.map(|s| 1.0 / (s * 255.0));
-        let mut pixels = Vec::with_capacity(rows * columns * 3 * side * side);
-        let mut positions = Vec::with_capacity(rows * columns * 2);
-        for block_row in 0..rows / merge {
-            for block_column in 0..columns / merge {
-                for r in block_row * merge..(block_row + 1) * merge {
-                    for c in block_column * merge..(block_column + 1) * merge {
-                        positions.push(u32::try_from(r).map_err(|_| invalid("patch overflow"))?);
-                        positions.push(u32::try_from(c).map_err(|_| invalid("patch overflow"))?);
-                        for channel in 0..3 {
-                            for y in r * side..(r + 1) * side {
-                                let row = &values[y * width * 3..(y + 1) * width * 3];
-                                let run = &row[(c * side) * 3..((c + 1) * side) * 3];
-                                pixels.extend(
-                                    run.iter().skip(channel).step_by(3).map(|&v| {
-                                        (f32::from(v) - offset[channel]) * scale[channel]
-                                    }),
-                                );
+        let steps = frames.len() / 2;
+        let offset = self.processor.mean.map(|m| m * 255.0);
+        let scale = self.processor.std.map(|s| 1.0 / (s * 255.0));
+        let patches = steps * rows * columns;
+        let mut pixels = Vec::with_capacity(patches * 3 * 2 * side * side);
+        let mut positions = Vec::with_capacity(patches * 2);
+        for step in frames.as_chunks::<2>().0 {
+            for block_row in 0..rows / merge {
+                for block_column in 0..columns / merge {
+                    for r in block_row * merge..(block_row + 1) * merge {
+                        for c in block_column * merge..(block_column + 1) * merge {
+                            positions
+                                .push(u32::try_from(r).map_err(|_| invalid("patch overflow"))?);
+                            positions
+                                .push(u32::try_from(c).map_err(|_| invalid("patch overflow"))?);
+                            for channel in 0..3 {
+                                for frame in step {
+                                    for y in r * side..(r + 1) * side {
+                                        let row = &frame[y * width * 3..(y + 1) * width * 3];
+                                        let run = &row[(c * side) * 3..((c + 1) * side) * 3];
+                                        pixels.extend(run.iter().skip(channel).step_by(3).map(
+                                            |&v| (f32::from(v) - offset[channel]) * scale[channel],
+                                        ));
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        let shape = (rows * columns, 3 * side * side);
         Ok(Patches {
-            pixels: Tensor::from_vec(pixels, shape, &self.device)?,
+            pixels: Tensor::from_vec(pixels, (patches, 3 * 2 * side * side), &self.device)?,
             positions,
             rows,
             columns,
+            steps,
         })
+    }
+
+    /// Frames sampled from a video: uniformly at the reference's rate, within the frame bounds.
+    fn video_indices(video: &Video) -> Vec<usize> {
+        let total = video.frame_count();
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "frame counts are bounded far below 2^52"
+        )]
+        let wanted = (total as f64 / video.fps() * VIDEO_FPS) as usize;
+        let count = wanted.clamp(MIN_VIDEO_FRAMES, MAX_VIDEO_FRAMES).min(total);
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "frame counts are bounded far below 2^52"
+        )]
+        (0..count)
+            .map(|at| {
+                let share = (total - 1) as f64 * at as f64 / (count - 1).max(1) as f64;
+                share.round_ties_even() as usize
+            })
+            .collect()
+    }
+
+    fn video_target(&self, video: &Video, frames: usize) -> Result<(usize, usize)> {
+        resize_frames(
+            frames,
+            video.height(),
+            video.width(),
+            self.config.patch_size * self.config.spatial_merge_size,
+            self.video_pixels,
+        )
+    }
+
+    /// Soft tokens of each step of `video`, in a grid, and the timestamp its text carries.
+    pub(super) fn video_steps(&self, video: &Video) -> Result<(Vec<f64>, (usize, usize))> {
+        let mut indices = Self::video_indices(video);
+        let (height, width) = self.video_target(video, indices.len())?;
+        if !indices.len().is_multiple_of(2) {
+            indices.extend(indices.last().copied());
+        }
+        #[allow(clippy::cast_precision_loss, reason = "frame counts are small")]
+        let stamps = indices
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| (pair[0] as f64 + pair[1] as f64) / video.fps() / 2.0)
+            .collect();
+        let block = self.config.patch_size * self.config.spatial_merge_size;
+        Ok((stamps, (height / block, width / block)))
+    }
+
+    /// Decode, resize and cut a video's sampled frames into patches.
+    pub(super) fn video_patches(&self, video: &Video) -> Result<Patches> {
+        let indices = Self::video_indices(video);
+        let (height, width) = self.video_target(video, indices.len())?;
+        let decoded = video.frames(&indices)?;
+        let mut resized: Vec<Vec<u8>> = decoded
+            .iter()
+            .map(|frame| {
+                crate::image::resize::bicubic(
+                    frame,
+                    (video.height(), video.width()),
+                    (height, width),
+                )
+            })
+            .collect();
+        drop(decoded);
+        // An odd frame count repeats the last frame to fill its step.
+        if let Some(last) = resized.last().filter(|_| !indices.len().is_multiple_of(2)) {
+            resized.push(last.clone());
+        }
+        let frames: Vec<&[u8]> = resized.iter().map(Vec::as_slice).collect();
+        self.frame_patches(&frames, height, width)
     }
 
     /// `[patches, hidden]` learned positions, resampled bilinearly with aligned corners from
@@ -463,8 +618,22 @@ impl VisionTower {
             };
             let (q, k) = (rotate(0)?, rotate(hidden)?);
             let v = qkv.narrow(1, 2 * hidden, hidden)?.contiguous()?;
-            let kv = whole.whole(rows, rows)?;
-            return whole.attend(&q, &whole.pool(&k, &v)?, &kv, head_scale(dim));
+            let per_step = rows / patches.steps;
+            let kv = whole.whole(per_step, per_step)?;
+            let attended = (0..patches.steps)
+                .map(|step| {
+                    let part = |x: &Tensor| -> Result<Tensor> {
+                        Ok(x.narrow(0, step * per_step, per_step)?.contiguous()?)
+                    };
+                    whole.attend(
+                        &part(&q)?,
+                        &whole.pool(&part(&k)?, &part(&v)?)?,
+                        &kv,
+                        head_scale(dim),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Tensor::cat(&attended, 0)?);
         }
         let rotate = |offset| -> Result<Tensor> {
             let rows3 = qkv
@@ -478,7 +647,19 @@ impl VisionTower {
         };
         let (q, k) = (rotate(0)?, rotate(hidden)?);
         let v = qkv.narrow(1, 2 * hidden, hidden)?.contiguous()?;
-        attend_whole((&q, &k, &v), count, HEAD_GROUP, head_scale(dim))
+        let per_step = rows / patches.steps;
+        let attended = (0..patches.steps)
+            .map(|step| {
+                let part = |x: &Tensor| x.narrow(0, step * per_step, per_step);
+                attend_whole(
+                    (&part(&q)?, &part(&k)?, &part(&v)?),
+                    count,
+                    HEAD_GROUP,
+                    head_scale(dim),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Tensor::cat(&attended, 0)?)
     }
 
     /// `[patches, hidden]` final states and `[soft tokens, text hidden]` merged rows.

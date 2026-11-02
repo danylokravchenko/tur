@@ -303,7 +303,7 @@ async fn test_http_rejects_unsupported_media_and_invalid_controls() -> Result<()
             .map_err(|error| TurError::Other(error.to_string()))?;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
-    let response = router.oneshot(request(&json!({"messages":[{"role":"user","content":[{"type":"video_url","video_url":{"url":"data:video/mp4;base64,AA=="}}]}]}))?).await
+    let response = router.oneshot(request(&json!({"messages":[{"role":"user","content":[{"type":"file","file":{"file_data":"AA=="}}]}]}))?).await
         .map_err(|error| TurError::Other(error.to_string()))?;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     Ok(())

@@ -20,7 +20,7 @@ fn no_audio() -> tur_core::TurError {
     invalid("this model has no audio encoder")
 }
 
-fn no_image() -> tur_core::TurError {
+fn no_vision() -> tur_core::TurError {
     invalid("this model has no vision encoder")
 }
 
@@ -173,6 +173,22 @@ impl TextModel {
             Self::Gemma4(m) => m.image_prompt(),
         }
     }
+    /// How a video appears in prompts, when the model has a vision encoder loaded.
+    pub fn video_prompt(&self) -> Option<MediaPrompt> {
+        match self {
+            Self::Qwen35(m) => m.video_prompt(),
+            Self::GptOss(_) => None,
+            Self::Gemma4(m) => m.video_prompt(),
+        }
+    }
+    /// How `media` appears in prompts, when this model's encoder for it is loaded.
+    pub fn media_prompt(&self, media: Media<'_>) -> Option<MediaPrompt> {
+        match media {
+            Media::Audio(_) => self.audio_prompt(),
+            Media::Image(_) => self.image_prompt(),
+            Media::Video(_) => self.video_prompt(),
+        }
+    }
     /// The token a soft-token position feeds the model, under its embedded row.
     pub fn media_slot(&self) -> Option<u32> {
         match self {
@@ -181,31 +197,47 @@ impl TextModel {
             Self::Gemma4(m) => m.media_slot(),
         }
     }
-    /// Prompt positions an input's soft tokens occupy, between any framing tokens.
+    /// The runs of soft tokens an input occupies, and what the prompt holds around each.
     pub fn media_layout(&self, media: Media<'_>) -> Result<MediaLayout> {
         match (self, media) {
-            (Self::Gemma4(m), Media::Audio(clip)) => Ok(MediaLayout {
-                tokens: m.audio_tokens(clip)?,
-                grid: None,
-            }),
-            (Self::Gemma4(m), Media::Image(image)) => Ok(MediaLayout {
-                tokens: m.image_tokens(image)?,
-                grid: None,
-            }),
+            (Self::Gemma4(m), Media::Audio(clip)) => {
+                Ok(MediaLayout::single(m.audio_tokens(clip)?, None))
+            }
+            (Self::Gemma4(m), Media::Image(image)) => {
+                Ok(MediaLayout::single(m.image_tokens(image)?, None))
+            }
+            (Self::Gemma4(m), Media::Video(video)) => m.video_layout(video),
             (Self::Qwen35(m), Media::Image(image)) => m.image_layout(image),
+            (Self::Qwen35(m), Media::Video(video)) => m.video_layout(video),
             (_, Media::Audio(_)) => Err(no_audio()),
-            (_, Media::Image(_)) => Err(no_image()),
+            (_, Media::Image(_) | Media::Video(_)) => Err(no_vision()),
         }
     }
-    /// Encode an input into F32 `[soft tokens, hidden]` embedding rows on the model device.
+    /// F32 `[soft tokens, hidden]` embedding rows of an input on the model device, its
+    /// segments in order. Rows encoded recently are returned without encoding again.
     pub fn encode_media(&self, media: Media<'_>) -> Result<candle_core::Tensor> {
-        match (self, media) {
-            (Self::Gemma4(m), Media::Audio(clip)) => m.encode_audio(clip),
-            (Self::Gemma4(m), Media::Image(image)) => m.encode_image(image),
-            (Self::Qwen35(m), Media::Image(image)) => m.encode_image(image),
-            (_, Media::Audio(_)) => Err(no_audio()),
-            (_, Media::Image(_)) => Err(no_image()),
+        let cache = match self {
+            Self::Qwen35(m) => Some(m.media_cache()),
+            Self::Gemma4(m) => Some(m.media_cache()),
+            Self::GptOss(_) => None,
+        };
+        let key = media.digest();
+        if let Some(rows) = cache.and_then(|cache| cache.get(&key)) {
+            return Ok(rows);
         }
+        let rows = match (self, media) {
+            (Self::Gemma4(m), Media::Audio(clip)) => m.encode_audio(clip)?,
+            (Self::Gemma4(m), Media::Image(image)) => m.encode_image(image)?,
+            (Self::Gemma4(m), Media::Video(video)) => m.encode_video(video)?,
+            (Self::Qwen35(m), Media::Image(image)) => m.encode_image(image)?,
+            (Self::Qwen35(m), Media::Video(video)) => m.encode_video(video)?,
+            (_, Media::Audio(_)) => return Err(no_audio()),
+            (_, Media::Image(_) | Media::Video(_)) => return Err(no_vision()),
+        };
+        if let Some(cache) = cache {
+            cache.insert(key, &rows);
+        }
+        Ok(rows)
     }
     /// Whether the model reads any non-text input, so requests may need encoding.
     pub fn has_encoders(&self) -> bool {

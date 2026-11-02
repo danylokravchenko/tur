@@ -1,6 +1,7 @@
 //! Image input: decoding to RGB and resizing as the models' image processors do.
-mod resize;
+pub(crate) mod resize;
 
+use crate::media::Digest;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
 use std::{io::Cursor, sync::Arc};
 use tur_core::{Result, execution::invalid};
@@ -18,6 +19,9 @@ pub struct Image {
     height: u32,
     /// `height` rows of `width` RGB byte triples.
     pixels: Arc<[u8]>,
+    /// Hash of the size and pixels, computed where the image is decoded: off the executor
+    /// and off the thread that runs passes.
+    digest: Digest,
 }
 
 fn decode_error(error: impl std::fmt::Display) -> tur_core::TurError {
@@ -62,10 +66,13 @@ impl Image {
         if width == 0 || height == 0 || pixels.len() != expected {
             return Err(invalid("image size does not match its pixels"));
         }
+        let size = (u64::from(width) << 32) | u64::from(height);
+        let digest = crate::media::digest(&[b"image", &size.to_le_bytes(), &pixels]);
         Ok(Self {
             width,
             height,
             pixels: pixels.into(),
+            digest,
         })
     }
 
@@ -82,16 +89,10 @@ impl Image {
         &self.pixels
     }
 
-    /// 64-bit FNV-1a of the size and pixels: images are told apart by content, as prefix
-    /// reuse requires, not by how they were encoded.
-    pub fn fingerprint(&self) -> u64 {
-        let size = (u64::from(self.width) << 32) | u64::from(self.height);
-        size.to_le_bytes()
-            .iter()
-            .chain(self.pixels.iter())
-            .fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-            })
+    /// Identifies the size and pixels: images are told apart by content, as prefix reuse
+    /// requires, not by how they were encoded.
+    pub fn digest(&self) -> Digest {
+        self.digest
     }
 
     /// Interleaved RGB of the image at `height` × `width`, resampled as the models' image
@@ -160,16 +161,13 @@ mod tests {
     }
 
     #[test]
-    fn test_fingerprints_differ_by_size_and_content() -> Result<()> {
+    fn test_digests_differ_by_size_and_content() -> Result<()> {
         let wide = Image::from_rgb(2, 1, vec![1; 6])?;
         let tall = Image::from_rgb(1, 2, vec![1; 6])?;
         let other = Image::from_rgb(2, 1, vec![2; 6])?;
-        assert_ne!(wide.fingerprint(), tall.fingerprint());
-        assert_ne!(wide.fingerprint(), other.fingerprint());
-        assert_eq!(
-            wide.fingerprint(),
-            Image::from_rgb(2, 1, vec![1; 6])?.fingerprint()
-        );
+        assert_ne!(wide.digest(), tall.digest());
+        assert_ne!(wide.digest(), other.digest());
+        assert_eq!(wide.digest(), Image::from_rgb(2, 1, vec![1; 6])?.digest());
         Ok(())
     }
 }

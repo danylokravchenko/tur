@@ -9,14 +9,14 @@ Tur is an inference service for Apple Silicon Macs. It aims for three things at 
 - Apple Silicon Macs with Metal. CPU execution exists only as a numerical reference for tests.
 - Qwen3.5-family hybrid text models (dense Qwen3.5 and Qwen3.8, and experimentally the Qwen3.6 MoE), Gemma 4 text models and gpt-oss text models. The architecture is identified from checkpoint fields, never from the name.
 - GGUF weights for those models, in any format mix llama.cpp's Q-, IQ- and MXFP4-based files use (see [GGUF files](../guide/gguf.md)).
-- Images, as input to Qwen3.5-family models and Gemma 4 through their own encoders (see [Images](../architecture/vision.md)).
+- Images and H.264 video, as input to Qwen3.5-family models and Gemma 4 through their own encoders (see [Images and video](../architecture/vision.md)).
 - Speech: audio input to Gemma 4 E2B and E4B through their own encoder, and Whisper transcription (see [Audio](../architecture/audio.md)).
 - The `tur` CLI, an OpenAI-compatible HTTP API and the Rust library.
 
 ## Out of scope
 
 - Intel Macs, CUDA and Linux.
-- Video input, which is rejected until its frame sampling and timestamps exist.
+- Video codecs other than H.264.
 - Speech output and audio containers other than WAV.
 - Other model families, such as plain Qwen3 transformers.
 - Splitting a model across GPUs or machines, spilling state to SSD, and the Apple Neural Engine. These wait until a measured workload needs them.

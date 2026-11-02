@@ -15,13 +15,15 @@ use crate::hybrid::{
 #[cfg(feature = "metal")]
 use crate::hybrid::{LayerCarry, LayerStep};
 use crate::image::Image;
-use crate::media::{MediaLayout, MediaPrompt};
+use crate::media::{MediaLayout, MediaPrompt, MediaSegment};
 #[cfg(feature = "metal")]
 use crate::models::gguf::stored_parts;
 use crate::models::math::AxialTable;
+use crate::models::media_cache::{MediaCache, RESERVED_BYTES};
 use crate::models::weights::{Embeddings, Tensors};
 use crate::models::{Execution, LoadOptions, Weights, artifact};
 use crate::quantization::{Calibration, Recorder};
+use crate::video::Video;
 use candle_core::{DType, Device, Tensor};
 use std::{path::Path, sync::Arc};
 use tur_core::progress::Stage;
@@ -279,6 +281,7 @@ pub struct Qwen35 {
     vision: Option<vision::VisionTower>,
     /// How text rotary reads an image's grid, beside a loaded tower.
     axial: Option<AxialTable>,
+    media_cache: MediaCache,
     #[cfg(feature = "metal")]
     fused: Option<fused::Fused>,
     /// Bounded expert storage the layers' banks read, when this load has one.
@@ -656,7 +659,8 @@ impl Qwen35 {
         let mut weights = plan.bytes(config)?;
         if let (Some(precision), Some(settings)) = (tower, &config.vision) {
             weights = vision::planned_bytes(settings, precision)?
-                .checked_add(weights)
+                .checked_add(RESERVED_BYTES)
+                .and_then(|bytes| bytes.checked_add(weights))
                 .ok_or_else(|| invalid("weight total overflow"))?;
         }
         if let Some(budget) = options.expert_cache {
@@ -819,6 +823,7 @@ impl Qwen35 {
             )?,
             vision,
             axial,
+            media_cache: MediaCache::default(),
             config,
             device: device.clone(),
             dims,
@@ -869,7 +874,10 @@ impl Qwen35 {
         let mut total = self.projection_bytes()
             + bytes(&self.norm)
             + self.embed.bytes()
-            + self.vision.as_ref().map_or(0, vision::VisionTower::bytes);
+            + self
+                .vision
+                .as_ref()
+                .map_or(0, |tower| tower.bytes() + RESERVED_BYTES);
         if let Some(mtp) = &self.mtp {
             total += bytes(&mtp.embedding_norm) + bytes(&mtp.hidden_norm) + bytes(&mtp.norm);
         }
@@ -1133,10 +1141,65 @@ impl Qwen35 {
     /// Soft tokens `image` occupies in the prompt, in their grid.
     pub fn image_layout(&self, image: &Image) -> Result<MediaLayout> {
         let (rows, columns) = self.tower()?.grid(image)?;
-        Ok(MediaLayout {
-            tokens: rows * columns,
-            grid: self.axial.as_ref().map(|_| (rows, columns)),
+        Ok(MediaLayout::single(
+            rows * columns,
+            self.axial.as_ref().map(|_| (rows, columns)),
+        ))
+    }
+
+    /// How a video appears in prompts, when the tower is loaded. The template frames its one
+    /// placeholder, and every step of the video writes its own frame inside that one, as
+    /// Transformers' processor does.
+    pub fn video_prompt(&self) -> Option<MediaPrompt> {
+        let settings = self
+            .config
+            .vision
+            .as_ref()
+            .filter(|_| self.vision.is_some())?;
+        let (placeholder, begin, end) = settings.video_token?;
+        Some(MediaPrompt {
+            placeholder,
+            begin: Some(begin),
+            end: Some(end),
         })
+    }
+
+    /// One run of soft tokens per temporal step of `video`, labelled with its timestamp.
+    pub fn video_layout(&self, video: &Video) -> Result<MediaLayout> {
+        let (stamps, (rows, columns)) = self.tower()?.video_steps(video)?;
+        Ok(MediaLayout {
+            segments: stamps
+                .into_iter()
+                .map(|stamp| MediaSegment {
+                    label: format!("<{stamp:.1} seconds>"),
+                    tokens: rows * columns,
+                    grid: self.axial.as_ref().map(|_| (rows, columns)),
+                })
+                .collect(),
+        })
+    }
+
+    /// F32 `[soft tokens, hidden]` rows of `video`'s steps in order, as [`Self::encode_image`].
+    pub fn encode_video(&self, video: &Video) -> Result<Tensor> {
+        let tower = self.tower()?;
+        let (_, rows) = tower.forward(&tower.video_patches(video)?)?;
+        if rows.device().same_device(&self.device) {
+            return Ok(rows);
+        }
+        Ok(rows.to_device(&Device::Cpu)?.to_device(&self.device)?)
+    }
+
+    /// `video`'s patches, the tower's final states and its soft tokens, for comparing every
+    /// stage with a reference.
+    pub fn trace_video(&self, video: &Video) -> Result<[Tensor; 3]> {
+        let tower = self.tower()?;
+        let patches = tower.video_patches(video)?;
+        let (hidden, rows) = tower.forward(&patches)?;
+        Ok([patches.pixels, hidden, rows])
+    }
+
+    pub(crate) fn media_cache(&self) -> &MediaCache {
+        &self.media_cache
     }
 
     /// F32 `[soft tokens, hidden]` rows of `image` on the model device. The tower has its own

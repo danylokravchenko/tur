@@ -30,7 +30,7 @@
 - [Sampling](architecture/sampling.md)
 - [Speculative decoding](architecture/speculation.md)
 - [Audio](architecture/audio.md)
-- [Images](architecture/vision.md)
+- [Images and video](architecture/vision.md)
 - [Expert cache](architecture/expert-cache.md)
 - [Metal kernels](architecture/kernels.md)
 - [Serving](architecture/serving.md)

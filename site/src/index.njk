@@ -141,8 +141,8 @@ description: "A Rust inference engine for Apple Silicon that serves mixture-of-e
     <div>
       <h2>Models</h2>
       <ul class="plain">
-        <li>Qwen3.5-family hybrid models with images, including Qwen3.8 and, experimentally, the Qwen3.6 mixture-of-experts</li>
-        <li>Gemma 4 with images, and with WAV audio on E2B and E4B</li>
+        <li>Qwen3.5-family hybrid models with images and video, including Qwen3.8 and, experimentally, the Qwen3.6 mixture-of-experts</li>
+        <li>Gemma 4 with images and video, and with WAV audio on E2B and E4B</li>
         <li>gpt-oss text, through the expert cache when it doesn't fit</li>
         <li>Whisper large-v3-turbo for transcription</li>
       </ul>
@@ -150,7 +150,7 @@ description: "A Rust inference engine for Apple Silicon that serves mixture-of-e
     </div>
     <div>
       <h2>When to look elsewhere</h2>
-      <p>Tur supports few models, reads images only on Qwen3.5-family models and Gemma 4, and doesn't accept video. It has no embeddings, serves one chat model per process, and its HTTP API doesn't offer structured output yet. On 8K-token prompts, llama.cpp prefills 6 to 11% faster on a 16 GB M1.</p>
+      <p>Tur supports few models, and reads images and H.264 video only on Qwen3.5-family models and Gemma 4. It has no embeddings and serves one chat model per process. On 8K-token prompts, llama.cpp prefills 6 to 11% faster on a 16 GB M1.</p>
       <p>For those, or for other hardware, look at oMLX, llama.cpp, Ollama, SGLang or Strata. <a href="/docs/architecture/comparison/">Tur and other engines</a> says which fits what.</p>
     </div>
   </section>

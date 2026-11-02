@@ -22,7 +22,7 @@ Choose Tur if you want one of these on an Apple Silicon Mac:
 
 Already have a GGUF quant you like? Tur loads it directly from a path or Hugging Face with `--gguf`, in any mix of K-quant, legacy, IQ and MXFP4 blocks, for the Qwen and Gemma 4 models it supports ([GGUF files](docs/src/guide/gguf.md)).
 
-Tur supports few models, reads images only on Qwen3.5-family models and Gemma 4, and doesn't accept video. It has no embeddings and serves one chat model per process. For those, or for other hardware, look at oMLX, llama.cpp, Ollama, SGLang or Strata. [Tur and other engines](docs/src/architecture/comparison.md) compares them.
+Tur supports few models, and reads images and H.264 video only on Qwen3.5-family models and Gemma 4. It has no embeddings and serves one chat model per process. For those, or for other hardware, look at oMLX, llama.cpp, Ollama, SGLang or Strata. [Tur and other engines](docs/src/architecture/comparison.md) compares them.
 
 ## How it works
 
@@ -62,7 +62,7 @@ Other results for Qwen3.5-0.8B on that 16 GB M1:
 
 ## Models
 
-Tur supports the Qwen3.5 family, Gemma 4 and gpt-oss for text, plus Whisper for transcription. Qwen3.5-family models and Gemma 4 also accept images, and Gemma 4 E2B and E4B accept WAV audio. [Scope and principles](docs/src/design/scope.md) lists how far each model has been validated.
+Tur supports the Qwen3.5 family, Gemma 4 and gpt-oss for text, plus Whisper for transcription. Qwen3.5-family models and Gemma 4 also accept images and H.264 video, and Gemma 4 E2B and E4B accept WAV audio. [Scope and principles](docs/src/design/scope.md) lists how far each model has been validated.
 
 ## Get started
 

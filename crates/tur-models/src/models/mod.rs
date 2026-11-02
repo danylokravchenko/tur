@@ -5,6 +5,7 @@ mod encoder;
 mod generation;
 mod gguf;
 mod math;
+mod media_cache;
 mod options;
 #[cfg(feature = "metal")]
 mod paging;

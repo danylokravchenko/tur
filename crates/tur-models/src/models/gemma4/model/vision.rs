@@ -20,6 +20,7 @@ use crate::{
         math::{self, AxialTable},
         weights::tiled,
     },
+    video::Video,
 };
 use candle_core::{DType, Device, Tensor};
 use std::{collections::BTreeMap, path::Path};
@@ -55,6 +56,9 @@ struct Layer {
 pub(super) struct VisionTower {
     config: VisionConfig,
     max_patches: usize,
+    /// Patches per video frame and frames per video, from the video processor.
+    video_patches: usize,
+    video_frames: usize,
     input: PackedLinear,
     /// `[size, hidden]` learned positions of the x and y axes.
     positions: [Tensor; 2],
@@ -162,6 +166,31 @@ fn max_soft_tokens(dir: &Path, config: &VisionConfig) -> Result<usize> {
         return Err(invalid("unsupported Gemma 4 image processor settings"));
     }
     usize::try_from(tokens).map_err(|_| invalid("soft token count overflow"))
+}
+
+/// Soft tokens per video frame and frames per video, from `processor_config.json`'s video
+/// processor, or the shipped values without one.
+fn video_settings(dir: &Path, config: &VisionConfig) -> Result<(usize, usize)> {
+    let raw = match std::fs::read_to_string(dir.join("processor_config.json")) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((70, 32)),
+        Err(error) => return Err(error.into()),
+    };
+    let raw: serde_json::Value = serde_json::from_str(&raw)?;
+    let processor = &raw["video_processor"];
+    let matches =
+        |key: &str, expected: usize| processor[key].as_u64().is_none_or(|v| v == expected as u64);
+    let tokens = processor["max_soft_tokens"].as_u64().unwrap_or(70);
+    let frames = processor["num_frames"].as_u64().unwrap_or(32);
+    if !matches("patch_size", config.patch_size)
+        || !matches("pooling_kernel_size", config.pooling_kernel_size)
+        || ![70, 140, 280, 560, 1120].contains(&tokens)
+        || frames == 0
+    {
+        return Err(invalid("unsupported Gemma 4 video processor settings"));
+    }
+    let size = |value: u64| usize::try_from(value).map_err(|_| invalid("video setting overflow"));
+    Ok((size(tokens)?, size(frames)?))
 }
 
 /// Transformers' `get_aspect_ratio_preserving_size`: the largest size with the image's aspect
@@ -283,10 +312,15 @@ impl VisionTower {
                 Ok::<_, tur_core::TurError>((whole, rotation))
             })
             .transpose()?;
-        let max_patches = tokens * config.pooling_kernel_size * config.pooling_kernel_size;
+        let pooled = config.pooling_kernel_size * config.pooling_kernel_size;
+        let max_patches = tokens * pooled;
+        let (video_tokens, video_frames) = video_settings(dir, &config)?;
+        let video_patches = video_tokens * pooled;
         Ok(Self {
             config,
             max_patches,
+            video_patches,
+            video_frames,
             input,
             positions,
             layers,
@@ -325,9 +359,20 @@ impl VisionTower {
     /// Resize and cut `image` into patches, with values in 0..=1.
     pub(super) fn patches(&self, image: &Image) -> Result<Patches> {
         let (height, width) = self.target(image);
+        let values = image.resized(height, width)?;
+        self.frame_patches(&values, height, width, |v| f32::from(v) * RESCALE)
+    }
+
+    /// Cut one resized frame into patches in raster order.
+    fn frame_patches(
+        &self,
+        values: &[u8],
+        height: usize,
+        width: usize,
+        scaled: impl Fn(u8) -> f32,
+    ) -> Result<Patches> {
         let side = self.config.patch_size;
         let (rows, columns) = (height / side, width / side);
-        let values = image.resized(height, width)?;
         let mut pixels = Vec::with_capacity(rows * columns * 3 * side * side);
         let mut positions = Vec::with_capacity(rows * columns * 2);
         for r in 0..rows {
@@ -339,7 +384,7 @@ impl VisionTower {
                     pixels.extend(
                         row[(c * side) * 3..((c + 1) * side) * 3]
                             .iter()
-                            .map(|&v| f32::from(v) * RESCALE),
+                            .map(|&v| scaled(v)),
                     );
                 }
             }
@@ -350,6 +395,59 @@ impl VisionTower {
             positions,
             columns,
         })
+    }
+
+    /// Frames sampled from a video: evenly spaced, as many as the video has up to the
+    /// processor's count. Transformers rejects a video shorter than that count.
+    fn video_indices(&self, video: &Video) -> Vec<usize> {
+        let total = video.frame_count();
+        let count = self.video_frames.min(total);
+        (0..count).map(|at| at * total / count).collect()
+    }
+
+    fn video_target(&self, video: &Video) -> (usize, usize) {
+        target_size(
+            video.height(),
+            video.width(),
+            self.config.patch_size,
+            self.config.pooling_kernel_size,
+            self.video_patches,
+        )
+    }
+
+    /// Timestamps of a video's sampled frames, and each frame's soft tokens.
+    pub(super) fn video_steps(&self, video: &Video) -> (Vec<f64>, usize) {
+        let (height, width) = self.video_target(video);
+        let block = self.config.patch_size * self.config.pooling_kernel_size;
+        #[allow(clippy::cast_precision_loss, reason = "frame counts are small")]
+        let stamps = self
+            .video_indices(video)
+            .into_iter()
+            .map(|at| at as f64 / video.fps())
+            .collect();
+        (stamps, height / block * (width / block))
+    }
+
+    /// Each sampled frame's patches and pixels, in order.
+    pub(super) fn video_frames(&self, video: &Video) -> Result<Vec<Patches>> {
+        let (height, width) = self.video_target(video);
+        video
+            .frames(&self.video_indices(video))?
+            .iter()
+            .map(|frame| {
+                let resized = if (height, width) == (video.height(), video.width()) {
+                    frame.clone()
+                } else {
+                    crate::image::resize::bicubic(
+                        frame,
+                        (video.height(), video.width()),
+                        (height, width),
+                    )
+                };
+                // A video's values rescale and normalize in one step, unlike an image's.
+                self.frame_patches(&resized, height, width, |v| f32::from(v) / 255.0)
+            })
+            .collect()
     }
 
     /// `[patches, hidden]` projected patches with their learned positions.

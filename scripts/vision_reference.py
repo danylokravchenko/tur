@@ -5,6 +5,7 @@ Tiny fixtures are offline numerical oracles, not evidence that a real model work
 Real checkpoints (immutable revisions), on any image file:
   python -I scripts/vision_reference.py --qwen <dir> --image photo.png --golden /tmp/qwen-image.safetensors
   python -I scripts/vision_reference.py --gemma <dir> --image photo.png --golden /tmp/gemma-image.safetensors
+Add --video clip.mp4 (H.264, decoded with PyAV) to either for a video answer or tower outputs instead.
 """
 import argparse
 import json
@@ -34,6 +35,34 @@ def pattern(width, height):
     ], axis=-1)
     image += 18 * np.sin(np.arange(width * height).reshape(height, width, 1) * 12.9898)
     return Image.fromarray(np.round(np.clip(image, 0, 255)).astype(np.uint8), "RGB")
+
+
+def moving(frames, width, height):
+    """A pattern that slides, as `[frames, height, width, 3]` RGB bytes."""
+    base = np.array(pattern(width + frames * 3, height))
+    return np.stack([base[:, 3 * t:3 * t + width] for t in range(frames)])
+
+
+def write_clip(path, frames, fps):
+    """An H.264 MP4 with B-frames, and what PyAV decodes from it."""
+    import av
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("libx264", rate=fps)
+        stream.width, stream.height, stream.pix_fmt = frames.shape[2], frames.shape[1], "yuv420p"
+        for frame in frames:
+            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return read_clip(path)[0]
+
+
+def read_clip(path):
+    import av
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        frames = np.stack([f.to_ndarray(format="rgb24") for f in container.decode(stream)])
+        return frames, float(stream.average_rate)
 
 
 def float32(config):
@@ -120,7 +149,51 @@ def tiny_qwen(root, small, large):
     for handle in handles:
         handle.remove()
     data["logits"] = result.logits.squeeze(0).float().contiguous()
+    tiny_qwen_video(model, data)
     write(root / "qwen3_5", model, config, settings, data)
+    video = dict(settings, size=dict(shortest_edge=4096, longest_edge=262144), video_processor_type="Qwen3VLVideoProcessor")
+    video.pop("image_processor_type")
+    (root / "qwen3_5" / "video_preprocessor_config.json").write_text(json.dumps(video, indent=2) + "\n")
+
+
+def tiny_qwen_video(model, data):
+    from transformers import Qwen3VLVideoProcessor
+    from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+    from transformers.video_utils import VideoMetadata
+    frames = moving(10, 61, 93)
+    processor = Qwen3VLVideoProcessor(size=dict(shortest_edge=4096, longest_edge=262144), patch_size=16, temporal_patch_size=2,
+                                      merge_size=2, image_mean=[0.5] * 3, image_std=[0.5] * 3, cap_pixels_per_frame=False)
+    metadata = VideoMetadata(total_num_frames=10, fps=5.0, width=61, height=93, frames_indices=list(range(10)), duration=2.0)
+    out = processor(videos=[frames], video_metadata=[metadata], return_metadata=True, return_tensors="pt")
+    t, h, w = out["video_grid_thw"][0].tolist()
+    indices = out["video_metadata"][0].frames_indices
+    stamps = Qwen3VLProcessor._calculate_timestamps(None, list(indices), 5.0, 2)
+    with torch.inference_mode():
+        vision = model.model.visual(out["pixel_values_videos"], grid_thw=out["video_grid_thw"])
+    soft = vision.pooler_output.float().contiguous()
+    per_frame = h * w // 4
+    # Label positions stand in for a tokenized timestamp.
+    tokens = [2, 92]
+    for _ in range(t):
+        tokens += [5, 6, 92] + [95] * per_frame + [93]
+    tokens += [93, 9]
+    ids = torch.tensor([tokens])
+    types = (ids == 95).long() * 2
+    with torch.inference_mode():
+        positions, _ = model.model.get_rope_index(ids, mm_token_type_ids=types, video_grid_thw=out["video_grid_thw"])
+        result = model(input_ids=ids, mm_token_type_ids=types, pixel_values_videos=out["pixel_values_videos"], video_grid_thw=out["video_grid_thw"], use_cache=False)
+    data.update({
+        "video.frames": torch.from_numpy(frames).contiguous(),
+        "video.pixels": out["pixel_values_videos"].float().contiguous(),
+        "video.grid": out["video_grid_thw"][0].to(torch.int64),
+        "video.indices": torch.tensor(list(indices), dtype=torch.int64),
+        "video.stamps": torch.tensor(stamps, dtype=torch.float32),
+        "video.tower": vision.last_hidden_state.float().contiguous(),
+        "video.soft_tokens": soft,
+        "video.tokens": ids[0].to(torch.int64),
+        "video.rotary": positions[:, 0].t().to(torch.int64).contiguous(),
+        "video.logits": result.logits.squeeze(0).float().contiguous(),
+    })
 
 
 def tiny_gemma(root, small, large):
@@ -171,20 +244,76 @@ def tiny_gemma(root, small, large):
     for handle in handles:
         handle.remove()
     data["logits"] = result.logits.squeeze(0).float().contiguous()
+    tiny_gemma_video(model, data)
     (root / "gemma4").mkdir(parents=True, exist_ok=True)
     directory = root / "gemma4"
     write(directory, model, config, settings["image_processor"], data)
     (directory / "preprocessor_config.json").unlink()
+    settings["video_processor"] = dict(video_processor_type="Gemma4VideoProcessor", max_soft_tokens=70, num_frames=4, patch_size=16, pooling_kernel_size=3)
     (directory / "processor_config.json").write_text(json.dumps(settings, indent=2) + "\n")
+
+
+def tiny_gemma_video(model, data):
+    from transformers import Gemma4VideoProcessor
+    from transformers.video_utils import VideoMetadata
+    frames = moving(10, 61, 93)
+    processor = Gemma4VideoProcessor(max_soft_tokens=70, num_frames=4, patch_size=16, pooling_kernel_size=3)
+    metadata = VideoMetadata(total_num_frames=10, fps=5.0, width=61, height=93, frames_indices=list(range(10)), duration=2.0)
+    out = processor(videos=[frames], video_metadata=[metadata], return_metadata=True, return_tensors="pt")
+    tokens_per_frame = int(out["num_soft_tokens_per_video"][0])
+    count = tokens_per_frame * 9
+    with torch.inference_mode():
+        features = model.model.get_video_features(out["pixel_values_videos"], out["video_position_ids"], out["num_frames_per_video"], return_dict=True)
+    soft = features.pooler_output[0].float().contiguous()
+    frames_used = int(out["num_frames_per_video"][0])
+    tokens = [2]
+    for _ in range(frames_used):
+        tokens += [5, 91] + [93] * tokens_per_frame + [92]
+    ids = torch.tensor([tokens])
+    with torch.inference_mode():
+        # Transformers 5.20.2's forward drops `num_frames_per_video`, so the features go in encoded.
+        result = model(input_ids=ids, mm_encoder_outputs={"video": features}, use_cache=False)
+    data.update({
+        "video.frames": torch.from_numpy(frames).contiguous(),
+        "video.pixels": out["pixel_values_videos"][:, :count].float().contiguous(),
+        "video.indices": torch.tensor(list(out["video_metadata"][0].frames_indices), dtype=torch.int64),
+        "video.soft_tokens": soft,
+        "video.tokens": ids[0].to(torch.int64),
+        "video.logits": result.logits.squeeze(0).float().contiguous(),
+    })
 
 
 def tiny(root):
     root.mkdir(parents=True, exist_ok=True)
+    frames = write_clip(root / "clip.mp4", moving(20, 64, 48), 10)
+    save_file({"frames": torch.from_numpy(frames).contiguous()}, root / "clip.safetensors")
     small, large = pattern(61, 93), pattern(800, 533)
     small.save(root / "small.png")
     large.save(root / "large.png")
     tiny_qwen(root, small, large)
     tiny_gemma(root, small, large)
+
+
+def real_video(directory, video_path, output, qwen):
+    """A greedy answer on 0.8B, or E2B's prompt: PyAV frames through each model's own processor."""
+    from transformers import AutoProcessor
+    from transformers.video_utils import VideoMetadata
+    frames, fps = read_clip(video_path)
+    metadata = VideoMetadata(total_num_frames=len(frames), fps=fps, width=frames.shape[2], height=frames.shape[1], frames_indices=list(range(len(frames))), duration=len(frames) / fps)
+    processor = AutoProcessor.from_pretrained(directory, local_files_only=True)
+    messages = [{"role": "user", "content": [{"type": "video"}, {"type": "text", "text": "Describe this video in one sentence."}]}]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    inputs = processor(text=[text], videos=[frames], video_metadata=[metadata], return_tensors="pt", add_special_tokens=False)
+    data = {"tokens": inputs["input_ids"][0].to(torch.int64).contiguous()}
+    if qwen:
+        model = Qwen3_5ForConditionalGeneration.from_pretrained(directory, dtype=torch.float32, local_files_only=True).eval()
+        with torch.inference_mode():
+            data["soft_tokens"] = model.model.visual(inputs["pixel_values_videos"], grid_thw=inputs["video_grid_thw"]).pooler_output.float().contiguous()
+            generated = model.generate(**inputs, max_new_tokens=48, do_sample=False)[0, inputs["input_ids"].shape[1]:]
+        data["greedy"] = generated.to(torch.int64).contiguous()
+        print(repr(processor.decode(generated)), flush=True)
+    save_file(data, output, metadata={"transformers": transformers.__version__, "torch": torch.__version__})
+    print(f"wrote {output}: {data['tokens'].numel()} prompt tokens", flush=True)
 
 
 def real_qwen(directory, image_path, output):
@@ -235,14 +364,17 @@ def main():
     parser.add_argument("--qwen", type=Path)
     parser.add_argument("--gemma", type=Path)
     parser.add_argument("--image", type=Path)
+    parser.add_argument("--video", type=Path)
     parser.add_argument("--golden", type=Path)
     args = parser.parse_args()
     torch.manual_seed(0)
     if args.tiny:
         tiny(args.tiny)
-    if args.qwen:
+    if args.video:
+        real_video(args.qwen or args.gemma, args.video, args.golden, args.qwen is not None)
+    elif args.qwen:
         real_qwen(args.qwen, args.image, args.golden)
-    if args.gemma:
+    elif args.gemma:
         real_gemma(args.gemma, args.image, args.golden)
 
 

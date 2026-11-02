@@ -11,7 +11,7 @@ use candle_core::Tensor;
 use std::{ops::Range, sync::Arc};
 use tur_core::execution::{EmbeddedInput, invalid};
 use tur_models::{
-    media::{Media, MediaPrompt},
+    media::{Digest, Media},
     models::TextModel,
 };
 
@@ -33,10 +33,13 @@ impl MediaSpan {
     }
 }
 
-/// Identity of soft token `index` of the input with `fingerprint`: 31 hashed bits, so an
-/// input of `n` soft tokens collides with another of the same length with probability
-/// 2^-31n, and only where their surrounding tokens also match.
-fn identity(fingerprint: u64, index: usize) -> u32 {
+/// Identity of soft token `index` of the input with `digest`: 31 hashed bits, so an input of
+/// `n` soft tokens collides with another of the same length with probability 2^-31n, and only
+/// where their surrounding tokens also match.
+fn identity(digest: &Digest, index: usize) -> u32 {
+    let mut leading = [0u8; 8];
+    leading.copy_from_slice(&digest[..8]);
+    let fingerprint = u64::from_le_bytes(leading);
     let mut hash = fingerprint ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     // SplitMix64 finalizer.
     hash = (hash ^ (hash >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -53,20 +56,6 @@ fn identity(fingerprint: u64, index: usize) -> u32 {
 /// Whether a prompt token is an input's identity rather than a vocabulary entry.
 pub(super) fn is_identity(token: u32) -> bool {
     token >= IDENTITY
-}
-
-/// Which kind of input a placeholder token stands for.
-fn placeholder_matches(
-    media: Media<'_>,
-    token: u32,
-    audio: Option<MediaPrompt>,
-    image: Option<MediaPrompt>,
-) -> bool {
-    let prompt = match media {
-        Media::Audio(_) => audio,
-        Media::Image(_) => image,
-    };
-    prompt.is_some_and(|prompt| prompt.placeholder == token)
 }
 
 /// Rotary (t, h, w) positions of prompt positions `range`, as `get_rope_index` lays them out:
@@ -134,22 +123,25 @@ impl InferencePipeline {
         if !request.encoded_media.is_empty() && request.encoded_media.len() != inputs.len() {
             return Err(invalid("encoded media does not match the request's inputs"));
         }
-        let audio = self.model.audio_prompt();
-        let image = self.model.image_prompt();
         for input in &inputs {
-            match input {
-                Media::Audio(_) if audio.is_none() => {
-                    return Err(invalid("this model accepts no audio input"));
-                }
-                Media::Image(_) if image.is_none() => {
-                    return Err(invalid("this model accepts no image input"));
-                }
-                _ => {}
+            if self.model.media_prompt(*input).is_none() {
+                return Err(invalid(match input {
+                    Media::Audio(_) => "this model accepts no audio input",
+                    Media::Image(_) => "this model accepts no image input",
+                    Media::Video(_) => "this model accepts no video input",
+                }));
             }
         }
+        let prompts = [
+            self.model.audio_prompt(),
+            self.model.image_prompt(),
+            self.model.video_prompt(),
+        ];
         let placeholder = |token: u32| {
-            audio.is_some_and(|p| p.placeholder == token)
-                || image.is_some_and(|p| p.placeholder == token)
+            prompts
+                .iter()
+                .flatten()
+                .any(|prompt| prompt.placeholder == token)
         };
         let placeholders = tokens.iter().filter(|&&t| placeholder(t)).count();
         if placeholders != inputs.len() {
@@ -173,35 +165,56 @@ impl InferencePipeline {
             let input = inputs
                 .next()
                 .ok_or_else(|| invalid("media placeholder without an input"))?;
-            if !placeholder_matches(input, token, audio, image) {
-                return Err(invalid("the chat template reordered the request's media"));
-            }
-            let prompt = match input {
-                Media::Audio(_) => audio,
-                Media::Image(_) => image,
-            }
-            .ok_or_else(|| invalid("media without an encoder"))?;
-            let layout = self.model.media_layout(input)?;
             let rows = match encoded.next() {
                 Some(rows) => rows.clone(),
                 None => self.model.encode_media(input)?,
             };
-            if rows.dim(0)? != layout.tokens {
-                return Err(TurError::Other(
-                    "media encoder returned the wrong number of rows".into(),
-                ));
+            self.expand_input(input, token, &rows, &mut expanded, &mut spans)?;
+        }
+        Ok((expanded, spans))
+    }
+
+    /// Write one input's segments in place of its placeholder `token`.
+    fn expand_input(
+        &self,
+        input: Media<'_>,
+        token: u32,
+        rows: &Tensor,
+        expanded: &mut Vec<u32>,
+        spans: &mut Vec<MediaSpan>,
+    ) -> Result<()> {
+        let prompt = self
+            .model
+            .media_prompt(input)
+            .filter(|prompt| prompt.placeholder == token)
+            .ok_or_else(|| invalid("the chat template reordered the request's media"))?;
+        let layout = self.model.media_layout(input)?;
+        if rows.dim(0)? != layout.tokens() {
+            return Err(TurError::Other(
+                "media encoder returned the wrong number of rows".into(),
+            ));
+        }
+        let digest = input.digest();
+        let mut at = 0;
+        for segment in &layout.segments {
+            if !segment.label.is_empty() {
+                let label = self
+                    .tokenizer
+                    .encode(segment.label.as_str(), false)
+                    .map_err(|error| TurError::Tokenizer(error.to_string()))?;
+                expanded.extend_from_slice(label.get_ids());
             }
-            let fingerprint = input.fingerprint();
             expanded.extend(prompt.begin);
             spans.push(MediaSpan {
                 start: expanded.len(),
-                rows,
-                grid: layout.grid,
+                rows: rows.narrow(0, at, segment.tokens)?,
+                grid: segment.grid,
             });
-            expanded.extend((0..layout.tokens).map(|index| identity(fingerprint, index)));
+            expanded.extend((at..at + segment.tokens).map(|index| identity(&digest, index)));
             expanded.extend(prompt.end);
+            at += segment.tokens;
         }
-        Ok((expanded, spans))
+        Ok(())
     }
 
     /// The model's tokens for `tokens` at prompt positions from `start`, and the embedded
@@ -291,8 +304,8 @@ mod tests {
 
     #[test]
     fn test_clip_identities_lie_above_vocabularies_and_differ_by_clip_and_position() {
-        let a: Vec<u32> = (0..64).map(|i| identity(7, i)).collect();
-        let b: Vec<u32> = (0..64).map(|i| identity(8, i)).collect();
+        let a: Vec<u32> = (0..64).map(|i| identity(&[7; 32], i)).collect();
+        let b: Vec<u32> = (0..64).map(|i| identity(&[8; 32], i)).collect();
         assert!(a.iter().chain(&b).all(|&t| is_identity(t)));
         assert!(a.iter().zip(&b).all(|(x, y)| x != y));
         let unique: std::collections::HashSet<_> = a.iter().collect();

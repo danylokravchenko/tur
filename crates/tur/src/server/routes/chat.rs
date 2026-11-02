@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{audio::Audio, image::Image};
+use crate::{audio::Audio, image::Image, video::Video};
 use crate::{
     backend::{
         chat_template::{ChatMessage, Content, ContentPart, RenderOptions, Role, ToolCall},
@@ -121,6 +121,18 @@ fn image(url: &str) -> crate::Result<ContentPart> {
     Ok(ContentPart::Image(Image::decode(&bytes)?))
 }
 
+/// A video part's file, which only a `data:` URL carries. Its frames are decoded later, once a
+/// model has chosen them.
+fn video(url: &str) -> crate::Result<ContentPart> {
+    let (media_type, bytes) = media::data_url(url)?;
+    if !media_type.starts_with("video/") {
+        return Err(crate::core::execution::invalid(
+            "video_url must hold a data: URL of a video",
+        ));
+    }
+    Ok(ContentPart::Video(Video::decode(&bytes)?))
+}
+
 /// Decode a request's content; audio and images are decoded (and audio resampled) here, so
 /// callers run this off the async executor.
 fn to_internal_content(content: &MessageContent) -> crate::Result<Content> {
@@ -158,6 +170,7 @@ fn to_internal_content(content: &MessageContent) -> crate::Result<Content> {
                 wav(&bytes)?
             }
             Part::ImageUrl { image_url } => image(&image_url.url)?,
+            Part::VideoUrl { video_url } => video(&video_url.url)?,
         });
     }
     // Text-only parts render exactly like string content.
@@ -167,7 +180,7 @@ fn to_internal_content(content: &MessageContent) -> crate::Result<Content> {
                 .into_iter()
                 .filter_map(|p| match p {
                     ContentPart::Text(text) => Some(text),
-                    ContentPart::Audio(_) | ContentPart::Image(_) => None,
+                    ContentPart::Audio(_) | ContentPart::Image(_) | ContentPart::Video(_) => None,
                 })
                 .collect(),
         ));

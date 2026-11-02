@@ -64,15 +64,14 @@ impl Audio {
         Duration::from_secs_f64(self.samples.len() as f64 / f64::from(SAMPLE_RATE))
     }
 
-    /// 64-bit FNV-1a of the samples' bits: distinct clips are told apart by content, as
-    /// prefix reuse requires, not by how they were encoded.
-    pub fn fingerprint(&self) -> u64 {
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        for sample in self.samples.iter() {
-            for byte in sample.to_bits().to_le_bytes() {
-                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
-            }
-        }
-        hash
+    /// Identifies the samples: distinct clips are told apart by content, as prefix reuse
+    /// requires, not by how they were encoded.
+    pub fn digest(&self) -> crate::media::Digest {
+        let bytes: Vec<u8> = self
+            .samples
+            .iter()
+            .flat_map(|sample| sample.to_bits().to_le_bytes())
+            .collect();
+        crate::media::digest(&[b"audio", &bytes])
     }
 }

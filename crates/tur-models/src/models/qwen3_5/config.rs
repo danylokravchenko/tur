@@ -112,6 +112,8 @@ pub(super) struct Vision {
     pub config: VisionConfig,
     /// `<|image_pad|>`: one per soft token after expansion.
     pub token: u32,
+    /// `<|video_pad|>`, with the frame every step of a video writes around its soft tokens.
+    pub video_token: Option<(u32, u32, u32)>,
 }
 
 impl Vision {
@@ -141,7 +143,23 @@ impl Vision {
             && config.head_dim().is_multiple_of(4)
             && side >= 2
             && side * side == config.num_position_embeddings)
-            .then_some(Self { config, token })
+            .then_some(Self {
+                config,
+                token,
+                video_token: [
+                    "video_token_id",
+                    "vision_start_token_id",
+                    "vision_end_token_id",
+                ]
+                .map(|key| {
+                    raw.get(key)
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|id| u32::try_from(id).ok())
+                })
+                .into_iter()
+                .collect::<Option<Vec<u32>>>()
+                .and_then(|ids| Some((*ids.first()?, *ids.get(1)?, *ids.get(2)?))),
+            })
     }
 
     /// Every tower tensor's name and shape.

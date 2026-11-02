@@ -26,7 +26,7 @@ Integration tests for every crate are linked into one binary, `crates/tur/tests/
 | `pipeline`, `scheduling`, `scheduling_metal` | Admission, stress, preemption, deadlines, budgets |
 | `prefix_reuse`, `speculation`, `prepacked` | Reuse, drafting and artifact loading through the pipeline |
 | `serving`, `server` | The worker and the HTTP API |
-| `vision` | Image preprocessing, both vision towers and the text layers reading them, image prompts, prefix isolation, text beside images in one pass and artifacts carrying a tower |
+| `vision` | Image and video preprocessing, MP4 decoding, both vision towers and the text layers reading them, media prompts, prefix isolation, reused rows, text beside images in one pass and artifacts carrying a tower |
 | `audio` | Gemma 4 audio encoder and prompts, Whisper conformance, audio prefix isolation, chat audio parts and the transcription endpoints |
 
 `common.rs` builds tiny random checkpoints for pipeline and serving tests, and `model_common.rs` holds model and engine fixtures. Add a module rather than a new test target.
@@ -90,7 +90,8 @@ The image tests need an image file and goldens from `scripts/vision_reference.py
 export TUR_IMAGE=/tmp/picture.png TUR_QWEN_IMAGE_GOLDEN=/tmp/qwen-image.safetensors TUR_GEMMA4_IMAGE_GOLDEN=/tmp/gemma-image.safetensors
 python -I scripts/vision_reference.py --qwen "$TUR_QWEN35_0_8B" --image "$TUR_IMAGE" --golden "$TUR_QWEN_IMAGE_GOLDEN"
 python -I scripts/vision_reference.py --gemma "$TUR_GEMMA4_E2B" --image "$TUR_IMAGE" --golden "$TUR_GEMMA4_IMAGE_GOLDEN"
-just test-checkpoint -E 'test(qwen_0_8b_image) or test(e2b_vision)'
+python -I scripts/vision_reference.py --qwen "$TUR_QWEN35_0_8B" --video "$TUR_VIDEO" --golden "$TUR_QWEN_VIDEO_GOLDEN"   # TUR_VIDEO: H.264 in MP4; needs PyAV
+just test-checkpoint -j1 -E 'test(qwen_0_8b_image) or test(qwen_0_8b_video) or test(e2b_vision)'   # one at a time: each loads a whole model
 ```
 
 The audio tests need a speech clip, the Whisper checkpoint and goldens from `scripts/audio_reference.py`. The Gemma test compares the Q8_0 encoder with Transformers' F32 encoder by cosine similarity (mean above 0.999, minimum above 0.99); the Whisper tests require Transformers' exact transcript in F32 and in Q8_0, and on a clip beyond 30 s its exact tokens and segment times, prompted and conditioned tokens and word times in F32, and all but 2% of its words in Q8_0:

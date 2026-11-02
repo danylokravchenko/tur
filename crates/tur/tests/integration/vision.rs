@@ -9,7 +9,9 @@ use tur_core::{
 };
 use tur_models::{
     image::Image,
+    media::Media,
     models::{Execution, LoadOptions, WeightFormat, gemma4::Gemma4, qwen3_5::Qwen35},
+    video::Video,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -62,16 +64,6 @@ fn max_absolute(a: &Tensor, b: &Tensor) -> Result<f32> {
     Ok((a - b)?.abs()?.max_all()?.to_scalar::<f32>()?)
 }
 
-/// The golden's patches keep the two frames of a still image; Tur folds them into one.
-fn first_frame(pixels: &Tensor) -> Result<Tensor> {
-    let (patches, width) = pixels.dims2()?;
-    let per_frame = width / 6;
-    Ok(pixels
-        .reshape((patches, 3, 2, per_frame))?
-        .narrow(2, 0, 1)?
-        .reshape((patches, width / 2))?)
-}
-
 /// Preprocessed pixels are exact up to F32 rounding of the normalization.
 const PIXEL_GATE: f32 = 1e-5;
 
@@ -80,7 +72,7 @@ fn qwen_conformance(device: &Device, execution: Execution) -> Result<()> {
     let model = Qwen35::load(&fixture("qwen3_5"), &options(device, execution))?;
     let picture = image("small.png")?;
     let [pixels, hidden, soft] = model.trace_image(&picture)?;
-    assert!(max_absolute(&pixels, &first_frame(tensor(&golden, "small.pixels")?)?)? <= PIXEL_GATE);
+    assert!(max_absolute(&pixels, tensor(&golden, "small.pixels")?)? <= PIXEL_GATE);
     let error = max_relative(&rows(&hidden)?, &rows(tensor(&golden, "tower")?)?);
     assert!(error < 1e-4, "tower: {error}");
     let error = max_relative(&rows(&soft)?, &rows(tensor(&golden, "soft_tokens")?)?);
@@ -134,8 +126,7 @@ fn test_downscaling_matches_the_references_antialiased_resampling() -> Result<()
         &options(&Device::Cpu, Execution::Reference),
     )?;
     let [pixels, ..] = qwen.trace_image(&picture)?;
-    let expected = first_frame(tensor(&qwen_golden, "large.pixels")?)?;
-    assert!(max_absolute(&pixels, &expected)? <= PIXEL_GATE);
+    assert!(max_absolute(&pixels, tensor(&qwen_golden, "large.pixels")?)? <= PIXEL_GATE);
     let gemma_golden = golden("gemma4")?;
     let gemma = Gemma4::load(
         &fixture("gemma4"),
@@ -585,6 +576,254 @@ fn test_artifacts_carry_the_vision_tower_packed() -> Result<()> {
     Ok(())
 }
 
+/// The fixture's frames as a video: decoding is checked apart from the model.
+fn golden_video(golden: &HashMap<String, Tensor>) -> Result<Video> {
+    let frames = tensor(golden, "video.frames")?;
+    let (count, height, width, _) = frames.dims4()?;
+    let frames = (0..count)
+        .map(|at| Ok(frames.get(at)?.flatten_all()?.to_vec1::<u8>()?))
+        .collect::<Result<Vec<_>>>()?;
+    Video::from_frames(width, height, 5.0, frames)
+}
+
+fn qwen_video_conformance(device: &Device, execution: Execution) -> Result<()> {
+    let golden = golden("qwen3_5")?;
+    let model = Qwen35::load(&fixture("qwen3_5"), &options(device, execution))?;
+    let video = golden_video(&golden)?;
+    let layout = model.video_layout(&video)?;
+    let stamps = tensor(&golden, "video.stamps")?.to_vec1::<f32>()?;
+    let labels: Vec<String> = stamps.iter().map(|s| format!("<{s:.1} seconds>")).collect();
+    assert_eq!(
+        layout
+            .segments
+            .iter()
+            .map(|s| s.label.clone())
+            .collect::<Vec<_>>(),
+        labels
+    );
+    let [pixels, hidden, soft] = model.trace_video(&video)?;
+    assert!(max_absolute(&pixels, tensor(&golden, "video.pixels")?)? <= PIXEL_GATE);
+    let error = max_relative(&rows(&hidden)?, &rows(tensor(&golden, "video.tower")?)?);
+    assert!(error < 1e-4, "tower: {error}");
+    let error = max_relative(&rows(&soft)?, &rows(tensor(&golden, "video.soft_tokens")?)?);
+    assert!(error < 1e-4, "soft tokens: {error}");
+    // Each step reads its own grid, with its label's text between them.
+    let tokens = u32s(tensor(&golden, "video.tokens")?)?;
+    let axial: Vec<[u32; 3]> = u32s(tensor(&golden, "video.rotary")?)?
+        .as_chunks::<3>()
+        .0
+        .to_vec();
+    let rows_on_device = soft.to_device(&Device::Cpu)?.to_device(device)?;
+    let per_step = layout.segments[0].tokens;
+    let mut embedded = Vec::new();
+    let mut at = 0;
+    while at < tokens.len() {
+        if tokens[at] == 95 {
+            embedded.push(EmbeddedInput {
+                tokens: at..at + per_step,
+                rows: rows_on_device.narrow(0, embedded.len() * per_step, per_step)?,
+            });
+            at += per_step;
+        } else {
+            at += 1;
+        }
+    }
+    let all: Vec<usize> = (0..tokens.len()).collect();
+    let (_, logits) = model.trace_media(&tokens, &all, &embedded, &axial)?;
+    let error = max_relative(&rows(&logits)?, &rows(tensor(&golden, "video.logits")?)?);
+    assert!(error < 1e-4, "logits: {error}");
+    Ok(())
+}
+
+#[test]
+fn test_qwen_video_reference_matches_transformers() -> Result<()> {
+    qwen_video_conformance(&Device::Cpu, Execution::Reference)
+}
+
+#[test]
+fn test_qwen_video_metal_matches_transformers() -> Result<()> {
+    qwen_video_conformance(&Device::new_metal(0)?, Execution::Fused)
+}
+
+fn gemma_video_conformance(device: &Device, execution: Execution) -> Result<()> {
+    let golden = golden("gemma4")?;
+    let model = Gemma4::load(&fixture("gemma4"), &options(device, execution))?;
+    let video = golden_video(&golden)?;
+    let layout = model.video_layout(&video)?;
+    let labels: Vec<String> = u32s(tensor(&golden, "video.indices")?)?
+        .iter()
+        .enumerate()
+        .map(|(index, &at)| {
+            let lead = if index == 0 { "" } else { " " };
+            format!("{lead}00:{:02} ", at / 5)
+        })
+        .collect();
+    assert_eq!(
+        layout
+            .segments
+            .iter()
+            .map(|s| s.label.clone())
+            .collect::<Vec<_>>(),
+        labels
+    );
+    let [pixels, soft] = model.trace_video(&video)?;
+    assert!(max_absolute(&pixels, tensor(&golden, "video.pixels")?)? <= PIXEL_GATE);
+    let error = max_relative(&rows(&soft)?, &rows(tensor(&golden, "video.soft_tokens")?)?);
+    assert!(error < 1e-4, "soft tokens: {error}");
+    let slot = model
+        .media_slot()
+        .ok_or_else(|| invalid("vision tower not loaded"))?;
+    let reference = u32s(tensor(&golden, "video.tokens")?)?;
+    let tokens: Vec<u32> = reference
+        .iter()
+        .map(|&t| if t == 93 { slot } else { t })
+        .collect();
+    let per_frame = layout.segments[0].tokens;
+    let on_device = soft.to_device(&Device::Cpu)?.to_device(device)?;
+    let embedded = (0..layout.segments.len())
+        .map(|frame| {
+            // `t2`, then for each frame its label position, the frame's opener and its rows.
+            let start = 1 + frame * (per_frame + 3) + 2;
+            Ok(EmbeddedInput {
+                tokens: start..start + per_frame,
+                rows: on_device.narrow(0, frame * per_frame, per_frame)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let all: Vec<usize> = (0..tokens.len()).collect();
+    let (_, logits) = model.trace(&tokens, &all, &embedded)?;
+    let error = max_relative(&rows(&logits)?, &rows(tensor(&golden, "video.logits")?)?);
+    assert!(error < TEXT_GATE, "logits: {error}");
+    Ok(())
+}
+
+#[test]
+fn test_gemma4_video_reference_matches_transformers() -> Result<()> {
+    gemma_video_conformance(&Device::Cpu, Execution::Reference)
+}
+
+#[test]
+fn test_gemma4_video_metal_matches_transformers() -> Result<()> {
+    gemma_video_conformance(&Device::new_metal(0)?, Execution::Fused)
+}
+
+/// H.264 is lossy, and decoders agree only up to their YUV conversion, so frames are compared
+/// with `PyAV`'s within what that conversion moves. B-frames must come back in display order.
+#[test]
+fn test_mp4_frames_decode_in_display_order_near_pyav() -> Result<()> {
+    let bytes = std::fs::read(fixture("clip.mp4"))?;
+    let video = Video::decode(&bytes)?;
+    assert_eq!(
+        (video.width(), video.height(), video.frame_count()),
+        (64, 48, 20)
+    );
+    assert!((video.fps() - 10.0).abs() < 1e-6);
+    let expected = candle_core::safetensors::load(fixture("clip.safetensors"), &Device::Cpu)?;
+    let expected = tensor(&expected, "frames")?;
+    let indices: Vec<usize> = (0..20).collect();
+    let decoded = video.frames(&indices)?;
+    for (at, frame) in decoded.iter().enumerate() {
+        let reference = expected.get(at)?.flatten_all()?.to_vec1::<u8>()?;
+        let mean = frame
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| f64::from(a.abs_diff(*b)))
+            .sum::<f64>()
+            / frame.len() as f64;
+        assert!(mean < 4.0, "frame {at}: mean difference {mean}");
+    }
+    // A subset decodes to the same frames as the whole.
+    let sampled = video.frames(&[3, 11])?;
+    assert_eq!(sampled[0], decoded[3]);
+    assert_eq!(sampled[1], decoded[11]);
+    assert!(video.frames(&[20]).is_err());
+    assert!(Video::decode(&bytes[..bytes.len() / 2]).is_err());
+    Ok(())
+}
+
+fn video_request(video: Video, max_tokens: usize) -> tur::backend::pipeline::GenerationRequest {
+    use tur::backend::chat_template::{ChatMessage, Content, ContentPart, Role};
+    let mut request = tur::backend::pipeline::GenerationRequest::new(String::new(), max_tokens);
+    request.render.add_generation_prompt = false;
+    request.messages = vec![ChatMessage {
+        content: Content::Parts(vec![
+            ContentPart::Text("t2 ".into()),
+            ContentPart::Video(video),
+            ContentPart::Text(" t9".into()),
+        ]),
+        ..ChatMessage::new(Role::User, "")
+    }];
+    request
+}
+
+#[test]
+fn test_video_prompts_label_each_step_and_reuse_their_rows() -> Result<()> {
+    use tur::{InferencePipeline, backend::pipeline::PipelineConfig};
+    let golden = golden("qwen3_5")?;
+    let checkpoint = chat_checkpoint(
+        "qwen3_5",
+        &[
+            (90, "<|image_pad|>"),
+            (92, "<|vision_start|>"),
+            (93, "<|vision_end|>"),
+            (95, "<|video_pad|>"),
+        ],
+        "<|vision_start|><|image_pad|><|vision_end|>",
+    )?;
+    // The template here renders images only; swap in one that renders videos.
+    std::fs::write(
+        checkpoint.0.join("tokenizer_config.json"),
+        serde_json::json!({ "chat_template":
+            "{% for m in messages %}{% for p in m.content %}{% if p.type == 'video' %}\
+             <|vision_start|><|video_pad|><|vision_end|>{% else %}{{ p.text }}{% endif %}\
+             {% endfor %}{% endfor %}"
+        })
+        .to_string(),
+    )?;
+    let device = Device::new_metal(0)?;
+    let mut pipeline =
+        InferencePipeline::new(&factory(&checkpoint, &device), PipelineConfig::new(1, 256))?;
+    let video = golden_video(&golden)?;
+    let stats = pipeline.run(&video_request(video.clone(), 1), |_| {})?;
+    let soft = tensor(&golden, "video.soft_tokens")?.dim(0)?;
+    // `t2`, the template's frame, two steps of a label word and a frame each, and `t9`.
+    assert!(
+        stats.prompt_tokens > soft + 2 * 2 + 3,
+        "{}",
+        stats.prompt_tokens
+    );
+    // Asked again, the model hands back the rows it holds rather than encoding again.
+    let model = pipeline
+        .media_model()
+        .ok_or_else(|| invalid("no vision encoder"))?;
+    let first = model.encode_media(Media::Video(&video))?;
+    let again = model.encode_media(Media::Video(&video))?;
+    assert_eq!(rows(&first)?, rows(&again)?);
+    assert_eq!(first.id(), again.id());
+    Ok(())
+}
+
+/// A repeat of an input takes its rows from the cache: the same tensor, not a second encoding.
+#[test]
+fn test_encoded_rows_are_reused_by_content() -> Result<()> {
+    use tur::{InferencePipeline, backend::pipeline::PipelineConfig};
+    let checkpoint = qwen_chat()?;
+    let device = Device::new_metal(0)?;
+    let pipeline =
+        InferencePipeline::new(&factory(&checkpoint, &device), PipelineConfig::new(1, 64))?;
+    let model = pipeline
+        .media_model()
+        .ok_or_else(|| invalid("no vision encoder"))?;
+    let picture = image("small.png")?;
+    let first = model.encode_media(Media::Image(&picture))?;
+    // Decoded again, from the same file: same content, same rows.
+    let same = image("small.png")?;
+    assert_eq!(first.id(), model.encode_media(Media::Image(&same))?.id());
+    let other = inverted()?;
+    assert_ne!(first.id(), model.encode_media(Media::Image(&other))?.id());
+    Ok(())
+}
+
 fn required(name: &str) -> Result<PathBuf> {
     std::env::var_os(name)
         .map(PathBuf::from)
@@ -605,7 +844,7 @@ fn test_qwen_0_8b_image_answer_matches_transformers() -> Result<()> {
     };
     let model = Qwen35::load(&dir, &f32_load)?;
     let [pixels, _, soft] = model.trace_image(&picture)?;
-    assert!(max_absolute(&pixels, &first_frame(tensor(&golden, "pixels")?)?)? <= PIXEL_GATE);
+    assert!(max_absolute(&pixels, tensor(&golden, "pixels")?)? <= PIXEL_GATE);
     let error = max_relative(&rows(&soft)?, &rows(tensor(&golden, "soft_tokens")?)?);
     assert!(error < 1e-3, "soft tokens: {error}");
     drop(model);
@@ -628,6 +867,49 @@ fn test_qwen_0_8b_image_answer_matches_transformers() -> Result<()> {
     };
     let mut pipeline = InferencePipeline::new(&factory, PipelineConfig::new(1, 512))?;
     let mut request = image_request(picture, ("", "Describe this image in one sentence."), 48);
+    request.render.add_generation_prompt = true;
+    request.render.enable_thinking = Some(false);
+    request.sampling.temperature = Some(0.0);
+    let stats = pipeline.run(&request, |_| {})?;
+    assert_eq!(stats.prompt_tokens, tensor(&golden, "tokens")?.dim(0)?);
+    assert_eq!(stats.generated_text.trim(), expected.trim());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Qwen3.5-0.8B, an H.264 MP4 and its Transformers golden"]
+fn test_qwen_0_8b_video_answer_matches_transformers() -> Result<()> {
+    use tur::{InferencePipeline, backend::pipeline::PipelineConfig};
+    let golden = candle_core::safetensors::load(required("TUR_QWEN_VIDEO_GOLDEN")?, &Device::Cpu)?;
+    let video = Video::decode(&std::fs::read(required("TUR_VIDEO")?)?)?;
+    let dir = required("TUR_QWEN35_0_8B")?;
+    let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
+        .map_err(|e| invalid(e.to_string()))?;
+    let expected = tokenizer
+        .decode(&u32s(tensor(&golden, "greedy")?)?, true)
+        .map_err(|e| invalid(e.to_string()))?;
+    let factory = tur::ModelFactory {
+        source: tur::ModelSource::LocalPath(dir),
+        revision: "qwen-video-0.8b".into(),
+        format: Some(WeightFormat::F32),
+        device: Device::new_metal(0)?,
+        kv: KvLayout::new(16, KvFormat::F32),
+        recurrent: DType::F32,
+        audio: false,
+        vision: true,
+        expert_cache: None,
+        gguf: None,
+    };
+    let mut pipeline = InferencePipeline::new(&factory, PipelineConfig::new(1, 512))?;
+    let mut request = video_request(video, 48);
+    {
+        use tur::backend::chat_template::{Content, ContentPart};
+        let Content::Parts(parts) = &mut request.messages[0].content else {
+            return Err(invalid("expected parts"));
+        };
+        parts[0] = ContentPart::Text(String::new());
+        parts[2] = ContentPart::Text("Describe this video in one sentence.".into());
+    }
     request.render.add_generation_prompt = true;
     request.render.enable_thinking = Some(false);
     request.sampling.temperature = Some(0.0);

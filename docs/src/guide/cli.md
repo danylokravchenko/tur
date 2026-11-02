@@ -133,6 +133,7 @@ Speculation needs F32 recurrent state. With `--recurrent-state f16`, Tur logs a 
 | `--tools <file>` | none | JSON array of `{name, description, parameters}` function definitions |
 | `--audio <file.wav>` | none | A clip placed before the prompt, for models with an audio encoder. Needs a prompt |
 | `--image <file>` | none | An image placed before the prompt, for models with a vision encoder: PNG, JPEG, WebP or GIF. Repeat for several. Needs a prompt |
+| `--video <file.mp4>` | none | A video placed before the prompt, for models with a vision encoder: H.264 in MP4. Repeat for several. Needs a prompt |
 
 With no prompt in a terminal, `run` opens a chat. Each turn sends the whole conversation, so prefix reuse answers follow-ups without recomputing it. `/clear` forgets the conversation, and `/bye` or Ctrl-D leaves. A turn that fails, such as one past the context limit, prints its error and leaves the conversation as it was.
 
@@ -175,6 +176,8 @@ tur transcribe --whisper openai/whisper-large-v3-turbo \
 tur run gemma 'Summarize this recording.' --audio speech.wav --thinking false
 
 tur run qwen 'What does this sign say?' --image sign.jpg
+
+tur run qwen 'What happens in this clip?' --video clip.mp4
 ```
 
 ## Quantization (`quantize`)

@@ -279,6 +279,8 @@ pub(super) struct Vision {
     /// `<|image>` and `<image|>` around an image's soft tokens.
     pub begin: u32,
     pub end: u32,
+    /// `<|video|>`, rendered once per video.
+    pub video_token: Option<u32>,
 }
 
 impl Vision {
@@ -316,6 +318,7 @@ impl Vision {
             token: token("image_token_id")?,
             begin: token("boi_token_id")?,
             end: token("eoi_token_id")?,
+            video_token: token("video_token_id"),
             config,
         })
     }

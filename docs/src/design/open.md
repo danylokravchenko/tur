@@ -14,8 +14,7 @@
 
 ## Images
 
-- Video. Both families' templates and towers define it, but it needs a decoder, frame sampling and each model's timestamps.
-- Reuse encoded rows across requests. A repeat of a request restores its prompt from prefix reuse and still encodes its image: such a repeat at 300 soft tokens took 0.37 s on the M1.
+- HEVC, which most phone video is. It needs a decoder Tur can build, and MP4 rotation metadata to go with it.
 - An E4B checkpoint run, and a real run of the larger Qwen and Gemma towers, whose 72-wide heads run on Candle's attention rather than the tiled kernel.
 
 ## Audio

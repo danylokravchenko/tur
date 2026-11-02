@@ -1,6 +1,6 @@
 # HTTP API
 
-`tur serve` exposes an OpenAI-compatible API for one chat model and, with `--whisper`, one speech-to-text model. Chat requests carry text, plus images for models with a vision encoder (Qwen3.5 and Gemma 4) and audio for models with an audio encoder (Gemma 4 E2B and E4B). Requests and responses follow OpenAI's shapes, with a few extra fields for the chat template and prefix reuse. Request bodies may be up to 64 MiB.
+`tur serve` exposes an OpenAI-compatible API for one chat model and, with `--whisper`, one speech-to-text model. Chat requests carry text, plus images and video for models with a vision encoder (Qwen3.5 and Gemma 4) and audio for models with an audio encoder (Gemma 4 E2B and E4B). Requests and responses follow OpenAI's shapes, with a few extra fields for the chat template and prefix reuse. Request bodies may be up to 64 MiB.
 
 ## `GET /v1/models`
 
@@ -73,9 +73,17 @@ Images go in OpenAI's `image_url` part, holding a `data:` URL:
 ]}
 ```
 
-Images must be PNG, JPEG, WebP or GIF, and are scaled down to 1,048,576 pixels at most. Only models with a vision encoder accept them; others answer 400. `detail` is accepted and ignored. Image positions count toward `prompt_tokens`: one per 32×32 pixels on Qwen3.5, and up to 280 on Gemma 4. See [Images](../architecture/vision.md).
+Images must be PNG, JPEG, WebP or GIF, and are scaled down to 1,048,576 pixels at most. Only models with a vision encoder accept them; others answer 400. `detail` is accepted and ignored. Image positions count toward `prompt_tokens`: one per 32×32 pixels on Qwen3.5, and up to 280 on Gemma 4. See [Images and video](../architecture/vision.md).
 
-Video parts are rejected, and so are prompts containing a placeholder token without its image or clip.
+Videos go in a `video_url` part, also holding a `data:` URL:
+
+```json
+{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,<base64 file>"}}
+```
+
+Videos must be H.264 in an MP4 file, within the 64 MiB body limit once encoded. Each sampled step adds its soft tokens and a timestamp to `prompt_tokens`: up to 2048 soft tokens on Qwen3.5, and 70 per frame for up to 32 frames on Gemma 4.
+
+Prompts containing a placeholder token without its image, video or clip are rejected.
 
 ### Response
 
@@ -246,7 +254,7 @@ Errors use OpenAI's shape:
 
 | Status | `type` / `code` | Cause |
 | --- | --- | --- |
-| 400 | `invalid_request_error` | Empty messages, unknown role, invalid sampling values, unsupported `tool_choice`, a schema, grammar or tool choice that can't be honored (a grammar failing during generation has the code `invalid_grammar`), undecodable or unsupported audio or images, or a request the engine rejects (`invalid_request`) |
+| 400 | `invalid_request_error` | Empty messages, unknown role, invalid sampling values, unsupported `tool_choice`, a schema, grammar or tool choice that can't be honored (a grammar failing during generation has the code `invalid_grammar`), undecodable or unsupported audio, images or video, or a request the engine rejects (`invalid_request`) |
 | 400 | `invalid_request_error` / `context_length_exceeded` | The prompt and `max_tokens` don't fit the context the server allows |
 | 404 | `invalid_request_error` | Unknown `model` |
 | 408 | `timeout_error` / `slow_client` | A streaming client stopped reading |

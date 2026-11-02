@@ -138,7 +138,7 @@ pub(crate) struct ModelArgs {
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     audio_encoder: Option<bool>,
     /// Load the checkpoint's vision encoder when it has one, so chat requests may carry
-    /// images (Qwen3.5 and Gemma 4). `--vision-encoder=false` saves its memory (default: true).
+    /// images and video (Qwen3.5 and Gemma 4). `--vision-encoder=false` saves its memory (default: true).
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     vision_encoder: Option<bool>,
     /// Keep routed experts on disk and read them on demand into this many MiB of device

@@ -98,7 +98,7 @@ impl Filter {
 }
 
 /// `pixels` of interleaved RGB at `from` = (height, width), resampled to `to`.
-pub(super) fn bicubic(pixels: &[u8], from: (usize, usize), to: (usize, usize)) -> Vec<u8> {
+pub(crate) fn bicubic(pixels: &[u8], from: (usize, usize), to: (usize, usize)) -> Vec<u8> {
     let (in_height, in_width) = from;
     let (out_height, out_width) = to;
     let across = Filter::new(in_width, out_width);

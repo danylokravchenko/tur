@@ -1,5 +1,6 @@
-//! Image input: the axial rotary kernel against the plain one, and with a checkpoint, what an
-//! image costs to encode at its sizes and what its encoding costs a stream beside it.
+//! Image and video input: the axial rotary kernel against the plain one, and with a checkpoint,
+//! what an input costs to encode at its sizes, what reusing its rows saves, and what its
+//! encoding costs a stream beside it.
 //!
 //! `TUR_QWEN35_0_8B=<dir>` adds the checkpoint measurements.
 use candle_core::{DType, Device, Tensor};
@@ -13,17 +14,20 @@ use tur::{
     media::Media,
     models::{TextModel, WeightFormat},
     runtime::kernels::{Heads, Kernels},
+    video::Video,
 };
 
 const REPEATS: usize = 20;
 
-/// A deterministic image with detail at every scale, so the resampler has work to do.
-fn picture(side: u32) -> Result<Image> {
+/// A deterministic image with detail at every scale, so the resampler has work to do. Each
+/// `seed` differs in content, so encoding it is real work rather than a reuse of its rows.
+fn picture(side: u32, seed: u32) -> Result<Image> {
     let mut pixels = Vec::with_capacity((side * side * 3) as usize);
     for y in 0..side {
         for x in 0..side {
             let ramp = (x * 255 / side) as u8;
-            let hiss = (x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503)) >> 24;
+            let hiss =
+                (x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503) ^ (seed << 24)) >> 24;
             pixels.extend_from_slice(&[ramp, (y * 255 / side) as u8, hiss as u8]);
         }
     }
@@ -85,9 +89,10 @@ fn rotary() -> Result<()> {
 
 fn encoding(model: &TextModel) -> Result<()> {
     for side in [256u32, 512, 1024, 3000] {
-        let image = picture(side)?;
+        let image = picture(side, 0)?;
         let mut samples = Vec::with_capacity(3);
-        for _ in 0..3 {
+        for seed in 0..3 {
+            let image = picture(side, seed)?;
             let start = Instant::now();
             model.encode_media(Media::Image(&image))?;
             samples.push(start.elapsed().as_secs_f64());
@@ -95,8 +100,52 @@ fn encoding(model: &TextModel) -> Result<()> {
         println!(
             "{}",
             json!({"op": "encode", "side": side,
-                   "soft_tokens": model.media_layout(Media::Image(&image))?.tokens,
+                   "soft_tokens": model.media_layout(Media::Image(&image))?.tokens(),
                    "seconds": median(samples)})
+        );
+    }
+    Ok(())
+}
+
+/// A video of `seconds` at 10 fps, sampled at 2 per second by Qwen.
+fn clip(side: u32, seconds: usize) -> Result<Video> {
+    let base = picture(side, 3)?;
+    let frames = (0..seconds * 10)
+        .map(|at| {
+            let mut frame = base.pixels().to_vec();
+            let shift = at * 3 * side as usize % frame.len();
+            frame.rotate_left(shift);
+            frame
+        })
+        .collect();
+    Video::from_frames(side as usize, side as usize, 10.0, frames)
+}
+
+fn video_encoding(model: &TextModel) -> Result<()> {
+    for (side, seconds) in [(320, 5), (640, 5), (640, 30)] {
+        let video = clip(side, seconds)?;
+        let layout = model.media_layout(Media::Video(&video))?;
+        let start = Instant::now();
+        model.encode_media(Media::Video(&video))?;
+        println!(
+            "{}",
+            json!({"op": "encode_video", "side": side, "seconds_of_video": seconds,
+                   "steps": layout.segments.len(), "soft_tokens": layout.tokens(),
+                   "seconds": start.elapsed().as_secs_f64()})
+        );
+    }
+    Ok(())
+}
+
+/// A repeated request's encoding: the first encodes, and the second finds its rows.
+fn reuse(model: &TextModel) -> Result<()> {
+    let image = picture(600, 4)?;
+    for attempt in ["first", "repeat"] {
+        let start = Instant::now();
+        model.encode_media(Media::Image(&image))?;
+        println!(
+            "{}",
+            json!({"op": "reuse", "attempt": attempt, "seconds": start.elapsed().as_secs_f64()})
         );
     }
     Ok(())
@@ -105,7 +154,7 @@ fn encoding(model: &TextModel) -> Result<()> {
 /// Text passes while the largest image encodes on another thread, against none encoding: the
 /// slowest pass bounds how long a stream can pause for someone else's image.
 fn contention(pipeline: &mut InferencePipeline, model: &Arc<TextModel>) -> Result<()> {
-    let image = picture(1024)?;
+    let image = picture(1024, 5)?;
     for concurrent in [false, true] {
         let mut request = GenerationRequest::new("Write a long story about a river.".into(), 400);
         request.sampling.temperature = Some(0.0);
@@ -167,5 +216,7 @@ pub(crate) fn run() -> Result<()> {
         .media_model()
         .ok_or_else(|| TurError::Other("no vision encoder".into()))?;
     encoding(&model)?;
+    video_encoding(&model)?;
+    reuse(&model)?;
     contention(&mut pipeline, &model)
 }
