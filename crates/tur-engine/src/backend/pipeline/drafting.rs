@@ -186,7 +186,7 @@ impl InferencePipeline {
         }
         let eos = &self.defaults.eos_tokens;
         let vocab = self.engine.pool().description().vocab_size;
-        // A prompt's audio positions hold clip identities above the vocabulary, which a
+        // A prompt's soft-token positions hold input identities above the vocabulary, which a
         // lookup must never propose.
         let mut proposal: Vec<u32> = pending
             .ngrams
@@ -312,16 +312,16 @@ impl InferencePipeline {
             };
             // Each chained draft is expected to add the probability of reaching it.
             rates.extend((1..=drafts).map(|depth| rate.powi(depth as i32)));
-            // The head reads the token after each position; clip positions feed it the
-            // model's slot token, as the target pass did.
-            let tokens = self.model.audio_prompt().map_or_else(
+            // The head reads the token after each position; soft-token positions feed it
+            // the model's slot token, as the target pass did.
+            let tokens = self.model.media_slot().map_or_else(
                 || tokens.to_vec(),
-                |prompt| {
+                |slot| {
                     tokens
                         .iter()
                         .map(|&t| {
-                            if super::audio::is_identity(t) {
-                                prompt.slot
+                            if super::media::is_identity(t) {
+                                slot
                             } else {
                                 t
                             }

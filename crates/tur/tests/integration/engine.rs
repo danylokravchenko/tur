@@ -64,6 +64,8 @@ fn load(dir: &Path, format: WeightFormat, device: Device) -> Result<Arc<Qwen35>>
             recurrent: candle_core::DType::F32,
             mtp: None,
             audio: false,
+            vision: false,
+            video: false,
             expert_cache: None,
         },
     )?))
@@ -113,6 +115,7 @@ impl Runner {
     fn step(&mut self, items: &[(StateHandle, Vec<u32>)]) -> Result<Vec<u32>> {
         let mut plan = PackedExecution {
             embeddings: Vec::new(),
+            axial: Vec::new(),
             tokens: Vec::new(),
             positions: Vec::new(),
             sequences: Vec::new(),
@@ -237,6 +240,7 @@ fn test_speculative_verification_reproduces_greedy_decode() -> Result<()> {
         let n = drafts.len();
         runner.engine.submit(PackedExecution {
             embeddings: Vec::new(),
+            axial: Vec::new(),
             positions: (0..n).map(|i| meta.position + i).collect(),
             tokens: drafts,
             sequences: vec![SequenceDescriptor {
@@ -271,6 +275,7 @@ fn test_vision_placeholders_fail_only_their_request() -> Result<()> {
         .allocate(0, SamplingOptions::default(), None)?;
     let plan = PackedExecution {
         embeddings: Vec::new(),
+        axial: Vec::new(),
         tokens: vec![5, 6, 95, 7],
         positions: vec![0, 1, 0, 1],
         sequences: vec![
@@ -389,6 +394,8 @@ fn real(format: WeightFormat) -> Result<Real> {
             recurrent: candle_core::DType::F32,
             mtp: None,
             audio: false,
+            vision: false,
+            video: false,
             expert_cache: None,
         },
     )?);
@@ -535,6 +542,8 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
                     model: None,
                 }),
                 audio: false,
+                vision: false,
+                video: false,
                 expert_cache: None,
             },
         )?;
@@ -554,6 +563,7 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
         let positions: Vec<usize> = (0..count).collect();
         let mut steps = model.forward(&PackedForward {
             embeddings: &[],
+            axial: &[],
             tokens: &tokens[..count],
             positions: &positions,
             sequences: &[SequenceForward {

@@ -164,6 +164,8 @@ fn gemma(device: &Device, dir: &Path, wav: &Path) -> Result<()> {
             recurrent: DType::F32,
             mtp: None,
             audio: true,
+            vision: false,
+            video: false,
             expert_cache: None,
         },
     )?;
@@ -192,6 +194,8 @@ fn gemma_contention(dir: &Path, wav: &Path) -> Result<()> {
         kv: KvLayout::new(16, KvFormat::F16),
         recurrent: DType::F32,
         audio: true,
+        vision: false,
+        video: false,
         expert_cache: None,
         gguf: None,
     };
@@ -199,7 +203,7 @@ fn gemma_contention(dir: &Path, wav: &Path) -> Result<()> {
     let clip = Audio::from_samples(&clip.samples()[..clip.samples().len().min(480_000)], 16_000)?;
     let mut pipeline = InferencePipeline::new(&factory, PipelineConfig::new(1, 256))?;
     let model = pipeline
-        .audio_model()
+        .media_model()
         .ok_or_else(|| TurError::Other("no audio encoder".into()))?;
     for concurrent in [false, true] {
         let mut request = GenerationRequest::new("Write a long story about a river.".into(), 400);
@@ -209,7 +213,7 @@ fn gemma_contention(dir: &Path, wav: &Path) -> Result<()> {
         let encoder = concurrent.then(|| {
             std::thread::spawn(move || -> Result<f64> {
                 let start = Instant::now();
-                model.encode_audio(&clip)?;
+                model.encode_media(tur::media::Media::Audio(&clip))?;
                 Ok(start.elapsed().as_secs_f64())
             })
         });

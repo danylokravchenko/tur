@@ -211,6 +211,8 @@ fn test_f32_layers_and_logits_match_transformers() -> Result<()> {
             recurrent: candle_core::DType::F32,
             mtp: None,
             audio: false,
+            vision: false,
+            video: false,
             expert_cache: None,
         },
     )?;

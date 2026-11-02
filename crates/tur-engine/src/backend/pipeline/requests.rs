@@ -56,9 +56,9 @@ pub struct GenerationRequest {
     /// Gemma run with thinking off unless `render` asks for it. Reasoning then stays free and
     /// is returned apart from the answer.
     pub structured: Option<StructuredOutput>,
-    /// Soft tokens of every clip of `messages`, in order, when they were encoded before
-    /// submission; empty encodes them at submission, on the calling thread.
-    pub encoded_audio: Vec<Tensor>,
+    /// Soft tokens of every clip and image of `messages`, in order, when they were encoded
+    /// before submission; empty encodes them at submission, on the calling thread.
+    pub encoded_media: Vec<Tensor>,
 }
 
 impl GenerationRequest {
@@ -81,17 +81,17 @@ impl GenerationRequest {
             cache_salt: None,
             grammar: None,
             structured: None,
-            encoded_audio: Vec::new(),
+            encoded_media: Vec::new(),
         }
     }
 
-    /// Whether submission would have to encode audio.
-    pub fn needs_audio_encoding(&self) -> bool {
-        self.encoded_audio.is_empty()
+    /// Whether submission would have to encode clips or images.
+    pub fn needs_media_encoding(&self) -> bool {
+        self.encoded_media.is_empty()
             && self
                 .messages
                 .iter()
-                .any(|m| m.content.audio().next().is_some())
+                .any(|m| m.content.media().next().is_some())
     }
 }
 
@@ -508,7 +508,7 @@ impl InferencePipeline {
         if tokens.is_empty() {
             return Err(invalid("chat template produced an empty prompt"));
         }
-        let (tokens, audio) = self.expand_audio(request, tokens)?;
+        let (tokens, media) = self.expand_media(request, tokens)?;
         let limit = self.plan.context_tokens;
         let max_tokens = if request.fit_context {
             request
@@ -556,11 +556,11 @@ impl InferencePipeline {
             .map(|_| self.parser_factory())
             .transpose()?;
         let handle = self.engine.allocate(request.seed, options, guidance)?;
-        // Audio positions are not tokens the repetition penalty could see repeated.
+        // Soft-token positions are not tokens the repetition penalty could see repeated.
         let text: Vec<u32> = tokens
             .iter()
             .copied()
-            .filter(|&t| !super::audio::is_identity(t))
+            .filter(|&t| !super::media::is_identity(t))
             .collect();
         self.engine.add_context(handle, &text)?;
         let keys = self.prefix.keys(request.cache_salt.as_deref(), &tokens);
@@ -571,7 +571,7 @@ impl InferencePipeline {
                 prompt_tokens: tokens.len(),
                 turn_boundary,
                 tokens,
-                audio,
+                media,
                 consumed: 0,
                 boundaries: Vec::new(),
                 replay_floor: 0,

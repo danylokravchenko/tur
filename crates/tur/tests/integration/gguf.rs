@@ -447,6 +447,8 @@ fn options(weights: Weights, device: &Device) -> LoadOptions {
         recurrent: DType::F32,
         mtp: None,
         audio: false,
+        vision: false,
+        video: false,
         expert_cache: None,
     }
 }

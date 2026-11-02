@@ -25,6 +25,8 @@ use tur_metal::{
 pub(super) struct Fused {
     kernels: Kernels,
     inv_freq: Tensor,
+    /// Beside a vision tower: text rotary at an image's grid positions.
+    axial: Option<tur_metal::kernels::AxialRotation>,
     page: usize,
     delta: DeltaShape,
 }
@@ -56,6 +58,11 @@ impl Fused {
         let page = model.description.kv.page_tokens;
         Ok(Self {
             inv_freq: kernels.rotary_frequencies(d.rotary_dim, d.theta)?,
+            axial: model
+                .axial
+                .as_ref()
+                .map(|t| kernels.axial_rotation(&t.inv_freq, &t.axis, t.run, t.runs))
+                .transpose()?,
             page,
             delta: delta_shape(&d),
             kernels,
@@ -155,8 +162,7 @@ impl Qwen35 {
 
     /// Embedded rows and their first norm.
     fn first_rows(&self, fused: &Fused, pass: &Pass<'_, '_>) -> Result<(Tensor, Tensor)> {
-        let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
-        let x = self.embedding(&ids)?;
+        let x = self.input_rows(pass)?;
         let first = self
             .layers
             .first()
@@ -305,6 +311,13 @@ impl Qwen35 {
     }
 
     fn position_tensor(&self, pass: &Pass<'_, '_>) -> Result<Tensor> {
+        if !pass.axial.is_empty() {
+            return Ok(Tensor::from_slice(
+                &pass.axial,
+                (pass.ids.len(), 3),
+                &self.device,
+            )?);
+        }
         let positions = pass
             .positions
             .iter()
@@ -358,22 +371,15 @@ impl Qwen35 {
         // q_proj rows interleave `q | gate` per head.
         let q_gate = k.linear(&a.q, h)?;
         let kv = k.linear(&a.kv, h)?;
-        let q = k.qk_norm_rope(
-            &q_gate,
-            heads(d.heads, 2 * d.head_dim, 0),
-            &a.q_norm,
-            positions,
-            &fused.inv_freq,
-            d.eps,
-        )?;
-        let key = k.qk_norm_rope(
-            &kv,
-            heads(d.kv_heads, d.head_dim, 0),
-            &a.k_norm,
-            positions,
-            &fused.inv_freq,
-            d.eps,
-        )?;
+        let rotate = |x: &Tensor, at: Heads, norm: &Tensor| match &fused.axial {
+            Some(rotation) if !pass.axial.is_empty() => {
+                k.axial_rope(x, at, Some((norm, d.eps)), positions, rotation)
+            }
+            _ if !pass.axial.is_empty() => Err(invalid("axial positions without a rotation")),
+            _ => k.qk_norm_rope(x, at, norm, positions, &fused.inv_freq, d.eps),
+        };
+        let q = rotate(&q_gate, heads(d.heads, 2 * d.head_dim, 0), &a.q_norm)?;
+        let key = rotate(&kv, heads(d.kv_heads, d.head_dim, 0), &a.k_norm)?;
         let pool = pass.pool.attention(layer)?;
         // Values are read in place from the `k | v` projection.
         k.kv_write(

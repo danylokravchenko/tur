@@ -53,6 +53,14 @@ pub(crate) struct Companion {
     pub(crate) shape: Vec<usize>,
     /// Stored packed in this precision; `None` copies the checkpoint's tensor.
     pub(crate) packed: Option<Precision>,
+    pub(crate) part: Part,
+}
+
+/// An optional encoder an artifact can carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Part {
+    Audio,
+    Vision,
 }
 
 impl Companion {
@@ -78,6 +86,9 @@ pub struct Manifest {
     /// Whether the artifact holds its model's optional audio encoder.
     #[serde(default)]
     pub audio: bool,
+    /// Whether the artifact holds its model's optional vision encoder.
+    #[serde(default)]
+    pub vision: bool,
 }
 
 /// The conversion that produced an artifact.
@@ -130,7 +141,7 @@ fn config_fingerprint(dir: &Path) -> Result<String> {
     ))
 }
 
-fn open(dir: &Path) -> Result<(Checkpoint, Manifest)> {
+pub(crate) fn open(dir: &Path) -> Result<(Checkpoint, Manifest)> {
     let (checkpoint, metadata) = Checkpoint::scan(vec![dir.join(ARTIFACT_FILE)])?;
     let json = metadata
         .first()
@@ -203,8 +214,12 @@ pub(crate) fn open_for(dir: &Path, config: &impl ArtifactLayout) -> Result<(Chec
     let (checkpoint, manifest) = open(dir)?;
     manifest.plan.validate(config)?;
     let mut expected = expected(config, &manifest.plan)?;
-    if manifest.audio {
-        for (name, companion) in config.companions(&manifest.plan)? {
+    for (name, companion) in config.companions(&manifest.plan)? {
+        let held = match companion.part {
+            Part::Audio => manifest.audio,
+            Part::Vision => manifest.vision,
+        };
+        if held {
             expected.insert(name, companion.stored()?);
         }
     }
@@ -511,7 +526,8 @@ pub(crate) fn finish(
             description: conversion.calibration.to_owned(),
         }),
         plan: plan.clone(),
-        audio: !companions.is_empty(),
+        audio: companions.values().any(|c| c.part == Part::Audio),
+        vision: companions.values().any(|c| c.part == Part::Vision),
     };
     writer.finish(&manifest, config)?;
     copying.finish();

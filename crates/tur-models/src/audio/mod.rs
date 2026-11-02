@@ -17,18 +17,6 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// window, so this bounds host memory, not model work per pass.
 pub const MAX_DURATION: Duration = Duration::from_mins(30);
 
-/// How a model frames one clip in its prompt. The chat template renders `placeholder`
-/// once per audio part; the clip then occupies `begin`, one position per soft token and
-/// `end`. Each soft-token position feeds the model `slot`, whose input embedding the
-/// encoder's row replaces.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AudioPrompt {
-    pub placeholder: u32,
-    pub begin: u32,
-    pub end: u32,
-    pub slot: u32,
-}
-
 /// One mono clip at [`SAMPLE_RATE`], shared cheaply between a request and its model.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Audio {
@@ -76,15 +64,14 @@ impl Audio {
         Duration::from_secs_f64(self.samples.len() as f64 / f64::from(SAMPLE_RATE))
     }
 
-    /// 64-bit FNV-1a of the samples' bits: distinct clips are told apart by content, as
-    /// prefix reuse requires, not by how they were encoded.
-    pub fn fingerprint(&self) -> u64 {
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        for sample in self.samples.iter() {
-            for byte in sample.to_bits().to_le_bytes() {
-                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
-            }
-        }
-        hash
+    /// Identifies the samples: distinct clips are told apart by content, as prefix reuse
+    /// requires, not by how they were encoded.
+    pub fn digest(&self) -> crate::media::Digest {
+        let bytes: Vec<u8> = self
+            .samples
+            .iter()
+            .flat_map(|sample| sample.to_bits().to_le_bytes())
+            .collect();
+        crate::media::digest(&[b"audio", &bytes])
     }
 }

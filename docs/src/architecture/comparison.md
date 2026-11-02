@@ -6,7 +6,7 @@ Pick Tur to serve several requests at once from a supported model on an Apple Si
 | --- | --- |
 | Fast batched decode and low memory use on a Mac serving Qwen3.5-family models to several clients or agents | Tur |
 | An MoE model larger than GPU memory on a Mac, with bounded memory, no SSD writes and more than one request at a time | Tur |
-| Prompt caches that survive a restart, a menu bar app, several models, or images and embeddings on a Mac | oMLX |
+| Prompt caches that survive a restart, a menu bar app, several models, or embeddings on a Mac | oMLX |
 | Fast batched decode from a GGUF file you already have, on a Qwen3.5-family or Gemma 4 model | Tur |
 | The widest choice of models and hardware, or a library that runs everywhere | llama.cpp |
 | A model running in one command, with switching handled for you | Ollama |
@@ -131,4 +131,4 @@ Offloading is the fallback in either engine. If the whole model fits, keep it re
 
 ## What Tur leaves out
 
-Tur rejects images and video, serves one chat model per process, and has no embeddings or Anthropic-style API. Qwen3.6-35B and Qwen3.8-27B run on real checkpoints, though their quality against Transformers hasn't been measured. If you need any of these today, choose oMLX or llama.cpp on a Mac. [Scope and principles](../design/scope.md) has the evidence for each model, and [Open work](../design/open.md) tracks what's next.
+Tur serves one chat model per process and has no embeddings or Anthropic-style API. It reads images and video on Qwen3.5-family models and Gemma 4 only, with images up to about one megapixel and video limited to H.264 and HEVC in MP4, and only 0.8B and E2B have run with them on real checkpoints. Qwen3.6-35B and Qwen3.8-27B run on real checkpoints, though their quality against Transformers hasn't been measured. If you need any of these today, choose oMLX or llama.cpp on a Mac. [Scope and principles](../design/scope.md) has the evidence for each model, and [Open work](../design/open.md) tracks what's next.

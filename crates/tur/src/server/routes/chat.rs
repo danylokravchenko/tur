@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::audio::Audio;
+use crate::{audio::Audio, image::Image, video::Video};
 use crate::{
     backend::{
         chat_template::{ChatMessage, Content, ContentPart, RenderOptions, Role, ToolCall},
@@ -110,9 +110,32 @@ fn wav(bytes: &[u8]) -> crate::Result<ContentPart> {
     Ok(ContentPart::Audio(Audio::from_wav(bytes)?))
 }
 
-/// Decode a request's content; audio parts are decoded and resampled here, so callers run
-/// this off the async executor.
-fn to_internal_content(content: &MessageContent) -> crate::Result<Content> {
+/// An image part's bytes, which only a `data:` URL carries: decoding happens by content.
+fn image(url: &str) -> crate::Result<ContentPart> {
+    let (media_type, bytes) = media::data_url(url)?;
+    if !media_type.starts_with("image/") {
+        return Err(crate::core::execution::invalid(
+            "image_url must hold a data: URL of an image",
+        ));
+    }
+    Ok(ContentPart::Image(Image::decode(&bytes)?))
+}
+
+/// A video part's file, which only a `data:` URL carries. Its frames are decoded later, once a
+/// model has chosen them.
+fn video(url: &str) -> crate::Result<ContentPart> {
+    let (media_type, bytes) = media::data_url(url)?;
+    if !media_type.starts_with("video/") {
+        return Err(crate::core::execution::invalid(
+            "video_url must hold a data: URL of a video",
+        ));
+    }
+    Ok(ContentPart::Video(Video::decode(&bytes)?))
+}
+
+/// Decode a request's content; audio and images are decoded (and audio resampled) here, so
+/// callers run this off the async executor.
+fn to_internal_content(content: &MessageContent, video_allowed: bool) -> crate::Result<Content> {
     let parts = match content {
         MessageContent::Text(text) => return Ok(Content::Text(text.clone())),
         MessageContent::Parts(parts) => parts,
@@ -146,6 +169,13 @@ fn to_internal_content(content: &MessageContent) -> crate::Result<Content> {
                 }
                 wav(&bytes)?
             }
+            Part::ImageUrl { image_url } => image(&image_url.url)?,
+            Part::VideoUrl { .. } if !video_allowed => {
+                return Err(crate::core::execution::invalid(
+                    "this server does not accept video input",
+                ));
+            }
+            Part::VideoUrl { video_url } => video(&video_url.url)?,
         });
     }
     // Text-only parts render exactly like string content.
@@ -155,7 +185,7 @@ fn to_internal_content(content: &MessageContent) -> crate::Result<Content> {
                 .into_iter()
                 .filter_map(|p| match p {
                     ContentPart::Text(text) => Some(text),
-                    ContentPart::Audio(_) => None,
+                    ContentPart::Audio(_) | ContentPart::Image(_) | ContentPart::Video(_) => None,
                 })
                 .collect(),
         ));
@@ -165,6 +195,7 @@ fn to_internal_content(content: &MessageContent) -> crate::Result<Content> {
 
 fn to_internal_messages(
     msgs: &[crate::server::types::ChatMessage],
+    video_allowed: bool,
 ) -> crate::Result<Vec<ChatMessage>> {
     msgs.iter()
         .map(|m| {
@@ -197,10 +228,10 @@ fn to_internal_messages(
                 .collect::<crate::Result<Vec<_>>>()?;
             Ok(ChatMessage {
                 role,
-                content: m
-                    .content
-                    .as_ref()
-                    .map_or_else(|| Ok(Content::Text(String::new())), to_internal_content)?,
+                content: m.content.as_ref().map_or_else(
+                    || Ok(Content::Text(String::new())),
+                    |content| to_internal_content(content, video_allowed),
+                )?,
                 reasoning_content: m.reasoning_content.clone(),
                 tool_calls,
             })
@@ -331,7 +362,9 @@ pub async fn chat_completions(
     };
 
     let input = std::mem::take(&mut req.messages);
-    let converted = tokio::task::spawn_blocking(move || to_internal_messages(&input)).await;
+    let video_allowed = worker.accepts_video();
+    let converted =
+        tokio::task::spawn_blocking(move || to_internal_messages(&input, video_allowed)).await;
     let messages = match converted {
         Ok(Ok(messages)) => messages,
         Ok(Err(error)) => {
@@ -423,7 +456,7 @@ pub async fn chat_completions(
             cache_salt: req.cache_salt,
             grammar: None,
             structured,
-            encoded_audio: Vec::new(),
+            encoded_media: Vec::new(),
             render: RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.thinking,

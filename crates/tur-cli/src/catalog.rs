@@ -36,7 +36,7 @@ pub(crate) const MODELS: &[Model] = &[
         repository: "google/gemma-4-E2B-it",
         revision: "3e22461f65e89153144f8adb70e3b8c2cc9845a7",
         download: "9.6 GB",
-        about: "Text and WAV audio; about 9 GB of memory",
+        about: "Text, images, video and WAV audio; about 9 GB of memory",
         expert_cache_mb: None,
         max_batch_size: None,
     },

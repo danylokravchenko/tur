@@ -11,6 +11,8 @@ use tur::{
         pipeline::{GenerationRequest, InferencePipeline},
     },
     hybrid::SamplingOptions,
+    image::Image,
+    video::Video,
 };
 
 use crate::{
@@ -42,6 +44,16 @@ pub(crate) struct Args {
     #[arg(long)]
     #[serde(skip)]
     audio: Option<PathBuf>,
+    /// Image placed before the prompt, for models with a vision encoder (Qwen3.5 and
+    /// Gemma 4): PNG, JPEG, WebP or GIF. Repeat for several.
+    #[arg(long)]
+    #[serde(skip)]
+    image: Vec<PathBuf>,
+    /// Video placed before the prompt, for models with a vision encoder (Qwen3.5 and
+    /// Gemma 4): H.264 in an MP4 file. Repeat for several.
+    #[arg(long)]
+    #[serde(skip)]
+    video: Vec<PathBuf>,
     /// Generated-token limit, including EOS. Default: 1024, or what the context leaves.
     #[arg(short = 'n', long)]
     max_tokens: Option<usize>,
@@ -108,8 +120,10 @@ impl Args {
             return Ok(Some(prompt));
         }
         if std::io::stdin().is_terminal() {
-            if self.audio.is_some() {
-                return Err(TurError::Other("--audio needs a prompt".into()));
+            if self.audio.is_some() || !self.image.is_empty() || !self.video.is_empty() {
+                return Err(TurError::Other(
+                    "--audio, --image and --video need a prompt".into(),
+                ));
             }
             return Ok(None);
         }
@@ -125,10 +139,19 @@ impl Args {
         let mut request = GenerationRequest::new(prompt.clone(), self.max_tokens.unwrap_or(1024));
         // A limit nobody chose must not fail a long conversation.
         request.fit_context = self.max_tokens.is_none();
+        let mut parts = Vec::new();
         if let Some(path) = &self.audio {
-            let clip = Audio::from_wav(&std::fs::read(path)?)?;
-            request.messages[0].content =
-                Content::Parts(vec![ContentPart::Audio(clip), ContentPart::Text(prompt)]);
+            parts.push(ContentPart::Audio(Audio::from_wav(&std::fs::read(path)?)?));
+        }
+        for path in &self.image {
+            parts.push(ContentPart::Image(Image::decode(&std::fs::read(path)?)?));
+        }
+        for path in &self.video {
+            parts.push(ContentPart::Video(Video::decode(&std::fs::read(path)?)?));
+        }
+        if !parts.is_empty() {
+            parts.push(ContentPart::Text(prompt));
+            request.messages[0].content = Content::Parts(parts);
         }
         request.seed = self.seed.unwrap_or(299_792_458);
         request.sampling = SamplingOptions {

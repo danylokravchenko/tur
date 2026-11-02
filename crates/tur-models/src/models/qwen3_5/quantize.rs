@@ -3,6 +3,7 @@
 
 use super::{Qwen35, config::Config, model::streaming::calibrate_layers};
 use crate::models::artifact::{self, Conversion, Manifest, Writer};
+use crate::models::checkpoint::{Checkpoint, weight_files};
 use crate::models::{Embedding, Method, Packer, Precision, WeightPlan};
 use candle_core::{D, Device, Tensor};
 use serde::{Deserialize, Serialize};
@@ -12,7 +13,12 @@ use tur_core::{Result, execution::invalid, progress::Stage};
 /// The source config with its MTP head when the checkpoint has one, so an artifact can
 /// serve speculative decoding too.
 pub fn artifact_config(source: &Path) -> Result<Config> {
-    let config = Config::from_json(&std::fs::read_to_string(source.join("config.json"))?)?;
+    let mut config = Config::from_json(&std::fs::read_to_string(source.join("config.json"))?)?;
+    // A checkpoint can declare a tower it doesn't ship; the artifact then holds the text alone.
+    let (files, _) = Checkpoint::scan(weight_files(source)?)?;
+    if files.entry("model.visual.pos_embed.weight").is_err() {
+        config.vision = None;
+    }
     if config.supports_mtp() {
         config.with_mtp()
     } else {
@@ -28,7 +34,7 @@ pub fn write_artifact(
     packer: &Packer<'_>,
 ) -> Result<Manifest> {
     let config = artifact_config(conversion.source)?;
-    let checkpoint = config.open_checkpoint(conversion.source)?;
+    let checkpoint = config.open_artifact_source(conversion.source)?;
     artifact::write(conversion, &config, &checkpoint, plan, packer)
 }
 
@@ -49,7 +55,7 @@ pub fn write_calibrated_artifact(
     }
     let config = artifact_config(conversion.source)?;
     plan.validate(&config)?;
-    let checkpoint = config.open_checkpoint(conversion.source)?;
+    let checkpoint = config.open_artifact_source(conversion.source)?;
     let mut writer = Writer::create(conversion.source, conversion.output)?;
     let projections = config.projections()?;
     let mut packing = Stage::begin(

@@ -2,6 +2,9 @@
 pub mod audio;
 pub mod backend;
 pub mod hybrid;
+pub mod image;
+pub mod media;
 pub mod models;
 pub mod quantization;
+pub mod video;
 pub use tur_core::{Result, TurError};

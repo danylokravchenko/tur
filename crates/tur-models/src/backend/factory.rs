@@ -50,6 +50,10 @@ pub struct ModelFactory {
     pub recurrent: candle_core::DType,
     /// Load the checkpoint's audio encoder, when it has one ([`LoadOptions::audio`]).
     pub audio: bool,
+    /// Load the checkpoint's vision encoder, when it has one ([`LoadOptions::vision`]).
+    pub vision: bool,
+    /// Accept video through the vision encoder ([`LoadOptions::video`]).
+    pub video: bool,
     /// Device bytes of a bounded expert cache ([`LoadOptions::expert_cache`]).
     pub expert_cache: Option<usize>,
     /// Load weights from this GGUF file instead; `source` then supplies only the config,
@@ -208,6 +212,9 @@ impl ModelFactory {
             mtp: draft,
             // A GGUF text file has no audio encoder; llama.cpp keeps it in a separate one.
             audio: self.audio && self.gguf.is_none(),
+            // Nor a vision tower: that lives in a separate `mmproj` file.
+            vision: self.vision && self.gguf.is_none(),
+            video: self.video,
             expert_cache: self.expert_cache,
         };
         let config = if options.mtp.is_some() {
@@ -507,6 +514,8 @@ mod tests {
             kv: crate::models::DEFAULT_KV_LAYOUT,
             recurrent: crate::models::DEFAULT_RECURRENT_STATE,
             audio: false,
+            vision: false,
+            video: false,
             expert_cache: None,
             gguf: None,
         };

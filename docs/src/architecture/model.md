@@ -1,6 +1,6 @@
 # Model and checkpoints
 
-`tur-models` implements Qwen3.5-family hybrid decoders, Gemma 4 decoders with Gemma's audio encoder, and Whisper for transcription. `ModelConfig` picks the model from checkpoint fields, and `TextModel` runs it through the shared `HybridModel` contract. Both families share the engine, state pools, memory planner, packed projections, weight loader, norms, rotary embeddings and attention kernels, so an improvement to one of those helps both.
+`tur-models` implements Qwen3.5-family hybrid decoders, Gemma 4 decoders with Gemma's audio encoder, vision encoders for both families, and Whisper for transcription. `ModelConfig` picks the model from checkpoint fields, and `TextModel` runs it through the shared `HybridModel` contract. Both families share the engine, state pools, memory planner, packed projections, weight loader, norms, rotary embeddings and attention kernels, so an improvement to one of those helps both.
 
 ## Qwen: a hybrid of recurrence and attention
 
@@ -62,7 +62,7 @@ Tur derives and checks every weight shape before reading any data, for GGUF file
 - Any end-of-sequence token named in `generation_config.json`, the config, or the tokenizer's `eos_token` ends generation.
 - The checkpoint's own Jinja chat template (`chat_template.jinja`, or the one in `tokenizer_config.json`) renders every request through MiniJinja. Thinking controls are template variables, and Tur never appends anything to the prompt. A missing or invalid template fails at load time. Tokenizer special tokens, such as Gemma's `bos_token`, are passed to the template, and Python-style `get` and string methods behave as in Transformers.
 - Function definitions go to the template. Tur parses Qwen's XML tool calls using argument types from each tool's JSON schema, and Gemma's `call:name{...}` blocks with their own typed grammar. Protocol tokens are decoded separately, so special delimiters never leak into user-visible text.
-- Image, video and vision-boundary token IDs from the config are rejected in prompts, and so are audio placeholders unless the model's audio encoder is loaded. With the encoder, each audio part must render exactly one placeholder.
+- Image, video and vision-boundary token IDs from the config are rejected in prompts, and so are audio placeholders, unless the matching encoder is loaded. With an encoder, each audio, image or video part must render exactly one placeholder.
 
 ## Weights
 
@@ -72,7 +72,7 @@ Projections are stored as F32, Q8_0 or Q4K blocks (`PackedLinear`), or in whatev
 
 - The architecture comes from checkpoint fields, never from the model's name. Mapping every "qwen3" name to one decoder would silently run the wrong maths.
 - Correctness comes from pinned external references. The 0.8B checkpoint matches Transformers 5.20.2 (CPU, F32) per layer and in final logits within 3.5e-6 relative error, against a 1e-4 gate. Whole-prompt, chunked and incremental execution agree, and so do requests joining and leaving a batch. Qwen3.8-27B is validated against its pinned config, tensor headers and template, but hasn't been run. The MoE path passes an independent small Transformers fixture.
-- Image and video inputs are rejected, not silently dropped, until their encoders and position handling exist. Audio reaches Gemma 4 E2B and E4B through their encoder (see [Audio](audio.md)).
+- Images and video reach Qwen3.5 and Gemma 4 through their vision encoders (see [Images and video](vision.md)), and audio reaches Gemma 4 E2B and E4B through theirs (see [Audio](audio.md)).
 - Recurrent accumulation stays F32. The checkpoint's state dtype is F32, and rounding error in recurrent state carries into every later token.
 - Model families share execution infrastructure. Each adapter keeps its own equations, while weight plans, packing, tokenizer metadata and state ownership have one implementation.
 - Gemma conformance and quantization quality are separate gates. Small pinned Transformers F32 fixtures cover the dense PLE and sharing, MoE and Unified equations per layer and in logits on CPU and Metal at 1e-4 relative error. The real E2B Q8_0 checkpoint passes the 95% next-token agreement floor plus greedy-prefix and termination checks. That is a short conformance check, not a held-out quality study.

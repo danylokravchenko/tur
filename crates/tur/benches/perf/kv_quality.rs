@@ -79,6 +79,8 @@ impl Runner {
                 recurrent,
                 mtp: None,
                 audio: false,
+                vision: false,
+                video: false,
                 expert_cache: None,
             },
         )?;
@@ -108,6 +110,7 @@ impl Runner {
             .model
             .forward(&PackedForward {
                 embeddings: &[],
+                axial: &[],
                 tokens: chunk,
                 positions: &positions,
                 sequences: &[SequenceForward {
@@ -140,6 +143,7 @@ impl Runner {
                 .model
                 .forward(&PackedForward {
                     embeddings: &[],
+                    axial: &[],
                     tokens: &[next],
                     positions: &[state.position()],
                     sequences: &[SequenceForward {

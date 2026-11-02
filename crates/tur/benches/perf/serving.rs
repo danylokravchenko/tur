@@ -1258,6 +1258,8 @@ pub(crate) fn run() -> Result<()> {
             .map_or(Ok(DEFAULT_RECURRENT_STATE), |s| parse_recurrent_state(&s))
             .map_err(TurError::Other)?,
         audio: false,
+        vision: false,
+        video: false,
         expert_cache: expert_cache_bytes()?,
         gguf: None,
     };

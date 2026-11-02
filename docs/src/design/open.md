@@ -12,6 +12,11 @@
 - Finish Gemma 4. Run the larger checkpoints on suitable Macs and set held-out quality budgets. Assistant chains pay only with one request decoding (see [Speculative decoding](../architecture/speculation.md#decisions)); several requests need a cheaper chained step, for example gathering candidate heads in a batch without a CPU round trip per step. Calibrated Gemma artifacts (`imatrix`, GPTQ) need layer-by-layer calibration that handles PLE and shared K/V.
 - More Macs. Most numbers come from one M1; the Qwen3.6-35B-A3B and Qwen3.8-27B sections and a short Qwen3.5-0.8B run are the only ones from an M3 Pro. Launch shapes and crossover points need per-device sweeps, and the minimum supported macOS and chip still has to be decided.
 
+## Images
+
+- Tone mapping for phones' 10-bit HDR video, and honoring a stream's colour matrix: both decoders convert as BT.601.
+- An E4B checkpoint run, and a real run of the larger Qwen and Gemma towers, whose 72-wide heads run on Candle's attention rather than the tiled kernel.
+
 ## Audio
 
 - An E4B checkpoint run.

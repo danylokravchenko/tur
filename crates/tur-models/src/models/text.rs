@@ -6,9 +6,9 @@ use super::{
     qwen3_5::{self, Qwen35},
 };
 use crate::{
-    audio::{Audio, AudioPrompt},
     backend::tools::ToolSyntax,
     hybrid::{DraftForward, HybridModel, LayerCarry, LayerStep, PackedForward, SequenceStep},
+    media::{Media, MediaLayout, MediaPrompt},
 };
 use std::path::Path;
 use tur_core::{
@@ -18,6 +18,10 @@ use tur_core::{
 
 fn no_audio() -> tur_core::TurError {
     invalid("this model has no audio encoder")
+}
+
+fn no_vision() -> tur_core::TurError {
+    invalid("this model has no vision encoder")
 }
 
 /// Validated model-specific settings selected from explicit checkpoint architecture fields.
@@ -155,25 +159,89 @@ impl TextModel {
         }
     }
     /// How a clip appears in prompts, when the model has an audio encoder loaded.
-    pub fn audio_prompt(&self) -> Option<AudioPrompt> {
+    pub fn audio_prompt(&self) -> Option<MediaPrompt> {
         match self {
             Self::Qwen35(_) | Self::GptOss(_) => None,
             Self::Gemma4(m) => m.audio_prompt(),
         }
     }
-    /// Prompt positions a clip's soft tokens occupy, between its framing tokens.
-    pub fn audio_tokens(&self, clip: &Audio) -> Result<usize> {
+    /// How an image appears in prompts, when the model has a vision encoder loaded.
+    pub fn image_prompt(&self) -> Option<MediaPrompt> {
         match self {
-            Self::Qwen35(_) | Self::GptOss(_) => Err(no_audio()),
-            Self::Gemma4(m) => m.audio_tokens(clip),
+            Self::Qwen35(m) => m.image_prompt(),
+            Self::GptOss(_) => None,
+            Self::Gemma4(m) => m.image_prompt(),
         }
     }
-    /// Encode a clip into F32 `[audio_tokens, hidden]` embedding rows on the model device.
-    pub fn encode_audio(&self, clip: &Audio) -> Result<candle_core::Tensor> {
+    /// How a video appears in prompts, when the model has a vision encoder loaded.
+    pub fn video_prompt(&self) -> Option<MediaPrompt> {
         match self {
-            Self::Qwen35(_) | Self::GptOss(_) => Err(no_audio()),
-            Self::Gemma4(m) => m.encode_audio(clip),
+            Self::Qwen35(m) => m.video_prompt(),
+            Self::GptOss(_) => None,
+            Self::Gemma4(m) => m.video_prompt(),
         }
+    }
+    /// How `media` appears in prompts, when this model's encoder for it is loaded.
+    pub fn media_prompt(&self, media: Media<'_>) -> Option<MediaPrompt> {
+        match media {
+            Media::Audio(_) => self.audio_prompt(),
+            Media::Image(_) => self.image_prompt(),
+            Media::Video(_) => self.video_prompt(),
+        }
+    }
+    /// The token a soft-token position feeds the model, under its embedded row.
+    pub fn media_slot(&self) -> Option<u32> {
+        match self {
+            Self::Qwen35(m) => m.image_prompt().map(|prompt| prompt.placeholder),
+            Self::GptOss(_) => None,
+            Self::Gemma4(m) => m.media_slot(),
+        }
+    }
+    /// The runs of soft tokens an input occupies, and what the prompt holds around each.
+    pub fn media_layout(&self, media: Media<'_>) -> Result<MediaLayout> {
+        match (self, media) {
+            (Self::Gemma4(m), Media::Audio(clip)) => {
+                Ok(MediaLayout::single(m.audio_tokens(clip)?, None))
+            }
+            (Self::Gemma4(m), Media::Image(image)) => {
+                Ok(MediaLayout::single(m.image_tokens(image)?, None))
+            }
+            (Self::Gemma4(m), Media::Video(video)) => m.video_layout(video),
+            (Self::Qwen35(m), Media::Image(image)) => m.image_layout(image),
+            (Self::Qwen35(m), Media::Video(video)) => m.video_layout(video),
+            (_, Media::Audio(_)) => Err(no_audio()),
+            (_, Media::Image(_) | Media::Video(_)) => Err(no_vision()),
+        }
+    }
+    /// F32 `[soft tokens, hidden]` embedding rows of an input on the model device, its
+    /// segments in order. Rows encoded recently are returned without encoding again.
+    pub fn encode_media(&self, media: Media<'_>) -> Result<candle_core::Tensor> {
+        let cache = match self {
+            Self::Qwen35(m) => Some(m.media_cache()),
+            Self::Gemma4(m) => Some(m.media_cache()),
+            Self::GptOss(_) => None,
+        };
+        let key = media.digest();
+        if let Some(rows) = cache.and_then(|cache| cache.get(&key)) {
+            return Ok(rows);
+        }
+        let rows = match (self, media) {
+            (Self::Gemma4(m), Media::Audio(clip)) => m.encode_audio(clip)?,
+            (Self::Gemma4(m), Media::Image(image)) => m.encode_image(image)?,
+            (Self::Gemma4(m), Media::Video(video)) => m.encode_video(video)?,
+            (Self::Qwen35(m), Media::Image(image)) => m.encode_image(image)?,
+            (Self::Qwen35(m), Media::Video(video)) => m.encode_video(video)?,
+            (_, Media::Audio(_)) => return Err(no_audio()),
+            (_, Media::Image(_) | Media::Video(_)) => return Err(no_vision()),
+        };
+        if let Some(cache) = cache {
+            cache.insert(key, &rows);
+        }
+        Ok(rows)
+    }
+    /// Whether the model reads any non-text input, so requests may need encoding.
+    pub fn has_encoders(&self) -> bool {
+        self.audio_prompt().is_some() || self.image_prompt().is_some()
     }
     fn model(&self) -> &dyn HybridModel {
         match self {

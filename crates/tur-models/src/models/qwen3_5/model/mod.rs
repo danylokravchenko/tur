@@ -14,23 +14,30 @@ use crate::hybrid::{
 };
 #[cfg(feature = "metal")]
 use crate::hybrid::{LayerCarry, LayerStep};
+use crate::image::Image;
+use crate::media::{MediaLayout, MediaPrompt, MediaSegment};
 #[cfg(feature = "metal")]
 use crate::models::gguf::stored_parts;
+use crate::models::math::AxialTable;
+use crate::models::media_cache::{MediaCache, RESERVED_BYTES};
 use crate::models::weights::{Embeddings, Tensors};
 use crate::models::{Execution, LoadOptions, Weights, artifact};
 use crate::quantization::{Calibration, Recorder};
+use crate::video::Video;
 use candle_core::{DType, Device, Tensor};
 use std::{path::Path, sync::Arc};
 use tur_core::progress::Stage;
 use tur_core::{
     Result,
-    execution::{ModelDescription, checked_elements, invalid},
+    execution::{EmbeddedInput, ModelDescription, checked_elements, invalid},
 };
 use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
 
 #[cfg(feature = "metal")]
 mod fused;
 mod moe;
+
+use super::vision;
 
 /// Every projection of a model in [`Config::projections`] order, borrowed shared or (with
 /// `mut`) mutably: one traversal serves both.
@@ -167,8 +174,7 @@ impl Layer {
         let h = math::rms(&x, &self.input_norm, dims.eps)?;
         let mixed = match &self.mixer {
             Mixer::Attention(a) => {
-                let rotary =
-                    math::rotary_tables(&pass.positions, dims.rotary_dim, dims.theta, x.device())?;
+                let rotary = pass.rotary(dims, x.device())?;
                 Qwen35::attention(dims, a, &h, &rotary, pass.pool, index, pass.spans, recorder)?
             }
             Mixer::Delta(net) => {
@@ -271,6 +277,13 @@ pub struct Qwen35 {
     norm: Tensor,
     layers: Vec<Layer>,
     mtp: Option<MtpHead>,
+    /// The vision tower, when the checkpoint has one and the load requested it.
+    vision: Option<vision::VisionTower>,
+    /// How text rotary reads an image's grid, beside a loaded tower.
+    axial: Option<AxialTable>,
+    /// Whether video is accepted through the tower.
+    video: bool,
+    media_cache: MediaCache,
     #[cfg(feature = "metal")]
     fused: Option<fused::Fused>,
     /// Bounded expert storage the layers' banks read, when this load has one.
@@ -336,6 +349,54 @@ fn draft_vocab(config: &Config, options: &LoadOptions) -> Result<Option<usize>> 
         Some(rows) if rows < config.vocab_size() => Ok(Some(rows)),
         _ => Ok(None),
     }
+}
+
+/// Storage of the vision tower's projections when this load includes it: requested,
+/// declared by the checkpoint and, for a prepacked artifact, packed into it.
+fn vision_precision(config: &Config, options: &LoadOptions) -> Option<crate::models::Precision> {
+    let text_f32 = match &options.weights {
+        Weights::Prepacked(manifest) if !manifest.vision => return None,
+        Weights::Prepacked(manifest) => manifest
+            .plan
+            .projections
+            .values()
+            .all(|&precision| precision == crate::models::Precision::F32),
+        Weights::Uniform(format) => *format == crate::models::WeightFormat::F32,
+        Weights::Plan(_) => false,
+        Weights::Gguf(_) => return None,
+    };
+    (options.vision && config.vision.is_some()).then(|| vision::precision(text_f32))
+}
+
+/// The vision tower this load includes, on its own Metal queue: an image's GPU work then
+/// interleaves with text passes instead of holding every later one behind it in first-in,
+/// first-out order.
+fn load_vision(
+    dir: &Path,
+    config: &mut Config,
+    options: &LoadOptions,
+) -> Result<Option<vision::VisionTower>> {
+    let (Some(precision), Some(settings)) =
+        (vision_precision(config, options), config.vision.clone())
+    else {
+        return Ok(None);
+    };
+    config.allow_image_frames();
+    let device = match &options.device {
+        Device::Metal(_) => Device::new_metal(0)?,
+        device => device.clone(),
+    };
+    // The text tower's checkpoint holds only its own tensors.
+    let checkpoint = match &options.weights {
+        Weights::Prepacked(_) => artifact::open(dir)?.0,
+        _ => {
+            crate::models::checkpoint::Checkpoint::scan(crate::models::checkpoint::weight_files(
+                dir,
+            )?)?
+            .0
+        }
+    };
+    vision::VisionTower::load(dir, &checkpoint, &settings, precision, &device).map(Some)
 }
 
 fn f32_on(tensor: &Tensor, device: &Device) -> Result<Tensor> {
@@ -587,15 +648,23 @@ impl Qwen35 {
         } else {
             config
         };
-        let description = config.description(
+        let tower = vision_precision(config, options);
+        let description = config.described(
             format!("{}#{}", options.revision, options.weights.tag()),
             options.kv,
             options.recurrent,
+            tower.is_some(),
         )?;
         description.validate()?;
         let plan = options.weights.plan(config)?;
         plan.validate(config)?;
         let mut weights = plan.bytes(config)?;
+        if let (Some(precision), Some(settings)) = (tower, &config.vision) {
+            weights = vision::planned_bytes(settings, precision)?
+                .checked_add(RESERVED_BYTES)
+                .and_then(|bytes| bytes.checked_add(weights))
+                .ok_or_else(|| invalid("weight total overflow"))?;
+        }
         if let Some(budget) = options.expert_cache {
             weights = cached_weights(config, &plan, weights, budget, options)?;
         }
@@ -742,8 +811,22 @@ impl Qwen35 {
         )?;
         let norm = centred(&tensors.take(&format!("{prefix}.norm.weight"))?, device)?;
         let revision = format!("{}#{}", options.revision, options.weights.tag());
+        let vision = load_vision(dir, &mut config, options)?;
+        let axial = vision
+            .as_ref()
+            .and(config.mrope_sections())
+            .map(|sections| AxialTable::interleaved(dims.rotary_dim, dims.theta, sections));
         Self {
-            description: config.description(revision, options.kv, options.recurrent)?,
+            description: config.described(
+                revision,
+                options.kv,
+                options.recurrent,
+                vision.is_some(),
+            )?,
+            vision,
+            axial,
+            video: options.video,
+            media_cache: MediaCache::default(),
             config,
             device: device.clone(),
             dims,
@@ -791,7 +874,13 @@ impl Qwen35 {
     /// convolution and gate parameters. An embedding gathered from the head adds none.
     pub fn weight_bytes(&self) -> usize {
         let bytes = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
-        let mut total = self.projection_bytes() + bytes(&self.norm) + self.embed.bytes();
+        let mut total = self.projection_bytes()
+            + bytes(&self.norm)
+            + self.embed.bytes()
+            + self
+                .vision
+                .as_ref()
+                .map_or(0, |tower| tower.bytes() + RESERVED_BYTES);
         if let Some(mtp) = &self.mtp {
             total += bytes(&mtp.embedding_norm) + bytes(&mtp.hidden_norm) + bytes(&mtp.norm);
         }
@@ -872,7 +961,20 @@ impl Qwen35 {
     /// For validation against reference implementations.
     pub fn trace(&self, tokens: &[u32], rows: &[usize]) -> Result<(Vec<Tensor>, Tensor)> {
         let mut layers = Vec::with_capacity(self.layers.len());
-        let logits = self.single(tokens, rows, Some(&mut layers), None)?;
+        let logits = self.single(tokens, rows, (&[], &[]), Some(&mut layers), None)?;
+        Ok((layers, logits))
+    }
+
+    /// As [`Self::trace`], with embedded rows and their rotary positions.
+    pub fn trace_media(
+        &self,
+        tokens: &[u32],
+        rows: &[usize],
+        embeddings: &[EmbeddedInput],
+        axial: &[[u32; 3]],
+    ) -> Result<(Vec<Tensor>, Tensor)> {
+        let mut layers = Vec::with_capacity(self.layers.len());
+        let logits = self.single(tokens, rows, (embeddings, axial), Some(&mut layers), None)?;
         Ok((layers, logits))
     }
 
@@ -881,6 +983,7 @@ impl Qwen35 {
         &self,
         tokens: &[u32],
         rows: &[usize],
+        (embeddings, axial): (&[EmbeddedInput], &[[u32; 3]]),
         trace: Option<&mut Vec<Tensor>>,
         recorder: Option<&Recorder>,
     ) -> Result<Tensor> {
@@ -904,7 +1007,8 @@ impl Qwen35 {
             hidden: false,
         }];
         let batch = PackedForward {
-            embeddings: &[],
+            embeddings,
+            axial,
             tokens,
             positions: &positions,
             sequences: &sequences,
@@ -927,7 +1031,7 @@ impl Qwen35 {
         let mut ids = Vec::new();
         let mut stage = Stage::begin("Calibrating", samples.len() as u64, "samples");
         for sample in samples {
-            self.single(sample, &[], None, Some(&recorder))?;
+            self.single(sample, &[], (&[], &[]), None, Some(&recorder))?;
             self.device.synchronize()?;
             ids.extend(sample.iter().flat_map(|t| t.to_le_bytes()));
             stage.advance(1);
@@ -996,6 +1100,18 @@ impl Qwen35 {
     }
 
     /// F32 input embeddings of `ids`.
+    /// Token embeddings of a pass's rows, with embedded inputs in place of theirs.
+    fn input_rows(&self, pass: &Pass<'_, '_>) -> Result<Tensor> {
+        let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
+        let x = self.embedding(&ids)?;
+        crate::models::math::splice_embedded(&x, pass.embeddings, |range| {
+            let span = pass.spans.iter().find(|s| {
+                s.sequence.tokens.start <= range.start && range.end <= s.sequence.tokens.end
+            })?;
+            Some(span.start + (range.start - span.sequence.tokens.start))
+        })
+    }
+
     fn embedding(&self, ids: &Tensor) -> Result<Tensor> {
         self.embed.rows(ids, &self.lm_head)
     }
@@ -1008,6 +1124,115 @@ impl Qwen35 {
     /// Validated architecture settings, EOS IDs and forbidden modality tokens.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// How an image appears in prompts, when the tower is loaded. Qwen's template writes the
+    /// frame around its one placeholder itself.
+    pub fn image_prompt(&self) -> Option<MediaPrompt> {
+        let settings = self
+            .config
+            .vision
+            .as_ref()
+            .filter(|_| self.vision.is_some())?;
+        Some(MediaPrompt {
+            placeholder: settings.token,
+            begin: None,
+            end: None,
+        })
+    }
+
+    /// Soft tokens `image` occupies in the prompt, in their grid.
+    pub fn image_layout(&self, image: &Image) -> Result<MediaLayout> {
+        let (rows, columns) = self.tower()?.grid(image)?;
+        Ok(MediaLayout::single(
+            rows * columns,
+            self.axial.as_ref().map(|_| (rows, columns)),
+        ))
+    }
+
+    /// How a video appears in prompts, when the tower is loaded. The template frames its one
+    /// placeholder, and every step of the video writes its own frame inside that one, as
+    /// Transformers' processor does.
+    pub fn video_prompt(&self) -> Option<MediaPrompt> {
+        if !self.video {
+            return None;
+        }
+        let settings = self
+            .config
+            .vision
+            .as_ref()
+            .filter(|_| self.vision.is_some())?;
+        let (placeholder, begin, end) = settings.video_token?;
+        Some(MediaPrompt {
+            placeholder,
+            begin: Some(begin),
+            end: Some(end),
+        })
+    }
+
+    /// One run of soft tokens per temporal step of `video`, labelled with its timestamp.
+    pub fn video_layout(&self, video: &Video) -> Result<MediaLayout> {
+        let (stamps, (rows, columns)) = self.tower()?.video_steps(video)?;
+        Ok(MediaLayout {
+            segments: stamps
+                .into_iter()
+                .map(|stamp| MediaSegment {
+                    label: format!("<{stamp:.1} seconds>"),
+                    tokens: rows * columns,
+                    grid: self.axial.as_ref().map(|_| (rows, columns)),
+                })
+                .collect(),
+        })
+    }
+
+    /// F32 `[soft tokens, hidden]` rows of `video`'s steps in order, as [`Self::encode_image`].
+    pub fn encode_video(&self, video: &Video) -> Result<Tensor> {
+        let tower = self.tower()?;
+        let (_, rows) = tower.forward(&tower.video_patches(video)?)?;
+        if rows.device().same_device(&self.device) {
+            return Ok(rows);
+        }
+        Ok(rows.to_device(&Device::Cpu)?.to_device(&self.device)?)
+    }
+
+    /// `video`'s patches, the tower's final states and its soft tokens, for comparing every
+    /// stage with a reference.
+    pub fn trace_video(&self, video: &Video) -> Result<[Tensor; 3]> {
+        let tower = self.tower()?;
+        let patches = tower.video_patches(video)?;
+        let (hidden, rows) = tower.forward(&patches)?;
+        Ok([patches.pixels, hidden, rows])
+    }
+
+    pub(crate) fn media_cache(&self) -> &MediaCache {
+        &self.media_cache
+    }
+
+    /// F32 `[soft tokens, hidden]` rows of `image` on the model device. The tower has its own
+    /// Metal queue, so this waits for its work and copies the rows across; call it off the
+    /// thread that runs text passes when they should keep running.
+    pub fn encode_image(&self, image: &Image) -> Result<Tensor> {
+        let tower = self.tower()?;
+        let (_, rows) = tower.forward(&tower.patches(image)?)?;
+        if rows.device().same_device(&self.device) {
+            return Ok(rows);
+        }
+        Ok(rows.to_device(&Device::Cpu)?.to_device(&self.device)?)
+    }
+
+    /// `image`'s patches, the tower's final states and its soft tokens, for comparing every
+    /// stage with a reference.
+    pub fn trace_image(&self, image: &Image) -> Result<[Tensor; 3]> {
+        let tower = self.tower()?;
+        let patches = tower.patches(image)?;
+        let (hidden, rows) = tower.forward(&patches)?;
+        Ok([patches.pixels, hidden, rows])
+    }
+
+    fn tower(&self) -> Result<&vision::VisionTower> {
+        self.vision
+            .as_ref()
+            .ok_or_else(|| invalid("this model has no vision encoder loaded"))
     }
 
     /// Reject a sequence before any work (bounds, modality placeholders, positions and
@@ -1027,12 +1252,15 @@ impl Qwen35 {
             .positions
             .get(sequence.tokens.start)
             .ok_or_else(|| invalid("sequence range outside packed positions"))?;
-        if let Some(token) = tokens
-            .iter()
-            .find(|t| self.config.forbidden_tokens().contains(t))
-        {
+        // A placeholder is only ever the slot under an embedded row.
+        let embedded = |at: usize| batch.embeddings.iter().any(|e| e.tokens.contains(&at));
+        let forbidden = tokens.iter().enumerate().find(|&(index, token)| {
+            self.config.forbidden_tokens().contains(token)
+                && !embedded(sequence.tokens.start + index)
+        });
+        if let Some((_, token)) = forbidden {
             return Err(invalid(format!(
-                "token {token} is an image/video/audio placeholder; text-only execution rejects it"
+                "token {token} is an image/video/audio placeholder with no input behind it"
             )));
         }
         if sequence.logits.iter().any(|p| !sequence.tokens.contains(p)) {
@@ -1219,7 +1447,7 @@ impl Qwen35 {
         trace: Option<&mut Vec<Tensor>>,
         recorder: Option<&Recorder>,
     ) -> Result<Vec<SequenceStep>> {
-        let pass = Self::pass(batch, spans)?;
+        let pass = self.pass(batch, spans)?;
         #[cfg(feature = "metal")]
         let (logits, hidden) = match &self.fused {
             Some(fused) if recorder.is_none() => self.run_fused(fused, &pass, trace)?,
@@ -1231,9 +1459,14 @@ impl Qwen35 {
     }
 
     /// The packed rows of live spans.
-    fn pass<'a, 'b>(batch: &'a PackedForward<'_>, spans: &'a [Span<'b>]) -> Result<Pass<'a, 'b>> {
+    fn pass<'a, 'b>(
+        &'a self,
+        batch: &'a PackedForward<'_>,
+        spans: &'a [Span<'b>],
+    ) -> Result<Pass<'a, 'b>> {
         let mut ids = Vec::new();
         let mut positions = Vec::new();
+        let mut axial = Vec::new();
         for span in spans {
             let range = span.sequence.tokens.clone();
             let (Some(tokens), Some(at)) =
@@ -1243,6 +1476,13 @@ impl Qwen35 {
             };
             ids.extend_from_slice(tokens);
             positions.extend_from_slice(at);
+            if !batch.axial.is_empty() {
+                let rows = batch
+                    .axial
+                    .get(span.sequence.tokens.clone())
+                    .ok_or_else(|| invalid("sequence range outside axial positions"))?;
+                axial.extend(rows.iter().flatten());
+            }
         }
         let mut rows = Vec::new();
         for span in spans {
@@ -1265,6 +1505,9 @@ impl Qwen35 {
             hidden: spans.iter().any(|span| span.sequence.hidden),
             spans,
             pool: batch.pool,
+            axial,
+            table: self.axial.as_ref(),
+            embeddings: batch.embeddings,
         };
         Ok(pass)
     }
@@ -1300,8 +1543,7 @@ impl Qwen35 {
         recorder: Option<&Recorder>,
     ) -> Result<(Tensor, Option<Tensor>)> {
         let d = self.dims;
-        let ids = Tensor::new(pass.ids.as_slice(), &self.device)?;
-        let mut x = self.embedding(&ids)?;
+        let mut x = self.input_rows(pass)?;
         for (index, layer) in self.layers.iter().enumerate() {
             x = layer.reference(self.dims, x, pass, index, recorder)?;
             if let Some(trace) = trace.as_mut() {
@@ -1419,6 +1661,22 @@ struct Pass<'s, 'a> {
     hidden: bool,
     spans: &'s [Span<'a>],
     pool: &'s StatePool,
+    /// Flattened (t, h, w) rotary positions of the rows; empty when they rotate at `positions`.
+    axial: Vec<u32>,
+    table: Option<&'s AxialTable>,
+    embeddings: &'s [EmbeddedInput],
+}
+
+impl Pass<'_, '_> {
+    /// Rotary tables `[rows, dim/2]` of this pass.
+    fn rotary(&self, dims: Dims, device: &Device) -> Result<(Tensor, Tensor)> {
+        if self.axial.is_empty() {
+            return math::rotary_tables(&self.positions, dims.rotary_dim, dims.theta, device);
+        }
+        self.table
+            .ok_or_else(|| invalid("axial positions without a vision encoder"))?
+            .tables(&self.axial, 3, device)
+    }
 }
 
 impl HybridModel for Qwen35 {
@@ -1464,11 +1722,14 @@ impl HybridModel for Qwen35 {
         let [sequence] = batch.sequences else {
             return Err(invalid("a paused pass runs one sequence"));
         };
-        if batch.pool.description() != &self.description || !batch.embeddings.is_empty() {
+        if batch.pool.description() != &self.description
+            || !batch.embeddings.is_empty()
+            || !batch.axial.is_empty()
+        {
             return Err(invalid("a paused pass runs text on this model's own pool"));
         }
         let spans = [self.check(batch, sequence, 0)?];
-        let pass = Self::pass(batch, &spans)?;
+        let pass = self.pass(batch, &spans)?;
         match self.fused_range(fused, &pass, carry, end)? {
             fused::LayerProgress::Paused(carry) => Ok(LayerStep::Paused(carry)),
             fused::LayerProgress::Done((logits, hidden)) => {
@@ -1486,9 +1747,6 @@ impl HybridModel for Qwen35 {
             return Err(invalid(
                 "state pool was built for another model layout or device",
             ));
-        }
-        if !batch.embeddings.is_empty() {
-            return Err(invalid("Qwen3.5 accepts text input only"));
         }
         let mut results: Vec<Option<Result<SequenceStep>>> =
             batch.sequences.iter().map(|_| None).collect();
@@ -1589,6 +1847,11 @@ impl HybridModel for Qwen35 {
                 hidden: false,
                 spans: &spans,
                 pool: batch.pool,
+                // The draft head reads its own tokens' plain positions: nothing it writes
+                // reaches an answer unverified, so only its acceptance rate could differ.
+                axial: Vec::new(),
+                table: None,
+                embeddings: &[],
             };
             let hidden = Tensor::cat(&hidden, 0)?.to_dtype(DType::F32)?;
             #[cfg(feature = "metal")]

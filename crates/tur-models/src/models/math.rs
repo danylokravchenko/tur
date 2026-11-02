@@ -51,6 +51,144 @@ pub(crate) fn rotary_tables(
     ))
 }
 
+/// `x` with each input's rows replacing its packed range; `start_of` maps that range to `x`'s
+/// rows, and rows of sequences that failed validation map to nothing and are skipped with them.
+pub(crate) fn splice_embedded(
+    x: &Tensor,
+    inputs: &[tur_core::execution::EmbeddedInput],
+    start_of: impl Fn(&std::ops::Range<usize>) -> Option<usize>,
+) -> Result<Tensor> {
+    if inputs.is_empty() {
+        return Ok(x.clone());
+    }
+    let (rows, width) = x.dims2()?;
+    let mut pieces = Vec::new();
+    let mut cursor = 0;
+    for input in inputs {
+        let Some(start) = start_of(&input.tokens) else {
+            continue;
+        };
+        if start < cursor || input.rows.dims2()? != (input.tokens.len(), width) {
+            return Err(invalid("embedded input rows do not match the model width"));
+        }
+        if start > cursor {
+            pieces.push(x.narrow(0, cursor, start - cursor)?);
+        }
+        pieces.push(input.rows.to_device(x.device())?);
+        cursor = start + input.tokens.len();
+    }
+    if pieces.is_empty() {
+        return Ok(x.clone());
+    }
+    if cursor < rows {
+        pieces.push(x.narrow(0, cursor, rows - cursor)?);
+    }
+    Ok(Tensor::cat(&pieces, 0)?)
+}
+
+/// Rotary whose frequencies each read one coordinate of a position: multimodal text
+/// positions and image patches. The leading `runs` runs of `run` columns rotate apart.
+#[derive(Clone, Debug)]
+pub(crate) struct AxialTable {
+    pub(crate) inv_freq: Vec<f32>,
+    pub(crate) axis: Vec<u32>,
+    pub(crate) run: usize,
+    pub(crate) runs: usize,
+}
+
+fn inverse_frequencies(count: usize, dim: usize, theta: f64) -> Vec<f32> {
+    (0..count)
+        .map(|i| 1.0 / (theta as f32).powf((2 * i) as f32 / dim as f32))
+        .collect()
+}
+
+impl AxialTable {
+    /// Text rotary over `dim` columns, with interleaved (t, h, w) frequencies: every third
+    /// frequency reads the same coordinate, up to each axis's `sections` share.
+    pub(crate) fn interleaved(dim: usize, theta: f64, sections: [usize; 3]) -> Self {
+        let half = dim / 2;
+        let mut axis = vec![0u32; half];
+        for (coordinate, section) in [(1u32, sections[1]), (2, sections[2])] {
+            for at in (coordinate as usize..3 * section).step_by(3) {
+                if let Some(slot) = axis.get_mut(at) {
+                    *slot = coordinate;
+                }
+            }
+        }
+        Self {
+            inv_freq: inverse_frequencies(half, dim, theta),
+            axis,
+            run: dim,
+            runs: 1,
+        }
+    }
+
+    /// Image patches: `dim / 2` columns of a head per (first, second) coordinate's frequencies,
+    /// in the reference's run layout.
+    pub(crate) fn patches(dim: usize, theta: f64, run: usize, runs: usize) -> Self {
+        let quarter = dim / 4;
+        let frequencies = inverse_frequencies(quarter, dim / 2, theta);
+        Self {
+            inv_freq: frequencies.repeat(2),
+            axis: [vec![0u32; quarter], vec![1u32; quarter]].concat(),
+            run,
+            runs,
+        }
+    }
+
+    /// `[rows, frequencies]` cosine and sine tables at `positions`, `axes` coordinates per row.
+    pub(crate) fn tables(
+        &self,
+        positions: &[u32],
+        axes: usize,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        let rows = positions.len() / axes;
+        let (mut cos, mut sin) = (
+            Vec::with_capacity(rows * self.inv_freq.len()),
+            Vec::with_capacity(rows * self.inv_freq.len()),
+        );
+        for at in positions.chunks_exact(axes) {
+            for (&f, &axis) in self.inv_freq.iter().zip(&self.axis) {
+                let angle = at[axis as usize] as f32 * f;
+                cos.push(angle.cos());
+                sin.push(angle.sin());
+            }
+        }
+        let shape = (rows, self.inv_freq.len());
+        Ok((
+            Tensor::from_vec(cos, shape, device)?,
+            Tensor::from_vec(sin, shape, device)?,
+        ))
+    }
+
+    /// Rotate `[n, heads, head_dim]` at `positions`, `axes` coordinates per row.
+    pub(crate) fn rotate(&self, x: &Tensor, positions: &[u32], axes: usize) -> Result<Tensor> {
+        let (rows, _, dim) = x.dims3()?;
+        let half = self.run / 2;
+        if positions.len() != rows * axes
+            || self.inv_freq.len() != half * self.runs
+            || self.run * self.runs > dim
+        {
+            return Err(invalid("invalid axial rotary shape"));
+        }
+        let (cos, sin) = self.tables(positions, axes, x.device())?;
+        let mut parts = Vec::with_capacity(self.runs + 1);
+        for run in 0..self.runs {
+            parts.push(rotary(
+                &x.narrow(2, run * self.run, self.run)?,
+                &cos.narrow(1, run * half, half)?,
+                &sin.narrow(1, run * half, half)?,
+            )?);
+        }
+        let rotated = self.run * self.runs;
+        if rotated < dim {
+            parts.push(x.narrow(2, rotated, dim - rotated)?);
+        }
+        Ok(Tensor::cat(&parts, 2)?)
+    }
+}
+
 /// Rotate the leading `2 * cos.dim(1)` coordinates of `[n, heads, head_dim]` using split
 /// halves; the remaining coordinates pass through.
 pub(crate) fn rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {

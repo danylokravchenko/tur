@@ -4,16 +4,21 @@
 )]
 //! Whisper's encoder and cached decoder over Candle tensor operations.
 use super::config::{Config, validate_preprocessor};
+#[cfg(feature = "metal")]
+use crate::models::encoder::WholeAttention;
 use crate::{
     audio::{WhisperClip, WhisperFeatures},
     models::{
         Precision, WeightFormat,
         checkpoint::{Checkpoint, weight_files},
-        weights::{tiled, upload_projection},
+        encoder::{Linear, Loader, Norm, attend, attend_whole, head_scale, heads, merge},
+        weights::tiled,
     },
 };
-use candle_core::{DType, Device, Tensor};
-use candle_nn::ops::{layer_norm, softmax_last_dim};
+#[cfg(feature = "metal")]
+use candle_core::DType;
+use candle_core::{Device, Tensor};
+use candle_nn::ops::softmax_last_dim;
 use std::path::Path;
 use tur_core::{Result, execution::invalid};
 use tur_metal::packed::PackedLinear;
@@ -23,13 +28,10 @@ const EPS: f32 = 1e-5;
 /// Encoder heads attended at once: bounds the `[heads, 1500, 1500]` score buffer.
 const HEAD_GROUP: usize = 4;
 
-/// Metal attention over rows that every query sees whole: the paged kernels read the
-/// projections in place, as one page of a pool that needs no copy. 10× faster than
-/// Candle's matmuls and softmax on the encoder's shape.
+/// Whole-row attention plus Whisper's choice of cross-attention storage.
 #[cfg(feature = "metal")]
 struct FusedAttention {
-    kernels: tur_metal::kernels::Kernels,
-    head_dim: usize,
+    whole: WholeAttention,
     /// Cross-attention reads 15 MB per token per layer in F32, at the memory's limit, so
     /// beside packed projections its keys and values are stored F16.
     cross: DType,
@@ -40,74 +42,17 @@ impl FusedAttention {
     /// Kernels for `device` when it is Metal and has kernels for the head width.
     fn new(config: &Config, format: WeightFormat, device: &Device) -> Result<Option<Self>> {
         let head_dim = config.d_model / config.encoder_attention_heads;
-        if !device.is_metal()
-            || !matches!(head_dim, 64 | 128 | 256)
-            || config.d_model / config.decoder_attention_heads != head_dim
-        {
+        if config.d_model / config.decoder_attention_heads != head_dim {
             return Ok(None);
         }
-        Ok(Some(Self {
-            kernels: tur_metal::kernels::Kernels::new(device)?,
-            head_dim,
+        Ok(WholeAttention::new(head_dim, device)?.map(|whole| Self {
+            whole,
             cross: if format == WeightFormat::F32 {
                 DType::F32
             } else {
                 DType::F16
             },
         }))
-    }
-
-    /// `[keys, heads · dim]` rows as a one-page pool, read in place.
-    fn pool(&self, k: &Tensor, v: &Tensor) -> Result<tur_metal::pool::AttentionPool> {
-        use tur_core::execution::KvFormat;
-        use tur_metal::pool::{AttentionPool, KvPool};
-        let (keys, width) = k.dims2()?;
-        let (heads, dim) = (width / self.head_dim, self.head_dim);
-        Ok(AttentionPool {
-            key: KvPool {
-                data: k.reshape((keys, heads, dim))?,
-                scales: None,
-            },
-            value: KvPool {
-                data: v.reshape((keys, heads, dim))?,
-                scales: None,
-            },
-            format: if k.dtype() == DType::F16 {
-                KvFormat::F16
-            } else {
-                KvFormat::F32
-            },
-            page_tokens: keys,
-            kv_heads: heads,
-            head_dim: dim,
-        })
-    }
-
-    /// `queries` tokens that each see every key of a `keys`-token pool.
-    fn whole(&self, queries: usize, keys: usize) -> Result<tur_metal::kernels::PagedKv> {
-        let visible = u32::try_from(keys).map_err(|_| invalid("too many Whisper keys"))?;
-        self.kernels
-            .paged_kv(keys, keys, &[0], &vec![0; queries], &vec![visible; queries])
-    }
-
-    /// `[queries, heads · dim]` attention of query rows over `pool`.
-    fn attend(
-        &self,
-        q: &Tensor,
-        pool: &tur_metal::pool::AttentionPool,
-        kv: &tur_metal::kernels::PagedKv,
-    ) -> Result<Tensor> {
-        let (queries, width) = q.dims2()?;
-        let dim = self.head_dim;
-        #[allow(clippy::cast_precision_loss, reason = "head widths are small")]
-        let scale = (dim as f64).powf(-0.5);
-        self.kernels.attention_ungated(
-            &q.reshape((queries, width / dim, dim))?,
-            pool,
-            kv,
-            None,
-            scale,
-        )
     }
 }
 
@@ -118,33 +63,6 @@ struct DecoderPools {
     own: Vec<tur_metal::pool::AttentionPool>,
     /// Each layer's view of the encoder states.
     cross: Vec<tur_metal::pool::AttentionPool>,
-}
-
-struct Norm {
-    weight: Tensor,
-    bias: Tensor,
-}
-
-impl Norm {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(layer_norm(x, &self.weight, &self.bias, EPS)?)
-    }
-}
-
-/// A projection and its bias, which Whisper's keys lack.
-struct Linear {
-    weight: PackedLinear,
-    bias: Option<Tensor>,
-}
-
-impl Linear {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = self.weight.forward(x)?;
-        Ok(match &self.bias {
-            Some(bias) => y.broadcast_add(bias)?,
-            None => y,
-        })
-    }
 }
 
 struct Attention {
@@ -183,42 +101,7 @@ pub struct Whisper {
     fused: Option<FusedAttention>,
 }
 
-struct Loader<'a> {
-    checkpoint: &'a Checkpoint,
-    precision: Precision,
-    device: &'a Device,
-    bytes: usize,
-}
-
 impl Loader<'_> {
-    fn dense(&mut self, name: &str) -> Result<Tensor> {
-        let tensor = self
-            .checkpoint
-            .take(name)?
-            .to_dtype(DType::F32)?
-            .to_device(self.device)?;
-        self.bytes += tensor.elem_count() * 4;
-        Ok(tensor)
-    }
-    fn projection(&mut self, name: &str) -> Result<PackedLinear> {
-        let linear = upload_projection(&self.checkpoint.take(name)?, self.precision, self.device)?;
-        self.bytes += linear.resident_bytes();
-        Ok(linear)
-    }
-    fn linear(&mut self, name: &str, bias: bool) -> Result<Linear> {
-        Ok(Linear {
-            weight: self.projection(&format!("{name}.weight"))?,
-            bias: bias
-                .then(|| self.dense(&format!("{name}.bias")))
-                .transpose()?,
-        })
-    }
-    fn norm(&mut self, name: &str) -> Result<Norm> {
-        Ok(Norm {
-            weight: self.dense(&format!("{name}.weight"))?,
-            bias: self.dense(&format!("{name}.bias"))?,
-        })
-    }
     fn attention(&mut self, name: &str, norm: &str) -> Result<Attention> {
         Ok(Attention {
             q: self.linear(&format!("{name}.q_proj"), true)?,
@@ -264,47 +147,6 @@ fn head_precision(format: WeightFormat) -> Precision {
     }
 }
 
-/// `[heads, tokens, head_dim]` view of `[tokens, heads · head_dim]` rows.
-fn heads(x: &Tensor, heads: usize) -> Result<Tensor> {
-    let (tokens, width) = x.dims2()?;
-    Ok(x.reshape((tokens, heads, width / heads))?
-        .transpose(0, 1)?
-        .contiguous()?)
-}
-
-/// Scaled dot-product attention of `[heads, q, dim]` queries over `[heads, k, dim]`
-/// keys and values, optionally causal with `past` cached keys before the queries.
-fn attend(q: &Tensor, k: &Tensor, v: &Tensor, causal: Option<usize>) -> Result<Tensor> {
-    let (_, rows, dim) = q.dims3()?;
-    #[allow(clippy::cast_precision_loss, reason = "head widths are small")]
-    let scale = (dim as f64).powf(-0.5);
-    let mut scores = (q.matmul(&k.transpose(1, 2)?.contiguous()?)? * scale)?;
-    if let Some(past) = causal {
-        let keys = k.dim(1)?;
-        let mask: Vec<f32> = (0..rows)
-            .flat_map(|r| {
-                (0..keys).map(move |c| {
-                    if c <= past + r {
-                        0.0
-                    } else {
-                        f32::NEG_INFINITY
-                    }
-                })
-            })
-            .collect();
-        scores = scores.broadcast_add(&Tensor::from_vec(mask, (rows, keys), q.device())?)?;
-    }
-    Ok(softmax_last_dim(&scores)?.matmul(v)?)
-}
-
-/// `[tokens, heads · dim]` rows of `[heads, tokens, dim]` outputs.
-fn merge(x: &Tensor) -> Result<Tensor> {
-    let (heads, tokens, dim) = x.dims3()?;
-    Ok(x.transpose(0, 1)?
-        .contiguous()?
-        .reshape((tokens, heads * dim))?)
-}
-
 impl Whisper {
     /// Load a validated checkpoint with projections in `format`; norms, biases,
     /// convolutions and positions stay F32. The token embedding doubles as the output
@@ -329,7 +171,9 @@ impl Whisper {
             checkpoint: &checkpoint,
             precision: precision(format),
             device,
+            eps: EPS,
             bytes: 0,
+            packed_cols: std::collections::BTreeMap::new(),
         };
         let conv = [
             (
@@ -477,23 +321,12 @@ impl Whisper {
     fn attend_whole(&self, q: &Tensor, k: &Tensor, v: &Tensor, count: usize) -> Result<Tensor> {
         #[cfg(feature = "metal")]
         if let Some(fused) = &self.fused {
-            let kv = fused.whole(q.dim(0)?, k.dim(0)?)?;
-            return fused.attend(q, &fused.pool(k, v)?, &kv);
+            let kv = fused.whole.whole(q.dim(0)?, k.dim(0)?)?;
+            let scale = head_scale(fused.whole.head_dim);
+            return fused.whole.attend(q, &fused.whole.pool(k, v)?, &kv, scale);
         }
-        let (q, k, v) = (heads(q, count)?, heads(k, count)?, heads(v, count)?);
-        let groups = (0..count)
-            .step_by(HEAD_GROUP)
-            .map(|start| {
-                let n = HEAD_GROUP.min(count - start);
-                attend(
-                    &q.narrow(0, start, n)?,
-                    &k.narrow(0, start, n)?,
-                    &v.narrow(0, start, n)?,
-                    None,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        merge(&Tensor::cat(&groups, 0)?)
+        let scale = head_scale(q.dim(1)? / count);
+        attend_whole((q, k, v), count, HEAD_GROUP, scale)
     }
 
     fn feed_forward(layer: &Layer, x: &Tensor) -> Result<Tensor> {
@@ -541,11 +374,15 @@ impl Whisper {
         let empty = || Tensor::zeros((positions, width), DType::F32, &self.device);
         Ok(Some(DecoderPools {
             own: (0..self.decoder.len())
-                .map(|_| fused.pool(&empty()?, &empty()?))
+                .map(|_| fused.whole.pool(&empty()?, &empty()?))
                 .collect::<Result<_>>()?,
             cross: cross
                 .iter()
-                .map(|(k, v)| fused.pool(&k.to_dtype(fused.cross)?, &v.to_dtype(fused.cross)?))
+                .map(|(k, v)| {
+                    fused
+                        .whole
+                        .pool(&k.to_dtype(fused.cross)?, &v.to_dtype(fused.cross)?)
+                })
                 .collect::<Result<_>>()?,
         }))
     }
@@ -640,7 +477,7 @@ impl Decoder<'_> {
                 k = Tensor::cat(&[past_k, &k], 1)?;
                 v = Tensor::cat(&[past_v, &v], 1)?;
             }
-            let attended = attend(&q, &k, &v, Some(self.position))?;
+            let attended = attend(&q, &k, &v, Some(self.position), head_scale(q.dim(2)?))?;
             self.cache[i] = Some((k, v));
             x = (x + a.out.forward(&merge(&attended)?)?)?;
             let cross = layer
@@ -673,7 +510,8 @@ impl Decoder<'_> {
             return Err(invalid("fused decoder step without kernels"));
         };
         let count = model.config.decoder_attention_heads;
-        let dim = fused.head_dim;
+        let dim = fused.whole.head_dim;
+        let scale = head_scale(dim);
         let at = Heads {
             count,
             dim,
@@ -686,24 +524,30 @@ impl Decoder<'_> {
             .collect::<Result<Vec<_>>>()?;
         let own_kv =
             fused
+                .whole
                 .kernels
                 .paged_kv(positions, positions, &[0], &vec![0; tokens], &visible)?;
-        let cross_kv = fused.whole(tokens, model.config.max_source_positions)?;
+        let cross_kv = fused
+            .whole
+            .whole(tokens, model.config.max_source_positions)?;
         let mut alignment = Vec::new();
         for (i, layer) in model.decoder.iter().enumerate() {
             let a = &layer.attention;
             let h = a.norm.forward(&x)?;
             let (q, k, v) = (a.q.forward(&h)?, a.k.forward(&h)?, a.v.forward(&h)?);
             fused
+                .whole
                 .kernels
                 .kv_write(&k, at, &v, at, &pools.own[i], &own_kv)?;
-            x = (x + a.out.forward(&fused.attend(&q, &pools.own[i], &own_kv)?)?)?;
+            x = (x + a
+                .out
+                .forward(&fused.whole.attend(&q, &pools.own[i], &own_kv, scale)?)?)?;
             let cross = layer
                 .cross
                 .as_ref()
                 .ok_or_else(|| invalid("decoder layer without cross-attention"))?;
             let q = cross.q.forward(&cross.norm.forward(&x)?)?;
-            let attended = fused.attend(&q, &pools.cross[i], &cross_kv)?;
+            let attended = fused.whole.attend(&q, &pools.cross[i], &cross_kv, scale)?;
             if !self.alignment.is_empty() {
                 alignment.push((i, q));
             }
@@ -741,8 +585,8 @@ mod tests {
         let device = Device::new_metal(0)?;
         let (heads, dim) = (4, 64);
         let fused = FusedAttention {
-            kernels: tur_metal::kernels::Kernels::new(&device)?,
-            head_dim: dim,
+            whole: WholeAttention::new(dim, &device)?
+                .ok_or_else(|| invalid("no kernels for the head width"))?,
             cross: DType::F32,
         };
         for (queries, keys) in [(1500, 1500), (3, 1500), (1, 40)] {
@@ -754,9 +598,13 @@ mod tests {
                 &self::heads(&k, heads)?,
                 &self::heads(&v, heads)?,
                 None,
+                head_scale(dim),
             )?)?;
-            let kv = fused.whole(queries, keys)?;
-            let actual = fused.attend(&q, &fused.pool(&k, &v)?, &kv)?;
+            let kv = fused.whole.whole(queries, keys)?;
+            let actual =
+                fused
+                    .whole
+                    .attend(&q, &fused.whole.pool(&k, &v)?, &kv, head_scale(dim))?;
             assert_eq!(actual.dims(), reference.dims());
             let error = (actual - &reference)?
                 .abs()?

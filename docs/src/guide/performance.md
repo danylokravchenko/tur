@@ -325,6 +325,28 @@ The encoder always reads a full 30-second window, so a short clip costs almost a
 
 One encoder layer spends about 13 ms on attention and about 40 ms on projections, which run on Candle's GEMM at 1.2 to 1.6 TFLOP/s. A decoder step is mostly the output head and cross-attention, both limited by how fast the GPU can read memory, so Tur reads fewer bytes there: a Q4K head and F16 cross-attention keys and values. Word timestamps added about 1.7 s to the 80 s clip through the CLI.
 
+## Images and video
+
+Qwen3.5-0.8B with Q8_0 weights, encoding on the tower's own queue, while a 400-token greedy request decodes (`just bench vision` with `TUR_QWEN35_0_8B`):
+
+| Case | Result |
+| --- | --- |
+| Encoding 256×256, 64 soft tokens | 0.05 s |
+| Encoding 512×512, 256 soft tokens | 0.24 s |
+| Encoding 1024×1024, 1024 soft tokens | 1.56 s |
+| Encoding 3000×3000, scaled to 1024 soft tokens | 1.59 s |
+| Encoding 1024×1024 beside a decoding request | 2.23 s |
+| Encoding a 5 s 320×320 clip, 500 soft tokens | 0.47 s |
+| Encoding a 5 s 640×640 clip, 2000 soft tokens | 2.35 s |
+| Encoding a 30 s 640×640 clip, 1920 soft tokens | 1.95 s |
+| Decoding 1080p H.264, one thread | 98 frames/s |
+| Decoding 1080p HEVC, one thread | 88 frames/s (78 at 10-bit) |
+| Repeating an encoded input, rows reused | under 10 µs |
+| Text pass, alone: median, slowest | 17.6 ms, 86 ms |
+| Text pass beside that image: median, slowest | 18.4 ms, 80 ms |
+
+Gemma 4 E2B encodes a 640×480 image, 266 soft tokens from about 2400 patches, in 1.64 s.
+
 ## Gemma 4 audio
 
 E2B with Q8_0 weights encoding clips on their own queue, while a 400-token greedy request decodes (`just bench whisper` with `TUR_GEMMA4_E2B`):

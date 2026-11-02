@@ -9,15 +9,19 @@ pub enum MessageContent {
     Parts(Vec<ContentPart>),
 }
 
-/// A typed content part: text, or audio as `OpenAI`'s `input_audio` (base64 data) or a
-/// `data:` URL in the `audio_url` form other servers accept. Other part types fail to
-/// deserialize, so the request is rejected rather than silently stripped.
+/// A typed content part: text; audio as `OpenAI`'s `input_audio` (base64 data) or a
+/// `data:` URL in the `audio_url` form other servers accept; or an image as `OpenAI`'s
+/// `image_url` holding a `data:` URL, or a video in the `video_url` form other servers accept.
+/// Other part types fail to deserialize, so the request
+/// is rejected rather than silently stripped.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     Text { text: String },
     InputAudio { input_audio: InputAudio },
     AudioUrl { audio_url: MediaUrl },
+    ImageUrl { image_url: MediaUrl },
+    VideoUrl { video_url: MediaUrl },
 }
 
 #[derive(Debug, Deserialize)]

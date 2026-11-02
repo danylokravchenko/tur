@@ -1,7 +1,8 @@
 //! Validated text configuration for dense and expert Qwen3.5 architectures (3.8/3.6).
 
+use crate::models::artifact::Companion;
 use crate::models::generation::{GenerationDefaults, parse_tokens};
-use crate::models::weights::{Projection, WeightLayout};
+use crate::models::weights::{Projection, WeightLayout, WeightPlan};
 use crate::models::{checkpoint::Adjust, gguf::GgufTensor};
 use candle_core::DType;
 use serde::Deserialize;
@@ -76,8 +77,142 @@ pub(super) struct TextConfig {
     pub mamba_ssm_dtype: Option<String>,
 }
 
+/// The vision tower of Qwen3.5 checkpoints; `Qwen3_5VisionModel` in Transformers.
+#[derive(Clone, Debug, Deserialize)]
+pub(super) struct VisionConfig {
+    pub depth: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_heads: usize,
+    pub in_channels: usize,
+    pub patch_size: usize,
+    pub spatial_merge_size: usize,
+    pub temporal_patch_size: usize,
+    pub out_hidden_size: usize,
+    pub num_position_embeddings: usize,
+    pub hidden_act: String,
+    #[serde(default)]
+    pub deepstack_visual_indexes: Vec<usize>,
+}
+
+impl VisionConfig {
+    pub(super) fn head_dim(&self) -> usize {
+        self.hidden_size / self.num_heads
+    }
+
+    /// Side of the square table of learned positions.
+    pub(super) fn position_side(&self) -> usize {
+        self.num_position_embeddings.isqrt()
+    }
+}
+
+/// The vision tower's settings and the prompt token its soft tokens replace.
+#[derive(Clone, Debug)]
+pub(super) struct Vision {
+    pub config: VisionConfig,
+    /// `<|image_pad|>`: one per soft token after expansion.
+    pub token: u32,
+    /// `<|video_pad|>`, with the frame every step of a video writes around its soft tokens.
+    pub video_token: Option<(u32, u32, u32)>,
+}
+
+impl Vision {
+    /// The tower a checkpoint declares, when it is one this implementation runs. Anything else
+    /// leaves the model text-only, which is all that those settings ever promised.
+    fn parse(raw: &serde_json::Value, text_hidden: usize) -> Option<Self> {
+        let config: VisionConfig =
+            serde_json::from_value(raw.get("vision_config")?.clone()).ok()?;
+        let token = u32::try_from(raw.get("image_token_id")?.as_u64()?).ok()?;
+        let dims = [
+            config.depth,
+            config.hidden_size,
+            config.intermediate_size,
+            config.num_heads,
+            config.patch_size,
+            config.spatial_merge_size,
+            config.out_hidden_size,
+        ];
+        let side = config.position_side();
+        (!dims.contains(&0)
+            && config.in_channels == 3
+            && config.temporal_patch_size == 2
+            && config.deepstack_visual_indexes.is_empty()
+            && config.hidden_act == "gelu_pytorch_tanh"
+            && config.out_hidden_size == text_hidden
+            && config.hidden_size.is_multiple_of(config.num_heads)
+            && config.head_dim().is_multiple_of(4)
+            && side >= 2
+            && side * side == config.num_position_embeddings)
+            .then_some(Self {
+                config,
+                token,
+                video_token: [
+                    "video_token_id",
+                    "vision_start_token_id",
+                    "vision_end_token_id",
+                ]
+                .map(|key| {
+                    raw.get(key)
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|id| u32::try_from(id).ok())
+                })
+                .into_iter()
+                .collect::<Option<Vec<u32>>>()
+                .and_then(|ids| Some((*ids.first()?, *ids.get(1)?, *ids.get(2)?))),
+            })
+    }
+
+    /// Every tower tensor's name and shape.
+    pub(super) fn weight_shapes(&self) -> BTreeMap<String, Vec<usize>> {
+        let c = &self.config;
+        let (hidden, units) = (c.hidden_size, c.spatial_merge_size * c.spatial_merge_size);
+        let merged = hidden * units;
+        let mut shapes = BTreeMap::new();
+        let mut linear = |name: String, rows: usize, cols: usize| {
+            shapes.insert(format!("{name}.weight"), vec![rows, cols]);
+            shapes.insert(format!("{name}.bias"), vec![rows]);
+        };
+        for i in 0..c.depth {
+            let p = format!("model.visual.blocks.{i}");
+            linear(format!("{p}.attn.qkv"), 3 * hidden, hidden);
+            linear(format!("{p}.attn.proj"), hidden, hidden);
+            linear(format!("{p}.mlp.linear_fc1"), c.intermediate_size, hidden);
+            linear(format!("{p}.mlp.linear_fc2"), hidden, c.intermediate_size);
+        }
+        linear("model.visual.merger.linear_fc1".into(), merged, merged);
+        linear(
+            "model.visual.merger.linear_fc2".into(),
+            c.out_hidden_size,
+            merged,
+        );
+        for name in (0..c.depth)
+            .flat_map(|i| ["norm1", "norm2"].map(|n| format!("model.visual.blocks.{i}.{n}")))
+            .chain(["model.visual.merger.norm".to_owned()])
+        {
+            shapes.insert(format!("{name}.weight"), vec![hidden]);
+            shapes.insert(format!("{name}.bias"), vec![hidden]);
+        }
+        shapes.insert(
+            "model.visual.patch_embed.proj.weight".into(),
+            vec![
+                hidden,
+                c.in_channels,
+                c.temporal_patch_size,
+                c.patch_size,
+                c.patch_size,
+            ],
+        );
+        shapes.insert("model.visual.patch_embed.proj.bias".into(), vec![hidden]);
+        shapes.insert(
+            "model.visual.pos_embed.weight".into(),
+            vec![c.num_position_embeddings, hidden],
+        );
+        shapes
+    }
+}
+
 /// Architecture-specific settings. Construction validates the complete text layout.
-/// Vision and MTP tensors may exist in the checkpoint but are never executed.
+/// MTP tensors may exist in the checkpoint but only execute when requested.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub(super) text: TextConfig,
@@ -87,6 +222,10 @@ pub struct Config {
     pub(super) prefix: String,
     forbidden_tokens: Vec<u32>,
     eos: Vec<u32>,
+    /// The vision tower, when the checkpoint declares one this implementation runs.
+    pub(super) vision: Option<Vision>,
+    /// Starts of a loaded tower's images, which then are ordinary prompt tokens.
+    vision_frame: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -178,7 +317,15 @@ impl Config {
         validate_rope(&text)?;
         let eos = parse_tokens(&text.eos_token_id, text.vocab_size)?;
         let forbidden_tokens = modality_tokens(&raw)?;
+        let vision_frame = ["vision_start_token_id", "vision_end_token_id"]
+            .iter()
+            .filter_map(|key| raw.get(*key)?.as_u64())
+            .filter_map(|id| u32::try_from(id).ok())
+            .collect();
+        let vision = Vision::parse(&raw, text.hidden_size);
         let config = Self {
+            vision,
+            vision_frame,
             text,
             moe,
             mtp: false,
@@ -196,6 +343,23 @@ impl Config {
         // Validate every weight product before any file payload is read.
         config.weight_shapes()?;
         Ok(config)
+    }
+
+    /// The checkpoint with the tensors an artifact keeps beside the text tower.
+    pub(crate) fn open_artifact_source(
+        &self,
+        dir: &std::path::Path,
+    ) -> Result<crate::models::checkpoint::Checkpoint> {
+        let mut expected = self.weight_shapes()?;
+        if let Some(vision) = &self.vision {
+            expected.extend(vision.weight_shapes());
+        }
+        crate::models::checkpoint::Checkpoint::open_shapes(
+            dir,
+            &expected,
+            self.text_prefix(),
+            self.tied_embeddings(),
+        )
     }
 
     pub(crate) fn open_checkpoint(
@@ -233,6 +397,24 @@ impl Config {
     /// Image/video/audio placeholder tokens that text-only execution must reject.
     pub fn forbidden_tokens(&self) -> &[u32] {
         &self.forbidden_tokens
+    }
+
+    /// A loaded tower allows the framing tokens its images need in a prompt. The image token
+    /// stays forbidden outside embedded rows.
+    pub(super) fn allow_image_frames(&mut self) {
+        let frame = std::mem::take(&mut self.vision_frame);
+        self.forbidden_tokens.retain(|id| !frame.contains(id));
+    }
+
+    /// Rotary sections of the (t, h, w) coordinates, when the checkpoint declares them.
+    pub(super) fn mrope_sections(&self) -> Option<[usize; 3]> {
+        let section = &self.text.rope_parameters.mrope_section;
+        Some([*section.first()?, *section.get(1)?, *section.get(2)?])
+    }
+
+    /// Whether the checkpoint declares a vision tower this implementation runs.
+    pub fn has_vision(&self) -> bool {
+        self.vision.is_some()
     }
 
     /// Add placeholders the tokenizer declares in `extra_special_tokens` (for example audio
@@ -320,6 +502,17 @@ impl Config {
         kv: KvLayout,
         recurrent: DType,
     ) -> Result<ModelDescription> {
+        self.described(revision, kv, recurrent, false)
+    }
+
+    /// The model's state and limits; `vision` declares that the tower is loaded.
+    pub(super) fn described(
+        &self,
+        revision: String,
+        kv: KvLayout,
+        recurrent: DType,
+        vision: bool,
+    ) -> Result<ModelDescription> {
         let t = &self.text;
         let layers = t
             .layer_types
@@ -362,7 +555,11 @@ impl Config {
             },
             layers,
             kv,
-            modalities: vec![Modality::Text],
+            modalities: if vision {
+                vec![Modality::Text, Modality::Image]
+            } else {
+                vec![Modality::Text]
+            },
             vocab_size: t.vocab_size,
             max_position: t.max_position_embeddings,
         })
@@ -985,6 +1182,15 @@ impl crate::models::artifact::ArtifactLayout for Config {
     }
     fn unloaded(&self, name: &str) -> bool {
         name.starts_with("mtp.") && !self.mtp()
+    }
+    fn companions(&self, plan: &WeightPlan) -> Result<BTreeMap<String, Companion>> {
+        Ok(self.vision.as_ref().map_or_else(BTreeMap::new, |vision| {
+            let f32_text = plan
+                .projections
+                .values()
+                .all(|&precision| precision == crate::models::Precision::F32);
+            super::vision::stored_tensors(vision, super::vision::precision(f32_text))
+        }))
     }
 }
 

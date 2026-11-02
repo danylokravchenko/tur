@@ -1,9 +1,13 @@
 //! Gemma 4 equations over the common packed weights and persistent state pools.
 use super::config::Audio as AudioSettings;
 use super::{Config, config::LayerKind};
-use crate::audio::{Audio, AudioPrompt};
+use crate::audio::Audio;
+use crate::image::Image;
+use crate::media::{MediaLayout, MediaPrompt, MediaSegment};
+use crate::models::media_cache::{MediaCache, RESERVED_BYTES};
 #[cfg(feature = "metal")]
 use crate::models::paging::Paging;
+use crate::video::Video;
 use crate::{
     hybrid::{
         Addresses, Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward,
@@ -19,7 +23,7 @@ use crate::{
 };
 use candle_core::{DType, Device, Tensor};
 use std::{collections::BTreeSet, path::Path, sync::Arc};
-use tur_core::execution::EmbeddedInput;
+use tur_core::execution::{EmbeddedInput, Modality};
 use tur_core::progress::Stage;
 use tur_core::{
     Result,
@@ -29,6 +33,7 @@ use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
 mod assistant;
 mod audio;
 mod moe;
+pub(super) mod vision;
 
 struct Layer {
     /// `q | k | v` on K/V owners (`q | k` when values reuse keys), queries alone otherwise.
@@ -71,6 +76,11 @@ pub struct Gemma4 {
     assistant: Option<assistant::Assistant>,
     /// The audio encoder, when the checkpoint has one and the load requested it.
     audio: Option<audio::AudioTower>,
+    /// The vision tower, when the checkpoint has one and the load requested it.
+    vision: Option<vision::VisionTower>,
+    /// Whether video is accepted through the tower.
+    video: bool,
+    media_cache: MediaCache,
     #[cfg(feature = "metal")]
     fused: Option<Fused>,
 }
@@ -112,6 +122,30 @@ fn audio_precision(config: &Config, options: &LoadOptions) -> Option<crate::mode
         Weights::Gguf(_) => return None,
     };
     (options.audio && config.audio.is_some()).then(|| audio::precision(text_f32))
+}
+
+/// Storage of the vision tower's projections when this load includes it, by the same rules.
+fn vision_precision(config: &Config, options: &LoadOptions) -> Option<crate::models::Precision> {
+    let text_f32 = match &options.weights {
+        Weights::Prepacked(manifest) if !manifest.vision => return None,
+        Weights::Prepacked(manifest) => plan_is_f32(&manifest.plan),
+        Weights::Uniform(format) => *format == crate::models::WeightFormat::F32,
+        Weights::Plan(_) => false,
+        Weights::Gguf(_) => return None,
+    };
+    (options.vision && config.vision.is_some()).then(|| vision::precision(text_f32))
+}
+
+/// The inputs this load's encoders accept beside text.
+fn loaded_modalities(config: &Config, options: &LoadOptions) -> Vec<Modality> {
+    let mut modalities = Vec::new();
+    if audio_precision(config, options).is_some() {
+        modalities.push(Modality::Audio);
+    }
+    if vision_precision(config, options).is_some() {
+        modalities.push(Modality::Image);
+    }
+    modalities
 }
 
 fn format_plan(config: &Config, options: &LoadOptions) -> Result<WeightPlan> {
@@ -214,15 +248,23 @@ impl artifact::ArtifactLayout for Config {
         &self,
         plan: &WeightPlan,
     ) -> Result<std::collections::BTreeMap<String, artifact::Companion>> {
-        let Some(settings) = &self.audio else {
-            return Ok(std::collections::BTreeMap::new());
-        };
-        let precision = audio::precision(plan_is_f32(plan));
-        Ok(audio::stored_tensors(
-            settings,
-            self.hidden_size(),
-            precision,
-        ))
+        let text_f32 = plan_is_f32(plan);
+        let mut companions = std::collections::BTreeMap::new();
+        if let Some(settings) = &self.audio {
+            companions.extend(audio::stored_tensors(
+                settings,
+                self.hidden_size(),
+                audio::precision(text_f32),
+            ));
+        }
+        if let Some(settings) = &self.vision {
+            companions.extend(vision::stored_tensors(
+                settings,
+                self.hidden_size(),
+                vision::precision(text_f32),
+            ));
+        }
+        Ok(companions)
     }
 }
 
@@ -423,6 +465,28 @@ impl Gemma4 {
             }
             _ => None,
         };
+        let vision = match (vision_precision(&config, options), config.vision.clone()) {
+            (Some(precision), Some(settings)) => {
+                // Image framing tokens are ordinary prompt tokens once the tower exists.
+                config
+                    .forbidden
+                    .retain(|id| *id != settings.begin && *id != settings.end);
+                // Its own Metal queue, as for the audio encoder.
+                let device = match &options.device {
+                    Device::Metal(_) => Device::new_metal(0)?,
+                    device => device.clone(),
+                };
+                Some(vision::VisionTower::load(
+                    dir,
+                    &t.checkpoint,
+                    &settings,
+                    config.hidden_size(),
+                    precision,
+                    &device,
+                )?)
+            }
+            _ => None,
+        };
         let (description, _, _) = Self::memory_requirements(&config, options, 1, &[1])?;
         Self {
             config,
@@ -435,6 +499,9 @@ impl Gemma4 {
             ple,
             assistant,
             audio,
+            vision,
+            video: options.video,
+            media_cache: MediaCache::default(),
             #[cfg(feature = "metal")]
             fused: None,
         }
@@ -496,18 +563,123 @@ impl Gemma4 {
         &self.config
     }
     /// How a clip appears in prompts, when the audio encoder is loaded.
-    pub fn audio_prompt(&self) -> Option<AudioPrompt> {
+    pub fn audio_prompt(&self) -> Option<MediaPrompt> {
         let settings = self
             .config
             .audio
             .as_ref()
             .filter(|_| self.audio.is_some())?;
-        Some(AudioPrompt {
+        Some(MediaPrompt {
             placeholder: settings.token,
-            begin: settings.begin,
-            end: settings.end,
-            slot: self.config.text.pad_token_id.unwrap_or(0),
+            begin: Some(settings.begin),
+            end: Some(settings.end),
         })
+    }
+    /// How an image appears in prompts, when the vision tower is loaded.
+    pub fn image_prompt(&self) -> Option<MediaPrompt> {
+        let settings = self
+            .config
+            .vision
+            .as_ref()
+            .filter(|_| self.vision.is_some())?;
+        Some(MediaPrompt {
+            placeholder: settings.token,
+            begin: Some(settings.begin),
+            end: Some(settings.end),
+        })
+    }
+    /// The token soft-token positions feed the model, under their embedded rows. Transformers
+    /// feeds pad there for everything read per token.
+    pub fn media_slot(&self) -> Option<u32> {
+        (self.audio.is_some() || self.vision.is_some())
+            .then(|| self.config.text.pad_token_id.unwrap_or(0))
+    }
+    /// How a video appears in prompts, when the vision tower is loaded.
+    pub fn video_prompt(&self) -> Option<MediaPrompt> {
+        if !self.video {
+            return None;
+        }
+        let settings = self
+            .config
+            .vision
+            .as_ref()
+            .filter(|_| self.vision.is_some())?;
+        Some(MediaPrompt {
+            placeholder: settings.video_token?,
+            begin: Some(settings.begin),
+            end: Some(settings.end),
+        })
+    }
+    /// One run of soft tokens per sampled frame, labelled `mm:ss` and spaced as Transformers'
+    /// processor writes them.
+    pub fn video_layout(&self, video: &Video) -> Result<MediaLayout> {
+        let (stamps, tokens) = self.tower()?.video_steps(video);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "timestamps are non-negative and small"
+        )]
+        let segments = stamps
+            .into_iter()
+            .enumerate()
+            .map(|(index, stamp)| {
+                let seconds = stamp as u64;
+                let lead = if index == 0 { "" } else { " " };
+                MediaSegment {
+                    label: format!("{lead}{:02}:{:02} ", seconds / 60, seconds % 60),
+                    tokens,
+                    grid: None,
+                }
+            })
+            .collect();
+        Ok(MediaLayout { segments })
+    }
+    /// F32 `[soft tokens, hidden]` rows of a video's frames in order. Frames don't attend to
+    /// one another, so each is its own tower pass.
+    pub fn encode_video(&self, video: &Video) -> Result<Tensor> {
+        let [_, rows] = self.trace_video(video)?;
+        Ok(rows.to_device(&Device::Cpu)?.to_device(&self.device)?)
+    }
+    /// A video's patches and soft tokens, for comparing with a reference.
+    pub fn trace_video(&self, video: &Video) -> Result<[Tensor; 2]> {
+        let tower = self.tower()?;
+        let (mut pixels, mut rows) = (Vec::new(), Vec::new());
+        for frame in tower.video_frames(video)? {
+            let (_, encoded) = tower.forward(&frame)?;
+            pixels.push(frame.pixels);
+            rows.push(encoded);
+        }
+        Ok([Tensor::stack(&pixels, 0)?, Tensor::cat(&rows, 0)?])
+    }
+    pub(crate) fn media_cache(&self) -> &MediaCache {
+        &self.media_cache
+    }
+    /// Soft tokens an image occupies in the prompt.
+    pub fn image_tokens(&self, image: &Image) -> Result<usize> {
+        Ok(self.tower()?.soft_tokens(image))
+    }
+    /// F32 `[soft tokens, hidden]` rows of an image on the model device. The tower has its own
+    /// Metal queue, so this waits for its work and copies the rows across.
+    pub fn encode_image(&self, image: &Image) -> Result<Tensor> {
+        let tower = self.tower()?;
+        let (_, rows) = tower.forward(&tower.patches(image)?)?;
+        if rows.device().same_device(&self.device) {
+            return Ok(rows);
+        }
+        Ok(rows.to_device(&Device::Cpu)?.to_device(&self.device)?)
+    }
+    /// An image's patches, the tower's pooled states and its soft tokens, for comparing every
+    /// stage with a reference.
+    pub fn trace_image(&self, image: &Image) -> Result<[Tensor; 3]> {
+        let tower = self.tower()?;
+        let patches = tower.patches(image)?;
+        let (pooled, rows) = tower.forward(&patches)?;
+        Ok([patches.pixels, pooled, rows])
+    }
+    fn tower(&self) -> Result<&vision::VisionTower> {
+        self.vision
+            .as_ref()
+            .ok_or_else(|| invalid("this model has no vision encoder loaded"))
     }
     /// Soft tokens a clip occupies in the prompt, or an error outside 40 ms to 30 s.
     pub fn audio_tokens(&self, clip: &Audio) -> Result<usize> {
@@ -542,35 +714,12 @@ impl Gemma4 {
     fn embed(&self, batch: &PackedForward<'_>, spans: &[Span<'_>], ids: &Tensor) -> Result<Tensor> {
         let x =
             (self.embedding.rows(ids, &self.head)? * (self.config.hidden_size() as f64).sqrt())?;
-        if batch.embeddings.is_empty() {
-            return Ok(x);
-        }
-        let mut pieces = Vec::new();
-        let mut cursor = 0;
-        for input in batch.embeddings {
-            let Some(span) = spans.iter().find(|s| {
-                s.sequence.tokens.start <= input.tokens.start
-                    && input.tokens.end <= s.sequence.tokens.end
-            }) else {
-                continue;
-            };
-            let start = span.start + (input.tokens.start - span.sequence.tokens.start);
-            if start < cursor
-                || input.rows.dims2()? != (input.tokens.len(), self.config.hidden_size())
-            {
-                return Err(invalid("embedded input rows do not match the model width"));
-            }
-            if start > cursor {
-                pieces.push(x.narrow(0, cursor, start - cursor)?);
-            }
-            pieces.push(input.rows.to_device(&self.device)?);
-            cursor = start + input.tokens.len();
-        }
-        let rows = x.dim(0)?;
-        if cursor < rows {
-            pieces.push(x.narrow(0, cursor, rows - cursor)?);
-        }
-        Ok(Tensor::cat(&pieces, 0)?)
+        math::splice_embedded(&x, batch.embeddings, |range| {
+            let span = spans.iter().find(|s| {
+                s.sequence.tokens.start <= range.start && range.end <= s.sequence.tokens.end
+            })?;
+            Some(span.start + (range.start - span.sequence.tokens.start))
+        })
     }
     /// Whether common Metal kernels or Candle reference operations execute passes.
     pub fn execution(&self) -> Execution {
@@ -639,6 +788,12 @@ impl Gemma4 {
                 .as_ref()
                 .map_or(0, assistant::Assistant::bytes)
             + self.audio.as_ref().map_or(0, audio::AudioTower::bytes)
+            + self.vision.as_ref().map_or(0, vision::VisionTower::bytes)
+            + if self.audio.is_some() || self.vision.is_some() {
+                RESERVED_BYTES
+            } else {
+                0
+            }
     }
 
     /// Plan packed weights, per-layer embedding storage and peak activations before loading.
@@ -656,7 +811,7 @@ impl Gemma4 {
         let description = config.description(
             format!("{}#{}", options.revision, options.weights.tag()),
             options.kv,
-            audio.is_some(),
+            &loaded_modalities(config, options),
         )?;
         let projections = config.projection_layout()?;
         let mut accounted: BTreeSet<String> = projections
@@ -668,6 +823,18 @@ impl Gemma4 {
         if let (Some(precision), Some(settings)) = (audio, &config.audio) {
             weights = audio::planned_bytes(settings, config.hidden_size(), precision)?
                 .checked_add(weights)
+                .ok_or_else(|| invalid("Gemma 4 weight bytes overflow"))?;
+        }
+        if let (Some(precision), Some(settings)) =
+            (vision_precision(config, options), &config.vision)
+        {
+            weights = vision::planned_bytes(settings, config.hidden_size(), precision)?
+                .checked_add(weights)
+                .ok_or_else(|| invalid("Gemma 4 weight bytes overflow"))?;
+        }
+        if !loaded_modalities(config, options).is_empty() {
+            weights = weights
+                .checked_add(RESERVED_BYTES)
                 .ok_or_else(|| invalid("Gemma 4 weight bytes overflow"))?;
         }
         if let Some(head) = &options.mtp {
@@ -1200,6 +1367,7 @@ impl Gemma4 {
         let sequences = [sequence];
         let batch = PackedForward {
             embeddings,
+            axial: &[],
             tokens,
             positions: &positions,
             sequences: &sequences,

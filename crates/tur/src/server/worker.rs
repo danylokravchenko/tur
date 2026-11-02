@@ -11,7 +11,6 @@ use uuid::Uuid;
 
 use crate::{
     ModelFactory, ModelSource, Result, TurError,
-    audio::Audio,
     backend::{
         memory::DeviceBudget,
         pipeline::{
@@ -142,6 +141,8 @@ pub struct PipelineWorker {
     report: Option<Arc<ModelReport>>,
     telemetry: Arc<WorkerTelemetry>,
     exit: watch::Receiver<()>,
+    /// Whether this model takes video. The route checks before any decoder sees a file.
+    video: bool,
 }
 
 const MAX_ADMISSIONS_PER_PASS: usize = 32;
@@ -263,14 +264,15 @@ fn encode_clips(
         telemetry.record_cancelled();
         return;
     }
-    let clips: Vec<&Audio> = msg
+    let encoded = msg
         .request
         .messages
         .iter()
-        .flat_map(|m| m.content.audio())
+        .flat_map(|m| m.content.media())
+        .map(|media| model.encode_media(media))
         .collect();
-    match clips.iter().map(|clip| model.encode_audio(clip)).collect() {
-        Ok(rows) => msg.request.encoded_audio = rows,
+    match encoded {
+        Ok(rows) => msg.request.encoded_media = rows,
         Err(error) => return reply(telemetry, msg.result_tx, Err(error)),
     }
     // A worker that stopped drops the request, which tells its client.
@@ -314,13 +316,13 @@ fn admit(
         telemetry.record_cancelled();
         return;
     }
-    if let Some(encoder) = encoder.filter(|_| msg.request.needs_audio_encoding()) {
+    if let Some(encoder) = encoder.filter(|_| msg.request.needs_media_encoding()) {
         match encoder.tx.try_send(msg) {
             Ok(()) => {}
             Err(std_mpsc::TrySendError::Full(msg)) => reply(
                 telemetry,
                 msg.result_tx,
-                Err(TurError::QueueFull("audio encoding queue is full".into())),
+                Err(TurError::QueueFull("media encoding queue is full".into())),
             ),
             Err(std_mpsc::TrySendError::Disconnected(msg)) => {
                 reply(telemetry, msg.result_tx, Err(TurError::WorkerUnavailable));
@@ -494,7 +496,7 @@ fn serve(
     device: &candle_core::Device,
 ) -> Result<()> {
     let encoder = pipeline
-        .audio_model()
+        .media_model()
         .map(|model| ClipEncoder::spawn(model, intake, Arc::clone(telemetry)))
         .transpose()?;
     let encoder = encoder.as_ref();
@@ -533,6 +535,7 @@ impl PipelineWorker {
     pub fn spawn(config: WorkerConfig) -> Result<Self> {
         let timeout = config.request_timeout;
         let stream = config.stream;
+        let video = config.factory.video;
         let (tx, rx) = mpsc::channel(256);
         let intake = tx.downgrade();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -587,6 +590,7 @@ impl PipelineWorker {
             report: Some(Arc::new(report)),
             telemetry,
             exit,
+            video,
         })
     }
 
@@ -599,7 +603,20 @@ impl PipelineWorker {
             report: None,
             telemetry: Arc::default(),
             exit: watch::channel(()).1,
+            video: true,
         }
+    }
+
+    /// This worker with video refused, as `--video-input=false` starts one.
+    #[must_use]
+    pub fn without_video(mut self) -> Self {
+        self.video = false;
+        self
+    }
+
+    /// Whether this model takes video in requests.
+    pub fn accepts_video(&self) -> bool {
+        self.video
     }
 
     /// Whether the worker still takes requests. A stopped one never comes back.
@@ -678,6 +695,7 @@ mod tests {
             report: None,
             telemetry: Arc::default(),
             exit: watch::channel(()).1,
+            video: true,
         };
         let message = || {
             let (token_tx, token_rx) = mpsc::channel(1);
@@ -729,6 +747,8 @@ mod tests {
                 kv: DEFAULT_KV_LAYOUT,
                 recurrent: DEFAULT_RECURRENT_STATE,
                 audio: false,
+                vision: false,
+                video: false,
                 expert_cache: None,
                 gguf: None,
             },

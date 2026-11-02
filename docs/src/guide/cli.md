@@ -85,6 +85,8 @@ Flags and the file override what a name brings. To run `gpt-oss` with every expe
 | `--kv-page-tokens <n>` | 16 | Tokens per K/V page |
 | `--recurrent-state f32\|f16` | `f32` | Storage for DeltaNet recurrent state |
 | `--audio-encoder [true\|false]` | `true` | Load the checkpoint's audio encoder when it has one (Gemma 4 E2B and E4B); `false` saves its memory |
+| `--vision-encoder [true\|false]` | `true` | Load the checkpoint's vision encoder when it has one (Qwen3.5 and Gemma 4); `false` saves its memory |
+| `--video-input [true\|false]` | `true` | Accept video through the vision encoder; `false` refuses it before any decoder reads the file, for untrusted clients, and images still work |
 | `--expert-cache-mb <MiB>` | every expert resident | Keep the experts of gpt-oss, a Qwen artifact or a Qwen GGUF file on disk and read them into this much memory; see [Expert cache](../architecture/expert-cache.md) |
 | `--cpu-reference` | off | Run the slow F32 CPU reference instead of Metal, for development |
 
@@ -131,6 +133,8 @@ Speculation needs F32 recurrent state. With `--recurrent-state f16`, Tur logs a 
 | `--preserve-thinking true\|false` | template default | Passed to the chat template |
 | `--tools <file>` | none | JSON array of `{name, description, parameters}` function definitions |
 | `--audio <file.wav>` | none | A clip placed before the prompt, for models with an audio encoder. Needs a prompt |
+| `--image <file>` | none | An image placed before the prompt, for models with a vision encoder: PNG, JPEG, WebP or GIF. Repeat for several. Needs a prompt |
+| `--video <file.mp4>` | none | A video placed before the prompt, for models with a vision encoder: H.264 or HEVC in MP4. Repeat for several. Needs a prompt |
 
 With no prompt in a terminal, `run` opens a chat. Each turn sends the whole conversation, so prefix reuse answers follow-ups without recomputing it. `/clear` forgets the conversation, and `/bye` or Ctrl-D leaves. A turn that fails, such as one past the context limit, prints its error and leaves the conversation as it was.
 
@@ -171,6 +175,10 @@ tur transcribe --whisper openai/whisper-large-v3-turbo \
   --whisper-revision 41f01f3fe87f28c78e2fbf8b568835947dd65ed9 speech.wav
 
 tur run gemma 'Summarize this recording.' --audio speech.wav --thinking false
+
+tur run qwen 'What does this sign say?' --image sign.jpg
+
+tur run qwen 'What happens in this clip?' --video clip.mp4
 ```
 
 ## Quantization (`quantize`)

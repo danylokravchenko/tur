@@ -1,0 +1,16 @@
+{
+  "image_processor": {
+    "image_processor_type": "Gemma4ImageProcessor",
+    "max_soft_tokens": 70,
+    "patch_size": 16,
+    "pooling_kernel_size": 3,
+    "image_seq_length": 70
+  },
+  "video_processor": {
+    "video_processor_type": "Gemma4VideoProcessor",
+    "max_soft_tokens": 70,
+    "num_frames": 4,
+    "patch_size": 16,
+    "pooling_kernel_size": 3
+  }
+}

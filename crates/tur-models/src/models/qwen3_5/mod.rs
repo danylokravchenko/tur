@@ -4,6 +4,7 @@ mod config;
 mod math;
 mod model;
 mod quantize;
+mod vision;
 
 pub use config::Config;
 pub use model::Qwen35;

@@ -845,6 +845,7 @@ impl GptOss {
         }];
         let batch = PackedForward {
             embeddings: &[],
+            axial: &[],
             tokens,
             positions: &positions,
             sequences: &sequences,

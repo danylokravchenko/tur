@@ -491,6 +491,9 @@ pub struct PackedExecution {
     pub sequences: Vec<SequenceDescriptor>,
     /// Embedding overrides, in packed order; empty for text.
     pub embeddings: Vec<EmbeddedInput>,
+    /// Per-token (t, h, w) rotary positions of models whose text rotary reads image grids,
+    /// parallel to `tokens`. Empty when every token rotates at its own position.
+    pub axial: Vec<[u32; 3]>,
 }
 
 /// Immutable execution input with checked ranges, positions and unique state writes.
@@ -664,6 +667,9 @@ impl PackedExecution {
             return Err(invalid("unassigned packed tokens"));
         }
         self.validate_embeddings(model)?;
+        if !self.axial.is_empty() && self.axial.len() != self.tokens.len() {
+            return Err(invalid("axial positions must be parallel to the tokens"));
+        }
         requirements.packed_input_bytes =
             self.embeddings
                 .iter()
@@ -741,6 +747,7 @@ mod tests {
         };
         let plan = PackedExecution {
             embeddings: Vec::new(),
+            axial: Vec::new(),
             tokens: vec![1, 2, 3],
             positions: vec![1, 2, 3],
             sequences: vec![SequenceDescriptor {

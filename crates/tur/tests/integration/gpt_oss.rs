@@ -35,6 +35,8 @@ fn load(device: &Device, format: WeightFormat, execution: Execution) -> Result<G
             recurrent: DType::F32,
             mtp: None,
             audio: false,
+            vision: false,
+            video: false,
             expert_cache: None,
         },
     )
@@ -120,6 +122,8 @@ fn test_gpt_oss_fused_mxfp4_experts_match_reference_and_plan() -> Result<()> {
             recurrent: DType::F32,
             mtp: None,
             audio: false,
+            vision: false,
+            video: false,
             expert_cache: None,
         },
         32,
@@ -143,6 +147,8 @@ fn cached(dir: &Path, device: &Device, slots: usize) -> Result<(GptOss, LoadOpti
         recurrent: DType::F32,
         mtp: None,
         audio: false,
+        vision: false,
+        video: false,
         expert_cache: Some(slots * expert),
     };
     Ok((GptOss::load(dir, &options)?, options))
@@ -205,6 +211,8 @@ fn test_expert_cache_rejects_a_budget_below_one_layer_of_experts() -> Result<()>
         recurrent: DType::F32,
         mtp: None,
         audio: false,
+        vision: false,
+        video: false,
         expert_cache: Some(1 << 20),
     };
     assert!(GptOss::load(&fixture(), &reference).is_err());
@@ -284,6 +292,8 @@ fn test_pruned_checkpoint_equals_hiding_its_removed_experts() -> Result<()> {
                 recurrent: DType::F32,
                 mtp: None,
                 audio: false,
+                vision: false,
+                video: false,
                 expert_cache: None,
             },
         )?;
@@ -356,6 +366,8 @@ fn test_gpt_oss_20b_matches_transformers_through_the_expert_cache() -> Result<()
             recurrent: DType::F32,
             mtp: None,
             audio: false,
+            vision: false,
+            video: false,
             expert_cache: Some(1 << 30),
         },
     )?;
