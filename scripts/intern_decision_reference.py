@@ -2,8 +2,10 @@
 
 Each case is an OpenAI `/v1/decisions` body. `to_intern` maps it to the checkpoint's request
 format exactly as tur's route does; the official `DecisionEngine` then renders, tokenizes and
-scores it. The golden file keeps the rendered prompt text, its token ids, and every field's
-candidate probabilities before and after the checkpoint's temperature.
+scores it. The golden file keeps the chat template's text (one placeholder per image), the
+token ids after image expansion, and every field's candidate probabilities before and after
+the checkpoint's temperature. Images are `data:` URLs of `tests/fixtures/vision/small.png`,
+written to temporary files because the reference reads paths.
 
 Pinned environment (CPU, float32):
 
@@ -14,10 +16,18 @@ Pinned environment (CPU, float32):
 """
 
 import argparse
+import base64
+import copy
 import importlib.util
 import json
 import sys
+import tempfile
 from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+SMALL_PNG = "data:image/png;base64," + base64.b64encode(
+    (REPO / "crates/tur/tests/fixtures/vision/small.png").read_bytes()
+).decode()
 
 CASES = [
     {
@@ -68,7 +78,31 @@ CASES = [
             }
         ],
     },
+    {
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": SMALL_PNG},
+                    {"type": "input_text", "text": "Photo from the returns desk."},
+                ],
+            }
+        ],
+        "questions": [
+            {"type": "predicate", "name": "colourful", "instructions": "Does the photo show bright colours?"},
+            {
+                "type": "choice",
+                "name": "pattern",
+                "instructions": "What does the photo mainly show?",
+                "choices": [{"value": "stripes"}, {"value": "a face"}, {"value": "text"}],
+            },
+        ],
+    },
 ]
+
+
+def is_image(part):
+    return part["type"] == "input_image"
 
 
 def part_value(part):
@@ -91,12 +125,16 @@ def state(input_):
         content = input_[0]["content"]
         if isinstance(content, str):
             return content
-        if len(content) == 1:
-            return part_value(content[0])
+        parts = [p for p in content if not is_image(p)]
+        if len(parts) == 1:
+            return part_value(parts[0])
+        if not parts:
+            return ""
     turns = []
     for message in input_:
         content = message["content"]
-        text = content if isinstance(content, str) else "\n".join(part_text(p) for p in content)
+        parts = [] if isinstance(content, str) else [p for p in content if not is_image(p)]
+        text = content if isinstance(content, str) else "\n".join(part_text(p) for p in parts)
         turns.append({"role": message["role"], "content": text})
     return turns
 
@@ -105,8 +143,29 @@ def value_key(value):
     return str(value).lower() if isinstance(value, bool) else value
 
 
-def to_intern(body):
-    """Unnamed questions are called q1, q2, ... by position."""
+def image_urls(input_):
+    if isinstance(input_, str):
+        return []
+    return [
+        p["image_url"]
+        for m in input_
+        if not isinstance(m["content"], str)
+        for p in m["content"]
+        if is_image(p)
+    ]
+
+
+def image_files(urls, directory):
+    paths = []
+    for index, url in enumerate(urls):
+        path = Path(directory) / f"image-{index}.png"
+        path.write_bytes(base64.b64decode(url.split(",", 1)[1]))
+        paths.append(str(path))
+    return paths
+
+
+def to_intern(body, directory):
+    """Unnamed questions are called q1, q2, ... by position. Images go to `images`."""
     questions = {}
     for index, question in enumerate(body["questions"]):
         name = question.get("name") or f"q{index + 1}"
@@ -121,7 +180,24 @@ def to_intern(body):
                 for level in question["levels"]
             ]
             questions[name] = {"type": "score", "instructions": question["instructions"], "criteria": levels}
-    return {"state": state(body["input"]), "questions": questions}
+    row = {"state": state(body["input"]), "questions": questions}
+    images = image_files(image_urls(body["input"]), directory)
+    if images:
+        row["images"] = images
+    return row
+
+
+def template_text(engine, reference, row):
+    """The chat template's output before the processor expands each image placeholder."""
+    messages = copy.deepcopy(reference.compile_row(row).messages)
+    if row.get("images"):
+        messages[1]["content"] = [
+            {"type": "image"} if part["type"] == "image_url" else part for part in messages[1]["content"]
+        ]
+    template = engine.backend.processor if row.get("images") else engine.tokenizer
+    return template.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False, enable_thinking=False, add_vision_id=True
+    )
 
 
 def main():
@@ -137,11 +213,12 @@ def main():
     spec.loader.exec_module(reference)
     engine = reference.DecisionEngine(checkpoint=args.model, device="cpu", dtype="float32", temperature=1.0)
     golden = {"temperature": reference.DEFAULT_TEMPERATURE, "cases": []}
+    directory = tempfile.mkdtemp()
     for body in CASES:
-        row = reference.validate_request(to_intern(body))
+        row = reference.validate_request(to_intern(body, directory))
         compiled, batch, _ = engine.backend.encode(row)
-        text = engine.tokenizer.decode(batch["input_ids"][0], skip_special_tokens=False)
-        raw = engine.predict(to_intern(body))["answers"]
+        text = template_text(engine, reference, row)
+        raw = engine.predict(to_intern(body, directory))["answers"]
         calibrated = reference.scale_result({"answers": raw}, reference.DEFAULT_TEMPERATURE)["answers"]
         golden["cases"].append(
             {

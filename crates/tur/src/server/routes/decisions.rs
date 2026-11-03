@@ -18,7 +18,7 @@ use crate::{
     hybrid::SamplingOptions,
     server::{
         AppState,
-        routes::chat::execution_error,
+        routes::chat::{execution_error, image},
         types::{
             ApiErrorResponse, ChoiceProbability, ChoiceValue, DecisionAnswer, DecisionContent,
             DecisionInput, DecisionInputDetails, DecisionOutputDetails, DecisionPart,
@@ -157,70 +157,99 @@ fn fields(questions: &[DecisionQuestion]) -> Result<Vec<Field>, String> {
     Ok(fields)
 }
 
-fn part_value(part: &DecisionPart) -> Result<Value, String> {
+/// A part's value in the state; images are passed to the model apart from it.
+fn part_value(part: &DecisionPart) -> Option<Value> {
     match part {
         DecisionPart::InputText { text } | DecisionPart::OutputText { text } => {
-            Ok(Value::String(text.clone()))
+            Some(Value::String(text.clone()))
         }
-        DecisionPart::InputJson { data } => Ok(data.clone()),
-        DecisionPart::InputImage { .. } => {
-            Err("decision checkpoints don't take image input yet".into())
-        }
+        DecisionPart::InputJson { data } => Some(data.clone()),
+        DecisionPart::InputImage { .. } => None,
     }
 }
 
 /// A message's parts as text, one per line; JSON parts are written compactly.
-fn content_text(content: &DecisionContent) -> Result<String, String> {
+fn content_text(content: &DecisionContent) -> String {
     let parts = match content {
-        DecisionContent::Text(text) => return Ok(text.clone()),
+        DecisionContent::Text(text) => return text.clone(),
         DecisionContent::Parts(parts) => parts,
     };
-    let texts = parts
+    let texts: Vec<String> = parts
         .iter()
-        .map(|part| {
-            Ok(match part_value(part)? {
-                Value::String(text) => text,
-                value => value.to_string(),
-            })
+        .filter_map(part_value)
+        .map(|value| match value {
+            Value::String(text) => text,
+            value => value.to_string(),
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(texts.join("\n"))
+        .collect();
+    texts.join("\n")
 }
 
 /// The state the questions are about. A string stays a string, and a lone user message's
-/// lone part its own value; anything else becomes a list of `{role, content}` turns.
-fn decision_state(input: &DecisionInput) -> Result<Value, String> {
+/// lone part besides its images its own value; anything else becomes a list of
+/// `{role, content}` turns.
+fn decision_state(input: &DecisionInput) -> Value {
     let messages = match input {
-        DecisionInput::Text(text) => return Ok(Value::String(text.clone())),
+        DecisionInput::Text(text) => return Value::String(text.clone()),
         DecisionInput::Messages(messages) => messages,
     };
     if let [message] = messages.as_slice()
         && message.role == "user"
     {
-        match &message.content {
-            DecisionContent::Text(text) => return Ok(Value::String(text.clone())),
-            DecisionContent::Parts(parts) if parts.len() == 1 => return part_value(&parts[0]),
-            DecisionContent::Parts(_) => {}
+        let values: Vec<Value> = match &message.content {
+            DecisionContent::Text(text) => vec![Value::String(text.clone())],
+            DecisionContent::Parts(parts) => parts.iter().filter_map(part_value).collect(),
+        };
+        match <[Value; 1]>::try_from(values) {
+            Ok([value]) => return value,
+            Err(values) if values.is_empty() => return Value::String(String::new()),
+            Err(_) => {}
         }
     }
     messages
         .iter()
         .map(|message| {
-            Ok(serde_json::json!({
+            serde_json::json!({
                 "role": message.role,
-                "content": content_text(&message.content)?,
-            }))
+                "content": content_text(&message.content),
+            })
         })
         .collect()
 }
 
+/// The input's image URLs, in order.
+fn image_urls(input: &DecisionInput) -> Vec<String> {
+    let DecisionInput::Messages(messages) = input else {
+        return Vec::new();
+    };
+    messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            DecisionContent::Parts(parts) => Some(parts),
+            DecisionContent::Text(_) => None,
+        })
+        .flatten()
+        .filter_map(|part| match part {
+            DecisionPart::InputImage { image_url } => Some(image_url.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One request reading every field; images are decoded here, so callers run this off the
+/// async executor.
 fn request(
     state: &Value,
     fields: &[Field],
+    images: &[String],
     cache_salt: Option<String>,
 ) -> crate::Result<GenerationRequest> {
+    let images = images
+        .iter()
+        .map(|url| image(url))
+        .collect::<crate::Result<Vec<_>>>()?;
     Ok(GenerationRequest {
-        messages: decision::conversation(state, fields)?,
+        messages: decision::conversation(state, fields, images)?,
         sampling: SamplingOptions {
             temperature: Some(0.0),
             ..SamplingOptions::default()
@@ -228,6 +257,7 @@ fn request(
         render: RenderOptions {
             add_generation_prompt: false,
             enable_thinking: Some(false),
+            add_vision_id: Some(true),
             ..RenderOptions::default()
         },
         cache_salt,
@@ -377,15 +407,24 @@ pub async fn decisions(
     let Some(temperature) = worker.decision_temperature() else {
         return bad_request(format!("model '{model_id}' is not a decision checkpoint"));
     };
-    let prepared =
-        fields(&req.questions).and_then(|fields| Ok((decision_state(&req.input)?, fields)));
-    let (input, fields) = match prepared {
-        Ok(prepared) => prepared,
+    let fields = match fields(&req.questions) {
+        Ok(fields) => fields,
         Err(message) => return bad_request(message),
     };
-    let request = match request(&input, &fields, req.prompt_cache_key) {
-        Ok(request) => request,
-        Err(error) => return bad_request(error.to_string()),
+    let (input, images) = (decision_state(&req.input), image_urls(&req.input));
+    let salt = req.prompt_cache_key;
+    let shared = fields.clone();
+    let built = tokio::task::spawn_blocking(move || request(&input, &shared, &images, salt)).await;
+    let request = match built {
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) => return bad_request(error.to_string()),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse::internal("input decoding failed")),
+            )
+                .into_response();
+        }
     };
     let stats = match run(&worker, request).await {
         Ok(stats) => stats,
@@ -455,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn test_state_keeps_a_lone_value_and_lists_conversations() -> Result<(), String> {
+    fn test_state_keeps_a_lone_value_and_lists_conversations() {
         let message = |role: &str, content: &str| DecisionMessage {
             role: role.into(),
             content: DecisionContent::Text(content.into()),
@@ -466,17 +505,33 @@ mod tests {
                 data: serde_json::json!({"days_late": 9}),
             }]),
         }]);
-        assert_eq!(decision_state(&json)?, serde_json::json!({"days_late": 9}));
+        assert_eq!(decision_state(&json), serde_json::json!({"days_late": 9}));
         let turns =
             DecisionInput::Messages(vec![message("user", "hi"), message("assistant", "yes")]);
         assert_eq!(
-            decision_state(&turns)?,
+            decision_state(&turns),
             serde_json::json!([
                 {"role": "user", "content": "hi"},
                 {"role": "assistant", "content": "yes"}
             ])
         );
-        Ok(())
+        // Images reach the model apart from the state.
+        let photo = DecisionInput::Messages(vec![DecisionMessage {
+            role: "user".into(),
+            content: DecisionContent::Parts(vec![
+                DecisionPart::InputImage {
+                    image_url: "data:image/png;base64,AA==".into(),
+                },
+                DecisionPart::InputText {
+                    text: "Returned item".into(),
+                },
+            ]),
+        }]);
+        assert_eq!(
+            decision_state(&photo),
+            Value::String("Returned item".into())
+        );
+        assert_eq!(image_urls(&photo), ["data:image/png;base64,AA=="]);
     }
 
     #[test]

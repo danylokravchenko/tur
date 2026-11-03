@@ -79,6 +79,7 @@ pub(super) fn options(case: &serde_json::Value) -> RenderOptions {
         enable_thinking: o["enable_thinking"].as_bool(),
         reasoning_effort: o["reasoning_effort"].as_str().map(String::from),
         preserve_thinking: o["preserve_thinking"].as_bool(),
+        add_vision_id: o["add_vision_id"].as_bool(),
     }
 }
 

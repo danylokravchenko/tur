@@ -5,7 +5,7 @@
 //! symbols, are its answer, so all fields are read in one causal pass and nothing is generated.
 //! The layout follows `compile_row` of the checkpoint's `inference.py`.
 
-use super::chat_template::{ChatMessage, Role};
+use super::chat_template::{ChatMessage, Content, ContentPart, Role};
 use super::factory::ModelSource;
 use crate::{Result, TurError};
 use serde::Serialize;
@@ -17,6 +17,8 @@ pub const MARKER: &str = "<decision>";
 pub const SYMBOLS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 /// Questions one prompt may hold, as `inference.py` validates.
 pub const MAX_FIELDS: usize = 16;
+/// Images one prompt may hold, as `inference.py` validates.
+pub const MAX_IMAGES: usize = 8;
 
 const SYSTEM_PROMPT: &str = "You are a careful decision assistant. Use the state and decision \
 schema in the user message to make the requested decisions. For every field, choose exactly one \
@@ -50,13 +52,28 @@ fn pretty(value: &impl Serialize, indent: &[u8]) -> Result<String> {
 }
 
 /// The conversation of one decision request: system, user and the assistant's skeleton,
-/// rendered with the generation prompt off and thinking off. Fails when a field has no
-/// options or more than [`SYMBOLS`] holds, or when the input already contains [`MARKER`].
-pub fn conversation(state: &Value, fields: &[Field]) -> Result<Vec<ChatMessage>> {
+/// rendered with the generation prompt off, thinking off and `add_vision_id` on. `images`
+/// open the user turn, in order. Fails when a field has no options or more than [`SYMBOLS`]
+/// holds, when there are more than [`MAX_IMAGES`] images, or when the input already
+/// contains [`MARKER`].
+pub fn conversation(
+    state: &Value,
+    fields: &[Field],
+    images: Vec<ContentPart>,
+) -> Result<Vec<ChatMessage>> {
     let invalid = |message: String| TurError::InvalidExecution(message);
     if !(1..=MAX_FIELDS).contains(&fields.len()) {
         return Err(invalid(format!(
             "a decision takes 1 to {MAX_FIELDS} questions"
+        )));
+    }
+    if images.len() > MAX_IMAGES
+        || images
+            .iter()
+            .any(|part| !matches!(part, ContentPart::Image(_)))
+    {
+        return Err(invalid(format!(
+            "a decision takes at most {MAX_IMAGES} images"
         )));
     }
     let mut schema = Vec::new();
@@ -86,9 +103,21 @@ pub fn conversation(state: &Value, fields: &[Field]) -> Result<Vec<ChatMessage>>
         .iter()
         .map(|field| (field.name.clone(), Value::String(MARKER.into())))
         .collect();
+    let user = if images.is_empty() {
+        ChatMessage::new(Role::User, user)
+    } else {
+        let mut parts = images;
+        parts.push(ContentPart::Text(user));
+        ChatMessage {
+            role: Role::User,
+            content: Content::Parts(parts),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+        }
+    };
     Ok(vec![
         ChatMessage::new(Role::System, SYSTEM_PROMPT),
-        ChatMessage::new(Role::User, user),
+        user,
         ChatMessage::new(Role::Assistant, pretty(&skeleton, b"    ")?),
     ])
 }
@@ -139,7 +168,7 @@ mod tests {
 
     #[test]
     fn test_skeleton_holds_one_marker_per_field_in_order() -> Result<()> {
-        let messages = conversation(&Value::Null, &[field("b", 2), field("a", 3)])?;
+        let messages = conversation(&Value::Null, &[field("b", 2), field("a", 3)], Vec::new())?;
         let skeleton = messages[2].content.as_text().unwrap_or_default();
         assert_eq!(
             skeleton,
@@ -151,9 +180,9 @@ mod tests {
 
     #[test]
     fn test_inputs_the_prompt_cannot_express_are_rejected() {
-        assert!(conversation(&Value::Null, &[]).is_err());
-        assert!(conversation(&Value::Null, &[field("x", 63)]).is_err());
+        assert!(conversation(&Value::Null, &[], Vec::new()).is_err());
+        assert!(conversation(&Value::Null, &[field("x", 63)], Vec::new()).is_err());
         let state = Value::String(format!("say {MARKER}"));
-        assert!(conversation(&state, &[field("x", 2)]).is_err());
+        assert!(conversation(&state, &[field("x", 2)], Vec::new()).is_err());
     }
 }

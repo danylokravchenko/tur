@@ -130,13 +130,11 @@ impl Pending {
     }
 
     /// Scheduling view. Prefill chunks stop at aligned and predicted turn boundaries,
-    /// so each snapshot has the recurrent state written at exactly its position, and at
-    /// scoring read positions.
+    /// so each snapshot has the recurrent state written at exactly its position.
     fn candidate(&self, id: Uuid, boundary: Option<usize>) -> Candidate {
         let boundary = boundary
             .into_iter()
             .chain(self.turn_boundary.filter(|&end| end > self.consumed))
-            .chain(self.scores.as_ref().and_then(|s| s.next_end(self.consumed)))
             .min();
         let unconsumed = self.tokens.len() - self.consumed;
         let next = self.boundaries.partition_point(|&end| end <= self.consumed);

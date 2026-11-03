@@ -251,7 +251,7 @@ All questions go into one prompt. The user turn shows the state and lists each q
 | Field | Meaning |
 | --- | --- |
 | `model` | As for chat completions; must be a decision checkpoint |
-| `input` | The state. A string, or messages with content as a string or `input_text`, `output_text` and `input_json` parts. A single user message with one part is passed as that value, so `input_json` reaches the model as JSON; anything else becomes a list of `{role, content}` turns |
+| `input` | The state. A string, or messages with content as a string or `input_text`, `output_text`, `input_json` and `input_image` parts. Images (up to 8, `data:` URLs) go to the model in order as `Picture 1`, `Picture 2` and so on. A single user message with one other part is passed as that value, so `input_json` reaches the model as JSON; anything else becomes a list of `{role, content}` turns |
 | `questions` | 1 to 16 questions, answered in order. Each has `type`, `instructions` and an optional `name`; unnamed questions are called `q1`, `q2` and so on by position, and names must be unique |
 | `prompt_cache_key` | Partitions prefix reuse like `cache_salt` |
 
@@ -261,7 +261,7 @@ All questions go into one prompt. The user turn shows the state and lists each q
 | `choice` | `choices`: 2 to 62 `{value, description?}`, values strings or booleans and distinct as text | `choice`, `confidence`, `probabilities` per value |
 | `score` | `levels`: 2 to 10 `{label, description?}`, lowest first | `score` (the probability-weighted level index from 0), `confidence`, `probabilities` per level |
 
-`confidence` is the probability of the likeliest option, and ties go to the smallest value. Each question costs a model pass, because its read ends a prefill chunk: on an M1 a question about a 300-token input takes about 210 ms and each further one adds about 50 ms. Prefix reuse applies to the input, so repeating a 1,900-token state with new questions restored 1,792 tokens and took 0.25 s. The temperature is known only for the published 0.8B; a local copy reads uncalibrated. Images, function-call input items, refusals and streaming aren't supported.
+`confidence` is the probability of the likeliest option, and ties go to the smallest value. Every question is read in the passes that prefill the prompt, so a request costs what its prompt does: on an M1 one question about the ticket above (194 tokens) takes about 205 ms, and all four (335 tokens, split into two passes at the 256-token snapshot boundary) about 300 ms. Prefix reuse applies to the input, so repeating a 1,900-token state with new questions restored 1,792 tokens and took 0.25 s. With the fixture image of colour ramps and a stripe, the 0.8B answers that it mainly shows stripes (0.81) and bright colours (0.82). The temperature is known only for the published 0.8B; a local copy reads uncalibrated. Function-call input items, refusals and streaming aren't supported.
 
 ## Operating the server
 

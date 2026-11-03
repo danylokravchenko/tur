@@ -668,8 +668,8 @@ impl InferencePipeline {
         Ok(())
     }
 
-    /// Publish one request's commit. `logits` are the model logits of its last output,
-    /// kept with a snapshot when the commit completes the prompt.
+    /// Publish one request's commit. `logits` are the model logits of its outputs; the
+    /// last one's are kept with a snapshot when the commit completes the prompt.
     pub(super) fn publish(
         &mut self,
         id: Uuid,
@@ -688,17 +688,18 @@ impl InferencePipeline {
         {
             return Err(TurError::DeadlineExceeded);
         }
+        let before = pending.consumed;
         pending.consumed = pending
             .consumed
             .checked_add(commit.accepted_tokens)
             .ok_or_else(|| invalid("consumed position overflow"))?;
-        // An inner read position's sampled token is not the prompt's next token: drop it.
+        // A read position's sampled token is not the prompt's next token: only the prompt's
+        // end publishes one.
         let mut outputs = commit.outputs;
         if let Some(scores) = &mut pending.scores {
-            scores.record(pending.consumed, outputs.len(), logits.as_ref())?;
-            if pending.consumed < pending.prompt_tokens {
-                outputs.clear();
-            }
+            scores.record(before..pending.consumed, logits.as_ref())?;
+            let ends = pending.consumed == pending.prompt_tokens;
+            outputs.drain(..outputs.len().saturating_sub(usize::from(ends)));
         }
         if pending
             .boundaries
@@ -753,8 +754,9 @@ impl InferencePipeline {
             let state = self.engine.model_state(pending.handle)?;
             let logits = logits
                 .filter(|_| prompt_end)
-                // An allocated copy: `Tensor::copy` shares storage on Metal.
-                .map(|logits| logits.force_contiguous())
+                // The last output's row, as an allocated copy: `Tensor::copy` shares storage
+                // on Metal.
+                .map(|logits| logits.narrow(0, logits.dim(0)? - 1, 1)?.force_contiguous())
                 .transpose()?;
             self.prefix
                 .insert(&pending.keys, prefix, &state, logits.as_ref())?;

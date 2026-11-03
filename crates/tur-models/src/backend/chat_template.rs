@@ -137,6 +137,8 @@ pub struct RenderOptions {
     pub enable_thinking: Option<bool>,
     pub reasoning_effort: Option<String>,
     pub preserve_thinking: Option<bool>,
+    /// Number images and videos (`Picture 1: ...`) where the template supports it.
+    pub add_vision_id: Option<bool>,
 }
 
 impl ChatTemplate {
@@ -255,6 +257,9 @@ impl ChatTemplate {
         }
         if let Some(value) = options.preserve_thinking {
             ctx.insert("preserve_thinking".into(), value.into());
+        }
+        if let Some(value) = options.add_vision_id {
+            ctx.insert("add_vision_id".into(), value.into());
         }
         env.get_template("chat")
             .and_then(|t| t.render(minijinja::value::Serde(serde_json::Value::Object(ctx))))

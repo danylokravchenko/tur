@@ -16,7 +16,7 @@ use tower::ServiceExt;
 use tur::{
     InferencePipeline, Result, TurError,
     backend::{
-        chat_template::{ChatTemplate, RenderOptions},
+        chat_template::ChatTemplate,
         memory::DeviceBudget,
         pipeline::{GenerationRequest, GenerationStats, PipelineConfig, Scoring},
         prefix::PrefixConfig,
@@ -87,6 +87,22 @@ fn test_inner_marker_reads_match_a_prompt_cut_there_and_survive_restores() -> Re
         .max_by(|&a, &b| cold.scores[1][a].total_cmp(&cold.scores[1][b]))
         .ok_or_else(|| TurError::Other("no scores".into()))?;
     assert_eq!(cold.generated_text.trim(), format!("t{best}"));
+
+    // Without snapshot boundaries the prompt fits one chunk, and both reads come from its pass.
+    let mut single = InferencePipeline::new(
+        &fixture.factory(),
+        PipelineConfig {
+            prefix: PrefixConfig::DISABLED,
+            ..PipelineConfig::new(1, 64)
+        },
+    )?;
+    let before = single.scheduler().iteration();
+    let one_pass = single.run(&two, |_| {})?;
+    assert!(one_pass.prompt_tokens <= 64);
+    assert_eq!(single.scheduler().iteration() - before, 1);
+    for (one_pass, cold) in one_pass.scores.iter().zip(&cold.scores) {
+        assert_close(one_pass, cold, 1e-4);
+    }
 
     // A repeat restores the shared prefix but still computes every read.
     let warm = pipeline.run(&two, |_| {})?;
@@ -214,11 +230,6 @@ fn number(value: &Value) -> f32 {
 async fn test_route_renders_the_reference_prompt_of_every_golden_case() -> Result<()> {
     let (router, mut seen) = decision_router();
     let template = ChatTemplate::from_template(TEMPLATE)?;
-    let render = RenderOptions {
-        add_generation_prompt: false,
-        enable_thinking: Some(false),
-        ..RenderOptions::default()
-    };
     for case in golden()?["cases"].as_array().into_iter().flatten() {
         let (status, _) = post(&router, &case["request"]).await?;
         assert_eq!(status, StatusCode::OK);
@@ -228,7 +239,9 @@ async fn test_route_renders_the_reference_prompt_of_every_golden_case() -> Resul
             .ok_or_else(|| TurError::Other("no request".into()))?;
         assert_eq!(request.max_tokens, 1);
         assert!(request.sampling.greedy());
-        let rendered = template.render(&request.messages, &[], &render)?;
+        assert!(!request.render.add_generation_prompt);
+        assert_eq!(request.render.enable_thinking, Some(false));
+        let rendered = template.render(&request.messages, &[], &request.render)?;
         assert_eq!(Some(rendered.as_str()), case["text"].as_str());
         let fields = case["fields"].as_array().map_or(0, Vec::len);
         assert_eq!(request.scoring.map(|s| s.candidates.len()), Some(fields));
@@ -299,7 +312,7 @@ fn intern_router(format: tur::models::WeightFormat) -> Result<axum::Router> {
             kv: tur::models::DEFAULT_KV_LAYOUT,
             recurrent: tur::models::DEFAULT_RECURRENT_STATE,
             audio: false,
-            vision: false,
+            vision: true,
             video: false,
             expert_cache: None,
             gguf: None,

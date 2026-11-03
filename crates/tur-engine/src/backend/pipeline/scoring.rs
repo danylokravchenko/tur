@@ -1,11 +1,13 @@
 //! Candidate logits read inside a prompt, as decision checkpoints answer: each field's answer
 //! is the next-token distribution just before its marker. The prompt is cut before its last
-//! marker, prefill chunks end at every read position with an output there, and the token the
-//! engine samples at an inner position is dropped, since the prompt continues instead.
+//! marker, and a prefill chunk has an output at every read position it covers, so one pass
+//! reads them all; the tokens the engine samples at inner positions are dropped, since the
+//! prompt continues instead.
 
 use super::{InferencePipeline, media::MediaSpan};
 use crate::{Result, TurError};
 use candle_core::{DType, Tensor};
+use std::ops::Range;
 use tur_core::execution::invalid;
 
 /// Read candidate logits inside the prompt: before each occurrence of `marker`, those of that
@@ -28,16 +30,6 @@ pub(super) struct Scores {
 }
 
 impl Scores {
-    /// The first read position after `consumed`, where the next prefill chunk must stop.
-    pub(super) fn next_end(&self, consumed: usize) -> Option<usize> {
-        self.ends.iter().copied().find(|&end| end > consumed)
-    }
-
-    /// Whether a chunk ending at `end` needs an output there.
-    pub(super) fn reads_at(&self, end: usize) -> bool {
-        self.ends.binary_search(&end).is_ok()
-    }
-
     /// The longest prefix a snapshot may restore: one short of the first unread position, so
     /// the pass computing that row still runs.
     pub(super) fn restore_limit(&self) -> usize {
@@ -48,31 +40,41 @@ impl Scores {
             .map_or(usize::MAX, |(&end, _)| end - 1)
     }
 
-    /// Keep the candidates' logits from `logits`, the row of a commit's only output, when
-    /// `consumed` is a read position not yet read.
-    pub(super) fn record(
-        &mut self,
-        consumed: usize,
-        outputs: usize,
-        logits: Option<&Tensor>,
-    ) -> Result<()> {
-        let Ok(index) = self.ends.binary_search(&consumed) else {
-            return Ok(());
-        };
-        if self.read.get(index).is_some_and(Option::is_some) {
+    /// Keep the candidates' logits of every unread position in `consumed` (exclusive start,
+    /// inclusive end) from `logits`, a commit's output rows, one per read position there.
+    pub(super) fn record(&mut self, consumed: Range<usize>, logits: Option<&Tensor>) -> Result<()> {
+        let first = self.ends.partition_point(|&end| end <= consumed.start);
+        let last = self.ends.partition_point(|&end| end <= consumed.end);
+        if first == last {
             return Ok(());
         }
         let logits = logits
-            .filter(|_| outputs == 1)
+            .filter(|logits| logits.dim(0).ok() == Some(last - first))
             .ok_or_else(|| invalid("a scored position's logits are unavailable"))?;
-        let ids = Tensor::new(self.candidates[index].as_slice(), logits.device())?;
-        let row = logits
-            .index_select(&ids, 1)?
-            .flatten_all()?
-            .to_dtype(DType::F32)?
-            .to_vec1::<f32>()?;
-        self.read[index] = Some(row);
+        for (row, index) in (first..last).enumerate() {
+            if self.read[index].is_some() {
+                continue;
+            }
+            let ids = Tensor::new(self.candidates[index].as_slice(), logits.device())?;
+            self.read[index] = Some(
+                logits
+                    .narrow(0, row, 1)?
+                    .index_select(&ids, 1)?
+                    .flatten_all()?
+                    .to_dtype(DType::F32)?
+                    .to_vec1::<f32>()?,
+            );
+        }
         Ok(())
+    }
+
+    /// Packed offsets, from a chunk's first token, of the read positions a chunk covering
+    /// `consumed` (exclusive start, inclusive end) holds: each read needs an output there.
+    pub(super) fn outputs(&self, consumed: Range<usize>) -> impl Iterator<Item = usize> + '_ {
+        self.ends
+            .iter()
+            .filter(move |&&end| end > consumed.start && end <= consumed.end)
+            .map(move |&end| end - consumed.start - 1)
     }
 
     /// Every position's logits, in marker order.

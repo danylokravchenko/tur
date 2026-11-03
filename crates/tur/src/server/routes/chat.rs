@@ -111,7 +111,7 @@ fn wav(bytes: &[u8]) -> crate::Result<ContentPart> {
 }
 
 /// An image part's bytes, which only a `data:` URL carries: decoding happens by content.
-fn image(url: &str) -> crate::Result<ContentPart> {
+pub(crate) fn image(url: &str) -> crate::Result<ContentPart> {
     let (media_type, bytes) = media::data_url(url)?;
     if !media_type.starts_with("image/") {
         return Err(crate::core::execution::invalid(
@@ -463,6 +463,7 @@ pub async fn chat_completions(
                 enable_thinking: req.thinking,
                 reasoning_effort: req.reasoning_effort,
                 preserve_thinking: req.preserve_thinking,
+                add_vision_id: None,
             },
         },
         token_tx,
