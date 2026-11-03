@@ -122,6 +122,10 @@ The [Tur book](https://danylokravchenko.github.io/tur/docs/) covers usage, archi
 | Understand the engine | [Architecture](docs/src/architecture/overview.md), [Scope](docs/src/design/scope.md) |
 | See what's next | [Open work](docs/src/design/open.md), [Rejected experiments](docs/src/design/rejected.md) |
 
+## The name
+
+Tur is named after the strongest of the three Cossacks in *Yak kozaky…* ("How the Cossacks…"), the Ukrainian cartoon series Volodymyr Dakhno made at Kyivnaukfilm. Tur is the big one with the moustache who settles things by strength, and the mascot is drawn after him. In Ukrainian, *tur* also means the aurochs, the wild ox.
+
 ## Contributing
 
 Contributions are welcome. Read the [development workflow](docs/src/development/workflow.md) and [AGENTS.md](AGENTS.md), install [`just`](https://github.com/casey/just), and run `just ci` before you open a pull request. Tests need direct Metal access on an Apple Silicon Mac.
