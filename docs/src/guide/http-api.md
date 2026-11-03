@@ -33,6 +33,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `messages` | array | required, non-empty | Conversation turns, see below |
 | `model` | string | served model | If present, must equal `--served-model-name` (otherwise 404) |
 | `max_tokens` | integer > 0 | 1024, or what the context leaves | Most tokens to generate, counting EOS. An explicit value must fit the context |
+| `max_completion_tokens` | integer > 0 | `max_tokens` | OpenAI's newer name for `max_tokens`, which newer clients send; it wins when both are set |
 | `stop` | string or array | none | End the answer before the first of these texts (up to 16, each up to 1024 bytes). The text is left out, and `finish_reason` is `stop` |
 | `stream` | bool | false | Server-sent events instead of one JSON response |
 | `temperature` | number ≥ 0 | checkpoint | 0 is greedy |
@@ -51,7 +52,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `preserve_thinking` | bool | template default | Passed to the chat template |
 | `cache_salt` | string | none | Prefix-reuse namespace: only requests with the same salt share cached prompts |
 
-Each message has a `role` of `system`, `user`, `assistant` or `tool`. `content` is a string or an array of `{"type":"text","text":...}` parts. Assistant turns may carry `reasoning_content` and `tool_calls` (function calls with JSON-encoded `arguments`), and tool results are `tool` turns. The checkpoint's own chat template renders all of them.
+Each message has a `role` of `system`, `developer` (read as `system`), `user`, `assistant` or `tool`. `content` is a string or an array of `{"type":"text","text":...}` parts. Assistant turns may carry `reasoning_content` and `tool_calls` (function calls with JSON-encoded `arguments`), and tool results are `tool` turns. The checkpoint's own chat template renders all of them.
 
 User content may also hold audio parts, in OpenAI's `input_audio` form or as an `audio_url` holding a `data:` URL:
 
@@ -107,9 +108,11 @@ Prompts containing a placeholder token without its image, video or clip are reje
 
 `finish_reason` is `stop` when the model ends its turn, `length` when it hits `max_tokens`, or `tool_calls`. `completion_tokens` counts sampled tokens, including the end-of-turn token. `cached_tokens` counts prompt tokens restored from a prefix snapshot rather than computed, which is a quick way to check that prefix reuse is working.
 
-For gpt-oss, which writes its reasoning on a separate Harmony channel, `message.reasoning_content` holds the reasoning and `content` only the answer. Send it back in `reasoning_content` on later turns with tool calls, and the template replays it.
+When a model reasons, `message.reasoning_content` holds the reasoning and `content` only the answer, without the tags that delimit the reasoning. gpt-oss writes reasoning on a separate Harmony channel, Gemma in a thought channel, and Qwen between `<think>` and `</think>` once the prompt opens thinking, which `thinking: true` does and Qwen3.8's template does by default. Send the reasoning back in `reasoning_content` on later turns with tool calls, and the template replays it.
 
-When the model emits complete function calls, Tur parses them against each tool's parameter schema and returns them as `tool_calls` with no `content`. Tur never runs the tools itself.
+When the model emits complete function calls, Tur parses them against each tool's parameter schema and returns them as `tool_calls`. Text the model wrote before its calls stays in `content`, which is `null` when the reply is only calls. A call that `max_tokens` cut off isn't a call, so it comes back as text with `finish_reason` `length`. Tur never runs the tools itself.
+
+On Qwen, a parameter is read as JSON when its schema says it can't be a string. A schema with several types, in a `type` list or in `anyOf` or `oneOf` alternatives as MCP servers often write optional parameters, is read as JSON when the text parses as one of its other types. So `7` for `{"anyOf": [{"type": "integer"}, {"type": "null"}]}` arrives as the number 7.
 
 With `logprobs`, `choices[0].logprobs.content` lists a `token`, `logprob`, `bytes` and `top_logprobs` for every generated token except the end-of-turn token. The numbers describe the model's own distribution, before penalties, temperature, truncation and grammar masks, so `top_logprobs` can name a token that a grammar forbade. The list also covers reasoning and any text a stop sequence removed. Asking for log probabilities doesn't change which tokens a seed produces.
 
@@ -158,13 +161,72 @@ With `"stream": true`, the response is `text/event-stream`:
 1. A chunk with `delta: {"role": "assistant"}`.
 2. Text chunks with `delta.content`, one per model pass at most. Reasoning a model separates arrives the same way in `delta.reasoning_content`.
 3. With `logprobs`, one chunk holding all of them in `choices[0].logprobs`, because text fragments don't line up with tokens.
-4. Tool-call chunks, if any. A forced call sends only these, without its raw text in `delta.content`.
+4. Tool-call chunks, if any, one per call. A call's raw text never appears in `delta.content`: on Qwen and Gemma the worker keeps every token from a call's opening marker to its closing one out of the text, and gpt-oss writes calls on their own channel.
 5. A final chunk with `finish_reason` and `usage`.
 6. `data: [DONE]`.
 
 The server sends a keep-alive comment every 15 seconds. If generation fails mid-stream, it sends an error object as a data event, then `[DONE]`.
 
 A slow client never holds up other requests. Each stream has a small bounded queue, and text that doesn't fit waits in a buffer. If a client falls more than 16 KiB behind, the server cancels its request with a `slow_client` error and frees its memory. A disconnected client is noticed within one pass.
+
+## `POST /v1/responses`
+
+OpenAI's Responses API, for clients such as the OpenAI Agents SDK and Codex that speak it instead of chat completions. It runs the same generation as chat completions, so models, templates, tool parsing and grammars behave the same. Tur stores no responses: send the whole conversation in `input` each time, as clients do with `"store": false`.
+
+```sh
+curl http://127.0.0.1:8080/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "instructions": "Use tools when they help.",
+    "input": "What is the weather in Paris?",
+    "tools": [{"type": "function", "name": "get_weather",
+      "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+  }'
+```
+
+```json
+{
+  "id": "resp_3daa...", "object": "response", "created_at": 1793708914, "status": "completed", "model": "qwen",
+  "output": [
+    {"type": "function_call", "id": "fc_a094...", "call_id": "call_e36c...", "name": "get_weather",
+     "arguments": "{\"city\":\"Paris\"}", "status": "completed"}
+  ],
+  "usage": {"input_tokens": 277, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 26,
+    "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 303},
+  "incomplete_details": null, "error": null
+}
+```
+
+To continue, append the response's `output` items to `input` as they came, then a `function_call_output` item with the same `call_id` for each call, and send the request again.
+
+| Field | Meaning |
+| --- | --- |
+| `input` | A string, read as one user message, or a list of items: messages (`type` may be left out) with a `role` of `system`, `developer`, `user` or `assistant`, `function_call`, `function_call_output` and `reasoning` |
+| `instructions` | A system message ahead of `input` |
+| `tools` | Function tools: `{"type":"function","name":...,"description":...,"parameters":...}` |
+| `tool_choice` | `"auto"`, `"none"`, `"required"` or `{"type":"function","name":...}`, as in [Structured output](#structured-output) |
+| `text.format` | `{"type":"text"}`, `{"type":"json_object"}` or `{"type":"json_schema","schema":...}`, like `response_format` |
+| `max_output_tokens` | Like `max_tokens` |
+| `temperature`, `top_p` | As for chat completions |
+| `reasoning.effort` | Like `reasoning_effort` |
+| `thinking` (alias `enable_thinking`) | A Tur extension, as for chat completions |
+| `prompt_cache_key` | Partitions prefix reuse like `cache_salt` |
+| `stream` | Server-sent events instead of one JSON response |
+
+Message content is a string or a list of `input_text`, `output_text`, `refusal` and `input_image` parts, where an image is a `data:` URL. A `function_call_output`'s `output` is a string or such a list. A `reasoning` item's text, its `content` if present or else its `summary`, goes to the assistant turn after it. Other fields, such as `store`, `include` and `parallel_tool_calls`, are ignored.
+
+The `output` list holds a `reasoning` item when the model separates its reasoning, then a `message` with one `output_text` part unless the reply is only calls, then a `function_call` item per call. `status` is `completed`, or `incomplete` with `incomplete_details.reason` `max_output_tokens` when the limit cut the reply off. `reasoning_tokens` isn't counted apart from `output_tokens` and reads 0.
+
+Requests Tur can't honor answer 400: `previous_response_id`, because nothing is stored; hosted tools such as `mcp`, `web_search` or `file_search`, because Tur never runs tools (an agent runs its MCP tools itself and offers them as functions); and a `function_call_output` whose `call_id` no earlier `function_call` in `input` has.
+
+With `"stream": true`, every event carries its `type` as the SSE event name and a `sequence_number` from 0:
+
+1. `response.created` and `response.in_progress`, with an empty `output`.
+2. For reasoning and then the answer: `response.output_item.added`, `response.content_part.added`, a `response.reasoning_text.delta` or `response.output_text.delta` per model pass at most, then the matching `.done` event, `response.content_part.done` and `response.output_item.done`.
+3. For each call: `response.output_item.added`, one `response.function_call_arguments.delta` holding all the arguments, `response.function_call_arguments.done` and `response.output_item.done`.
+4. `response.completed`, or `response.incomplete`, with the whole response. Its items, ids included, are the ones streamed.
+
+If generation fails, the stream ends with `response.failed`, whose response holds the `error` code and message. Keep-alives and slow clients are handled as for chat completions.
 
 ## `POST /v1/audio/transcriptions`
 
@@ -202,6 +264,66 @@ Silent windows produce no text. Clips longer than 30 s are transcribed window by
 ## `POST /v1/audio/translations`
 
 Takes the same form and returns English text translated from the speech. Whisper large-v3-turbo was not trained for translation, so prefer a multilingual checkpoint such as large-v3 for this endpoint.
+
+## `POST /v1/decisions`
+
+Answers typed questions about an input with a probability per option, in the shape of OpenAI's Decisions API, so the OpenAI SDKs work by pointing `base_url` at the server. It needs a decision checkpoint, a model trained to answer this way instead of generating text. Tur serves [Intern-Decision](https://huggingface.co/internlm/Intern-Decision-0.8B), an Apache-2.0 fine-tune of Qwen3.5 whose authors report it 9.4 points behind TypeSafe's Jev at 0.8B (79.4 against 88.7 on their seven-benchmark average) and 1.3 ahead at 4B. Other models answer 400.
+
+```sh
+tur serve internlm/Intern-Decision-0.8B --revision 42457fafd13d10d0b0d9be46cb30a23caa409994
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
+decision = client.decisions.create(
+    model="Intern-Decision-0.8B",
+    input="The package arrived with a broken screen. I want my money back.",
+    questions=[
+        {"type": "predicate", "name": "damaged", "instructions": "Does the customer report a damaged item?"},
+        {"type": "choice", "name": "queue", "instructions": "Which team should handle this ticket?",
+         "choices": [{"value": "billing", "description": "Refunds and payments"},
+                     {"value": "shipping", "description": "Delivery and damaged items"}]},
+        {"type": "score", "name": "urgency", "instructions": "How urgent is this ticket?",
+         "levels": [{"label": "low"}, {"label": "medium"}, {"label": "high"}]},
+        {"type": "predicate", "name": "praise", "instructions": "Is the customer praising the product?"},
+    ],
+)
+```
+
+The 0.8B checkpoint answers:
+
+```json
+{"model": "Intern-Decision-0.8B",
+ "answers": [
+  {"type": "predicate", "name": "damaged", "probability": 0.87},
+  {"type": "choice", "name": "queue", "choice": "billing", "confidence": 0.56,
+   "probabilities": [{"value": "billing", "probability": 0.56}, {"value": "shipping", "probability": 0.44}]},
+  {"type": "score", "name": "urgency", "score": 1.23, "confidence": 0.43,
+   "probabilities": [{"value": 0, "label": "low", "probability": 0.17}, {"value": 1, "label": "medium", "probability": 0.43}, {"value": 2, "label": "high", "probability": 0.40}]},
+  {"type": "predicate", "name": "praise", "probability": 0.25}],
+ "usage": {"input_tokens": 335, "output_tokens": 0, "total_tokens": 335,
+           "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+           "output_tokens_details": {"reasoning_tokens": 0}}}
+```
+
+All questions go into one prompt. The user turn shows the state and lists each question's options under the symbols A, B, C and so on; the assistant turn is a JSON object whose values are the checkpoint's `<decision>` token. A question's answer is the softmax over its symbols' logits at the token before its marker, tempered by the temperature the checkpoint's authors fitted (2.75 for the 0.8B). Nothing is generated, so `output_tokens` is 0. The prompt matches the checkpoint's own `inference.py` token for token, and the probabilities match its reference within 0.002 with F32 weights and 0.03 with the default Q8_0.
+
+| Field | Meaning |
+| --- | --- |
+| `model` | As for chat completions; must be a decision checkpoint |
+| `input` | The state. A string, or messages with content as a string or `input_text`, `output_text`, `input_json` and `input_image` parts. Images (up to 8, `data:` URLs) go to the model in order as `Picture 1`, `Picture 2` and so on. A single user message with one other part is passed as that value, so `input_json` reaches the model as JSON; anything else becomes a list of `{role, content}` turns |
+| `questions` | 1 to 16 questions, answered in order. Each has `type`, `instructions` and an optional `name`; unnamed questions are called `q1`, `q2` and so on by position, and names must be unique |
+| `prompt_cache_key` | Partitions prefix reuse like `cache_salt` |
+
+| `type` | Extra fields | Answer |
+| --- | --- | --- |
+| `predicate` | none | `probability` that the answer is yes |
+| `choice` | `choices`: 2 to 62 `{value, description?}`, values strings or booleans and distinct as text | `choice`, `confidence`, `probabilities` per value |
+| `score` | `levels`: 2 to 10 `{label, description?}`, lowest first | `score` (the probability-weighted level index from 0), `confidence`, `probabilities` per level |
+
+`confidence` is the probability of the likeliest option, and ties go to the smallest value. Every question is read in the passes that prefill the prompt, so a request costs what its prompt does: on an M1 one question about the ticket above (194 tokens) takes about 205 ms, and all four (335 tokens, split into two passes at the 256-token snapshot boundary) about 300 ms. Prefix reuse applies to the input, so repeating a 1,900-token state with new questions restored 1,792 tokens and took 0.25 s. With the fixture image of colour ramps and a stripe, the 0.8B answers that it mainly shows stripes (0.81) and bright colours (0.82). The temperature is known only for the published 0.8B; a local copy reads uncalibrated. Function-call input items, refusals and streaming aren't supported.
 
 ## Operating the server
 
@@ -254,7 +376,7 @@ Errors use OpenAI's shape:
 
 | Status | `type` / `code` | Cause |
 | --- | --- | --- |
-| 400 | `invalid_request_error` | Empty messages, unknown role, invalid sampling values, unsupported `tool_choice`, a schema, grammar or tool choice that can't be honored (a grammar failing during generation has the code `invalid_grammar`), undecodable or unsupported audio, images or video, or a request the engine rejects (`invalid_request`) |
+| 400 | `invalid_request_error` | Empty messages, unknown role, invalid sampling values, unsupported `tool_choice`, a schema, grammar or tool choice that can't be honored (a grammar failing during generation has the code `invalid_grammar`), undecodable or unsupported audio, images or video, a decision request with too many or malformed questions or for a model that isn't a decision checkpoint, a Responses request with `previous_response_id`, a hosted tool or a `function_call_output` without its call, or a request the engine rejects (`invalid_request`) |
 | 400 | `invalid_request_error` / `context_length_exceeded` | The prompt and `max_tokens` don't fit the context the server allows |
 | 404 | `invalid_request_error` | Unknown `model` |
 | 408 | `timeout_error` / `slow_client` | A streaming client stopped reading |

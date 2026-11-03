@@ -5,9 +5,11 @@
     reason = "tests assert outcomes after fallible setup"
 )]
 
+mod agentic;
 mod audio;
 mod common;
 mod contracts;
+mod decisions;
 mod engine;
 mod fused;
 mod gemma4;

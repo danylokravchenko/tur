@@ -10,7 +10,9 @@ tur run qwen 'What is the capital of France?' \
 
 `--gguf` takes a local path or `organization/repository/file.gguf`. A remote file loads at `--gguf-revision`, a 40-character commit, because branches can move. Without the flag, Tur uses the repository's latest commit and prints it. Give the first shard of a split file (`-00001-of-00003.gguf`) and Tur finds the others.
 
-The model argument still names the original checkpoint, because the config, tokenizer and chat template come from there. Tur downloads only those files, not its weights. A local directory holding just `config.json`, `tokenizer.json`, `tokenizer_config.json` and the template works too. `--weight-format` is an error with `--gguf`.
+The model argument still names the original checkpoint, because the config and tokenizer come from there. Tur downloads only those files, not its weights. A local directory holding just `config.json`, `tokenizer.json`, `tokenizer_config.json` and the template works too. `--weight-format` is an error with `--gguf`.
+
+A fine-tune can change its chat template or its tokens without changing the base model's shapes, so Tur reads both from the file. A template in the file (`tokenizer.chat_template`) replaces the checkpoint's. The file's token list must spell every token as the checkpoint's tokenizer does, with llama.cpp's `[PAD<id>]` filler where the tokenizer has none. Otherwise loading fails and names the first token that differs, because a mismatched tokenizer would feed the model the wrong IDs. The file's end-of-sequence token also stops generation.
 
 Before reading any weights, Tur checks the file's architecture and every tensor's name, shape and format against the config, so a file for the wrong model fails at once.
 
@@ -58,5 +60,6 @@ On the two files measured, with several sequences Tur decodes 1.2 to 1.4× faste
 
 - Tensors load as stored. Decoding to one format would cost memory and fidelity the user chose, and re-encoding would change the quant they picked.
 - Mixed matrices run per part. Up to eight rows, each part takes its own fastest kernel and the outputs concatenate, which brought one-row decode from 0.43 to 0.54× of Candle's one-format speed to 0.84 to 0.98×. Above eight rows every part writes its columns of one output through the wide block kernel, with no copy, which raised `UD-Q2_K_XL` prefill from 1,137 to 1,287 tokens/s at 512 tokens. This costs `Q3_K` parts some kernel speed, at about 0.9× of Candle's, but no real file measured got slower.
-- The model's config, tokenizer and template come from its own checkpoint rather than the file's metadata, so shape validation and templates share one path with SafeTensors.
+- The config and tokenizer come from the model's checkpoint rather than being rebuilt from the file's metadata, so shape validation and tokenization share one path with SafeTensors. The file's token list is checked against that tokenizer, which every token of a real Qwen3.8-27B fine-tune's file matched.
+- The file's chat template wins over the checkpoint's, because it is the one the file's author shipped and a fine-tune may have edited it.
 - Decoders are checked against ggml's own `dequantize_row_*`, on host and device, in every packed format (`scripts/gguf_blocks_reference.py`).

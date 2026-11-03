@@ -595,8 +595,9 @@ pub struct SequenceCommit {
 pub struct SequenceResult {
     pub request: Uuid,
     pub outcome: Result<SequenceCommit>,
-    /// Model logits of the sequence's last output, before penalties and masks; a view of
-    /// the pass's output, so copy it to keep it beyond the result.
+    /// Model logits of the sequence's outputs, `[outputs, vocab]` in output order, before
+    /// penalties and masks; a view of the pass's output, so copy it to keep it beyond the
+    /// result.
     pub logits: Option<Tensor>,
     /// Final hidden states of every input token of the pass, when the draft head is
     /// enabled ([`HybridEngine::enable_draft_head`]); the first `accepted_tokens` rows are
@@ -1898,11 +1899,7 @@ impl<M: HybridModel> HybridEngine<M> {
             let hidden = hidden.next().flatten();
             let first_logprobs = logprob_first.next().flatten();
             let n = sequence.outputs.len();
-            let last = logits
-                .as_ref()
-                .ok()
-                .filter(|_| n > 0)
-                .and_then(|t| t.narrow(0, n - 1, 1).ok());
+            let rows_of_outputs = logits.as_ref().ok().filter(|_| n > 0).cloned();
             let rows = logits.and_then(|_| match placement {
                 Placement::None => Ok(Vec::new()),
                 Placement::Stopped => Ok((0..n).map(|_| Row::Stopped).collect()),
@@ -1954,7 +1951,7 @@ impl<M: HybridModel> HybridEngine<M> {
             results.push(SequenceResult {
                 request: id,
                 outcome,
-                logits: last,
+                logits: rows_of_outputs,
                 hidden,
             });
         }

@@ -79,7 +79,7 @@ Flags and the file override what a name brings. To run `gpt-oss` with every expe
 | --- | --- | --- |
 | `--revision <rev>` | The name's commit, a repository's latest, or a directory's name | A 40-character commit for remote models, or a name you choose for local ones |
 | `--weight-format f32\|q8_0\|q4k` | `q8_0` | Convert SafeTensors weights to this format while loading. Leave it out for a [prepacked artifact](quantization.md) |
-| `--gguf <path or org/name/file.gguf>` | none (flag or `TUR_GGUF`) | Load weights from a [GGUF file](gguf.md) as stored; the model argument then supplies only the config, tokenizer and template |
+| `--gguf <path or org/name/file.gguf>` | none (flag or `TUR_GGUF`) | Load weights from a [GGUF file](gguf.md) as stored; the model argument then supplies the config and a tokenizer that must match the file; a template in the file replaces the checkpoint's |
 | `--gguf-revision <commit>` | the repository's latest (flag or `TUR_GGUF_REVISION`) | 40-character commit of a remote `--gguf` file |
 | `--kv-format f32\|f16\|q8\|q8_<group>` | `f16` | Storage for attention keys and values; `q8` uses one scale per 32 values |
 | `--kv-page-tokens <n>` | 16 | Tokens per K/V page |

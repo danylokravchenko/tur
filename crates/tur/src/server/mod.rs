@@ -80,6 +80,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/diagnostics", get(routes::ops::diagnostics))
         .route("/v1/models", get(routes::models::list_models))
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
+        .route("/v1/responses", post(routes::responses::responses))
+        .route("/v1/decisions", post(routes::decisions::decisions))
         .route(
             "/v1/audio/transcriptions",
             post(routes::audio::transcriptions),

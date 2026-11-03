@@ -902,6 +902,7 @@ mod http {
                     generated_text: clips.join(","),
                     reasoning_text: String::new(),
                     logprobs: Vec::new(),
+                    scores: Vec::new(),
                 })));
             }
         });

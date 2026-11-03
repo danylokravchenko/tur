@@ -103,13 +103,7 @@ fn parse_xml_call(text: &str, tools: &[ToolDefinition]) -> Option<ToolCall> {
             return None;
         }
         let (value, rest) = rest.split_once("</parameter>")?;
-        let schema = &tool.parameters["properties"][parameter];
-        let value = match schema["type"].as_str() {
-            Some("number" | "integer" | "boolean" | "object" | "array" | "null") => {
-                serde_json::from_str(value.trim()).ok()?
-            }
-            _ => serde_json::Value::String(value.trim().to_string()),
-        };
+        let value = xml_value(value.trim(), &tool.parameters["properties"][parameter])?;
         if arguments.insert(parameter.to_string(), value).is_some() {
             return None;
         }
@@ -119,6 +113,42 @@ fn parse_xml_call(text: &str, tools: &[ToolDefinition]) -> Option<ToolCall> {
         name: name.to_string(),
         arguments: arguments.into(),
     })
+}
+
+/// The JSON types `schema` admits, from `type` (a name or a list) or the alternatives of
+/// `anyOf` and `oneOf`, as MCP servers often describe optional parameters. Empty when it
+/// names none.
+fn schema_types(schema: &serde_json::Value) -> Vec<&str> {
+    let mut types: Vec<&str> = match &schema["type"] {
+        serde_json::Value::String(name) => vec![name.as_str()],
+        serde_json::Value::Array(names) => names.iter().filter_map(|n| n.as_str()).collect(),
+        _ => Vec::new(),
+    };
+    for key in ["anyOf", "oneOf"] {
+        for alternative in schema[key].as_array().into_iter().flatten() {
+            types.extend(schema_types(alternative));
+        }
+    }
+    types
+}
+
+/// One parameter's text as its value. A parameter that can't be a string must be JSON; one
+/// that can be either is JSON when it reads as one of its other types, and text otherwise.
+fn xml_value(text: &str, schema: &serde_json::Value) -> Option<serde_json::Value> {
+    let types = schema_types(schema);
+    let text_value = || serde_json::Value::String(text.to_string());
+    if types.iter().all(|name| *name == "string") {
+        return Some(text_value());
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
+    if !types.contains(&"string") {
+        return parsed;
+    }
+    Some(
+        parsed
+            .filter(|value| !value.is_string())
+            .unwrap_or_else(text_value),
+    )
 }
 
 #[cfg(test)]
@@ -194,5 +224,37 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn test_xml_union_types_decode_their_non_string_alternatives() {
+        let tools = [ToolDefinition::new(
+            "f",
+            "",
+            serde_json::json!({"properties": {
+                "milestone": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                "note": {"type": ["string", "null"]},
+                "tag": {"oneOf": [{"type": "string"}, {"type": "array"}]},
+                "plain": {"description": "no type at all"}
+            }}),
+        )];
+        let call = |parameter: &str, value: &str| {
+            let text = format!(
+                "<tool_call><function=f><parameter={parameter}>{value}</parameter></function></tool_call>"
+            );
+            ToolCall::parse_from_output(&text, &tools)
+                .first()
+                .map(|call| call.arguments[parameter].clone())
+        };
+        assert_eq!(call("milestone", "7"), Some(serde_json::json!(7)));
+        assert_eq!(call("milestone", "null"), Some(serde_json::Value::Null));
+        // Neither an integer nor null: not a valid call.
+        assert_eq!(call("milestone", "soon"), None);
+        assert_eq!(call("note", "null"), Some(serde_json::Value::Null));
+        assert_eq!(call("note", "hello"), Some(serde_json::json!("hello")));
+        // A string alternative keeps text that happens to be quoted JSON as written.
+        assert_eq!(call("tag", "\"v1\""), Some(serde_json::json!("\"v1\"")));
+        assert_eq!(call("tag", "[\"a\"]"), Some(serde_json::json!(["a"])));
+        assert_eq!(call("plain", "42"), Some(serde_json::json!("42")));
     }
 }

@@ -16,14 +16,14 @@ use uuid::Uuid;
 use crate::{audio::Audio, image::Image, video::Video};
 use crate::{
     backend::{
-        chat_template::{ChatMessage, Content, ContentPart, RenderOptions, Role, ToolCall},
-        pipeline::{GenerationRequest, GenerationStats, TokenLogprob},
+        chat_template::{ChatMessage, Content, ContentPart, Role, ToolCall},
+        pipeline::{GenerationStats, TokenLogprob},
         structured::StructuredOutput,
         tools::ToolDefinition,
     },
-    hybrid::SamplingOptions,
     server::{
         AppState, media,
+        routes::generation::{self, Controls, ToolChoice, bad_request, forced_output},
         types::{
             ApiErrorBody, ApiErrorResponse, AssistantFunction, AssistantToolCall, ChatChoice,
             ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
@@ -32,7 +32,7 @@ use crate::{
             PromptTokensDetails, ResponseFormat, ResponseFunction, ResponseToolCall, StopSequences,
             TopLogprob, Usage,
         },
-        worker::{TextDelta, WorkerMsg},
+        worker::TextDelta,
     },
 };
 
@@ -111,7 +111,7 @@ fn wav(bytes: &[u8]) -> crate::Result<ContentPart> {
 }
 
 /// An image part's bytes, which only a `data:` URL carries: decoding happens by content.
-fn image(url: &str) -> crate::Result<ContentPart> {
+pub(crate) fn image(url: &str) -> crate::Result<ContentPart> {
     let (media_type, bytes) = media::data_url(url)?;
     if !media_type.starts_with("image/") {
         return Err(crate::core::execution::invalid(
@@ -200,7 +200,8 @@ fn to_internal_messages(
     msgs.iter()
         .map(|m| {
             let role = match m.role.as_str() {
-                "system" => Role::System,
+                // OpenAI's newer name for system instructions.
+                "system" | "developer" => Role::System,
                 "user" => Role::User,
                 "assistant" => Role::Assistant,
                 "tool" => Role::Tool,
@@ -251,32 +252,25 @@ fn to_internal_tools(tools: &[crate::server::types::OpenAITool]) -> Vec<ToolDefi
 }
 
 /// What a request's `response_format` and `tool_choice` force, or why they can't be honored.
-/// `tool_choice=none` also clears the tools, so the model isn't told about them.
-fn structured_output(req: &mut ChatCompletionRequest) -> Result<Option<StructuredOutput>, String> {
-    let tool = match req.tool_choice.as_ref() {
-        None => None,
+fn structured_output(
+    req: &mut ChatCompletionRequest,
+    tools: &mut Vec<ToolDefinition>,
+) -> Result<Option<StructuredOutput>, String> {
+    let choice = match req.tool_choice.take() {
+        None => ToolChoice::Auto,
         Some(serde_json::Value::String(mode)) => match mode.as_str() {
-            "auto" => None,
-            "none" => {
-                req.tools.clear();
-                None
-            }
-            "required" if req.tools.is_empty() => {
-                return Err("tool_choice=required needs at least one tool".into());
-            }
-            "required" => Some(StructuredOutput::Tool(None)),
+            "auto" => ToolChoice::Auto,
+            "none" => ToolChoice::None,
+            "required" => ToolChoice::Required,
             other => return Err(format!("unsupported tool_choice '{other}'")),
         },
-        Some(choice) => {
-            let name = choice["function"]["name"]
+        Some(choice) => ToolChoice::Named(
+            choice["function"]["name"]
                 .as_str()
                 .filter(|_| choice["type"] == "function")
-                .ok_or("tool_choice must be a mode or name a function")?;
-            if !req.tools.iter().any(|tool| tool.function.name == name) {
-                return Err(format!("tool_choice names unknown tool '{name}'"));
-            }
-            Some(StructuredOutput::Tool(Some(name.to_owned())))
-        }
+                .ok_or("tool_choice must be a mode or name a function")?
+                .to_owned(),
+        ),
     };
     let answer = match req.response_format.take() {
         None | Some(ResponseFormat::Text) => None,
@@ -289,11 +283,7 @@ fn structured_output(req: &mut ChatCompletionRequest) -> Result<Option<Structure
             GrammarSyntax::Lark => StructuredOutput::Lark(definition),
         }),
     };
-    // A forced answer leaves a model no way to reach a tool it was told about.
-    if answer.is_some() && !req.tools.is_empty() {
-        return Err("response_format can't be combined with tools; set tool_choice to none".into());
-    }
-    Ok(tool.or(answer))
+    forced_output(choice, answer, tools)
 }
 
 /// The alternatives count of a request's log probabilities.
@@ -333,151 +323,62 @@ pub async fn chat_completions(
     Json(mut req): Json<ChatCompletionRequest>,
 ) -> Response {
     if req.messages.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ApiErrorResponse::bad_request("messages must not be empty")),
-        )
-            .into_response();
+        return bad_request("messages must not be empty");
     }
-
-    let model_id = if req.model.is_empty() {
-        state.default_model.clone()
-    } else {
-        req.model.clone()
+    let (model_id, worker) = match generation::worker(&state, &req.model) {
+        Ok(found) => found,
+        Err(response) => return *response,
     };
-
-    let worker = match state.workers.get(&model_id) {
-        Some(w) => w.clone(),
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ApiErrorResponse::bad_request(format!(
-                    "model '{}' not found; available: {}",
-                    model_id,
-                    state.workers.keys().cloned().collect::<Vec<_>>().join(", ")
-                ))),
-            )
-                .into_response();
-        }
-    };
-
     let input = std::mem::take(&mut req.messages);
     let video_allowed = worker.accepts_video();
-    let converted =
-        tokio::task::spawn_blocking(move || to_internal_messages(&input, video_allowed)).await;
-    let messages = match converted {
-        Ok(Ok(messages)) => messages,
-        Ok(Err(error)) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ApiErrorResponse::bad_request(error.to_string())),
-            )
-                .into_response();
-        }
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorResponse::internal("message decoding failed")),
-            )
-                .into_response();
-        }
-    };
-    let bad_request = |message: String| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ApiErrorResponse::bad_request(message)),
-        )
-            .into_response()
-    };
-    let structured = match structured_output(&mut req) {
+    let messages =
+        match generation::convert(move || to_internal_messages(&input, video_allowed)).await {
+            Ok(messages) => messages,
+            Err(response) => return *response,
+        };
+    let mut tools = to_internal_tools(&req.tools);
+    let structured = match structured_output(&mut req, &mut tools) {
         Ok(structured) => structured,
         Err(message) => return bad_request(message),
     };
     let logprobs = match logprob_count(&req) {
         Ok(logprobs) => logprobs,
-        Err(message) => return bad_request(message.to_owned()),
+        Err(message) => return bad_request(message),
     };
     // A forced call has no answer: its raw text must not stream as `content`.
     let forced_call = matches!(structured, Some(StructuredOutput::Tool(_)));
-    if req.max_tokens == Some(0)
-        || req.temperature.is_some_and(|v| !v.is_finite() || v < 0.0)
-        || req
-            .top_p
-            .is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 1.0)
-        || req.top_k == Some(0)
-        || [req.presence_penalty, req.frequency_penalty]
-            .iter()
-            .flatten()
-            .any(|v| !v.is_finite())
-        || req
-            .repetition_penalty
-            .is_some_and(|v| !v.is_finite() || v <= 0.0)
-        || req
-            .reasoning_effort
-            .as_ref()
-            .is_some_and(|v| !matches!(v.as_str(), "low" | "medium" | "xhigh"))
+    let controls = Controls {
+        // Newer clients send `max_completion_tokens`, which replaced `max_tokens`.
+        max_tokens: req.max_completion_tokens.or(req.max_tokens),
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k,
+        presence_penalty: req.presence_penalty,
+        frequency_penalty: req.frequency_penalty,
+        repetition_penalty: req.repetition_penalty,
+        seed: req.seed,
+        thinking: req.thinking,
+        reasoning_effort: req.reasoning_effort,
+        preserve_thinking: req.preserve_thinking,
+        cache_salt: req.cache_salt,
+        stop: req.stop.map_or_else(Vec::new, StopSequences::into_vec),
+        logprobs,
+    };
+    let submitted = match generation::submit(
+        &worker, messages, tools, structured, controls, req.stream,
+    )
+    .await
     {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ApiErrorResponse::bad_request("invalid generation controls")),
-        )
-            .into_response();
-    }
-    let tools = to_internal_tools(&req.tools);
-    let max_tokens = req.max_tokens.unwrap_or(1024);
-
-    let (token_tx, token_rx) = if req.stream {
-        let (tx, rx) = worker.stream_channel();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
+        Ok(submitted) => submitted,
+        Err(response) => return *response,
     };
-    let (result_tx, result_rx) = oneshot::channel();
-
-    let worker_msg = WorkerMsg {
-        request: GenerationRequest {
-            messages,
-            tools,
-            max_tokens,
-            fit_context: req.max_tokens.is_none(),
-            stop: req.stop.map_or_else(Vec::new, StopSequences::into_vec),
-            sampling: SamplingOptions {
-                temperature: req.temperature,
-                top_p: req.top_p,
-                top_k: req.top_k,
-                repetition_penalty: req.repetition_penalty,
-                presence_penalty: req.presence_penalty,
-                frequency_penalty: req.frequency_penalty,
-                logprobs,
-            },
-            seed: req.seed.unwrap_or(299_792_458),
-            timeout: None,
-            submitted_at: None,
-            cache_salt: req.cache_salt,
-            grammar: None,
-            structured,
-            encoded_media: Vec::new(),
-            render: RenderOptions {
-                add_generation_prompt: true,
-                enable_thinking: req.thinking,
-                reasoning_effort: req.reasoning_effort,
-                preserve_thinking: req.preserve_thinking,
-            },
-        },
-        token_tx,
-        result_tx,
-    };
-
-    if let Err(e) = worker.send(worker_msg).await {
-        let (status, body) = execution_error(&e);
-        return (status, Json(body)).into_response();
-    }
-
-    match token_rx {
-        Some(token_rx) => {
-            stream_response(model_id, token_rx, result_rx, forced_call).into_response()
+    match submitted.tokens {
+        Some(tokens) => {
+            stream_response(model_id, tokens, submitted.result, forced_call).into_response()
         }
-        None => blocking_response(model_id, result_rx).await.into_response(),
+        None => blocking_response(model_id, submitted.result)
+            .await
+            .into_response(),
     }
 }
 
@@ -504,25 +405,21 @@ async fn blocking_response(
         }
     };
 
-    let full_text = stats.generated_text.clone();
-
-    let (content, response_tool_calls) = if stats.tool_calls.is_empty() {
-        (Some(full_text), vec![])
-    } else {
-        let calls: Vec<AssistantToolCall> = stats
-            .tool_calls
-            .iter()
-            .map(|tc| AssistantToolCall {
-                id: format!("call_{:08x}", Uuid::new_v4().as_fields().0),
-                call_type: "function".to_string(),
-                function: AssistantFunction {
-                    name: tc.name.clone(),
-                    arguments: serde_json::to_string(&tc.arguments).unwrap_or_default(),
-                },
-            })
-            .collect();
-        (None, calls)
-    };
+    // Text the model wrote besides its calls stays; a reply of calls alone has no content.
+    let content = Some(stats.generated_text.clone())
+        .filter(|text| stats.tool_calls.is_empty() || !text.is_empty());
+    let response_tool_calls: Vec<AssistantToolCall> = stats
+        .tool_calls
+        .iter()
+        .map(|tc| AssistantToolCall {
+            id: format!("call_{:08x}", Uuid::new_v4().as_fields().0),
+            call_type: "function".to_string(),
+            function: AssistantFunction {
+                name: tc.name.clone(),
+                arguments: serde_json::to_string(&tc.arguments).unwrap_or_default(),
+            },
+        })
+        .collect();
 
     let finish_reason = if response_tool_calls.is_empty() {
         stats.finish_reason

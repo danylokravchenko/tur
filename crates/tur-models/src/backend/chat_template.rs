@@ -137,6 +137,8 @@ pub struct RenderOptions {
     pub enable_thinking: Option<bool>,
     pub reasoning_effort: Option<String>,
     pub preserve_thinking: Option<bool>,
+    /// Number images and videos (`Picture 1: ...`) where the template supports it.
+    pub add_vision_id: Option<bool>,
 }
 
 impl ChatTemplate {
@@ -185,7 +187,8 @@ impl ChatTemplate {
         Self::from_tokenizer_config(&dir.join("tokenizer_config.json"))
     }
 
-    fn with_tokens(mut self, config: &serde_json::Value) -> Result<Self> {
+    /// Give the template the special tokens `tokenizer_config.json` names.
+    pub(crate) fn with_tokens(mut self, config: &serde_json::Value) -> Result<Self> {
         for (name, value) in config.as_object().into_iter().flatten() {
             // Tokenizer insertion policies are not special-token template variables.
             if !name.ends_with("_token") || name.starts_with("add_") || value.is_null() {
@@ -255,6 +258,9 @@ impl ChatTemplate {
         }
         if let Some(value) = options.preserve_thinking {
             ctx.insert("preserve_thinking".into(), value.into());
+        }
+        if let Some(value) = options.add_vision_id {
+            ctx.insert("add_vision_id".into(), value.into());
         }
         env.get_template("chat")
             .and_then(|t| t.render(minijinja::value::Serde(serde_json::Value::Object(ctx))))

@@ -143,6 +143,8 @@ pub struct PipelineWorker {
     exit: watch::Receiver<()>,
     /// Whether this model takes video. The route checks before any decoder sees a file.
     video: bool,
+    /// The candidate temperature of a decision checkpoint; `None` for other models.
+    decisions: Option<f64>,
 }
 
 const MAX_ADMISSIONS_PER_PASS: usize = 32;
@@ -536,6 +538,7 @@ impl PipelineWorker {
         let timeout = config.request_timeout;
         let stream = config.stream;
         let video = config.factory.video;
+        let temperature = crate::backend::decision::temperature(&config.factory.source);
         let (tx, rx) = mpsc::channel(256);
         let intake = tx.downgrade();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -551,11 +554,15 @@ impl PipelineWorker {
                     &config.budget,
                 ) {
                     Ok(pipeline) => {
-                        let report = model_report(&config.factory, &pipeline);
+                        let decisions = pipeline
+                            .token_id(crate::backend::decision::MARKER)
+                            .map(|_| temperature);
+                        let report = (model_report(&config.factory, &pipeline), decisions);
                         tracing::info!(
-                            source = %report.source,
-                            revision = %report.revision,
-                            kernels = %report.kernels,
+                            source = %report.0.source,
+                            revision = %report.0.revision,
+                            kernels = %report.0.kernels,
+                            decision_temperature = ?decisions,
                             "Model loaded"
                         );
                         if ready_tx.send(Ok(report)).is_err() {
@@ -580,7 +587,7 @@ impl PipelineWorker {
                 // Dropped last: the pipeline and its device memory are gone by now.
                 drop(exit_tx);
             })?;
-        let report = ready_rx
+        let (report, decisions) = ready_rx
             .recv()
             .map_err(|error| TurError::Other(format!("Worker startup failed: {error}")))??;
         Ok(Self {
@@ -591,6 +598,7 @@ impl PipelineWorker {
             telemetry,
             exit,
             video,
+            decisions,
         })
     }
 
@@ -604,6 +612,7 @@ impl PipelineWorker {
             telemetry: Arc::default(),
             exit: watch::channel(()).1,
             video: true,
+            decisions: None,
         }
     }
 
@@ -612,6 +621,19 @@ impl PipelineWorker {
     pub fn without_video(mut self) -> Self {
         self.video = false;
         self
+    }
+
+    /// This worker answering decisions with candidate `temperature`, as a decision checkpoint
+    /// loads.
+    #[must_use]
+    pub fn with_decisions(mut self, temperature: f64) -> Self {
+        self.decisions = Some(temperature);
+        self
+    }
+
+    /// The candidate temperature when this model is a decision checkpoint.
+    pub fn decision_temperature(&self) -> Option<f64> {
+        self.decisions
     }
 
     /// Whether this model takes video in requests.
@@ -696,6 +718,7 @@ mod tests {
             telemetry: Arc::default(),
             exit: watch::channel(()).1,
             video: true,
+            decisions: None,
         };
         let message = || {
             let (token_tx, token_rx) = mpsc::channel(1);

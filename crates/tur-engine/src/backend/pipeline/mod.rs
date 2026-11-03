@@ -8,11 +8,14 @@ mod layered;
 mod media;
 mod requests;
 mod scheduling;
+mod scoring;
 
 pub use config::PipelineConfig;
 pub use requests::{BatchStepOutput, GenerationRequest, GenerationStats, PassTiming, TokenLogprob};
+pub use scoring::Scoring;
 
 use super::{
+    calls::CallSplit,
     guidance::ParserFactory,
     harmony::Harmony,
     memory::{BudgetLease, MemoryPlan},
@@ -95,9 +98,14 @@ struct Pending {
     last_run: u64,
     preemptions: usize,
     tools: Vec<ToolDefinition>,
+    /// Holds tool calls out of the answer, when tools are offered and the tokenizer has
+    /// single-token call markers.
+    calls: Option<CallSplit>,
     /// Names tokens for the log probabilities it reports, when the request asked for them.
     logprob_tokens: Option<Arc<ParserFactory>>,
     logprobs: Vec<TokenLogprob>,
+    /// Read positions inside the prompt, for a scoring request.
+    scores: Option<scoring::Scores>,
     /// Separates reasoning from a structured answer, for models whose channels don't.
     split: Option<ReasoningSplit>,
     /// Greedy decoding: its drafts' acceptance is calibrated separately from sampling's.
@@ -237,6 +245,11 @@ impl InferencePipeline {
     /// The model behind this pipeline, for its identity and kernels.
     pub fn model(&self) -> &TextModel {
         &self.model
+    }
+
+    /// The id of `token` in the tokenizer's vocabulary or added tokens.
+    pub fn token_id(&self, token: &str) -> Option<u32> {
+        self.tokenizer.token_to_id(token)
     }
 
     /// Width of the model's output.

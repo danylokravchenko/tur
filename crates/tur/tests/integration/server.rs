@@ -74,6 +74,7 @@ fn mock_worker(response_text: &'static str) -> PipelineWorker {
                 generated_text: response_text.to_string(),
                 reasoning_text: String::new(),
                 logprobs: Vec::new(),
+                scores: Vec::new(),
             })));
         }
     });
@@ -108,6 +109,7 @@ fn mock_tool_call_worker(
                 generated_text: String::new(),
                 reasoning_text: String::new(),
                 logprobs: Vec::new(),
+                scores: Vec::new(),
             })));
         }
     });
@@ -531,6 +533,7 @@ fn plain_stats() -> GenerationStats {
         generated_text: "{}".to_string(),
         reasoning_text: String::new(),
         logprobs: Vec::new(),
+        scores: Vec::new(),
     }
 }
 

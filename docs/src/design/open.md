@@ -42,3 +42,4 @@
 
 - Soak tests: multi-hour cancellation and churn runs to check thermal behaviour and leaks.
 - Lints: tighten `indexing_slicing` crate by crate, starting with `tur-core` and `tur-cli`.
+- Decisions: serve the Intern-Decision 2B and 4B checkpoints once their temperatures are pinned and checked against their references.

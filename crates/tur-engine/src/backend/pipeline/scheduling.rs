@@ -121,10 +121,15 @@ impl InferencePipeline {
             }
             // Recomputation keeps its original pass boundaries above the first restore.
             let (boundaries, floor) = (&pending.boundaries, pending.replay_floor);
+            let limit = pending
+                .scores
+                .as_ref()
+                .map_or(usize::MAX, super::scoring::Scores::restore_limit);
             let accept = |length: usize| {
-                boundaries.is_empty()
-                    || length <= floor
-                    || boundaries.binary_search(&length).is_ok()
+                length <= limit
+                    && (boundaries.is_empty()
+                        || length <= floor
+                        || boundaries.binary_search(&length).is_ok())
             };
             let Some(hit) = self.prefix.lookup(&pending.keys, &pending.tokens, accept) else {
                 pending.prefix_checked = Some(inserted);
