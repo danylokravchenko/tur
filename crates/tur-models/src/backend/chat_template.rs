@@ -187,7 +187,8 @@ impl ChatTemplate {
         Self::from_tokenizer_config(&dir.join("tokenizer_config.json"))
     }
 
-    fn with_tokens(mut self, config: &serde_json::Value) -> Result<Self> {
+    /// Give the template the special tokens `tokenizer_config.json` names.
+    pub(crate) fn with_tokens(mut self, config: &serde_json::Value) -> Result<Self> {
         for (name, value) in config.as_object().into_iter().flatten() {
             // Tokenizer insertion policies are not special-token template variables.
             if !name.ends_with("_token") || name.starts_with("add_") || value.is_null() {

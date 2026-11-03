@@ -9,7 +9,7 @@ use tur::{
 };
 use tur_models::models::WeightFormat;
 
-const TINY: &str = r#"{
+pub(crate) const TINY: &str = r#"{
   "architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5_text",
   "hidden_size": 64, "intermediate_size": 128, "vocab_size": 96, "num_hidden_layers": 4,
   "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
@@ -119,7 +119,10 @@ impl Checkpoint {
         })
     }
 
-    fn write(config: &str, weights: impl Fn(&str, usize, u64) -> Vec<f32>) -> Result<Self> {
+    pub(crate) fn write(
+        config: &str,
+        weights: impl Fn(&str, usize, u64) -> Vec<f32>,
+    ) -> Result<Self> {
         let dir = std::env::temp_dir().join(format!("tur-adapter-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let fixture = Self(dir);

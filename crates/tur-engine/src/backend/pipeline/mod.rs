@@ -15,6 +15,7 @@ pub use requests::{BatchStepOutput, GenerationRequest, GenerationStats, PassTimi
 pub use scoring::Scoring;
 
 use super::{
+    calls::CallSplit,
     guidance::ParserFactory,
     harmony::Harmony,
     memory::{BudgetLease, MemoryPlan},
@@ -97,6 +98,9 @@ struct Pending {
     last_run: u64,
     preemptions: usize,
     tools: Vec<ToolDefinition>,
+    /// Holds tool calls out of the answer, when tools are offered and the tokenizer has
+    /// single-token call markers.
+    calls: Option<CallSplit>,
     /// Names tokens for the log probabilities it reports, when the request asked for them.
     logprob_tokens: Option<Arc<ParserFactory>>,
     logprobs: Vec<TokenLogprob>,

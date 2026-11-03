@@ -141,6 +141,15 @@ impl ModelFactory {
         reserve: impl FnOnce(&ModelConfig, &LoadOptions) -> Result<R>,
     ) -> Result<(TextModel, Tokenizer, ChatTemplate, GenerationDefaults, R)> {
         let dir = self.resolve()?;
+        let gguf = match &self.gguf {
+            Some(_) if self.format.is_some() => {
+                return Err(TurError::Other(
+                    "a GGUF file loads as stored; omit the weight format".into(),
+                ));
+            }
+            Some(source) => Some(Arc::new(GgufFile::open(&source.resolve()?)?)),
+            None => None,
+        };
         let config = ModelConfig::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?;
         let generation = match std::fs::read_to_string(dir.join("generation_config.json")) {
             Ok(json) => Some(json),
@@ -176,26 +185,29 @@ impl ModelFactory {
                 defaults.eos_tokens.push(id);
             }
         }
-        let template = ChatTemplate::from_model_dir(&dir)?;
-        let weights = match (self.format, is_artifact(&dir)) {
-            (Some(_), _) if self.gguf.is_some() => {
-                return Err(TurError::Other(
-                    "a GGUF file loads as stored; omit the weight format".into(),
-                ));
-            }
-            _ if self.gguf.is_some() => {
-                let path = self.gguf.as_ref().map(GgufSource::resolve).transpose()?;
-                let path = path.ok_or_else(|| TurError::Other("no GGUF file".into()))?;
-                Weights::Gguf(Arc::new(GgufFile::open(&path)?))
-            }
-            (None, true) => Weights::Prepacked(Arc::new(Manifest::read(&dir)?)),
-            (None, false) => WeightFormat::Q8_0.into(),
-            (Some(_), true) => {
+        if let Some(id) = gguf
+            .as_ref()
+            .map(|file| file.check_tokenizer(&tokenizer))
+            .transpose()?
+            .flatten()
+            && !defaults.eos_tokens.contains(&id)
+        {
+            defaults.eos_tokens.push(id);
+        }
+        let template = match gguf.as_ref().and_then(|file| file.chat_template()) {
+            Some(source) => ChatTemplate::from_template(source)?.with_tokens(&tokenizer_config)?,
+            None => ChatTemplate::from_model_dir(&dir)?,
+        };
+        let weights = match (self.format, is_artifact(&dir), gguf) {
+            (_, _, Some(file)) => Weights::Gguf(file),
+            (None, true, None) => Weights::Prepacked(Arc::new(Manifest::read(&dir)?)),
+            (None, false, None) => WeightFormat::Q8_0.into(),
+            (Some(_), true, None) => {
                 return Err(TurError::Other(
                     "checkpoint is a prepacked artifact; omit the weight format".into(),
                 ));
             }
-            (Some(format), false) => format.into(),
+            (Some(format), false, None) => format.into(),
         };
         let options = LoadOptions {
             revision: match &self.source {

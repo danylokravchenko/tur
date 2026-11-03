@@ -235,14 +235,47 @@ fn gguf_string(out: &mut Vec<u8>, text: &str) {
     out.extend_from_slice(text.as_bytes());
 }
 
-fn write_gguf(path: &Path, architecture: &str, tensors: &[Written]) -> Result<()> {
+/// A metadata value a fixture writes beside `general.architecture`.
+enum Meta {
+    Text(String),
+    U32(u32),
+    Strings(Vec<String>),
+}
+
+fn write_gguf(
+    path: &Path,
+    architecture: &str,
+    metadata: &[(&str, Meta)],
+    tensors: &[Written],
+) -> Result<()> {
     let mut out = b"GGUF".to_vec();
     out.extend_from_slice(&3u32.to_le_bytes());
     out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-    out.extend_from_slice(&1u64.to_le_bytes());
+    out.extend_from_slice(&(1 + metadata.len() as u64).to_le_bytes());
     gguf_string(&mut out, "general.architecture");
     out.extend_from_slice(&8u32.to_le_bytes());
     gguf_string(&mut out, architecture);
+    for (key, value) in metadata {
+        gguf_string(&mut out, key);
+        match value {
+            Meta::Text(text) => {
+                out.extend_from_slice(&8u32.to_le_bytes());
+                gguf_string(&mut out, text);
+            }
+            Meta::U32(number) => {
+                out.extend_from_slice(&4u32.to_le_bytes());
+                out.extend_from_slice(&number.to_le_bytes());
+            }
+            Meta::Strings(strings) => {
+                out.extend_from_slice(&9u32.to_le_bytes());
+                out.extend_from_slice(&8u32.to_le_bytes());
+                out.extend_from_slice(&(strings.len() as u64).to_le_bytes());
+                for text in strings {
+                    gguf_string(&mut out, text);
+                }
+            }
+        }
+    }
     let mut offset = 0u64;
     for (name, dims, ggml_type, bytes) in tensors {
         gguf_string(&mut out, name);
@@ -430,7 +463,7 @@ fn convert(
     };
     let holder = temp("file")?;
     let path = holder.0.join(format!("weights-{cycle}.gguf"));
-    write_gguf(&path, config.gguf_architectures()[0], &written)?;
+    write_gguf(&path, config.gguf_architectures()[0], &[], &written)?;
     let copy = temp("decoded")?;
     std::fs::copy(source.join("config.json"), copy.0.join("config.json"))?;
     candle_core::safetensors::save(&decoded, copy.0.join("model.safetensors"))?;
@@ -566,8 +599,8 @@ fn test_expert_cache_over_gguf_files_is_bit_identical_to_resident() -> Result<()
         .ok_or_else(|| invalid("fixture has no second layer's up bank"))?;
     let shard = |index: usize| holder.0.join(format!("mixed-{index:05}-of-00002.gguf"));
     let architecture = config.gguf_architectures()[0];
-    write_gguf(&shard(1), architecture, &tensors[..split])?;
-    write_gguf(&shard(2), architecture, &tensors[split..])?;
+    write_gguf(&shard(1), architecture, &[], &tensors[..split])?;
+    write_gguf(&shard(2), architecture, &[], &tensors[split..])?;
     let weights = Weights::Gguf(Arc::new(GgufFile::open(&shard(1))?));
     let load = |expert_cache| LoadOptions {
         expert_cache,
@@ -675,6 +708,7 @@ fn test_gguf_files_that_do_not_fit_the_model_fail_before_loading() -> Result<()>
     write_gguf(
         &other,
         "llama",
+        &[],
         &[tensor(
             "token_embd.weight",
             vec![256, 160],
@@ -686,6 +720,7 @@ fn test_gguf_files_that_do_not_fit_the_model_fail_before_loading() -> Result<()>
     write_gguf(
         &other,
         "qwen35",
+        &[],
         &[tensor(
             "token_embd.weight",
             vec![256, 160],
@@ -697,12 +732,14 @@ fn test_gguf_files_that_do_not_fit_the_model_fail_before_loading() -> Result<()>
     write_gguf(
         &other,
         "qwen35",
+        &[],
         &[tensor("token_embd.weight", vec![512, 80], 0, 512 * 80 * 4)],
     )?;
     assert!(message(GgufFile::open(&other)).contains("expected"));
     write_gguf(
         &other,
         "qwen35",
+        &[],
         &[tensor(
             "token_embd.weight",
             vec![256, 160],
@@ -711,7 +748,12 @@ fn test_gguf_files_that_do_not_fit_the_model_fail_before_loading() -> Result<()>
         )],
     )?;
     assert!(message(GgufFile::open(&other)).contains("cannot read"));
-    write_gguf(&other, "qwen35", &[tensor("blk.0.unknown", vec![4], 0, 16)])?;
+    write_gguf(
+        &other,
+        "qwen35",
+        &[],
+        &[tensor("blk.0.unknown", vec![4], 0, 16)],
+    )?;
     assert!(message(GgufFile::open(&other)).contains("no place"));
     Ok(())
 }
@@ -726,14 +768,87 @@ fn test_split_files_load_from_their_first_shard_and_need_every_shard() -> Result
     let tensors = read_written(&path)?;
     let (first, second) = tensors.split_at(tensors.len() / 2);
     let shard = |index: usize| holder.0.join(format!("model-{index:05}-of-00002.gguf"));
-    write_gguf(&shard(1), "qwen35", first)?;
+    write_gguf(&shard(1), "qwen35", &[], first)?;
     assert!(
         GgufFile::open(&shard(1)).is_err(),
         "a missing shard must fail"
     );
-    write_gguf(&shard(2), "qwen35", second)?;
+    write_gguf(&shard(2), "qwen35", &[], second)?;
     let split = Weights::Gguf(Arc::new(GgufFile::open(&shard(1))?)).plan(&config)?;
     assert_eq!(split, whole);
+    Ok(())
+}
+
+#[test]
+fn test_gguf_files_bring_their_template_and_must_match_the_tokenizer() -> Result<()> {
+    use tur_models::backend::chat_template::{ChatMessage, RenderOptions, Role};
+    use tur_models::backend::factory::GgufSource;
+    let source = Checkpoint::fused()?;
+    let config = Config::from_json(&std::fs::read_to_string(source.0.join("config.json"))?)?;
+    let (holder, path, _decoded) = convert(&source.0, &config, 0, true)?;
+    let tensors = read_written(&path)?;
+    // The fixture's tokenizer spells IDs as `t<id>`, and llama.cpp pads the rest of the vocabulary.
+    let tokens = |changed: Option<usize>| -> Vec<String> {
+        (0..config.vocab_size())
+            .map(|id| match changed {
+                Some(at) if at == id => "edited".to_owned(),
+                _ => format!("t{id}"),
+            })
+            .collect()
+    };
+    let device = Device::new_metal(0)?;
+    let factory = |file: &Path| tur::ModelFactory {
+        format: None,
+        device: device.clone(),
+        gguf: Some(GgufSource::LocalPath(file.to_path_buf())),
+        ..source.factory()
+    };
+    let render = |messages: &[ChatMessage]| -> Result<String> {
+        let (_, _, template, _) = factory(&path).create_model()?;
+        template.render(messages, &[], &RenderOptions::default())
+    };
+    let hello = [ChatMessage::new(Role::User, "hello")];
+    assert_eq!(
+        render(&hello)?,
+        "hello ",
+        "no template in the file: the checkpoint's"
+    );
+    let file = holder.0.join("with-metadata.gguf");
+    let architecture = config.gguf_architectures()[0];
+    write_gguf(
+        &file,
+        architecture,
+        &[
+            (
+                "tokenizer.chat_template",
+                Meta::Text("file:{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+            ),
+            ("tokenizer.ggml.tokens", Meta::Strings(tokens(None))),
+            ("tokenizer.ggml.eos_token_id", Meta::U32(7)),
+        ],
+        &tensors,
+    )?;
+    let (_, _, template, defaults) = factory(&file).create_model()?;
+    assert_eq!(
+        template.render(&hello, &[], &RenderOptions::default())?,
+        "file:hello"
+    );
+    assert!(
+        defaults.eos_tokens.contains(&7),
+        "{:?}",
+        defaults.eos_tokens
+    );
+    write_gguf(
+        &file,
+        architecture,
+        &[("tokenizer.ggml.tokens", Meta::Strings(tokens(Some(5))))],
+        &tensors,
+    )?;
+    let error = factory(&file).create_model().err().map(|e| e.to_string());
+    assert!(
+        error.as_deref().is_some_and(|e| e.contains("GGUF token 5")),
+        "{error:?}"
+    );
     Ok(())
 }
 

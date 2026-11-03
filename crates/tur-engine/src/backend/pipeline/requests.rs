@@ -1,6 +1,7 @@
 //! Request admission, cancellation and publication of committed outputs.
 
 use super::super::{
+    calls::{CallSplit, Calls},
     guidance::{GuidanceControl, ParserFactory, TopLevelGrammar, build_llg_factory, token_bytes},
     harmony::{Fragment, Harmony},
     reasoning::{ReasoningSplit, Route},
@@ -262,6 +263,9 @@ impl Pending {
         let fragment = match (route, &mut self.harmony) {
             (Route::Taken(fragment), _) => fragment,
             (Route::Answer, Some(harmony)) => harmony.push(token)?,
+            (Route::Answer, None) if self.calls.as_mut().is_some_and(|c| c.take(token)) => {
+                Fragment::default()
+            }
             (Route::Answer, None) => Fragment {
                 content: self.stream.next_token(token)?,
                 reasoning: None,
@@ -277,7 +281,12 @@ impl Pending {
         id: Uuid,
         output: &mut BatchStepOutput,
     ) -> Result<(String, String, Vec<ToolCall>)> {
-        let fragment = match &mut self.harmony {
+        let calls = self
+            .calls
+            .as_ref()
+            .map(|split| split.finish(self.stream.tokenizer(), &self.tools))
+            .transpose()?;
+        let mut fragment = match &mut self.harmony {
             Some(harmony) => harmony.finish()?,
             None => Fragment {
                 content: self.stream.decode_rest()?,
@@ -289,6 +298,9 @@ impl Pending {
                     .flatten(),
             },
         };
+        if let Some(calls) = &calls {
+            fragment.content = finish_answer(fragment.content, calls);
+        }
         self.publish_fragment(id, fragment, output);
         if let Some(text) = self.stop.flush() {
             output.new_tokens.push((id, text));
@@ -300,20 +312,39 @@ impl Pending {
                 harmony.tool_calls(&self.tools)?,
             )
         } else {
-            let tool_calls = if self.tools.is_empty() {
-                Vec::new()
-            } else {
-                ToolCall::parse_from_output(&self.stream.decode_raw()?, &self.tools)
-            };
             let reasoning = self
                 .split
                 .as_ref()
                 .map_or_else(|| Ok(String::new()), ReasoningSplit::reasoning)?;
-            (self.stream.decode_all()?, reasoning, tool_calls)
+            let answer = self.stream.decode_all()?;
+            match calls {
+                Some(calls) => {
+                    let answer = finish_answer(Some(answer), &calls).unwrap_or_default();
+                    (answer, reasoning, calls.calls)
+                }
+                // Without single-token markers, calls stay in the answer and are parsed from it.
+                None if !self.tools.is_empty() => {
+                    let calls =
+                        ToolCall::parse_from_output(&self.stream.decode_raw()?, &self.tools);
+                    (answer, reasoning, calls)
+                }
+                None => (answer, reasoning, Vec::new()),
+            }
         };
         self.stop.truncate(&mut content);
         Ok((content, reasoning, tool_calls))
     }
+}
+
+/// The end of an answer that `calls` were split from. Spans that weren't calls rejoin it, and
+/// the whitespace that separated the answer from its calls goes.
+fn finish_answer(rest: Option<String>, calls: &Calls) -> Option<String> {
+    let mut text = rest.unwrap_or_default();
+    text.push_str(&calls.unparsed);
+    if !calls.calls.is_empty() {
+        text.truncate(text.trim_end().len());
+    }
+    Some(text).filter(|text| !text.is_empty())
 }
 
 impl InferencePipeline {
@@ -398,6 +429,23 @@ impl InferencePipeline {
             ToolSyntax::Gemma => thinking == Some(true),
             // A template that ignored the request hasn't opened anything to close.
             ToolSyntax::Xml => thinking == Some(true) && self.prompt_opens_thinking(prompt),
+        };
+        if reasons {
+            Preamble::Reasoning
+        } else {
+            Preamble::None
+        }
+    }
+
+    /// Whether free text may start with reasoning. Qwen reasons when its prompt opened
+    /// thinking, which templates do by default on some checkpoints, and Gemma whenever it
+    /// opens a thought channel; either way the reasoning goes to its own channel rather than
+    /// into the answer.
+    fn free_preamble(&self, prompt: &[u32]) -> Preamble {
+        let reasons = match self.tool_syntax() {
+            ToolSyntax::Harmony => false,
+            ToolSyntax::Gemma => true,
+            ToolSyntax::Xml => self.prompt_opens_thinking(prompt),
         };
         if reasons {
             Preamble::Reasoning
@@ -562,7 +610,7 @@ impl InferencePipeline {
         let preamble = if request.structured.is_some() {
             self.preamble(request, &tokens)
         } else {
-            Preamble::None
+            self.free_preamble(&tokens)
         };
         let guidance = self.request_guidance(request, preamble)?;
         let logprob_tokens = options
@@ -605,6 +653,9 @@ impl InferencePipeline {
                 last_run: 0,
                 preemptions: 0,
                 tools: request.tools.clone(),
+                calls: (!request.tools.is_empty())
+                    .then(|| CallSplit::new(self.tool_syntax(), &self.tokenizer))
+                    .flatten(),
                 logprob_tokens,
                 logprobs: Vec::new(),
                 scores,

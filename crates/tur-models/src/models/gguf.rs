@@ -1,6 +1,7 @@
 //! GGUF weight files as llama.cpp's converter writes them: tensors in ggml's block formats
 //! under ggml's names, loaded as stored into a model configured by its own checkpoint's
-//! `config.json`. The tokenizer and template come from that checkpoint too.
+//! `config.json`. The tokenizer comes from that checkpoint too, and must match the file's
+//! token list; a chat template in the file replaces the checkpoint's.
 
 use crate::models::{
     checkpoint::{Adjust, Checkpoint, Entry},
@@ -18,6 +19,8 @@ use tur_metal::blocks::BlockFormat;
 const MAX_ENTRIES: u64 = 1 << 24;
 const MAX_STRING_BYTES: u64 = 1 << 30;
 const DEFAULT_ALIGNMENT: u64 = 32;
+/// The only array this reader keeps: the token strings, indexed by ID.
+const TOKENS: &str = "tokenizer.ggml.tokens";
 
 /// What a model reads from one GGUF tensor.
 pub enum GgufTensor {
@@ -46,6 +49,12 @@ pub struct GgufFile {
     architecture: String,
     /// Identity of the numerical contents, for state namespaces.
     fingerprint: u64,
+    /// `tokenizer.chat_template`, which a fine-tune may have changed.
+    chat_template: Option<String>,
+    /// `tokenizer.ggml.tokens`: every token string by ID.
+    tokens: Option<Vec<String>>,
+    /// `tokenizer.ggml.eos_token_id`.
+    eos_token: Option<u32>,
 }
 
 struct Reader<R> {
@@ -74,6 +83,14 @@ impl<R: Read + Seek> Reader<R> {
         let mut bytes = vec![0; length as usize];
         self.inner.read_exact(&mut bytes)?;
         String::from_utf8(bytes).map_err(|_| invalid("GGUF string is not UTF-8"))
+    }
+    /// An array of strings, after its value type.
+    fn strings(&mut self) -> Result<Vec<String>> {
+        let (element, count) = (self.u32()?, self.u64()?);
+        if element != 8 || count > MAX_ENTRIES {
+            return Err(invalid(format!("GGUF {TOKENS} is not a list of strings")));
+        }
+        (0..count).map(|_| self.string()).collect()
     }
     fn skip(&mut self, bytes: u64) -> Result<()> {
         let at = self.inner.stream_position()?;
@@ -131,6 +148,7 @@ impl<R: Read + Seek> Reader<R> {
 enum Value {
     Number(u64),
     Text(String),
+    Strings(Vec<String>),
 }
 
 /// Header of one file: its tensors, with absolute payload offsets, and the metadata kept.
@@ -156,7 +174,9 @@ fn read_header(path: &Path, file: usize) -> Result<(Vec<Located>, BTreeMap<Strin
     for _ in 0..metadata_count {
         let key = reader.string()?;
         let kind = reader.u32()?;
-        if let Some(value) = reader.value(kind)? {
+        if key == TOKENS && kind == 9 {
+            metadata.insert(key, Value::Strings(reader.strings()?));
+        } else if let Some(value) = reader.value(kind)? {
             metadata.insert(key, value);
         }
     }
@@ -254,16 +274,31 @@ impl GgufFile {
             None => vec![path.to_path_buf()],
         };
         let mut tensors = Vec::new();
-        let mut architecture = None;
+        // llama.cpp's splitter writes the model's metadata into the first shard only.
+        let mut first = None;
         for (file, shard) in files.iter().enumerate() {
             let (found, metadata) = read_header(shard, file)?;
             tensors.extend(found);
-            if let Some(Value::Text(name)) = metadata.get("general.architecture") {
-                architecture.get_or_insert_with(|| name.clone());
-            }
+            first.get_or_insert(metadata);
         }
-        let architecture =
-            architecture.ok_or_else(|| invalid("GGUF file names no general.architecture"))?;
+        let mut metadata = first.unwrap_or_default();
+        let Some(Value::Text(architecture)) = metadata.remove("general.architecture") else {
+            return Err(invalid("GGUF file names no general.architecture"));
+        };
+        let chat_template = match metadata.remove("tokenizer.chat_template") {
+            Some(Value::Text(template)) => Some(template),
+            _ => None,
+        };
+        let tokens = match metadata.remove(TOKENS) {
+            Some(Value::Strings(tokens)) => Some(tokens),
+            _ => None,
+        };
+        let eos_token = match metadata.get("tokenizer.ggml.eos_token_id") {
+            Some(&Value::Number(id)) => {
+                Some(u32::try_from(id).map_err(|_| invalid("GGUF eos_token_id is out of range"))?)
+            }
+            _ => None,
+        };
         let table = tensors
             .iter()
             .map(|t| format!("{} {:?} {} {}\n", t.name, t.shape, t.ggml_type, t.offset))
@@ -274,7 +309,44 @@ impl GgufFile {
             fingerprint: fnv1a(table.as_bytes()),
             tensors,
             architecture,
+            chat_template,
+            tokens,
+            eos_token,
         })
+    }
+
+    /// The file's chat template, when it carries one.
+    pub(crate) fn chat_template(&self) -> Option<&str> {
+        self.chat_template.as_deref()
+    }
+
+    /// Check that `tokenizer` spells every token as the file does, so the checkpoint the
+    /// tokenizer came from was not edited apart from the file. IDs the tokenizer lacks must be
+    /// llama.cpp's `[PAD<id>]` filler. Returns the file's end-of-sequence token, if any.
+    pub(crate) fn check_tokenizer(&self, tokenizer: &tokenizers::Tokenizer) -> Result<Option<u32>> {
+        for (id, token) in self.tokens.iter().flatten().enumerate() {
+            let id = u32::try_from(id).map_err(|_| invalid("GGUF token list is too long"))?;
+            let matches = tokenizer.id_to_token(id).map_or_else(
+                || *token == format!("[PAD{id}]"),
+                |expected| expected == *token,
+            );
+            if !matches {
+                return Err(invalid(format!(
+                    "GGUF token {id} is {token:?}, but the checkpoint's tokenizer has {:?}; \
+                     the file needs the tokenizer it was converted with",
+                    tokenizer.id_to_token(id)
+                )));
+            }
+        }
+        if let Some(eos) = self.eos_token
+            && self
+                .tokens
+                .as_ref()
+                .is_some_and(|tokens| eos as usize >= tokens.len())
+        {
+            return Err(invalid(format!("GGUF eos_token_id {eos} is not a token")));
+        }
+        Ok(self.eos_token)
     }
 
     /// Stable identity of the weights, for state namespaces.

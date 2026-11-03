@@ -26,10 +26,13 @@ Integration tests for every crate are linked into one binary, `crates/tur/tests/
 | `pipeline`, `scheduling`, `scheduling_metal` | Admission, stress, preemption, deadlines, budgets |
 | `prefix_reuse`, `speculation`, `prepacked` | Reuse, drafting and artifact loading through the pipeline |
 | `serving`, `server` | The worker and the HTTP API |
+| `agentic` | Agent tool loops over chat completions and Responses, with MCP-style schemas, through the real worker, call grammar and parser; the ignored ones repeat the loops on the real 0.8B checkpoint |
 | `vision` | Image and video preprocessing, MP4 decoding, both vision towers and the text layers reading them, media prompts, prefix isolation, reused rows, text beside images in one pass and artifacts carrying a tower |
 | `audio` | Gemma 4 audio encoder and prompts, Whisper conformance, audio prefix isolation, chat audio parts and the transcription endpoints |
 
 `common.rs` builds tiny random checkpoints for pipeline and serving tests, and `model_common.rs` holds model and engine fixtures. Add a module rather than a new test target.
+
+`agentic` builds a scripted checkpoint: one-hot embeddings, every decoder update zero except layer 0's MLP, which maps each token to its scripted successor. The next token then depends only on the last one, so a prompt's last token picks a deterministic reply, calls included, and the real grammar and parser run on it. A grammar that forces text allows only the first token of the tokenizer's own encoding of that text, so a script splits its tokens where the grammar forces text.
 
 Fixtures live in `crates/tur/tests/fixtures/`: pinned configs, templates and tensor headers of real checkpoints (`checkpoints/`), the MoE golden outputs, and rendered template cases.
 
