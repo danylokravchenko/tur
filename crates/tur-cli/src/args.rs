@@ -110,8 +110,9 @@ pub(crate) struct ModelArgs {
     #[serde(deserialize_with = "optional_from_str")]
     weight_format: Option<WeightFormat>,
     /// Load weights from this GGUF file as stored: a local path, or
-    /// `organization/repository/file.gguf` at `--gguf-revision`. MODEL then supplies only the
-    /// config, tokenizer and template, and its weights are not downloaded.
+    /// `organization/repository/file.gguf` at `--gguf-revision`. MODEL then supplies the
+    /// config and tokenizer, and its weights are not downloaded. A chat template in the file
+    /// replaces MODEL's.
     #[arg(long, env = "TUR_GGUF")]
     gguf: Option<String>,
     /// Commit of a remote `--gguf` file. Default: the repository's latest.

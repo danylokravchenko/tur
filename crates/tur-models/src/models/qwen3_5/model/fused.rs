@@ -474,6 +474,7 @@ fn delta_shape(d: &Dims) -> DeltaShape {
         value_dim: d.value_dim,
         b_col: d.channels + d.value_width,
         a_col: d.channels + d.value_width + d.value_heads,
+        tiled: d.tiled,
     }
 }
 

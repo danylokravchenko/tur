@@ -12,7 +12,7 @@ tur run qwen 'What is the capital of France?' \
 
 The model argument still names the original checkpoint, because the config and tokenizer come from there. Tur downloads only those files, not its weights. A local directory holding just `config.json`, `tokenizer.json`, `tokenizer_config.json` and the template works too. `--weight-format` is an error with `--gguf`.
 
-A fine-tune can change its chat template or its tokens without changing the base model's shapes, so Tur reads both from the file. A template in the file (`tokenizer.chat_template`) replaces the checkpoint's. The file's token list must spell every token as the checkpoint's tokenizer does, with llama.cpp's `[PAD<id>]` filler where the tokenizer has none. Otherwise loading fails and names the first token that differs, because a mismatched tokenizer would feed the model the wrong IDs. The file's end-of-sequence token also stops generation.
+A fine-tune can change its chat template or its tokens without changing the base model's shapes, so Tur reads both from the file. A template in the file (`tokenizer.chat_template`) replaces the checkpoint's. Every token the checkpoint's tokenizer defines must be spelled the same in the file's token list. Otherwise loading fails and names the first token that differs, because a mismatched tokenizer would feed the model the wrong IDs. IDs the tokenizer leaves unused may hold anything, such as llama.cpp's `[PAD<id>]` filler or special tokens from a newer tokenizer revision. The file's end-of-sequence token also stops generation.
 
 Before reading any weights, Tur checks the file's architecture and every tensor's name, shape and format against the config, so a file for the wrong model fails at once.
 
@@ -35,7 +35,8 @@ NVFP4, TQ1_0, TQ2_0, Q1_0, Q2_0 and F8_E4M3 fail with an error naming the tensor
 | Model | GGUF `general.architecture` | Evidence |
 | --- | --- | --- |
 | Qwen3.5-0.8B | `qwen35` | Eleven real quants, including pure IQ and legacy files, gave llama.cpp's greedy text in the text compared, apart from one near-tie |
-| Qwen3.8-27B | `qwen35` | Header of a real file plans correctly; not run |
+| Qwen3.5-4B | `qwen35` | A real Q4_K_M file gives llama.cpp's greedy text on the prompt compared; its value heads outnumber its key heads, so it exercises llama.cpp's reordered layout |
+| Qwen3.8-27B | `qwen35` | Header of a real file plans correctly, and its tokens match the base tokenizer; not compared with llama.cpp |
 | Qwen3.6-35B-A3B | `qwen35moe` | Headers of three real files plan correctly, including MXFP4 experts, and sampled expert blocks decode to plausible values; not run |
 | Gemma 4 E2B | `gemma4` | A real Q3_K_S file gives the same probabilities as its weights decoded into Tur's Transformers-validated SafeTensors path |
 
@@ -59,6 +60,7 @@ On the two files measured, with several sequences Tur decodes 1.2 to 1.4× faste
 ## Decisions
 
 - Tensors load as stored. Decoding to one format would cost memory and fidelity the user chose, and re-encoding would change the quant they picked.
+- Value heads stay in the file's order. When a Qwen model has more value heads than key heads, llama.cpp's converter moves them from grouped by key head to tiled (`k0v0, k1v0, k0v1, …`) in every linear-attention tensor, so the DeltaNet kernels pick value head `h`'s key head as `h % key_heads` for GGUF weights. Undoing the reorder at load would split `out_proj`'s quantized blocks, which hold two 128-wide heads each. Files with equal head counts, like the 0.8B, are unaffected.
 - Mixed matrices run per part. Up to eight rows, each part takes its own fastest kernel and the outputs concatenate, which brought one-row decode from 0.43 to 0.54× of Candle's one-format speed to 0.84 to 0.98×. Above eight rows every part writes its columns of one output through the wide block kernel, with no copy, which raised `UD-Q2_K_XL` prefill from 1,137 to 1,287 tokens/s at 512 tokens. This costs `Q3_K` parts some kernel speed, at about 0.9× of Candle's, but no real file measured got slower.
 - The config and tokenizer come from the model's checkpoint rather than being rebuilt from the file's metadata, so shape validation and tokenization share one path with SafeTensors. The file's token list is checked against that tokenizer, which every token of a real Qwen3.8-27B fine-tune's file matched.
 - The file's chat template wins over the checkpoint's, because it is the one the file's author shipped and a fine-tune may have edited it.

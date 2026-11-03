@@ -56,8 +56,9 @@ pub struct ModelFactory {
     pub video: bool,
     /// Device bytes of a bounded expert cache ([`LoadOptions::expert_cache`]).
     pub expert_cache: Option<usize>,
-    /// Load weights from this GGUF file instead; `source` then supplies only the config,
-    /// tokenizer and template.
+    /// Load weights from this GGUF file instead; `source` then supplies the config and a
+    /// tokenizer the file's tokens must agree with. The file's chat template, when it has
+    /// one, replaces the checkpoint's.
     pub gguf: Option<GgufSource>,
 }
 

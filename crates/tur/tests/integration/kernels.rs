@@ -529,7 +529,7 @@ fn scan_reference(
         let row = &mixed[t * case.mixed_cols..];
         let pr = &proj[t * case.proj_cols..];
         for h in 0..heads {
-            let kh = h / groups;
+            let kh = if s.tiled { h % s.key_heads } else { h / groups };
             let norm = |v: &[f32]| -> Vec<f64> {
                 let inv =
                     1.0 / (v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() + 1e-6).sqrt();
@@ -568,15 +568,17 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
     // Single-token sequences take the step kernel, or the scan when tuning disables it.
     // Narrow storage rounds each stored state once; a pass accumulates in F32, so outputs
     // match a reference started from the rounded committed state. Rows of `mixed` padded
-    // by 3 or 4 columns take the unaligned or the aligned scan.
-    for (dk, delta_step, dtype, pad) in [64usize, 128, 256].into_iter().flat_map(|dk| {
+    // by 3 or 4 columns take the unaligned or the aligned scan. Each kernel also runs with
+    // value heads in llama.cpp's tiled order.
+    for (dk, delta_step, dtype, pad, tiled) in [64usize, 128, 256].into_iter().flat_map(|dk| {
         [DType::F32, DType::F16, DType::BF16]
             .into_iter()
             .flat_map(move |dtype| {
                 [
-                    (dk, true, dtype, 3),
-                    (dk, false, dtype, 3),
-                    (dk, false, dtype, 4),
+                    (dk, true, dtype, 3, false),
+                    (dk, true, dtype, 3, true),
+                    (dk, false, dtype, 3, false),
+                    (dk, false, dtype, 4, true),
                 ]
             })
     }) {
@@ -596,6 +598,7 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
             value_dim: 22,
             b_col: 3,
             a_col: 8,
+            tiled,
         };
         let case = ScanCase {
             shape,
@@ -646,7 +649,7 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
             let error = relative_error(&actual, &expected_out);
             assert!(
                 error < 1e-5,
-                "{dtype:?} dk {dk} step {delta_step} tokens {tokens}: output {error}"
+                "{dtype:?} dk {dk} step {delta_step} tiled {tiled} tokens {tokens}: output {error}"
             );
             let boundaries: Vec<&Vec<f64>> = if writes.len() > 1 {
                 expected_states.iter().collect()
@@ -657,7 +660,7 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
                 let error = relative_error(&widen(slot as usize)?, expected);
                 assert!(
                     error < stored,
-                    "{dtype:?} dk {dk} step {delta_step} tokens {tokens}: state {error}"
+                    "{dtype:?} dk {dk} step {delta_step} tiled {tiled} tokens {tokens}: state {error}"
                 );
             }
             assert_eq!(widen(*slot as usize)?, initial[*slot as usize]);
@@ -1749,6 +1752,7 @@ fn test_invalid_inputs_are_rejected_before_encoding() -> Result<()> {
         value_dim: 4,
         b_col: 0,
         a_col: 1,
+        tiled: false,
     };
     let mixed = Tensor::ones((2, 200), DType::F32, &device)?;
     let ones = Tensor::ones(1, DType::F32, &device)?;

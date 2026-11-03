@@ -164,7 +164,14 @@ struct ScanParams {
     uint b_col;
     uint a_col;
     uint prep_stride;
+    // Value heads in llama.cpp's tiled order: head h reads key head h % key_heads instead of
+    // h / groups.
+    uint tiled;
 };
+
+inline uint key_head(uint h, constant ScanParams &p) {
+    return p.tiled != 0 ? h % (p.heads / p.groups) : h / p.groups;
+}
 
 // Per-token inputs of the scan, computed once per token instead of once per state column:
 // row r of `prep` holds, per key head, the scales that L2-normalise q (also by
@@ -214,7 +221,7 @@ kernel void delta_prepare_f32(
     }
     device const float *gates = proj + ulong(row) * p.proj_stride;
     for (uint g = lane; g < p.groups; g += SIMD) {
-        uint h = kh * p.groups + g;
+        uint h = p.tiled != 0 ? g * key_heads + kh : kh * p.groups + g;
         device float *db = out + 3 * key_heads + 2 * h;
         db[0] = exp(softplus(gates[p.a_col + h] + dt_bias[h]) * neg_a[h]);
         db[1] = sigmoid(gates[p.b_col + h]);
@@ -267,7 +274,7 @@ kernel void delta_scan(
     // Inactive lanes mirror the last column so every load stays in bounds.
     uint column = min(col, dv - 1);
     uint r0 = (lane / columns) * ROWS;
-    uint kh = h / p.groups;
+    uint kh = key_head(h, p);
     uint key_heads = p.heads / p.groups;
     ulong state_size = ulong(p.heads) * dk * dv;
     ulong head_state = ulong(h) * dk * dv;
@@ -390,7 +397,7 @@ kernel void delta_step(
     uint j = (tg % blocks) * 2 * SIMD + 2 * lane;
     // Value dims are even (checked by the host), so a lane's pair is wholly in or out.
     bool active = j < dv;
-    uint kh = h / p.groups;
+    uint kh = key_head(h, p);
     device const float *row = mixed + ulong(s.row) * p.mixed_stride;
     device const float *gates = proj + ulong(s.row) * p.proj_stride;
     device const float *q = row + kh * DK;

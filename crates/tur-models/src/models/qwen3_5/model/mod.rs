@@ -241,6 +241,9 @@ struct Dims {
     eps: f64,
     rotary_dim: usize,
     theta: f64,
+    /// Value heads in llama.cpp's tiled order ([`tur_metal::kernels::DeltaShape::tiled`]):
+    /// its converter reorders them so ggml can broadcast key heads without interleaving.
+    tiled: bool,
 }
 
 impl Dims {
@@ -262,6 +265,7 @@ impl Dims {
             eps: t.rms_norm_eps,
             rotary_dim: config.rotary_dim(),
             theta: t.rope_parameters.rope_theta,
+            tiled: false,
         })
     }
 }
@@ -742,7 +746,10 @@ impl Qwen35 {
         if options.expert_cache.is_some() {
             return Err(invalid("the expert cache needs Metal"));
         }
-        let dims = Dims::new(&config)?;
+        let dims = Dims {
+            tiled: matches!(options.weights, Weights::Gguf(_)),
+            ..Dims::new(&config)?
+        };
         let prefix = config.text_prefix().to_string();
         let mut layers = Vec::with_capacity(config.layer_kinds().len());
         let mut loading = Stage::begin(
@@ -1396,11 +1403,15 @@ impl Qwen35 {
                     .contiguous()?
                     .reshape((len, count, dim))?)
             };
-            let q = math::repeat_heads(&heads(0, d.key_width, d.key_heads, d.key_dim)?, groups)?;
-            let k = math::repeat_heads(
-                &heads(d.key_width, d.key_width, d.key_heads, d.key_dim)?,
-                groups,
-            )?;
+            let per_value = |x: Tensor| -> Result<Tensor> {
+                if d.tiled {
+                    Ok(x.repeat((1, groups, 1))?)
+                } else {
+                    math::repeat_heads(&x, groups)
+                }
+            };
+            let q = per_value(heads(0, d.key_width, d.key_heads, d.key_dim)?)?;
+            let k = per_value(heads(d.key_width, d.key_width, d.key_heads, d.key_dim)?)?;
             let v = heads(2 * d.key_width, d.value_width, d.value_heads, d.value_dim)?;
             let g = g.narrow(0, span.start, len)?.contiguous()?;
             let beta = beta.narrow(0, span.start, len)?.contiguous()?;
