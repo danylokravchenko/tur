@@ -8,6 +8,7 @@
 mod audio;
 mod common;
 mod contracts;
+mod decisions;
 mod engine;
 mod fused;
 mod gemma4;

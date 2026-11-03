@@ -36,6 +36,10 @@ Each streaming request has a bounded channel of 64 messages and a buffer behind 
 
 The listener, model ID, admission and deadline settings, prefix retention and streaming limits can all go in [`tur.toml`](../guide/configuration.md), and flags override the file. Streaming limits are file-only and are checked before the model loads.
 
+## Typed decisions
+
+`POST /v1/decisions` is served by decision checkpoints, which Tur recognizes by the `<decision>` token in their tokenizer. The route turns every question into a field of one prompt (`tur_models::backend::decision`) and submits it as one request with a `Scoring`: the marker and each field's option symbols. The pipeline finds the markers in the tokenized prompt and cuts it before the last one. Prefill chunks end at every marker, each with an output at its last token, so the pass computes the row that predicts the field's symbol. The pipeline keeps those symbols' logits and drops the token the engine sampled there, since the prompt continues instead. Snapshots may restore a prefix only up to the first unread marker, and reads survive preemption because recomputing gives the same rows. The final read is the request's one output. The route applies the checkpoint's temperature and builds the answers.
+
 ## Decisions
 
 - One chat model per server, plus at most one Whisper model. The library can share one GPU budget among several pipelines; the Whisper worker leases its memory first, and the chat pool is sized from what remains.
@@ -48,3 +52,6 @@ The listener, model ID, admission and deadline settings, prefix retention and st
 - Metrics are written by hand in Prometheus text, with no new dependency. The format is small, and the counters already had one writer.
 - `/health` also fails when a worker has stopped. Nothing restarts a worker, so a supervisor should replace the process.
 - Local checkpoints report as `local`. Clients get the revision, not the server's file paths, and no endpoint reports prompts.
+- Decisions come from a decision checkpoint rather than from asking the chat model. Reading option-letter logits from stock Qwen3.5-0.8B gave a damaged-item question 0.32 once the complaint followed a long order history; Intern-Decision-0.8B gives 0.73 there. Intern-Decision was chosen because it ships as an ordinary Qwen3.5 checkpoint with an Apache-2.0 license and publishes one table against Jev; Jeff and pplx-decider score higher but need bidirectional attention, a separate head or Qwen3.8.
+- One prompt holds every question, as the checkpoint was trained, and Tur reads it with a pass per question. A single pass needs logits of several positions per chunk from the engine; until then each further question costs about 50 ms on an M1.
+- Calibration is the temperature the checkpoint's authors fitted, pinned per published repository, because the checkpoint ships it only inside its Python reference.

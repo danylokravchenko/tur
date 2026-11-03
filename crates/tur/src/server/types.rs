@@ -355,6 +355,155 @@ pub struct ModelList {
     pub data: Vec<ModelObject>,
 }
 
+// ── Decisions endpoint ────────────────────────────────────────────────────────
+
+/// `OpenAI`'s `POST /v1/decisions` body: typed questions answered with probabilities
+/// about one shared input. Unknown fields such as `safety_identifier` are ignored.
+#[derive(Debug, Deserialize)]
+pub struct DecisionRequest {
+    #[serde(default)]
+    pub model: String,
+    pub input: DecisionInput,
+    pub questions: Vec<DecisionQuestion>,
+    /// Partitions prefix reuse like a chat request's `cache_salt`.
+    pub prompt_cache_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum DecisionInput {
+    Text(String),
+    Messages(Vec<DecisionMessage>),
+}
+
+/// One input message. Tool-call items have no `role` and fail to deserialize.
+#[derive(Debug, Deserialize)]
+pub struct DecisionMessage {
+    pub role: String,
+    pub content: DecisionContent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum DecisionContent {
+    Text(String),
+    Parts(Vec<DecisionPart>),
+}
+
+/// A Responses-style content part. Images must be `data:` URLs.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DecisionPart {
+    InputText { text: String },
+    OutputText { text: String },
+    InputImage { image_url: String },
+    InputJson { data: serde_json::Value },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DecisionQuestion {
+    Predicate {
+        instructions: String,
+        name: Option<String>,
+    },
+    Choice {
+        instructions: String,
+        name: Option<String>,
+        choices: Vec<DecisionChoice>,
+    },
+    Score {
+        instructions: String,
+        name: Option<String>,
+        /// Ordered from lowest to highest.
+        levels: Vec<DecisionLevel>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DecisionChoice {
+    pub value: ChoiceValue,
+    pub description: Option<String>,
+}
+
+/// A choice's value; `"true"` and `true` are different values.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ChoiceValue {
+    Bool(bool),
+    Text(String),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DecisionLevel {
+    pub label: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DecisionResponse {
+    pub model: String,
+    /// In question order.
+    pub answers: Vec<DecisionAnswer>,
+    pub usage: DecisionUsage,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DecisionAnswer {
+    Predicate {
+        name: Option<String>,
+        probability: f32,
+    },
+    Choice {
+        name: Option<String>,
+        choice: ChoiceValue,
+        confidence: f32,
+        probabilities: Vec<ChoiceProbability>,
+    },
+    Score {
+        name: Option<String>,
+        /// Probability-weighted level index, from 0.
+        score: f32,
+        confidence: f32,
+        probabilities: Vec<LevelProbability>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChoiceProbability {
+    pub value: ChoiceValue,
+    pub probability: f32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LevelProbability {
+    /// The level's index, from 0.
+    pub value: usize,
+    pub label: String,
+    pub probability: f32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DecisionUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
+    pub input_tokens_details: DecisionInputDetails,
+    pub output_tokens_details: DecisionOutputDetails,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DecisionInputDetails {
+    pub cached_tokens: u32,
+    pub cache_write_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DecisionOutputDetails {
+    pub reasoning_tokens: u32,
+}
+
 // ── Error response ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]

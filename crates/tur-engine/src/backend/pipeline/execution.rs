@@ -76,7 +76,9 @@ impl InferencePipeline {
                 tokens: start..plan.tokens.len(),
                 outputs: if speculative {
                     (start..plan.tokens.len()).collect()
-                } else if end == pending.tokens.len() {
+                } else if end == pending.tokens.len()
+                    || pending.scores.as_ref().is_some_and(|s| s.reads_at(end))
+                {
                     vec![plan.tokens.len() - 1]
                 } else {
                     Vec::new()

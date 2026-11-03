@@ -9,7 +9,7 @@ use super::super::{
     structured::{self, Preamble, StructuredOutput},
     tokenizer::TokenOutputStream,
 };
-use super::{InferencePipeline, Pending};
+use super::{InferencePipeline, Pending, scoring::Scoring};
 use crate::{
     Result, TurError,
     hybrid::{Forced, OutputLogprobs, SamplingOptions, SequenceCommit},
@@ -59,6 +59,9 @@ pub struct GenerationRequest {
     /// Soft tokens of every clip and image of `messages`, in order, when they were encoded
     /// before submission; empty encodes them at submission, on the calling thread.
     pub encoded_media: Vec<Tensor>,
+    /// Read candidate logits inside the prompt into [`GenerationStats::scores`]; it ends the
+    /// prompt before its last marker and needs `max_tokens` 1.
+    pub scoring: Option<Scoring>,
 }
 
 impl GenerationRequest {
@@ -82,6 +85,7 @@ impl GenerationRequest {
             grammar: None,
             structured: None,
             encoded_media: Vec::new(),
+            scoring: None,
         }
     }
 
@@ -150,6 +154,9 @@ pub struct GenerationStats {
     /// Every generated token except EOS, in order, when the request asked for them. This
     /// includes reasoning and tokens a stop sequence cut from `generated_text`.
     pub logprobs: Vec<TokenLogprob>,
+    /// Model logits of each scoring marker's candidates, in marker order, before penalties and
+    /// masks; empty when the request scored nothing.
+    pub scores: Vec<Vec<f32>>,
     /// `stop` for EOS, `length` for the request limit.
     pub finish_reason: &'static str,
 }
@@ -508,7 +515,14 @@ impl InferencePipeline {
         if tokens.is_empty() {
             return Err(invalid("chat template produced an empty prompt"));
         }
-        let (tokens, media) = self.expand_media(request, tokens)?;
+        let (mut tokens, media) = self.expand_media(request, tokens)?;
+        let scores = match &request.scoring {
+            Some(_) if request.max_tokens != 1 => {
+                return Err(invalid("a scoring request takes max_tokens 1"));
+            }
+            Some(scoring) => Some(self.scores(scoring, &mut tokens, &media)?),
+            None => None,
+        };
         let limit = self.plan.context_tokens;
         let max_tokens = if request.fit_context {
             request
@@ -593,6 +607,7 @@ impl InferencePipeline {
                 tools: request.tools.clone(),
                 logprob_tokens,
                 logprobs: Vec::new(),
+                scores,
                 split: self.reasoning_split(preamble),
                 greedy: options.greedy(),
                 ngrams: NgramIndex::default(),
@@ -677,6 +692,14 @@ impl InferencePipeline {
             .consumed
             .checked_add(commit.accepted_tokens)
             .ok_or_else(|| invalid("consumed position overflow"))?;
+        // An inner read position's sampled token is not the prompt's next token: drop it.
+        let mut outputs = commit.outputs;
+        if let Some(scores) = &mut pending.scores {
+            scores.record(pending.consumed, outputs.len(), logits.as_ref())?;
+            if pending.consumed < pending.prompt_tokens {
+                outputs.clear();
+            }
+        }
         if pending
             .boundaries
             .last()
@@ -692,7 +715,7 @@ impl InferencePipeline {
         // equal them are appended below.
         let mut finished = commit.finished;
         let mut reason = "stop";
-        for token in commit.outputs {
+        for token in outputs {
             if let Some(ended) = pending.accept(
                 id,
                 token.token,
@@ -759,6 +782,10 @@ impl InferencePipeline {
             generated_text,
             reasoning_text,
             logprobs: std::mem::take(&mut pending.logprobs),
+            scores: pending
+                .scores
+                .as_mut()
+                .map_or_else(|| Ok(Vec::new()), super::scoring::Scores::finish)?,
             tool_calls,
             finish_reason: reason,
         };

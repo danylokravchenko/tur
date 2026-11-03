@@ -1,4 +1,4 @@
-pub use tur_models::backend::{chat_template, factory, tools};
+pub use tur_models::backend::{chat_template, decision, factory, tools};
 pub mod guidance;
 mod harmony;
 pub mod memory;

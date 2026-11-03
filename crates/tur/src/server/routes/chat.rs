@@ -457,6 +457,7 @@ pub async fn chat_completions(
             grammar: None,
             structured,
             encoded_media: Vec::new(),
+            scoring: None,
             render: RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.thinking,

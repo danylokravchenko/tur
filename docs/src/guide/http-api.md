@@ -203,6 +203,66 @@ Silent windows produce no text. Clips longer than 30 s are transcribed window by
 
 Takes the same form and returns English text translated from the speech. Whisper large-v3-turbo was not trained for translation, so prefer a multilingual checkpoint such as large-v3 for this endpoint.
 
+## `POST /v1/decisions`
+
+Answers typed questions about an input with a probability per option, in the shape of OpenAI's Decisions API, so the OpenAI SDKs work by pointing `base_url` at the server. It needs a decision checkpoint, a model trained to answer this way instead of generating text. Tur serves [Intern-Decision](https://huggingface.co/internlm/Intern-Decision-0.8B), an Apache-2.0 fine-tune of Qwen3.5 whose authors report it 9.4 points behind TypeSafe's Jev at 0.8B (79.4 against 88.7 on their seven-benchmark average) and 1.3 ahead at 4B. Other models answer 400.
+
+```sh
+tur serve internlm/Intern-Decision-0.8B --revision 42457fafd13d10d0b0d9be46cb30a23caa409994
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
+decision = client.decisions.create(
+    model="Intern-Decision-0.8B",
+    input="The package arrived with a broken screen. I want my money back.",
+    questions=[
+        {"type": "predicate", "name": "damaged", "instructions": "Does the customer report a damaged item?"},
+        {"type": "choice", "name": "queue", "instructions": "Which team should handle this ticket?",
+         "choices": [{"value": "billing", "description": "Refunds and payments"},
+                     {"value": "shipping", "description": "Delivery and damaged items"}]},
+        {"type": "score", "name": "urgency", "instructions": "How urgent is this ticket?",
+         "levels": [{"label": "low"}, {"label": "medium"}, {"label": "high"}]},
+        {"type": "predicate", "name": "praise", "instructions": "Is the customer praising the product?"},
+    ],
+)
+```
+
+The 0.8B checkpoint answers:
+
+```json
+{"model": "Intern-Decision-0.8B",
+ "answers": [
+  {"type": "predicate", "name": "damaged", "probability": 0.87},
+  {"type": "choice", "name": "queue", "choice": "billing", "confidence": 0.56,
+   "probabilities": [{"value": "billing", "probability": 0.56}, {"value": "shipping", "probability": 0.44}]},
+  {"type": "score", "name": "urgency", "score": 1.23, "confidence": 0.43,
+   "probabilities": [{"value": 0, "label": "low", "probability": 0.17}, {"value": 1, "label": "medium", "probability": 0.43}, {"value": 2, "label": "high", "probability": 0.40}]},
+  {"type": "predicate", "name": "praise", "probability": 0.25}],
+ "usage": {"input_tokens": 335, "output_tokens": 0, "total_tokens": 335,
+           "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+           "output_tokens_details": {"reasoning_tokens": 0}}}
+```
+
+All questions go into one prompt. The user turn shows the state and lists each question's options under the symbols A, B, C and so on; the assistant turn is a JSON object whose values are the checkpoint's `<decision>` token. A question's answer is the softmax over its symbols' logits at the token before its marker, tempered by the temperature the checkpoint's authors fitted (2.75 for the 0.8B). Nothing is generated, so `output_tokens` is 0. The prompt matches the checkpoint's own `inference.py` token for token, and the probabilities match its reference within 0.002 with F32 weights and 0.03 with the default Q8_0.
+
+| Field | Meaning |
+| --- | --- |
+| `model` | As for chat completions; must be a decision checkpoint |
+| `input` | The state. A string, or messages with content as a string or `input_text`, `output_text` and `input_json` parts. A single user message with one part is passed as that value, so `input_json` reaches the model as JSON; anything else becomes a list of `{role, content}` turns |
+| `questions` | 1 to 16 questions, answered in order. Each has `type`, `instructions` and an optional `name`; unnamed questions are called `q1`, `q2` and so on by position, and names must be unique |
+| `prompt_cache_key` | Partitions prefix reuse like `cache_salt` |
+
+| `type` | Extra fields | Answer |
+| --- | --- | --- |
+| `predicate` | none | `probability` that the answer is yes |
+| `choice` | `choices`: 2 to 62 `{value, description?}`, values strings or booleans and distinct as text | `choice`, `confidence`, `probabilities` per value |
+| `score` | `levels`: 2 to 10 `{label, description?}`, lowest first | `score` (the probability-weighted level index from 0), `confidence`, `probabilities` per level |
+
+`confidence` is the probability of the likeliest option, and ties go to the smallest value. Each question costs a model pass, because its read ends a prefill chunk: on an M1 a question about a 300-token input takes about 210 ms and each further one adds about 50 ms. Prefix reuse applies to the input, so repeating a 1,900-token state with new questions restored 1,792 tokens and took 0.25 s. The temperature is known only for the published 0.8B; a local copy reads uncalibrated. Images, function-call input items, refusals and streaming aren't supported.
+
 ## Operating the server
 
 These endpoints have no authentication, like the rest of the API, so keep the port away from untrusted clients.
@@ -254,7 +314,7 @@ Errors use OpenAI's shape:
 
 | Status | `type` / `code` | Cause |
 | --- | --- | --- |
-| 400 | `invalid_request_error` | Empty messages, unknown role, invalid sampling values, unsupported `tool_choice`, a schema, grammar or tool choice that can't be honored (a grammar failing during generation has the code `invalid_grammar`), undecodable or unsupported audio, images or video, or a request the engine rejects (`invalid_request`) |
+| 400 | `invalid_request_error` | Empty messages, unknown role, invalid sampling values, unsupported `tool_choice`, a schema, grammar or tool choice that can't be honored (a grammar failing during generation has the code `invalid_grammar`), undecodable or unsupported audio, images or video, a decision request with too many or malformed questions or for a model that isn't a decision checkpoint, or a request the engine rejects (`invalid_request`) |
 | 400 | `invalid_request_error` / `context_length_exceeded` | The prompt and `max_tokens` don't fit the context the server allows |
 | 404 | `invalid_request_error` | Unknown `model` |
 | 408 | `timeout_error` / `slow_client` | A streaming client stopped reading |

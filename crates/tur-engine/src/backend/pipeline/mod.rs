@@ -8,9 +8,11 @@ mod layered;
 mod media;
 mod requests;
 mod scheduling;
+mod scoring;
 
 pub use config::PipelineConfig;
 pub use requests::{BatchStepOutput, GenerationRequest, GenerationStats, PassTiming, TokenLogprob};
+pub use scoring::Scoring;
 
 use super::{
     guidance::ParserFactory,
@@ -98,6 +100,8 @@ struct Pending {
     /// Names tokens for the log probabilities it reports, when the request asked for them.
     logprob_tokens: Option<Arc<ParserFactory>>,
     logprobs: Vec<TokenLogprob>,
+    /// Read positions inside the prompt, for a scoring request.
+    scores: Option<scoring::Scores>,
     /// Separates reasoning from a structured answer, for models whose channels don't.
     split: Option<ReasoningSplit>,
     /// Greedy decoding: its drafts' acceptance is calibrated separately from sampling's.
@@ -126,11 +130,13 @@ impl Pending {
     }
 
     /// Scheduling view. Prefill chunks stop at aligned and predicted turn boundaries,
-    /// so each snapshot has the recurrent state written at exactly its position.
+    /// so each snapshot has the recurrent state written at exactly its position, and at
+    /// scoring read positions.
     fn candidate(&self, id: Uuid, boundary: Option<usize>) -> Candidate {
         let boundary = boundary
             .into_iter()
             .chain(self.turn_boundary.filter(|&end| end > self.consumed))
+            .chain(self.scores.as_ref().and_then(|s| s.next_end(self.consumed)))
             .min();
         let unconsumed = self.tokens.len() - self.consumed;
         let next = self.boundaries.partition_point(|&end| end <= self.consumed);
@@ -237,6 +243,11 @@ impl InferencePipeline {
     /// The model behind this pipeline, for its identity and kernels.
     pub fn model(&self) -> &TextModel {
         &self.model
+    }
+
+    /// The id of `token` in the tokenizer's vocabulary or added tokens.
+    pub fn token_id(&self, token: &str) -> Option<u32> {
+        self.tokenizer.token_to_id(token)
     }
 
     /// Width of the model's output.
