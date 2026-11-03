@@ -371,6 +371,7 @@ fn convert(
     shared_banks: bool,
 ) -> Result<(Checkpoint, PathBuf, Checkpoint)> {
     let tensors = candle_core::safetensors::load(source.join("model.safetensors"), &Device::Cpu)?;
+    let heads = linear_heads(source)?;
     let shapes = config.stored_shapes()?;
     let mut decoded: HashMap<String, Tensor> = HashMap::new();
     let mut written: Vec<Written> = Vec::new();
@@ -397,6 +398,20 @@ fn convert(
         let shape = &shapes[&source_name];
         let mut values = read(&source_name)?;
         let mut shape = shape.clone();
+        // The file holds llama.cpp's tiled value-head order; `decoded` keeps the checkpoint's.
+        let order = heads.and_then(|heads| tiled_order(&name, &shape, heads));
+        let grouped = |tiled: Vec<f32>| -> Vec<f32> {
+            let Some(order) = &order else { return tiled };
+            let mut out = vec![0.0; tiled.len()];
+            for (value, &at) in tiled.into_iter().zip(order) {
+                out[at] = value;
+            }
+            out
+        };
+        let original = values.clone();
+        if let Some(order) = &order {
+            values = order.iter().map(|&at| original[at]).collect();
+        }
         if part.is_some() {
             // Each expert's gate rows, then its up rows.
             let (experts, rows, cols) = (shape[0], shape[1] / 2, shape[2]);
@@ -417,7 +432,7 @@ fn convert(
             // bank stays as stored.
             index += usize::from(!shared_banks || !name.ends_with(".experts.gate_proj"));
             let bytes = quantize(&values, cols, candle, None)?;
-            let stored = format.decode(&bytes, cols)?;
+            let stored = grouped(format.decode(&bytes, cols)?);
             (ggml_type, bytes, stored)
         } else {
             let stored = match adjust {
@@ -426,16 +441,15 @@ fn convert(
                 Adjust::LogNegated => values.iter().map(|v| -v.exp()).collect(),
             };
             let bytes = stored.iter().flat_map(|v| v.to_le_bytes()).collect();
-            (0, bytes, values.clone())
+            (0, bytes, original)
         };
-        let stored_values = if matrix { stored } else { values };
         // ggml orders dimensions innermost first and drops the convolution's unit one.
         let mut dims: Vec<u64> = shape.iter().rev().map(|&d| d as u64).collect();
         if name.contains("conv1d") {
             dims.retain(|&d| d != 1);
         }
         written.push((gguf, dims, ggml_type, bytes));
-        decoded.insert(name, Tensor::from_vec(stored_values, shape, &Device::Cpu)?);
+        decoded.insert(name, Tensor::from_vec(stored, shape, &Device::Cpu)?);
     }
     // Restack the banks the F32 copy loads as one tensor.
     let banks: Vec<String> = decoded
@@ -516,9 +530,25 @@ fn test_gguf_models_compute_what_their_blocks_decode_to() -> Result<()> {
                 &decoded.0,
                 &self::options(Weights::Uniform(WeightFormat::F32), &device),
             )?;
-            let error = max_relative(&logits(&model, vocab)?, &logits(&reference, vocab)?);
+            let expected = logits(&reference, vocab)?;
+            let error = max_relative(&logits(&model, vocab)?, &expected);
             // Prefill chunks of 16 round weights through F16 on Candle's tiles.
             assert!(error < 2e-3, "cycle {cycle}: relative error {error}");
+            // The reference operations read the file's value-head order too. Their batched
+            // GEMM stages weight tiles as F16, which `test_fused_packed_formats_track_reference`
+            // bounds the same way; the checkpoint's grouped order would be off by about 0.5.
+            let composed = Qwen35::load(
+                &source.0,
+                &LoadOptions {
+                    execution: Execution::Reference,
+                    ..self::options(Weights::Gguf(Arc::new(GgufFile::open(&path)?)), &device)
+                },
+            )?;
+            let error = max_relative(&logits(&composed, vocab)?, &expected);
+            assert!(
+                error < 2e-2,
+                "cycle {cycle}: reference relative error {error}"
+            );
         }
     }
     Ok(())
@@ -850,6 +880,66 @@ fn test_gguf_files_bring_their_template_and_must_match_the_tokenizer() -> Result
         "{error:?}"
     );
     Ok(())
+}
+
+/// Key heads, value heads, key dim and value dim of a checkpoint whose linear attention
+/// has more value heads than key heads: the case llama.cpp's converter reorders.
+fn linear_heads(source: &Path) -> Result<Option<[usize; 4]>> {
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(source.join("config.json"))?)?;
+    let field = |name: &str| config[name].as_u64().map(|value| value as usize);
+    Ok(
+        match [
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+        ]
+        .map(field)
+        {
+            [Some(k), Some(v), Some(dk), Some(dv)] if k != v => Some([k, v, dk, dv]),
+            _ => None,
+        },
+    )
+}
+
+/// For a linear-attention tensor llama.cpp's converter reorders, the checkpoint element each
+/// element of the file holds: value heads move from grouped by key head
+/// (`[k0v0, k0v1, k1v0, k1v1]`) to tiled (`[k0v0, k1v0, k0v1, k1v1]`).
+fn tiled_order(name: &str, shape: &[usize], [k, v, dk, dv]: [usize; 4]) -> Option<Vec<usize>> {
+    let tensor = name.split(".linear_attn.").nth(1)?;
+    let key_width = k * dk;
+    // (first reordered row, values per head) along the rows, or along the columns.
+    let (start, head, columns) = match tensor {
+        "in_proj_qkv.weight" | "conv1d.weight" => (2 * key_width, dv, false),
+        "in_proj_z.weight" => (0, dv, false),
+        "in_proj_a.weight" | "in_proj_b.weight" | "A_log" | "dt_bias" => (0, 1, false),
+        "out_proj.weight" => (0, dv, true),
+        _ => return None,
+    };
+    let per_key = v / k;
+    // Tiled position `j` of the reordered span holds grouped position `heads[j]`.
+    let heads: Vec<usize> = (0..per_key)
+        .flat_map(|r| {
+            (0..k).flat_map(move |g| (0..head).map(move |d| (g * per_key + r) * head + d))
+        })
+        .collect();
+    let rows = shape[0];
+    let width: usize = shape[1..].iter().product();
+    Some(
+        (0..rows * width)
+            .map(|at| {
+                let (row, col) = (at / width, at % width);
+                if columns {
+                    row * width + heads[col]
+                } else if row >= start {
+                    (start + heads[row - start]) * width + col
+                } else {
+                    at
+                }
+            })
+            .collect(),
+    )
 }
 
 /// The tensors of a file `write_gguf` wrote, with their payloads.

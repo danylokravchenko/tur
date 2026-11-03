@@ -320,21 +320,19 @@ impl GgufFile {
         self.chat_template.as_deref()
     }
 
-    /// Check that `tokenizer` spells every token as the file does, so the checkpoint the
-    /// tokenizer came from was not edited apart from the file. IDs the tokenizer lacks must be
-    /// llama.cpp's `[PAD<id>]` filler. Returns the file's end-of-sequence token, if any.
+    /// Check that every token `tokenizer` defines is spelled as the file spells it, so the
+    /// checkpoint the tokenizer came from was not edited apart from the file. IDs the
+    /// tokenizer leaves unused may hold anything: llama.cpp's `[PAD<id>]` filler, or special
+    /// tokens of a newer tokenizer revision. Returns the file's end-of-sequence token, if any.
     pub(crate) fn check_tokenizer(&self, tokenizer: &tokenizers::Tokenizer) -> Result<Option<u32>> {
         for (id, token) in self.tokens.iter().flatten().enumerate() {
             let id = u32::try_from(id).map_err(|_| invalid("GGUF token list is too long"))?;
-            let matches = tokenizer.id_to_token(id).map_or_else(
-                || *token == format!("[PAD{id}]"),
-                |expected| expected == *token,
-            );
-            if !matches {
+            if let Some(expected) = tokenizer.id_to_token(id)
+                && expected != *token
+            {
                 return Err(invalid(format!(
-                    "GGUF token {id} is {token:?}, but the checkpoint's tokenizer has {:?}; \
-                     the file needs the tokenizer it was converted with",
-                    tokenizer.id_to_token(id)
+                    "GGUF token {id} is {token:?}, but the checkpoint's tokenizer has \
+                     {expected:?}; the file needs the tokenizer it was converted with"
                 )));
             }
         }

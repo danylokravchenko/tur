@@ -128,6 +128,7 @@ struct ScanParams {
     b_col: u32,
     a_col: u32,
     prep_stride: u32,
+    tiled: u32,
 }
 
 #[repr(C)]
@@ -304,6 +305,10 @@ pub struct DeltaShape {
     pub value_dim: usize,
     pub b_col: usize,
     pub a_col: usize,
+    /// Value heads are in llama.cpp's tiled order, so value head `h` reads key head
+    /// `h % key_heads`; otherwise heads sharing a key head are adjacent and it reads
+    /// `h / (value_heads / key_heads)`.
+    pub tiled: bool,
 }
 
 impl DeltaShape {
@@ -1386,6 +1391,7 @@ impl Kernels {
                 b_col: to_u32(shape.b_col, "b column")?,
                 a_col: to_u32(shape.a_col, "a column")?,
                 prep_stride: to_u32(prep_stride, "prepared stride")?,
+                tiled: u32::from(shape.tiled),
             })
         };
         let table = self.runtime.view(&spans.spans, DType::U32)?;

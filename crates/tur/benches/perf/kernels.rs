@@ -661,6 +661,7 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
             value_dim: 128,
             b_col: 0,
             a_col: value_heads,
+            tiled: false,
         };
         let channels = shape.channels();
         for tokens in [1usize, 16, 32, 64, 128, 512, 2048, 8192] {
