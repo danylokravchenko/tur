@@ -24,7 +24,7 @@ A `ModelState` is a page table plus one recurrent slot at an exact token boundar
 
 - Pages and slots are reference counted. When the last holder drops one, it is retired, and it returns to the free list only through `StatePool::reclaim`, which the engine calls once no unfinished GPU work can use it. Reclaiming bumps the id's generation, so an old reference can't reach the reused memory.
 - Tokens a snapshot can see are never overwritten. A request writes into its partly filled last page directly only if nobody else holds that page; otherwise it first copies the page's valid part to a fresh page (copy-on-write).
-- Recurrent state is never updated in place. Each pass writes new slots, and `Reservation::commit` makes the accepted one current without copying.
+- Recurrent state is never updated in place. Each pass writes new slots, after its last token and at any checkpoints or speculative boundaries it keeps, and `Reservation::commit` makes the accepted one current without copying.
 
 ## The memory plan
 
@@ -36,7 +36,7 @@ resident = packed weights + attention K/V + recurrent state
          + speculative state + in-flight buffers + runtime overhead
 ```
 
-K/V pages, recurrent slots, snapshots and speculative state all come from the state pool, so its size caps their total. Scratch is the kernel workspace of the largest planned pass, in-flight covers packed inputs, logits and draft indices, and the overhead is a tenth of the GPU's recommended working set.
+K/V pages, recurrent slots and snapshots all come from the state pool, so its size caps their total. Scratch is the kernel workspace of the largest planned pass, in-flight covers packed inputs, logits, draft indices and retained replay projections, and the overhead is a tenth of the GPU's recommended working set.
 
 By default the state pool gives every concurrent request room for an 8K-token context; `--context-tokens` sets that length and `--state-memory-mb` sets the bytes directly (see [Tuning](../guide/tuning.md#set-the-context-you-need)). A plan larger than the GPU's working set, or than what other models on the same budget have left, fails before loading, and the loaded weights must match the plan exactly. That way Tur fails at startup with a clear error instead of pushing macOS into swap halfway through serving.
 
@@ -60,3 +60,4 @@ Measured on Qwen3.5-0.8B on an M1 unless noted:
 - 4-bit K/V was rejected. Every 4-bit format missed the quality budget by 10 to 30× (see [Rejected experiments](../design/rejected.md)).
 - Gemma's sliding layers store only their window. They are 12 of E2B's 15 K/V-producing layers, and keeping only the window plus the current page cuts K/V memory per token beyond the window to a third. At 8K tokens, one request needs 57 MB instead of 151 MB, with decode and prefill speed unchanged within noise. A ring buffer was not built: every pass would copy the whole window, and attention would need a second key source inside each chunk.
 - Gemma's PLE tables and shared K/V enter the same memory plan. Only K/V-producing layers allocate state; the E2B checkpoint validates bounded staging, and synthetic F32 fixtures validate shared-cache chunking and rollback.
+- Fused Qwen verification reserves one output slot per sequence and charges retained projection rows to in-flight memory. Partial acceptance replays into that output slot while the original slot stays leased through completion. On the 0.8B with four drafts, this saves 77 MiB of pool memory with one request and 308 MiB with four or eight, before charging records.

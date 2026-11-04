@@ -105,37 +105,43 @@ Multi-turn chat: four conversations of six turns each, with a 256-token first me
 
 ### Speculative decoding
 
-80 output tokens per request, three repeats each, total output tokens/s.
+Tur verifies drafts into one recurrent slot per sequence and replays the accepted prefix after a rejection, reducing recurrent-state writes. These runs use Q8_0 weights, 80 output tokens per request and the best of three repeats after warmup, in total output tokens/s. Each prompt runs in a separate benchmark invocation with a fresh pipeline for each configuration, so adaptive draft estimates carry over only from that prompt's warmup and earlier repeats.
 
 Greedy:
 
 | Prompt | Seqs | Normal | Lookup (4 drafts) | Lookup + MTP |
 | --- | --- | --- | --- | --- |
-| Novel prose | 1 | 54.1 | 53.5 | 72.3 |
-| | 4 | 157.1 | 156.5 | 194.1 |
-| | 8 | 249.7 | 250.6 | 244.0 |
-| Code | 1 | 53.7 | 54.0 | 72.3 |
-| | 4 | 155.9 | 157.6 | 193.5 |
-| | 8 | 247.7 | 248.0 | 240.8 |
-| Repetitive | 1 | 52.1 | 151.5 | 144.7 |
-| | 4 | 145.0 | 272.9 | 262.2 |
-| | 8 | 221.9 | 301.2 | 289.3 |
+| Novel prose | 1 | 53.9 | 56.3 | 74.0 |
+|  | 4 | 158.3 | 158.5 | 191.8 |
+|  | 8 | 253.0 | 249.0 | 239.5 |
+| Code | 1 | 53.6 | 53.1 | 73.6 |
+|  | 4 | 157.5 | 152.2 | 187.7 |
+|  | 8 | 250.2 | 240.5 | 230.7 |
+| Repetitive | 1 | 52.3 | 160.4 | 153.4 |
+|  | 4 | 146.4 | 292.4 | 278.0 |
+|  | 8 | 217.0 | 303.6 | 301.0 |
 
 Sampled at temperature 0.7, top-k 20, top-p 0.95:
 
 | Prompt | Seqs | Normal | Lookup (4 drafts) | Lookup + MTP |
 | --- | --- | --- | --- | --- |
-| Novel prose | 1 | 53.0 | 53.1 | 65.2 |
-| | 4 | 155.4 | 156.1 | 177.3 |
-| | 8 | 249.0 | 248.7 | 241.2 |
-| Code | 1 | 53.1 | 53.0 | 73.0 |
-| | 4 | 155.6 | 155.9 | 192.7 |
-| | 8 | 247.3 | 247.6 | 238.7 |
-| Repetitive | 1 | 51.5 | 153.3 | 146.2 |
-| | 4 | 134.5 | 157.6 | 179.5 |
-| | 8 | 214.3 | 226.4 | 229.0 |
+| Novel prose | 1 | 53.1 | 54.9 | 59.9 |
+|  | 4 | 157.3 | 153.9 | 154.9 |
+|  | 8 | 251.6 | 247.9 | 236.6 |
+| Code | 1 | 53.6 | 60.4 | 71.9 |
+|  | 4 | 156.1 | 155.0 | 183.5 |
+|  | 8 | 247.2 | 236.7 | 232.8 |
+| Repetitive | 1 | 51.8 | 158.5 | 158.9 |
+|  | 4 | 133.8 | 162.2 | 178.8 |
+|  | 8 | 212.9 | 235.2 | 237.3 |
 
-Prompt lookup gives up to 2.9× on repetitive text. On new text, the MTP head adds 1.1 to 1.4× with one to four sequences. With eight sequences the head costs a few percent, so Tur switches it off there by itself. In every configuration the output was identical to normal decoding.
+Prompt lookup reaches 3.1× normal decoding on repetitive text with one request. The MTP head adds up to 1.4× on prose and code with one to four requests, but gives no gain on sampled prose at four. While more than four requests decode, the head stops proposing drafts; maintaining its attention state still costs time.
+
+The planner retains measured costs and calibrated head acceptance across requests. Running prose and code before repetition on one pipeline reduced greedy repetitive Lookup + MTP from 153 to 81 tokens/s at one request and from 278 to 204 at four: single-token head drafts displaced longer lookup chains. At eight requests, lookup largely stopped drafting and Lookup + MTP fell from 301 to 213 tokens/s. The isolated tables above avoid this history effect, which remains relevant to long-lived servers.
+
+The widest spread between the three repeats was 7% for greedy and 12% for sampled output, including changes in adaptive draft selection. In a separate paired comparison with 64 output tokens, replay improved repetitive throughput by 6 to 8% at one, four and eight requests and reduced planned resident memory by 74 to 297 MiB after charging replay records; code throughput ranged from 3% slower to 2% faster (see [replay measurements](../research/hybrid-state-from-vllm.md#what-tur-built-replay)).
+
+All greedy speculative runs reproduced normal decoding's token IDs. Sampled output matched except in the first eight-request prose repeat with lookup or MTP, where one request differed at output token 60; a focused rerun reproduced the mismatch, and later repeats matched. Same-seed equality remains unresolved for that case.
 
 ### Loading
 
@@ -266,7 +272,8 @@ Tur prefills 11 to 13% faster and decodes one Q8_0 sequence 9% faster. With more
 
 | Case | Result |
 | --- | --- |
-| Prefill, 512 tokens | 417 tokens/s |
+| Prefill, 512 tokens | 1192 tokens/s |
+| Prefill, 2048 tokens | 1012 tokens/s |
 | Decode, 1 sequence at 128 tokens | 19.8 to 21.3 tokens/s |
 | Decode, 4 sequences at 128 tokens | 51.8 tokens/s |
 | Decode, 1 sequence at 8K tokens | 18.9 to 20.0 tokens/s |

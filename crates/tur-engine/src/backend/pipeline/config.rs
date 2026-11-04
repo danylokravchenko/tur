@@ -89,12 +89,6 @@ impl PipelineConfig {
             }
             self.speculation = SpeculationConfig::DISABLED;
         }
-        // A snapshot at B cannot hold the head's entry for B - 1: it depends on the
-        // token sampled after B, which differs between requests sharing the snapshot.
-        if self.speculation.mtp_enabled() && self.prefix.enabled() {
-            tracing::info!("native MTP drafts disable prefix reuse");
-            self.prefix = PrefixConfig::DISABLED;
-        }
         Ok(self)
     }
 }
@@ -164,6 +158,19 @@ impl InferencePipeline {
                 let in_flight = in_flight
                     .checked_add(config.speculation.index_bytes(sequences, context)?)
                     .ok_or_else(|| invalid("draft index reservation overflow"))?;
+                // A model that replays verification keeps its projection rows instead of a
+                // recurrent slot per drafted token.
+                let replay = if draft_rows > 0 {
+                    let rows = sequences
+                        .checked_add(draft_rows)
+                        .ok_or_else(|| invalid("replay row count overflow"))?;
+                    architecture.replay_bytes(options, rows)?
+                } else {
+                    None
+                };
+                let in_flight = in_flight
+                    .checked_add(replay.unwrap_or(0))
+                    .ok_or_else(|| invalid("replay reservation overflow"))?;
                 let (plan, pool) = MemoryPlan::new(
                     &description,
                     PlanInputs {
@@ -173,7 +180,7 @@ impl InferencePipeline {
                         sequences: limits.max_running,
                         retained: config.prefix.entries,
                         retained_share: config.prefix.state_share,
-                        draft_slots: draft_rows,
+                        draft_slots: if replay.is_some() { 0 } else { draft_rows },
                         pass_tokens: limits
                             .max_chunk
                             .max(config.speculation.max_draft.saturating_add(1)),
@@ -212,6 +219,8 @@ impl InferencePipeline {
             device_sampling: config.device_sampling,
             _lease: lease,
             pending: HashMap::new(),
+            finishing: HashMap::new(),
+            snapshots: Vec::new(),
             prefix: PrefixCache::new(PrefixConfig {
                 entries: plan.retained,
                 ..config.prefix

@@ -154,6 +154,126 @@ fn test_gemma4_chunking_batching_and_forks_preserve_window_and_shared_kv() -> Re
     Ok(())
 }
 
+/// Rows without logits stop before the K/V-sharing layers: the kept rows' logits and
+/// hidden states equal a full pass's, skipped rows' hidden states are zero, and the owner
+/// layers still store every row's K/V, including in a pass that keeps no row at all.
+#[test]
+#[cfg(feature = "metal")]
+fn test_gemma4_sharing_layers_skip_rows_without_outputs() -> Result<()> {
+    let device = Device::new_metal(0)?;
+    let tokens: Vec<u32> = (0..41).map(|i| (i * 17 % 50 + 2) as u32).collect();
+    let model = Gemma4::load(
+        &fixture("dense"),
+        &options(
+            device.clone(),
+            Execution::Fused,
+            WeightFormat::F32,
+            KvFormat::F32,
+        ),
+    )?;
+    let pool = pool(&model)?;
+    let settle = || -> Result<()> {
+        device.synchronize()?;
+        pool.reclaim();
+        Ok(())
+    };
+    let (whole, _) = common::prefill(&model, ModelState::new(&pool), &tokens, 41)?;
+    let (other, _) = common::prefill(&model, ModelState::new(&pool), &tokens[20..29], 9)?;
+    let every: Vec<usize> = (0..23).collect();
+    let (mut steps, reservations) = common::forward_rows(
+        &model,
+        &[(
+            &ModelState::new(&pool),
+            &tokens[..23],
+            Boundaries::Final,
+            every.as_slice(),
+            true,
+        )],
+    )?;
+    let full_hidden = rows(
+        &steps
+            .pop()
+            .ok_or_else(|| invalid("missing step"))??
+            .hidden
+            .ok_or_else(|| invalid("missing hidden states"))?,
+    )?;
+    drop(reservations);
+    settle()?;
+
+    let (sparse, idle, last) = (
+        ModelState::new(&pool),
+        ModelState::new(&pool),
+        ModelState::new(&pool),
+    );
+    let (steps, reservations) = common::forward_rows(
+        &model,
+        &[
+            (
+                &sparse,
+                &tokens[..23],
+                Boundaries::Final,
+                &[5, 22][..],
+                true,
+            ),
+            (&idle, &tokens[..7], Boundaries::Final, &[][..], false),
+            (&last, &tokens[20..29], Boundaries::Final, &[8][..], false),
+        ],
+    )?;
+    let mut steps = steps.into_iter();
+    let mut next = || steps.next().ok_or_else(|| invalid("missing step"));
+    let first = next()??;
+    assert!(
+        max_relative(
+            &rows(&first.logits)?,
+            &[whole[5].clone(), whole[22].clone()]
+        ) < 1e-4
+    );
+    let hidden = rows(
+        &first
+            .hidden
+            .ok_or_else(|| invalid("missing hidden states"))?,
+    )?;
+    for row in [5, 22] {
+        let error = max_relative(&hidden[row..=row], &full_hidden[row..=row]);
+        assert!(error < 1e-4, "kept hidden row {row}: {error}");
+    }
+    assert!(
+        hidden[3].iter().all(|&v| v == 0.0),
+        "skipped rows hold no state"
+    );
+    assert_eq!(next()??.logits.dim(0)?, 0);
+    assert!(max_relative(&rows(&next()??.logits)?, &other[8..]) < 1e-4);
+    let resumed = reservations[0].commit(23)?;
+    drop(reservations);
+    settle()?;
+    let (continued, _) = common::prefill(&model, resumed, &tokens[23..], 4)?;
+    assert!(
+        max_relative(&continued, &whole[23..]) < 1e-4,
+        "K/V of skipped rows"
+    );
+
+    // No row needs output: the pass ends at the last owner layer.
+    let (_, reservations) = common::forward_rows(
+        &model,
+        &[(
+            &ModelState::new(&pool),
+            &tokens[..16],
+            Boundaries::Final,
+            &[][..],
+            false,
+        )],
+    )?;
+    let resumed = reservations[0].commit(16)?;
+    drop(reservations);
+    settle()?;
+    let (continued, _) = common::prefill(&model, resumed, &tokens[16..], 5)?;
+    assert!(
+        max_relative(&continued, &whole[16..]) < 1e-4,
+        "K/V of a pass keeping no row"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_gemma4_factory_runs_through_shared_pipeline_and_accounts_weights() -> Result<()> {
     let checkpoint = crate::common::Checkpoint::new()?;
@@ -248,6 +368,7 @@ fn test_gemma4_batched_assistant_chains_keep_their_rows() -> Result<()> {
             tokens: start..plan.tokens.len(),
             outputs: vec![plan.tokens.len() - 1],
             speculative: false,
+            checkpoints: Vec::new(),
         });
         ids.push(handle.request);
     }
@@ -270,6 +391,7 @@ fn test_gemma4_batched_assistant_chains_keep_their_rows() -> Result<()> {
                 .hidden
                 .ok_or_else(|| invalid("missing hidden states"))?,
             drafts,
+            pending: Vec::new(),
         });
     }
     let together = engine.draft(&requests)?;
@@ -353,6 +475,75 @@ fn test_gemma4_assistant_drafts_preserve_target_sampling() -> Result<()> {
     }
     let stats = drafted.speculation_stats();
     assert!(stats.mtp_passes > 0 && stats.mtp_drafted > 0, "{stats:?}");
+    let usage = drafted.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+    Ok(())
+}
+
+/// The assistant keeps no state, so it drafts beside prefix reuse: restored requests
+/// generate exactly what ordinary decoding does.
+#[test]
+fn test_gemma4_assistant_drafts_beside_prefix_reuse() -> Result<()> {
+    use tur::backend::{
+        pipeline::{GenerationRequest, InferencePipeline, PipelineConfig},
+        prefix::PrefixConfig,
+        speculation::SpeculationConfig,
+    };
+    use tur_models::models::DraftHead;
+    let checkpoint = crate::common::Checkpoint::new()?;
+    for name in ["model.safetensors", "config.json"] {
+        std::fs::copy(fixture("dense").join(name), checkpoint.0.join(name))?;
+    }
+    let factory = checkpoint.factory();
+    let mut plain = InferencePipeline::new(
+        &factory,
+        PipelineConfig {
+            prefix: PrefixConfig::DISABLED,
+            ..PipelineConfig::new(1, 16)
+        },
+    )?;
+    let mut drafted = InferencePipeline::new(
+        &factory,
+        PipelineConfig {
+            prefix: PrefixConfig {
+                entries: 8,
+                spacing: 16,
+                state_share: None,
+                restorable_first: false,
+                tool_hold: std::time::Duration::ZERO,
+            },
+            speculation: SpeculationConfig {
+                min_ngram: 16,
+                max_ngram: 16,
+                mtp: Some(DraftHead {
+                    vocab: None,
+                    model: Some(fixture("assistant")),
+                }),
+                ..SpeculationConfig::new(4)
+            },
+            ..PipelineConfig::new(1, 16)
+        },
+    )?;
+    let prompt = "t2 t7 t5 t9 t3 t12 t7 t17 t4 t11 t6 t13 t8 t14 t15 t16 t18 t19 t20";
+    let short = GenerationRequest::new(prompt.into(), 1);
+    let expected = plain.run(&short, |_| {})?.generated_text;
+    let first = drafted.run(&short, |_| {})?;
+    assert_eq!(first.generated_text, expected);
+    // The whole prompt restores from its snapshot's logits, and a longer prompt continues
+    // after that snapshot: no draft-head entry has to match the token after it.
+    for request in [
+        GenerationRequest::new(prompt.into(), 24),
+        GenerationRequest::new(format!("{prompt} t21 t22"), 24),
+    ] {
+        let restored = drafted.run(&request, |_| {})?;
+        assert_eq!(
+            restored.generated_text,
+            plain.run(&request, |_| {})?.generated_text
+        );
+        assert_eq!(restored.cached_tokens, first.prompt_tokens);
+    }
+    assert!(drafted.speculation_stats().mtp_drafted > 0);
+    drafted.clear_prefix_cache();
     let usage = drafted.memory()?;
     assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
     Ok(())
@@ -630,7 +821,7 @@ fn assistant_drafts(device: &Device, execution: Execution) -> Result<()> {
             .ok_or_else(|| invalid("missing hidden states"))?;
         state = reservation.commit(1)?;
         drop(reservation);
-        let side = state.side(p, 1)?;
+        let side = state.side(p, 1, &[])?;
         let drafted = model
             .draft(&DraftForward {
                 tokens: &tokens[p + 1..p + 2],
@@ -746,7 +937,7 @@ fn test_gemma4_e2b_assistant_drafts_agree_with_transformers_past_the_window() ->
             .ok_or_else(|| invalid("missing hidden states"))?;
         state = reservation.commit(piece.len())?;
         drop(reservation);
-        let side = state.side(p, 1)?;
+        let side = state.side(p, 1, &[])?;
         let drafted = model
             .draft(&DraftForward {
                 tokens: &tokens[p + 1..p + 2],

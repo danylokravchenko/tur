@@ -40,6 +40,7 @@
 
 ## Serving
 
-- Soak tests: multi-hour cancellation and churn runs to check thermal behaviour and leaks.
+- Extend agent soak coverage to multi-hour cancellation and churn runs, queue saturation and slow readers, with thermal measurements. A 30-minute Pi coding-agent run on the M1 with Qwen3.5-0.8B, a 65,536-token context and two request slots completed 161 requests and 120 tool calls without crashes or unexpected engine errors. Device allocation stayed near 3.2 GB, with no preemptions or swapouts; concurrent requests, stream disconnection and timed agent aborts allowed subsequent requests to complete. Sessions reset periodically, so sustained growth in one conversation remains untested. A separate 63,031-token request returned the correct retrieval marker in 291 s while Pi ran, close to the 300 s request deadline.
+- Check agent task completion as well as server stability. The 0.8B model repeatedly supplied edit text that did not match the file, and its large-ledger turns returned text instead of writing the requested audit files. The soak exercised tool-error feedback and recovery, but no edit succeeded; successful edits and verified task outputs still need coverage.
 - Lints: tighten `indexing_slicing` crate by crate, starting with `tur-core` and `tur-cli`.
 - Decisions: serve the Intern-Decision 2B and 4B checkpoints once their temperatures are pinned and checked against their references.

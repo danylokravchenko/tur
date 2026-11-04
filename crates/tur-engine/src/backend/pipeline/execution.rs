@@ -87,6 +87,15 @@ impl InferencePipeline {
                     Vec::new()
                 },
                 speculative,
+                checkpoints: if speculative {
+                    Vec::new()
+                } else {
+                    self.prefix.checkpoints(
+                        pending.consumed,
+                        end - pending.consumed,
+                        pending.turn_boundary,
+                    )
+                },
             });
             context = context.max(end);
         }
@@ -294,9 +303,9 @@ impl InferencePipeline {
                 heads.push((id, before, hidden.narrow(0, 0, commit.accepted_tokens)?));
             }
             let logits = result.logits;
-            let outcome = result
-                .outcome
-                .and_then(|commit| self.publish(id, commit, logits, &mut output));
+            let outcome = result.outcome.and_then(|commit| {
+                self.publish(id, commit, logits, result.hidden.as_ref(), &mut output)
+            });
             if let Err(error) = outcome {
                 self.fail(id, error, &mut output)?;
             }
@@ -306,6 +315,7 @@ impl InferencePipeline {
             self.speculation_stats.mtp_passes += 1;
             self.speculation_stats.mtp_seconds += timing.draft_head.as_secs_f64();
         }
+        self.settle()?;
         self.expire(Instant::now(), &mut output)?;
         timing.publish = published.elapsed();
         output.timing = Some(timing);

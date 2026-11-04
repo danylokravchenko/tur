@@ -25,7 +25,7 @@ pub use tur_metal::{
 };
 pub use tur_models::hybrid::{
     Boundaries, DraftForward, DraftSequence, HybridModel, LayerCarry, LayerStep, PackedForward,
-    SequenceForward, SequenceState, SequenceStep,
+    ReplayCommit, ReplayInputs, SequenceForward, SequenceState, SequenceStep,
 };
 use uuid::Uuid;
 
@@ -588,6 +588,9 @@ pub struct SequenceCommit {
     pub outputs: Vec<TokenOutput>,
     /// The grammar reached a terminal state; later outputs will not be sampled.
     pub finished: bool,
+    /// Committed states after each of the sequence's
+    /// [`checkpoints`](SequenceDescriptor::checkpoints), for prefix snapshots.
+    pub checkpoints: Vec<ModelState>,
 }
 
 /// Per-request outcome. An error leaves that request's committed state unchanged.
@@ -617,6 +620,9 @@ pub struct DraftRequest {
     /// Greedy drafts to return after the newest token, chained where the head can (a
     /// Gemma 4 assistant); a head that cannot returns at most one.
     pub drafts: usize,
+    /// Committed states of the request that share its pages but that nothing reads until
+    /// the head has run, such as checkpoints of its last pass awaiting a prefix snapshot.
+    pub pending: Vec<ModelState>,
 }
 
 /// The draft head's greedy draft.
@@ -665,6 +671,8 @@ struct Batch<M> {
     logits: Vec<Result<Tensor>>,
     /// Final hidden states of every sequence's tokens, when the draft head is enabled.
     hidden: Vec<Option<Tensor>>,
+    /// What the model kept to replay each [`Boundaries::Replayed`] sequence.
+    replay: Vec<Option<ReplayInputs>>,
     placement: Vec<Placement>,
     /// Full rows for the host sampler and token/status pairs decided on the device, each
     /// concatenated before the fence, so `finish` copies them to the host once.
@@ -718,6 +726,8 @@ pub struct HybridEngine<M: HybridModel> {
     device_sampling: bool,
     /// Return every sequence's final hidden states for the model's draft head.
     draft_head: bool,
+    /// The model replays speculative passes ([`HybridModel::replays`]).
+    replays: bool,
     /// A pass paused between layers; nothing of it is in flight between calls.
     layered: Option<Layered>,
     /// The model's kernels, for penalizing and sampling rows on the device.
@@ -827,11 +837,23 @@ fn attach_logprobs(
     Ok(())
 }
 
-fn boundaries(speculative: bool) -> Boundaries {
-    if speculative {
-        Boundaries::EveryToken
-    } else {
+/// Recurrent states a pass keeps for `sequence`, on a model that `replays` or not.
+fn boundaries(sequence: &SequenceDescriptor, replays: bool) -> Boundaries {
+    if sequence.speculative {
+        speculative_boundaries(replays)
+    } else if sequence.checkpoints.is_empty() {
         Boundaries::Final
+    } else {
+        Boundaries::Checkpoints(sequence.checkpoints.as_slice().into())
+    }
+}
+
+/// A speculative pass keeps one state for replay, or else the state after every token.
+fn speculative_boundaries(replays: bool) -> Boundaries {
+    if replays {
+        Boundaries::Replayed
+    } else {
+        Boundaries::EveryToken
     }
 }
 
@@ -868,9 +890,22 @@ fn publish(
         .ok_or_else(|| invalid("request revision overflow"))?;
     let sampling = &mut request.snapshot.sampling;
     let mark = sampling.mark();
-    let published = sample_sequence(sampling, sequence, tokens, rows)
-        .and_then(|(accepted, outputs)| Ok((reservation.commit(accepted)?, accepted, outputs)));
-    let (model, accepted, outputs) = match published {
+    let published =
+        sample_sequence(sampling, sequence, tokens, rows).and_then(|(accepted, outputs)| {
+            let checkpoints = sequence
+                .checkpoints
+                .iter()
+                .filter(|&&checkpoint| checkpoint < accepted)
+                .map(|&checkpoint| reservation.commit(checkpoint))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((
+                reservation.commit(accepted)?,
+                accepted,
+                outputs,
+                checkpoints,
+            ))
+        });
+    let (model, accepted, outputs, checkpoints) = match published {
         Ok(published) => published,
         Err(error) => {
             sampling.rollback(mark);
@@ -884,6 +919,7 @@ fn publish(
         accepted_tokens: accepted,
         outputs,
         finished: request.snapshot.sampling.finished,
+        checkpoints,
     })
 }
 
@@ -907,6 +943,7 @@ impl<M: HybridModel> HybridEngine<M> {
             stats: SamplingStats::default(),
             device_sampling: true,
             draft_head: false,
+            replays: model.replays(),
             #[cfg(feature = "metal")]
             kernels: model.kernels(),
             model,
@@ -941,12 +978,23 @@ impl<M: HybridModel> HybridEngine<M> {
         self.pool.usage()
     }
 
-    /// Pool pages and slots that a pass of `tokens` new tokens for `handle` would lease.
-    pub fn demand(&self, handle: StateHandle, tokens: usize, speculative: bool) -> Result<Demand> {
+    /// Recurrent states a speculative pass keeps on this engine's model.
+    pub fn speculative_boundaries(&self) -> Boundaries {
+        speculative_boundaries(self.replays)
+    }
+
+    /// Pool pages and slots that a pass of `tokens` new tokens for `handle`, keeping the
+    /// recurrent states `boundaries` lists, would lease.
+    pub fn demand(
+        &self,
+        handle: StateHandle,
+        tokens: usize,
+        boundaries: &Boundaries,
+    ) -> Result<Demand> {
         self.request(handle)?
             .snapshot
             .model
-            .demand(tokens, boundaries(speculative))
+            .demand(tokens, boundaries)
     }
 
     /// Whether the request's grammar constrains its next output, which rules out drafting.
@@ -1304,7 +1352,11 @@ impl<M: HybridModel> HybridEngine<M> {
                 .checked_add(1)
                 .ok_or_else(|| invalid("request revision overflow"))?;
             demand = demand
-                + self.demand(sequence.state, sequence.tokens.len(), sequence.speculative)?;
+                + self.demand(
+                    sequence.state,
+                    sequence.tokens.len(),
+                    &boundaries(sequence, self.replays),
+                )?;
         }
         let usage = self.pool.usage()?;
         if !demand.fits(&usage) {
@@ -1322,7 +1374,7 @@ impl<M: HybridModel> HybridEngine<M> {
                 self.request(sequence.state)?
                     .snapshot
                     .model
-                    .reserve(sequence.tokens.len(), boundaries(sequence.speculative))?,
+                    .reserve(sequence.tokens.len(), boundaries(sequence, self.replays))?,
             );
         }
         requirements.state_update_bytes = reservations.iter().try_fold(0usize, |total, r| {
@@ -1364,6 +1416,7 @@ impl<M: HybridModel> HybridEngine<M> {
                 reservations,
                 logits: Vec::new(),
                 hidden: Vec::new(),
+                replay: Vec::new(),
                 placement: Vec::new(),
                 host: None,
                 pairs: None,
@@ -1406,10 +1459,13 @@ impl<M: HybridModel> HybridEngine<M> {
         });
         match result {
             Ok(steps) if steps.len() == batch.plan.sequences.len() => {
-                for (sequence, step) in batch.plan.sequences.iter().zip(steps) {
+                for (sequence, mut step) in batch.plan.sequences.iter().zip(steps) {
                     batch
                         .hidden
                         .push(step.as_ref().ok().and_then(|step| step.hidden.clone()));
+                    batch
+                        .replay
+                        .push(step.as_mut().ok().and_then(|step| step.replay.take()));
                     batch.logits.push(step.and_then(|step| {
                         validate_logits(
                             &step.logits,
@@ -1464,8 +1520,8 @@ impl<M: HybridModel> HybridEngine<M> {
     /// Run the model's draft head between passes over each request's newest committed
     /// positions, writing the head's own state layer, and return its chained greedy drafts
     /// where requested (empty otherwise). Requests fail independently; the pages a
-    /// request's positions occupy must not be shared with a snapshot. Waits for the device
-    /// only to read drafts.
+    /// request's positions occupy must not be shared with a snapshot, other than its
+    /// [`DraftRequest::pending`] states. Waits for the device only to read drafts.
     pub fn draft(&mut self, requests: &[DraftRequest]) -> Result<Vec<Result<Vec<Draft>>>> {
         if self.pending.is_some() {
             return Err(invalid("the draft head runs between passes"));
@@ -1481,7 +1537,9 @@ impl<M: HybridModel> HybridEngine<M> {
                         "draft positions must end at the committed position",
                     ));
                 }
-                r.snapshot.model.side(request.start, request.tokens.len())
+                r.snapshot
+                    .model
+                    .side(request.start, request.tokens.len(), &request.pending)
             });
             match state {
                 Ok(state) => {
@@ -1816,7 +1874,50 @@ impl<M: HybridModel> HybridEngine<M> {
                 .into_iter()
                 .collect(),
             finished: request.snapshot.sampling.finished,
+            checkpoints: Vec::new(),
         })
+    }
+
+    /// Keep replay's records and leases until its second completion fence succeeds.
+    fn complete_replays(
+        &mut self,
+        reservations: Vec<Reservation>,
+        replays: Vec<(ReplayInputs, SequenceState, usize)>,
+        results: &[SequenceResult],
+    ) -> Result<()> {
+        if replays.is_empty() {
+            return Ok(());
+        }
+        // Replay reads superseded base slots and writes the newly published slots.
+        // Retain both, the records and weights through a second completion fence,
+        // including when encoding fails after submitting only some layers.
+        let mut completion = Completion::new(
+            self.device.clone(),
+            &self.quarantine,
+            (Arc::clone(&self.model), reservations, replays),
+        );
+        let (model, _, replays) = completion
+            .resources_mut()
+            .ok_or_else(|| invalid("missing replay resources"))?;
+        let commits: Vec<ReplayCommit<'_>> = replays
+            .iter()
+            .map(|(inputs, state, accepted)| ReplayCommit {
+                inputs,
+                state,
+                accepted: *accepted,
+            })
+            .collect();
+        let outcome = model.replay(&self.pool, &commits);
+        let fenced = completion.wait();
+        if let Err(error) = outcome.and(fenced) {
+            // A partially written replay cannot serve another pass or snapshot.
+            for result in results {
+                self.requests.remove(&result.request);
+            }
+            return Err(error);
+        }
+        self.completed_at = Some(Instant::now());
+        Ok(())
     }
 
     /// Fence the pending batch, then sample and publish each request independently.
@@ -1849,6 +1950,7 @@ impl<M: HybridModel> HybridEngine<M> {
             reservations,
             logits,
             hidden,
+            replay,
             placement,
             host,
             pairs,
@@ -1889,6 +1991,8 @@ impl<M: HybridModel> HybridEngine<M> {
         let mut fallbacks = 0;
         let mut results = Vec::with_capacity(plan.sequences.len());
         let mut hidden = hidden.into_iter();
+        let mut replay = replay.into_iter();
+        let mut replays = Vec::new();
         for (((sequence, reservation), logits), placement) in plan
             .sequences
             .iter()
@@ -1897,6 +2001,7 @@ impl<M: HybridModel> HybridEngine<M> {
             .zip(placement)
         {
             let hidden = hidden.next().flatten();
+            let inputs = replay.next().flatten();
             let first_logprobs = logprob_first.next().flatten();
             let n = sequence.outputs.len();
             let rows_of_outputs = logits.as_ref().ok().filter(|_| n > 0).cloned();
@@ -1948,6 +2053,13 @@ impl<M: HybridModel> HybridEngine<M> {
                     }
                     Ok(commit)
                 });
+            // A replayed pass that accepted only part of its tokens rewrites its slot.
+            if let (Ok(commit), Some(inputs)) = (&outcome, inputs)
+                && commit.accepted_tokens > 0
+                && commit.accepted_tokens < sequence.tokens.len()
+            {
+                replays.push((inputs, reservation.binding(), commit.accepted_tokens));
+            }
             results.push(SequenceResult {
                 request: id,
                 outcome,
@@ -1955,11 +2067,10 @@ impl<M: HybridModel> HybridEngine<M> {
                 hidden,
             });
         }
+        self.complete_replays(reservations, replays, &results)?;
         self.stats.fallback_rows += fallbacks;
         self.requests.retain(|_, request| !request.cancelled);
-        // Unaccepted pages, superseded slots and cancelled states retire here; their work
-        // has completed, and publishing enqueued none.
-        drop(reservations);
+        // Both verification and any replay have completed before leases return.
         self.pool.reclaim();
         Ok(results)
     }
@@ -2036,6 +2147,7 @@ mod tests {
                 tokens: 0..1,
                 outputs: vec![0],
                 speculative: false,
+                checkpoints: Vec::new(),
             }],
         };
         assert!(engine.submit(plan).is_err());

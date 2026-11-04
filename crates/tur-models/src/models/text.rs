@@ -7,7 +7,10 @@ use super::{
 };
 use crate::{
     backend::tools::ToolSyntax,
-    hybrid::{DraftForward, HybridModel, LayerCarry, LayerStep, PackedForward, SequenceStep},
+    hybrid::{
+        DraftForward, HybridModel, LayerCarry, LayerStep, PackedForward, ReplayCommit,
+        SequenceStep, StatePool,
+    },
     media::{Media, MediaLayout, MediaPrompt},
 };
 use std::path::Path;
@@ -73,6 +76,17 @@ impl ModelConfig {
             // The assistant is a separate checkpoint, loaded from the draft head's directory.
             Self::Gemma4(c) => Ok(Self::Gemma4(c)),
             Self::GptOss(_) => Err(invalid("gpt-oss has no draft head")),
+        }
+    }
+    /// Whether the model loaded with `options` replays speculative passes
+    /// ([`crate::hybrid::HybridModel::replays`]), and the bytes a pass of `rows`
+    /// speculative rows then keeps for it. Models without recurrent state need none.
+    pub fn replay_bytes(&self, options: &LoadOptions, rows: usize) -> Result<Option<usize>> {
+        match self {
+            Self::Qwen35(c) if Qwen35::uses_replay(options) => {
+                Qwen35::replay_bytes(c, rows).map(Some)
+            }
+            _ => Ok(None),
         }
     }
     /// Reserve the selected model's exact weights and bounded scratch before loading.
@@ -263,6 +277,12 @@ impl HybridModel for TextModel {
     }
     fn pausable_layers(&self) -> Option<usize> {
         self.model().pausable_layers()
+    }
+    fn replays(&self) -> bool {
+        self.model().replays()
+    }
+    fn replay(&self, pool: &StatePool, commits: &[ReplayCommit<'_>]) -> Result<()> {
+        self.model().replay(pool, commits)
     }
     fn forward_layers(
         &self,

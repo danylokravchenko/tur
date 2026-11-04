@@ -9,14 +9,14 @@
 //! committed key is copied.
 
 use super::{Attention, Config, DeltaNet, Dims, LayerKind, Mixer, Mlp, MtpHead, Pass, Qwen35};
-use crate::hybrid::{LayerCarry, PackedForward};
+use crate::hybrid::{Boundaries, LayerCarry, PackedForward, ReplayCommit, StatePool};
 use candle_core::{DType, Tensor};
 use tur_core::{
     Result,
     execution::{KvLayout, checked_elements, invalid},
 };
 use tur_metal::{
-    kernels::{DeltaShape, Heads, Kernels, PagedKv, RecurrentSpan, RecurrentSpans},
+    kernels::{DeltaShape, Heads, Kernels, PagedKv, RecurrentSpan, RecurrentSpans, Tuning},
     packed::PackedLinear,
     scratch::ScratchPlan,
 };
@@ -24,6 +24,9 @@ use tur_metal::{
 /// Compiled kernels and per-model constants for fused execution.
 pub(super) struct Fused {
     kernels: Kernels,
+    /// `kernels` without the single-token step kernel: a replay of one token must run
+    /// the scan, as the verification pass it reproduces did.
+    scan_only: Kernels,
     inv_freq: Tensor,
     /// Beside a vision tower: text rotary at an image's grid positions.
     axial: Option<tur_metal::kernels::AxialRotation>,
@@ -36,6 +39,9 @@ struct Addressing {
     positions: Tensor,
     paging: Option<PagedKv>,
     recurrent: Option<RecurrentSpans>,
+    /// Packed rows of the sequences with [`Boundaries::Replayed`], whose projection rows
+    /// each recurrent layer keeps for a replay.
+    replayed: Option<Tensor>,
 }
 
 /// How far [`Qwen35::fused_range`] took its pass.
@@ -65,6 +71,10 @@ impl Fused {
                 .transpose()?,
             page,
             delta: delta_shape(&d),
+            scan_only: kernels.clone().with_tuning(Tuning {
+                delta_step: false,
+                ..kernels.tuning()
+            })?,
             kernels,
         })
     }
@@ -108,17 +118,29 @@ impl Qwen35 {
 impl Qwen35 {
     /// Fused body of [`Qwen35::run`]: returns logits for `pass.rows`, and every row's final
     /// hidden state when `pass.hidden`, and writes state.
+    /// Also returns, per recurrent layer, the projection rows of the pass's replayed
+    /// sequences (none without them).
     pub(super) fn run_fused(
         &self,
         fused: &Fused,
         pass: &Pass<'_, '_>,
         trace: Option<&mut Vec<Tensor>>,
-    ) -> Result<(Tensor, Option<Tensor>)> {
+    ) -> Result<(Tensor, Option<Tensor>, Vec<Tensor>)> {
         let addressing = self.addressing(fused, pass)?;
         let rows = self.first_rows(fused, pass)?;
         let span = 0..self.layers.len();
-        let (_, h) = self.fused_layers(fused, pass, &addressing, span, rows, trace)?;
-        self.fused_outputs(fused, pass, &h)
+        let mut replay = Vec::new();
+        let (_, h) = self.fused_layers(
+            fused,
+            pass,
+            &addressing,
+            span,
+            rows,
+            trace,
+            Some(&mut replay),
+        )?;
+        let (logits, hidden) = self.fused_outputs(fused, pass, &h)?;
+        Ok((logits, hidden, replay))
     }
 
     /// One sequence's pass from `carry` (or its first layer) up to layer `end`. Each layer
@@ -140,7 +162,7 @@ impl Qwen35 {
             return Err(invalid("paused pass must advance within the model"));
         }
         let addressing = self.addressing(fused, pass)?;
-        let (x, h) = self.fused_layers(fused, pass, &addressing, start..end, rows, None)?;
+        let (x, h) = self.fused_layers(fused, pass, &addressing, start..end, rows, None, None)?;
         if end == self.layers.len() {
             return Ok(LayerProgress::Done(self.fused_outputs(fused, pass, &h)?));
         }
@@ -198,20 +220,36 @@ impl Qwen35 {
                     position: span.past,
                     read: span.addresses.read,
                     writes: &span.addresses.writes,
+                    ends: &span.ends,
                 })
                 .collect();
             Some(fused.kernels.recurrent_spans(&spans)?)
         } else {
             None
         };
+        let replayed: Vec<u32> = pass
+            .spans
+            .iter()
+            .filter(|span| span.sequence.state.boundaries() == &Boundaries::Replayed)
+            .flat_map(|span| span.start..span.start + span.len)
+            .map(|row| u32::try_from(row).map_err(|_| invalid("packed row overflow")))
+            .collect::<Result<_>>()?;
         Ok(Addressing {
             positions: self.position_tensor(pass)?,
             paging,
             recurrent,
+            replayed: (!replayed.is_empty())
+                .then(|| Tensor::new(replayed.as_slice(), &self.device))
+                .transpose()?,
         })
     }
 
-    /// Run `(x, h)` through `layers`.
+    /// Run `(x, h)` through `layers`, keeping each recurrent layer's replayed projection
+    /// rows in `replay`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the pass, its addressing, a layer range, the rows and two collectors"
+    )]
     fn fused_layers(
         &self,
         fused: &Fused,
@@ -220,6 +258,7 @@ impl Qwen35 {
         layers: std::ops::Range<usize>,
         (mut x, mut h): (Tensor, Tensor),
         mut trace: Option<&mut Vec<Tensor>>,
+        mut replay: Option<&mut Vec<Tensor>>,
     ) -> Result<(Tensor, Tensor)> {
         let k = &fused.kernels;
         let d = self.dims;
@@ -242,7 +281,11 @@ impl Qwen35 {
                         .recurrent
                         .as_ref()
                         .ok_or_else(|| invalid("recurrent layer without slot addressing"))?;
-                    self.fused_delta(fused, net, &h, pass, spans, index)?
+                    let (out, proj) = self.fused_delta(fused, net, &h, pass, spans, index)?;
+                    if let (Some(rows), Some(replay)) = (&addressing.replayed, replay.as_mut()) {
+                        replay.push(proj.index_select(rows, 0)?);
+                    }
+                    out
                 }
             };
             let (sum, normed) = k.add_rms_norm(&x, &mixed, &layer.post_norm, d.eps)?;
@@ -408,7 +451,7 @@ impl Qwen35 {
         pass: &Pass<'_, '_>,
         spans: &RecurrentSpans,
         layer: usize,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor)> {
         let k = &fused.kernels;
         let d = self.dims;
         let pool = pass.pool.recurrent(layer)?;
@@ -424,7 +467,112 @@ impl Qwen35 {
             &pool.state,
         )?;
         let gated = k.gated_rms(&core, &proj, d.channels, d.value_heads, &net.norm, d.eps)?;
-        k.linear(&net.out, &gated)
+        Ok((k.linear(&net.out, &gated)?, proj))
+    }
+
+    /// Rerun each recurrent layer's convolution and scan over the accepted rows of
+    /// `commits` from their committed slots into their written ones. The same kernels on the
+    /// same rows store exactly the states a pass keeping every token's state would have.
+    pub(super) fn replay_fused(
+        &self,
+        fused: &Fused,
+        pool: &StatePool,
+        commits: &[ReplayCommit<'_>],
+    ) -> Result<()> {
+        let Some(first) = commits.first() else {
+            return Ok(());
+        };
+        let nets: Vec<_> = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, layer)| match &layer.mixer {
+                Mixer::Delta(net) => Some((index, net)),
+                Mixer::Attention(_) => None,
+            })
+            .collect();
+        if nets.len() != first.inputs.layers.len() {
+            return Err(invalid("replay inputs do not match the recurrent layers"));
+        }
+        let width = self.dims.channels + self.dims.value_width + 2 * self.dims.value_heads;
+        for ((index, _), proj) in nets.iter().zip(&first.inputs.layers) {
+            if proj.dtype() != DType::F32
+                || proj.dims2()?.1 != width
+                || pool.recurrent(*index)?.state.dtype() != DType::F32
+            {
+                return Err(invalid(
+                    "replay requires F32 state and matching projection rows",
+                ));
+            }
+        }
+        let mut rows = Vec::new();
+        let mut addresses = Vec::with_capacity(commits.len());
+        for commit in commits {
+            if commit.inputs.layers.len() != first.inputs.layers.len()
+                || commit
+                    .inputs
+                    .layers
+                    .iter()
+                    .zip(&first.inputs.layers)
+                    .any(|(a, b)| a.id() != b.id())
+            {
+                return Err(invalid("replayed sequences come from different passes"));
+            }
+            if commit.accepted == 0
+                || commit.accepted > commit.inputs.rows.len()
+                || commit.inputs.rows.len() != commit.state.tokens()
+                || commit.state.boundaries() != &Boundaries::Replayed
+                || first
+                    .inputs
+                    .layers
+                    .iter()
+                    .any(|layer| commit.inputs.rows.end > layer.dim(0).unwrap_or(0))
+            {
+                return Err(invalid("replay outside the pass's tokens"));
+            }
+            let start = commit.inputs.rows.start;
+            let end = start
+                .checked_add(commit.accepted)
+                .ok_or_else(|| invalid("replay row overflow"))?;
+            for row in start..end {
+                rows.push(u32::try_from(row).map_err(|_| invalid("replay row overflow"))?);
+            }
+            addresses.push(commit.state.resolve(pool)?);
+        }
+        let spans: Vec<_> = commits
+            .iter()
+            .zip(&addresses)
+            .map(|(commit, addresses)| {
+                Ok(RecurrentSpan {
+                    tokens: commit.accepted,
+                    position: commit.state.past(),
+                    read: addresses.read,
+                    writes: addresses
+                        .writes
+                        .get(..1)
+                        .ok_or_else(|| invalid("replayed sequence writes no slot"))?,
+                    ends: &[],
+                })
+            })
+            .collect::<Result<_>>()?;
+        let k = &fused.scan_only;
+        let spans = k.recurrent_spans(&spans)?;
+        let rows = Tensor::new(rows.as_slice(), &self.device)?;
+        for ((index, net), proj) in nets.into_iter().zip(&first.inputs.layers) {
+            let pool = pool.recurrent(index)?;
+            let proj = proj.index_select(&rows, 0)?;
+            let mixed = k.delta_conv(&proj, &spans, &pool.convolution, &net.conv)?;
+            k.delta_scan(
+                &mixed,
+                &proj,
+                &spans,
+                &fused.delta,
+                &net.dt_bias,
+                &net.neg_a,
+                &pool.state,
+            )?;
+        }
+        Ok(())
     }
 
     /// Peak scratch of the fused pass, mirroring its live set layer by layer. Pools and

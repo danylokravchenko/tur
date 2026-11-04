@@ -31,8 +31,9 @@ use super::{
 };
 use crate::{
     Result,
-    hybrid::{Draft, HybridEngine, PoolUsage, SamplingStats},
+    hybrid::{Boundaries, Draft, HybridEngine, ModelState, PoolUsage, SamplingStats},
 };
+use candle_core::Tensor;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -115,6 +116,9 @@ struct Pending {
     /// Positions whose draft-head keys and values are written, and the head's chained
     /// drafts for the tokens after the pending one, valid while `mtp_done == consumed`.
     mtp_done: usize,
+    /// `[1, hidden]` final hidden state at `mtp_done` when the head's entry there must be
+    /// recomputed first: a restored snapshot's entry read another next token.
+    head_seed: Option<Tensor>,
     mtp_drafts: Vec<Draft>,
     mtp_acceptance: Acceptance,
     /// Confidences of the head's drafts verified by the pass in flight.
@@ -123,7 +127,37 @@ struct Pending {
     accepted_drafts: usize,
 }
 
+/// A commit to snapshot at the end of its step.
+struct SnapshotCommit {
+    id: Uuid,
+    /// A checkpoint inside the request's last pass; `None` snapshots its committed state.
+    state: Option<ModelState>,
+    /// `[1, vocab]` logits after a prompt's last token.
+    logits: Option<Tensor>,
+    /// `[1, hidden]` final hidden state at the snapshot's last position, when the draft head
+    /// runs, so a request continuing with another token can recompute the head's entry.
+    hidden: Option<Tensor>,
+}
+
+/// A finished request whose reply is snapshotted at the end of its step.
+struct Finishing {
+    pending: Pending,
+    /// Its reply ended in tool calls, so its snapshots are held for the caller's return.
+    tool_calls: bool,
+}
+
 impl Pending {
+    /// Recurrent states a non-speculative pass of `tokens` tokens keeps: the last one and
+    /// any snapshot positions inside it.
+    fn boundaries(&self, prefix: &PrefixCache, tokens: usize) -> Boundaries {
+        let checkpoints = prefix.checkpoints(self.consumed, tokens, self.turn_boundary);
+        if checkpoints.is_empty() {
+            Boundaries::Final
+        } else {
+            Boundaries::Checkpoints(checkpoints.into())
+        }
+    }
+
     fn generated(&self) -> usize {
         self.tokens.len() - self.prompt_tokens
     }
@@ -133,13 +167,9 @@ impl Pending {
         self.running && self.generated() > 0 && self.consumed >= self.prompt_tokens
     }
 
-    /// Scheduling view. Prefill chunks stop at aligned and predicted turn boundaries,
-    /// so each snapshot has the recurrent state written at exactly its position.
-    fn candidate(&self, id: Uuid, boundary: Option<usize>) -> Candidate {
-        let boundary = boundary
-            .into_iter()
-            .chain(self.turn_boundary.filter(|&end| end > self.consumed))
-            .min();
+    /// Scheduling view. Snapshot positions inside a chunk become checkpoints of its pass,
+    /// so only a replay's original boundaries and the first restore end chunks.
+    fn candidate(&self, id: Uuid) -> Candidate {
         let unconsumed = self.tokens.len() - self.consumed;
         let next = self.boundaries.partition_point(|&end| end <= self.consumed);
         let replay = self
@@ -147,15 +177,12 @@ impl Pending {
             .get(next)
             .filter(|_| self.consumed >= self.replay_floor)
             .map(|end| end - self.consumed);
-        // Below the first restore, chunks also stop there, where replay boundaries begin.
-        let end = boundary.map(|end| {
-            if self.consumed < self.replay_floor {
-                end.min(self.replay_floor)
-            } else {
-                end
-            }
-        });
-        let aligned = end.map_or(unconsumed, |end| unconsumed.min(end - self.consumed));
+        // Below the first restore, chunks stop there, where replay boundaries begin.
+        let aligned = if self.consumed < self.replay_floor {
+            unconsumed.min(self.replay_floor - self.consumed)
+        } else {
+            unconsumed
+        };
         Candidate {
             id,
             pending: replay.unwrap_or(aligned),
@@ -188,7 +215,12 @@ pub struct InferencePipeline {
     device_sampling: bool,
     _lease: BudgetLease,
     pending: HashMap<Uuid, Pending>,
+    /// Requests finished this step, kept until [`Self::settle`] snapshots their replies.
+    finishing: HashMap<Uuid, Finishing>,
     prefix: PrefixCache,
+    /// This step's snapshot commits, inserted by [`Self::settle`] once the draft head has
+    /// written its entries for them.
+    snapshots: Vec<SnapshotCommit>,
     /// Waiting requests left unscheduled this pass for a producer of a shared prefix.
     awaiting: HashSet<Uuid>,
     in_flight: Option<InFlight>,

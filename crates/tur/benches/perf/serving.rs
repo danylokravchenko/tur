@@ -11,7 +11,8 @@
 //! `TUR_BENCH_SAMPLING=0.7,20,0.95` samples instead of greedy decoding,
 //! `TUR_BENCH_DEVICE_SAMPLING=0` samples on the host, and
 //! `TUR_BENCH_WORKLOADS=prefix TUR_BENCH_SPACING=0,256` runs the prefix-reuse workloads
-//! (`TUR_BENCH_PREFIX_ENTRIES=8` changes their snapshot capacity; default 16), and
+//! (`TUR_BENCH_PREFIX_ENTRIES=8` changes their snapshot capacity; default 16, and
+//! `TUR_BENCH_MTP=0,1` runs them without and with four drafts from the native MTP head), and
 //! `TUR_BENCH_WORKLOADS=reuse` runs the prefix-scheduling ones on default pipelines
 //! (`TUR_BENCH_RESTORABLE_FIRST=1` admits restorable prefixes first);
 //! `TUR_BENCH_WORKLOADS=tools` compares tool-call follow-ups with and without a snapshot hold;
@@ -284,15 +285,20 @@ fn report(label: &str, result: &Value) {
     );
 }
 
-/// Prefix workloads at one snapshot spacing (0 disables reuse): requests sharing a long
-/// system prompt, and multi-turn conversations whose next prompt re-renders the history.
+/// Prefix workloads at one snapshot spacing (0 disables reuse), with or without drafts from
+/// the native MTP head: requests sharing a long system prompt, and multi-turn
+/// conversations whose next prompt re-renders the history.
 fn prefix_runs(
     factory: &ModelFactory,
     tokenizer: &Tokenizer,
     spacing: usize,
+    mtp: bool,
     options: SamplingOptions,
 ) -> Result<Vec<Value>> {
     let mut config = PipelineConfig::new(8, CHUNK);
+    if mtp {
+        config.speculation = SpeculationConfig::with_mtp(4);
+    }
     let entries = std::env::var("TUR_BENCH_PREFIX_ENTRIES").map_or(Ok(16), |value| {
         value
             .parse::<usize>()
@@ -332,8 +338,11 @@ fn prefix_runs(
     run_requests(&mut pipeline, &[shared(0)?])?;
     let users = (1..=8).map(shared).collect::<Result<Vec<_>>>()?;
     let result = run_requests(&mut pipeline, &users)?;
-    report(&format!("shared system prompt, spacing {spacing}"), &result);
-    runs.push(json!({"workload": "shared_system_prompt", "spacing": spacing, "system_tokens": 1536, "result": result}));
+    report(
+        &format!("shared system prompt, spacing {spacing}, mtp {mtp}"),
+        &result,
+    );
+    runs.push(json!({"workload": "shared_system_prompt", "spacing": spacing, "mtp": mtp, "system_tokens": 1536, "result": result}));
     // Four conversations of six turns, advanced together turn by turn.
     pipeline.clear_prefix_cache();
     let mut conversations: Vec<Vec<ChatMessage>> = (0..4)
@@ -345,6 +354,8 @@ fn prefix_runs(
         })
         .collect::<Result<_>>()?;
     let mut turns = Vec::new();
+    let (started, drafts_before) = (Instant::now(), pipeline.speculation_stats());
+    let mut generated = 0;
     for turn in 0..6 {
         let requests: Vec<GenerationRequest> = conversations
             .iter()
@@ -371,6 +382,7 @@ fn prefix_runs(
                 ttft.push(stats.first_token.as_secs_f64());
                 prompt_tokens += stats.prompt_tokens;
                 cached += stats.cached_tokens;
+                generated += stats.generated_tokens;
                 replies[ids[&id]] = stats.generated_text;
             }
         }
@@ -393,8 +405,14 @@ fn prefix_runs(
             c + t["cached_tokens"].as_u64().unwrap_or(0),
         )
     });
+    let wall = started.elapsed().as_secs_f64();
+    let drafts = pipeline.speculation_stats();
+    let (mtp_drafted, mtp_accepted) = (
+        drafts.mtp_drafted - drafts_before.mtp_drafted,
+        drafts.mtp_accepted - drafts_before.mtp_accepted,
+    );
     eprintln!(
-        "multi-turn, spacing {spacing}: {cached_total} of {prompt_total} prompt tokens cached; last-turn TTFT p50 {:.0} ms",
+        "multi-turn, spacing {spacing}, mtp {mtp}: {cached_total} of {prompt_total} prompt tokens cached; last-turn TTFT p50 {:.0} ms; {wall:.2} s; head accepted {mtp_accepted} of {mtp_drafted}",
         turns
             .last()
             .map_or(0.0, |t| t["ttft_seconds"]["p50"].as_f64().unwrap_or(0.0))
@@ -402,7 +420,9 @@ fn prefix_runs(
     );
     let prefix = pipeline.prefix_stats();
     runs.push(
-        json!({"workload": "multi_turn", "spacing": spacing, "conversations": 4, "turns": turns,
+        json!({"workload": "multi_turn", "spacing": spacing, "mtp": mtp, "conversations": 4,
+        "turns": turns, "wall_seconds": wall, "generated_tokens": generated,
+        "mtp_drafted": mtp_drafted, "mtp_accepted": mtp_accepted,
         "retained_entries": pipeline.memory_plan().retained,
         "prefix": format!("{prefix:?}"), "snapshot_slot_bytes": slot_bytes}),
     );
@@ -1294,7 +1314,15 @@ pub(crate) fn run() -> Result<()> {
     }
     if workloads.contains("prefix") {
         for spacing in env_sizes("TUR_BENCH_SPACING", "0,64,128,256,512")? {
-            runs.extend(prefix_runs(&factory, &tokenizer, spacing, options)?);
+            for mtp in env_sizes("TUR_BENCH_MTP", "0")? {
+                runs.extend(prefix_runs(
+                    &factory,
+                    &tokenizer,
+                    spacing,
+                    mtp == 1,
+                    options,
+                )?);
+            }
         }
     }
     if workloads.contains("reuse") {

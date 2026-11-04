@@ -3,7 +3,7 @@
 //! enqueues `reps` operations and then synchronizes.
 //!
 //! `cargo bench --offline -p tur --bench perf -- kernels > out.json`
-//! `TUR_BENCH_ONLY=delta|linear|paged|tiled|sample|moe|blocks` restricts the run to one group;
+//! `TUR_BENCH_ONLY=delta|replay|linear|paged|tiled|sample|moe|blocks` restricts the run to one group;
 //! `TUR_BENCH_MOE=q8_0,q4k,f32` selects expert weight formats.
 //! `TUR_BENCH_LINEAR=q8_0,q4k,q6k,q5k,q3k,q2k` selects projection formats (default `q8_0,q4k`);
 //! Q5K and Q6K have no Tur kernels and measure Candle's only.
@@ -651,6 +651,9 @@ fn tiled_window_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> 
 }
 
 fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+    if std::env::var("TUR_BENCH_ONLY").is_ok_and(|group| group == "replay") {
+        return delta_verify_cases(device, kernels);
+    }
     // Qwen3.5-0.8B: 16 key/value heads of 128; Qwen3.8-27B: 16 key and 48 value heads.
     let mut cases = Vec::new();
     for (label, key_heads, value_heads) in [("0.8b", 16usize, 16usize), ("27b", 16, 48)] {
@@ -678,6 +681,7 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
                 position: 0,
                 read: 0,
                 writes: &[1],
+                ends: &[],
             }])?;
             let conv = time(device, || {
                 kernels.delta_conv(&mixed, &writes, &history, &conv_w)
@@ -710,6 +714,114 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
         }
         cases.extend(delta_decode_cases(device, kernels, label, shape)?);
     }
+    cases.extend(delta_verify_cases(device, kernels)?);
+    Ok(cases)
+}
+
+/// Speculative verification: `sequences` of `tokens` (the decode token and its drafts)
+/// writing the state after every token, as verification does, against writing only the
+/// last, as committing accepted drafts by replay would. A replay costs about the one-write
+/// pass over the accepted tokens, which `replay` times for every count up to `tokens`.
+fn delta_verify_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+    let mut cases = Vec::new();
+    let kernels = &kernels.clone().with_tuning(Tuning {
+        delta_step: false,
+        ..kernels.tuning()
+    })?;
+    let filter = std::env::var("TUR_BENCH_SHAPE").ok();
+    // DeltaNet layers per model: Qwen3.5-0.8B 18, Qwen3.6-35B-A3B 30, Qwen3.8-27B 48.
+    for (label, value_heads, layers) in [
+        ("0.8b", 16usize, 18usize),
+        ("35b-a3b", 32, 30),
+        ("27b", 48, 48),
+    ] {
+        if filter
+            .as_ref()
+            .is_some_and(|filter| !label.contains(filter))
+        {
+            continue;
+        }
+        let shape = DeltaShape {
+            key_heads: 16,
+            value_heads,
+            key_dim: 128,
+            value_dim: 128,
+            b_col: 0,
+            a_col: value_heads,
+            tiled: false,
+        };
+        let channels = shape.channels();
+        for sequences in [1usize, 4, 8] {
+            for tokens in [2usize, 4, 8] {
+                let rows = sequences * tokens;
+                let mixed = random(device, &[rows, channels], 7, 1.0)?;
+                let proj = random(device, &[rows, 2 * value_heads], 8, 1.0)?;
+                let slots = sequences * (tokens + 1);
+                let history = random(device, &[slots, 3, channels], 9, 1.0)?;
+                let conv_w = random(device, &[channels, 4], 10, 0.5)?;
+                let dt_bias = random(device, &[value_heads], 11, 1.0)?;
+                let neg_a = (random(device, &[value_heads], 12, 1.0)?.abs()? * -1.0)?;
+                let state = random(device, &[slots, value_heads, 128, 128], 13, 0.1)?;
+                // Sequence i reads slot i and writes from slot `sequences + i * tokens`.
+                let every: Vec<Vec<u32>> = (0..sequences)
+                    .map(|i| {
+                        let first = (sequences + i * tokens) as u32;
+                        (first..first + tokens as u32).collect()
+                    })
+                    .collect();
+                let pass = |count: usize, per_token: bool| -> Result<Value> {
+                    let spans: Vec<_> = every
+                        .iter()
+                        .enumerate()
+                        .map(|(i, writes)| RecurrentSpan {
+                            tokens: count,
+                            position: 100,
+                            read: i as u32,
+                            writes: if per_token {
+                                &writes[..count]
+                            } else {
+                                &writes[..1]
+                            },
+                            ends: &[],
+                        })
+                        .collect();
+                    let spans = kernels.recurrent_spans(&spans)?;
+                    let (x, gates) = (
+                        mixed.narrow(0, 0, sequences * count)?,
+                        proj.narrow(0, 0, sequences * count)?,
+                    );
+                    time(device, || {
+                        let x = kernels.delta_conv(&x, &spans, &history, &conv_w)?;
+                        kernels.delta_scan(&x, &gates, &spans, &shape, &dt_bias, &neg_a, &state)
+                    })
+                };
+                let per_token = pass(tokens, true)?;
+                let last_only = pass(tokens, false)?;
+                let replay = (1..tokens)
+                    .map(|accepted| pass(accepted, false))
+                    .collect::<Result<Vec<_>>>()?;
+                let seconds = |v: &Value| v["median_seconds"].as_f64().unwrap_or(0.0);
+                let saved = (seconds(&per_token) - seconds(&last_only)) * layers as f64;
+                eprintln!(
+                    "verify {label} x{sequences} {tokens} tokens: every {:.1} us, last {:.1} us per layer; {:.2} ms per pass over {layers} layers; replay of 1..{} tokens {:?} us",
+                    seconds(&per_token) * 1e6,
+                    seconds(&last_only) * 1e6,
+                    saved * 1e3,
+                    tokens - 1,
+                    replay
+                        .iter()
+                        .map(|v| (seconds(v) * 1e7).round() / 10.0)
+                        .collect::<Vec<_>>(),
+                );
+                cases.push(json!({
+                    "operation": "delta_verify", "shape": label, "layers": layers,
+                    "sequences": sequences, "tokens": tokens,
+                    "every_token": per_token, "last_only": last_only, "replay": replay,
+                    "saved_seconds_per_pass": saved,
+                }));
+            }
+        }
+    }
     Ok(cases)
 }
 
@@ -740,6 +852,7 @@ fn delta_decode_cases(
                 position: 100,
                 read: i as u32,
                 writes: w,
+                ends: &[],
             })
             .collect();
         let ragged = kernels.recurrent_spans(&spans)?;
@@ -1009,7 +1122,7 @@ pub(crate) fn run() -> Result<()> {
         "cases": {
             "blocks": if skip("blocks") { json!([]) } else { json!(block_cases(&device, &kernels)?) },
             "norm": if skip("delta") { json!([]) } else { json!(norm_cases(&device, &kernels)?) },
-            "delta_net": if skip("delta") { json!([]) } else { json!(delta_cases(&device, &kernels)?) },
+            "delta_net": if skip("delta") && skip("replay") { json!([]) } else { json!(delta_cases(&device, &kernels)?) },
             "attention": if skip("paged") { json!([]) } else { json!(attention_cases(&device, &kernels)?) },
             "paged_attention": if skip("paged") { json!([]) } else { json!(paged_cases(&device, &kernels)?) },
             "tiled_attention": if skip("tiled") { json!([]) } else { json!(tiled_cases(&device, &kernels)?) },

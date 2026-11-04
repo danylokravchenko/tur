@@ -27,12 +27,40 @@ use tur_core::{
 };
 
 /// Recurrent states a model must write for one sequence.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Boundaries {
     /// Only the state after the last token.
     Final,
     /// The state after every token, so any accepted prefix can be published.
     EveryToken,
+    /// The state after each listed number of the pass's tokens (ascending, from one, below
+    /// the pass's length) and after the last, so prefix snapshots can sit inside a pass.
+    Checkpoints(Arc<[usize]>),
+    /// The state after the last token, into one slot that serves any accepted prefix: the
+    /// model's replay rewrites it with the state after an earlier token before anything
+    /// reads it. Speculative passes use it instead of [`Self::EveryToken`] when the model
+    /// can replay.
+    Replayed,
+}
+
+impl Boundaries {
+    /// Numbers of a `tokens`-token pass's tokens after which it writes recurrent state,
+    /// ascending; the last is `tokens`.
+    pub fn ends(&self, tokens: usize) -> Result<Vec<usize>> {
+        match self {
+            Self::Final | Self::Replayed => Ok(vec![tokens]),
+            Self::EveryToken => Ok((1..=tokens).collect()),
+            Self::Checkpoints(points) => {
+                if points.first() == Some(&0)
+                    || points.last().is_some_and(|&last| last >= tokens)
+                    || !points.windows(2).all(|pair| pair[0] < pair[1])
+                {
+                    return Err(invalid("checkpoints must ascend inside the pass"));
+                }
+                Ok(points.iter().copied().chain([tokens]).collect())
+            }
+        }
+    }
 }
 
 /// Recurrent slot of a snapshot: the shared zero state, or a leased slot.
@@ -65,6 +93,27 @@ pub struct ModelState {
     pages: Vec<Arc<Lease>>,
     windows: Windows,
     slot: Slot,
+}
+
+/// States are equal when they hold the same leases of the same pool at the same position.
+impl PartialEq for ModelState {
+    fn eq(&self, other: &Self) -> bool {
+        self.pool.same_pool(&other.pool)
+            && self.position == other.position
+            && ids(&self.pages) == ids(&other.pages)
+            && window_ids(&self.windows) == window_ids(&other.windows)
+            && self.slot.id() == other.slot.id()
+    }
+}
+
+impl std::fmt::Debug for ModelState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelState")
+            .field("position", &self.position)
+            .field("pages", &ids(&self.pages))
+            .field("slot", &self.slot.id())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Pool ids a pass would lease.
@@ -220,7 +269,7 @@ impl ModelState {
 
     /// Pages, window pages and slots a pass of `tokens` would lease, including
     /// copy-on-write tails.
-    pub fn demand(&self, tokens: usize, boundaries: Boundaries) -> Result<Demand> {
+    pub fn demand(&self, tokens: usize, boundaries: &Boundaries) -> Result<Demand> {
         let description = self.description();
         let end = self.end(tokens)?;
         let opened = description.pages_for(end) - description.pages_for(self.position);
@@ -235,10 +284,10 @@ impl ModelState {
         } else {
             0
         };
-        let slots = match (description.has_recurrent(), boundaries) {
-            (false, _) => 0,
-            (true, Boundaries::Final) => 1,
-            (true, Boundaries::EveryToken) => tokens,
+        let slots = if description.has_recurrent() {
+            boundaries.ends(tokens)?.len()
+        } else {
+            0
         };
         Ok(Demand {
             pages,
@@ -284,10 +333,11 @@ impl ModelState {
                 windows.push(Some(self.pool.lease_window()?));
             }
         }
-        let count = match (description.has_recurrent(), boundaries) {
-            (false, _) => 0,
-            (true, Boundaries::Final) => 1,
-            (true, Boundaries::EveryToken) => tokens,
+        let ends = boundaries.ends(tokens)?;
+        let count = if description.has_recurrent() {
+            ends.len()
+        } else {
+            0
         };
         let slots = (0..count)
             .map(|_| self.pool.lease_slot())
@@ -303,14 +353,17 @@ impl ModelState {
             window_copy,
             tokens,
             boundaries,
+            ends,
         })
     }
 
     /// Addressing of committed positions `start..start + tokens` for a side pass, such as a
     /// draft head, that writes only layers no ordinary pass writes. It leases nothing and
-    /// writes no recurrent slot. The pages must be exclusively owned: a page shared with a
-    /// snapshot would see the side layer change under it.
-    pub fn side(&self, start: usize, tokens: usize) -> Result<SequenceState> {
+    /// writes no recurrent slot. The pages must be owned by this state and `pending` alone:
+    /// a page shared with a snapshot would see the side layer change under it. `pending`
+    /// are earlier states of the same sequence that nothing reads before the side pass
+    /// completes, such as snapshots it is meant to complete.
+    pub fn side(&self, start: usize, tokens: usize, pending: &[Self]) -> Result<SequenceState> {
         let end = start
             .checked_add(tokens)
             .ok_or_else(|| invalid("position overflow"))?;
@@ -319,13 +372,23 @@ impl ModelState {
         }
         let description = self.description();
         let first = start / description.kv.page_tokens;
+        let held = |page: &Arc<Lease>| {
+            1 + pending
+                .iter()
+                .filter(|state| state.pages.iter().any(|other| Arc::ptr_eq(other, page)))
+                .count()
+        };
         if description.has_full_attention()
             && self
                 .pages
                 .get(first..description.pages_for(end))
-                .is_none_or(|pages| pages.iter().any(|page| Arc::strong_count(page) > 1))
+                .is_none_or(|pages| {
+                    pages
+                        .iter()
+                        .any(|page| Arc::strong_count(page) > held(page))
+                })
         {
-            return Err(invalid("side pass needs exclusively owned pages"));
+            return Err(invalid("side pass needs pages no other state holds"));
         }
         Ok(SequenceState {
             pool: self.pool.id(),
@@ -401,6 +464,8 @@ pub struct Reservation {
     new_windows: usize,
     tokens: usize,
     boundaries: Boundaries,
+    /// [`Boundaries::ends`] of the pass: the accepted counts that have a state.
+    ends: Vec<usize>,
 }
 
 impl Reservation {
@@ -477,14 +542,15 @@ impl Reservation {
             windows: window_ids(&self.windows),
             read: self.base.slot.id(),
             writes: ids(&self.slots),
-            boundaries: self.boundaries,
+            boundaries: self.boundaries.clone(),
         }
     }
 
     /// The snapshot after the first `accepted` tokens of this pass; the base is unchanged.
-    /// A partial accept requires [`Boundaries::EveryToken`], whose boundary is selected
-    /// exactly: recurrent state is never truncated. Window pages wholly behind the new
-    /// boundary's window are released.
+    /// A partial accept must be one of the pass's [`Boundaries`], whose state is selected
+    /// exactly, except for [`Boundaries::Replayed`], whose model must rewrite the slot
+    /// before reading the returned state. Window pages wholly behind the new boundary's
+    /// window are released.
     pub fn commit(&self, accepted: usize) -> Result<ModelState> {
         if accepted == 0 {
             return Ok(self.base.clone());
@@ -492,10 +558,12 @@ impl Reservation {
         if self.copy.is_some() || self.window_copy.is_some() {
             return Err(invalid("reservation was never prepared"));
         }
-        let partial = accepted < self.tokens;
-        if accepted > self.tokens || (partial && self.boundaries == Boundaries::Final) {
-            return Err(invalid("accepted prefix has no saved boundary"));
-        }
+        // A replayed pass's one slot takes the state after any accepted prefix.
+        let boundary = match self.ends.binary_search(&accepted) {
+            Ok(boundary) => boundary,
+            Err(_) if self.boundaries == Boundaries::Replayed && accepted <= self.tokens => 0,
+            Err(_) => return Err(invalid("accepted prefix has no saved boundary")),
+        };
         let position = self
             .base
             .position
@@ -503,10 +571,7 @@ impl Reservation {
             .ok_or_else(|| invalid("position overflow"))?;
         let description = self.base.description();
         let keep = description.pages_for(position);
-        let slot = match self.boundaries {
-            Boundaries::Final => self.slots.first(),
-            Boundaries::EveryToken => self.slots.get(accepted - 1),
-        };
+        let slot = self.slots.get(boundary);
         let first = description.first_window_page(position);
         let windows = self
             .windows
@@ -565,8 +630,14 @@ impl SequenceState {
     }
 
     /// Recurrent boundaries the pass writes.
-    pub fn boundaries(&self) -> Boundaries {
-        self.boundaries
+    pub fn boundaries(&self) -> &Boundaries {
+        &self.boundaries
+    }
+
+    /// Numbers of this pass's tokens after which it writes recurrent state; see
+    /// [`Boundaries::ends`].
+    pub fn ends(&self) -> Result<Vec<usize>> {
+        self.boundaries.ends(self.tokens)
     }
 
     /// Page capacity in tokens.
@@ -699,7 +770,7 @@ mod tests {
         let pool = pool(4, 2)?;
         let one = pass(&ModelState::new(&pool), &[1.0], Boundaries::Final, 1)?;
         assert_eq!(
-            one.demand(1, Boundaries::Final)?,
+            one.demand(1, &Boundaries::Final)?,
             Demand {
                 pages: 0,
                 windows: 0,
@@ -730,7 +801,7 @@ mod tests {
         // Two forks of a mid-page boundary each copy the shared tail.
         let fork = saved.clone();
         assert_eq!(
-            saved.demand(1, Boundaries::Final)?,
+            saved.demand(1, &Boundaries::Final)?,
             Demand {
                 pages: 1,
                 windows: 0,
@@ -783,7 +854,7 @@ mod tests {
             full.reserve(1, Boundaries::Final),
             Err(TurError::MemoryAllocation(_))
         ));
-        assert_eq!(full.demand(1, Boundaries::Final)?.pages, 1);
+        assert_eq!(full.demand(1, &Boundaries::Final)?.pages, 1);
         drop(full);
         let usage = pool.usage()?;
         assert_eq!((usage.pages.leased, usage.pages.retired), (0, 2));
@@ -837,7 +908,7 @@ mod tests {
             2 * usage.page_bytes + 3 * usage.slot_bytes
         );
         assert_eq!(
-            state.demand(3, Boundaries::EveryToken)?.bytes(&usage),
+            state.demand(3, &Boundaries::EveryToken)?.bytes(&usage),
             reservation.bytes()?
         );
         Ok(())
@@ -960,7 +1031,7 @@ mod tests {
         // A pass demands window pages like pages, and a fork copies its shared tail.
         let fork = state.clone();
         assert_eq!(
-            fork.demand(1, Boundaries::Final)?,
+            fork.demand(1, &Boundaries::Final)?,
             Demand {
                 pages: 1,
                 windows: 1,
@@ -986,7 +1057,7 @@ mod tests {
             state.reserve(1, Boundaries::Final),
             Err(TurError::MemoryAllocation(_))
         ));
-        assert_eq!(state.demand(1, Boundaries::Final)?.windows, 1);
+        assert_eq!(state.demand(1, &Boundaries::Final)?.windows, 1);
         Ok(())
     }
 }

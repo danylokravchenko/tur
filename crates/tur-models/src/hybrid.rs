@@ -22,7 +22,9 @@ pub struct SequenceForward<'a> {
     /// Strictly increasing packed positions whose logits are required.
     pub logits: &'a [usize],
     /// Also return the final normalized hidden state of every new token, which a draft
-    /// head consumes ([`HybridModel::draft`]).
+    /// head consumes ([`HybridModel::draft`]). A model whose last layers only read shared
+    /// K/V (Gemma 4 E2B, E4B) may compute it for just the logit rows and the last row,
+    /// leaving other rows zero; its own draft head reads only the last committed row.
     pub hidden: bool,
 }
 
@@ -46,6 +48,28 @@ pub struct SequenceStep {
     pub logits: Tensor,
     /// F32 `[tokens, hidden]` final normalized hidden states, when requested.
     pub hidden: Option<Tensor>,
+    /// What [`HybridModel::replay`] needs to recompute the recurrent state after a prefix
+    /// of the pass's tokens, for a sequence with [`Boundaries::Replayed`].
+    pub replay: Option<ReplayInputs>,
+}
+
+/// Inputs a model keeps from a pass with [`Boundaries::Replayed`] sequences, to recompute
+/// their recurrent state after an earlier token. Their meaning belongs to the model.
+#[derive(Clone, Debug)]
+pub struct ReplayInputs {
+    /// Per recurrent layer, the rows its update reads, for every replayed sequence of the
+    /// pass.
+    pub layers: Vec<Tensor>,
+    /// This sequence's rows in each of them, in token order.
+    pub rows: Range<usize>,
+}
+
+/// A replayed sequence whose pass accepted only its first `accepted` tokens.
+pub struct ReplayCommit<'a> {
+    pub inputs: &'a ReplayInputs,
+    /// The pass's addressing: the committed slot it read and the one slot it wrote.
+    pub state: &'a SequenceState,
+    pub accepted: usize,
 }
 
 /// Activations of one sequence paused between layers of a pass.
@@ -130,6 +154,19 @@ pub trait HybridModel: Send + Sync + 'static {
         _end: usize,
     ) -> Result<LayerStep> {
         Err(invalid("model cannot pause between layers"))
+    }
+
+    /// Whether speculative passes may write [`Boundaries::Replayed`] states, which
+    /// [`Self::replay`] completes. Models without recurrent state never need it.
+    fn replays(&self) -> bool {
+        false
+    }
+
+    /// Encode, after a pass, the recurrent state of each of `commits` after its accepted
+    /// tokens into its written slot, exactly as a pass storing every token's state would
+    /// have written it. Only models whose [`Self::replays`] is true are asked.
+    fn replay(&self, _pool: &StatePool, _commits: &[ReplayCommit<'_>]) -> Result<()> {
+        Err(invalid("model cannot replay recurrent state"))
     }
 
     /// Encode a draft-head pass (native multi-token prediction): per sequence, the F32

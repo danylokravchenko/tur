@@ -22,10 +22,28 @@ impl Paging {
         spans: impl Iterator<Item = (&'a Addresses, usize, usize)>,
         tokens: usize,
     ) -> Result<Self> {
+        Self::queries(
+            k,
+            description,
+            pool,
+            spans.map(|(addresses, past, len)| (addresses, past..past + len)),
+            tokens,
+        )
+    }
+
+    /// [`Self::new`] for queries at chosen positions: `spans` yields each sequence's
+    /// addresses and the increasing positions of its queries in this pass.
+    pub(crate) fn queries<'a, P: IntoIterator<Item = usize>>(
+        k: &Kernels,
+        description: &ModelDescription,
+        pool: &StatePool,
+        spans: impl Iterator<Item = (&'a Addresses, P)>,
+        tokens: usize,
+    ) -> Result<Self> {
         let mut first = Vec::with_capacity(tokens);
         let mut visible = Vec::with_capacity(tokens);
         let (mut full, mut windows) = (Vec::new(), Vec::new());
-        for (addresses, past, len) in spans {
+        for (addresses, positions) in spans {
             let base = u32::try_from(full.len().max(windows.len()))
                 .map_err(|_| invalid("page table overflow"))?;
             // Both tables index the same logical pages; pad the shorter so bases agree.
@@ -35,9 +53,12 @@ impl Paging {
                 + addresses.pages.len().max(addresses.windows.len());
             full.resize(end, 0);
             windows.resize(end, 0);
-            for p in past..past + len {
+            for p in positions {
+                let keys = p
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("context overflow"))?;
                 first.push(base);
-                visible.push(u32::try_from(p + 1).map_err(|_| invalid("context overflow"))?);
+                visible.push(u32::try_from(keys).map_err(|_| invalid("context overflow"))?);
             }
         }
         Self::from_tables(k, description, pool, (&full, &windows), &first, &visible)

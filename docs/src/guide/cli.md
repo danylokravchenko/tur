@@ -111,8 +111,8 @@ tur run gemma 'Explain river deltas.' --draft-model google/gemma-4-E2B-it-assist
 | `--context-tokens <n>` | what the pool and model allow | Most tokens one request may hold, prompt and output together. Sizes the state pool for that many per concurrent request; a start that can't fit it fails and names what would |
 | `--state-memory-mb <n>` | derived | Memory for K/V pages and recurrent state. By default, room for an 8K-token context per concurrent request |
 | `--speculative-draft <n>` | 0 | Most tokens drafted from the request's own text per step; 0 turns speculation off |
-| `--mtp [true\|false]` | off | Also draft with the checkpoint's multi-token-prediction head; turns off prefix reuse |
-| `--draft-model <dir\|repo>` | none | Draft with a separate assistant checkpoint (Gemma 4); turns off prefix reuse |
+| `--mtp [true\|false]` | off | Also draft with the checkpoint's multi-token-prediction head |
+| `--draft-model <dir\|repo>` | none | Draft with a separate assistant checkpoint (Gemma 4) |
 | `--draft-revision <commit>` | none | Commit of a remote `--draft-model`, or a name for a local one |
 
 Speculation needs F32 recurrent state. With `--recurrent-state f16`, Tur logs a warning and decodes normally. [Speculative decoding](../architecture/speculation.md) explains when it pays.

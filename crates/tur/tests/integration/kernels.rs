@@ -406,6 +406,7 @@ fn spans(ragged: &Ragged) -> Vec<RecurrentSpan<'_>> {
             position: 7,
             read: *read,
             writes,
+            ends: &[],
         })
         .collect()
 }
@@ -562,12 +563,106 @@ fn scan_reference(
     (outputs, states)
 }
 
+/// States written inside one pass, for prefix snapshots, equal the states of passes that end
+/// at the same tokens, bit for bit and in every state format: narrow state continues from
+/// the stored value, as the next pass would. So do the outputs and the final state.
+#[test]
+fn test_states_inside_a_pass_equal_passes_ending_there() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    let shape = DeltaShape {
+        key_heads: 2,
+        value_heads: 4,
+        key_dim: 128,
+        value_dim: 22,
+        b_col: 3,
+        a_col: 8,
+        tiled: false,
+    };
+    let (cols, proj_cols, taps) = (shape.channels(), 12, 4);
+    let (tokens, ends) = (40, [16, 29, 40]);
+    let mixed = values(tokens * cols, 15, 1.0);
+    let proj = values(tokens * proj_cols, 16, 3.0);
+    let weight = upload(&device, &values(cols * taps, 14, 1.0), &[cols, taps])?;
+    let dt_bias = upload(&device, &values(4, 17, 1.0), &[4])?;
+    let neg_a: Vec<f32> = values(4, 18, 1.0).iter().map(|v| -v.abs() - 0.1).collect();
+    let neg_a = upload(&device, &neg_a, &[4])?;
+    let rows = |data: &[f32], width: usize, from: usize, to: usize| {
+        upload(
+            &device,
+            &data[from * width..to * width],
+            &[to - from, width],
+        )
+    };
+    for dtype in [DType::F32, DType::F16, DType::BF16] {
+        // Slot 0 is committed; 1..=3 take the states inside the whole pass and 4..=6 the
+        // states of three passes that end at the same tokens.
+        let (pool, _) = committed_pool(&device, 7, &[4, 128, 22], &[(1, 0, vec![])], 0.1)?;
+        let pool = pool.to_dtype(dtype)?;
+        let (history, _) = committed_pool(&device, 7, &[taps - 1, cols], &[(1, 0, vec![])], 2.0)?;
+        let pass = |from: usize, to: usize, read: u32, writes: &[u32], ends: &[usize]| {
+            let spans = kernels.recurrent_spans(&[RecurrentSpan {
+                tokens: to - from,
+                position: from,
+                read,
+                writes,
+                ends,
+            }])?;
+            let x = rows(&mixed, cols, from, to)?;
+            kernels.delta_conv(&x, &spans, &history, &weight)?;
+            kernels.delta_scan(
+                &x,
+                &rows(&proj, proj_cols, from, to)?,
+                &spans,
+                &shape,
+                &dt_bias,
+                &neg_a,
+                &pool,
+            )
+        };
+        let whole = read(&pass(0, tokens, 0, &[1, 2, 3], &ends)?.to_dtype(DType::F32)?)?;
+        let mut split = Vec::new();
+        for (index, (from, to)) in [(0, 16), (16, 29), (29, 40)].into_iter().enumerate() {
+            let slot = 4 + index as u32;
+            let read_slot = if index == 0 { 0 } else { slot - 1 };
+            split.extend(read(&pass(from, to, read_slot, &[slot], &[])?)?);
+        }
+        assert_eq!(whole, split, "{dtype:?} outputs");
+        for (inside, ending) in [(1, 4), (2, 5), (3, 6)] {
+            for store in [&pool, &history] {
+                assert_eq!(
+                    read(&store.get(inside)?.to_dtype(DType::F32)?)?,
+                    read(&store.get(ending)?.to_dtype(DType::F32)?)?,
+                    "{dtype:?} slot {inside}"
+                );
+            }
+        }
+    }
+    // Ends must ascend inside the sequence and finish at its last token.
+    for ends in [&[16, 16, 40][..], &[0, 40], &[16, 29], &[29, 16, 40]] {
+        let writes = &[1, 2, 3][..ends.len()];
+        assert!(
+            kernels
+                .recurrent_spans(&[RecurrentSpan {
+                    tokens,
+                    position: 0,
+                    read: 0,
+                    writes,
+                    ends,
+                }])
+                .is_err(),
+            "{ends:?}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<()> {
     let (device, kernels, _gpu) = setup()?;
     // Single-token sequences take the step kernel, or the scan when tuning disables it.
-    // Narrow storage rounds each stored state once; a pass accumulates in F32, so outputs
-    // match a reference started from the rounded committed state. Rows of `mixed` padded
+    // Narrow storage rounds each stored state once and the scan continues from the stored
+    // value, so a pass storing only its last state matches a reference started from the
+    // rounded committed state, and one storing every state follows it within rounding. Rows of `mixed` padded
     // by 3 or 4 columns take the unaligned or the aligned scan. Each kernel also runs with
     // value heads in llama.cpp's tiled order.
     for (dk, delta_step, dtype, pad, tiled) in [64usize, 128, 256].into_iter().flat_map(|dk| {
@@ -647,8 +742,9 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
             );
             let actual = read(&out.narrow(0, row * 4, tokens * 4)?)?;
             let error = relative_error(&actual, &expected_out);
+            let bound = if writes.len() > 1 { stored } else { 1e-5 };
             assert!(
-                error < 1e-5,
+                error < bound,
                 "{dtype:?} dk {dk} step {delta_step} tiled {tiled} tokens {tokens}: output {error}"
             );
             let boundaries: Vec<&Vec<f64>> = if writes.len() > 1 {
@@ -656,10 +752,16 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
             } else {
                 expected_states.last().into_iter().collect()
             };
+            // Later states carry the roundings of the states stored before them.
+            let state_bound = if writes.len() > 1 {
+                2.0 * stored
+            } else {
+                stored
+            };
             for (&slot, expected) in writes.iter().zip(boundaries) {
                 let error = relative_error(&widen(slot as usize)?, expected);
                 assert!(
-                    error < stored,
+                    error < state_bound,
                     "{dtype:?} dk {dk} step {delta_step} tiled {tiled} tokens {tokens}: state {error}"
                 );
             }
@@ -1761,6 +1863,7 @@ fn test_invalid_inputs_are_rejected_before_encoding() -> Result<()> {
         position: 0,
         read,
         writes,
+        ends: &[],
     };
     let state = Tensor::zeros((3, 1, 96, 4), DType::F32, &device)?;
     let decodes = kernels.recurrent_spans(&[span(1, 0, &[1]), span(1, 0, &[2])])?;

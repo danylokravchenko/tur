@@ -602,7 +602,7 @@ fn head_logits(model: &Qwen35, ids: &[u32]) -> Result<Vec<Vec<f32>>> {
     drop(reservation);
     let mut rows = Vec::with_capacity(count);
     for row in 0..count {
-        let side = state.side(row, 1)?;
+        let side = state.side(row, 1, &[])?;
         let logits = model
             .draft(&DraftForward {
                 tokens: &ids[row + 1..row + 2],

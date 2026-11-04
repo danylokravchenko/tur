@@ -680,6 +680,7 @@ impl GptOss {
                 .hidden
                 .then(|| hidden.narrow(0, s.start, s.len))
                 .transpose()?,
+            replay: None,
         })
     }
 
