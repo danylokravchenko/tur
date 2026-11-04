@@ -33,6 +33,7 @@ use crate::{
     Result,
     hybrid::{Draft, HybridEngine, PoolUsage, SamplingStats},
 };
+use candle_core::Tensor;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -115,12 +116,32 @@ struct Pending {
     /// Positions whose draft-head keys and values are written, and the head's chained
     /// drafts for the tokens after the pending one, valid while `mtp_done == consumed`.
     mtp_done: usize,
+    /// `[1, hidden]` final hidden state at `mtp_done` when the head's entry there must be
+    /// recomputed first: a restored snapshot's entry read another next token.
+    head_seed: Option<Tensor>,
     mtp_drafts: Vec<Draft>,
     mtp_acceptance: Acceptance,
     /// Confidences of the head's drafts verified by the pass in flight.
     mtp_verifying: Vec<f32>,
     drafted: usize,
     accepted_drafts: usize,
+}
+
+/// A commit to snapshot at the end of its step.
+struct SnapshotCommit {
+    id: Uuid,
+    /// `[1, vocab]` logits after a prompt's last token.
+    logits: Option<Tensor>,
+    /// `[1, hidden]` final hidden state at the last committed position, when the draft head
+    /// runs, so a request continuing with another token can recompute the head's entry.
+    hidden: Option<Tensor>,
+}
+
+/// A finished request whose reply is snapshotted at the end of its step.
+struct Finishing {
+    pending: Pending,
+    /// Its reply ended in tool calls, so its snapshots are held for the caller's return.
+    tool_calls: bool,
 }
 
 impl Pending {
@@ -188,7 +209,12 @@ pub struct InferencePipeline {
     device_sampling: bool,
     _lease: BudgetLease,
     pending: HashMap<Uuid, Pending>,
+    /// Requests finished this step, kept until [`Self::settle`] snapshots their replies.
+    finishing: HashMap<Uuid, Finishing>,
     prefix: PrefixCache,
+    /// This step's snapshot commits, inserted by [`Self::settle`] once the draft head has
+    /// written its entries for them.
+    snapshots: Vec<SnapshotCommit>,
     /// Waiting requests left unscheduled this pass for a producer of a shared prefix.
     awaiting: HashSet<Uuid>,
     in_flight: Option<InFlight>,

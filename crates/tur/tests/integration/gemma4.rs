@@ -478,6 +478,75 @@ fn test_gemma4_assistant_drafts_preserve_target_sampling() -> Result<()> {
     Ok(())
 }
 
+/// The assistant keeps no state, so it drafts beside prefix reuse: restored requests
+/// generate exactly what ordinary decoding does.
+#[test]
+fn test_gemma4_assistant_drafts_beside_prefix_reuse() -> Result<()> {
+    use tur::backend::{
+        pipeline::{GenerationRequest, InferencePipeline, PipelineConfig},
+        prefix::PrefixConfig,
+        speculation::SpeculationConfig,
+    };
+    use tur_models::models::DraftHead;
+    let checkpoint = crate::common::Checkpoint::new()?;
+    for name in ["model.safetensors", "config.json"] {
+        std::fs::copy(fixture("dense").join(name), checkpoint.0.join(name))?;
+    }
+    let factory = checkpoint.factory();
+    let mut plain = InferencePipeline::new(
+        &factory,
+        PipelineConfig {
+            prefix: PrefixConfig::DISABLED,
+            ..PipelineConfig::new(1, 16)
+        },
+    )?;
+    let mut drafted = InferencePipeline::new(
+        &factory,
+        PipelineConfig {
+            prefix: PrefixConfig {
+                entries: 8,
+                spacing: 16,
+                state_share: None,
+                restorable_first: false,
+                tool_hold: std::time::Duration::ZERO,
+            },
+            speculation: SpeculationConfig {
+                min_ngram: 16,
+                max_ngram: 16,
+                mtp: Some(DraftHead {
+                    vocab: None,
+                    model: Some(fixture("assistant")),
+                }),
+                ..SpeculationConfig::new(4)
+            },
+            ..PipelineConfig::new(1, 16)
+        },
+    )?;
+    let prompt = "t2 t7 t5 t9 t3 t12 t7 t17 t4 t11 t6 t13 t8 t14 t15 t16 t18 t19 t20";
+    let short = GenerationRequest::new(prompt.into(), 1);
+    let expected = plain.run(&short, |_| {})?.generated_text;
+    let first = drafted.run(&short, |_| {})?;
+    assert_eq!(first.generated_text, expected);
+    // The whole prompt restores from its snapshot's logits, and a longer prompt continues
+    // after that snapshot: no draft-head entry has to match the token after it.
+    for request in [
+        GenerationRequest::new(prompt.into(), 24),
+        GenerationRequest::new(format!("{prompt} t21 t22"), 24),
+    ] {
+        let restored = drafted.run(&request, |_| {})?;
+        assert_eq!(
+            restored.generated_text,
+            plain.run(&request, |_| {})?.generated_text
+        );
+        assert_eq!(restored.cached_tokens, first.prompt_tokens);
+    }
+    assert!(drafted.speculation_stats().mtp_drafted > 0);
+    drafted.clear_prefix_cache();
+    let usage = drafted.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires pinned Gemma 4 E2B checkpoint and Transformers golden"]
 #[cfg(feature = "metal")]

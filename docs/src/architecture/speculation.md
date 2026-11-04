@@ -42,7 +42,6 @@ The MTP head and the Gemma assistant have extra gates:
 ## Constraints
 
 - Speculation needs F32 recurrent state. With F16 or BF16 state, the pipeline logs a warning and decodes normally, because verifying several tokens keeps F32 intermediate state between drafts.
-- MTP turns off prefix reuse (see [Prefix reuse](prefix-reuse.md)).
 - Grammar-constrained requests never draft, and the end-of-sequence token is never proposed.
 - Drafting needs extra state memory, a recurrent slot per candidate boundary and an output row per draft, which the memory plan reserves up front.
 

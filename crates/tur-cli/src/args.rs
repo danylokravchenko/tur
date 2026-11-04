@@ -366,12 +366,12 @@ pub(crate) struct PipelineArgs {
     #[arg(long)]
     speculative_draft: Option<usize>,
     /// Also draft from the checkpoint's native multi-token prediction head. Implies at
-    /// least one draft and disables prefix reuse.
+    /// least one draft.
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     mtp: Option<bool>,
     /// Draft from a separate multi-token prediction checkpoint (a Gemma 4 assistant): a
     /// local directory or a Hugging Face repository at `--draft-revision`. Implies at
-    /// least one draft and disables prefix reuse.
+    /// least one draft.
     #[arg(long)]
     draft_model: Option<String>,
     /// Immutable commit of a remote `--draft-model`, or an identity for a local one.

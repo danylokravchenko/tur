@@ -101,7 +101,7 @@ pub(crate) fn run() -> Result<()> {
             for salt in 1..entries as u32 {
                 let other = tokens(length / 2, salt);
                 let keys = cache.keys(None, &other);
-                cache.insert(&keys, &other, &state(&pool, other.len())?, None)?;
+                cache.insert(&keys, &other, &state(&pool, other.len())?, None, None)?;
             }
             let probe = tokens(length, 0);
             let keys = cache.keys(None, &probe);
@@ -110,6 +110,7 @@ pub(crate) fn run() -> Result<()> {
                 &probe[..length / 2],
                 &state(&pool, length / 2)?,
                 None,
+                None,
             )?;
             let miss = tokens(length, 9_999);
             let miss_keys = cache.keys(None, &miss);
@@ -117,10 +118,14 @@ pub(crate) fn run() -> Result<()> {
                 black_box(cache.keys(None, black_box(&probe)));
             });
             let hit = time(|| {
-                black_box(cache.lookup(&keys, &probe, |_| true).map(|hit| hit.length));
+                black_box(
+                    cache
+                        .lookup(&keys, &probe, false, |_| true)
+                        .map(|hit| hit.length),
+                );
             });
             let missed = time(|| {
-                black_box(cache.lookup(&miss_keys, &miss, |_| true).is_some());
+                black_box(cache.lookup(&miss_keys, &miss, false, |_| true).is_some());
             });
             eprintln!(
                 "{entries} entries, {length} tokens: keys {:.1} µs, hit {:.1} µs, miss {:.1} µs",

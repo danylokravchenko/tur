@@ -1,6 +1,9 @@
 //! Prefix restoration and pass selection under state-pool pressure.
 
-use super::super::scheduler::{Candidate, Chunk, Decision};
+use super::super::{
+    prefix::HeadEntry,
+    scheduler::{Candidate, Chunk, Decision},
+};
 use super::{BatchStepOutput, InferencePipeline, Pending};
 use crate::{Result, TurError, hybrid::Demand};
 use std::time::Instant;
@@ -13,13 +16,14 @@ impl InferencePipeline {
     /// concurrently: a producer has not yet reached the deepest snapshot it will insert
     /// within the shared tokens, and the cache holds nothing as deep. Only first
     /// admissions younger than the queue-age limit wait.
-    fn awaits(&self, waiter: &Pending, producers: &[Uuid], now: Instant) -> bool {
+    fn awaits(&self, id: Uuid, waiter: &Pending, producers: &[Uuid], now: Instant) -> bool {
         if !waiter.boundaries.is_empty()
             || now.saturating_duration_since(waiter.arrival)
                 >= self.scheduler.config().max_queue_wait
         {
             return false;
         }
+        let head = self.needs_head(id);
         let mut cached = None;
         producers.iter().any(|id| {
             self.pending.get(id).is_some_and(|producer| {
@@ -31,8 +35,9 @@ impl InferencePipeline {
                     .map_or(depth, |boundary| depth.max(boundary));
                 depth > producer.consumed
                     && depth
-                        > *cached
-                            .get_or_insert_with(|| self.prefix.depth(&waiter.keys, &waiter.tokens))
+                        > *cached.get_or_insert_with(|| {
+                            self.prefix.depth(&waiter.keys, &waiter.tokens, head)
+                        })
                     && waiter.tokens.get(..depth) == producer.tokens.get(..depth)
             })
         })
@@ -50,7 +55,8 @@ impl InferencePipeline {
                 continue;
             }
             let cached = if shortest {
-                self.prefix.depth(&pending.keys, &pending.tokens)
+                self.prefix
+                    .depth(&pending.keys, &pending.tokens, self.needs_head(*id))
             } else {
                 0
             };
@@ -104,7 +110,7 @@ impl InferencePipeline {
                 .pending
                 .get(&id)
                 .ok_or_else(|| invalid("missing pipeline request"))?;
-            if self.awaits(pending, &producers, now) {
+            if self.awaits(id, pending, &producers, now) {
                 self.awaiting.insert(id);
                 continue;
             }
@@ -112,6 +118,8 @@ impl InferencePipeline {
             if !restorable_first {
                 free -= 1;
             }
+            let (head, keyed) = (self.needs_head(id), self.keyed_head());
+            let page = self.engine.pool().description().kv.page_tokens;
             let pending = self
                 .pending
                 .get_mut(&id)
@@ -131,7 +139,10 @@ impl InferencePipeline {
                         || length <= floor
                         || boundaries.binary_search(&length).is_ok())
             };
-            let Some(hit) = self.prefix.lookup(&pending.keys, &pending.tokens, accept) else {
+            let Some(hit) = self
+                .prefix
+                .lookup(&pending.keys, &pending.tokens, head, accept)
+            else {
                 pending.prefix_checked = Some(inserted);
                 continue;
             };
@@ -141,6 +152,7 @@ impl InferencePipeline {
             pending.handle = self.engine.adopt(pending.handle, &hit.state)?;
             pending.consumed = hit.length;
             pending.running = true;
+            resume_head(pending, hit.length, hit.head.as_ref(), keyed, page);
             if pending.boundaries.is_empty() {
                 pending.replay_floor = hit.length;
                 pending.cached_tokens = hit.length;
@@ -154,12 +166,26 @@ impl InferencePipeline {
                 .logits
                 .ok_or_else(|| invalid("whole-prompt snapshot without logits"))
                 .and_then(|logits| self.engine.sample_logits(handle, &logits))
-                .and_then(|commit| self.publish(id, commit, None, output));
+                .and_then(|commit| self.publish(id, commit, None, None, output));
             if let Err(error) = first {
                 self.fail(id, error, output)?;
             }
+            // The sampled output decides whether the head's last entry holds.
+            if let Some(pending) = self
+                .pending
+                .get_mut(&id)
+                .or_else(|| self.finishing.get_mut(&id).map(|f| &mut f.pending))
+            {
+                resume_head(pending, hit.length, hit.head.as_ref(), keyed, page);
+            }
         }
-        Ok(())
+        self.settle()
+    }
+
+    /// Whether `id` runs a draft head that keeps keys and values, so a snapshot it restores
+    /// must hold the head's entries (see [`super::super::prefix`]).
+    fn needs_head(&self, id: Uuid) -> bool {
+        self.keyed_head() && !self.engine.constraining(id)
     }
 
     /// Evict snapshots while they keep the first admissible waiting request's next chunk
@@ -278,4 +304,34 @@ fn growth(description: &tur_core::execution::ModelDescription, sequences: usize)
         },
         slots: 0,
     }
+}
+
+/// Where the draft head of `pending`, restored to a snapshot of `length` tokens whose head
+/// entry is `head`, continues. A head without keys and values always continues there. The
+/// snapshot's last entry holds if the token after it is the one it read, or is not known
+/// yet; otherwise the head recomputes it from the stored hidden state where it can, and
+/// stays behind where it can't.
+fn resume_head(
+    pending: &mut Pending,
+    length: usize,
+    head: Option<&HeadEntry>,
+    keyed: bool,
+    page_tokens: usize,
+) {
+    pending.head_seed = None;
+    pending.mtp_done = match (keyed, head) {
+        (false, _) => length,
+        (true, None) => 0,
+        (true, Some(head)) => match pending.tokens.get(length) {
+            Some(&next) if next != head.next => {
+                if head.recomputable(length, page_tokens) {
+                    pending.head_seed.clone_from(&head.hidden);
+                    length - 1
+                } else {
+                    0
+                }
+            }
+            _ => length,
+        },
+    };
 }

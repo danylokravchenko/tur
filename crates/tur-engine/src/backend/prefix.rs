@@ -18,6 +18,15 @@
 //! nothing; it keeps one recurrent slot and its pages alive. A snapshot inside a page
 //! makes its first appender copy that one tail page.
 //!
+//! A draft head that writes its own keys and values (Qwen3.5's MTP head) reads the token
+//! after each position, so its entry at a snapshot's last position depends on the token
+//! that followed it. A snapshot records that token and the final hidden state there. A
+//! request that needs the head and continues with the same token uses the entry as it is.
+//! One that continues differently recomputes it from the hidden state, which needs the
+//! snapshot to end inside a page: the request's first pass then copies that page, so the
+//! entry is rewritten in a page no other holder sees. Chat templates rewrite history right
+//! after a turn boundary, so those snapshots are always continued differently.
+//!
 //! Keys chain a per-cache keyed hash over tokens, seeded by a namespace (tenant or cache
 //! salt), so equal prefixes in different namespaces never meet. A hash hit is used only
 //! after comparing every token. The pool pins model identity and state layout, so entries
@@ -120,6 +129,8 @@ struct Entry {
     state: ModelState,
     /// `[1, vocab]` model logits after the last token, for prompt-end snapshots.
     logits: Option<Tensor>,
+    /// The draft head's entry at the last position; `None` when the head wrote none.
+    head: Option<HeadEntry>,
     last_use: u64,
     /// Until when eviction takes this entry only after every entry not on hold.
     held_until: Option<Instant>,
@@ -171,12 +182,32 @@ impl PrefixKeys {
     }
 }
 
+/// The draft head's entry at a snapshot's last position (see the module documentation).
+#[derive(Clone, Debug)]
+pub struct HeadEntry {
+    /// The token after the snapshot that the entry read.
+    pub next: u32,
+    /// `[1, hidden]` final hidden state at the last position, to recompute the entry for
+    /// another next token.
+    pub hidden: Option<Tensor>,
+}
+
+impl HeadEntry {
+    /// Whether a request restoring the snapshot of `length` tokens, with `page_tokens`-token
+    /// pages, can recompute this entry for its own next token.
+    pub fn recomputable(&self, length: usize, page_tokens: usize) -> bool {
+        self.hidden.is_some() && !length.is_multiple_of(page_tokens)
+    }
+}
+
 /// A verified snapshot of a request's first `length` tokens.
 pub struct Restored {
     pub length: usize,
     pub state: ModelState,
     /// The logits after the last of those tokens, when the snapshot kept them.
     pub logits: Option<Tensor>,
+    /// The draft head's entry at the last of them, when it wrote its entries.
+    pub head: Option<HeadEntry>,
 }
 
 /// Bounded snapshots of committed prefixes for one engine's pool.
@@ -271,11 +302,14 @@ impl PrefixCache {
 
     /// Key and length of the deepest verified entry for a prefix of `tokens` whose length
     /// `accept` admits, counting rejected hash matches. A snapshot of all of `tokens`
-    /// needs its logits, since an output must come from them.
+    /// needs its logits, since an output must come from them. With `head`, the draft
+    /// head's entries must hold up to the snapshot, its last one usable or recomputable
+    /// for the token after it.
     fn find(
         &self,
         keys: &PrefixKeys,
         tokens: &[u32],
+        head: bool,
         accept: impl Fn(usize) -> bool,
         collisions: &mut u64,
     ) -> Option<(u64, usize)> {
@@ -289,7 +323,14 @@ impl PrefixCache {
                 *collisions += 1;
                 continue;
             }
-            if accept(length) && (length < tokens.len() || entry.logits.is_some()) {
+            let head_holds = !head
+                || entry.head.as_ref().is_some_and(|entry_head| {
+                    tokens
+                        .get(length)
+                        .is_none_or(|&token| token == entry_head.next)
+                        || entry_head.recomputable(length, entry.state.description().kv.page_tokens)
+                });
+            if accept(length) && head_holds && (length < tokens.len() || entry.logits.is_some()) {
                 return Some((key, length));
             }
         }
@@ -297,20 +338,24 @@ impl PrefixCache {
     }
 
     /// Tokens of `tokens` a lookup could restore now, without counting it as one.
-    pub fn depth(&self, keys: &PrefixKeys, tokens: &[u32]) -> usize {
+    pub fn depth(&self, keys: &PrefixKeys, tokens: &[u32], head: bool) -> usize {
         if !self.config.enabled() {
             return 0;
         }
-        self.find(keys, tokens, |_| true, &mut 0)
+        self.find(keys, tokens, head, |_| true, &mut 0)
             .map_or(0, |(_, length)| length)
     }
 
     /// Deepest verified snapshot of a prefix of `tokens` whose length `accept` admits. A
     /// snapshot of all of `tokens` needs its logits, since an output must come from them.
+    /// With `head`, the draft head's entries must also hold for `tokens` (see the module
+    /// documentation); a snapshot of all of `tokens` holds them as they are only if the
+    /// output sampled from its logits is the one [`Restored::head`] read.
     pub fn lookup(
         &mut self,
         keys: &PrefixKeys,
         tokens: &[u32],
+        head: bool,
         accept: impl Fn(usize) -> bool,
     ) -> Option<Restored> {
         if !self.config.enabled() || self.map.is_empty() {
@@ -318,7 +363,7 @@ impl PrefixCache {
         }
         self.stats.lookups += 1;
         let mut collisions = 0;
-        let found = self.find(keys, tokens, accept, &mut collisions);
+        let found = self.find(keys, tokens, head, accept, &mut collisions);
         self.stats.collisions += collisions;
         let (key, length) = found?;
         self.tick += 1;
@@ -331,6 +376,7 @@ impl PrefixCache {
             length,
             state: entry.state.clone(),
             logits: entry.logits.clone(),
+            head: entry.head.clone(),
         })
     }
 
@@ -352,14 +398,17 @@ impl PrefixCache {
     }
 
     /// Retain `state`, committed after exactly `tokens` (covered by `keys`), with the
-    /// logits after its last token if known. An entry for the same tokens is refreshed and
-    /// gains logits it lacked; a colliding one is kept.
+    /// logits after its last token if known and the draft head's entry at its last position
+    /// if the head wrote its entries up to there. An entry for the same tokens is refreshed
+    /// and gains logits it lacked, and takes this state if only this one has the head's
+    /// entries; a colliding one is kept.
     pub fn insert(
         &mut self,
         keys: &PrefixKeys,
         tokens: &[u32],
         state: &ModelState,
         logits: Option<&Tensor>,
+        head: Option<HeadEntry>,
     ) -> Result<()> {
         if !self.config.enabled() {
             return Ok(());
@@ -389,6 +438,10 @@ impl PrefixCache {
                 if entry.logits.is_none() {
                     entry.logits = logits.cloned();
                 }
+                if entry.head.is_none() && head.is_some() {
+                    entry.state = state.clone();
+                    entry.head = head;
+                }
             } else {
                 self.stats.collisions += 1;
             }
@@ -406,6 +459,7 @@ impl PrefixCache {
                 keys: keys.keys[..tokens.len()].into(),
                 state: state.clone(),
                 logits: logits.cloned(),
+                head,
                 last_use: self.tick,
                 held_until: None,
             },
@@ -600,27 +654,33 @@ mod tests {
         assert_eq!(keys.len(), 5);
         cache.extend(&mut keys, &prompt);
         assert_eq!(keys.keys, cache.keys(None, &prompt).keys);
-        cache.insert(&keys, &prompt[..4], &state(&pool, 4)?, None)?;
-        cache.insert(&keys, &prompt[..7], &state(&pool, 7)?, None)?;
+        cache.insert(&keys, &prompt[..4], &state(&pool, 4)?, None, None)?;
+        cache.insert(&keys, &prompt[..7], &state(&pool, 7)?, None, None)?;
         assert!(
             cache
-                .insert(&keys, &prompt[..6], &state(&pool, 5)?, None)
+                .insert(&keys, &prompt[..6], &state(&pool, 5)?, None, None)
                 .is_err()
         );
         let hit = cache
-            .lookup(&keys, &prompt, |_| true)
+            .lookup(&keys, &prompt, false, |_| true)
             .ok_or_else(|| invalid("miss"))?;
         assert_eq!((hit.length, hit.state.position()), (7, 7));
         // The caller may restrict admissible lengths, e.g. to its own pass boundaries.
-        assert_eq!(length(cache.lookup(&keys, &prompt, |n| n != 7)), Some(4));
+        assert_eq!(
+            length(cache.lookup(&keys, &prompt, false, |n| n != 7)),
+            Some(4)
+        );
         // A different continuation shares only the first four tokens.
         let mut other = prompt.clone();
         other[5] = 15;
         let other_keys = cache.keys(None, &other);
-        assert_eq!(length(cache.lookup(&other_keys, &other, |_| true)), Some(4));
+        assert_eq!(
+            length(cache.lookup(&other_keys, &other, false, |_| true)),
+            Some(4)
+        );
         // Namespaces never share entries.
         let salted = cache.keys(Some("tenant"), &prompt);
-        assert!(cache.lookup(&salted, &prompt, |_| true).is_none());
+        assert!(cache.lookup(&salted, &prompt, false, |_| true).is_none());
         let stats = cache.stats();
         assert_eq!((stats.hits, stats.hit_tokens, stats.lookups), (3, 15, 4));
         Ok(())
@@ -632,14 +692,17 @@ mod tests {
         let mut cache = cache(4);
         let prompt: Vec<u32> = (0..6).collect();
         let keys = cache.keys(None, &prompt);
-        cache.insert(&keys, &prompt[..4], &state(&pool, 4)?, None)?;
-        cache.insert(&keys, &prompt, &state(&pool, 6)?, None)?;
+        cache.insert(&keys, &prompt[..4], &state(&pool, 4)?, None, None)?;
+        cache.insert(&keys, &prompt, &state(&pool, 6)?, None, None)?;
         // Without logits a repeat must recompute its last token.
-        assert_eq!(length(cache.lookup(&keys, &prompt, |_| true)), Some(4));
+        assert_eq!(
+            length(cache.lookup(&keys, &prompt, false, |_| true)),
+            Some(4)
+        );
         let logits = Tensor::zeros((1, 16), DType::F32, &Device::Cpu)?;
-        cache.insert(&keys, &prompt, &state(&pool, 6)?, Some(&logits))?;
+        cache.insert(&keys, &prompt, &state(&pool, 6)?, Some(&logits), None)?;
         let hit = cache
-            .lookup(&keys, &prompt, |_| true)
+            .lookup(&keys, &prompt, false, |_| true)
             .ok_or_else(|| invalid("miss"))?;
         assert_eq!(hit.length, 6);
         assert!(hit.logits.is_some());
@@ -647,9 +710,87 @@ mod tests {
         let longer: Vec<u32> = (0..9).collect();
         let longer_keys = cache.keys(None, &longer);
         assert_eq!(
-            length(cache.lookup(&longer_keys, &longer, |_| true)),
+            length(cache.lookup(&longer_keys, &longer, false, |_| true)),
             Some(6)
         );
+        Ok(())
+    }
+
+    fn head(next: u32, hidden: bool) -> Result<Option<HeadEntry>> {
+        Ok(Some(HeadEntry {
+            next,
+            hidden: hidden
+                .then(|| Tensor::zeros((1, 4), DType::F32, &Device::Cpu))
+                .transpose()?,
+        }))
+    }
+
+    #[test]
+    fn test_a_draft_head_restores_entries_it_can_use_or_recompute() -> Result<()> {
+        let pool = pool()?;
+        let mut cache = cache(4);
+        let prompt: Vec<u32> = (0..7).collect();
+        let keys = cache.keys(None, &prompt);
+        cache.insert(&keys, &prompt[..2], &state(&pool, 2)?, None, head(2, true)?)?;
+        // Pages hold two tokens: an entry ending on a page boundary can't be recomputed.
+        cache.insert(
+            &keys,
+            &prompt[..6],
+            &state(&pool, 6)?,
+            None,
+            head(15, true)?,
+        )?;
+        assert_eq!(
+            length(cache.lookup(&keys, &prompt, true, |_| true)),
+            Some(2)
+        );
+        // A request without the head takes the deeper snapshot.
+        assert_eq!(cache.depth(&keys, &prompt, false), 6);
+        // Inside a page, the hidden state lets the request recompute the entry.
+        cache.insert(
+            &keys,
+            &prompt[..5],
+            &state(&pool, 5)?,
+            None,
+            head(15, true)?,
+        )?;
+        assert_eq!(cache.depth(&keys, &prompt, true), 5);
+        let other: Vec<u32> = (20..26).collect();
+        let other_keys = cache.keys(None, &other);
+        cache.insert(
+            &other_keys,
+            &other[..3],
+            &state(&pool, 3)?,
+            None,
+            head(15, false)?,
+        )?;
+        assert_eq!(cache.depth(&other_keys, &other, true), 0);
+        // A whole-prompt hit is restored before its output is sampled.
+        let logits = Tensor::zeros((1, 16), DType::F32, &Device::Cpu)?;
+        cache.insert(&keys, &prompt[..2], &state(&pool, 2)?, Some(&logits), None)?;
+        let hit = cache
+            .lookup(&keys, &prompt[..2], true, |_| true)
+            .ok_or_else(|| invalid("miss"))?;
+        assert_eq!(hit.length, 2);
+        assert_eq!(hit.head.map(|entry| entry.next), Some(2));
+        // An entry without the head's entries serves only requests without the head, until
+        // a snapshot of the same tokens that has them replaces its state.
+        cache.clear();
+        let headless = state(&pool, 2)?;
+        cache.insert(&other_keys, &other[..2], &headless, None, None)?;
+        assert_eq!(cache.depth(&other_keys, &other, true), 0);
+        assert_eq!(cache.depth(&other_keys, &other, false), 2);
+        assert_eq!(headless.exclusive().pages, 0);
+        cache.insert(
+            &other_keys,
+            &other[..2],
+            &state(&pool, 2)?,
+            None,
+            head(22, false)?,
+        )?;
+        assert_eq!(cache.depth(&other_keys, &other, true), 2);
+        // The cache let go of the state without the head's entries.
+        assert_eq!(headless.exclusive().pages, 1);
         Ok(())
     }
 
@@ -659,13 +800,16 @@ mod tests {
         let mut cache = cache(2);
         let prompt: Vec<u32> = (0..8).collect();
         let keys = cache.keys(None, &prompt);
-        cache.insert(&keys, &prompt[..4], &state(&pool, 4)?, None)?;
+        cache.insert(&keys, &prompt[..4], &state(&pool, 4)?, None, None)?;
         // Forge a collision: different tokens presented with the stored key.
         let forged: Vec<u32> = (8..16).collect();
-        assert!(cache.lookup(&keys, &forged[..5], |_| true).is_none());
-        cache.insert(&keys, &forged[..4], &state(&pool, 4)?, None)?;
+        assert!(cache.lookup(&keys, &forged[..5], false, |_| true).is_none());
+        cache.insert(&keys, &forged[..4], &state(&pool, 4)?, None, None)?;
         assert_eq!(cache.stats().collisions, 2);
-        assert_eq!(length(cache.lookup(&keys, &prompt, |_| true)), Some(4));
+        assert_eq!(
+            length(cache.lookup(&keys, &prompt, false, |_| true)),
+            Some(4)
+        );
         Ok(())
     }
 
@@ -677,13 +821,25 @@ mod tests {
             .map(|p| (0..5).map(|t| t + p * 5).collect())
             .collect();
         let keys: Vec<_> = prompts.iter().map(|p| cache.keys(None, p)).collect();
-        cache.insert(&keys[0], &prompts[0][..4], &state(&pool, 4)?, None)?;
-        cache.insert(&keys[1], &prompts[1][..4], &state(&pool, 4)?, None)?;
-        assert!(cache.lookup(&keys[0], &prompts[0], |_| true).is_some());
+        cache.insert(&keys[0], &prompts[0][..4], &state(&pool, 4)?, None, None)?;
+        cache.insert(&keys[1], &prompts[1][..4], &state(&pool, 4)?, None, None)?;
+        assert!(
+            cache
+                .lookup(&keys[0], &prompts[0], false, |_| true)
+                .is_some()
+        );
         // Inserting a third evicts the unused second entry, not the older hit one.
-        cache.insert(&keys[2], &prompts[2][..4], &state(&pool, 4)?, None)?;
-        assert!(cache.lookup(&keys[0], &prompts[0], |_| true).is_some());
-        assert!(cache.lookup(&keys[1], &prompts[1], |_| true).is_none());
+        cache.insert(&keys[2], &prompts[2][..4], &state(&pool, 4)?, None, None)?;
+        assert!(
+            cache
+                .lookup(&keys[0], &prompts[0], false, |_| true)
+                .is_some()
+        );
+        assert!(
+            cache
+                .lookup(&keys[1], &prompts[1], false, |_| true)
+                .is_none()
+        );
         assert_eq!(pool.usage()?.slots.leased, 2);
         cache.clear();
         let usage = pool.usage()?;
@@ -699,19 +855,25 @@ mod tests {
         let prompt: Vec<u32> = (0..12).collect();
         let keys = cache.keys(None, &prompt);
         for length in [4, 8, 9] {
-            cache.insert(&keys, &prompt[..length], &state(&pool, length)?, None)?;
+            cache.insert(&keys, &prompt[..length], &state(&pool, length)?, None, None)?;
         }
-        assert_eq!(cache.depth(&keys, &prompt), 9);
-        assert_eq!(cache.depth(&keys, &prompt[..8]), 4);
+        assert_eq!(cache.depth(&keys, &prompt, false), 9);
+        assert_eq!(cache.depth(&keys, &prompt[..8], false), 4);
         assert_eq!(cache.stats().lookups, 0);
         // Evicting the 9-token entry (it saves one token beyond the 8-token one) leaves
         // the length index consistent.
         assert!(cache.evict());
-        assert_eq!(length(cache.lookup(&keys, &prompt, |_| true)), Some(8));
+        assert_eq!(
+            length(cache.lookup(&keys, &prompt, false, |_| true)),
+            Some(8)
+        );
         cache.clear();
-        assert_eq!(cache.depth(&keys, &prompt), 0);
-        cache.insert(&keys, &prompt[..4], &state(&pool, 4)?, None)?;
-        assert_eq!(length(cache.lookup(&keys, &prompt, |_| true)), Some(4));
+        assert_eq!(cache.depth(&keys, &prompt, false), 0);
+        cache.insert(&keys, &prompt[..4], &state(&pool, 4)?, None, None)?;
+        assert_eq!(
+            length(cache.lookup(&keys, &prompt, false, |_| true)),
+            Some(4)
+        );
         Ok(())
     }
 
@@ -745,14 +907,18 @@ mod tests {
         let keys: Vec<_> = prompts.iter().map(|p| cache.keys(None, p)).collect();
         // The first prefix is computed, evicted by two single-use prefixes, then computed
         // again: the repeat outranks newer single-use entries.
-        cache.insert(&keys[0], &prompts[0][..4], &state(&pool, 4)?, None)?;
-        cache.insert(&keys[1], &prompts[1][..4], &state(&pool, 4)?, None)?;
-        cache.insert(&keys[2], &prompts[2][..4], &state(&pool, 4)?, None)?;
-        assert!(cache.lookup(&keys[0], &prompts[0], |_| true).is_none());
-        cache.insert(&keys[0], &prompts[0][..4], &state(&pool, 4)?, None)?;
-        cache.insert(&keys[3], &prompts[3][..4], &state(&pool, 4)?, None)?;
+        cache.insert(&keys[0], &prompts[0][..4], &state(&pool, 4)?, None, None)?;
+        cache.insert(&keys[1], &prompts[1][..4], &state(&pool, 4)?, None, None)?;
+        cache.insert(&keys[2], &prompts[2][..4], &state(&pool, 4)?, None, None)?;
+        assert!(
+            cache
+                .lookup(&keys[0], &prompts[0], false, |_| true)
+                .is_none()
+        );
+        cache.insert(&keys[0], &prompts[0][..4], &state(&pool, 4)?, None, None)?;
+        cache.insert(&keys[3], &prompts[3][..4], &state(&pool, 4)?, None, None)?;
         assert_eq!(
-            length(cache.lookup(&keys[0], &prompts[0], |_| true)),
+            length(cache.lookup(&keys[0], &prompts[0], false, |_| true)),
             Some(4)
         );
         // An extension saves only its tokens beyond the entry it extends. A new entry is
@@ -761,16 +927,16 @@ mod tests {
         drop(cache);
         pool.reclaim();
         let mut wider = self::cache(3);
-        wider.insert(&keys[0], &prompts[0][..4], &state(&pool, 4)?, None)?;
-        wider.insert(&keys[0], &prompts[0][..6], &state(&pool, 6)?, None)?;
-        wider.insert(&keys[1], &prompts[1][..4], &state(&pool, 4)?, None)?;
-        wider.insert(&keys[2], &prompts[2][..4], &state(&pool, 4)?, None)?;
+        wider.insert(&keys[0], &prompts[0][..4], &state(&pool, 4)?, None, None)?;
+        wider.insert(&keys[0], &prompts[0][..6], &state(&pool, 6)?, None, None)?;
+        wider.insert(&keys[1], &prompts[1][..4], &state(&pool, 4)?, None, None)?;
+        wider.insert(&keys[2], &prompts[2][..4], &state(&pool, 4)?, None, None)?;
         assert_eq!(
-            length(wider.lookup(&keys[0], &prompts[0], |_| true)),
+            length(wider.lookup(&keys[0], &prompts[0], false, |_| true)),
             Some(4)
         );
         assert_eq!(
-            length(wider.lookup(&keys[1], &prompts[1], |_| true)),
+            length(wider.lookup(&keys[1], &prompts[1], false, |_| true)),
             Some(4)
         );
         assert_eq!(wider.stats().evicted, 1);
@@ -795,15 +961,18 @@ mod tests {
             (Instant::now(), false),
         ] {
             let (mut cache, prompts, keys) = held_fixture();
-            cache.insert(&keys[0], &prompts[0][..4], &state(&pool, 4)?, None)?;
+            cache.insert(&keys[0], &prompts[0][..4], &state(&pool, 4)?, None, None)?;
             // The others cover more tokens, so without the hold the first entry goes.
             for p in 1..4 {
-                cache.insert(&keys[p], &prompts[p][..6], &state(&pool, 6)?, None)?;
+                cache.insert(&keys[p], &prompts[p][..6], &state(&pool, 6)?, None, None)?;
             }
             // A length with no entry holds nothing.
             cache.hold(&keys[0], &prompts[0], &[7, 4], until);
-            cache.insert(&keys[4], &prompts[4][..6], &state(&pool, 6)?, None)?;
-            assert_eq!(cache.depth(&keys[0], &prompts[0]) == 4, held_survives);
+            cache.insert(&keys[4], &prompts[4][..6], &state(&pool, 6)?, None, None)?;
+            assert_eq!(
+                cache.depth(&keys[0], &prompts[0], false) == 4,
+                held_survives
+            );
             // Once only held entries remain, pressure still takes them.
             while cache.evict() {}
             assert_eq!(cache.stats().entries, 0);
@@ -817,7 +986,7 @@ mod tests {
         let pool = pool()?;
         let (mut cache, prompts, keys) = held_fixture();
         for p in 0..4 {
-            cache.insert(&keys[p], &prompts[p][..4], &state(&pool, 4)?, None)?;
+            cache.insert(&keys[p], &prompts[p][..4], &state(&pool, 4)?, None, None)?;
         }
         let soon = Instant::now() + Duration::from_secs(600);
         let later = soon + Duration::from_secs(600);
@@ -827,26 +996,32 @@ mod tests {
         cache.hold(&keys[2], &prompts[2], &[4], later);
         assert!(cache.evict());
         assert!(cache.evict());
-        assert_eq!(cache.depth(&keys[0], &prompts[0]), 0);
-        assert_eq!(cache.depth(&keys[3], &prompts[3]), 0);
+        assert_eq!(cache.depth(&keys[0], &prompts[0], false), 0);
+        assert_eq!(cache.depth(&keys[3], &prompts[3], false), 0);
         // Among holds, the one ending soonest goes first.
         assert!(cache.evict());
-        assert_eq!(cache.depth(&keys[1], &prompts[1]), 0);
-        assert_eq!(cache.depth(&keys[2], &prompts[2]), 4);
+        assert_eq!(cache.depth(&keys[1], &prompts[1], false), 0);
+        assert_eq!(cache.depth(&keys[2], &prompts[2], false), 4);
         // One call holds only its most wanted lengths within the budget.
         cache.clear();
         pool.reclaim();
         let prompt: Vec<u32> = (0..8).collect();
         let chain = cache.keys(None, &prompt);
         for length in [2, 4, 6] {
-            cache.insert(&chain, &prompt[..length], &state(&pool, length)?, None)?;
+            cache.insert(
+                &chain,
+                &prompt[..length],
+                &state(&pool, length)?,
+                None,
+                None,
+            )?;
         }
-        cache.insert(&keys[3], &prompts[3][..6], &state(&pool, 6)?, None)?;
+        cache.insert(&keys[3], &prompts[3][..6], &state(&pool, 6)?, None, None)?;
         cache.hold(&chain, &prompt, &[6, 2, 4], later);
         assert!(cache.evict());
         assert!(cache.evict());
-        assert_eq!(cache.depth(&chain, &prompt), 6);
-        assert_eq!(cache.depth(&chain, &prompt[..4]), 2);
+        assert_eq!(cache.depth(&chain, &prompt, false), 6);
+        assert_eq!(cache.depth(&chain, &prompt[..4], false), 2);
         Ok(())
     }
 
@@ -857,7 +1032,7 @@ mod tests {
         let prompt: Vec<u32> = (0..8).collect();
         let forged: Vec<u32> = (8..16).collect();
         let keys = cache.keys(None, &prompt);
-        cache.insert(&keys, &prompt[..4], &state(&pool, 4)?, None)?;
+        cache.insert(&keys, &prompt[..4], &state(&pool, 4)?, None, None)?;
         // A key match over different tokens must not hold the entry.
         cache.hold(
             &keys,
@@ -866,11 +1041,11 @@ mod tests {
             Instant::now() + Duration::from_secs(600),
         );
         let other = cache.keys(None, &forged);
-        cache.insert(&other, &forged[..6], &state(&pool, 6)?, None)?;
+        cache.insert(&other, &forged[..6], &state(&pool, 6)?, None, None)?;
         let third: Vec<u32> = (16..24).collect();
         let third_keys = cache.keys(None, &third);
-        cache.insert(&third_keys, &third[..6], &state(&pool, 6)?, None)?;
-        assert_eq!(cache.depth(&keys, &prompt), 0);
+        cache.insert(&third_keys, &third[..6], &state(&pool, 6)?, None, None)?;
+        assert_eq!(cache.depth(&keys, &prompt, false), 0);
         Ok(())
     }
 
@@ -880,9 +1055,9 @@ mod tests {
         let mut cache = cache(2);
         let stale: Vec<u32> = (0..8).collect();
         let stale_keys = cache.keys(None, &stale);
-        cache.insert(&stale_keys, &stale[..4], &state(&pool, 4)?, None)?;
+        cache.insert(&stale_keys, &stale[..4], &state(&pool, 4)?, None, None)?;
         for _ in 0..20 {
-            assert!(cache.lookup(&stale_keys, &stale, |_| true).is_some());
+            assert!(cache.lookup(&stale_keys, &stale, false, |_| true).is_some());
         }
         // A stream of single-use prefixes halves the stale count (21) every aging period
         // until it ties them and, as the least recently used, goes.
@@ -891,8 +1066,8 @@ mod tests {
             pool.reclaim();
             let fresh: Vec<u32> = (0..4).map(|t| t + salt * 8).collect();
             let keys = cache.keys(None, &fresh);
-            cache.insert(&keys, &fresh, &state(&pool, 4)?, None)?;
-            if cache.depth(&stale_keys, &stale) == 0 {
+            cache.insert(&keys, &fresh, &state(&pool, 4)?, None, None)?;
+            if cache.depth(&stale_keys, &stale, false) == 0 {
                 evicted_at = Some(salt);
                 break;
             }
@@ -912,9 +1087,9 @@ mod tests {
         assert!(!cache.is_boundary(256));
         let keys = cache.keys(None, &[1; 6]);
         assert!(keys.is_empty());
-        cache.insert(&keys, &[1; 4], &state(&pool, 4)?, None)?;
+        cache.insert(&keys, &[1; 4], &state(&pool, 4)?, None, None)?;
         assert_eq!(cache.stats().entries, 0);
-        assert!(cache.lookup(&keys, &[1; 6], |_| true).is_none());
+        assert!(cache.lookup(&keys, &[1; 6], false, |_| true).is_none());
         assert!(
             PrefixConfig {
                 spacing: 24,

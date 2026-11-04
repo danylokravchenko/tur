@@ -1,6 +1,6 @@
 # Hybrid state ideas from vLLM
 
-Created: 2026-11-04. Status: design; nothing here is built or measured in Tur.
+Created: 2026-11-04. Status: part 1 is built and measured (see [Prefix reuse](../architecture/prefix-reuse.md#snapshots-and-the-mtp-head)); parts 2 and 3 are designs, not yet built or measured.
 
 vLLM's Qwen3.5 work between September and November 2026 was mostly tuning for NVIDIA and ROCm: FP8 and NVFP4 fusions, CUDA-graph sizing, tile configurations. Three of its changes address limits that Tur also has, because they come from how a hybrid model's recurrent state behaves rather than from a GPU. This page designs Tur's version of each, in the order they should be built:
 
@@ -22,29 +22,18 @@ That rule costs the most where both features matter: agents and multi-turn chat,
 
 [vLLM #61589](https://github.com/vllm-project/vllm/pull/61589) puts the token after each block into the block's hash. A cached block matches only when its lookahead token matches too, so a hit reads exactly the draft keys and values a cold run would write. Hits then reach the same depth as without speculation, apart from prefixes that end exactly on a block boundary.
 
-### Design (MTP)
+### What Tur built (MTP)
 
-Key MTP snapshots by their lookahead token, as vLLM does.
+The lookahead key alone was built first and measured on Qwen3.5-0.8B over four six-turn conversations. It kept every hit inside prompts but lost every snapshot at a template-rewrite boundary or a reply's end, because a rewrite boundary is by definition where the next prompt's token differs. Cached prompt tokens fell from 8,667 without MTP to 5,376. So Tur stores the final hidden state at `B - 1` with each snapshot as well, and recomputes the head's entry when the token differs:
 
-- A `PrefixCache` entry at `B` gains `lookahead: Option<u32>`, the token at position `B` that the producer's head used for its entry at `B - 1`. It is set only when the producer's head has written that entry (`mtp_done >= B`), and is `None` for entries taken with MTP off.
-- With MTP on, an entry at `B` is inserted after the producer's head has run over `B - 1`. For aligned and template boundaries inside a prompt, the lookahead token is the prompt's token at `B`. For prompt-end and finished-request snapshots, it is the token sampled after `B`, known once the pass that ended at `B` has sampled. The pipeline already runs `draft_head` after each pass and before the next schedule, and all work goes through one command queue, so the head's write at `B - 1` is ordered before any pass that restores the entry.
-- `find` accepts an MTP entry at `B` when the request's token at `B` equals `lookahead`. When the request has no token at `B` yet, as with an exact repeat that samples from the entry's stored logits, the entry is still restored. If the sampled token then differs from `lookahead`, the request's head is marked behind, and it drafts only from prompt lookup, as it does today after a head failure.
-- A restoring request starts with `mtp_done = B`, so its first `draft_head` call continues from the snapshot.
-- Lookups probe one extra key per candidate length. Probes stay proportional to the number of entries.
+- The pipeline inserts a pass's snapshots in `settle`, after the draft head has run over that pass, including for requests that finished in it. The head's side pass needs pages that no snapshot shares, and inserting first would have made it fail.
+- A `PrefixCache` entry carries a `HeadEntry`: the token the head read after `B`, and the hidden row at `B - 1`. A request that needs the head accepts an entry whose token matches, or whose snapshot ends inside a page and has a hidden row. The restoring request's first pass copies that tail page, so its head can rewrite position `B - 1` in a page nobody else sees. Its first head run starts at `B - 1` with the stored row prepended.
+- An entry the head never reached (a constrained producer) serves only requests without the head, until a snapshot of the same tokens with head entries replaces its state.
+- A Gemma 4 assistant keeps no state, so its requests restore any snapshot.
 
-Prompt-interior boundaries lose a hit only when two prompts share exactly `B` tokens and differ at `B`. Finished-request snapshots keep their hits in chat: the last sampled token is the end-of-turn marker, which the next turn's prompt repeats at the same position. Check this against the pinned Qwen3.5 template, including the variant that drops thinking blocks.
+With both mechanisms, the six-turn conversations cached 8,915 of 13,765 prompt tokens with MTP on and finished in 9.9 s, against 11.2 s for reuse alone and 16.0 s for MTP alone. The head's drafts were 92% accepted. Eight users behind a shared 1.5K-token system prompt cached the same 12,288 tokens with and without MTP. Throughput there fell from 158 to 137 tokens/s, as it does without reuse, because the head stops drafting above four decoding requests but still writes its keys and values.
 
-Output exactness doesn't depend on any of this. Verification matches the target model, so a wrong head entry can lower acceptance but can't change a token. The lookahead key keeps acceptance, and therefore speed, the same whether a prefix came from the cache or from a cold run.
-
-### Alternative (MTP)
-
-Store the final hidden row at `B - 1` with each snapshot (4 KB on the 0.8B model, 20 KB on Qwen3.8-27B), and have the restoring request compute its own head entry at `B - 1` once it knows its token `B`. This keeps every hit, but the entry has to go into a page that the snapshot and its producer share. Tur's copy-on-write covers only appends past a shared tail, so this would add a second kind of copy-on-write for a position behind the committed one. Build it only if the lookahead key measurably loses hits.
-
-### Tests and measurement (MTP)
-
-- Unit: an entry with a mismatching lookahead is skipped, and lookup falls back to a shallower entry. An exact repeat whose sample differs from `lookahead` marks the head behind.
-- Integration: with `--mtp`, a restored request's tokens match a cold run's for greedy and seeded sampling, and its head acceptance matches the cold run's.
-- Real run on Qwen3.5-0.8B: the six-turn conversation and tool-loop workloads used in [Prefix reuse](../architecture/prefix-reuse.md#decisions), with MTP on and reuse on against each one alone. Report the share of prompt tokens cached, time to first token, and decode tokens per second.
+Output exactness never depended on this. Verification matches the target model, so a wrong head entry could only lower acceptance. An integration test checks the stronger property: after a restore that recomputes the entry, the head drafts exactly as it does after computing the whole prompt.
 
 ## 2. Committing accepted drafts by replay
 

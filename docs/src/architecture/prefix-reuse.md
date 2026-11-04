@@ -15,6 +15,12 @@ Chat templates often render the previous assistant turn differently once a new u
 
 A snapshot shares its pages and slot with the request that produced it, so taking one copies nothing. It keeps one recurrent slot and its pages alive. If a snapshot ends partway through a page, the first request to append there copies that one page.
 
+## Snapshots and the MTP head
+
+Qwen3.5's MTP head writes its own keys and values, one entry per position, and its entry at position `p` reads the token at `p + 1`. A snapshot at boundary `B` therefore holds an entry at `B - 1` that depends on the token its producer continued with. The pipeline inserts a pass's snapshots only after the head has run over that pass, so the entry is complete, and records the token it read together with the final hidden state at `B - 1`.
+
+A request that continues with the same token uses the entry as it is. One that continues differently recomputes it from the stored hidden state during its first head run. That happens at every template-rewrite boundary, because a rewrite boundary is by definition where the next prompt's token differs. The recomputed entry has to go into a page nobody else sees, so this works only for snapshots that end inside a page, which the restoring request's first pass copies. Aligned snapshots end on a page boundary, but they sit inside prompts, where the next token almost always matches. A request whose head can't continue from a snapshot restores an earlier one, and a request without the head (a constrained one, or with MTP off) restores any.
+
 ## Lookup
 
 Keys are a chained hash over the tokens, seeded by a namespace: the tenant, or the request's `cache_salt`. Equal prefixes in different namespaces never meet, and a hash match is used only after comparing every token. The pool records the model's identity and state layout, so entries can't cross models, quantizations or positional settings.
@@ -46,5 +52,6 @@ Measured on Qwen3.5-0.8B on an M1:
 - Tool-calling replies hold their snapshots for 60 seconds, a judgment of how long tools take rather than a measured value. In a tool loop with three users behind a shared system prompt between each call, follow-ups restored all but the new tool result, against at most 1,536 of 2,346 tokens without a hold, and their first token came 3× sooner (206 ms against 641 ms). The other users kept all their cached tokens and their time (4.30 s against 4.32 s).
 - Holds are capped at half the snapshots. With no cap, three of the four snapshots were held in that loop, and the other users cached 24% fewer tokens and took 1.7× as long.
 - Lookup uses an indexed hash, not a radix tree. A hit at 32K tokens costs 6.6 µs and a miss under 0.1 µs.
-- Prefix reuse and the MTP drafter exclude each other. The head's state for boundary B depends on the token sampled after B, which a snapshot at B can't hold, so `--mtp` turns reuse off.
+- Prefix reuse and MTP drafts work together. Over four six-turn conversations at 256-token spacing, both together cached 8,915 of 13,765 prompt tokens and finished in 9.9 s, against 11.2 s for reuse alone and 16.0 s for MTP alone, with the head's drafts 92% accepted.
+- Head entries are recomputed from a stored hidden state rather than requiring the next token to match. Requiring a match, as vLLM's lookahead block hashes do, cut those conversations' cached tokens from 8,667 to 5,376, because every template-rewrite and reply snapshot is continued with another token.
 - The template-rewrite boundary is taken once a prompt has assistant history. Over four six-turn conversations with 16 snapshots, it raised the share of cached prompt tokens from 52% to 68%, cut last-turn time to first token by 30%, and finished 11% sooner. With 8 snapshots, eviction limited the gain to 2% on the last turn and nothing on total time. Taking it on first turns too made a single uncached request 15% slower to its first token, so first turns skip it.

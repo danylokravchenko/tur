@@ -414,21 +414,19 @@ fn test_mtp_over_experts_preserves_target_sampling() -> Result<()> {
 }
 
 #[test]
-fn test_mtp_needs_a_head_and_disables_prefix_reuse() -> Result<()> {
+fn test_mtp_needs_a_head_and_keeps_prefix_reuse() -> Result<()> {
     let with_head = Checkpoint::random_mtp()?;
     let without_head = Checkpoint::random()?;
     assert!(InferencePipeline::new(&without_head.factory(), mtp_config(4, 1)).is_err());
     // The head's keys and values are one more state layer of the plan.
     let plain = InferencePipeline::new(&with_head.factory(), config(4, 1))?;
     let drafted = InferencePipeline::new(&with_head.factory(), mtp_config(4, 1))?;
-    // Requested prefix reuse is dropped, retaining no snapshots or their logit rows.
+    // Requested prefix reuse stays, with the memory of its snapshots.
     let mut prefix = mtp_config(4, 1);
     prefix.prefix = PipelineConfig::new(1, 16).prefix;
     let prefix = InferencePipeline::new(&with_head.factory(), prefix)?;
-    assert_eq!(
-        prefix.memory_plan().resident(),
-        drafted.memory_plan().resident()
-    );
+    assert!(prefix.memory_plan().retained > 0);
+    assert!(prefix.memory_plan().resident() > drafted.memory_plan().resident());
     assert!(drafted.memory_plan().weights > plain.memory_plan().weights);
     // A reduced draft vocabulary is a copy of that many F32 LM-head rows of 64 values; the
     // pipeline checks the plan against the loaded weights.
@@ -476,6 +474,81 @@ fn test_preempted_mtp_requests_recompute_the_head_and_match_plain_decoding() -> 
     assert!(preemptions > 0, "the pool never forced a preemption");
     assert!(pipeline.speculation_stats().mtp_passes > 0);
     let usage = pipeline.memory()?;
+    assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn test_mtp_with_prefix_reuse_resumes_the_head_and_matches_plain_decoding() -> Result<()> {
+    let fixture = Checkpoint::random_mtp()?;
+    let mut plain = InferencePipeline::new(&fixture.factory(), config(0, 1))?;
+    let mut cold = InferencePipeline::new(&fixture.factory(), mtp_config(4, 1))?;
+    let mut cfg = mtp_config(4, 1);
+    cfg.prefix = PrefixConfig {
+        entries: 8,
+        spacing: 16,
+        state_share: None,
+        restorable_first: false,
+        tool_hold: std::time::Duration::ZERO,
+    };
+    let mut warm = InferencePipeline::new(&fixture.factory(), cfg)?;
+    let words =
+        |range: std::ops::Range<u32>| range.map(|t| format!("t{t}")).collect::<Vec<_>>().join(" ");
+    let prompt = words(2..40);
+    // The same history leaves both pipelines' drafting decisions equal: no pass has
+    // drafted yet, so none waits on measured costs. One output needs no decode.
+    let primer = GenerationRequest::new(prompt.clone(), 1);
+    let primed = warm.run(&primer, |_| {})?;
+    assert_eq!(
+        primed.generated_text,
+        cold.run(&primer, |_| {})?.generated_text
+    );
+    // The prompt-end snapshot's last head entry read the first output, which a longer
+    // prompt doesn't continue with. The snapshot ends inside a page, so the head recomputes
+    // that entry from the stored hidden state and then drafts exactly as it does after
+    // computing the whole prompt.
+    let longer = GenerationRequest::new(format!("{prompt} {}", words(60..64)), 3);
+    let restored = warm.run(&longer, |_| {})?;
+    assert_eq!(
+        restored.generated_text,
+        cold.run(&longer, |_| {})?.generated_text
+    );
+    assert_eq!(
+        restored.generated_text,
+        plain.run(&longer, |_| {})?.generated_text
+    );
+    assert_eq!(restored.cached_tokens, primed.prompt_tokens);
+    assert_ne!(primed.prompt_tokens % 16, 0);
+    let (warm_stats, cold_stats) = (warm.speculation_stats(), cold.speculation_stats());
+    assert!(cold_stats.mtp_drafted > 0, "{cold_stats:?}");
+    assert_eq!(
+        (warm_stats.mtp_drafted, warm_stats.confidence_drafted),
+        (cold_stats.mtp_drafted, cold_stats.confidence_drafted)
+    );
+    // A repeat restores the whole prompt and samples the token its head entries assumed.
+    let first = GenerationRequest::new(prompt.clone(), 7);
+    let reply = warm.run(&first, |_| {})?;
+    assert_eq!(
+        reply.generated_text,
+        plain.run(&first, |_| {})?.generated_text
+    );
+    assert_eq!(reply.cached_tokens, reply.prompt_tokens);
+    // The next turn repeats the reply and its end-of-sequence token `t1`, as chat templates
+    // close a turn. The reply's snapshot holds the head's entry for its last consumed
+    // token, which read that end token.
+    assert_eq!(reply.finish_reason, "stop");
+    let turn = GenerationRequest::new(format!("{prompt} {} t1 t50 t51", reply.generated_text), 9);
+    let next = warm.run(&turn, |_| {})?;
+    assert_eq!(
+        next.generated_text,
+        plain.run(&turn, |_| {})?.generated_text
+    );
+    assert_eq!(
+        next.cached_tokens,
+        reply.prompt_tokens + reply.generated_tokens - 1
+    );
+    warm.clear_prefix_cache();
+    let usage = warm.memory()?;
     assert_eq!((usage.pages.leased, usage.slots.leased), (0, 0));
     Ok(())
 }

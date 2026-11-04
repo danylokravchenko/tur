@@ -2,9 +2,9 @@
 
 use super::super::{
     scheduler::Chunk,
-    speculation::{self, Acceptance, DraftSource, Proposal},
+    speculation::{self, Acceptance, DraftSource, Proposal, SpeculationConfig},
 };
-use super::InferencePipeline;
+use super::{InferencePipeline, Pending};
 use crate::{
     Result,
     hybrid::{Demand, DraftRequest},
@@ -253,7 +253,10 @@ impl InferencePipeline {
     /// each with the token that followed it, and keep the head's draft for a request whose
     /// next pass decodes, unless prompt lookup proposes with higher acceptance. A request whose head falls behind (it failed, or a position was
     /// published without hidden states) stops drafting from the head until it recomputes.
+    /// A request that finished this step runs a head that keeps keys and values without
+    /// drafting, so the snapshot of its reply holds the head's entries.
     pub(super) fn draft_head(&mut self, heads: Vec<(Uuid, usize, Tensor)>) -> Result<Duration> {
+        let keyed = self.keyed_head();
         let mut requests = Vec::with_capacity(heads.len());
         let mut ids = Vec::with_capacity(heads.len());
         let mut rates = Vec::new();
@@ -269,49 +272,28 @@ impl InferencePipeline {
                 .as_ref()
                 .is_some_and(tur_models::models::DraftHead::chains);
         for (id, before, hidden) in heads {
-            let Some(pending) = self.pending.get_mut(&id) else {
-                continue;
+            let (pending, finished) = match self.pending.get_mut(&id) {
+                Some(pending) => (pending, false),
+                None => match self.finishing.get_mut(&id) {
+                    Some(finishing) if keyed => (&mut finishing.pending, true),
+                    _ => continue,
+                },
             };
             pending.mtp_drafts.clear();
-            let Some(tokens) = pending.tokens.get(before + 1..=pending.consumed) else {
+            let Some((start, hidden)) = head_rows(pending, before, hidden)? else {
                 continue;
             };
-            if pending.mtp_done != before || tokens.len() != hidden.dim(0)? {
-                continue;
-            }
-            // Its LM-head projection costs about a third of a small model's decode: compute
-            // a draft only when the next pass decodes, prompt lookup has no proposal or a less
-            // accepted one, and the head's acceptance can repay it.
-            let mut draft = pending.tokens.len() == pending.consumed + 1;
-            if draft && pending.mtp_acceptance.rate() < speculation::MTP_MIN_RATE {
-                // Towards the neutral prior, not the pipeline's rate, which may itself sit
-                // below the threshold: a skipped head is retried after a few passes.
-                pending.mtp_acceptance.recover(Acceptance::default());
-                draft = false;
-            }
-            draft = draft
-                && (pending.mtp_acceptance.rate() > pending.acceptance.rate()
-                    || pending
-                        .ngrams
-                        .propose(&pending.tokens, &self.speculation, 1)
-                        .is_empty());
-            let rate = pending.mtp_acceptance.rate();
-            // Outputs after the pending token that the request may still publish.
-            let limit = self.speculation.max_draft.min(
-                pending
-                    .max_tokens
-                    .saturating_sub(pending.generated())
-                    .saturating_sub(1),
-            );
-            let drafts = if !draft || limit == 0 {
-                0
-            } else if chains {
-                speculation::chain_depth(rate, limit)
+            let (drafts, rate) = if finished {
+                (0, 0.0)
             } else {
-                1
+                head_drafts(pending, &self.speculation, chains)
             };
             // Each chained draft is expected to add the probability of reaching it.
             rates.extend((1..=drafts).map(|depth| rate.powi(depth as i32)));
+            let tokens = pending
+                .tokens
+                .get(start + 1..=pending.consumed)
+                .unwrap_or_default();
             // The head reads the token after each position; soft-token positions feed it
             // the model's slot token, as the target pass did.
             let tokens = self.model.media_slot().map_or_else(
@@ -331,7 +313,7 @@ impl InferencePipeline {
             );
             requests.push(DraftRequest {
                 handle: pending.handle,
-                start: before,
+                start,
                 tokens,
                 hidden,
                 drafts,
@@ -357,7 +339,11 @@ impl InferencePipeline {
             self.head_costs.record(drafts, elapsed.as_secs_f64());
         }
         for (id, outcome) in ids.into_iter().zip(outcomes) {
-            let Some(pending) = self.pending.get_mut(&id) else {
+            let Some(pending) = self
+                .pending
+                .get_mut(&id)
+                .or_else(|| self.finishing.get_mut(&id).map(|f| &mut f.pending))
+            else {
                 continue;
             };
             match outcome {
@@ -380,4 +366,63 @@ impl InferencePipeline {
         }
         Ok(elapsed)
     }
+}
+
+/// The first position and `[rows, hidden]` final hidden states the head runs over for
+/// `pending`, whose pass committed the positions from `before` with `hidden`: those
+/// positions, preceded by a restored snapshot's last position when the head must recompute
+/// its entry there. `None` when the head is behind or the rows don't match the tokens.
+fn head_rows(
+    pending: &mut Pending,
+    before: usize,
+    hidden: Tensor,
+) -> Result<Option<(usize, Tensor)>> {
+    let (start, hidden) = match pending.head_seed.take() {
+        Some(seed) if pending.mtp_done + 1 == before => {
+            (pending.mtp_done, Tensor::cat(&[&seed, &hidden], 0)?)
+        }
+        _ => (before, hidden),
+    };
+    let rows = hidden.dim(0)?;
+    let aligned = pending
+        .tokens
+        .get(start + 1..=pending.consumed)
+        .is_some_and(|tokens| tokens.len() == rows);
+    Ok((pending.mtp_done == start && aligned).then_some((start, hidden)))
+}
+
+/// Drafts the head computes for `pending`, and its acceptance rate. Its LM-head projection
+/// costs about a third of a small model's decode: draft only when the next pass decodes,
+/// prompt lookup has no proposal or a less accepted one, and the head's acceptance can repay
+/// it. A chaining head drafts as deep as its rate supports.
+fn head_drafts(pending: &mut Pending, config: &SpeculationConfig, chains: bool) -> (usize, f64) {
+    let mut draft = pending.tokens.len() == pending.consumed + 1;
+    if draft && pending.mtp_acceptance.rate() < speculation::MTP_MIN_RATE {
+        // Towards the neutral prior, not the pipeline's rate, which may itself sit below
+        // the threshold: a skipped head is retried after a few passes.
+        pending.mtp_acceptance.recover(Acceptance::default());
+        draft = false;
+    }
+    draft = draft
+        && (pending.mtp_acceptance.rate() > pending.acceptance.rate()
+            || pending
+                .ngrams
+                .propose(&pending.tokens, config, 1)
+                .is_empty());
+    let rate = pending.mtp_acceptance.rate();
+    // Outputs after the pending token that the request may still publish.
+    let limit = config.max_draft.min(
+        pending
+            .max_tokens
+            .saturating_sub(pending.generated())
+            .saturating_sub(1),
+    );
+    let drafts = if !draft || limit == 0 {
+        0
+    } else if chains {
+        speculation::chain_depth(rate, limit)
+    } else {
+        1
+    };
+    (drafts, rate)
 }

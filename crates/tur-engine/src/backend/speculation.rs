@@ -45,8 +45,7 @@ pub struct SpeculationConfig {
     /// Also draft one token from the checkpoint's native multi-token prediction head when
     /// prompt lookup has no proposal or a less accepted one. Drafts are computed for
     /// unconstrained requests in passes of at most [`MTP_MAX_DECODES`] decodes, and each
-    /// is weighed by its calibrated confidence ([`Calibration`]). Needs prefix reuse
-    /// disabled.
+    /// is weighed by its calibrated confidence ([`Calibration`]).
     pub mtp: Option<DraftHead>,
 }
 

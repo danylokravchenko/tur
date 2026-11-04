@@ -26,7 +26,7 @@ These rules apply to every model:
 
 - Prepack weights with `tur quantize` if you restart often. Artifacts load in a fraction of the time, and on models with shared embeddings they drop the separate embedding table.
 - Leave out `weight_format` when loading an artifact, because setting it is an error.
-- MTP and the Gemma assistant turn off prefix reuse. Use them for single requests with fresh prompts, and leave them off for chat history and agent loops, which resend the same prompt.
+- MTP and the Gemma assistant work beside prefix reuse, so chat history and agent loops keep their cached prompts while the head drafts. Both drafters pay with up to four requests decoding; leave them off for wider batches.
 - Prompt lookup doesn't affect prefix reuse and costs little when it has nothing to draft: nothing measurable on the 0.8B and about 5% on Gemma E2B with four requests. That makes `speculative_draft = 4` a cheap addition, though tokens may arrive in small bursts.
 - Speculation needs `recurrent_state = "f32"`, the default. Outputs match normal decoding with every speculative configuration.
 - Set `context_tokens` if you need more than 8K tokens per request, so the start fails early with the largest context that fits.
@@ -92,7 +92,7 @@ tur quantize --model Qwen/Qwen3.8-27B --revision 1d4bf0f2ff6012fd82039f2fa52739d
   --output ./models/qwen3.8-27b-q4k --method rtn
 ```
 
-The checkpoint ships an MTP head, but it hasn't been measured here. Leave it off to begin with, because prefix reuse is worth more at 92 tokens/s of prefill: repeating a 2K-token prompt costs 22 s without reuse. Lookup helped repetitive output on every model where it was measured, though not yet on this one. Four requests at once kept a median of 141 ms between tokens, against 115 ms for one, and eight also complete at 156 ms if you need the throughput.
+The checkpoint ships an MTP head, but it hasn't been measured here. It now runs beside prefix reuse, which matters most at 92 tokens/s of prefill: repeating a 2K-token prompt costs 22 s without reuse. Lookup helped repetitive output on every model where it was measured, though not yet on this one. Four requests at once kept a median of 141 ms between tokens, against 115 ms for one, and eight also complete at 156 ms if you need the throughput.
 
 ```toml
 [model]

@@ -4,13 +4,14 @@ use super::super::{
     calls::{CallSplit, Calls},
     guidance::{GuidanceControl, ParserFactory, TopLevelGrammar, build_llg_factory, token_bytes},
     harmony::{Fragment, Harmony},
+    prefix::HeadEntry,
     reasoning::{ReasoningSplit, Route},
     speculation::{Acceptance, NgramIndex},
     stop::StopMatcher,
     structured::{self, Preamble, StructuredOutput},
     tokenizer::TokenOutputStream,
 };
-use super::{InferencePipeline, Pending, scoring::Scoring};
+use super::{Finishing, InferencePipeline, Pending, SnapshotCommit, scoring::Scoring};
 use crate::{
     Result, TurError,
     hybrid::{Forced, OutputLogprobs, SamplingOptions, SequenceCommit},
@@ -664,6 +665,7 @@ impl InferencePipeline {
                 ngrams: NgramIndex::default(),
                 acceptance: Acceptance::default(),
                 mtp_done: 0,
+                head_seed: None,
                 mtp_drafts: Vec::new(),
                 mtp_acceptance: self.mtp_acceptance,
                 mtp_verifying: Vec::new(),
@@ -713,6 +715,7 @@ impl InferencePipeline {
         pending.running = false;
         pending.ngrams = NgramIndex::default();
         pending.mtp_done = 0;
+        pending.head_seed = None;
         pending.mtp_drafts.clear();
         pending.preemptions += 1;
         tracing::debug!(request = %id, tokens = pending.tokens.len(), "preempted for recompute");
@@ -720,12 +723,15 @@ impl InferencePipeline {
     }
 
     /// Publish one request's commit. `logits` are the model logits of its outputs; the
-    /// last one's are kept with a snapshot when the commit completes the prompt.
+    /// last one's are kept with a snapshot when the commit completes the prompt. `hidden`
+    /// holds the pass's final hidden states when the draft head runs; a snapshot keeps the
+    /// last committed one.
     pub(super) fn publish(
         &mut self,
         id: Uuid,
         commit: SequenceCommit,
         logits: Option<Tensor>,
+        hidden: Option<&Tensor>,
         output: &mut BatchStepOutput,
     ) -> Result<()> {
         let pending = self
@@ -796,21 +802,18 @@ impl InferencePipeline {
                 }
             }
         }
-        if (self.prefix.is_boundary(pending.consumed)
-            || prompt_end
-            || pending.turn_boundary == Some(pending.consumed))
-            && let Some(prefix) = pending.tokens.get(..pending.consumed)
+        if self.prefix.config().enabled()
+            && (self.prefix.is_boundary(pending.consumed)
+                || prompt_end
+                || pending.turn_boundary == Some(pending.consumed))
         {
-            self.prefix.extend(&mut pending.keys, prefix);
-            let state = self.engine.model_state(pending.handle)?;
+            // Last rows, as allocated copies: `Tensor::copy` shares storage on Metal.
             let logits = logits
                 .filter(|_| prompt_end)
-                // The last output's row, as an allocated copy: `Tensor::copy` shares storage
-                // on Metal.
                 .map(|logits| logits.narrow(0, logits.dim(0)? - 1, 1)?.force_contiguous())
                 .transpose()?;
-            self.prefix
-                .insert(&pending.keys, prefix, &state, logits.as_ref())?;
+            let hidden = last_hidden(hidden, commit.accepted_tokens)?;
+            self.snapshots.push(SnapshotCommit { id, logits, hidden });
         }
         if !finished {
             return Ok(());
@@ -842,15 +845,78 @@ impl InferencePipeline {
             tool_calls,
             finish_reason: reason,
         };
-        // The reply's state lets a conversation's next turn resume after it.
-        if pending.consumed > 0
-            && self.prefix.config().enabled()
-            && let Some(consumed) = pending.tokens.get(..pending.consumed)
-        {
-            self.prefix.extend(&mut pending.keys, consumed);
+        // The reply's state lets a conversation's next turn resume after it. The request
+        // stays until `settle`, so the draft head can first write its entries for it.
+        let tool_calls = !stats.tool_calls.is_empty();
+        if pending.consumed > 0 && self.prefix.config().enabled() {
+            self.snapshots.push(SnapshotCommit {
+                id,
+                logits: None,
+                hidden: last_hidden(hidden, commit.accepted_tokens)?,
+            });
+            if let Some(pending) = self.pending.remove(&id) {
+                self.finishing.insert(
+                    id,
+                    Finishing {
+                        pending,
+                        tool_calls,
+                    },
+                );
+            }
+        } else {
+            self.engine.cancel(pending.handle)?;
+            self.pending.remove(&id);
+        }
+        output.completed.push((id, Ok(stats)));
+        Ok(())
+    }
+
+    /// Whether the draft head keeps keys and values, so that a snapshot's entries for it
+    /// depend on the token after the snapshot (see [`super::super::prefix`]).
+    pub(super) fn keyed_head(&self) -> bool {
+        self.speculation.mtp_enabled()
+            && self
+                .speculation
+                .mtp
+                .as_ref()
+                .is_some_and(|head| !head.chains())
+    }
+
+    /// Insert this step's snapshots, after the draft head wrote its entries for them: the
+    /// head writes only pages no snapshot shares. Then release the requests that finished,
+    /// holding a tool-calling reply's snapshots for the caller's return.
+    pub(super) fn settle(&mut self) -> Result<()> {
+        let keyed = self.keyed_head();
+        for SnapshotCommit { id, logits, hidden } in std::mem::take(&mut self.snapshots) {
+            let Some(pending) = self
+                .pending
+                .get_mut(&id)
+                .or_else(|| self.finishing.get_mut(&id).map(|f| &mut f.pending))
+            else {
+                continue;
+            };
+            let Some(prefix) = pending.tokens.get(..pending.consumed) else {
+                continue;
+            };
+            self.prefix.extend(&mut pending.keys, prefix);
             let state = self.engine.model_state(pending.handle)?;
-            self.prefix.insert(&pending.keys, consumed, &state, None)?;
-            if !stats.tool_calls.is_empty() {
+            let head = pending
+                .tokens
+                .get(pending.consumed)
+                .filter(|_| keyed && pending.mtp_done >= pending.consumed)
+                .map(|&next| HeadEntry { next, hidden });
+            self.prefix
+                .insert(&pending.keys, prefix, &state, logits.as_ref(), head)?;
+        }
+        for (
+            _,
+            Finishing {
+                pending,
+                tool_calls,
+            },
+        ) in std::mem::take(&mut self.finishing)
+        {
+            if tool_calls && let Some(consumed) = pending.tokens.get(..pending.consumed) {
                 // The caller is coming back once the tools ran. How far it matches depends on
                 // how its template renders this reply: to the reply's end if unchanged, to the
                 // prompt's end if only the reply changes, and otherwise to where history is
@@ -863,10 +929,8 @@ impl InferencePipeline {
                 let until = Instant::now() + self.prefix.config().tool_hold;
                 self.prefix.hold(&pending.keys, consumed, &lengths, until);
             }
+            self.engine.cancel(pending.handle)?;
         }
-        self.engine.cancel(pending.handle)?;
-        self.pending.remove(&id);
-        output.completed.push((id, Ok(stats)));
         Ok(())
     }
 
@@ -882,6 +946,15 @@ impl InferencePipeline {
             self.fail(id, TurError::DeadlineExceeded, output)?;
         }
         Ok(())
+    }
+}
+
+/// The last committed row of a pass's `[rows, hidden]` final hidden states, as an allocated
+/// copy: `Tensor::copy` shares storage on Metal.
+fn last_hidden(hidden: Option<&Tensor>, accepted: usize) -> Result<Option<Tensor>> {
+    match (hidden, accepted.checked_sub(1)) {
+        (Some(hidden), Some(last)) => Ok(Some(hidden.narrow(0, last, 1)?.force_contiguous()?)),
+        _ => Ok(None),
     }
 }
 

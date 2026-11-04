@@ -89,12 +89,6 @@ impl PipelineConfig {
             }
             self.speculation = SpeculationConfig::DISABLED;
         }
-        // A snapshot at B cannot hold the head's entry for B - 1: it depends on the
-        // token sampled after B, which differs between requests sharing the snapshot.
-        if self.speculation.mtp_enabled() && self.prefix.enabled() {
-            tracing::info!("native MTP drafts disable prefix reuse");
-            self.prefix = PrefixConfig::DISABLED;
-        }
         Ok(self)
     }
 }
@@ -212,6 +206,8 @@ impl InferencePipeline {
             device_sampling: config.device_sampling,
             _lease: lease,
             pending: HashMap::new(),
+            finishing: HashMap::new(),
+            snapshots: Vec::new(),
             prefix: PrefixCache::new(PrefixConfig {
                 entries: plan.retained,
                 ..config.prefix

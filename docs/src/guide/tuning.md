@@ -90,7 +90,7 @@ A bigger batch raises total throughput, though each user's tokens arrive a littl
 tur serve --max-batch-size 8 --prefix-snapshots 16
 ```
 
-Agent loops resend a growing conversation each step, and prefix reuse skips the part already computed; in one agent benchmark, 83% of prompt tokens came from the cache. When several users hit the same new prompt at once, one computes it and the others wait for it rather than each computing their own copy. Leave `--mtp` off, because it disables prefix reuse.
+Agent loops resend a growing conversation each step, and prefix reuse skips the part already computed; in one agent benchmark, 83% of prompt tokens came from the cache. When several users hit the same new prompt at once, one computes it and the others wait for it rather than each computing their own copy. `--mtp` combines with reuse and pays with up to four requests decoding: four six-turn conversations finished in 9.9 s with both, against 11.2 s with reuse alone. With eight users behind a shared system prompt it cost 14% of throughput, so leave it off for wider batches.
 
 If most requests share a cached prompt and their first token matters more than total throughput, let them start ahead of older uncached requests:
 
