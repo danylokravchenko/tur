@@ -131,9 +131,8 @@ impl InferencePipeline {
                 .ok_or_else(|| invalid("missing pipeline request"))?;
             let mut count = count;
             while count > 0 {
-                let verify =
-                    self.engine
-                        .demand(pending.handle, count + 1, &Boundaries::EveryToken)?;
+                let boundaries = self.engine.speculative_boundaries();
+                let verify = self.engine.demand(pending.handle, count + 1, &boundaries)?;
                 // The verified draft replaces this sequence's plain demand.
                 let needed = demand - plain[index] + verify;
                 if needed.fits(&usage) {

@@ -182,6 +182,9 @@ fn test_speculative_device_sampling_preserves_seeded_penalties_and_outputs() -> 
     factory.format = Some(tur::models::WeightFormat::Q8_0);
     let mut plain = InferencePipeline::new(&factory, config(0, 1))?;
     let mut speculative = InferencePipeline::new(&factory, config(3, 1))?;
+    // Fused replay keeps records in the in-flight budget, freeing the per-draft slots.
+    assert_eq!(speculative.memory_plan().draft_slots, 0);
+    assert!(speculative.memory_plan().in_flight > plain.memory_plan().in_flight);
     let mut request = GenerationRequest::new(
         (2..90)
             .map(|t| format!("t{t}"))

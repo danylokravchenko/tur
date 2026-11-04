@@ -36,6 +36,11 @@ pub enum Boundaries {
     /// The state after each listed number of the pass's tokens (ascending, from one, below
     /// the pass's length) and after the last, so prefix snapshots can sit inside a pass.
     Checkpoints(Arc<[usize]>),
+    /// The state after the last token, into one slot that serves any accepted prefix: the
+    /// model's replay rewrites it with the state after an earlier token before anything
+    /// reads it. Speculative passes use it instead of [`Self::EveryToken`] when the model
+    /// can replay.
+    Replayed,
 }
 
 impl Boundaries {
@@ -43,7 +48,7 @@ impl Boundaries {
     /// ascending; the last is `tokens`.
     pub fn ends(&self, tokens: usize) -> Result<Vec<usize>> {
         match self {
-            Self::Final => Ok(vec![tokens]),
+            Self::Final | Self::Replayed => Ok(vec![tokens]),
             Self::EveryToken => Ok((1..=tokens).collect()),
             Self::Checkpoints(points) => {
                 if points.first() == Some(&0)
@@ -543,8 +548,9 @@ impl Reservation {
 
     /// The snapshot after the first `accepted` tokens of this pass; the base is unchanged.
     /// A partial accept must be one of the pass's [`Boundaries`], whose state is selected
-    /// exactly: recurrent state is never truncated. Window pages wholly behind the new
-    /// boundary's window are released.
+    /// exactly, except for [`Boundaries::Replayed`], whose model must rewrite the slot
+    /// before reading the returned state. Window pages wholly behind the new boundary's
+    /// window are released.
     pub fn commit(&self, accepted: usize) -> Result<ModelState> {
         if accepted == 0 {
             return Ok(self.base.clone());
@@ -552,8 +558,11 @@ impl Reservation {
         if self.copy.is_some() || self.window_copy.is_some() {
             return Err(invalid("reservation was never prepared"));
         }
-        let Ok(boundary) = self.ends.binary_search(&accepted) else {
-            return Err(invalid("accepted prefix has no saved boundary"));
+        // A replayed pass's one slot takes the state after any accepted prefix.
+        let boundary = match self.ends.binary_search(&accepted) {
+            Ok(boundary) => boundary,
+            Err(_) if self.boundaries == Boundaries::Replayed && accepted <= self.tokens => 0,
+            Err(_) => return Err(invalid("accepted prefix has no saved boundary")),
         };
         let position = self
             .base

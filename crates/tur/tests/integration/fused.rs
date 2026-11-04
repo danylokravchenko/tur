@@ -21,8 +21,8 @@ use tur_core::{
     execution::{KvFormat, KvLayout, PackedExecution, SequenceDescriptor, StateHandle, invalid},
 };
 use tur_engine::hybrid::{
-    Boundaries, HybridEngine, HybridModel, ModelState, PackedForward, PoolConfig, SamplingOptions,
-    SequenceForward, StatePool,
+    Boundaries, HybridEngine, HybridModel, ModelState, PackedForward, PoolConfig, ReplayCommit,
+    SamplingOptions, SequenceForward, StatePool,
 };
 use tur_metal::state::LayerSnapshot;
 use tur_models::models::qwen3_5::Qwen35;
@@ -268,6 +268,67 @@ fn test_fused_every_token_boundaries_match_reference() -> Result<()> {
         let error = snapshot_error(&x, &y)?;
         assert!(error < 1e-4, "accepted {accepted}: {error}");
     }
+    Ok(())
+}
+
+#[test]
+fn test_replayed_partial_accepts_preserve_every_token_state_exactly() -> Result<()> {
+    let _gpu = GPU.lock();
+    let checkpoint = small()?;
+    let device = metal()?;
+    let model = load(&checkpoint.0, WeightFormat::F32, &device, Execution::Fused)?;
+    let pool = common::pool(&model, 256, 32)?;
+    let (_, base) = prefill(&model, ModelState::new(&pool), &prompt(15, 7), 15)?;
+    let drafts = [prompt(5, 8), prompt(3, 9)];
+    let sequences: Vec<_> = drafts
+        .iter()
+        .map(|tokens| (&base, tokens.as_slice(), Boundaries::EveryToken))
+        .collect();
+    let (_, expected) = forward(&model, &sequences)?;
+    let sequences: Vec<_> = drafts
+        .iter()
+        .map(|tokens| (&base, tokens.as_slice(), Boundaries::Replayed))
+        .collect();
+    let (steps, actual) = forward(&model, &sequences)?;
+    let steps = steps.into_iter().collect::<Result<Vec<_>>>()?;
+    let bindings: Vec<_> = actual
+        .iter()
+        .map(tur_metal::state::Reservation::binding)
+        .collect();
+    // Compare full acceptance before rewriting the slot for each earlier prefix. The
+    // second sequence uses a different accepted count to expose packed-row mistakes.
+    for accepted in (1..=5).rev() {
+        let counts = [accepted, accepted.min(3)];
+        let commits: Vec<_> = steps
+            .iter()
+            .zip(&bindings)
+            .zip(counts)
+            .filter(|((_, state), count)| *count < state.tokens())
+            .map(|((step, state), accepted)| {
+                Ok(ReplayCommit {
+                    inputs: step
+                        .replay
+                        .as_ref()
+                        .ok_or_else(|| invalid("missing replay inputs"))?,
+                    state,
+                    accepted,
+                })
+            })
+            .collect::<Result<_>>()?;
+        model.replay(&pool, &commits)?;
+        for (index, count) in counts.into_iter().enumerate() {
+            let replayed = actual[index].commit(count)?;
+            assert_eq!(replayed.position(), 15 + count);
+            assert_eq!(
+                snapshot(&replayed)?,
+                snapshot(&expected[index].commit(count)?)?,
+                "sequence {index}, accepted {count}"
+            );
+        }
+    }
+    // Replaying must leave the shared base intact for prefix forks.
+    let (_, control) = prefill(&model, ModelState::new(&pool), &prompt(15, 7), 15)?;
+    assert_eq!(snapshot(&base)?, snapshot(&control)?);
     Ok(())
 }
 

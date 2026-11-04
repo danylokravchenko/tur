@@ -1005,7 +1005,11 @@ impl Gemma4 {
             (true, None) => Some(hidden.narrow(0, s.start, s.len)?),
             (true, Some(kept)) => Some(self.kept_hidden(s, hidden, kept)?),
         };
-        Ok(SequenceStep { logits, hidden })
+        Ok(SequenceStep {
+            logits,
+            hidden,
+            replay: None,
+        })
     }
     /// A sequence's `[len, hidden]` states when only its kept rows reached the final norm.
     /// The other rows are zero: they hold no final state, and the assistant reads only

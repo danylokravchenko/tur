@@ -1,6 +1,6 @@
 # Hybrid state ideas from vLLM
 
-Created: 2026-11-04. Status: parts 1 and 3 are built and measured (see [Prefix reuse](../architecture/prefix-reuse.md#snapshots-and-the-mtp-head)); part 2 is a design, not yet built or measured.
+Created: 2026-11-04. Status: all three parts are built and measured on Qwen3.5-0.8B on the M1. Part 2 uses the existing convolution and scan kernels for replay; compact records and a dedicated commit kernel remain candidates. See [Prefix reuse](../architecture/prefix-reuse.md#snapshots-and-the-mtp-head) for parts 1 and 3.
 
 vLLM's Qwen3.5 work between September and November 2026 was mostly tuning for NVIDIA and ROCm: FP8 and NVFP4 fusions, CUDA-graph sizing, tile configurations. Three of its changes address limits that Tur also has, because they come from how a hybrid model's recurrent state behaves rather than from a GPU. This page designs Tur's version of each, in the order they should be built:
 
@@ -39,7 +39,7 @@ Output exactness never depended on this. Verification matches the target model, 
 
 ### Problem (replay)
 
-Verification reserves `Boundaries::EveryToken`, and `delta_scan` and `delta_conv` write a complete recurrent slot after every verified token. `Reservation::commit` then keeps the slot at the accepted boundary. A slot holds every DeltaNet layer's matrix and convolution history:
+Without replay, verification reserves `Boundaries::EveryToken`, and `delta_scan` and `delta_conv` write a complete recurrent slot after every verified token. `Reservation::commit` then keeps the slot at the accepted boundary. A slot holds every DeltaNet layer's matrix and convolution history:
 
 | Model | DeltaNet layers | Matrix state per slot | Convolution history per slot |
 | --- | --- | --- | --- |
@@ -65,12 +65,35 @@ ReplaySSM and RecoverSSM ([#63045](https://github.com/vllm-project/vllm/pull/630
 
 Expected traffic per sequence per pass, in slot sizes `S`, with `k` drafts and acceptance rate `a` for the whole chain:
 
-| | Today | Replay |
+| | Per-token slots | Replay |
 | --- | --- | --- |
 | All accepted | `(k + 1)S` written | `S` written |
 | Partial accept | `(k + 1)S` written | `S` written, then `S` read and `S` written |
 
-With one draft, the expected cost is `2S` today against `(3 - 2a)S` with replay, which only wins when acceptance is above one half. The gain grows with chain depth and with prompt-lookup drafts, which often run four or more tokens deep. The memory saving holds at every depth.
+With one draft, the expected cost is `2S` with per-token slots against `(3 - 2a)S` with replay, which only wins when acceptance is above one half. The gain grows with chain depth and with prompt-lookup drafts, which often run four or more tokens deep. The memory saving holds at every depth.
+
+### What Tur built (replay)
+
+Fused Qwen execution with F32 recurrent state reserves `Boundaries::Replayed`: one output slot per sequence, even when it verifies several drafts. Each DeltaNet layer retains the speculative sequences' projection rows (`q | k | v | z | b | a`). A full acceptance uses the final slot directly. A partial acceptance reruns convolution and scan over the accepted projection rows, reading the original base slot and overwriting the output slot. Reusing the scan also reuses its reduction order; even a one-token replay uses the scan rather than `delta_step`.
+
+The engine batches partial commits across sequences and retains the records, weights and reservations through a second completion fence before releasing old slots or returning results. The planner includes that completion in the pass cost. The memory plan charges retained projection rows to in-flight memory and reserves no per-draft slots. Reference execution still uses `EveryToken`, and narrow recurrent state still disables speculation.
+
+On the pinned Qwen3.5-0.8B checkpoint with Q8_0 weights, F16 K/V and four lookup drafts, two measured runs after warmup generated 64 tokens per request. The table gives mean output tokens per second, including prefill:
+
+| Workload | Requests | Per-token slots | Replay | Ratio |
+| --- | --- | --- | --- | --- |
+| Repeated pattern, lookup | 1 | 139.3 | 148.6 | 1.07× |
+| Repeated pattern, lookup | 4 | 237.2 | 257.1 | 1.08× |
+| Repeated pattern, lookup | 8 | 262.8 | 282.1 | 1.07× |
+| Repeated pattern, lookup and MTP | 1 | 137.0 | 145.8 | 1.06× |
+| Repeated pattern, lookup and MTP | 4 | 234.0 | 251.7 | 1.08× |
+| Repeated pattern, lookup and MTP | 8 | 249.8 | 269.8 | 1.08× |
+
+On the code prompt, where lookup rarely finds an accepted draft, ratios ranged from 0.97× to 1.02× across the same request counts and draft sources. Every paired run produced identical token IDs. The state pool shrank by 77 MiB with one request and 308 MiB with four or eight; after charging projection records, total planned resident memory fell by 74, 297 and 295 MiB respectively. Eight requests still reserve at most sixteen drafts across the pass.
+
+The kernel-only run (`TUR_BENCH_ONLY=replay TUR_BENCH_SHAPE=0.8b just bench kernels`) timed convolution and scan together. For one four-token sequence, writing only the final state took 78 µs per layer against 153 µs for every-token writes; replaying one to three accepted tokens took 58 to 68 µs. With eight sequences, the corresponding verification times were 608 and 1,159 µs. These timings exclude retaining and gathering projection rows and the engine's second fence, so the serving comparison determines whether replay pays overall.
+
+A model test compares every accepted prefix of ragged five- and three-token passes with `EveryToken` snapshots by exact equality, including convolution history, attention pages across a partial-page boundary and the unchanged shared base. Existing seeded speculation tests cover lookup, MTP, penalties and resource release through the pipeline. Measurements on Qwen3.6-35B-A3B on the M3 Pro remain outstanding. Compact post-convolution records and a dedicated commit kernel would avoid repeating convolution, preparation and unused scan outputs; their benefit has not been measured.
 
 ### Exactness (replay)
 
@@ -118,7 +141,7 @@ Less than in vLLM. On the M1, 256- and 512-token chunks prefill an 8K-token prom
 - Chunks no longer stop at aligned or template-rewrite positions, and the scheduler's memory check counts each chunk's extra slots.
 - The template-rewrite boundary is also taken on first turns.
 
-On Qwen3.5-0.8B over four six-turn conversations at 256-token spacing, cached prompt tokens rose from 8,667 to 9,681 of 13,765, last-turn time to first token fell from 1.19 s to 0.62 s, and the run took 10.4 s instead of 11.2 s. Decode speed and the shared-system-prompt workload stayed within run-to-run noise. Verification passes still stop at the next aligned position, because speculative sequences keep a state per token and take no checkpoints.
+On Qwen3.5-0.8B over four six-turn conversations at 256-token spacing, cached prompt tokens rose from 8,667 to 9,681 of 13,765, last-turn time to first token fell from 1.19 s to 0.62 s, and the run took 10.4 s instead of 11.2 s. Decode speed and the shared-system-prompt workload stayed within run-to-run noise. Verification passes still stop at the next aligned position, because speculative sequences take no checkpoints.
 
 ## Not ported
 

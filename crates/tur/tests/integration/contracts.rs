@@ -169,6 +169,7 @@ impl Fixture {
         Ok(SequenceStep {
             logits,
             hidden: None,
+            replay: None,
         })
     }
 }

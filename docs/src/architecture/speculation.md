@@ -21,7 +21,7 @@ The engine asks for logits at every drafted position and checks drafts by target
 
 A draft `d` is accepted with exactly the probability the model gives it, and a mismatching draw already follows the model's distribution over everything else. So the published tokens follow the model's distribution exactly: the same seed gives the same tokens as normal decoding. Unlike classic speculative sampling, there is no `min(1, p/q)` correction and no draft tree.
 
-Undoing rejected drafts means picking a boundary. Every recurrent layer keeps a slot at each candidate position, and attention pages past the accepted one are released. The random stream, penalties and grammar state advance only for published tokens.
+Undoing rejected drafts means restoring the accepted boundary. Fused Qwen verification keeps one recurrent output slot and small projection records. If it accepts only part of a pass, it replays those rows from the original state into that slot using the same convolution and scan kernels, then waits for completion before releasing the old state. Full acceptance needs no replay. Reference execution keeps a slot at each candidate position. Attention pages past the accepted boundary are released. The random stream, penalties and grammar state advance only for published tokens.
 
 ## Drafting only when it pays
 
@@ -43,7 +43,7 @@ The MTP head and the Gemma assistant have extra gates:
 
 - Speculation needs F32 recurrent state. With F16 or BF16 state, the pipeline logs a warning and decodes normally, because verifying several tokens keeps F32 intermediate state between drafts.
 - Grammar-constrained requests never draft, and the end-of-sequence token is never proposed.
-- Drafting needs extra state memory, a recurrent slot per candidate boundary and an output row per draft, which the memory plan reserves up front.
+- Drafting needs projection records and output rows, which the memory plan reserves up front. Reference execution reserves a recurrent slot per candidate boundary instead of records.
 
 ## Decisions
 
@@ -64,3 +64,4 @@ Measured on Qwen3.5-0.8B on an M1 unless noted:
 - The Gemma assistant chains drafts with one request decoding. Against one draft per pass, chains were 1.14× faster on prose and 1.50× on repetitive text, and level on code. With four requests they lost 6% on prose and 13% on code, so chaining is limited to one request. Every run reproduced the single-draft tokens.
 - Expert checkpoints carry an MTP head too, whose single layer has its own routed experts and shared expert. It matches Transformers' `MoE` decoder layer on a tiny fixture within 2e-4, on the host and on the kernels, and its tensor shapes match the published Qwen3.6 header. On the real Qwen3.6-35B-A3B Q4K artifact it was accepted for 80 to 90% of its drafts on new prose and code, and lookup plus MTP gave 1.09 to 1.34× normal decoding with one to four requests, outputs identical to normal decoding (see [Measured performance](../guide/performance.md#qwen36-35b-a3b)). That is one 36 GB M3 Pro, with the artifact's experts resident.
 - Chained MTP drafts are the next candidate, estimated at about 10% with one request (see [Open work](../design/open.md)).
+- Fused Qwen verification commits partial accepts by replay with F32 state. On the 0.8B, repetitive lookup output improved 7 to 8% at one, four and eight requests; code output ranged from 3% slower to 2% faster. Lookup plus MTP gave similar results, with identical tokens in every paired run. The plan saves 74 to 297 MiB after charging records (see [Replay measurements](../research/hybrid-state-from-vllm.md#what-tur-built-replay)).

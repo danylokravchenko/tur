@@ -9,11 +9,11 @@ use super::{
     math::{self, DeltaInputs},
 };
 use crate::hybrid::{
-    Addresses, Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward,
+    Addresses, Boundaries, DraftForward, DraftSequence, HybridModel, PackedForward, ReplayInputs,
     SequenceForward, SequenceStep, StatePool,
 };
 #[cfg(feature = "metal")]
-use crate::hybrid::{LayerCarry, LayerStep};
+use crate::hybrid::{LayerCarry, LayerStep, ReplayCommit};
 use crate::image::Image;
 use crate::media::{MediaLayout, MediaPrompt, MediaSegment};
 #[cfg(feature = "metal")]
@@ -637,6 +637,30 @@ impl Tensors {
 }
 
 impl Qwen35 {
+    /// Whether a model loaded with `options` replays speculative passes: the fused kernels
+    /// do, the reference path keeps every token's state instead.
+    pub fn uses_replay(options: &LoadOptions) -> bool {
+        options.execution == Execution::Fused
+            && options.device.is_metal()
+            && options.recurrent == DType::F32
+    }
+
+    /// Bytes a replaying pass keeps for `rows` speculative rows: every recurrent layer's
+    /// F32 projection rows (`q | k | v | z | b | a`).
+    pub fn replay_bytes(config: &Config, rows: usize) -> Result<usize> {
+        let d = Dims::new(config)?;
+        let layers = config
+            .layer_kinds()
+            .iter()
+            .filter(|kind| matches!(kind, LayerKind::LinearAttention))
+            .count();
+        d.channels
+            .checked_add(d.value_width)
+            .and_then(|width| width.checked_add(d.value_heads.checked_mul(2)?))
+            .and_then(|width| width.checked_mul(4)?.checked_mul(rows)?.checked_mul(layers))
+            .ok_or_else(|| invalid("replay input size overflow"))
+    }
+
     /// Description, resident weight bytes and peak workspace computed from validated
     /// metadata, before reading weight payloads or uploading weights. `contexts` bounds
     /// each sequence's resulting position, and `tokens` bounds the packed pass.
@@ -1460,13 +1484,16 @@ impl Qwen35 {
     ) -> Result<Vec<SequenceStep>> {
         let pass = self.pass(batch, spans)?;
         #[cfg(feature = "metal")]
-        let (logits, hidden) = match &self.fused {
+        let (logits, hidden, replay) = match &self.fused {
             Some(fused) if recorder.is_none() => self.run_fused(fused, &pass, trace)?,
-            _ => self.run_reference(&pass, trace, recorder)?,
+            _ => {
+                let (logits, hidden) = self.run_reference(&pass, trace, recorder)?;
+                (logits, hidden, Vec::new())
+            }
         };
         #[cfg(not(feature = "metal"))]
-        let (logits, hidden) = self.run_reference(&pass, trace, recorder)?;
-        Self::steps(spans, &logits, hidden.as_ref())
+        let ((logits, hidden), replay) = (self.run_reference(&pass, trace, recorder)?, Vec::new());
+        Self::steps(spans, &logits, hidden.as_ref(), &replay)
     }
 
     /// The packed rows of live spans.
@@ -1475,6 +1502,15 @@ impl Qwen35 {
         batch: &'a PackedForward<'_>,
         spans: &'a [Span<'b>],
     ) -> Result<Pass<'a, 'b>> {
+        if !self.replays()
+            && spans
+                .iter()
+                .any(|span| span.sequence.state.boundaries() == &Boundaries::Replayed)
+        {
+            return Err(invalid(
+                "replay requires fused execution with F32 recurrent state",
+            ));
+        }
         let mut ids = Vec::new();
         let mut positions = Vec::new();
         let mut axial = Vec::new();
@@ -1523,22 +1559,39 @@ impl Qwen35 {
         Ok(pass)
     }
 
-    /// Split a pass's outputs back into its spans.
+    /// Split a pass's outputs back into its spans. `replay` holds each recurrent layer's
+    /// rows of the replayed spans, in span order.
     fn steps(
         spans: &[Span<'_>],
         logits: &Tensor,
         hidden: Option<&Tensor>,
+        replay: &[Tensor],
     ) -> Result<Vec<SequenceStep>> {
         let mut offset = 0;
+        let mut replayed = 0;
         let mut steps = Vec::with_capacity(spans.len());
         for span in spans {
             let rows = span.sequence.logits.len();
+            let replay = if span.sequence.state.boundaries() == &Boundaries::Replayed {
+                if replay.is_empty() {
+                    return Err(invalid("a replayed sequence ran without replay inputs"));
+                }
+                let range = replayed..replayed + span.len;
+                replayed = range.end;
+                Some(ReplayInputs {
+                    layers: replay.to_vec(),
+                    rows: range,
+                })
+            } else {
+                None
+            };
             steps.push(SequenceStep {
                 logits: logits.narrow(0, offset, rows)?.contiguous()?,
                 hidden: match (hidden, span.sequence.hidden) {
                     (Some(hidden), true) => Some(hidden.narrow(0, span.start, span.len)?),
                     _ => None,
                 },
+                replay,
             });
             offset += rows;
         }
@@ -1712,6 +1765,29 @@ impl HybridModel for Qwen35 {
         Ok(0)
     }
 
+    /// Fused kernels replay; the reference path keeps every token's state instead.
+    fn replays(&self) -> bool {
+        #[cfg(feature = "metal")]
+        {
+            self.fused.is_some() && self.description.layers.iter().all(|kind| {
+                !matches!(kind, tur_core::execution::LayerStateKind::Recurrent { dtype, .. } if *dtype != DType::F32)
+            })
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    fn replay(&self, pool: &StatePool, commits: &[ReplayCommit<'_>]) -> Result<()> {
+        let fused = self
+            .fused
+            .as_ref()
+            .ok_or_else(|| invalid("only fused execution replays recurrent state"))?;
+        self.replay_fused(fused, pool, commits)
+    }
+
     /// Only behind an expert cache, where a pass costs enough to stall streams: see
     /// `InferencePipeline`'s layered prefill.
     #[cfg(feature = "metal")]
@@ -1744,7 +1820,7 @@ impl HybridModel for Qwen35 {
         match self.fused_range(fused, &pass, carry, end)? {
             fused::LayerProgress::Paused(carry) => Ok(LayerStep::Paused(carry)),
             fused::LayerProgress::Done((logits, hidden)) => {
-                let mut steps = Self::steps(&spans, &logits, hidden.as_ref())?;
+                let mut steps = Self::steps(&spans, &logits, hidden.as_ref(), &[])?;
                 let step = steps.pop().ok_or_else(|| invalid("missing Qwen output"))?;
                 Ok(LayerStep::Done(step))
             }
