@@ -22,7 +22,9 @@ pub struct SequenceForward<'a> {
     /// Strictly increasing packed positions whose logits are required.
     pub logits: &'a [usize],
     /// Also return the final normalized hidden state of every new token, which a draft
-    /// head consumes ([`HybridModel::draft`]).
+    /// head consumes ([`HybridModel::draft`]). A model whose last layers only read shared
+    /// K/V (Gemma 4 E2B, E4B) may compute it for just the logit rows and the last row,
+    /// leaving other rows zero; its own draft head reads only the last committed row.
     pub hidden: bool,
 }
 

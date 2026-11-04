@@ -229,6 +229,11 @@ impl Config {
     fn layers(&self) -> usize {
         self.text.num_hidden_layers
     }
+    /// The first layer that reads another layer's K/V; every later layer does too.
+    #[cfg(feature = "metal")]
+    fn first_shared(&self) -> usize {
+        self.layers() - self.text.num_kv_shared_layers
+    }
     /// The last layer of `kind` that owns its K/V: what sharing layers and the assistant read.
     pub(super) fn last_owner(&self, kind: LayerKind) -> Option<usize> {
         (0..self.layers())
@@ -942,46 +947,88 @@ impl Gemma4 {
             positions: &positions,
         };
         #[cfg(feature = "metal")]
-        let hidden = match &self.fused {
-            Some(fused) => self.run_fused(fused, &pass, x, inputs, trace)?,
-            None => self.run_reference(&pass, x, inputs.as_ref(), trace)?,
+        let (hidden, kept) = match &self.fused {
+            Some(fused) => {
+                // A trace reports every row of every layer, so it runs the whole pass.
+                let kept = if trace.is_none() {
+                    kept_rows(&self.config, spans)?
+                } else {
+                    None
+                };
+                let hidden = self.run_fused(fused, &pass, x, inputs, trace, kept.as_deref())?;
+                (hidden, kept)
+            }
+            None => (self.run_reference(&pass, x, inputs.as_ref(), trace)?, None),
         };
         #[cfg(not(feature = "metal"))]
-        let hidden = self.run_reference(&pass, x, inputs.as_ref(), trace)?;
+        let (hidden, kept) = (
+            self.run_reference(&pass, x, inputs.as_ref(), trace)?,
+            None::<Vec<u32>>,
+        );
         spans
             .iter()
-            .map(|s| {
-                let rows = s
-                    .sequence
-                    .logits
-                    .iter()
-                    .map(|r| {
-                        u32::try_from(s.start + r - s.sequence.tokens.start)
-                            .map_err(|_| invalid("logit row overflow"))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let logits = if rows.is_empty() {
-                    Tensor::zeros((0, self.config.vocab_size()), DType::F32, &self.device)?
-                } else {
-                    let raw = self.linear(
-                        &self.head,
-                        &hidden.index_select(&Tensor::new(rows.as_slice(), &self.device)?, 0)?,
-                    )?;
-                    match self.config.text.final_logit_softcapping {
-                        Some(cap) => ((raw / cap)?.tanh()? * cap)?,
-                        None => raw,
-                    }
-                };
-                Ok(SequenceStep {
-                    logits,
-                    hidden: s
-                        .sequence
-                        .hidden
-                        .then(|| hidden.narrow(0, s.start, s.len))
-                        .transpose()?,
+            .map(|s| self.step(s, &hidden, kept.as_deref()))
+            .collect()
+    }
+    /// One sequence's logits and hidden states from the final-normed rows of the pass,
+    /// which hold only the `kept` rows when the sharing layers ran on those alone.
+    fn step(&self, s: &Span<'_>, hidden: &Tensor, kept: Option<&[u32]>) -> Result<SequenceStep> {
+        let rows = s
+            .sequence
+            .logits
+            .iter()
+            .map(|r| {
+                let row = u32::try_from(s.start + r - s.sequence.tokens.start)
+                    .map_err(|_| invalid("logit row overflow"))?;
+                kept.map_or(Ok(row), |kept| {
+                    kept.binary_search(&row)
+                        .ok()
+                        .and_then(|i| u32::try_from(i).ok())
+                        .ok_or_else(|| invalid("logit row skipped the sharing layers"))
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        let logits = if rows.is_empty() {
+            Tensor::zeros((0, self.config.vocab_size()), DType::F32, &self.device)?
+        } else {
+            let raw = self.linear(
+                &self.head,
+                &hidden.index_select(&Tensor::new(rows.as_slice(), &self.device)?, 0)?,
+            )?;
+            match self.config.text.final_logit_softcapping {
+                Some(cap) => ((raw / cap)?.tanh()? * cap)?,
+                None => raw,
+            }
+        };
+        let hidden = match (s.sequence.hidden, kept) {
+            (false, _) => None,
+            (true, None) => Some(hidden.narrow(0, s.start, s.len)?),
+            (true, Some(kept)) => Some(self.kept_hidden(s, hidden, kept)?),
+        };
+        Ok(SequenceStep { logits, hidden })
+    }
+    /// A sequence's `[len, hidden]` states when only its kept rows reached the final norm.
+    /// The other rows are zero: they hold no final state, and the assistant reads only
+    /// the last committed row, which is always kept.
+    fn kept_hidden(&self, s: &Span<'_>, hidden: &Tensor, kept: &[u32]) -> Result<Tensor> {
+        let (mut local, mut compact) = (Vec::new(), Vec::new());
+        for (i, &row) in kept.iter().enumerate() {
+            let row = row as usize;
+            if (s.start..s.start + s.len).contains(&row) {
+                local.push(u32::try_from(row - s.start).map_err(|_| invalid("row overflow"))?);
+                compact.push(u32::try_from(i).map_err(|_| invalid("row overflow"))?);
+            }
+        }
+        let zeros = Tensor::zeros((s.len, hidden.dim(1)?), hidden.dtype(), &self.device)?;
+        if local.is_empty() {
+            return Ok(zeros);
+        }
+        let compact = Tensor::new(compact.as_slice(), &self.device)?;
+        Ok(zeros.index_add(
+            &Tensor::new(local.as_slice(), &self.device)?,
+            &hidden.index_select(&compact, 0)?,
+            0,
+        )?)
     }
     /// `gelu(gate) * up` over the halves of a fused `gate | up` projection.
     fn gelu_product(&self, gate_up: &Tensor) -> Result<Tensor> {
@@ -1104,19 +1151,20 @@ impl Gemma4 {
         mut x: Tensor,
         inputs: Option<Tensor>,
         mut trace: Option<&mut Vec<Tensor>>,
+        kept: Option<&[u32]>,
     ) -> Result<Tensor> {
         let k = &f.kernels;
         let eps = self.config.text.rms_norm_eps;
         let tokens = x.dim(0)?;
-        let paging = self.paging(k, pass.pool, pass.spans, tokens)?;
+        let mut paging = self.paging(k, pass.pool, pass.spans, tokens)?;
         let positions = pass
             .positions
             .iter()
             .map(|&p| u32::try_from(p).map_err(|_| invalid("position exceeds u32")))
             .collect::<Result<Vec<_>>>()?;
-        let positions = Tensor::new(positions.as_slice(), &self.device)?;
+        let mut positions = Tensor::new(positions.as_slice(), &self.device)?;
         // Per-layer inputs as `[tokens, layers × width]`; each layer reads its columns.
-        let inputs = inputs
+        let mut inputs = inputs
             .map(|t| {
                 t.reshape((
                     tokens,
@@ -1130,6 +1178,18 @@ impl Gemma4 {
             .ok_or_else(|| invalid("model has no layers"))?;
         let mut h = k.rms_norm(&x, &first.input_norm, eps)?;
         for (i, l) in self.layers.iter().enumerate() {
+            if let Some(kept) = kept.filter(|_| i == self.config.first_shared()) {
+                // Sharing layers store no K/V, so rows nobody reads stop at the last owner.
+                if kept.is_empty() {
+                    return Ok(h.narrow(0, 0, 0)?);
+                }
+                let index = Tensor::new(kept, &self.device)?;
+                x = x.index_select(&index, 0)?;
+                h = h.index_select(&index, 0)?;
+                positions = positions.index_select(&index, 0)?;
+                inputs = inputs.map(|t| t.index_select(&index, 0)).transpose()?;
+                paging = self.kept_paging(k, pass, kept)?;
+            }
             let attention = self.fused_attention(f, l, i, &h, &positions, pass.pool, &paging)?;
             let (sum, normed) = k.residual_rms_norm(
                 &x,
@@ -1284,6 +1344,50 @@ impl Gemma4 {
             tokens,
         )
     }
+    /// Page addressing of the `kept` packed rows alone.
+    fn kept_paging(
+        &self,
+        k: &tur_metal::kernels::Kernels,
+        pass: &Pass<'_, '_>,
+        kept: &[u32],
+    ) -> Result<Paging> {
+        let spans = pass.spans.iter().filter_map(|s| {
+            let rows = s.start..s.start + s.len;
+            let positions: Vec<usize> = kept
+                .iter()
+                .map(|&r| r as usize)
+                .filter(|r| rows.contains(r))
+                .map(|r| s.past + r - s.start)
+                .collect();
+            (!positions.is_empty()).then_some((&s.addresses, positions))
+        });
+        Paging::queries(k, &self.description, pass.pool, spans, kept.len())
+    }
+}
+
+/// Packed rows the K/V-sharing layers must run on: each sequence's logit rows, and its
+/// last row when the caller takes hidden states. `None` when that is every row, or the
+/// model shares no K/V.
+#[cfg(feature = "metal")]
+fn kept_rows(config: &Config, spans: &[Span<'_>]) -> Result<Option<Vec<u32>>> {
+    if config.first_shared() == config.layers() {
+        return Ok(None);
+    }
+    let mut kept = Vec::new();
+    let mut tokens = 0;
+    for s in spans {
+        let row = |r: usize| u32::try_from(s.start + r).map_err(|_| invalid("row overflow"));
+        for &r in s.sequence.logits {
+            kept.push(row(r - s.sequence.tokens.start)?);
+        }
+        let last = row(s.len - 1)?;
+        // Logit rows increase within the sequence, so the last row can only be the latest.
+        if s.sequence.hidden && kept.last() != Some(&last) {
+            kept.push(last);
+        }
+        tokens += s.len;
+    }
+    Ok((kept.len() < tokens).then_some(kept))
 }
 
 impl Gemma4 {

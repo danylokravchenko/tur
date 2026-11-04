@@ -266,7 +266,8 @@ Tur prefills 11 to 13% faster and decodes one Q8_0 sequence 9% faster. With more
 
 | Case | Result |
 | --- | --- |
-| Prefill, 512 tokens | 417 tokens/s |
+| Prefill, 512 tokens | 1192 tokens/s |
+| Prefill, 2048 tokens | 1012 tokens/s |
 | Decode, 1 sequence at 128 tokens | 19.8 to 21.3 tokens/s |
 | Decode, 4 sequences at 128 tokens | 51.8 tokens/s |
 | Decode, 1 sequence at 8K tokens | 18.9 to 20.0 tokens/s |

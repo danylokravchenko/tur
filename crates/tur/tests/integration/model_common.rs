@@ -102,13 +102,36 @@ pub(crate) fn forward(
     model: &impl HybridModel,
     sequences: &[(&ModelState, &[u32], Boundaries)],
 ) -> Result<(Vec<Result<SequenceStep>>, Vec<Reservation>)> {
+    let every: Vec<Vec<usize>> = sequences
+        .iter()
+        .map(|(_, tokens, _)| (0..tokens.len()).collect())
+        .collect();
+    let sequences: Vec<_> = sequences
+        .iter()
+        .zip(&every)
+        .map(|(&(state, tokens, boundaries), rows)| {
+            (state, tokens, boundaries, rows.as_slice(), false)
+        })
+        .collect();
+    forward_rows(model, &sequences)
+}
+
+/// One sequence of [`forward_rows`]: state, new tokens, boundaries, logit rows counted
+/// from its first new token, and whether it returns hidden states.
+pub(crate) type RowsForward<'a> = (&'a ModelState, &'a [u32], Boundaries, &'a [usize], bool);
+
+/// [`forward`] with each sequence's own logit rows and hidden-state request.
+pub(crate) fn forward_rows(
+    model: &impl HybridModel,
+    sequences: &[RowsForward<'_>],
+) -> Result<(Vec<Result<SequenceStep>>, Vec<Reservation>)> {
     let pool = sequences
         .first()
-        .map(|(state, _, _)| state.pool().clone())
+        .map(|(state, ..)| state.pool().clone())
         .ok_or_else(|| invalid("empty pass"))?;
     let mut reservations = sequences
         .iter()
-        .map(|(state, tokens, boundaries)| state.reserve(tokens.len(), *boundaries))
+        .map(|(state, tokens, boundaries, ..)| state.reserve(tokens.len(), *boundaries))
         .collect::<Result<Vec<_>>>()?;
     for reservation in &mut reservations {
         reservation.prepare()?;
@@ -117,22 +140,24 @@ pub(crate) fn forward(
     let mut tokens = Vec::new();
     let mut positions = Vec::new();
     let mut ranges = Vec::new();
-    for (state, new, _) in sequences {
+    let mut logits = Vec::new();
+    for (state, new, _, rows, _) in sequences {
         let start = tokens.len();
         tokens.extend_from_slice(new);
         positions.extend(state.position()..state.position() + new.len());
         ranges.push(start..tokens.len());
+        logits.push(rows.iter().map(|r| start + r).collect::<Vec<_>>());
     }
-    let logits: Vec<Vec<usize>> = ranges.iter().map(|r| r.clone().collect()).collect();
     let forwards: Vec<SequenceForward<'_>> = bindings
         .iter()
         .zip(&ranges)
         .zip(&logits)
-        .map(|((state, range), logits)| SequenceForward {
+        .zip(sequences)
+        .map(|(((state, range), logits), sequence)| SequenceForward {
             tokens: range.clone(),
             state,
             logits,
-            hidden: false,
+            hidden: sequence.4,
         })
         .collect();
     let steps = model.forward(&PackedForward {
