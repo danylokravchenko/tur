@@ -357,15 +357,9 @@ impl InferencePipeline {
         render: &RenderOptions,
         tokens: &[u32],
     ) -> Option<usize> {
-        // A first turn has no demonstrated conversational reuse; splitting it adds a
-        // pass to ordinary single-turn requests. Start predicting once history exists.
-        if !self.prefix.config().enabled()
-            || !render.add_generation_prompt
-            || !request
-                .messages
-                .iter()
-                .any(|message| message.role == Role::Assistant)
-        {
+        // The boundary is a checkpoint inside a prefill pass, so a first turn pays only for
+        // the probe's rendering.
+        if !self.prefix.config().enabled() || !render.add_generation_prompt {
             return None;
         }
         let mut messages = request.messages.clone();
@@ -739,13 +733,23 @@ impl InferencePipeline {
             .get_mut(&id)
             .ok_or_else(|| invalid("unknown pipeline request"))?;
         pending.handle = commit.handle;
+        let before = pending.consumed;
+        // States inside the pass, snapshotted once the draft head has written its entries.
+        for state in commit.checkpoints {
+            let row = state.position() - before;
+            self.snapshots.push(SnapshotCommit {
+                id,
+                hidden: last_hidden(hidden, row)?,
+                state: Some(state),
+                logits: None,
+            });
+        }
         if pending
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
             return Err(TurError::DeadlineExceeded);
         }
-        let before = pending.consumed;
         pending.consumed = pending
             .consumed
             .checked_add(commit.accepted_tokens)
@@ -813,7 +817,12 @@ impl InferencePipeline {
                 .map(|logits| logits.narrow(0, logits.dim(0)? - 1, 1)?.force_contiguous())
                 .transpose()?;
             let hidden = last_hidden(hidden, commit.accepted_tokens)?;
-            self.snapshots.push(SnapshotCommit { id, logits, hidden });
+            self.snapshots.push(SnapshotCommit {
+                id,
+                state: None,
+                logits,
+                hidden,
+            });
         }
         if !finished {
             return Ok(());
@@ -851,6 +860,7 @@ impl InferencePipeline {
         if pending.consumed > 0 && self.prefix.config().enabled() {
             self.snapshots.push(SnapshotCommit {
                 id,
+                state: None,
                 logits: None,
                 hidden: last_hidden(hidden, commit.accepted_tokens)?,
             });
@@ -887,26 +897,33 @@ impl InferencePipeline {
     /// holding a tool-calling reply's snapshots for the caller's return.
     pub(super) fn settle(&mut self) -> Result<()> {
         let keyed = self.keyed_head();
-        for SnapshotCommit { id, logits, hidden } in std::mem::take(&mut self.snapshots) {
+        for commit in std::mem::take(&mut self.snapshots) {
             let Some(pending) = self
                 .pending
-                .get_mut(&id)
-                .or_else(|| self.finishing.get_mut(&id).map(|f| &mut f.pending))
+                .get_mut(&commit.id)
+                .or_else(|| self.finishing.get_mut(&commit.id).map(|f| &mut f.pending))
             else {
                 continue;
             };
-            let Some(prefix) = pending.tokens.get(..pending.consumed) else {
+            let state = match commit.state {
+                Some(state) => state,
+                None => self.engine.model_state(pending.handle)?,
+            };
+            let length = state.position();
+            let Some(prefix) = pending.tokens.get(..length) else {
                 continue;
             };
             self.prefix.extend(&mut pending.keys, prefix);
-            let state = self.engine.model_state(pending.handle)?;
             let head = pending
                 .tokens
-                .get(pending.consumed)
-                .filter(|_| keyed && pending.mtp_done >= pending.consumed)
-                .map(|&next| HeadEntry { next, hidden });
+                .get(length)
+                .filter(|_| keyed && pending.mtp_done >= length)
+                .map(|&next| HeadEntry {
+                    next,
+                    hidden: commit.hidden,
+                });
             self.prefix
-                .insert(&pending.keys, prefix, &state, logits.as_ref(), head)?;
+                .insert(&pending.keys, prefix, &state, commit.logits.as_ref(), head)?;
         }
         for (
             _,
@@ -949,10 +966,10 @@ impl InferencePipeline {
     }
 }
 
-/// The last committed row of a pass's `[rows, hidden]` final hidden states, as an allocated
-/// copy: `Tensor::copy` shares storage on Metal.
-fn last_hidden(hidden: Option<&Tensor>, accepted: usize) -> Result<Option<Tensor>> {
-    match (hidden, accepted.checked_sub(1)) {
+/// Row `rows - 1` of a pass's `[rows, hidden]` final hidden states, the state after its
+/// first `rows` tokens, as an allocated copy: `Tensor::copy` shares storage on Metal.
+fn last_hidden(hidden: Option<&Tensor>, rows: usize) -> Result<Option<Tensor>> {
+    match (hidden, rows.checked_sub(1)) {
         (Some(hidden), Some(last)) => Ok(Some(hidden.narrow(0, last, 1)?.force_contiguous()?)),
         _ => Ok(None),
     }

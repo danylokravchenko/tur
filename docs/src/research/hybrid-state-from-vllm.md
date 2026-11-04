@@ -1,6 +1,6 @@
 # Hybrid state ideas from vLLM
 
-Created: 2026-11-04. Status: part 1 is built and measured (see [Prefix reuse](../architecture/prefix-reuse.md#snapshots-and-the-mtp-head)); parts 2 and 3 are designs, not yet built or measured.
+Created: 2026-11-04. Status: parts 1 and 3 are built and measured (see [Prefix reuse](../architecture/prefix-reuse.md#snapshots-and-the-mtp-head)); part 2 is a design, not yet built or measured.
 
 vLLM's Qwen3.5 work between September and November 2026 was mostly tuning for NVIDIA and ROCm: FP8 and NVFP4 fusions, CUDA-graph sizing, tile configurations. Three of its changes address limits that Tur also has, because they come from how a hybrid model's recurrent state behaves rather than from a GPU. This page designs Tur's version of each, in the order they should be built:
 
@@ -76,7 +76,7 @@ With one draft, the expected cost is `2S` today against `(3 - 2a)S` with replay,
 
 The commit must store exactly the state that `EveryToken` would have stored at the accepted boundary. The dot products in the scan reduce across lanes, so the result depends on the lane layout: `delta_commit` has to share the scan's update code and its `ROWS` and column layout, not reimplement it. Factor the per-token update out of `delta_scan` into an inline function that both kernels call.
 
-The same restructuring offers a cheaper side gain. Speculation currently requires F32 state, because verification keeps F32 intermediates between drafts while ordinary decoding rounds after every token. If the scan rounds its register state through `store_state` after each token when speculating, verification reproduces ordinary decoding's rounding exactly, and speculation can run with F16 state at half the slot memory. That change touches only the scan and can land before replay.
+The same restructuring offers a cheaper side gain. Speculation currently requires F32 state, because verification keeps F32 intermediates between drafts while ordinary decoding rounds after every token. If the scan rounds its register state through `store_state` after each token when speculating, verification rounds at the same points as ordinary decoding, and speculation could run with F16 state at half the slot memory. That alone isn't enough, though: ordinary decoding runs `delta_step` while verification runs `delta_scan`, and the two reduce their dot products in different lane layouts. In F32 their results differ by about 1e-7, which hasn't changed a token in the speculation tests. With F16 storage, the same difference can tip a stochastic rounding and move an element by a whole F16 ulp. So this side gain first needs `delta_step` and `delta_scan` to produce bit-identical states for one token, with a kernel test that checks it.
 
 ### Tests and measurement (replay)
 
@@ -111,11 +111,14 @@ Less than in vLLM. On the M1, 256- and 512-token chunks prefill an 8K-token prom
 - The scheduler stops treating snapshot positions as chunk limits. `next_boundary` becomes a list of positions to checkpoint inside the chunk, and the drafting cap at boundaries goes away.
 - Attention needs no change. A snapshot inside a pass sees only its own positions, and copy-on-write already covers a snapshot that ends partway through a page.
 
-### Tests and measurement (in-pass snapshots)
+### What Tur built (in-pass snapshots)
 
-- Kernel: a checkpoint written inside a pass is bit-identical to the slot written by a pass that ends at the same position, for every state format.
-- Integration: a request that restores a mid-pass snapshot generates exactly the tokens of an uncached run.
-- Real run: re-measure first-turn template-rewrite snapshots, and run the shared-prompt serving benchmark at the default 256-token spacing and at 64. Keep the change only if it removes a measured cost. If it only matches today's numbers, record it in [Rejected experiments](../design/rejected.md) with the patch.
+- `RecurrentSpan` lists write ends instead of an every-token flag. The scan writes a slot when it passes an end and continues from the stored value, and the convolution writes the history there. A kernel test checks that states, outputs and the final state equal those of passes ending at the same tokens, bit for bit, in F32, F16 and BF16.
+- `Boundaries::Checkpoints` lists a pass's in-pass ends, and `SequenceDescriptor::checkpoints` carries them to the engine, which returns the committed state at each with the request's commit. The pipeline inserts them as snapshots in `settle`, after the draft head has run. The head's side pass accepts pages held by those not-yet-inserted states.
+- Chunks no longer stop at aligned or template-rewrite positions, and the scheduler's memory check counts each chunk's extra slots.
+- The template-rewrite boundary is also taken on first turns.
+
+On Qwen3.5-0.8B over four six-turn conversations at 256-token spacing, cached prompt tokens rose from 8,667 to 9,681 of 13,765, last-turn time to first token fell from 1.19 s to 0.62 s, and the run took 10.4 s instead of 11.2 s. Decode speed and the shared-system-prompt workload stayed within run-to-run noise. Verification passes still stop at the next aligned position, because speculative sequences keep a state per token and take no checkpoints.
 
 ## Not ported
 

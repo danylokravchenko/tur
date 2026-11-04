@@ -130,18 +130,28 @@ impl Fixture {
                         matrices.push(value);
                         last = token as f32;
                     }
-                    let keep = match state.boundaries() {
-                        Boundaries::Final => 1,
-                        Boundaries::EveryToken => n,
+                    // The state after each of the pass's ends.
+                    let ends = state.ends()?;
+                    let at = |values: &[f32], end: usize, width: usize| {
+                        values
+                            .get(width * (end - 1)..width * end)
+                            .map(<[f32]>::to_vec)
+                            .ok_or_else(|| invalid("state end outside the pass"))
                     };
                     let history = Tensor::from_vec(
-                        history.split_off(2 * (n - keep)),
-                        (keep, 2, 1),
+                        ends.iter()
+                            .map(|&end| at(&history, end, 2))
+                            .collect::<Result<Vec<_>>>()?
+                            .concat(),
+                        (ends.len(), 2, 1),
                         &Device::Cpu,
                     )?;
                     let matrices = Tensor::from_vec(
-                        matrices.split_off(n - keep),
-                        (keep, 1, 1, 1),
+                        ends.iter()
+                            .map(|&end| at(&matrices, end, 1))
+                            .collect::<Result<Vec<_>>>()?
+                            .concat(),
+                        (ends.len(), 1, 1, 1),
                         &Device::Cpu,
                     )?;
                     for (b, &slot) in addresses.writes.iter().enumerate() {
@@ -192,7 +202,7 @@ impl HybridModel for Fixture {
             .sequences
             .iter()
             .map(|sequence| {
-                recorded.push(sequence.state.boundaries());
+                recorded.push(sequence.state.boundaries().clone());
                 let range = sequence.tokens.clone();
                 self.sequence(
                     batch.pool,
@@ -258,6 +268,7 @@ fn packed(
             tokens: start..end,
             outputs: (start..end).collect(),
             speculative,
+            checkpoints: Vec::new(),
         });
     }
     Ok(packed)
@@ -839,6 +850,7 @@ fn test_position_overflow_and_limit_are_checked() -> Result<()> {
             tokens: 0..1,
             outputs: vec![0],
             speculative: false,
+            checkpoints: Vec::new(),
         }],
     };
     assert!(

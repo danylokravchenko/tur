@@ -131,6 +131,7 @@ impl Runner {
                 tokens: start..plan.tokens.len(),
                 outputs: vec![plan.tokens.len() - 1],
                 speculative: false,
+                checkpoints: Vec::new(),
             });
         }
         self.engine.submit(plan)?;
@@ -248,6 +249,7 @@ fn test_speculative_verification_reproduces_greedy_decode() -> Result<()> {
                 tokens: 0..n,
                 outputs: (0..n).collect(),
                 speculative: true,
+                checkpoints: Vec::new(),
             }],
         })?;
         let commit = runner
@@ -284,12 +286,14 @@ fn test_vision_placeholders_fail_only_their_request() -> Result<()> {
                 tokens: 0..2,
                 outputs: vec![1],
                 speculative: false,
+                checkpoints: Vec::new(),
             },
             SequenceDescriptor {
                 state: bad,
                 tokens: 2..4,
                 outputs: vec![3],
                 speculative: false,
+                checkpoints: Vec::new(),
             },
         ],
     };
@@ -584,7 +588,7 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
         let (mut actual, mut start) = (Vec::new(), 0);
         for &row in &rows {
             let len = row + 1 - start;
-            let side = state.side(start, len)?;
+            let side = state.side(start, len, &[])?;
             let logits = model
                 .draft(&DraftForward {
                     tokens: &tokens[start + 1..row + 2],

@@ -7,7 +7,7 @@ use super::super::{
 use super::{InferencePipeline, Pending};
 use crate::{
     Result,
-    hybrid::{Demand, DraftRequest},
+    hybrid::{Boundaries, Demand, DraftRequest},
 };
 use candle_core::Tensor;
 use std::time::{Duration, Instant};
@@ -118,7 +118,9 @@ impl InferencePipeline {
                 .get(&chunk.id)
                 .ok_or_else(|| invalid("missing pipeline request"))?
                 .handle;
-            let one = self.engine.demand(handle, chunk.tokens, false)?;
+            let one = self
+                .engine
+                .demand(handle, chunk.tokens, &Boundaries::Final)?;
             demand = demand + one;
             plain.push(one);
         }
@@ -129,7 +131,9 @@ impl InferencePipeline {
                 .ok_or_else(|| invalid("missing pipeline request"))?;
             let mut count = count;
             while count > 0 {
-                let verify = self.engine.demand(pending.handle, count + 1, true)?;
+                let verify =
+                    self.engine
+                        .demand(pending.handle, count + 1, &Boundaries::EveryToken)?;
                 // The verified draft replaces this sequence's plain demand.
                 let needed = demand - plain[index] + verify;
                 if needed.fits(&usage) {
@@ -249,6 +253,34 @@ impl InferencePipeline {
         false
     }
 
+    /// Move this step's checkpoint states of each request into its draft request, and return
+    /// the snapshot commits they came from. The head completes those snapshots, which share
+    /// the request's pages; a copy would count as another holder of them.
+    fn lend_checkpoints(&mut self, requests: &mut [DraftRequest], ids: &[Uuid]) -> Vec<usize> {
+        let mut moved = Vec::new();
+        for (request, id) in requests.iter_mut().zip(ids) {
+            for (index, commit) in self.snapshots.iter_mut().enumerate() {
+                if commit.id == *id
+                    && let Some(state) = commit.state.take()
+                {
+                    request.pending.push(state);
+                    moved.push(index);
+                }
+            }
+        }
+        moved
+    }
+
+    /// Return the states [`Self::lend_checkpoints`] moved, in order, to their commits.
+    fn return_checkpoints(&mut self, requests: Vec<DraftRequest>, moved: Vec<usize>) {
+        let states = requests.into_iter().flat_map(|request| request.pending);
+        for (index, state) in moved.into_iter().zip(states) {
+            if let Some(commit) = self.snapshots.get_mut(index) {
+                commit.state = Some(state);
+            }
+        }
+    }
+
     /// Run the draft head over each published request's newly committed positions, pairing
     /// each with the token that followed it, and keep the head's draft for a request whose
     /// next pass decodes, unless prompt lookup proposes with higher acceptance. A request whose head falls behind (it failed, or a position was
@@ -317,6 +349,7 @@ impl InferencePipeline {
                 tokens,
                 hidden,
                 drafts,
+                pending: Vec::new(),
             });
             ids.push(id);
         }
@@ -332,8 +365,11 @@ impl InferencePipeline {
         // Decode-sized: at most the drafted tokens plus one per sequence.
         let rows: usize = requests.iter().map(|r| r.tokens.len()).sum();
         let decode_sized = rows <= requests.len() * (self.speculation.max_draft + 1);
+        let moved = self.lend_checkpoints(&mut requests, &ids);
         let started = Instant::now();
-        let outcomes = self.engine.draft(&requests)?;
+        let outcomes = self.engine.draft(&requests);
+        self.return_checkpoints(requests, moved);
+        let outcomes = outcomes?;
         let elapsed = started.elapsed();
         if decode_sized {
             self.head_costs.record(drafts, elapsed.as_secs_f64());

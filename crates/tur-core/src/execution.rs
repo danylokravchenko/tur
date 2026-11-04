@@ -470,6 +470,10 @@ pub struct SequenceDescriptor {
     /// Strictly increasing packed positions whose logits are sampled.
     pub outputs: Vec<usize>,
     pub speculative: bool,
+    /// Numbers of the sequence's tokens, ascending and inside it, after which the engine
+    /// also keeps the recurrent state, for prefix snapshots inside a pass. Empty for
+    /// speculative sequences, which keep it after every token.
+    pub checkpoints: Vec<usize>,
 }
 
 /// Encoder output that replaces the input embeddings of a packed token range, such as
@@ -653,7 +657,27 @@ impl PackedExecution {
                     "speculative sequences need an output at every token",
                 ));
             }
-            let boundaries = if sequence.speculative { length } else { 1 };
+            if !sequence.checkpoints.is_empty()
+                && (sequence.speculative
+                    || sequence.checkpoints.first() == Some(&0)
+                    || sequence
+                        .checkpoints
+                        .last()
+                        .is_some_and(|&last| last >= length)
+                    || !sequence
+                        .checkpoints
+                        .windows(2)
+                        .all(|pair| pair[0] < pair[1]))
+            {
+                return Err(invalid(
+                    "checkpoints must ascend inside a non-speculative sequence",
+                ));
+            }
+            let boundaries = if sequence.speculative {
+                length
+            } else {
+                sequence.checkpoints.len() + 1
+            };
             requirements.state_update_bytes = requirements
                 .state_update_bytes
                 .checked_add(model.state_update_bytes(state.position, length, boundaries)?)
@@ -755,6 +779,7 @@ mod tests {
                 tokens: 0..3,
                 outputs: vec![1],
                 speculative: false,
+                checkpoints: Vec::new(),
             }],
         };
         let validated = plan.validate(

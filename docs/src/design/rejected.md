@@ -14,7 +14,6 @@ git show 99b073e:<path> > change.patch
 | Batch-invariant execution | Bit-identical across batch size, order and chunking, but 0.52 to 0.60× prefill speed and 0.59 to 0.87× single-sequence decode | `rejected-batch-invariance.patch` |
 | Letting cached prefixes jump the queue by default | Cached requests got their first token 5× sooner, but uncached ones waited 15% longer and throughput fell 10%. Kept as the opt-in `engine.prefix_restorable_first` | none |
 | Running the shortest remaining prompt first by default | At light load, short prompts got their median first token about 4× sooner, but the slowest 5% of token gaps grew by 15 to 50%. Under overload the short-prompt median was no better, and about 18% worse at two arrivals per second. Kept as the opt-in `engine.shortest_prompt_first` | none |
-| Template-rewrite snapshots on first turns | The extra prefill pass made a single uncached request 15% slower to its first token. These boundaries are taken only once a prompt has assistant history | none |
 | Carrying a decode-free prefill budget into mixed passes | 4 to 5% slower under contention and churn | `rejected-budget-carry.patch` |
 | Prefetched staging over Q8 pools in tiled attention | 9 to 42% slower at every shape, and still 2% slower at 8K with the scale reads replaced by constants, so better scale handling can't win | none |
 | Prefetching tiled-attention chunks two steps ahead | Slower than one step at 8K, because of the extra registers | none |

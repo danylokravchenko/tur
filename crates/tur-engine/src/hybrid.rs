@@ -588,6 +588,9 @@ pub struct SequenceCommit {
     pub outputs: Vec<TokenOutput>,
     /// The grammar reached a terminal state; later outputs will not be sampled.
     pub finished: bool,
+    /// Committed states after each of the sequence's
+    /// [`checkpoints`](SequenceDescriptor::checkpoints), for prefix snapshots.
+    pub checkpoints: Vec<ModelState>,
 }
 
 /// Per-request outcome. An error leaves that request's committed state unchanged.
@@ -617,6 +620,9 @@ pub struct DraftRequest {
     /// Greedy drafts to return after the newest token, chained where the head can (a
     /// Gemma 4 assistant); a head that cannot returns at most one.
     pub drafts: usize,
+    /// Committed states of the request that share its pages but that nothing reads until
+    /// the head has run, such as checkpoints of its last pass awaiting a prefix snapshot.
+    pub pending: Vec<ModelState>,
 }
 
 /// The draft head's greedy draft.
@@ -827,11 +833,14 @@ fn attach_logprobs(
     Ok(())
 }
 
-fn boundaries(speculative: bool) -> Boundaries {
-    if speculative {
+/// Recurrent states a pass keeps for `sequence`.
+fn boundaries(sequence: &SequenceDescriptor) -> Boundaries {
+    if sequence.speculative {
         Boundaries::EveryToken
-    } else {
+    } else if sequence.checkpoints.is_empty() {
         Boundaries::Final
+    } else {
+        Boundaries::Checkpoints(sequence.checkpoints.as_slice().into())
     }
 }
 
@@ -868,9 +877,22 @@ fn publish(
         .ok_or_else(|| invalid("request revision overflow"))?;
     let sampling = &mut request.snapshot.sampling;
     let mark = sampling.mark();
-    let published = sample_sequence(sampling, sequence, tokens, rows)
-        .and_then(|(accepted, outputs)| Ok((reservation.commit(accepted)?, accepted, outputs)));
-    let (model, accepted, outputs) = match published {
+    let published =
+        sample_sequence(sampling, sequence, tokens, rows).and_then(|(accepted, outputs)| {
+            let checkpoints = sequence
+                .checkpoints
+                .iter()
+                .filter(|&&checkpoint| checkpoint < accepted)
+                .map(|&checkpoint| reservation.commit(checkpoint))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((
+                reservation.commit(accepted)?,
+                accepted,
+                outputs,
+                checkpoints,
+            ))
+        });
+    let (model, accepted, outputs, checkpoints) = match published {
         Ok(published) => published,
         Err(error) => {
             sampling.rollback(mark);
@@ -884,6 +906,7 @@ fn publish(
         accepted_tokens: accepted,
         outputs,
         finished: request.snapshot.sampling.finished,
+        checkpoints,
     })
 }
 
@@ -941,12 +964,18 @@ impl<M: HybridModel> HybridEngine<M> {
         self.pool.usage()
     }
 
-    /// Pool pages and slots that a pass of `tokens` new tokens for `handle` would lease.
-    pub fn demand(&self, handle: StateHandle, tokens: usize, speculative: bool) -> Result<Demand> {
+    /// Pool pages and slots that a pass of `tokens` new tokens for `handle`, keeping the
+    /// recurrent states `boundaries` lists, would lease.
+    pub fn demand(
+        &self,
+        handle: StateHandle,
+        tokens: usize,
+        boundaries: &Boundaries,
+    ) -> Result<Demand> {
         self.request(handle)?
             .snapshot
             .model
-            .demand(tokens, boundaries(speculative))
+            .demand(tokens, boundaries)
     }
 
     /// Whether the request's grammar constrains its next output, which rules out drafting.
@@ -1304,7 +1333,7 @@ impl<M: HybridModel> HybridEngine<M> {
                 .checked_add(1)
                 .ok_or_else(|| invalid("request revision overflow"))?;
             demand = demand
-                + self.demand(sequence.state, sequence.tokens.len(), sequence.speculative)?;
+                + self.demand(sequence.state, sequence.tokens.len(), &boundaries(sequence))?;
         }
         let usage = self.pool.usage()?;
         if !demand.fits(&usage) {
@@ -1322,7 +1351,7 @@ impl<M: HybridModel> HybridEngine<M> {
                 self.request(sequence.state)?
                     .snapshot
                     .model
-                    .reserve(sequence.tokens.len(), boundaries(sequence.speculative))?,
+                    .reserve(sequence.tokens.len(), boundaries(sequence))?,
             );
         }
         requirements.state_update_bytes = reservations.iter().try_fold(0usize, |total, r| {
@@ -1464,8 +1493,8 @@ impl<M: HybridModel> HybridEngine<M> {
     /// Run the model's draft head between passes over each request's newest committed
     /// positions, writing the head's own state layer, and return its chained greedy drafts
     /// where requested (empty otherwise). Requests fail independently; the pages a
-    /// request's positions occupy must not be shared with a snapshot. Waits for the device
-    /// only to read drafts.
+    /// request's positions occupy must not be shared with a snapshot, other than its
+    /// [`DraftRequest::pending`] states. Waits for the device only to read drafts.
     pub fn draft(&mut self, requests: &[DraftRequest]) -> Result<Vec<Result<Vec<Draft>>>> {
         if self.pending.is_some() {
             return Err(invalid("the draft head runs between passes"));
@@ -1481,7 +1510,9 @@ impl<M: HybridModel> HybridEngine<M> {
                         "draft positions must end at the committed position",
                     ));
                 }
-                r.snapshot.model.side(request.start, request.tokens.len())
+                r.snapshot
+                    .model
+                    .side(request.start, request.tokens.len(), &request.pending)
             });
             match state {
                 Ok(state) => {
@@ -1816,6 +1847,7 @@ impl<M: HybridModel> HybridEngine<M> {
                 .into_iter()
                 .collect(),
             finished: request.snapshot.sampling.finished,
+            checkpoints: Vec::new(),
         })
     }
 
@@ -2036,6 +2068,7 @@ mod tests {
                 tokens: 0..1,
                 outputs: vec![0],
                 speculative: false,
+                checkpoints: Vec::new(),
             }],
         };
         assert!(engine.submit(plan).is_err());

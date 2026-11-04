@@ -87,6 +87,15 @@ impl InferencePipeline {
                     Vec::new()
                 },
                 speculative,
+                checkpoints: if speculative {
+                    Vec::new()
+                } else {
+                    self.prefix.checkpoints(
+                        pending.consumed,
+                        end - pending.consumed,
+                        pending.turn_boundary,
+                    )
+                },
             });
             context = context.max(end);
         }

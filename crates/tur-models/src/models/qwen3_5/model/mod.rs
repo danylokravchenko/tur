@@ -321,7 +321,8 @@ struct Span<'a> {
     len: usize,
     /// Committed tokens before this pass.
     past: usize,
-    every: bool,
+    /// Numbers of the pass's tokens after which it writes recurrent state.
+    ends: Vec<usize>,
     addresses: Addresses,
     sequence: &'a SequenceForward<'a>,
 }
@@ -1278,10 +1279,9 @@ impl Qwen35 {
             return Err(invalid("sequence state does not match its positions"));
         }
         let addresses = state.resolve(batch.pool)?;
-        let every = state.boundaries() == Boundaries::EveryToken;
-        let boundaries = if every { tokens.len() } else { 1 };
+        let ends = state.ends()?;
         if addresses.pages.len() != self.description.pages_for(past + tokens.len())
-            || addresses.writes.len() != boundaries
+            || addresses.writes.len() != ends.len()
         {
             return Err(invalid("sequence state does not cover its new tokens"));
         }
@@ -1289,7 +1289,7 @@ impl Qwen35 {
             start,
             len: tokens.len(),
             past,
-            every,
+            ends,
             addresses,
             sequence,
         })
@@ -1388,13 +1388,12 @@ impl Qwen35 {
         let mut outputs = Vec::with_capacity(spans.len());
         for span in spans {
             let (convolution, recurrent) = store.read(span.addresses.read)?;
-            let every = span.every;
             let len = span.len;
             let conv = math::convolution(
                 &qkv.narrow(0, span.start, len)?.contiguous()?,
                 &convolution,
                 &net.conv,
-                every,
+                &span.ends,
             )?;
             let mixed = &conv.output;
             let heads = |offset: usize, width: usize, count: usize, dim: usize| -> Result<Tensor> {
@@ -1422,9 +1421,10 @@ impl Qwen35 {
                 g: &g,
                 beta: &beta,
             };
-            // The reference uses the recurrence for single-token decode and chunks otherwise.
-            let core = if every || len == 1 {
-                math::delta_recurrent(&inputs, &recurrent, every)?
+            // The reference uses the recurrence for single-token decode and for states inside
+            // the pass, and chunks otherwise.
+            let core = if span.ends.len() > 1 || len == 1 {
+                math::delta_recurrent(&inputs, &recurrent, &span.ends)?
             } else {
                 math::delta_chunked(&inputs, &recurrent)?
             };
@@ -1612,7 +1612,7 @@ impl Qwen35 {
             start,
             len,
             past,
-            every: false,
+            ends: vec![len],
             addresses,
             sequence: forward,
         })

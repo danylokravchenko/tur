@@ -24,7 +24,7 @@ A `ModelState` is a page table plus one recurrent slot at an exact token boundar
 
 - Pages and slots are reference counted. When the last holder drops one, it is retired, and it returns to the free list only through `StatePool::reclaim`, which the engine calls once no unfinished GPU work can use it. Reclaiming bumps the id's generation, so an old reference can't reach the reused memory.
 - Tokens a snapshot can see are never overwritten. A request writes into its partly filled last page directly only if nobody else holds that page; otherwise it first copies the page's valid part to a fresh page (copy-on-write).
-- Recurrent state is never updated in place. Each pass writes new slots, and `Reservation::commit` makes the accepted one current without copying.
+- Recurrent state is never updated in place. Each pass writes new slots, after its last token and at any checkpoints or speculative boundaries it keeps, and `Reservation::commit` makes the accepted one current without copying.
 
 ## The memory plan
 

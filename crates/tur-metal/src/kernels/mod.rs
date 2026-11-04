@@ -390,8 +390,7 @@ fn query_tiles(first_block: &[u32], visible: &[u32]) -> Option<Vec<u32>> {
 }
 
 /// One sequence's recurrent addressing in a packed pass: its token count, the slot holding
-/// its committed state, and the slots receiving its state after the last token (one) or
-/// after every token (one per token).
+/// its committed state, and the slots receiving its state.
 #[derive(Clone, Copy, Debug)]
 pub struct RecurrentSpan<'a> {
     pub tokens: usize,
@@ -400,6 +399,38 @@ pub struct RecurrentSpan<'a> {
     pub position: usize,
     pub read: u32,
     pub writes: &'a [u32],
+    /// Tokens of this pass after which each write takes the state: ascending, the last
+    /// one `tokens`. Empty takes it after the last token (one write) or after every token
+    /// (one write per token). A narrow state continues from each stored value.
+    pub ends: &'a [usize],
+}
+
+impl RecurrentSpan<'_> {
+    /// Zero-based token indices after which each write takes the state.
+    fn write_indices(&self) -> Result<Vec<u32>> {
+        let ends: Vec<usize> = match (self.ends.is_empty(), self.writes.len()) {
+            (false, _) => self.ends.to_vec(),
+            (true, 1) => vec![self.tokens],
+            (true, n) if n == self.tokens => (1..=self.tokens).collect(),
+            _ => {
+                return Err(invalid(
+                    "a recurrent sequence writes one slot, one per token, or one per listed end",
+                ));
+            }
+        };
+        if ends.len() != self.writes.len()
+            || ends.first().is_none_or(|&first| first == 0)
+            || ends.last() != Some(&self.tokens)
+            || !ends.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return Err(invalid(
+                "recurrent write ends must ascend inside the sequence and end at its last token",
+            ));
+        }
+        ends.into_iter()
+            .map(|end| to_u32(end - 1, "write end"))
+            .collect()
+    }
 }
 
 /// Validated recurrent addressing of a packed pass: consecutive sequences covering every
@@ -1160,34 +1191,45 @@ impl Kernels {
     }
 
     /// Validate and upload the recurrent addressing of a packed pass. Every sequence has
-    /// at least one token and writes one slot or one per token; no slot is written twice
-    /// or both read and written in the pass. Forks may share a committed slot.
+    /// at least one token and writes one slot, one per token, or one per listed end (see
+    /// [`RecurrentSpan::ends`]); no slot is written twice or both read and written in the
+    /// pass. Forks may share a committed slot.
     pub fn recurrent_spans(&self, spans: &[RecurrentSpan<'_>]) -> Result<RecurrentSpans> {
         if spans.is_empty() {
             return Err(invalid("a pass has at least one recurrent sequence"));
         }
-        let mut table = Vec::with_capacity(spans.len() * 6);
+        let mut table = Vec::with_capacity(spans.len() * 7);
         let mut rows = Vec::new();
         let mut slots = Vec::new();
+        let mut ends = Vec::new();
         for (index, span) in spans.iter().enumerate() {
-            if span.tokens == 0 || (span.writes.len() != 1 && span.writes.len() != span.tokens) {
-                return Err(invalid(
-                    "a recurrent sequence writes one slot or one per token",
-                ));
+            if span.tokens == 0 {
+                return Err(invalid("a recurrent sequence has at least one token"));
             }
+            let indices = span.write_indices()?;
             table.extend([
                 to_u32(rows.len(), "packed row")?,
                 to_u32(span.tokens, "tokens")?,
                 span.read,
                 to_u32(slots.len(), "slot offset")?,
-                u32::from(span.writes.len() > 1),
+                to_u32(span.writes.len(), "write count")?,
                 to_u32(span.position, "position")?,
+                // Ends follow every slot id in the uploaded list; shifted below.
+                to_u32(ends.len(), "end offset")?,
             ]);
             rows.resize(rows.len() + span.tokens, to_u32(index, "sequence")?);
             slots.extend_from_slice(span.writes);
+            ends.extend(indices);
+        }
+        let written_count = to_u32(slots.len(), "slot count")?;
+        for [.., end] in table.as_chunks_mut::<7>().0 {
+            *end = end
+                .checked_add(written_count)
+                .ok_or_else(|| invalid("recurrent slot list overflow"))?;
         }
         let mut written = slots.clone();
         written.sort_unstable();
+        slots.extend(ends);
         if written.windows(2).any(|pair| pair[0] == pair[1])
             || spans
                 .iter()

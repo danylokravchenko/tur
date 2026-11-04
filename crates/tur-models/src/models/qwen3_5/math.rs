@@ -36,12 +36,12 @@ pub(super) struct Convolved {
 }
 
 /// Depthwise causal convolution over `history` (`[K-1, C]`, oldest first) followed by `x`
-/// (`[n, C]`). `weight` is `[C, K]`. Returns the last history or one history per token.
+/// (`[n, C]`). `weight` is `[C, K]`. Returns the history after each of `ends` tokens.
 pub(super) fn convolution(
     x: &Tensor,
     history: &Tensor,
     weight: &Tensor,
-    every_token: bool,
+    ends: &[usize],
 ) -> Result<Convolved> {
     let (n, channels) = x.dims2()?;
     let (kept, history_channels) = history.dims2()?;
@@ -57,14 +57,14 @@ pub(super) fn convolution(
         let column = weight.narrow(1, tap, 1)?.t()?;
         output = (output + full.narrow(0, tap, n)?.broadcast_mul(&column)?)?;
     }
-    let histories = if every_token {
-        let slices = (1..=n)
-            .map(|end| full.narrow(0, end, kept))
-            .collect::<candle_core::Result<Vec<_>>>()?;
-        Tensor::stack(&slices, 0)?
-    } else {
-        full.narrow(0, n, kept)?.unsqueeze(0)?
-    };
+    if ends.is_empty() || ends.iter().any(|&end| end == 0 || end > n) {
+        return Err(invalid("convolution history ends outside the sequence"));
+    }
+    let slices = ends
+        .iter()
+        .map(|&end| full.narrow(0, end, kept))
+        .collect::<candle_core::Result<Vec<_>>>()?;
+    let histories = Tensor::stack(&slices, 0)?;
     Ok(Convolved {
         output: candle_nn::ops::silu(&output)?,
         histories,
@@ -104,17 +104,21 @@ fn normalise(inputs: &DeltaInputs<'_>) -> Result<(Tensor, Tensor)> {
 }
 
 /// Token-by-token gated delta rule: decay, read the prediction, write the beta-scaled
-/// correction, then read with the query. Exact per-token states for speculation.
+/// correction, then read with the query. Returns the state after each of `ends` tokens,
+/// exactly, for speculation and prefix snapshots.
 pub(super) fn delta_recurrent(
     inputs: &DeltaInputs<'_>,
     state: &Tensor,
-    every_token: bool,
+    ends: &[usize],
 ) -> Result<DeltaOutput> {
     let (q, k) = normalise(inputs)?;
     let n = q.dim(0)?;
+    if ends.is_empty() || ends.iter().any(|&end| end == 0 || end > n) {
+        return Err(invalid("delta state ends outside the sequence"));
+    }
     let mut state = state.clone();
     let mut outputs = Vec::with_capacity(n);
-    let mut states = Vec::with_capacity(if every_token { n } else { 1 });
+    let mut states = Vec::with_capacity(ends.len());
     for t in 0..n {
         let q_t = q.get(t)?.unsqueeze(1)?;
         let k_t = k.get(t)?;
@@ -126,12 +130,9 @@ pub(super) fn delta_recurrent(
         let correction = (v_t - prediction)?.broadcast_mul(&beta_t)?;
         state = (state + k_t.unsqueeze(2)?.matmul(&correction.unsqueeze(1)?)?)?;
         outputs.push(q_t.matmul(&state)?.squeeze(1)?);
-        if every_token {
+        if ends.contains(&(t + 1)) {
             states.push(state.clone());
         }
-    }
-    if !every_token {
-        states.push(state);
     }
     Ok(DeltaOutput {
         output: Tensor::stack(&outputs, 0)?,
@@ -290,7 +291,7 @@ mod tests {
                 beta: &beta,
             };
             let state = random(&[2, 8, 4], 9)?;
-            let recurrent = delta_recurrent(&inputs, &state, false)?;
+            let recurrent = delta_recurrent(&inputs, &state, &[n])?;
             let chunked = delta_chunked(&inputs, &state)?;
             assert!(
                 max_diff(&recurrent.output, &chunked.output)? < 1e-4,
@@ -315,7 +316,7 @@ mod tests {
             beta: &beta,
         };
         let zero = Tensor::zeros((2, 4, 3), DType::F32, &Device::Cpu)?;
-        let whole = delta_recurrent(&all, &zero, true)?;
+        let whole = delta_recurrent(&all, &zero, &(1..=10).collect::<Vec<_>>())?;
         let part = |s: usize, l: usize| -> Result<[Tensor; 5]> {
             Ok([
                 q.narrow(0, s, l)?,
@@ -335,7 +336,7 @@ mod tests {
                 beta: &b1,
             },
             &zero,
-            false,
+            &[4],
         )?;
         let [q2, k2, v2, g2, b2] = part(4, 6)?;
         let second = delta_recurrent(
@@ -347,7 +348,7 @@ mod tests {
                 beta: &b2,
             },
             &first.states.get(0)?,
-            false,
+            &[6],
         )?;
         assert!(max_diff(&whole.states.get(3)?, &first.states.get(0)?)? < 1e-6);
         assert!(max_diff(&whole.states.get(9)?, &second.states.get(0)?)? < 1e-5);
@@ -360,10 +361,10 @@ mod tests {
         let x = random(&[5, 3], 1)?;
         let history = random(&[3, 3], 2)?;
         let weight = random(&[3, 4], 3)?;
-        let whole = convolution(&x, &history, &weight, true)?;
+        let whole = convolution(&x, &history, &weight, &[1, 2, 3, 4, 5])?;
         let mut state = history.clone();
         for t in 0..5 {
-            let step = convolution(&x.narrow(0, t, 1)?, &state, &weight, false)?;
+            let step = convolution(&x.narrow(0, t, 1)?, &state, &weight, &[1])?;
             assert!(max_diff(&step.output.get(0)?, &whole.output.get(t)?)? < 1e-6);
             state = step.histories.get(0)?;
             assert!(max_diff(&state, &whole.histories.get(t)?)? < 1e-6);

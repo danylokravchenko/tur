@@ -258,6 +258,7 @@ fn engine_case(model: Arc<TextModel>, generated: usize) -> Result<Value> {
                 tokens: 0..n,
                 outputs: vec![n - 1],
                 speculative: false,
+                checkpoints: Vec::new(),
             }],
         })?;
         let submitted = start.elapsed().as_secs_f64();

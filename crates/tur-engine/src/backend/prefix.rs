@@ -5,8 +5,8 @@
 //! table and the recurrent slot written at exactly that boundary. A recurrent state
 //! exists only where a pass ended, so entries sit at pass ends:
 //!
-//! - every multiple of the spacing, because the pipeline never lets a prefill chunk cross
-//!   one;
+//! - every multiple of the spacing, where a prefill pass keeps the recurrent state as a
+//!   checkpoint if it doesn't end there;
 //! - the end of each prompt, with the logits of its last token, so an identical prompt
 //!   samples its first output without a model pass;
 //! - a predicted template-divergence boundary in prompts containing assistant history,
@@ -276,7 +276,24 @@ impl PrefixCache {
         }
     }
 
-    /// Next aligned position after `position`, where a prefill chunk must end.
+    /// Snapshot positions strictly inside a pass of `tokens` tokens after `position`, as
+    /// numbers of the pass's tokens: aligned positions and `turn`, a predicted
+    /// template-rewrite boundary. The pass keeps the recurrent state at each, so a snapshot
+    /// can sit there without the pass ending.
+    pub fn checkpoints(&self, position: usize, tokens: usize, turn: Option<usize>) -> Vec<usize> {
+        if !self.config.enabled() {
+            return Vec::new();
+        }
+        (1..tokens)
+            .filter(|&offset| {
+                let at = position + offset;
+                self.is_boundary(at) || turn == Some(at)
+            })
+            .collect()
+    }
+
+    /// Next aligned position after `position`. A speculative pass, which keeps no
+    /// checkpoints, ends there.
     pub fn next_boundary(&self, position: usize) -> Option<usize> {
         self.config
             .enabled()

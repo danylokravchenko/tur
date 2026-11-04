@@ -482,8 +482,14 @@ fn test_preempted_mtp_requests_recompute_the_head_and_match_plain_decoding() -> 
 fn test_mtp_with_prefix_reuse_resumes_the_head_and_matches_plain_decoding() -> Result<()> {
     let fixture = Checkpoint::random_mtp()?;
     let mut plain = InferencePipeline::new(&fixture.factory(), config(0, 1))?;
-    let mut cold = InferencePipeline::new(&fixture.factory(), mtp_config(4, 1))?;
-    let mut cfg = mtp_config(4, 1);
+    // 64-token chunks prefill each prompt in one pass, so the aligned snapshots are
+    // checkpoints inside it, which the head completes before they are inserted.
+    let chunked = || PipelineConfig {
+        scheduler: PipelineConfig::new(1, 64).scheduler,
+        ..mtp_config(4, 1)
+    };
+    let mut cold = InferencePipeline::new(&fixture.factory(), chunked())?;
+    let mut cfg = chunked();
     cfg.prefix = PrefixConfig {
         entries: 8,
         spacing: 16,

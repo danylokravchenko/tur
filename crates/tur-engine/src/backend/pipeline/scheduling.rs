@@ -203,16 +203,16 @@ impl InferencePipeline {
         else {
             return Ok(());
         };
-        let handle = self
+        let request = self
             .pending
             .get(&first.id)
-            .ok_or_else(|| invalid("missing pipeline request"))?
-            .handle;
+            .ok_or_else(|| invalid("missing pipeline request"))?;
         let tokens = first.pending.min(self.scheduler.config().max_chunk);
+        let (handle, boundaries) = (request.handle, request.boundaries(&self.prefix, tokens));
         let headroom = growth(self.engine.pool().description(), running);
         let mut usage = self.engine.memory()?;
         while self.prefix.stats().entries > 0 {
-            let demand = self.engine.demand(handle, tokens, false)? + headroom;
+            let demand = self.engine.demand(handle, tokens, &boundaries)? + headroom;
             if demand.fits(&usage) {
                 break;
             }
@@ -242,18 +242,19 @@ impl InferencePipeline {
                 .filter(|(id, _)| !self.awaiting.contains(*id))
                 // A paused chunk holds the pass's prefill work until it finishes.
                 .filter(|(_, p)| self.layered.is_none() || p.decoding())
-                .map(|(id, p)| p.candidate(*id, self.prefix.next_boundary(p.consumed)))
+                .map(|(id, p)| p.candidate(*id))
                 .collect();
             self.relieve_admission(&candidates)?;
             let usage = self.engine.memory()?;
             let running = candidates.iter().filter(|c| c.running).count();
-            let (engine, pending) = (&self.engine, &self.pending);
+            let (engine, pending, prefix) = (&self.engine, &self.pending, &self.prefix);
             let mut demand = Demand::default();
             let decision = self.scheduler.plan(&candidates, Instant::now(), |chunk| {
                 let request = pending
                     .get(&chunk.id)
                     .ok_or_else(|| invalid("missing pipeline request"))?;
-                let needed = demand + engine.demand(request.handle, chunk.tokens, false)?;
+                let boundaries = request.boundaries(prefix, chunk.tokens);
+                let needed = demand + engine.demand(request.handle, chunk.tokens, &boundaries)?;
                 // Admission keeps one page of growth per running sequence free, so new
                 // work does not immediately force running decodes out.
                 let headroom = growth(

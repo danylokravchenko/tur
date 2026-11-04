@@ -109,8 +109,8 @@ pub(crate) fn forward(
     let sequences: Vec<_> = sequences
         .iter()
         .zip(&every)
-        .map(|(&(state, tokens, boundaries), rows)| {
-            (state, tokens, boundaries, rows.as_slice(), false)
+        .map(|((state, tokens, boundaries), rows)| {
+            (*state, *tokens, boundaries.clone(), rows.as_slice(), false)
         })
         .collect();
     forward_rows(model, &sequences)
@@ -131,7 +131,7 @@ pub(crate) fn forward_rows(
         .ok_or_else(|| invalid("empty pass"))?;
     let mut reservations = sequences
         .iter()
-        .map(|(state, tokens, boundaries, ..)| state.reserve(tokens.len(), *boundaries))
+        .map(|(state, tokens, boundaries, ..)| state.reserve(tokens.len(), boundaries.clone()))
         .collect::<Result<Vec<_>>>()?;
     for reservation in &mut reservations {
         reservation.prepare()?;
@@ -226,6 +226,7 @@ pub(crate) fn generate<M: HybridModel>(
                 tokens: 0..n,
                 outputs: vec![n - 1],
                 speculative: false,
+                checkpoints: Vec::new(),
             }],
         })?;
         let token = engine

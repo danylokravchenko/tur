@@ -678,6 +678,7 @@ fn delta_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
                 position: 0,
                 read: 0,
                 writes: &[1],
+                ends: &[],
             }])?;
             let conv = time(device, || {
                 kernels.delta_conv(&mixed, &writes, &history, &conv_w)
@@ -740,6 +741,7 @@ fn delta_decode_cases(
                 position: 100,
                 read: i as u32,
                 writes: w,
+                ends: &[],
             })
             .collect();
         let ragged = kernels.recurrent_spans(&spans)?;

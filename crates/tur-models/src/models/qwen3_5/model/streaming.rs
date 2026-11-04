@@ -149,7 +149,7 @@ fn run_layer(
         start: 0,
         len,
         past: 0,
-        every: false,
+        ends: vec![len],
         addresses: state.resolve(&pool)?,
         sequence: &sequence,
     };

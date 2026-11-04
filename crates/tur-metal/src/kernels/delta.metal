@@ -10,16 +10,36 @@ struct ConvParams {
 };
 
 // One sequence of a packed pass: its first packed row, token count, committed recurrent
-// slot, offset of its written slots in the pass's slot list, whether it writes one slot
-// per token, and its committed position. Sequences are consecutive and cover every row.
+// slot, offset of its written slots in the pass's slot list, how many it writes, its
+// committed position, and the offset in the same list of the ascending token indices
+// after which each written slot takes the state. The last index is the last token.
+// Sequences are consecutive and cover every row.
 struct RecurrentSpan {
     uint row;
     uint tokens;
     uint read;
     uint writes;
-    uint every;
+    uint count;
     uint position;
+    uint ends;
 };
+
+// Which of a sequence's written slots takes the state after its token `t`, or `count`.
+// One write per pass or per token needs no lookup; only checkpoints search their ends.
+static inline uint written_after(RecurrentSpan s, device const uint *slots, uint t) {
+    if (s.count == 1) {
+        return t + 1 == s.tokens ? 0 : 1;
+    }
+    if (s.count == s.tokens) {
+        return t;
+    }
+    for (uint w = 0; w < s.count; ++w) {
+        if (slots[s.ends + w] == t) {
+            return w;
+        }
+    }
+    return s.count;
+}
 
 // Recurrent state is updated in F32 and stored as T. Narrow storage rounds
 // stochastically: the dropped mantissa bits are compared with a hash of the token
@@ -65,9 +85,8 @@ static inline float conv_input(
 }
 
 // Depthwise causal convolution of every sequence of a packed pass over [history; x], then
-// SiLU. Each sequence writes its final (taps-1)-row history into its first written slot,
-// or the history after token t into its t-th slot when `every` is set. A sequence reads
-// only its committed slot, which no sequence of the pass writes.
+// SiLU. Each sequence writes the (taps-1)-row history after each token its written slots
+// list. A sequence reads only its committed slot, which no sequence of the pass writes.
 kernel void delta_conv_f32(
     device const float *x [[buffer(0)]],
     device float *pool [[buffer(1)]],
@@ -94,8 +113,9 @@ kernel void delta_conv_f32(
         acc = acc + conv_input(xs, history, t + j, c, kept, p) * wc[j];
     }
     out[gid] = silu(acc);
-    if (s.every != 0 || t + 1 == s.tokens) {
-        ulong base = ulong(slots[s.writes + (s.every != 0 ? t : 0)]) * kept * p.channels;
+    uint written = written_after(s, slots, t);
+    if (written < s.count) {
+        ulong base = ulong(slots[s.writes + written]) * kept * p.channels;
         for (uint r = 0; r < kept; ++r) {
             pool[base + ulong(r) * p.channels + c] = conv_input(xs, history, t + 1 + r, c, kept, p);
         }
@@ -143,8 +163,9 @@ kernel void delta_conv4_f32(
     }
     *(device float4 *)(out + ulong(row) * p.channels + c) =
         float4(silu(acc.x), silu(acc.y), silu(acc.z), silu(acc.w));
-    if (s.every != 0 || t + 1 == s.tokens) {
-        ulong base = ulong(slots[s.writes + (s.every != 0 ? t : 0)]) * kept * p.channels;
+    uint written = written_after(s, slots, t);
+    if (written < s.count) {
+        ulong base = ulong(slots[s.writes + written]) * kept * p.channels;
         for (uint r = 0; r < kept; ++r) {
             *(device float4 *)(pool + base + ulong(r) * p.channels + c) =
                 conv_input4(xs, history, t + 1 + r, c, kept, p);
@@ -289,6 +310,8 @@ kernel void delta_scan(
     uint k_col = p.key_width + kh * dk + r0;
     uint gate_col = 3 * key_heads + 2 * h;
     uint v_col = 2 * p.key_width + h * dv + column;
+    // The next written slot and the token after which it takes the state.
+    uint next = 0, at = slots[s.ends];
     for (uint t = 0; t < s.tokens; ++t) {
         uint row = s.row + t;
         device const float *pr = prep + ulong(row) * p.prep_stride;
@@ -325,24 +348,23 @@ kernel void delta_scan(
             state[4 * i + 2] = fma(state[4 * i + 2], decay, kc.z);
             state[4 * i + 3] = fma(state[4 * i + 3], decay, kc.w);
         }
-        // Per-token states serve speculative verification.
-        if (s.every != 0 && active) {
-            device T *st = pool + ulong(slots[s.writes + t]) * state_size + head_state + col;
+        // Per-token states serve speculative verification, and states inside a pass serve
+        // prefix snapshots. The scan continues from the stored values, so narrow state
+        // rounds where it would had a pass ended here.
+        if (t == at) {
+            device T *st = pool + ulong(slots[s.writes + next]) * state_size + head_state + column;
             #pragma clang loop unroll(full)
             for (uint i = 0; i < ROWS; ++i) {
-                ulong at = ulong(r0 + i) * dv;
-                st[at] = store_state<T>(state[i], s.position + t, uint(head_state + at + col));
+                ulong offset = ulong(r0 + i) * dv;
+                T stored = store_state<T>(state[i], s.position + t, uint(head_state + offset + col));
+                if (active) {
+                    st[offset] = stored;
+                }
+                state[i] = float(stored);
             }
+            next += 1;
+            at = next < s.count ? slots[s.ends + next] : s.tokens;
         }
-    }
-    if (s.every != 0 || !active) {
-        return;
-    }
-    device T *final_state = pool + ulong(slots[s.writes]) * state_size + head_state + col;
-    #pragma clang loop unroll(full)
-    for (uint i = 0; i < ROWS; ++i) {
-        ulong at = ulong(r0 + i) * dv;
-        final_state[at] = store_state<T>(state[i], s.position + s.tokens - 1, uint(head_state + at + col));
     }
 }
 

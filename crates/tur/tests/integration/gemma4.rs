@@ -368,6 +368,7 @@ fn test_gemma4_batched_assistant_chains_keep_their_rows() -> Result<()> {
             tokens: start..plan.tokens.len(),
             outputs: vec![plan.tokens.len() - 1],
             speculative: false,
+            checkpoints: Vec::new(),
         });
         ids.push(handle.request);
     }
@@ -390,6 +391,7 @@ fn test_gemma4_batched_assistant_chains_keep_their_rows() -> Result<()> {
                 .hidden
                 .ok_or_else(|| invalid("missing hidden states"))?,
             drafts,
+            pending: Vec::new(),
         });
     }
     let together = engine.draft(&requests)?;
@@ -819,7 +821,7 @@ fn assistant_drafts(device: &Device, execution: Execution) -> Result<()> {
             .ok_or_else(|| invalid("missing hidden states"))?;
         state = reservation.commit(1)?;
         drop(reservation);
-        let side = state.side(p, 1)?;
+        let side = state.side(p, 1, &[])?;
         let drafted = model
             .draft(&DraftForward {
                 tokens: &tokens[p + 1..p + 2],
@@ -935,7 +937,7 @@ fn test_gemma4_e2b_assistant_drafts_agree_with_transformers_past_the_window() ->
             .ok_or_else(|| invalid("missing hidden states"))?;
         state = reservation.commit(piece.len())?;
         drop(reservation);
-        let side = state.side(p, 1)?;
+        let side = state.side(p, 1, &[])?;
         let drafted = model
             .draft(&DraftForward {
                 tokens: &tokens[p + 1..p + 2],

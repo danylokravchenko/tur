@@ -198,6 +198,7 @@ impl Qwen35 {
                     position: span.past,
                     read: span.addresses.read,
                     writes: &span.addresses.writes,
+                    ends: &span.ends,
                 })
                 .collect();
             Some(fused.kernels.recurrent_spans(&spans)?)

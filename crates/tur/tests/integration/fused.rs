@@ -695,6 +695,7 @@ fn feed(engine: &mut HybridEngine<Qwen35>, request: StateHandle, tokens: &[u32])
             tokens: 0..n,
             outputs: vec![n - 1],
             speculative: false,
+            checkpoints: Vec::new(),
         }],
     })?;
     engine
@@ -784,6 +785,7 @@ fn test_full_and_partial_prefix_forks_and_restores_continue_exactly() -> Result<
                 tokens: 0..n,
                 outputs: (0..n).collect(),
                 speculative: true,
+                checkpoints: Vec::new(),
             }],
         })?;
         let commit = engine
@@ -1010,6 +1012,7 @@ fn generate(
                 tokens: start..tokens.len(),
                 outputs: vec![tokens.len() - 1],
                 speculative: false,
+                checkpoints: Vec::new(),
             });
         }
         engine.submit(PackedExecution {
@@ -1204,6 +1207,7 @@ fn test_grammar_masks_are_applied_on_the_device() -> Result<()> {
                 tokens: start..plan.tokens.len(),
                 outputs: vec![plan.tokens.len() - 1],
                 speculative: false,
+                checkpoints: Vec::new(),
             });
         }
         engine.submit(plan)?;
@@ -1275,6 +1279,7 @@ fn test_cached_last_logits_sample_like_the_pass_that_produced_them() -> Result<(
                 tokens: 0..tokens.len(),
                 outputs: vec![tokens.len() - 1],
                 speculative: false,
+                checkpoints: Vec::new(),
             }],
         })?;
         let result = engine.finish()?.pop().ok_or_else(|| invalid("no result"))?;

@@ -31,7 +31,7 @@ use super::{
 };
 use crate::{
     Result,
-    hybrid::{Draft, HybridEngine, PoolUsage, SamplingStats},
+    hybrid::{Boundaries, Draft, HybridEngine, ModelState, PoolUsage, SamplingStats},
 };
 use candle_core::Tensor;
 use std::{
@@ -130,9 +130,11 @@ struct Pending {
 /// A commit to snapshot at the end of its step.
 struct SnapshotCommit {
     id: Uuid,
+    /// A checkpoint inside the request's last pass; `None` snapshots its committed state.
+    state: Option<ModelState>,
     /// `[1, vocab]` logits after a prompt's last token.
     logits: Option<Tensor>,
-    /// `[1, hidden]` final hidden state at the last committed position, when the draft head
+    /// `[1, hidden]` final hidden state at the snapshot's last position, when the draft head
     /// runs, so a request continuing with another token can recompute the head's entry.
     hidden: Option<Tensor>,
 }
@@ -145,6 +147,17 @@ struct Finishing {
 }
 
 impl Pending {
+    /// Recurrent states a non-speculative pass of `tokens` tokens keeps: the last one and
+    /// any snapshot positions inside it.
+    fn boundaries(&self, prefix: &PrefixCache, tokens: usize) -> Boundaries {
+        let checkpoints = prefix.checkpoints(self.consumed, tokens, self.turn_boundary);
+        if checkpoints.is_empty() {
+            Boundaries::Final
+        } else {
+            Boundaries::Checkpoints(checkpoints.into())
+        }
+    }
+
     fn generated(&self) -> usize {
         self.tokens.len() - self.prompt_tokens
     }
@@ -154,13 +167,9 @@ impl Pending {
         self.running && self.generated() > 0 && self.consumed >= self.prompt_tokens
     }
 
-    /// Scheduling view. Prefill chunks stop at aligned and predicted turn boundaries,
-    /// so each snapshot has the recurrent state written at exactly its position.
-    fn candidate(&self, id: Uuid, boundary: Option<usize>) -> Candidate {
-        let boundary = boundary
-            .into_iter()
-            .chain(self.turn_boundary.filter(|&end| end > self.consumed))
-            .min();
+    /// Scheduling view. Snapshot positions inside a chunk become checkpoints of its pass,
+    /// so only a replay's original boundaries and the first restore end chunks.
+    fn candidate(&self, id: Uuid) -> Candidate {
         let unconsumed = self.tokens.len() - self.consumed;
         let next = self.boundaries.partition_point(|&end| end <= self.consumed);
         let replay = self
@@ -168,15 +177,12 @@ impl Pending {
             .get(next)
             .filter(|_| self.consumed >= self.replay_floor)
             .map(|end| end - self.consumed);
-        // Below the first restore, chunks also stop there, where replay boundaries begin.
-        let end = boundary.map(|end| {
-            if self.consumed < self.replay_floor {
-                end.min(self.replay_floor)
-            } else {
-                end
-            }
-        });
-        let aligned = end.map_or(unconsumed, |end| unconsumed.min(end - self.consumed));
+        // Below the first restore, chunks stop there, where replay boundaries begin.
+        let aligned = if self.consumed < self.replay_floor {
+            unconsumed.min(self.replay_floor - self.consumed)
+        } else {
+            unconsumed
+        };
         Candidate {
             id,
             pending: replay.unwrap_or(aligned),

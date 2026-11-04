@@ -85,17 +85,17 @@ fn test_warmed_prefixes_continue_like_cold_runs_and_skip_their_prefill() -> Resu
     for (index, (stats, expected)) in stats.iter().zip(&expected).enumerate() {
         assert_eq!(&stats.generated_text, expected, "request {index}");
     }
-    // The first prompt left snapshots at 16 and 32 tokens and at its end, with its last
-    // logits. The repeat restores all 40 tokens and samples its first output from them,
-    // so its outputs take one pass fewer than their count, against three aligned prefill
-    // passes (16 + 16 + 8 tokens) plus the remaining decodes for the cold run; the
-    // 36-token shares restore 32.
+    // The first prompt ran in one pass that kept checkpoints at 16 and 32 tokens, and
+    // left those snapshots and one at its end, with its last logits. The repeat restores
+    // all 40 tokens and samples its first output from them, so its outputs take one pass
+    // fewer than their count, against one prefill pass plus the remaining decodes for the
+    // cold run; the 36-token shares restore 32.
     let cached_tokens: Vec<usize> = stats.iter().map(|s| s.cached_tokens).collect();
     assert_eq!(cached_tokens, [0, 40, 32, 32]);
     assert_eq!(
         passes[..2],
         [
-            stats[0].generated_tokens as u64 + 2,
+            stats[0].generated_tokens as u64,
             stats[1].generated_tokens as u64 - 1
         ]
     );
@@ -180,11 +180,11 @@ fn test_template_divergence_restores_the_last_shared_token() -> Result<()> {
     let mut pipeline = InferencePipeline::new(&factory, cached(16))?;
     let single = request(prompt(22, 0, 0), 1);
     let stats = pipeline.run(&single, |_| {})?;
-    // A single-turn request keeps its two ordinary prefill passes, without a third
-    // pass to save a speculative future turn.
+    // A single-turn request prefills in one pass, its aligned snapshot a checkpoint
+    // inside it, and takes no snapshot for a speculative future turn.
     assert_eq!(
         pipeline.scheduler().iteration(),
-        stats.generated_tokens as u64 + 1
+        stats.generated_tokens as u64
     );
     pipeline.clear_prefix_cache();
     let mut first = request(String::new(), 1);
