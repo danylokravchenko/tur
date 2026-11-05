@@ -134,8 +134,17 @@ impl InferencePipeline {
                     .context_tokens
                     .unwrap_or_else(|| architecture.max_position())
                     .min(architecture.max_position());
+                let contexts = vec![context; sequences];
                 let (description, weights, scratch_peak) =
-                    architecture.memory_requirements(options, tokens, &vec![context; sequences])?;
+                    architecture.memory_requirements(options, tokens, &contexts)?;
+                // Selection scratch of one attention layer at a time.
+                let scratch_peak = match &factory.sparse {
+                    Some(sparse) => sparse
+                        .workspace_bytes(tokens, &contexts)
+                        .and_then(|bytes| bytes.checked_add(scratch_peak))
+                        .ok_or_else(|| invalid("sparse scratch overflow"))?,
+                    None => scratch_peak,
+                };
                 config.prefix.validate(description.kv.page_tokens)?;
                 // Full model logits and their gathered copy coexist for sampled requests;
                 // every drafted token adds an output row.
@@ -188,12 +197,18 @@ impl InferencePipeline {
                         context: config.context_tokens,
                         limit: budget.limit(),
                         reserved: budget.leased(),
+                        indexed: factory.sparse.is_some(),
                     },
                 )?;
                 let lease = budget.lease(plan.resident())?;
                 plan.report(limits.max_running);
                 Ok((plan, pool, lease))
             })?;
+        if model.indexed() != factory.sparse.is_some() {
+            return Err(invalid(
+                "the model's sparse attention disagrees with its pool",
+            ));
+        }
         if model.weight_bytes() != plan.weights {
             return Err(invalid(
                 "loaded weights disagree with the pre-load memory plan",

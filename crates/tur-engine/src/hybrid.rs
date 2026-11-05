@@ -2091,6 +2091,7 @@ mod tests {
         pages: 2,
         window_pages: 2,
         recurrent_slots: 1,
+        index_blocks: 0,
     };
 
     struct UnusedModel;

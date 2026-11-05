@@ -689,6 +689,7 @@ fn real_router() -> Result<axum::Router> {
             video: false,
             expert_cache: None,
             gguf: None,
+            sparse: None,
         },
         pipeline: PipelineConfig::new(2, 256),
         budget: DeviceBudget::new(None),

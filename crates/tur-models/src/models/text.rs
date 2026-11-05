@@ -257,6 +257,22 @@ impl TextModel {
     pub fn has_encoders(&self) -> bool {
         self.audio_prompt().is_some() || self.image_prompt().is_some()
     }
+    /// Read attention sparsely as `sparse` describes; Qwen3.5-family models on fused
+    /// Metal execution only.
+    #[cfg_attr(
+        not(feature = "metal"),
+        allow(unused_variables, reason = "only Qwen on Metal reads sparse attention")
+    )]
+    pub fn sparse_attention(&mut self, sparse: &super::SparseAttention) -> Result<()> {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Qwen35(model) => model.sparse_attention(sparse),
+            _ => Err(tur_core::TurError::Other(
+                "latent sparse attention supports Qwen3.5-family models on Metal only".into(),
+            )),
+        }
+    }
+
     fn model(&self) -> &dyn HybridModel {
         match self {
             Self::Qwen35(m) => m.as_ref(),
@@ -271,6 +287,9 @@ impl HybridModel for TextModel {
     }
     fn workspace_bytes(&self, batch: &PackedForward<'_>) -> Result<usize> {
         self.model().workspace_bytes(batch)
+    }
+    fn indexed(&self) -> bool {
+        self.model().indexed()
     }
     fn forward(&self, batch: &PackedForward<'_>) -> Result<Vec<Result<SequenceStep>>> {
         self.model().forward(batch)

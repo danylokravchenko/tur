@@ -832,6 +832,7 @@ impl GptOss {
                 pages: self.description.pages_for(tokens.len()).max(1),
                 window_pages: self.description.pages_for(tokens.len()).max(1),
                 recurrent_slots: 1,
+                index_blocks: 0,
             },
         )?;
         let mut reservation = ModelState::new(&pool).reserve(tokens.len(), Boundaries::Final)?;

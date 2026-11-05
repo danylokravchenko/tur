@@ -198,6 +198,7 @@ fn gemma_contention(dir: &Path, wav: &Path) -> Result<()> {
         video: false,
         expert_cache: None,
         gguf: None,
+        sparse: None,
     };
     let clip = Audio::from_wav(&std::fs::read(wav)?)?;
     let clip = Audio::from_samples(&clip.samples()[..clip.samples().len().min(480_000)], 16_000)?;

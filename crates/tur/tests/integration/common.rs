@@ -180,6 +180,7 @@ impl Checkpoint {
             video: false,
             expert_cache: None,
             gguf: None,
+            sparse: None,
         }
     }
 }

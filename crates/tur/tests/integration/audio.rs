@@ -331,6 +331,7 @@ fn factory(fixture: &crate::common::Checkpoint) -> tur::ModelFactory {
         video: false,
         expert_cache: None,
         gguf: None,
+        sparse: None,
     }
 }
 

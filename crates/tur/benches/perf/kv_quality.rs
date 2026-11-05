@@ -92,6 +92,7 @@ impl Runner {
                 pages: model.description().pages_for(tokens) + 1 + SNAPSHOTS.len() * 16,
                 window_pages: model.description().pages_for(tokens) + 1 + SNAPSHOTS.len() * 16,
                 recurrent_slots: 4 + 2 * SNAPSHOTS.len(),
+                index_blocks: 0,
             },
         )?;
         let state = ModelState::new(&pool);

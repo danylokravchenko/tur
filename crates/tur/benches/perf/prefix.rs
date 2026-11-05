@@ -55,6 +55,7 @@ fn pool(entries: usize) -> Result<StatePool> {
             pages: entries * LONGEST / PAGE,
             window_pages: entries * LONGEST / PAGE,
             recurrent_slots: entries + 1,
+            index_blocks: 0,
         },
     )
 }

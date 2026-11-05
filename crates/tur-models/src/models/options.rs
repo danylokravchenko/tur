@@ -174,3 +174,51 @@ impl DraftHead {
         self.model.is_some()
     }
 }
+
+/// Latent sparse attention: past `crossover` keys, a decoding or verifying query of a full
+/// attention layer reads up to `top_k` keys of its `top_p` best buckets, its `window` most
+/// recent keys and the first `sink` keys, chosen through the per-layer index map stored at
+/// `map` (`tur sparse-map` writes one). Prefill stays dense. Qwen3.5 family only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SparseAttention {
+    pub map: std::path::PathBuf,
+    pub top_k: usize,
+    pub top_p: usize,
+    pub window: usize,
+    pub sink: usize,
+    pub crossover: usize,
+}
+
+impl SparseAttention {
+    /// The paper's budget for Qwen3.8-27B (4,612 keys) over the map at `map`, reading
+    /// sparsely past 16K keys: below that the budget is over a quarter of the context, and
+    /// per-layer attention measured 2.8× faster only from 32K.
+    pub fn new(map: std::path::PathBuf) -> Self {
+        Self {
+            map,
+            top_k: 4096,
+            top_p: 1024,
+            window: 512,
+            sink: 4,
+            crossover: 16_384,
+        }
+    }
+
+    /// Keys one query reads at most.
+    pub fn width(&self) -> usize {
+        self.top_k + self.window + self.sink
+    }
+
+    /// Scratch of one attention layer's clustering and selection over a pass of `n` rows
+    /// whose sequences end at `contexts`: scores of every visible bucket, key lists, and
+    /// one cluster job per closed block. Up to 64 buckets of 64-dimensional F32 pools per
+    /// block of 512 keys.
+    pub fn workspace_bytes(&self, n: usize, contexts: &[usize]) -> Option<usize> {
+        const BLOCK: usize = 512;
+        let buckets = contexts.iter().map(|&c| c / BLOCK).max().unwrap_or(0) * 64;
+        let jobs = n / BLOCK + contexts.len();
+        n.checked_mul(self.width() + buckets + 1)?
+            .checked_mul(4)?
+            .checked_add(jobs.checked_mul(BLOCK / 4 * 64 * 4)?)
+    }
+}

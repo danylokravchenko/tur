@@ -4,16 +4,13 @@
 //! scalar reference over every K/V format, more heads, another head size and several
 //! sequences in one pass.
 
-use crate::kernels::{read, setup, stored};
+use crate::kernels::{read, relative_error, setup, sigmoid, stored};
 use candle_core::{DType, Device, Tensor};
 use std::path::Path;
 use tur_core::{Result, TurError, execution::KvFormat};
 use tur_metal::{
-    kernels::{
-        BUCKET_POOLS, ClusterJob, INDEX_BLOCK_TOKENS, INDEX_BUCKETS, INDEX_DIM, IndexMap,
-        IndexPool, IndexTable, Kernels, PagedKv, SparseBudget,
-    },
-    pool::AttentionPool,
+    kernels::{ClusterJob, IndexMap, IndexTable, Kernels, PagedKv, SparseBudget, Tuning},
+    pool::{AttentionPool, BUCKET_POOLS, INDEX_BLOCK_TOKENS, INDEX_BUCKETS, INDEX_DIM, IndexPool},
 };
 
 const PAGE: usize = 16;
@@ -118,8 +115,11 @@ impl Case {
 /// A case's keys stored in a shuffled paged pool, with its index addressing.
 struct Built {
     pool: AttentionPool,
-    /// Dequantized pool rows `[slots, kv_heads, dim]`, what a correct kernel reads.
+    /// Dequantized key and value rows `[slots, kv_heads, dim]`, what a correct kernel reads.
     exact: Vec<f32>,
+    values: Vec<f32>,
+    /// Slots of the K/V pool.
+    pool_slots: usize,
     kv: PagedKv,
     page_table: Vec<u32>,
     /// Where each sequence's pages start in `page_table`.
@@ -140,19 +140,28 @@ fn build(case: &Case, device: &Device, kernels: &Kernels, format: KvFormat) -> R
     // Reversed physical pages exercise the indirection; unused rows hold NaN poison.
     let physical: Vec<u32> = (0..total as u32).rev().collect();
     let slots = total * PAGE;
+    let pool_slots = slots;
     let mut rows = vec![f32::NAN; slots * row];
+    let mut value_rows = rows.clone();
     let (mut page_table, mut page_first) = (Vec::new(), Vec::new());
     for (s, &count) in pages.iter().enumerate() {
         let base = page_table.len();
         page_first.push(base);
         page_table.extend_from_slice(&physical[base..base + count]);
-        for (j, key) in case.keys(s).chunks_exact(row).enumerate() {
+        let values = unit(15 + 100 * s as u32, case.sequences[s].0 * row);
+        for (j, (key, value)) in case
+            .keys(s)
+            .chunks_exact(row)
+            .zip(values.chunks_exact(row))
+            .enumerate()
+        {
             let slot = page_table[base + j / PAGE] as usize * PAGE + j % PAGE;
             rows[slot * row..(slot + 1) * row].copy_from_slice(key);
+            value_rows[slot * row..(slot + 1) * row].copy_from_slice(value);
         }
     }
     let (key, exact) = stored(device, &rows, slots, case.kv_heads, case.dim, format)?;
-    let (value, _) = stored(device, &rows, slots, case.kv_heads, case.dim, format)?;
+    let (value, values) = stored(device, &value_rows, slots, case.kv_heads, case.dim, format)?;
     let pool = AttentionPool {
         key,
         value,
@@ -172,6 +181,8 @@ fn build(case: &Case, device: &Device, kernels: &Kernels, format: KvFormat) -> R
     Ok(Built {
         pool,
         exact,
+        values,
+        pool_slots,
         kv,
         page_table,
         page_first,
@@ -585,6 +596,128 @@ fn test_lsa_index_matches_scalar_reference_for_every_format_and_sequence() -> Re
         check_against_scalar(&wide, format)?;
     }
     check_against_scalar(&narrow, KvFormat::F16)
+}
+
+/// F64 gated attention of each selecting token over exactly the keys of its list.
+fn sparse_reference(
+    case: &Case,
+    built: &Built,
+    queries: &[f32],
+    gate: &[f32],
+    rows: &[Vec<i64>],
+) -> Vec<f64> {
+    let (heads, dim, per) = (case.heads, case.dim, case.heads / case.kv_heads);
+    let row = case.kv_heads * dim;
+    let owners: Vec<usize> = case
+        .sequences
+        .iter()
+        .enumerate()
+        .flat_map(|(s, (_, positions))| std::iter::repeat_n(s, positions.len()))
+        .collect();
+    let mut out = Vec::with_capacity(rows.len() * heads * dim);
+    for (t, keys) in rows.iter().enumerate() {
+        let slots: Vec<usize> = keys
+            .iter()
+            .map(|&j| {
+                let j = j as usize;
+                built.page_table[built.page_first[owners[t]] + j / PAGE] as usize * PAGE + j % PAGE
+            })
+            .collect();
+        for h in 0..heads {
+            let g = h / per;
+            let qh = &queries[(t * heads + h) * dim..][..dim];
+            let scores: Vec<f64> = slots
+                .iter()
+                .map(|s| {
+                    let k = &built.exact[s * row + g * dim..][..dim];
+                    qh.iter()
+                        .zip(k)
+                        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                        .sum::<f64>()
+                        / (dim as f64).sqrt()
+                })
+                .collect();
+            let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+            let total: f64 = weights.iter().sum();
+            for i in 0..dim {
+                let value: f64 = slots
+                    .iter()
+                    .zip(&weights)
+                    .map(|(s, w)| w * f64::from(built.values[s * row + g * dim + i]))
+                    .sum();
+                out.push(
+                    value / total * sigmoid(f64::from(gate[(t * heads + h) * 2 * dim + dim + i])),
+                );
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn test_sparse_attention_matches_scalar_reference_over_selected_keys() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    let split = kernels.clone().with_tuning(Tuning {
+        min_split_keys: 8,
+        ..kernels.tuning()
+    })?;
+    let whole = kernels.clone().with_tuning(Tuning {
+        attention_parallelism: 1,
+        ..kernels.tuning()
+    })?;
+    let case = Case {
+        kv_heads: 2,
+        heads: 8,
+        dim: 256,
+        rotary: 64,
+        segment: 29,
+        topics: 6,
+        sequences: vec![(1300, vec![1299, 600]), (2100, vec![2099, 1536])],
+    };
+    let budget = SparseBudget {
+        top_k: 300,
+        top_p: 48,
+        window: 512,
+        sink: 4,
+    };
+    for format in [KvFormat::F32, KvFormat::F16, KvFormat::Q8 { group: 32 }] {
+        let built = build(&case, &device, &kernels, format)?;
+        let index = cluster(&case, &built, &kernels, &device)?;
+        let (table, q) = selections(&case, &built, &kernels, &device, &index)?;
+        let selected = kernels.lsa_select(&q, &built.map, &index, &table, budget)?;
+        let rows = rows_of(
+            &read(selected.keys())?,
+            &read(selected.lengths())?,
+            selected.width(),
+        );
+        let (mut first, mut visible) = (Vec::new(), Vec::new());
+        for (s, (_, positions)) in case.sequences.iter().enumerate() {
+            for &position in positions {
+                first.push(built.page_first[s] as u32);
+                visible.push(position as u32 + 1);
+            }
+        }
+        let kv = kernels.paged_kv(PAGE, built.pool_slots, &built.page_table, &first, &visible)?;
+        let tokens = visible.len();
+        let gate = unit(16, tokens * case.heads * 2 * case.dim);
+        let gate_tensor =
+            Tensor::from_vec(gate.clone(), (tokens, case.heads * 2 * case.dim), &device)?;
+        let heads = tur_metal::kernels::Heads {
+            count: case.heads,
+            dim: case.dim,
+            head_stride: 2 * case.dim,
+            col_offset: case.dim,
+        };
+        let expected = sparse_reference(&case, &built, &read(&q)?, &gate, &rows);
+        for (label, tuned) in [("split", &split), ("whole", &whole), ("default", &kernels)] {
+            let out =
+                tuned.attention_sparse(&q, &built.pool, &kv, &gate_tensor, heads, &selected)?;
+            let error = relative_error(&read(&out)?, &expected);
+            assert!(error < 1e-5, "{format:?} {label}: {error}");
+        }
+    }
+    Ok(())
 }
 
 #[test]

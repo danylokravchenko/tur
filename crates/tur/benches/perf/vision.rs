@@ -230,6 +230,7 @@ pub(crate) fn run() -> Result<()> {
         video: true,
         expert_cache: None,
         gguf: None,
+        sparse: None,
     };
     let mut pipeline = InferencePipeline::new(&factory, PipelineConfig::new(1, 256))?;
     let model = pipeline

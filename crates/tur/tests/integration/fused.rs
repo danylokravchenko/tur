@@ -801,6 +801,7 @@ fn test_full_and_partial_prefix_forks_and_restores_continue_exactly() -> Result<
         pages: 64,
         window_pages: 64,
         recurrent_slots: 16,
+        index_blocks: 0,
     };
     let mut engine = HybridEngine::new(Arc::clone(&model), device, config)?;
     // Prefixes ending mid-page (37) and on a page boundary (48).
@@ -888,6 +889,7 @@ fn test_memory_pressure_fails_new_work_without_corrupting_live_requests() -> Res
             pages: 64,
             window_pages: 64,
             recurrent_slots: 8,
+            index_blocks: 0,
         },
     )?;
     let c = greedy(&mut control)?;
@@ -902,6 +904,7 @@ fn test_memory_pressure_fails_new_work_without_corrupting_live_requests() -> Res
             pages: 7,
             window_pages: 7,
             recurrent_slots: 4,
+            index_blocks: 0,
         },
     )?;
     let a = greedy(&mut engine)?;
@@ -1052,6 +1055,7 @@ fn generate(
         pages: 64,
         window_pages: 64,
         recurrent_slots: 2 * batch,
+        index_blocks: 0,
     };
     let mut engine = HybridEngine::new(model, device, config)?;
     let handles = (0..batch)
@@ -1227,6 +1231,7 @@ fn test_grammar_masks_are_applied_on_the_device() -> Result<()> {
         pages: 64,
         window_pages: 64,
         recurrent_slots: 8,
+        index_blocks: 0,
     };
     let mut engine = HybridEngine::new(Arc::clone(&model), device, config)?;
     let sampled = SamplingOptions {
@@ -1318,6 +1323,7 @@ fn test_cached_last_logits_sample_like_the_pass_that_produced_them() -> Result<(
         pages: 64,
         window_pages: 64,
         recurrent_slots: 8,
+        index_blocks: 0,
     };
     let mut engine = HybridEngine::new(Arc::clone(&model), device, config)?;
     let options = SamplingOptions {
@@ -1373,5 +1379,77 @@ fn test_cached_last_logits_sample_like_the_pass_that_produced_them() -> Result<(
         engine.cancel(cached.handle)?;
     }
     assert_eq!(engine.sampling_stats().host_rows, 0);
+    Ok(())
+}
+
+/// [`SMALL`] with 128-dimension heads: 32 rotated and 96 position-free dims per head, as the
+/// index kernels need.
+fn wide_heads() -> Result<Checkpoint> {
+    common::checkpoint(
+        &SMALL.replace(r#""head_dim": 64"#, r#""head_dim": 128"#),
+        0.08,
+        0.1,
+    )
+}
+
+/// Sparse reads under a budget that holds every key reproduce dense attention: decoding,
+/// a verification window, and a pass that adds a fresh prefill and so splits its rows.
+#[test]
+fn test_sparse_attention_with_a_budget_over_every_key_matches_dense() -> Result<()> {
+    let _gpu = GPU.lock();
+    let device = metal()?;
+    let checkpoint = wide_heads()?;
+    let dense = load(&checkpoint.0, WeightFormat::F32, &device, Execution::Fused)?;
+    let mut sparse = load(&checkpoint.0, WeightFormat::F32, &device, Execution::Fused)?;
+    let map = checkpoint.0.join("index-map.safetensors");
+    let layer =
+        |seed| Tensor::from_vec(common::values(192 * 64, seed, 1.0), (192, 64), &Device::Cpu);
+    let layers = [
+        ("layer.1".to_string(), layer(7)?),
+        ("layer.3".to_string(), layer(8)?),
+    ];
+    candle_core::safetensors::save(&layers.into_iter().collect(), &map)?;
+    sparse.sparse_attention(&tur_models::models::SparseAttention {
+        top_k: 8192,
+        crossover: 600,
+        ..tur_models::models::SparseAttention::new(map)
+    })?;
+    assert!(sparse.indexed() && !dense.indexed());
+    let config = |index_blocks| PoolConfig {
+        pages: 160,
+        window_pages: 0,
+        recurrent_slots: 16,
+        index_blocks,
+    };
+    let pools = [
+        StatePool::new(Arc::new(dense.description()), &device, config(0))?,
+        StatePool::new(Arc::new(sparse.description()), &device, config(16))?,
+    ];
+    let prompt: Vec<u32> = (0..1100).map(|i| (i * 37 % 157) as u32 + 2).collect();
+    let dense_state = prefill(&dense, ModelState::new(&pools[0]), &prompt, 256)?.1;
+    let sparse_state = prefill(&sparse, ModelState::new(&pools[1]), &prompt, 256)?.1;
+    assert_eq!(sparse_state.index_count(), 2);
+    for (tokens, fresh) in [
+        (&[5u32][..], false),
+        (&[6, 7, 8, 9][..], false),
+        (&[10][..], true),
+    ] {
+        let mut logits = Vec::new();
+        for (model, state) in [(&dense, &dense_state), (&sparse, &sparse_state)] {
+            let empty = ModelState::new(state.pool());
+            let mut batch = vec![(state, tokens, Boundaries::EveryToken)];
+            if fresh {
+                batch.push((&empty, &prompt[..300], Boundaries::Final));
+            }
+            let (steps, _held) = forward(model, &batch)?;
+            let mut pass = Vec::new();
+            for step in steps {
+                pass.extend(rows(&step?.logits)?);
+            }
+            logits.push(pass);
+        }
+        let error = max_relative(&logits[1], &logits[0]);
+        assert!(error < 1e-4, "{} tokens: {error}", tokens.len());
+    }
     Ok(())
 }

@@ -134,6 +134,7 @@ fn run_layer(
             pages: description.pages_for(len).max(1),
             window_pages: description.pages_for(len).max(1),
             recurrent_slots: 1,
+            index_blocks: 0,
         },
     )?;
     let mut reservation = ModelState::new(&pool).reserve(len, Boundaries::Final)?;

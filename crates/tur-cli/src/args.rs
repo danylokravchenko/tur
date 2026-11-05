@@ -152,6 +152,14 @@ pub(crate) struct ModelArgs {
     /// set. Reads only: the cache never writes to disk (default: every expert resident).
     #[arg(long)]
     expert_cache_mb: Option<usize>,
+    /// Latent sparse attention: `auto` lets decoding and verifying queries past 16K keys read
+    /// only the keys `--sparse-map` selects, on Qwen3.5-family models. Outputs differ from
+    /// dense attention (default: off).
+    #[arg(long, value_parser = PossibleValuesParser::new(["off", "auto"]))]
+    sparse_attention: Option<String>,
+    /// Index map for `--sparse-attention auto`, written by `tur sparse-map`.
+    #[arg(long)]
+    sparse_map: Option<PathBuf>,
     /// Use the CPU numerical reference for development checks.
     #[arg(long)]
     #[serde(skip)]
@@ -176,7 +184,9 @@ impl ModelArgs {
         audio_encoder,
         vision_encoder,
         video_input,
-        expert_cache_mb
+        expert_cache_mb,
+        sparse_attention,
+        sparse_map
     );
 
     /// Settle which model runs. A model on the command line replaces the file's along with its
@@ -265,7 +275,22 @@ impl ModelArgs {
                         .ok_or_else(|| TurError::Other("expert cache size overflow".into()))
                 })
                 .transpose()?,
+            sparse: self.sparse()?,
         })
+    }
+
+    /// Sparse attention settings, which `auto` reads from its map.
+    fn sparse(&self) -> Result<Option<tur::models::SparseAttention>> {
+        match (self.sparse_attention.as_deref(), &self.sparse_map) {
+            (None | Some("off"), _) => Ok(None),
+            (Some("auto"), Some(map)) => Ok(Some(tur::models::SparseAttention::new(map.clone()))),
+            (Some("auto"), None) => Err(TurError::Other(
+                "--sparse-attention auto needs --sparse-map; `tur sparse-map` writes one".into(),
+            )),
+            (Some(other), _) => Err(TurError::Other(format!(
+                "sparse attention is off or auto, not {other}"
+            ))),
+        }
     }
 
     pub(crate) fn relative_to(&mut self, directory: &Path) {
@@ -278,6 +303,9 @@ impl ModelArgs {
             {
                 *model = directory.join(path).to_string_lossy().into_owned();
             }
+        }
+        if let Some(map) = self.sparse_map.as_mut().filter(|map| map.is_relative()) {
+            *map = directory.join(&*map);
         }
     }
 
@@ -653,6 +681,29 @@ mod tests {
         args.factory()?;
         args.kv_page_tokens = Some(0);
         assert!(args.factory().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_sparse_attention_auto_needs_a_map_and_off_loads_none() -> Result<()> {
+        let args = |mode: &str, map: Option<&str>| ModelArgs {
+            sparse_attention: Some(mode.into()),
+            sparse_map: map.map(PathBuf::from),
+            ..ModelArgs::default()
+        };
+        assert!(args("off", Some("map.safetensors")).sparse()?.is_none());
+        assert!(args("auto", None).sparse().is_err());
+        let sparse = args("auto", Some("map.safetensors")).sparse()?;
+        assert_eq!(
+            sparse.map(|s| s.map),
+            Some(PathBuf::from("map.safetensors"))
+        );
+        let mut relative = args("auto", Some("maps/qwen.safetensors"));
+        relative.relative_to(Path::new("/etc/tur"));
+        assert_eq!(
+            relative.sparse_map,
+            Some(PathBuf::from("/etc/tur/maps/qwen.safetensors"))
+        );
         Ok(())
     }
 }

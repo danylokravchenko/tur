@@ -316,6 +316,7 @@ fn intern_router(format: tur::models::WeightFormat) -> Result<axum::Router> {
             video: false,
             expert_cache: None,
             gguf: None,
+            sparse: None,
         },
         pipeline: PipelineConfig::new(1, 512),
         budget: DeviceBudget::new(None),

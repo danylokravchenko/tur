@@ -574,6 +574,7 @@ fn head_logits(model: &Qwen35, ids: &[u32]) -> Result<Vec<Vec<f32>>> {
             pages: description.pages_for(count),
             window_pages: description.pages_for(count),
             recurrent_slots: 2,
+            index_blocks: 0,
         },
     )?;
     let mut reservation = ModelState::new(&pool).reserve(count, Boundaries::Final)?;

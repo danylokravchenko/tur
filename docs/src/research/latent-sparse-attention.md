@@ -1,6 +1,6 @@
 # Latent sparse attention
 
-Created: 2026-11-05. Status: steps 1 and 2 of the [plan](#plan) are measured on Qwen3.5-0.8B (decode cost on the M1, quality in Transformers with a training-free map), and both cleared their gates. Step 3 is built: the index kernels match the reference implementation exactly on its golden fixture. Attention doesn't read the selected keys yet. The plan starts with the 0.8B, then moves to Qwen3.8-27B with the paper's released index maps.
+Created: 2026-11-05. Status: steps 1 and 2 of the [plan](#plan) are measured on Qwen3.5-0.8B (decode cost on the M1, quality in Transformers with a training-free map), and both cleared their gates. Steps 3 to 5 are built: the index kernels match the reference implementation exactly on its golden fixture, the engine keeps index blocks in the state pool, `tur sparse-map` fits maps natively, and `--sparse-attention auto` decodes the 0.8B at 128K tokens 2.2× faster. The retrieval budget (step 6) is still open. The plan starts with the 0.8B, then moves to Qwen3.8-27B with the paper's released index maps.
 
 Decoding one token reads every key and value in every full attention layer, so at long contexts the K/V reads outgrow the weight reads and decode slows down with each token of context. Latent Sparse Attention ([Prefrontal-AI, arXiv 2610.42147](https://arxiv.org/abs/2610.42147), [code](https://github.com/Prefrontal-AI/latent-sparse-attention), Apache-2.0) caps those reads. It groups keys into small clusters once, and each query scores the clusters before reading only the keys of the best ones. Attention over the keys it picks stays exact, with the model's own kernel. This page records what the method does, where it would pay in Tur, and how to build it.
 
@@ -58,6 +58,28 @@ A bandwidth estimate for Qwen3.8-27B with Q4K weights (about 15 GB read per step
 
 Batches gain more, because the weights are read once for the batch and the K/V once per sequence: four sequences at 64K would read 32 GB dense and 16 GB with LSA. The estimate assumes attention reads memory as fast as the projections do. If it reads slower, which the 0.8B numbers suggest on the M1, the real gain is larger.
 
+`TUR_BENCH_ONLY=lsa just bench kernels` times one attention layer of the 0.8B (8 query heads, 2 K/V heads, F16 pool) on the M1 with the paper's budget. Clustering costs 2.0 ms per block, which decode pays once every 512 tokens:
+
+| Context, sequences | Dense attention | Selection | Sparse attention | Sparse total | Speedup |
+| --- | --- | --- | --- | --- | --- |
+| 32K, 1 | 1.29 ms | 0.22 ms | 0.24 ms | 0.46 ms | 2.8× |
+| 64K, 1 | 2.45 ms | 0.23 ms | 0.24 ms | 0.47 ms | 5.2× |
+| 128K, 1 | 4.78 ms | 0.37 ms | 0.25 ms | 0.62 ms | 7.7× |
+| 32K, 4 | 5.35 ms | 0.33 ms | 0.74 ms | 1.07 ms | 5.0× |
+| 64K, 4 | 9.73 ms | 0.57 ms | 0.77 ms | 1.34 ms | 7.3× |
+
+Six attention layers at 4.78 ms account for the 28.4 ms that context adds to a 128K decode step, so with sparse attention the step should fall from 45 ms to about 21 ms. Clustering runs on one GPU core per block, which adds about 12 ms to the one step in 512 that completes a block on all six layers; spreading each block over several threadgroups would remove that stall.
+
+Through the whole model (`TUR_BENCH_SPARSE_MAP=<map> just bench model`), with the map `tur sparse-map` fitted on four books, Q8_0 weights, F16 K/V, one sequence on the M1:
+
+| Context | Dense step | Sparse step | Tokens/s, dense | Tokens/s, sparse | Speedup |
+| --- | --- | --- | --- | --- | --- |
+| 32K | 25.7 ms | 21.8 ms | 38.9 | 46.0 | 1.18× |
+| 64K | 32.6 ms | 20.9 ms | 30.7 | 48.0 | 1.56× |
+| 128K | 46.2 ms | 21.1 ms | 21.7 | 47.5 | 2.19× |
+
+The sparse step stays near 21 ms from 64K on, as the kernel measurements predicted. These steps don't close a block, so the clustering stall once every 512 tokens isn't in them.
+
 Prefill isn't covered by this design. A 128K prompt on the 27B takes minutes on a Mac, and with dense prefill, decoding at that context is only worth speeding up when [prefix reuse](../architecture/prefix-reuse.md) supplies the long prefix. Sparse prefill comes after decode.
 
 ## Which models
@@ -81,22 +103,22 @@ The kernels live in `tur-metal`'s `lsa.metal` and `lsa.rs`:
 - `lsa_cluster_{f32,f16,q8}`: one threadgroup per complete block, from a list of jobs (page-table offset, block, index slot). It reads the unrotated dimensions straight from the K pool (rotation doesn't touch them), dequantizing Q8, projects and normalizes each key, sums pools, runs the Ward rounds and writes centroids and pools. The 128 F32 key sums alone fill the M1's 32 KiB of threadgroup memory, so they live in a device scratch row per job, and each round recomputes its costs from them. Decode runs it once every 512 tokens. Prefill runs it for every block a chunk completes.
 - `lsa_score_f32`: a grid of 256-bucket chunks by tokens. Each threadgroup forms its token's index query and scores its chunk of centroids, so long contexts spread over the whole GPU.
 - `lsa_select_f32`: one threadgroup per token. It finds the exact `p`-th best score with four 8-bit radix passes, collects the buckets above it plus the lowest-numbered ties, sorts them, and expands them into key positions with a prefix sum. The paper's kernel estimates the threshold from a sample instead; the exact version is what makes Tur's lists identical to the reference's. At 128K that is 16,384 centroids, 4 MiB of reads per layer.
-- `attention_kv` will gain an optional position list (step 4). Entry `i` becomes page `table[J[i] / 16]` and slot `J[i] % 16`, and the existing splits, online softmax and gate stay as they are. A pool holds 4 consecutive keys, so a bucket expands into runs of 4 contiguous rows inside a page.
+- `attention_kv` reads an optional key list (`Kernels::attention_sparse`). Each listed position goes through the page table on its own, splits partition the list instead of a range, and the online softmax and gate stay as they are. A position at or past the token's visible keys is clamped, so a malformed list can't read another sequence's pages. Prefill keeps the tiled kernel. Entry `i` becomes page `table[J[i] / 16]` and slot `J[i] % 16`, and the existing splits, online softmax and gate stay as they are. A pool holds 4 consecutive keys, so a bucket expands into runs of 4 contiguous rows inside a page.
 
 ### Engine
 
-- `[engine] sparse_attention` is `off` or `auto`, and `off` is the default, because outputs change compared with dense attention and every golden test assumes dense attention. Under `auto`, a request reads sparsely once its context passes the crossover; below it, and for models without a map, attention stays dense. A model can default to `auto` only after it passes the retrieval budget.
+- `[model] sparse_attention` (`--sparse-attention`) is `off` or `auto`, and `off` is the default, because outputs change compared with dense attention and every golden test assumes dense attention. Under `auto`, a request reads sparsely once its context passes the crossover; below it, and for models without a map, attention stays dense. A model can default to `auto` only after it passes the retrieval budget.
 - The crossover is measured with `just bench model` and stored in the tuning table like the tiled-attention crossover. The budget (`k`, `p`, window, sinks) is an advanced setting with the paper's values as defaults.
 - Verification runs one selection per verified position, as plain decoding would at that position, so speculation stays exact with respect to the sparse model. The MTP head's own attention layer stays dense.
 - Prefill attention stays dense and tiled, and only builds index blocks.
 
 ## Validation
 
-Model correctness follows the usual rule: a pinned external reference first. The reference repository ships a plain PyTorch oracle for the flat design (`src/lsa/core/reference.py`, `ward.py` and `index_space.py`), which its own CUDA kernels are tested against. `scripts/lsa_reference.py golden` runs it on synthetic keys, queries and a map that the test rebuilds bit for bit from an integer hash, so the fixture holds only the reference's outputs. Tur's kernels reproduce its buckets and key lists exactly, for three blocks, eight query positions and two budgets, and its centroids within 1e-5. A second test checks F32, F16 and Q8 pools, four K/V heads, 128-dimension heads and two sequences in one pass against an F64 scalar reference of the same algorithm, also exactly. Making either the merge cost or the window boundary wrong fails both tests. Indexed attention will be checked against a scalar reference over the same positions.
+Model correctness follows the usual rule: a pinned external reference first. The reference repository ships a plain PyTorch oracle for the flat design (`src/lsa/core/reference.py`, `ward.py` and `index_space.py`), which its own CUDA kernels are tested against. `scripts/lsa_reference.py golden` runs it on synthetic keys, queries and a map that the test rebuilds bit for bit from an integer hash, so the fixture holds only the reference's outputs. Tur's kernels reproduce its buckets and key lists exactly, for three blocks, eight query positions and two budgets, and its centroids within 1e-5. A second test checks F32, F16 and Q8 pools, four K/V heads, 128-dimension heads and two sequences in one pass against an F64 scalar reference of the same algorithm, also exactly. Making either the merge cost or the window boundary wrong fails both tests. Sparse attention matches an F64 scalar reference over exactly the selected keys within 1e-5 for every format, with and without split-K, and reading each position off by one fails it.
 
 For quality, the dense model is the reference. The first check needs no Tur kernels: `scripts/lsa_reference.py` runs Qwen3.5-0.8B in Transformers, prefills a document densely, and runs its last 64 tokens once densely and once with each attention layer reading only the keys the reference selects. It reports how much of each layer's dense attention weight the selected keys hold, against the same number of most recent keys and against the best single list for all heads, and how far next-token logits move.
 
-The training-free map was fitted on four books at 32K tokens and tested on three other books and Tur's Rust sources, with the paper's budget of 4,612 keys:
+The training-free map was fitted on four books at 32K tokens with the Python reference; `tur sparse-map` fits the same subspaces (mean squared cosine 0.97 to 0.99 per layer, against 0.17 for a random one), and its map gives the same results at 32K within 0.01 of weight held and 0.001 of KL and tested on three other books and Tur's Rust sources, with the paper's budget of 4,612 keys:
 
 | Context | Weight held, LSA | Most recent keys | Best list | Mean KL | Top-1 agreement | Change in NLL |
 | --- | --- | --- | --- | --- | --- | --- |

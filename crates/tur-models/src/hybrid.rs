@@ -127,6 +127,11 @@ pub trait HybridModel: Send + Sync + 'static {
         Ok(0)
     }
 
+    /// Whether the model reads attention sparsely, so its pool must keep index blocks.
+    fn indexed(&self) -> bool {
+        false
+    }
+
     /// Compiled Metal kernels the engine may reuse for logit reductions, when the model
     /// runs on them; `None` keeps the engine's host path.
     #[cfg(feature = "metal")]

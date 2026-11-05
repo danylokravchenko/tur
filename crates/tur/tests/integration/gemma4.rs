@@ -53,6 +53,7 @@ fn pool(model: &Gemma4) -> Result<StatePool> {
             pages: 256,
             window_pages: 256,
             recurrent_slots: 1,
+            index_blocks: 0,
         },
     )
 }
@@ -346,6 +347,7 @@ fn test_gemma4_batched_assistant_chains_keep_their_rows() -> Result<()> {
             pages: 64,
             window_pages: 64,
             recurrent_slots: 2,
+            index_blocks: 0,
         },
     )?;
     engine.enable_draft_head();
@@ -608,6 +610,7 @@ fn test_gemma4_e2b_checkpoint_logits_match_transformers() -> Result<()> {
             pages: 64,
             window_pages: 64,
             recurrent_slots: 1,
+            index_blocks: 0,
         },
         &tokens,
         &stops,

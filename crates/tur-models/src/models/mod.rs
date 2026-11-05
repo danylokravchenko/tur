@@ -17,8 +17,8 @@ pub(crate) use gguf::{shard_name, split_name};
 pub(crate) use weights::STAGING_BYTES;
 pub mod weights;
 pub use options::{
-    DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, DraftHead, Execution, LoadOptions, WeightFormat,
-    Weights, parse_recurrent_state,
+    DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, DraftHead, Execution, LoadOptions, SparseAttention,
+    WeightFormat, Weights, parse_recurrent_state,
 };
 pub use weights::{Embedding, Method, Packer, Precision, Projection, WeightPlan};
 pub mod gemma4;

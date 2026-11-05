@@ -13,6 +13,7 @@ tur stop        Stop a server on this machine
 tur transcribe  Transcribe a WAV file with a Whisper checkpoint
 tur quantize    Prepack weights offline, optionally calibrated, for instant loading
 tur prune       Experiment: write a gpt-oss checkpoint with fewer experts
+tur sparse-map  Experiment: fit a Qwen model's latent sparse attention index map
 ```
 
 `tur <command> --help` prints every flag. This page groups the flags by purpose and gives their defaults.
@@ -88,6 +89,8 @@ Flags and the file override what a name brings. To run `gpt-oss` with every expe
 | `--vision-encoder [true\|false]` | `true` | Load the checkpoint's vision encoder when it has one (Qwen3.5 and Gemma 4); `false` saves its memory |
 | `--video-input [true\|false]` | `true` | Accept video through the vision encoder; `false` refuses it before any decoder reads the file, for untrusted clients, and images still work |
 | `--expert-cache-mb <MiB>` | every expert resident | Keep the experts of gpt-oss, a Qwen artifact or a Qwen GGUF file on disk and read them into this much memory; see [Expert cache](../architecture/expert-cache.md) |
+| `--sparse-attention off\|auto` | `off` | Experiment: past 16K keys, decoding and verifying queries of Qwen3.5-family models read only the keys `--sparse-map` selects; outputs differ from dense attention. See [latent sparse attention](../research/latent-sparse-attention.md) |
+| `--sparse-map <file>` | none | Index map for `--sparse-attention auto`, from `tur sparse-map` |
 | `--cpu-reference` | off | Run the slow F32 CPU reference instead of Metal, for development |
 
 Gemma 4 uses the same commands. For the E2B model used in development:
@@ -202,6 +205,20 @@ tur run qwen 'What happens in this clip?' --video clip.mp4
 
 [Prepacked weights](quantization.md) walks through the workflow. `tur prune` takes `--json` the same way, and its `--model` also accepts a repository.
 
+## Index maps (`sparse-map`)
+
+`tur sparse-map` prefills each calibration file as one long document, reads every full attention layer's keys back from the state pool, and writes each layer's leading 64 principal directions of their position-free dimensions: the training-free map `--sparse-map` reads.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--model <dir or org/name>` | required | Qwen3.5-family checkpoint: a directory, or a Hugging Face repository at `--revision` |
+| `--revision <rev>` | required | Identity of the checkpoint |
+| `--output <file>` | required | Index map to write |
+| `--calibration <files>` | required | Comma-separated text files, one long document each; the reference fits on eight |
+| `--context <n>` | 32768 | Tokens of each document, its first |
+| `--rows <n>` | 8192 | Key rows each document gives each layer, spread evenly across it |
+| `--weight-format q8_0\|q4k\|f32` | `q8_0` | Weights the calibration text runs through |
+
 ## Logging
 
 Logs go to stderr through `tracing`. `RUST_LOG` sets the filter, for example `RUST_LOG=tur_engine=debug`.
@@ -212,7 +229,7 @@ Logs go to stderr through `tracing`. `RUST_LOG` sets the filter, for example `RU
 - Progress is `tracing` events from a `Stage` in `tur-core`, not callbacks: no signature changes, a library user pays for a filtered event, and any front end can subscribe to the `tur_progress` target.
 - Monitoring reads the public `/diagnostics` over HTTP, in `serve` too, so there is one source of truth and it works remotely. Bars use `indicatif` and the dashboard `ratatui`; the client stays on `std` because it only makes plain GETs.
 - `tur stop` signals the process named by `/diagnostics` rather than calling a shutdown route. The API port has no authentication and allows any origin, so a route would let any web page stop the server. The signal limits stopping to the machine and the user running the server, and `stop` checks that the process is a `tur` binary, because a forwarded port can report a PID that means something else locally.
-- The banner animates for bare `tur`, `serve`, `quantize` and `prune`. `run`, `list`, `pull`, `transcribe`, `status` and `top` start without it, because people run them often or in scripts.
+- The banner animates for bare `tur`, `serve`, `quantize`, `prune` and `sparse-map`. `run`, `list`, `pull`, `transcribe`, `status` and `top` start without it, because people run them often or in scripts.
 - The model and prompt are positional because they are what every invocation changes. `TUR_MODEL` and `TUR_REVISION` are gone: they existed to shorten a command that names now shorten, and a positional argument read from the environment would make `tur run hello` ambiguous between a model and a prompt. `tur.toml` still selects a model for a directory.
 - `tur run` answers up to 1024 tokens, the server's default, fitted to the context. A limit of 128 ends models that think by default before their answer begins.
 - Per-run inputs stay explicit: prompts, tool files, CPU reference mode and quantization jobs are always flags, and logging stays in `RUST_LOG`.

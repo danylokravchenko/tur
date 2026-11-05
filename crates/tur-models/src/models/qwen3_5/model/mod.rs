@@ -35,7 +35,11 @@ use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
 
 #[cfg(feature = "metal")]
 mod fused;
+mod index_map;
 mod moe;
+pub use index_map::principal_map;
+#[cfg(feature = "metal")]
+mod sparse;
 
 use super::vision;
 
@@ -1026,6 +1030,7 @@ impl Qwen35 {
                 pages: self.description.pages_for(tokens.len()).max(1),
                 window_pages: self.description.pages_for(tokens.len()).max(1),
                 recurrent_slots: 1,
+                index_blocks: 0,
             },
         )?;
         let mut reservation = ModelState::new(&pool).reserve(tokens.len(), Boundaries::Final)?;
@@ -1763,6 +1768,16 @@ impl HybridModel for Qwen35 {
         }
         let _ = batch;
         Ok(0)
+    }
+
+    fn indexed(&self) -> bool {
+        #[cfg(feature = "metal")]
+        return self
+            .fused
+            .as_ref()
+            .is_some_and(|fused| fused.sparse.is_some());
+        #[cfg(not(feature = "metal"))]
+        false
     }
 
     /// Fused kernels replay; the reference path keeps every token's state instead.

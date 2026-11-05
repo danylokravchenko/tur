@@ -2,62 +2,19 @@
 //! decoding query reads. Follows the flat design of Prefrontal-AI's reference implementation;
 //! see the book's latent sparse attention chapter.
 use super::{Kernels, PagedKv, runtime::to_u32};
-use crate::pool::AttentionPool;
-use candle_core::{DType, Device, Tensor};
+use crate::pool::{AttentionPool, INDEX_BLOCK_TOKENS, INDEX_BUCKETS, INDEX_DIM, IndexPool};
+use candle_core::{DType, Tensor};
 use tur_core::{
     Result,
     execution::{KvFormat, invalid},
 };
 
-/// Keys in one index block (a cluster block): clustered once, when its last key is written.
-pub const INDEX_BLOCK_TOKENS: usize = 512;
-/// Buckets of one index block.
-pub const INDEX_BUCKETS: usize = 64;
-/// Dimensions of index keys and queries.
-pub const INDEX_DIM: usize = 64;
-/// Pools of four consecutive keys that one bucket holds at most (16 keys).
-pub const BUCKET_POOLS: usize = 4;
-const POOLS: usize = 128;
+const POOLS: usize = INDEX_BLOCK_TOKENS / 4;
 const MAX_TOP_P: usize = 1024;
 const MAX_FREE_DIMS: usize = 2048;
 const SCORE_CHUNK: usize = 256;
 /// Key positions travel as F32, exact below 2^24.
 const MAX_POSITION: usize = 1 << 24;
-
-/// One attention layer's index: for each index block, 64 unit centroids `[blocks, 64 * 64]`
-/// and each bucket's pools in ascending order `[blocks, 64 * 4]`, as F32 integers with -1
-/// past a bucket's size. Pool `i` of block `b` holds keys `512 b + 4 i ..= 512 b + 4 i + 3`.
-pub struct IndexPool {
-    centroids: Tensor,
-    members: Tensor,
-    blocks: usize,
-}
-
-impl IndexPool {
-    /// A zeroed pool of `blocks` index blocks on `device`.
-    pub fn new(device: &Device, blocks: usize) -> Result<Self> {
-        if blocks == 0 {
-            return Err(invalid("an index pool needs at least one block"));
-        }
-        Ok(Self {
-            centroids: Tensor::zeros((blocks, INDEX_BUCKETS * INDEX_DIM), DType::F32, device)?,
-            members: Tensor::zeros((blocks, INDEX_BUCKETS * BUCKET_POOLS), DType::F32, device)?,
-            blocks,
-        })
-    }
-
-    pub fn blocks(&self) -> usize {
-        self.blocks
-    }
-
-    pub fn centroids(&self) -> &Tensor {
-        &self.centroids
-    }
-
-    pub fn members(&self) -> &Tensor {
-        &self.members
-    }
-}
 
 /// A layer's map `[kv_heads * (head_dim - rotary), 64]` from the position-free key dims of
 /// every K/V head, concatenated, to index space. Rotation covers each head's first `rotary`
@@ -295,8 +252,8 @@ impl Kernels {
         let job_view = self.runtime.view(&jobs_tensor, DType::U32)?;
         let map_view = self.view(&map.map)?;
         map_view.contiguous("index map")?;
-        let centroids = self.view(&index.centroids)?;
-        let members = self.view(&index.members)?;
+        let centroids = self.view(index.centroids())?;
+        let members = self.view(index.members())?;
         let params = ClusterParams {
             jobs: to_u32(jobs.len(), "cluster jobs")?,
             kv_heads: to_u32(pool.kv_heads, "kv heads")?,
@@ -359,7 +316,7 @@ impl Kernels {
                 .checked_mul(pages)
                 .and_then(|p| p.checked_add(job.first_block as usize));
             let end_key = (job.block as usize + 1).checked_mul(INDEX_BLOCK_TOKENS);
-            if job.slot as usize >= index.blocks
+            if job.slot as usize >= index.blocks()
                 || end_page.is_none_or(|end| end > table_len)
                 || end_key.is_none_or(|end| end > MAX_POSITION)
             {
@@ -386,7 +343,7 @@ impl Kernels {
         if tokens != table.tokens
             || dim != map.head_dim
             || !heads.is_multiple_of(map.kv_heads)
-            || table.blocks > index.blocks
+            || table.blocks > index.blocks()
         {
             return Err(invalid("sparse selection shapes do not match"));
         }
@@ -397,8 +354,8 @@ impl Kernels {
         let index_table = self.runtime.view(&table.table, DType::U32)?;
         let first = self.runtime.view(&table.first, DType::U32)?;
         let visible = self.runtime.view(&table.visible, DType::U32)?;
-        let centroids = self.view(&index.centroids)?;
-        let members = self.view(&index.members)?;
+        let centroids = self.view(index.centroids())?;
+        let members = self.view(index.members())?;
         let stride = table.max_buckets.max(1);
         let scores = self.output(tokens, stride)?;
         if table.max_buckets > 0 {

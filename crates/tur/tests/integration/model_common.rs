@@ -92,6 +92,7 @@ pub(crate) fn pool(model: &Qwen35, pages: usize, slots: usize) -> Result<StatePo
             pages,
             window_pages: pages,
             recurrent_slots: slots,
+            index_blocks: 0,
         },
     )
 }

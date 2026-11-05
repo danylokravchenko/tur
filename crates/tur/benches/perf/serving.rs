@@ -1282,6 +1282,7 @@ pub(crate) fn run() -> Result<()> {
         video: false,
         expert_cache: expert_cache_bytes()?,
         gguf: None,
+        sparse: None,
     };
     let bench = Bench {
         factory: &factory,

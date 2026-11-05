@@ -11,7 +11,7 @@ use tur_core::{
     execution::{ModelDescription, invalid},
 };
 use tur_metal::{
-    pool::{PoolConfig, working_set_bytes},
+    pool::{PoolConfig, index_capacity, working_set_bytes},
     system::SystemMemory,
 };
 
@@ -85,6 +85,8 @@ pub struct PlanInputs {
     pub limit: Option<usize>,
     /// Bytes already leased by other models on the device.
     pub reserved: usize,
+    /// Keep latent sparse attention index blocks beside the pages.
+    pub indexed: bool,
 }
 
 impl MemoryPlan {
@@ -235,6 +237,7 @@ impl MemoryPlan {
             inputs.sequences,
             extra,
             inputs.pass_tokens,
+            inputs.indexed,
         )?;
         let full_contexts = match description.full_pages_for(sized_context) {
             0 => inputs.sequences,
@@ -303,11 +306,21 @@ fn wanted_pool_bytes(
             .ok_or_else(|| invalid("window page count overflow"))?,
         None => 0,
     };
+    let pages = description
+        .full_pages_for(context)
+        .checked_mul(inputs.sequences)
+        .ok_or_else(|| invalid("page count overflow"))?;
+    let index_blocks = if inputs.indexed {
+        index_capacity(
+            description,
+            pages,
+            inputs.sequences.saturating_add(inputs.retained),
+        )
+    } else {
+        0
+    };
     PoolConfig {
-        pages: description
-            .full_pages_for(context)
-            .checked_mul(inputs.sequences)
-            .ok_or_else(|| invalid("page count overflow"))?,
+        pages,
         window_pages,
         recurrent_slots: inputs
             .sequences
@@ -315,6 +328,7 @@ fn wanted_pool_bytes(
             .and_then(|slots| slots.checked_add(inputs.retained))
             .and_then(|slots| slots.checked_add(inputs.draft_slots))
             .ok_or_else(|| invalid("recurrent slot count overflow"))?,
+        index_blocks,
     }
     .bytes(description)
 }
@@ -479,6 +493,7 @@ mod tests {
             context: None,
             limit,
             reserved: 0,
+            indexed: false,
         }
     }
 

@@ -11,6 +11,8 @@
 //! `TUR_BENCH_BATCHES=1,2,4,8,16` sets the decode batches at the short context and
 //! `TUR_BENCH_CONTEXT_BATCHES=1,4` those at each of `TUR_BENCH_CONTEXTS`; larger models
 //! such as Gemma 4 E2B use fewer of both to keep a run short.
+//! `TUR_BENCH_SPARSE_MAP=<index map>` reads attention sparsely through that map, with the
+//! default budget and crossover, over indexed pools.
 
 use candle_core::Device;
 use serde_json::{Value, json};
@@ -28,7 +30,9 @@ use tur_engine::hybrid::{
     SamplingOptions, SequenceForward, StatePool,
 };
 use tur_models::models::TextModel;
-use tur_models::models::{Execution, LoadOptions, WeightFormat, Weights, parse_recurrent_state};
+use tur_models::models::{
+    Execution, LoadOptions, SparseAttention, WeightFormat, Weights, parse_recurrent_state,
+};
 use tur_models::models::{GgufFile, Manifest, is_artifact};
 
 const SHORT_CONTEXT: usize = 128;
@@ -69,6 +73,11 @@ fn pool(model: &TextModel, contexts: &[usize], extra: usize) -> Result<StatePool
         .iter()
         .map(|c| description.pages_for(c + extra) + 1)
         .sum();
+    let index_blocks = if model.indexed() {
+        tur_metal::pool::index_capacity(&description, pages, contexts.len())
+    } else {
+        0
+    };
     StatePool::new(
         Arc::new(description),
         model.device(),
@@ -76,6 +85,7 @@ fn pool(model: &TextModel, contexts: &[usize], extra: usize) -> Result<StatePool
             pages,
             window_pages: pages,
             recurrent_slots: 2 * contexts.len() + 2,
+            index_blocks,
         },
     )
 }
@@ -235,6 +245,7 @@ fn engine_case(model: Arc<TextModel>, generated: usize) -> Result<Value> {
         pages: model.description().pages_for(SHORT_CONTEXT + generated) + 1,
         window_pages: model.description().pages_for(SHORT_CONTEXT + generated) + 1,
         recurrent_slots: 2,
+        index_blocks: 0,
     };
     let mut engine = HybridEngine::new(model, device, config)?;
     let handle = engine.allocate(0, SamplingOptions::default(), None)?;
@@ -349,6 +360,7 @@ pub(crate) fn run() -> Result<()> {
     };
     let pages = env_sizes("TUR_BENCH_PAGES", "16")?;
     let reference = std::env::var("TUR_BENCH_REFERENCE").is_ok_and(|v| v == "1");
+    let sparse_map = std::env::var_os("TUR_BENCH_SPARSE_MAP").map(PathBuf::from);
     let engine_tokens = env_sizes("TUR_BENCH_ENGINE_TOKENS", "32")?
         .first()
         .copied()
@@ -392,7 +404,12 @@ pub(crate) fn run() -> Result<()> {
                         },
                     )?;
                     let load_seconds = load_start.elapsed().as_secs_f64();
+                    let mut model = model;
+                    if let Some(map) = &sparse_map {
+                        model.sparse_attention(&SparseAttention::new(map.clone()))?;
+                    }
                     let mut result = measure(&model, &sweep, &sweep.contexts)?;
+                    result["sparse_map"] = json!(sparse_map);
                     result["format"] = json!(name);
                     result["recurrent_state"] = json!(state);
                     result["execution"] = json!("Fused");

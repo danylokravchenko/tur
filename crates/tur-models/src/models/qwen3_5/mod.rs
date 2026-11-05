@@ -7,7 +7,7 @@ mod quantize;
 mod vision;
 
 pub use config::Config;
-pub use model::Qwen35;
+pub use model::{Qwen35, principal_map};
 pub use quantize::{
     Reference, Sensitivity, allocate, artifact_config, sensitivities, write_artifact,
     write_calibrated_artifact,

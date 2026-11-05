@@ -97,6 +97,10 @@ struct AttentionParams {
     uint window;
     uint ungated;
     uint sinks;
+    // Nonzero: each token reads the keys its list in `sparse_keys` names, `sparse_width` per
+    // row, `sparse_lengths[t]` of them, instead of a range of positions.
+    uint sparse;
+    uint sparse_width;
 };
 
 // Keys per attention_kv step: their table lookups and K/V loads are all in flight at once,
@@ -190,6 +194,8 @@ kernel void attention_kv(
     constant AttentionParams &p [[buffer(10)]],
     device const half *k_scales [[buffer(11)]],
     device const half *v_scales [[buffer(12)]],
+    device const float *sparse_keys [[buffer(13)]],
+    device const float *sparse_lengths [[buffer(14)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -207,10 +213,13 @@ kernel void attention_kv(
     uint split = rest % p.splits;
     uint t = rest / p.splits;
     uint g = h0 / (p.heads / p.kv_heads);
-    uint keys = visible[t];
+    // A sparse token's splits partition its key list; positions index the page table.
+    uint limit = visible[t];
+    uint keys = p.sparse != 0 ? uint(sparse_lengths[t]) : limit;
+    device const float *list = sparse_keys + ulong(t) * p.sparse_width;
     // Splits partition each query's own window, so a sliding layer keeps every split busy
     // however long the context grows.
-    uint first_key = p.window > 0 && keys > p.window ? keys - p.window : 0u;
+    uint first_key = p.sparse == 0 && p.window > 0 && keys > p.window ? keys - p.window : 0u;
     uint begin = first_key + split * p.split_keys;
     uint end = min(keys, begin + p.split_keys);
     uint base = first_block[t];
@@ -243,7 +252,14 @@ kernel void attention_kv(
         // Keys past the range repeat the last one and get zero weight. A step inside one
         // page, the common case and uniform across the simdgroup, needs one table lookup.
         uint rows[U];
-        if (j0 % p.page + U <= p.page && j0 + U <= end) {
+        if (p.sparse != 0) {
+            // Listed positions past the token's keys are clamped, so a malformed list can't
+            // read outside the token's pages.
+            for (uint u = 0; u < U; ++u) {
+                uint j = min(uint(list[min(j0 + u, end - 1)]), limit - 1);
+                rows[u] = (table[base + j / p.page] * p.page + j % p.page) * p.kv_heads + g;
+            }
+        } else if (j0 % p.page + U <= p.page && j0 + U <= end) {
             uint row = (table[base + j0 / p.page] * p.page + j0 % p.page) * p.kv_heads + g;
             for (uint u = 0; u < U; ++u) {
                 rows[u] = row + u * p.kv_heads;
@@ -716,7 +732,7 @@ kernel void attention_reduce_f32(
         device const float *, device const T *, device const T *, device const uint *, \
         device const uint *, device const uint *, device const float *, device float *, \
         device float *, device float *, constant AttentionParams &, device const half *, \
-        device const half *, uint, uint, uint, uint);
+        device const half *, device const float *, device const float *, uint, uint, uint, uint);
 #define KV_FORMAT(R, NAME, T, QUANT) \
     TILED(R, NAME, T, QUANT) \
     template [[host_name("kv_write_r" #R "_" #NAME)]] kernel void kv_write<R, T, QUANT>( \

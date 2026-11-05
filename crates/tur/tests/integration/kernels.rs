@@ -53,7 +53,7 @@ pub(crate) fn read(tensor: &Tensor) -> Result<Vec<f32>> {
 }
 
 /// Max absolute error relative to the reference's largest magnitude.
-fn relative_error(actual: &[f32], expected: &[f64]) -> f64 {
+pub(crate) fn relative_error(actual: &[f32], expected: &[f64]) -> f64 {
     assert_eq!(actual.len(), expected.len(), "length");
     assert!(actual.iter().all(|v| v.is_finite()), "non-finite output");
     let scale = expected
@@ -72,7 +72,7 @@ fn silu(x: f64) -> f64 {
     x / (1.0 + (-x).exp())
 }
 
-fn sigmoid(x: f64) -> f64 {
+pub(crate) fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
 
