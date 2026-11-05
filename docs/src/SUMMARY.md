@@ -50,3 +50,4 @@
 - [Research: serving larger models](research/strata-large-model-serving.md)
 - [Research: serving technique gaps](research/serving-technique-gaps.md)
 - [Research: hybrid state ideas from vLLM](research/hybrid-state-from-vllm.md)
+- [Research: latent sparse attention](research/latent-sparse-attention.md)

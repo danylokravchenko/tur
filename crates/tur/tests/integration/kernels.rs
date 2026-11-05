@@ -24,7 +24,7 @@ use tur_metal::{
 /// this file run one at a time.
 static GPU: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-fn setup() -> Result<(Device, Kernels, parking_lot::MutexGuard<'static, ()>)> {
+pub(crate) fn setup() -> Result<(Device, Kernels, parking_lot::MutexGuard<'static, ()>)> {
     let guard = GPU.lock();
     let device = Device::new_metal(0)?;
     let kernels = Kernels::new(&device)?;
@@ -48,7 +48,7 @@ fn upload(device: &Device, data: &[f32], shape: &[usize]) -> Result<Tensor> {
     Ok(Tensor::from_slice(data, shape, device)?)
 }
 
-fn read(tensor: &Tensor) -> Result<Vec<f32>> {
+pub(crate) fn read(tensor: &Tensor) -> Result<Vec<f32>> {
     Ok(tensor.flatten_all()?.to_vec1::<f32>()?)
 }
 
@@ -824,7 +824,7 @@ fn paged_pool(case: &AttentionCase, seed: u64) -> Pool {
 /// Store F32 pool rows in `format`. Quantized pools keep NaN poison in the scales of
 /// unused slots (codes cannot hold NaN); returns the device pool and its exact dequantized
 /// host values, which are what a correct kernel reads.
-fn stored(
+pub(crate) fn stored(
     device: &Device,
     rows: &[f32],
     slots: usize,

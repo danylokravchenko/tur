@@ -5,8 +5,13 @@
 //! ranges) before encoding; nothing falls back to the CPU. Kernels only enqueue work: the
 //! caller fences with [`crate::completion::Completion`] before reading results.
 
+mod lsa;
 mod moe;
 mod runtime;
+pub use lsa::{
+    BUCKET_POOLS, ClusterJob, INDEX_BLOCK_TOKENS, INDEX_BUCKETS, INDEX_DIM, IndexMap, IndexPool,
+    IndexTable, SparseBudget, SparseKeys,
+};
 pub use moe::{ExpertRoutes, SharedExpert};
 
 use crate::{

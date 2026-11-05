@@ -25,7 +25,8 @@ use tur_core::{Result, TurError, execution::invalid};
 /// 4: windowed ungated attention and learned expert route scales.
 /// 5: windowed ungated tiled attention.
 /// 6: attention sinks and MXFP4 expert banks.
-pub const LAYOUT_VERSION: u32 = 6;
+/// 7: latent sparse attention index blocks and key lists.
+pub const LAYOUT_VERSION: u32 = 7;
 
 // Runtime Metal compilation has no local include search path, so embed the families as
 // one source string with shared helpers first.
@@ -45,6 +46,8 @@ const SOURCE: &str = concat!(
     include_str!("moe.metal"),
     "\n",
     include_str!("sampling.metal"),
+    "\n",
+    include_str!("lsa.metal"),
 );
 const SIMD_WIDTH: usize = 32;
 
@@ -172,6 +175,11 @@ const FUNCTIONS: &[&str] = &[
     "delta_step_d256_r16_bf16",
     "delta_step_d256_r32_bf16",
     "argmax_f32",
+    "lsa_cluster_f32",
+    "lsa_cluster_f16",
+    "lsa_cluster_q8",
+    "lsa_score_f32",
+    "lsa_select_f32",
     "penalize_f32",
     "mask_f32",
     "sample_f32",
