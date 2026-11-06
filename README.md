@@ -52,7 +52,7 @@ Tur against llama.cpp on an M3 Pro with 36 GB, in tokens per second. 4-bit rows 
 | Qwen3.5-0.8B, 8-bit, prefill, 2K tokens | 3,799 | 3,383 | +12% |
 | Qwen3.6-35B, 4-bit, decode, 1 sequence | 47.1 | 35.6 | +32% |
 
-Tur doesn't win everywhere: on a 16 GB M1, llama.cpp prefills 8K-token prompts 6 to 11% faster, and 27 to 35% faster after 32K to 128K of context, where its attention kernel does more arithmetic per second than Tur's. Prefill is mostly compute, so Tur's savings on memory reads help less there. With sparse attention, Tur prefills after 64K of context 2.6 times as fast as llama.cpp.
+Tur doesn't win everywhere: on a 16 GB M1, llama.cpp prefills 8K-token prompts 6 to 11% faster, and 20 to 28% faster after 32K to 128K of context, where its attention kernel does more arithmetic per second than Tur's. Prefill is mostly compute, so Tur's savings on memory reads help less there. With sparse attention, Tur prefills after 64K of context 2.6 times as fast as llama.cpp.
 
 Other results for Qwen3.5-0.8B on that 16 GB M1:
 

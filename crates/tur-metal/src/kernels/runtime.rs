@@ -121,6 +121,7 @@ const FUNCTIONS: &[&str] = &[
     "attention_tiled_r8_f32",
     "attention_tiled_r8_f16",
     "attention_tiled_r8_q8",
+    "attention_split_f16",
     "attention_reduce_r2_f32",
     "attention_reduce_r4_f32",
     "attention_reduce_r8_f32",

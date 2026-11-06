@@ -2198,7 +2198,15 @@ impl Kernels {
             sparse: u32::from(shape.sparse.is_some()),
             sparse_width: to_u32(shape.sparse.map_or(0, SparseKeys::width), "sparse width")?,
         };
-        let pipeline = self.pipeline(&Self::kv_kernel("attention_tiled", dim, pool.format)?)?;
+        // Dense F16 tiles of 256-dimension heads use the layout that reuses operands;
+        // key lists, other formats and other head sizes keep the per-row tiles.
+        let split = shape.sparse.is_none() && pool.format == KvFormat::F16 && dim == 256;
+        let name = if split {
+            "attention_split_f16".to_owned()
+        } else {
+            Self::kv_kernel("attention_tiled", dim, pool.format)?
+        };
+        let pipeline = self.pipeline(&name)?;
         if pipeline.threads(TILE_THREADS) != TILE_THREADS {
             return Err(invalid(
                 "tiled attention pipeline cannot run a full query tile",
@@ -2234,7 +2242,10 @@ impl Kernels {
                 let (keys, lengths) = lists.as_ref().map_or((qv, qv), |(k, l)| (k, l));
                 keys.bind(e, 12)?;
                 lengths.bind(e, 13)?;
-                e.set_threadgroup_memory_length(0, Self::tiled_memory_bytes());
+                // The operand-reusing tiles declare their threadgroup memory statically.
+                if !split {
+                    e.set_threadgroup_memory_length(0, Self::tiled_memory_bytes());
+                }
                 Ok(())
             })?;
         self.finish(out, (kv.tokens, heads * dim))

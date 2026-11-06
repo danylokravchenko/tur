@@ -700,6 +700,186 @@ kernel void attention_tiled(
     }
 }
 
+// Dense F16 query tiles of 256-dimension heads, laid out so each operand a simdgroup loads
+// feeds several multiplies; loading operands from threadgroup memory, not the multiplies,
+// bounds the per-row kernel above. For each block of 32 keys, simdgroup `sg` computes a
+// 2x2 block of score fragments (two row blocks by two key fragments) and writes it out;
+// then it normalizes row block `sg`'s scores in place; then it owns output dims
+// [64 sg, 64 sg + 64) of all 32 rows, so every value fragment it loads multiplies four
+// row blocks of weights. Key chunks stream through two buffers, and the value block
+// stages beside the last key chunk.
+#define SPLIT_D 256
+#define SPLIT_CHUNKS (SPLIT_D / TD)
+kernel void attention_split_f16(
+    device const float *q [[buffer(0)]],
+    device const half *k [[buffer(1)]],
+    device const half *v [[buffer(2)]],
+    device const uint *table [[buffer(3)]],
+    device const uint *first_block [[buffer(4)]],
+    device const uint *visible [[buffer(5)]],
+    device const float *gate [[buffer(6)]],
+    device float *out [[buffer(7)]],
+    device const uint *tiles [[buffer(8)]],
+    constant TiledParams &p [[buffer(9)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup half kst[2 * TK * TD];
+    threadgroup half vst[TK * SPLIT_D];
+    threadgroup float sp[TQ * TK];
+    threadgroup float lrow[TQ];
+    threadgroup float crow[TQ];
+    uint h = tg % p.heads;
+    uint tile = tg / p.heads;
+    if (tile >= p.tiles) {
+        return;
+    }
+    uint t0 = tiles[2 * tile];
+    uint n = tiles[2 * tile + 1];
+    uint g = h / (p.heads / p.kv_heads);
+    ushort2 fc = fragment_coord(lane);
+    uint keys = visible[t0 + n - 1];
+    uint start = p.window > 0 && visible[t0] > p.window ? (visible[t0] - p.window) / TK * TK : 0;
+    uint base = first_block[t0];
+    // Scores and softmax per simdgroup: rows 8 sg.. in registers, as the per-row tiles.
+    uint row = 8 * sg + fc.x;
+    uint token = t0 + min(row, n - 1);
+    uint limit = row < n ? visible[token] : 0;
+    uint lower = p.window > 0 && limit > p.window ? limit - p.window : 0;
+    device const float *qr = q + (ulong(token) * p.heads + h) * SPLIT_D;
+    float m = p.sinks != 0 ? gate[h] : -FLT_MAX;
+    float l = p.sinks != 0 ? 1.0f : 0.0f;
+    simdgroup_float8x8 o[4][TD / 8];
+    #pragma clang loop unroll(full)
+    for (uint rb = 0; rb < 4; ++rb) {
+        #pragma clang loop unroll(full)
+        for (uint u = 0; u < TD / 8; ++u) {
+            o[rb][u] = simdgroup_float8x8(0.0f);
+        }
+    }
+    uint key0 = tid / (TD / 4);
+    uint d0 = 4 * (tid % (TD / 4));
+    tile_keys none = {nullptr, 0};
+    for (uint kb = start; kb < keys; kb += TK) {
+        uint slot[LOADS];
+        kv_slots(slot, table, base, kb, keys, key0, p.page, none);
+        vec<half, 4> fetched[LOADS];
+        kv_fetch<half>(fetched, k, slot, kb, keys, key0, p.kv_heads, g, SPLIT_D, d0);
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < LOADS; ++i) {
+            *(threadgroup vec<half, 4> *)(kst + (key0 + i * KEY_STRIDE) * TD + d0) = fetched[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 s[TK / 8];
+        #pragma clang loop unroll(full)
+        for (uint kt = 0; kt < TK / 8; ++kt) {
+            s[kt] = simdgroup_float8x8(0.0f);
+        }
+        #pragma clang loop unroll(full)
+        for (uint c = 0; c < SPLIT_CHUNKS; ++c) {
+            // Read the next key chunk and value chunk `c` while this key chunk multiplies,
+            // then stage them; the value block's last reader was the previous block's P.V.
+            vec<half, 4> next_keys[LOADS];
+            vec<half, 4> values[LOADS];
+            if (c + 1 < SPLIT_CHUNKS) {
+                kv_fetch<half>(next_keys, k, slot, kb, keys, key0, p.kv_heads, g, SPLIT_D, (c + 1) * TD + d0);
+            }
+            kv_fetch<half>(values, v, slot, kb, keys, key0, p.kv_heads, g, SPLIT_D, c * TD + d0);
+            tile_scores<half, false>(s, kst + (c % 2) * TK * TD, qr, c, fc, p.scale);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < LOADS; ++i) {
+                uint key = key0 + i * KEY_STRIDE;
+                if (c + 1 < SPLIT_CHUNKS) {
+                    *(threadgroup vec<half, 4> *)(kst + ((c + 1) % 2) * TK * TD + key * TD + d0) = next_keys[i];
+                }
+                *(threadgroup vec<half, 4> *)(vst + key * SPLIT_D + c * TD + d0) = values[i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        // Online softmax in registers; the weights and each row's rescale go to the
+        // simdgroups that own the output dims.
+        float block = -FLT_MAX;
+        #pragma clang loop unroll(full)
+        for (uint kt = 0; kt < TK / 8; ++kt) {
+            #pragma clang loop unroll(full)
+            for (uint e = 0; e < 2; ++e) {
+                uint key = kb + 8 * kt + fc.y + e;
+                float score = s[kt].thread_elements()[e] * p.scale;
+                s[kt].thread_elements()[e] = score;
+                block = key >= lower && key < limit ? max(block, score) : block;
+            }
+        }
+        float m_new = max(m, row_max(block));
+        float total = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint kt = 0; kt < TK / 8; ++kt) {
+            #pragma clang loop unroll(full)
+            for (uint e = 0; e < 2; ++e) {
+                uint key = kb + 8 * kt + fc.y + e;
+                float w = key >= lower && key < limit ? exp(s[kt].thread_elements()[e] - m_new) : 0.0f;
+                s[kt].thread_elements()[e] = w;
+                total += w;
+            }
+            simdgroup_store(s[kt], sp + 8 * sg * TK + 8 * kt, TK);
+        }
+        float correction = exp(m - m_new);
+        l = l * correction + row_sum(total);
+        m = m_new;
+        crow[row] = correction;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (uint rb = 0; rb < 4; ++rb) {
+            float scale = crow[8 * rb + fc.x];
+            #pragma clang loop unroll(full)
+            for (uint u = 0; u < TD / 8; ++u) {
+                o[rb][u].thread_elements()[0] *= scale;
+                o[rb][u].thread_elements()[1] *= scale;
+            }
+        }
+        #pragma clang loop unroll(full)
+        for (uint kt = 0; kt < TK / 8; ++kt) {
+            simdgroup_float8x8 w[4];
+            #pragma clang loop unroll(full)
+            for (uint rb = 0; rb < 4; ++rb) {
+                simdgroup_load(w[rb], sp + 8 * rb * TK + 8 * kt, TK);
+            }
+            #pragma clang loop unroll(full)
+            for (uint u = 0; u < TD / 8; ++u) {
+                simdgroup_half8x8 b;
+                simdgroup_load(b, vst + 8 * kt * SPLIT_D + TD * sg + 8 * u, SPLIT_D);
+                #pragma clang loop unroll(full)
+                for (uint rb = 0; rb < 4; ++rb) {
+                    simdgroup_multiply_accumulate(o[rb][u], w[rb], b, o[rb][u]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    lrow[row] = l;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    #pragma clang loop unroll(full)
+    for (uint rb = 0; rb < 4; ++rb) {
+        uint out_row = 8 * rb + fc.x;
+        if (out_row >= n) {
+            continue;
+        }
+        uint out_token = t0 + out_row;
+        float sum = lrow[out_row];
+        float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+        device const float *gr = gate + ulong(out_token) * p.gate_stride + p.gate_col + ulong(h) * p.gate_head_stride;
+        device float *orow = out + (ulong(out_token) * p.heads + h) * SPLIT_D;
+        #pragma clang loop unroll(full)
+        for (uint u = 0; u < TD / 8; ++u) {
+            #pragma clang loop unroll(full)
+            for (uint e = 0; e < 2; ++e) {
+                uint col = TD * sg + 8 * u + fc.y + e;
+                orow[col] = o[rb][u].thread_elements()[e] * inv * (p.ungated ? 1.0f : sigmoid(gr[col]));
+            }
+        }
+    }
+}
+
 // Combine split partials of one (token, head) and apply the sigmoid output gate.
 template <uint R>
 kernel void attention_reduce_f32(
