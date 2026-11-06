@@ -1648,9 +1648,8 @@ impl Kernels {
             tiles.saturating_mul(heads) >= groups
                 // Sparse query tiles waste matrix work and lose split-K parallelism.
                 && (groups == 0 || kv.tokens >= tiles.saturating_mul(TILE_QUERIES / 2))
-                && matches!(dim, 64 | 128 | 256)
+                && matches!(dim, 64 | 128 | 256 | 512)
                 && self.capabilities().max_threads_per_threadgroup >= TILE_THREADS
-                && Self::tiled_memory_bytes() <= self.capabilities().threadgroup_memory_bytes
         })
     }
 
@@ -2198,14 +2197,18 @@ impl Kernels {
             sparse: u32::from(shape.sparse.is_some()),
             sparse_width: to_u32(shape.sparse.map_or(0, SparseKeys::width), "sparse width")?,
         };
-        // Dense F16 tiles of 256-dimension heads use the occupancy-bound layout; key lists,
-        // other formats and other head sizes keep the per-row tiles.
-        let split = shape.sparse.is_none() && pool.format == KvFormat::F16 && dim == 256;
-        let name = if split {
-            "attention_split_f16".to_owned()
-        } else {
-            Self::kv_kernel("attention_tiled", dim, pool.format)?
-        };
+        // 128- and 256-dimension heads use the occupancy-sized tiles; 64-dimension heads
+        // measured level with the per-row tiles and 512-dimension ones faster with them.
+        let split = matches!(dim, 128 | 256);
+        let name = Self::kv_kernel(
+            if split {
+                "attention_split"
+            } else {
+                "attention_tiled"
+            },
+            dim,
+            pool.format,
+        )?;
         let pipeline = self.pipeline(&name)?;
         if pipeline.threads(TILE_THREADS) != TILE_THREADS {
             return Err(invalid(

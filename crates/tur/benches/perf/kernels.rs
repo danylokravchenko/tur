@@ -616,6 +616,69 @@ fn tiled_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     Ok(cases)
 }
 
+/// The tiled-against-per-query crossover at Gemma 4 E2B's full layers: 8 ungated query heads
+/// over one K/V head of 512 dimensions, unscaled scores, no window. `TUR_BENCH_HEAD_DIM`
+/// replaces the head size.
+fn tiled_global_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+    let dim = std::env::var("TUR_BENCH_HEAD_DIM")
+        .map_or(Ok(512), |v| v.parse::<usize>())
+        .map_err(|_| TurError::Other("TUR_BENCH_HEAD_DIM".into()))?;
+    let (heads, kv_heads) = (8usize, 1usize);
+    let tiled = kernels.clone().with_tuning(Tuning {
+        attention_tiled_ungated_groups: 0,
+        ..kernels.tuning()
+    })?;
+    let simd = kernels.clone().with_tuning(Tuning {
+        attention_tiled_ungated_groups: usize::MAX,
+        ..kernels.tuning()
+    })?;
+    let shapes = [
+        ("global prefill 64", 0usize, 64usize),
+        ("global prefill 256", 0, 256),
+        ("global prefill 2048", 0, 2048),
+        ("global chunk 256 after 8192", 8192, 256),
+        ("global chunk 2048 after 32768", 32_768, 2048),
+    ];
+    let mut cases = Vec::new();
+    let shape_filter = std::env::var("TUR_BENCH_SHAPE").ok();
+    for (label, past, new) in shapes {
+        if shape_filter
+            .as_ref()
+            .is_some_and(|filter| !label.contains(filter))
+        {
+            continue;
+        }
+        let q = random(device, &[new, heads, dim], 5, 1.0)?;
+        for format in tiled_formats()? {
+            let paged = paged(device, kernels, format, 16, kv_heads, dim, past, new, 1)?;
+            let run = |k: &Kernels| {
+                time(device, || {
+                    k.attention_ungated(&q, &paged.pool, &paged.kv, None, 1.0)
+                })
+            };
+            let t = run(&tiled)?;
+            let s = if std::env::var("TUR_BENCH_PER_QUERY").is_ok_and(|v| v == "0") {
+                json!({"median_seconds": 0.0})
+            } else {
+                run(&simd)?
+            };
+            eprintln!(
+                "{label:30} {format:5}: tiled {:8.3} ms  per-query {:8.3} ms  x{:.2}",
+                t["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
+                s["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
+                speedup(&t, &s),
+            );
+            cases.push(json!({
+                "operation": "attention_tiled_global", "shape": label,
+                "kv_format": format.to_string(), "heads": heads, "kv_heads": kv_heads,
+                "head_dim": dim, "context": past + new, "tiles": paged.kv.tiles(),
+                "tiled": t, "per_query": s, "speedup": speedup(&t, &s),
+            }));
+        }
+    }
+    Ok(cases)
+}
+
 /// The same crossover at Gemma 4 E2B sliding layers: 8 ungated query heads over one K/V
 /// head of 256 dimensions, unscaled scores and a 512-key window.
 fn tiled_window_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
@@ -1237,6 +1300,7 @@ pub(crate) fn run() -> Result<()> {
             "paged_attention": if skip("paged") { json!([]) } else { json!(paged_cases(&device, &kernels)?) },
             "tiled_attention": if skip("tiled") { json!([]) } else { json!(tiled_cases(&device, &kernels)?) },
             "tiled_window_attention": if skip("tiled") { json!([]) } else { json!(tiled_window_cases(&device, &kernels)?) },
+            "tiled_global_attention": if skip("tiled") { json!([]) } else { json!(tiled_global_cases(&device, &kernels)?) },
             "packed_linear": if skip("linear") { json!([]) } else { json!(gemv_cases(&device, &kernels)?) },
             "sampling": if skip("sample") { json!([]) } else { json!(sample_cases(&device, &kernels)?) },
             "moe": if skip("moe") { json!([]) } else { json!(moe_cases(&device, &kernels)?) },

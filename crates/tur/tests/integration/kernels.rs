@@ -1137,7 +1137,7 @@ fn test_tiled_attention_matches_reference_for_every_format_and_tile_shape() -> R
         attention_tiled_groups: 0,
         ..kernels.tuning()
     })?;
-    for dim in [64usize, 128, 256] {
+    for dim in [64usize, 128, 256, 512] {
         // Partial and whole query tiles, key counts off the 32-key blocks, a single-token
         // sequence and a long prefill continuing 37 committed keys.
         let case = AttentionCase {
@@ -1197,7 +1197,7 @@ fn test_tiled_ungated_windowed_attention_matches_scalar_reference() -> Result<()
         attention_tiled_ungated_groups: 0,
         ..kernels.tuning()
     })?;
-    for dim in [64, 128, 256] {
+    for dim in [64, 128, 256, 512] {
         // Tiles crossing pages and key blocks, a long prefill continuing committed keys,
         // and windows shorter than, across and longer than one 32-key block.
         let case = AttentionCase {
@@ -1266,10 +1266,10 @@ fn test_tiled_attention_dispatch_preserves_decode_parallelism() -> Result<()> {
     assert!(!kernels.attention_tiled(&short, 8, 256));
     assert!(kernels.attention_tiled(&crossover, 8, 256));
     let prefill = kernels.paged_kv(16, 256, &table, &[0; 256], &visible)?;
-    for dim in [64, 128, 256] {
+    for dim in [64, 128, 256, 512] {
         assert!(kernels.attention_tiled(&prefill, 32, dim));
     }
-    for dim in [0, 32, 192, 512] {
+    for dim in [0, 32, 192] {
         assert!(!kernels.attention_tiled(&prefill, 32, dim));
     }
     let per_query = kernels.clone().with_tuning(Tuning {
