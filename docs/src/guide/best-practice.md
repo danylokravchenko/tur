@@ -20,7 +20,7 @@ This page gives a starting configuration for each model Tur supports: which weig
 
 A dense model runs every parameter for every token. On the large ones, prefill is limited by arithmetic: Qwen3.8-27B prefills about 92 tokens/s, so a 2K-token prompt takes 22 s, while batching is nearly free because one pass reads the weights once for all sequences. Keep prefix reuse on so a prompt is computed only once, and raise the batch size before you worry about decode speed.
 
-An MoE model uses a few experts per token, so it runs faster than its size suggests, but the whole bank has to live somewhere. Keep every expert resident when the model fits. The expert cache exists to run what doesn't fit, and reading experts from the SSD costs far more than batching saves: Qwen3.6-35B-A3B makes 101.5 tokens/s across 8 resident requests and 25.7 across 16 through a 4 GiB cache.
+An MoE model uses a few experts per token, so it runs faster than its size suggests, but the whole bank has to live somewhere. Keep every expert resident when the model fits. The expert cache exists to run what doesn't fit, and reading experts from the SSD costs far more than batching saves: Qwen3.6-35B-A3B makes 94.8 tokens/s across 8 resident requests and 25.7 across 16 through a 4 GiB cache.
 
 These rules apply to every model:
 
@@ -154,9 +154,9 @@ served_model_name = "qwen-35b"
 max_batch_size = 4
 ```
 
-For chat history and agents, set `mtp = false` and raise `max_batch_size` to 8, which is the most that runs resident on 36 GB and gives 101.5 tokens/s. Sixteen resident requests run out of GPU memory.
+For chat history and agents, set `mtp = false` and raise `max_batch_size` to 8, which is the most that runs resident on 36 GB and gives 94.8 tokens/s. Sixteen resident requests run out of GPU memory.
 
-Use the cache only for 16 requests at once, or on a Mac where the model doesn't fit. A 4 GiB cache ran 16 requests at 25.7 tokens/s with a median of 315 ms between tokens. The cache needs an artifact, and Tur raises the prefill chunk and snapshot spacing to 1,024 tokens for you. Leave MTP off, because the head hasn't been measured through the cache.
+Use the cache only for 16 requests at once, or on a Mac where the model doesn't fit. A 4 GiB cache ran 16 requests at 25.7 tokens/s with a median of 364 to 398 ms between tokens. The cache needs an artifact, and Tur raises the prefill chunk and snapshot spacing to 1,024 tokens for you. Leave MTP off, because the head hasn't been measured through the cache.
 
 ```toml
 [model]

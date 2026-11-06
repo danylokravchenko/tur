@@ -301,6 +301,83 @@ Batched decode with Q8_0, total tokens/s at about 128 tokens of context (Tur fro
 
 Tur prefills 11 to 13% faster and decodes one Q8_0 sequence 9% faster. With more sequences the lead grows to 31 to 60%, and Tur's 4-bit decode is 27 to 29% ahead of Q4_K_M. Tur's 4-bit prefill is 5 to 6% slower than its Q8_0 prefill.
 
+#### Long contexts, tiled attention and MTP
+
+The tiled dense attention kernels, sparse attention and the MTP head, on the same M3 Pro. Q8_0 is converted at load from the checkpoint; Q4K is a plain-rounding artifact (`tur quantize --method rtn --weight-format q4k`, 414 MiB). K/V is F16. Each sparse run uses an index map fitted on the weights it serves, but from 131K tokens of this repository's documentation and Rust source rather than books, and no retrieval check was run on these maps, so these rows show speed only. Decode is the median of 12 timed steps and prefill the median of two passes.
+
+The tiled prefill kernel against the per-query one (`kernels` benchmark, F16 K/V, Qwen3.5 attention shapes):
+
+| Prefill shape | Tiled | Per-query | Speedup |
+| --- | --- | --- | --- |
+| 2048 tokens | 4.8 ms | 14.9 ms | 3.1× |
+| 8192 tokens | 73 ms | 623 ms | 8.5× |
+| 2048-token chunk after 32K | 165 ms | 2,775 ms | 16.9× |
+
+Below 128 tokens the per-query kernel is faster (0.4 to 0.6× at 16 to 64 tokens), and the two meet at 128. For one decode token, selecting keys and attending to them takes 0.25 ms at 32K against 0.81 ms for dense attention, 0.26 ms against 1.65 ms at 64K, and 0.29 ms against 4.1 ms at 128K.
+
+Prefill of a 2048-token chunk after a long context, in prompt tokens/s:
+
+| Context before the chunk | Q8_0 dense | Q8_0 sparse | Q4K dense | Q4K sparse |
+| --- | --- | --- | --- | --- |
+| 4K | 3,154 | 3,148 | 3,043 | 2,984 |
+| 32K | 1,379 | 2,885 | 1,324 | 2,769 |
+| 64K | 800 | 2,632 | 805 | 2,569 |
+
+Decode in tokens/s, with the time per step:
+
+| Sequences, context | Q8_0 dense | Q8_0 sparse | Q4K dense | Q4K sparse |
+| --- | --- | --- | --- | --- |
+| 1 at 4K | 117 (8.6 ms) | 111 (9.0 ms) | 168 (6.0 ms) | 164 (6.1 ms) |
+| 1 at 32K | 80 (12.5 ms) | 100 (10.0 ms) | 98 (10.2 ms) | 135 (7.4 ms) |
+| 4 at 32K | 119 (33.6 ms) | 294 (13.6 ms) | 132 (30.2 ms) | 347 (11.5 ms) |
+| 1 at 64K | 56 (17.9 ms) | 97 (10.3 ms) | 69 (14.5 ms) | 134 (7.5 ms) |
+| 4 at 64K | 63 (63.1 ms) | 297 (13.5 ms) | 65 (61.8 ms) | 335 (11.9 ms) |
+
+Below the 16K crossover sparse attention reads every key and the two columns agree within run-to-run noise. Past it, prefill stays within 17% of its 4K speed out to 64K, and four sequences at 64K take 1.3× the step time of one, where dense takes 3.5×.
+
+Short prompts through the full server (`serving` benchmark, 64 output tokens, greedy), in output tokens/s:
+
+| Concurrent requests | 1 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- |
+| Q8_0 | 109 | 302 | 436 | 546 |
+| Q4K | 150 | 317 | 442 | 490 |
+
+Four drafts from the MTP head against normal decoding (`TUR_BENCH_WORKLOADS=speculation`, 128 output tokens, greedy, best of three repeats), in output tokens/s:
+
+| Prompt, requests | Q8_0 normal | Q8_0 MTP | Q4K normal | Q4K MTP |
+| --- | --- | --- | --- | --- |
+| Repetitive, 1 | 115 | 430 | 156 | 512 |
+| Repetitive, 4 | 364 | 753 | 424 | 758 |
+| Novel prose, 1 | 117 | 161 | 161 | 202 |
+| Novel prose, 4 | 381 | 476 | 454 | 510 |
+| Code, 1 | 117 | 167 | 159 | 188 |
+| Code, 4 | 382 | 473 | 447 | 510 |
+
+The head gains 3.3 to 3.8× on repetitive text with one request and 1.2 to 1.4× on prose and code. With four requests the gain falls to 1.8 to 2.1× on repetitive text and 1.1 to 1.25× on the rest. The same prompts with sparse attention enabled never reach the 16K crossover, so they measure its fixed cost. Q4K matched or beat the runs above (169 against 156 tokens/s for one normal request, 203 against 202 with MTP on novel prose). Q8_0 was about 7% slower with one request (106 to 109 against 115 to 117 tokens/s) and 5 to 8% slower with four, which these runs don't explain.
+
+One long prompt through the server (`TUR_BENCH_WORKLOADS=long TUR_BENCH_MTP=0,1`, 128 output tokens, cold prefix cache, one run each). The prompt is a synthetic list of repeated words, so the MTP rows show cost at depth, not the head's usual acceptance:
+
+| Prompt, weights | Mode | TTFT p50 | ITL p50 (MTP: gap between bursts) | Tokens per pass |
+| --- | --- | --- | --- | --- |
+| 32K, Q8_0 | dense | 16.5 s | 12.8 ms | 1.00 |
+|  | dense + MTP | 18.0 s | 20.0 ms | 1.94 |
+|  | sparse | 12.5 s | 10.1 ms | 1.00 |
+|  | sparse + MTP | 14.1 s | 12.9 ms | 1.83 |
+| 64K, Q8_0 | dense | 48.4 s | 18.1 ms | 1.00 |
+|  | dense + MTP | 53.9 s | 19.6 ms | 1.28 |
+|  | sparse | 25.2 s | 10.3 ms | 1.00 |
+|  | sparse + MTP | 30.8 s | 12.6 ms | 1.12 |
+| 32K, Q4K | dense | 16.7 s | 9.7 ms | 1.00 |
+|  | dense + MTP | 18.3 s | 16.9 ms | 1.54 |
+|  | sparse | 13.1 s | 7.5 ms | 1.00 |
+|  | sparse + MTP | 14.5 s | 8.5 ms | 1.08 |
+| 64K, Q4K | dense | 48.8 s | 14.6 ms | 1.00 |
+|  | dense + MTP | 54.5 s | 16.5 ms | 1.39 |
+|  | sparse | 26.1 s | 7.7 ms | 1.00 |
+|  | sparse + MTP | 31.8 s | 9.5 ms | 1.08 |
+
+Sparse attention halves the 64K first-token time and cuts the gap between tokens by 40 to 50%. MTP does not pay at these depths on this prompt: the first token arrives 10 to 20% later and the gap between bursts is longer than plain decoding's gap between tokens in every row. Accepted drafts vary, from 1.08 tokens per pass on sparse Q4K to 1.94 on dense Q8_0 at 32K, and these runs don't isolate why.
+
 ## Gemma 4 E2B
 
 `google/gemma-4-E2B-it` at revision `3e22461f65e89153144f8adb70e3b8c2cc9845a7`, Q8_0 weights and F16 K/V, measured with `just bench-gemma`. Ranges span the measurement rounds. E2B does about three times the work per token of the 0.8B Qwen, and its 262K-token output layer keeps single-sequence decode near 20 tokens/s.
@@ -423,31 +500,31 @@ Single sequence, from the `model` benchmark (median of 12 decode steps or 2 to 4
 
 | Case | Result |
 | --- | --- |
-| Prefill, 512 tokens | 647 tokens/s |
-| Prefill, 2,048 tokens | 717 tokens/s |
-| Decode, 1 sequence at 128 tokens | 47.1 tokens/s (21.2 ms per step) |
-| Decode, 1 sequence at 2K tokens | 45.7 tokens/s |
-| Decode, 4 sequences at 128 tokens | 86.0 tokens/s |
-| Decode, 4 sequences at 2K tokens | 89.0 tokens/s |
+| Prefill, 512 tokens | 640 tokens/s |
+| Prefill, 2,048 tokens | 718 tokens/s |
+| Decode, 1 sequence at 128 tokens | 47.2 tokens/s (21.2 ms per step) |
+| Decode, 1 sequence at 2K tokens | 47.6 tokens/s |
+| Decode, 4 sequences at 128 tokens | 94.3 tokens/s |
+| Decode, 4 sequences at 2K tokens | 89.1 tokens/s |
 | Decode, 8 sequences at 128 tokens | 142 tokens/s |
-| Load time | 9.2 s |
+| Load time | 5.5 s |
 
 Bursts through the full pipeline: N requests arrive at once, each with a 128-token prompt and 64 output tokens, sampled at temperature 0.7, top-k 20 and top-p 0.95:
 
 | Concurrent | Output tok/s | TTFT p50 | ITL p50 | ITL p95 | ITL p99 |
 | --- | --- | --- | --- | --- | --- |
-| 1 | 39.2 | 0.31 s | 20.8 ms | 21.8 ms | 21.9 ms |
-| 2 | 50.8 | 0.49 s | 32.4 ms | 33.8 ms | 34.0 ms |
-| 4 | 73.1 | 0.87 s | 43.8 ms | 46.2 ms | 46.7 ms |
-| 8 | 101.5 | 1.61 s | 54.4 ms | 65.2 ms | 75.4 ms |
+| 1 | 37.8 | 0.34 s | 21.3 ms | 22.4 ms | 22.6 ms |
+| 2 | 49.0 | 0.54 s | 32.7 ms | 34.1 ms | 34.3 ms |
+| 4 | 70.0 | 0.95 s | 43.5 ms | 45.7 ms | 46.2 ms |
+| 8 | 94.8 | 1.76 s | 55.2 ms | 66.3 ms | 66.9 ms |
 
-Sixteen concurrent requests cannot run with every expert resident: each attempt failed with a Metal out-of-memory error. With `TUR_BENCH_EXPERT_CACHE_MB=4096`, the experts stay on the SSD behind a 4 GiB cache and the same burst completes at 25.7 output tokens/s, with a range of 20.7 to 25.7 across runs. TTFT p50 is 5.9 s, and ITL p50 is 315 ms, because each sequence waits for its experts to be read on every step. The cache is the only way this burst runs on this Mac, and its figures are for a different configuration from the resident rows above.
+Sixteen concurrent requests cannot run with every expert resident: each attempt failed with a Metal out-of-memory error. With `TUR_BENCH_EXPERT_CACHE_MB=4096`, the experts stay on the SSD behind a 4 GiB cache and the same burst completes at 25.7 output tokens/s, with a range of 25.3 to 25.7 across three runs. TTFT p50 is 6.2 s, and ITL p50 is 364 to 398 ms with a p95 of 1.25 s, because each sequence waits for its experts to be read on every step. The cache is the only way this burst runs on this Mac, and its figures are for a different configuration from the resident rows above.
 
 Against llama.cpp and a reported MLX-family result on the same chip class:
 
 | Engine, weights | Prefill | Decode, 1 sequence |
 | --- | --- | --- |
-| Tur, Q4K artifact | 647 tokens/s at 512, 717 at 2K | 47.1 tokens/s at 128 tokens, 45.7 at 2K |
+| Tur, Q4K artifact | 640 tokens/s at 512, 718 at 2K | 47.2 tokens/s at 128 tokens, 47.6 at 2K |
 | llama.cpp, unsloth UD-Q4_K_M | 665 tokens/s at 512, 650 at 2K | 35.6 tokens/s at 128 tokens, 34.8 at 2K |
 | oMLX v0.7.0.dev2, 4-bit | 632 tokens/s at 1K | 39.2 tokens/s at 1K |
 
@@ -457,31 +534,56 @@ Batched decode with 128-token prompts and 64 generated tokens, as output tokens 
 
 | Concurrent | Tur | llama.cpp |
 | --- | --- | --- |
-| 1 | 39.2 | 31.3 |
-| 2 | 50.8 | 45.8 |
-| 4 | 73.1 | 62.1 |
-| 8 | 101.5 | 75.0 |
+| 1 | 37.8 | 31.3 |
+| 2 | 49.0 | 45.8 |
+| 4 | 70.0 | 62.1 |
+| 8 | 94.8 | 75.0 |
 | 16 | 25.7 with a 4 GiB expert cache | 81.4 |
 
-Tur is ahead of llama.cpp from 1 to 8 sequences, by 25% at one and 35% at eight. At 16 sequences llama.cpp keeps every weight resident and completes the burst, while Tur ran out of GPU memory and only completes it through the expert cache, so that row compares different configurations. Tur samples at temperature 0.7, top-k 20 and top-p 0.95 on the device, and `llama-batched-bench` has its own sampling, so the harnesses are not identical.
+Tur is ahead of llama.cpp from 1 to 8 sequences, by 21% at one and 26% at eight. At 16 sequences llama.cpp keeps every weight resident and completes the burst, while Tur ran out of GPU memory and only completes it through the expert cache, so that row compares different configurations. Tur samples at temperature 0.7, top-k 20 and top-p 0.95 on the device, and `llama-batched-bench` has its own sampling, so the harnesses are not identical.
 
 Speculative decoding with the model's own MTP head (`--mtp`, with prompt lookup and 4 drafts) speeds up decoding on this checkpoint. Each row is a burst of N requests with 128 output tokens, sampled at temperature 0.7, top-k 20 and top-p 0.95, as the best of three runs. Normal is decoding without speculation. These prompts are a repeated pattern, a new prose question and a code request, so they are not the burst prompts in the serving table above:
 
 | Requests | Prompt | Normal tok/s | Lookup + MTP tok/s | Speedup |
 | --- | --- | --- | --- | --- |
-| 1 | Repetitive | 43.5 | 82.0 | 1.89× |
-| 1 | New prose | 45.3 | 49.2 | 1.09× |
-| 1 | Code | 44.6 | 52.1 | 1.17× |
-| 2 | Repetitive | 58.4 | 116.5 | 1.99× |
-| 2 | New prose | 58.6 | 74.8 | 1.28× |
-| 2 | Code | 58.5 | 77.4 | 1.32× |
-| 4 | Repetitive | 99.1 | 156.7 | 1.58× |
-| 4 | New prose | 88.5 | 107.5 | 1.21× |
-| 4 | Code | 89.3 | 119.7 | 1.34× |
+| 1 | Repetitive | 42.9 | 90.8 | 2.11× |
+| 1 | New prose | 44.8 | 48.0 | 1.07× |
+| 1 | Code | 45.2 | 53.4 | 1.18× |
+| 2 | Repetitive | 59.5 | 120.8 | 2.03× |
+| 2 | New prose | 58.9 | 74.5 | 1.27× |
+| 2 | Code | 58.6 | 77.7 | 1.33× |
+| 4 | Repetitive | 98.8 | 167.3 | 1.69× |
+| 4 | New prose | 89.1 | 105.0 | 1.18× |
+| 4 | Code | 89.4 | 117.4 | 1.31× |
 
-On repetitive text prompt lookup supplies every draft and all of them are accepted. On new prose and code, MTP supplies nearly all the drafts, and 84% of its drafts were accepted on prose at one request (139 of 166), about 80% on prose at two and four requests, and 88 to 92% on code. A pass with drafts costs more than a normal pass, about 33 ms against 21 ms for one request, so the gain on new text is smaller than the acceptance suggests. Time to first token is unchanged. The output matched normal decoding's tokens for every request compared. The head also adds 0.8 to 1.7 GB to the resident plan for its draft slots at one to four requests.
+On repetitive text prompt lookup supplies every draft and all of them are accepted. On new prose and code, MTP supplies nearly all the drafts, and 78 to 80% of its drafts were accepted on prose (105 of 133 at one request) and 83 to 87% on code. A pass with drafts costs more than a normal pass, about 34 ms against 21 ms for one request, so the gain on new text is smaller than the acceptance suggests. Time to first token is unchanged. The head adds 0.5 to 0.6 GiB to the resident plan at one to four requests. Output equality with normal decoding was not compared in this round.
 
-In one process, the MTP configuration ran out of GPU memory after the normal-decoding configuration had run first, though it runs alone. Each configuration therefore ran in its own process. Whether the first pipeline's memory is released late or the two plans genuinely do not fit together is not established.
+Each concurrency ran in its own process. One process running one request and then four ran out of GPU memory at four, with or without the head, so the plan for the larger burst does not fit beside the smaller one's. Whether the first pipeline's memory is released late is not established.
+
+### Long contexts with sparse attention
+
+Only 10 of this model's 40 layers use full attention; the other 30 keep a fixed-size recurrent state, so long contexts cost less here than in a dense transformer. Sparse attention reads the 10 full-attention layers through an index map fitted on the Q4K weights (`tur sparse-map`, 5 minutes). The map comes from 131K tokens of this repository's documentation and Rust source, and no retrieval check was run on it, so these rows show speed only. Single sequence, from the `model` benchmark with F16 K/V. The chunk columns time one 2,048-token prefill chunk after a context of that length, and the decode columns time one step at that context:
+
+| Context | Prefill chunk, dense | Prefill chunk, sparse | Decode, dense | Decode, sparse |
+| --- | --- | --- | --- | --- |
+| 128 tokens | | | 47.4 tokens/s (21.1 ms) | 48.7 tokens/s (20.6 ms) |
+| 32K | 343 tokens/s (6.0 s) | 622 tokens/s (3.3 s) | 36.3 tokens/s (27.5 ms) | 40.6 tokens/s (24.6 ms) |
+| 64K | 227 tokens/s (9.0 s) | 598 tokens/s (3.4 s) | 29.2 tokens/s (34.2 ms) | 40.1 tokens/s (25.0 ms) |
+
+Dense attention slows with every doubling of the context, while the sparse run stays close to its 32K speed: a 2,048-token chunk after 64K takes 3.4 s instead of 9.0 s, and decode loses 0.4 ms per step between 32K and 64K instead of 6.7 ms. Decode of one sequence at 64K is within 18% of its 128-token speed.
+
+One 32K-token prompt through the server (`TUR_BENCH_WORKLOADS=long`, 128 output tokens, one request, cold prefix cache, one run each). With MTP, ITL is zero inside a burst, so the gap between bursts is the figure to read:
+
+| Mode | TTFT p50 | ITL p50 | Gap between bursts | Tokens per pass |
+| --- | --- | --- | --- | --- |
+| Dense | 74.9 s | 27.5 ms | 27.5 ms | 1.00 |
+| Sparse | 60.2 s | 24.4 ms | 24.4 ms | 1.00 |
+| Dense + MTP | 78.7 s | 29.0 ms | 29.0 ms | 1.32 |
+| Sparse + MTP | 63.9 s | 27.8 ms | 38.8 ms | 1.75 |
+
+Sparse attention cuts the first-token time by 20%, less than the chunk benchmark suggests, because the first 16K tokens of the prompt run dense, below the crossover. MTP does not pay at this depth on this synthetic prompt: the first token arrives 5 to 6% later, and the gap between bursts is 38.8 ms against 24.4 ms without it, for 1.75 tokens per pass. The 64K prompt was not run through the server.
+
+The `model` benchmark ran each context and mode in its own process, because one process running the whole sweep (dense and sparse, up to 64K, with batches of 8) ran out of GPU memory.
 
 ## Qwen3.8-27B
 

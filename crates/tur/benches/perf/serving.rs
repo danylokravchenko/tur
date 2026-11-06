@@ -23,7 +23,8 @@
 //! `TUR_BENCH_WORKLOADS=grammar` grammar-constrained requests, and
 //! `TUR_BENCH_WORKLOADS=logprobs` the cost of reporting log probabilities, and
 //! `TUR_BENCH_WORKLOADS=long TUR_BENCH_LONG=32768,65536` bursts of requests with prompts of
-//! that many tokens, from a cold prefix cache. `TUR_BENCH_SPARSE_MAP=<index map>` reads
+//! that many tokens, from a cold prefix cache (`TUR_BENCH_MTP=0,1` adds four MTP drafts).
+//! `TUR_BENCH_SPARSE_MAP=<index map>` reads
 //! attention sparsely through that map (`TUR_BENCH_SPARSE_CROSSOVER=<keys>` replaces the
 //! default crossover, `TUR_BENCH_SPARSE_PREFILL=0` keeps prefill dense).
 //! `TUR_BENCH_WORKLOADS=speculation TUR_BENCH_DRAFT=0,4` compares adaptive prompt lookup
@@ -1260,7 +1261,9 @@ fn long_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
                 let mut config = PipelineConfig::new(count, CHUNK);
                 config.prefix = PrefixConfig::DISABLED;
                 config.device_sampling = bench.device_sampling;
-                config.context_tokens = Some(context + bench.output + 256);
+                // Indexed pools hold whole 512-token index blocks of pages, so an unaligned
+                // context would leave the pool a few pages short of it.
+                config.context_tokens = Some((context + bench.output + 256).next_multiple_of(512));
                 if mtp == 1 {
                     config.speculation = SpeculationConfig::with_mtp(4);
                 }

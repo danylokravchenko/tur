@@ -91,8 +91,8 @@ These results are for llama.cpp 0.8.0 on an M3 Pro with 36 GB, Qwen3.5-0.8B and 
 | Decode, 1 sequence, 4-bit | 182 tok/s | 141 tok/s | +29% |
 | Decode, 8 sequences | 729 tok/s | 456 tok/s | +60% |
 | Prefill, 2K tokens | 3,799 tok/s | 3,383 tok/s | +12% |
-| Qwen3.6-35B, 4-bit, decode, 1 sequence | 47.1 tok/s | 35.6 tok/s | +32% |
-| Qwen3.6-35B, 4-bit, burst of 8, end to end | 101.5 tok/s | 75.0 tok/s | +35% |
+| Qwen3.6-35B, 4-bit, decode, 1 sequence | 47.2 tok/s | 35.6 tok/s | +33% |
+| Qwen3.6-35B, 4-bit, burst of 8, end to end | 94.8 tok/s | 75.0 tok/s | +26% |
 | Qwen3.8-27B, 4-bit, decode, 8 sequences | 52.5 tok/s | 41.1 tok/s | +28% |
 
 Against oMLX on an M1 with 16 GB and 4-bit Qwen3.5-0.8B, using its [published results](https://omlx.ai/benchmarks/performance/yw52053o) rather than a rerun on our Mac, Tur leads with one sequence, at 90 tok/s to 73.7 and with a peak of 0.71 GB to 2.17 GB. oMLX leads at two sequences, 123 tok/s to 114, and the two are level at four, with Tur at 202 and oMLX at 198.
@@ -127,7 +127,7 @@ Their speeds can't be compared directly, because no model and Mac appear on both
 
 Choose Tur's cache when your Mac can't hold the model, your model is supported and more than one client needs answers. Its total throughput rises slightly with more requests (2.1 to 2.7 tok/s from one to four on gpt-oss-20b), while each request slows down. Choose Strata for Flash-Next or DeepSeek-class models, for a desktop app, or for a discrete GPU.
 
-Offloading is the fallback in either engine. If the whole model fits, keep it resident: on the 36 GB M3 Pro, Qwen3.6-35B decodes 47.1 tok/s resident, while 3 tok/s on gpt-oss-20b suits batch work and short answers better than conversation. [Expert cache](expert-cache.md) covers sizing and SSD wear.
+Offloading is the fallback in either engine. If the whole model fits, keep it resident: on the 36 GB M3 Pro, Qwen3.6-35B decodes 47.2 tok/s resident, while 3 tok/s on gpt-oss-20b suits batch work and short answers better than conversation. [Expert cache](expert-cache.md) covers sizing and SSD wear.
 
 ## What Tur leaves out
 
