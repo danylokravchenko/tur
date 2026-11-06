@@ -1246,30 +1246,74 @@ fn speculation_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
 
 /// Bursts of `concurrency` requests whose prompts hold `TUR_BENCH_LONG` tokens each, on a
 /// pipeline sized for that context with prefix reuse off, so every request prefills cold.
+/// `TUR_BENCH_LONG_TEXT=<file>` takes each prompt from that text and asks for a summary, so
+/// the output is prose; `TUR_BENCH_MTP=0,1` runs each burst without and with four lookup
+/// drafts plus the native MTP head.
 fn long_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
+    let text = std::env::var_os("TUR_BENCH_LONG_TEXT")
+        .map(std::fs::read_to_string)
+        .transpose()?;
     let mut runs = Vec::new();
     for context in env_sizes("TUR_BENCH_LONG", "32768,65536")? {
         for &count in &bench.concurrency {
-            let mut config = PipelineConfig::new(count, CHUNK);
-            config.prefix = PrefixConfig::DISABLED;
-            config.device_sampling = bench.device_sampling;
-            config.context_tokens = Some(context + bench.output + 256);
-            let mut pipeline = InferencePipeline::new(bench.factory, config)?;
-            let case = Burst {
-                prompts: (0..count)
-                    .map(|i| prompt(bench.tokenizer, context, 20_000 + context + i))
-                    .collect::<Result<_>>()?,
-                output: bench.output,
-            };
-            let result = burst(&mut pipeline, &case, bench.options)?;
-            report(&format!("long {context} c={count}"), &result);
-            runs.push(
-                json!({"workload": "long", "prompt": context, "concurrency": count,
-                "sparse": bench.factory.sparse.is_some(), "result": result}),
-            );
+            for mtp in env_sizes("TUR_BENCH_MTP", "0")? {
+                let mut config = PipelineConfig::new(count, CHUNK);
+                config.prefix = PrefixConfig::DISABLED;
+                config.device_sampling = bench.device_sampling;
+                config.context_tokens = Some(context + bench.output + 256);
+                if mtp == 1 {
+                    config.speculation = SpeculationConfig::with_mtp(4);
+                }
+                let mut pipeline = InferencePipeline::new(bench.factory, config)?;
+                let prompts = (0..count)
+                    .map(|i| {
+                        text.as_ref().map_or_else(
+                            || prompt(bench.tokenizer, context, 20_000 + context + i),
+                            |text| excerpt(bench.tokenizer, text, context, i),
+                        )
+                    })
+                    .collect::<Result<_>>()?;
+                let case = Burst {
+                    prompts,
+                    output: bench.output,
+                };
+                let result = burst(&mut pipeline, &case, bench.options)?;
+                let label = if mtp == 1 { "+mtp" } else { "" };
+                report(&format!("long {context} c={count}{label}"), &result);
+                runs.push(
+                    json!({"workload": "long", "prompt": context, "concurrency": count,
+                    "sparse": bench.factory.sparse.is_some(), "mtp": mtp == 1,
+                    "speculation_totals": format!("{:?}", pipeline.speculation_stats()),
+                    "result": result}),
+                );
+            }
         }
     }
     Ok(runs)
+}
+
+/// About `tokens` tokens of `text`, starting at a different paragraph for each request,
+/// followed by a request to summarize them.
+fn excerpt(tokenizer: &Tokenizer, text: &str, tokens: usize, request: usize) -> Result<String> {
+    let ids = tokenizer
+        .encode(text, false)
+        .map_err(|e| TurError::Tokenizer(e.to_string()))?
+        .get_ids()
+        .to_vec();
+    let start = (request * 997) % ids.len().max(1);
+    let body: Vec<u32> = ids
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(tokens)
+        .copied()
+        .collect();
+    let passage = tokenizer
+        .decode(&body, true)
+        .map_err(|e| TurError::Tokenizer(e.to_string()))?;
+    Ok(format!(
+        "{passage}\n\nSummarize the passage above in a few paragraphs."
+    ))
 }
 
 /// `TUR_BENCH_EXPERT_CACHE_MB` keeps a Qwen `MoE` artifact's experts on disk behind a cache of
