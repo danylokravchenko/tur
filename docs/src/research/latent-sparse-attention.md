@@ -80,6 +80,17 @@ Through the whole model (`TUR_BENCH_SPARSE_MAP=<map> just bench model`), with th
 
 The sparse step stays near 21 ms from 64K on, as the kernel measurements predicted. These steps don't close a block, so the clustering stall once every 512 tokens isn't in them.
 
+Through the serving pipeline (`TUR_BENCH_WORKLOADS=long just bench serving`), with prompts prefilled cold, greedy decoding and 256 output tokens per request:
+
+| Prompt, requests | Inter-token p50, dense | Inter-token p50, sparse | Decode speedup | First token, dense | First token, sparse |
+| --- | --- | --- | --- | --- | --- |
+| 32K, 1 | 25.2 ms | 20.9 ms | 1.21× | 63.5 s | 63.5 s |
+| 32K, 4 | 43.9 ms | 30.3 ms | 1.45× | 241 s | 242 s |
+| 64K, 1 | 32.3 ms | 22.2 ms | 1.45× | 209 s | 215 s |
+| 64K, 4 | 78.2 ms | 33.3 ms | 2.35× | 787 s | 815 s |
+
+The gain grows with concurrency, because every request adds its own K/V reads while the weights are read once per pass: four requests at 64K decode as fast as one did dense. The first token comes up to 3% later, from clustering every block during prefill. Overall throughput didn't change, because prefill dominates these bursts: four 64K prompts take 13 minutes to prefill and 34 seconds to decode, at 313 prompt tokens/s against 520 at 32K, as dense attention's quadratic cost takes over.
+
 Prefill isn't covered by this design. A 128K prompt on the 27B takes minutes on a Mac, and with dense prefill, decoding at that context is only worth speeding up when [prefix reuse](../architecture/prefix-reuse.md) supplies the long prefix. Sparse prefill comes after decode.
 
 ## Which models
@@ -108,7 +119,7 @@ The kernels live in `tur-metal`'s `lsa.metal` and `lsa.rs`:
 ### Engine
 
 - `[model] sparse_attention` (`--sparse-attention`) is `off` or `auto`, and `off` is the default, because outputs change compared with dense attention and every golden test assumes dense attention. Under `auto`, a request reads sparsely once its context passes the crossover; below it, and for models without a map, attention stays dense. A model can default to `auto` only after it passes the retrieval budget.
-- The crossover is measured with `just bench model` and stored in the tuning table like the tiled-attention crossover. The budget (`k`, `p`, window, sinks) is an advanced setting with the paper's values as defaults.
+- The crossover defaults to 16K keys. Measured on the 0.8B with sparse reads forced from the first key, sparse decode is no slower than dense from 8K (20.2 against 20.9 ms) but gains only 4% at 16K and 12% at 24K, where the budget is still a large share of the context; the needle check above matched dense from 16K. A per-device value in the tuning table would replace it once more Macs are measured. The budget (`k`, `p`, window, sinks) is an advanced setting with the paper's values as defaults.
 - Verification runs one selection per verified position, as plain decoding would at that position, so speculation stays exact with respect to the sparse model. The MTP head's own attention layer stays dense.
 - Prefill attention stays dense and tiled, and only builds index blocks.
 
@@ -128,7 +139,15 @@ The training-free map was fitted on four books at 32K tokens with the Python ref
 
 Next-token quality barely moves at any of the three lengths, while the weight held falls as the fixed budget becomes a smaller share of the context. LSA holds clearly more than a window of recent keys in every layer but one. The first attention layer (layer 3) is the exception at 64K, where LSA held 0.61 to 0.70 and recent keys 0.65 to 0.74 on three of the four texts, so that layer may need a wider window or a larger budget. The gap to the best list, about 0.15 to 0.25 at 64K, is what a distilled map would close. Top-1 agreement over 64 tokens moves 1.6 points per token, so read it coarsely.
 
-These numbers measure how much attention weight survives, not whether a single fact from early in the context can still be found. A long-context retrieval budget (needle and RULER-style tasks), declared in advance, gates making it a default for any model.
+These numbers measure how much attention weight survives, not whether a single fact can still be found. `just bench needle` checks that through Tur itself: it plants eight six-digit access codes at evenly spaced depths of a held-out book, prefills the document once, asks for each code from a snapshot of it and answers greedily, decoding densely and then sparsely. The prompt prefills densely in both modes, so the answer tokens are where sparse selection must find the planted keys. On the 0.8B with the map from `tur sparse-map`:
+
+| Context | Dense correct | Sparse correct | Answers identical |
+| --- | --- | --- | --- |
+| 16K | 6 of 8 | 6 of 8 | 8 of 8 |
+| 32K | 8 of 8 | 8 of 8 | 7 of 8 |
+| 64K | 8 of 8 | 8 of 8 | 8 of 8 |
+
+Sparse decoding retrieved every code dense decoding did. The two misses at 16K are the model's own: both modes give a neighbouring fact's code. The one answer that differs at 32K has the right code and continues differently after it. This is one model, one filler text and 24 questions; a RULER-style set with confidence intervals, declared in advance, still gates making `auto` a default for any model.
 
 ## Plan
 

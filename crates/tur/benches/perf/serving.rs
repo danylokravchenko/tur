@@ -21,7 +21,11 @@
 //! per three 64-token ones, on four running slots (`TUR_BENCH_SHORTEST_FIRST=1` orders prefill
 //! by remaining prompt length), and
 //! `TUR_BENCH_WORKLOADS=grammar` grammar-constrained requests, and
-//! `TUR_BENCH_WORKLOADS=logprobs` the cost of reporting log probabilities.
+//! `TUR_BENCH_WORKLOADS=logprobs` the cost of reporting log probabilities, and
+//! `TUR_BENCH_WORKLOADS=long TUR_BENCH_LONG=32768,65536` bursts of requests with prompts of
+//! that many tokens, from a cold prefix cache. `TUR_BENCH_SPARSE_MAP=<index map>` reads
+//! attention sparsely through that map (`TUR_BENCH_SPARSE_CROSSOVER=<keys>` replaces the
+//! default crossover).
 //! `TUR_BENCH_WORKLOADS=speculation TUR_BENCH_DRAFT=0,4` compares adaptive prompt lookup
 //! (`TUR_BENCH_MTP=1` adds the native MTP head to drafted configurations, `0,1` runs both)
 //! with ordinary decoding, including acceptance counters, memory and exact token IDs, on
@@ -52,8 +56,8 @@ use tur_engine::{
     hybrid::SamplingOptions,
 };
 use tur_models::models::{
-    DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, DraftHead, WeightFormat, is_artifact,
-    parse_recurrent_state,
+    DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, DraftHead, SparseAttention, WeightFormat,
+    is_artifact, parse_recurrent_state,
 };
 
 const CHUNK: usize = 256;
@@ -1240,6 +1244,48 @@ fn speculation_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
     Ok(runs)
 }
 
+/// Bursts of `concurrency` requests whose prompts hold `TUR_BENCH_LONG` tokens each, on a
+/// pipeline sized for that context with prefix reuse off, so every request prefills cold.
+fn long_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
+    let mut runs = Vec::new();
+    for context in env_sizes("TUR_BENCH_LONG", "32768,65536")? {
+        for &count in &bench.concurrency {
+            let mut config = PipelineConfig::new(count, CHUNK);
+            config.prefix = PrefixConfig::DISABLED;
+            config.device_sampling = bench.device_sampling;
+            config.context_tokens = Some(context + bench.output + 256);
+            let mut pipeline = InferencePipeline::new(bench.factory, config)?;
+            let case = Burst {
+                prompts: (0..count)
+                    .map(|i| prompt(bench.tokenizer, context, 20_000 + context + i))
+                    .collect::<Result<_>>()?,
+                output: bench.output,
+            };
+            let result = burst(&mut pipeline, &case, bench.options)?;
+            report(&format!("long {context} c={count}"), &result);
+            runs.push(
+                json!({"workload": "long", "prompt": context, "concurrency": count,
+                "sparse": bench.factory.sparse.is_some(), "result": result}),
+            );
+        }
+    }
+    Ok(runs)
+}
+
+/// `TUR_BENCH_SPARSE_MAP` reads attention sparsely through that index map.
+fn sparse_attention() -> Result<Option<SparseAttention>> {
+    let Some(map) = std::env::var_os("TUR_BENCH_SPARSE_MAP") else {
+        return Ok(None);
+    };
+    let mut sparse = SparseAttention::new(map.into());
+    if let Ok(keys) = std::env::var("TUR_BENCH_SPARSE_CROSSOVER") {
+        sparse.crossover = keys
+            .parse()
+            .map_err(|_| invalid("TUR_BENCH_SPARSE_CROSSOVER".to_owned()))?;
+    }
+    Ok(Some(sparse))
+}
+
 /// `TUR_BENCH_EXPERT_CACHE_MB` keeps a Qwen `MoE` artifact's experts on disk behind a cache of
 /// this many MiB; unset, every expert stays resident.
 fn expert_cache_bytes() -> Result<Option<usize>> {
@@ -1282,7 +1328,7 @@ pub(crate) fn run() -> Result<()> {
         video: false,
         expert_cache: expert_cache_bytes()?,
         gguf: None,
-        sparse: None,
+        sparse: sparse_attention()?,
     };
     let bench = Bench {
         factory: &factory,
@@ -1303,6 +1349,9 @@ pub(crate) fn run() -> Result<()> {
     }
     if workloads.contains("grammar") {
         runs.extend(grammar_runs(&bench)?);
+    }
+    if workloads.contains("long") {
+        runs.extend(long_runs(&bench)?);
     }
     if workloads.contains("logprobs") {
         runs.extend(logprob_runs(&bench)?);
@@ -1347,6 +1396,7 @@ pub(crate) fn run() -> Result<()> {
         serde_json::to_string_pretty(&json!({
             "benchmark": "serving", "checkpoint": dir, "weights": weights_label,
             "expert_cache_bytes": factory.expert_cache,
+            "sparse_attention": format!("{:?}", factory.sparse),
             "kv": format!("{:?}", DEFAULT_KV_LAYOUT), "prefill_chunk": CHUNK,
             "output_tokens": output, "workload": "closed-loop bursts submitted at once",
             "sampling": format!("{options:?}"), "device_sampling": device_sampling,

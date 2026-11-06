@@ -191,8 +191,9 @@ pub struct SparseAttention {
 
 impl SparseAttention {
     /// The paper's budget for Qwen3.8-27B (4,612 keys) over the map at `map`, reading
-    /// sparsely past 16K keys: below that the budget is over a quarter of the context, and
-    /// per-layer attention measured 2.8× faster only from 32K.
+    /// sparsely past 16K keys. On the 0.8B, sparse decode is no slower than dense from 8K,
+    /// but gains only from 16K to 24K (4 to 12%), and from 16K it answered every needle
+    /// question as dense did; below 16K the budget is over a quarter of the context.
     pub fn new(map: std::path::PathBuf) -> Self {
         Self {
             map,

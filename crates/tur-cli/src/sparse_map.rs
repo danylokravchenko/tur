@@ -3,20 +3,20 @@
 //! over calibration text, as the reference's PCA map takes them.
 use crate::{args::checkpoint_dir, quantize::encode_samples, ui::Console};
 use candle_core::{DType, Device, Tensor};
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tur::{
     Result, TurError,
     core::progress::Stage,
     models::{
-        DEFAULT_KV_LAYOUT, Execution, LoadOptions, WeightFormat,
+        DEFAULT_KV_LAYOUT, Execution, LoadOptions, Manifest, WeightFormat, Weights, is_artifact,
         qwen3_5::{Qwen35, principal_map},
     },
 };
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct Args {
-    /// Qwen3.5-family checkpoint: a local directory, or a Hugging Face repository at
-    /// `--revision`.
+    /// Qwen3.5-family checkpoint, dense or `MoE`: a local directory, a prepacked artifact
+    /// directory, or a Hugging Face repository at `--revision`.
     #[arg(long)]
     model: PathBuf,
     /// Exact identity of the checkpoint.
@@ -35,9 +35,25 @@ pub(crate) struct Args {
     /// Key rows each document contributes per layer, spread evenly across it.
     #[arg(long, default_value_t = 8_192)]
     rows: usize,
-    /// Weights to run the calibration text through, as the model will serve them.
-    #[arg(long, default_value = "q8_0")]
-    weight_format: WeightFormat,
+    /// Weights to run the calibration text through, as the model will serve them (default:
+    /// `q8_0`). A prepacked artifact loads as stored.
+    #[arg(long)]
+    weight_format: Option<WeightFormat>,
+    /// Keep routed experts on disk and read them into this many MiB, for `MoE` models
+    /// larger than the GPU's working set (default: every expert resident).
+    #[arg(long)]
+    expert_cache_mb: Option<usize>,
+}
+
+/// The weights `args` names: an artifact as stored, or a checkpoint converted at load.
+fn weights(args: &Args) -> Result<Weights> {
+    match (is_artifact(&args.model), args.weight_format) {
+        (true, None) => Ok(Weights::Prepacked(Arc::new(Manifest::read(&args.model)?))),
+        (true, Some(_)) => Err(TurError::Other(
+            "checkpoint is a prepacked artifact; omit --weight-format".into(),
+        )),
+        (false, format) => Ok(format.unwrap_or(WeightFormat::Q8_0).into()),
+    }
 }
 
 pub(crate) fn run(args: &mut Args, console: &Console) -> Result<()> {
@@ -64,7 +80,7 @@ pub(crate) fn run(args: &mut Args, console: &Console) -> Result<()> {
         &args.model,
         &LoadOptions {
             revision: args.revision.clone(),
-            weights: args.weight_format.into(),
+            weights: weights(args)?,
             device: tur::shared::inference_device(false)?,
             execution: Execution::Fused,
             kv: DEFAULT_KV_LAYOUT,
@@ -73,7 +89,13 @@ pub(crate) fn run(args: &mut Args, console: &Console) -> Result<()> {
             audio: false,
             vision: false,
             video: false,
-            expert_cache: None,
+            expert_cache: args
+                .expert_cache_mb
+                .map(|mb| {
+                    mb.checked_mul(1 << 20)
+                        .ok_or_else(|| TurError::Other("expert cache size overflow".into()))
+                })
+                .transpose()?,
         },
     )?;
     let mut stage = Stage::begin("Collecting keys", documents.len() as u64, "documents");

@@ -211,13 +211,14 @@ tur run qwen 'What happens in this clip?' --video clip.mp4
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--model <dir or org/name>` | required | Qwen3.5-family checkpoint: a directory, or a Hugging Face repository at `--revision` |
+| `--model <dir or org/name>` | required | Qwen3.5-family checkpoint, dense or MoE: a directory, a prepacked artifact, or a Hugging Face repository at `--revision` |
 | `--revision <rev>` | required | Identity of the checkpoint |
 | `--output <file>` | required | Index map to write |
 | `--calibration <files>` | required | Comma-separated text files, one long document each; the reference fits on eight |
 | `--context <n>` | 32768 | Tokens of each document, its first |
 | `--rows <n>` | 8192 | Key rows each document gives each layer, spread evenly across it |
-| `--weight-format q8_0\|q4k\|f32` | `q8_0` | Weights the calibration text runs through |
+| `--weight-format q8_0\|q4k\|f32` | `q8_0` | Weights the calibration text runs through; an artifact loads as stored |
+| `--expert-cache-mb <MiB>` | every expert resident | Keep an MoE model's routed experts on disk and read them into this much memory |
 
 ## Logging
 
