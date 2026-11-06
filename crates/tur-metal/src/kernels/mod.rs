@@ -2198,8 +2198,8 @@ impl Kernels {
             sparse: u32::from(shape.sparse.is_some()),
             sparse_width: to_u32(shape.sparse.map_or(0, SparseKeys::width), "sparse width")?,
         };
-        // Dense F16 tiles of 256-dimension heads use the layout that reuses operands;
-        // key lists, other formats and other head sizes keep the per-row tiles.
+        // Dense F16 tiles of 256-dimension heads use the occupancy-bound layout; key lists,
+        // other formats and other head sizes keep the per-row tiles.
         let split = shape.sparse.is_none() && pool.format == KvFormat::F16 && dim == 256;
         let name = if split {
             "attention_split_f16".to_owned()
@@ -2242,7 +2242,7 @@ impl Kernels {
                 let (keys, lengths) = lists.as_ref().map_or((qv, qv), |(k, l)| (k, l));
                 keys.bind(e, 12)?;
                 lengths.bind(e, 13)?;
-                // The operand-reusing tiles declare their threadgroup memory statically.
+                // The split tiles declare their threadgroup memory statically.
                 if !split {
                     e.set_threadgroup_memory_length(0, Self::tiled_memory_bytes());
                 }

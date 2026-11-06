@@ -39,10 +39,10 @@ Prefill, in prompt tokens/s for one sequence:
 
 | Weights | 2K tokens | 8K tokens |
 | --- | --- | --- |
-| Q8_0 | 1,311 | 1,031 |
+| Q8_0 | 1,311 | 1,100 |
 | Q4K | 1,210 | 982 |
 
-A 2K-token prompt takes about 1.6 s, and an 8K-token prompt about 8 s.
+A 2K-token prompt takes about 1.6 s, and an 8K-token prompt about 7.5 s.
 
 ### Serving
 
@@ -159,11 +159,11 @@ Prefill of one 2048-token chunk after a long context (`TUR_BENCH_ONLY=chunk`), i
 
 | Context before the chunk | Dense | Sparse attention | llama.cpp | Chunk, dense | Chunk, sparse | Speedup |
 | --- | --- | --- | --- | --- | --- | --- |
-| 32K | 391 | 825 | 471 | 5.24 s | 2.48 s | 2.1× |
-| 64K | 230 | 733 | 279 | 8.92 s | 2.79 s | 3.2× |
-| 128K | 124 | 679 | 159 | 16.47 s | 3.02 s | 5.5× |
+| 32K | 481 | 825 | 471 | 4.26 s | 2.48 s | 1.7× |
+| 64K | 292 | 733 | 279 | 7.01 s | 2.79 s | 2.5× |
+| 128K | 165 | 679 | 159 | 12.37 s | 3.02 s | 4.1× |
 
-Dense, Tur decodes 5 to 7% faster than llama.cpp at every depth, but prefills 17 to 22% slower: both engines prefill 2K tokens without context in about 1.55 s, so the gap is attention over the context, where llama.cpp's flash attention still does more arithmetic per second than Tur's tiled kernel (see [Metal kernels](../architecture/kernels.md#decisions)). With sparse attention Tur decodes 1.25 to 2.35 times as fast as llama.cpp and prefills 1.75 to 4.3 times as fast, but its outputs differ slightly from dense attention while llama.cpp's don't. The serving rows above ran before the current tiled kernel, which prefills 13 to 27% faster after 32K to 64K of context, so their dense first-token times are now shorter.
+Dense, Tur decodes 5 to 7% faster than llama.cpp at every depth and prefills 2 to 5% faster after 32K to 128K of context, where attention over the context dominates; its prefill attention kernel keeps two threadgroups on each GPU core (see [Metal kernels](../architecture/kernels.md#decisions)). With sparse attention Tur decodes 1.25 to 2.35 times as fast as llama.cpp and prefills 1.75 to 4.3 times as fast, but its outputs differ slightly from dense attention while llama.cpp's don't. The serving rows above ran before the current prefill attention kernel, which prefills 39 to 61% faster after 32K to 64K of context, so their dense first-token times are now shorter.
 
 With 128 tokens of context the same build decodes 57.5 tokens/s and prefills a 2K prompt at 1,311 tokens/s, so sparse attention keeps decode at 83% of its short-context speed out to 128K, where dense falls to 38%.
 
@@ -216,7 +216,7 @@ Single sequence, in tokens/s (llama.cpp from `llama-bench`):
 | Decode at 2K | 56 | 49.4 | 89 | 63.5 |
 | Decode at 8K | 50 | 46.2 | 75 | 58.9 |
 | Prefill 2K | 1,311 | 1,323 | 1,210 | 1,188 |
-| Prefill 8K | 1,031 | 1,142 | 982 | 1,037 |
+| Prefill 8K | 1,100 | 1,142 | 982 | 1,037 |
 
 Batched decode with Q8_0, total tokens/s at about 128 tokens of context (Tur from the `model` benchmark, llama.cpp from `llama-batched-bench`):
 
@@ -233,7 +233,7 @@ Bursts of N requests with 128-token prompts and 64 output tokens, in output toke
 | llama.cpp Q8_0 | 47.6 | 75.5 | 114 | 155 | 170 |
 | llama.cpp Q4_K_M | 59.4 | 78.7 | 114 | 151 | 160 |
 
-Tur decodes 1.1 to 1.4× faster with one sequence and up to 1.55× faster with 8 to 16, and finishes bursts of 8 to 16 requests 1.2× faster end to end. Prefill is level at 2K tokens; at 8K, llama.cpp is 6 to 11% faster, and after 32K to 128K of context 20 to 28% faster with dense attention (see [Long contexts with sparse attention](#long-contexts-with-sparse-attention)).
+Tur decodes 1.1 to 1.4× faster with one sequence and up to 1.55× faster with 8 to 16, and finishes bursts of 8 to 16 requests 1.2× faster end to end. Prefill is level at 2K tokens; at 8K, llama.cpp is 4% faster on Q8_0 and 6% on 4-bit, while after 32K to 128K of context Tur's dense prefill is 2 to 5% faster (see [Long contexts with sparse attention](#long-contexts-with-sparse-attention)).
 
 #### On the same GGUF files
 
@@ -264,7 +264,7 @@ Single sequence, in tokens/s:
 
 | Engine, weights | Prefill | Decode | Peak memory |
 | --- | --- | --- | --- |
-| Tur Q8_0 | 1,311 at 2K, 1,031 at 8K | 56 at 2K, 50 at 8K | 1.20 GB RSS (artifact) |
+| Tur Q8_0 | 1,311 at 2K, 1,100 at 8K | 56 at 2K, 50 at 8K | 1.20 GB RSS (artifact) |
 | mlx_lm 8-bit | 814 at 4K | 46.1 at 4K | 2.46 GB |
 | Tur Q4K GPTQ | 1,210 at 2K, 982 at 8K | 89 at 2K, 75 at 8K | 0.71 GB RSS |
 | mlx_lm OptiQ-4bit | 946 at 4K | 56.0 at 4K | 3.50 GB |

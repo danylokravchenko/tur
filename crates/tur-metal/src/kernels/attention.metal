@@ -700,16 +700,49 @@ kernel void attention_tiled(
     }
 }
 
-// Dense F16 query tiles of 256-dimension heads, laid out so each operand a simdgroup loads
-// feeds several multiplies; loading operands from threadgroup memory, not the multiplies,
-// bounds the per-row kernel above. For each block of 32 keys, simdgroup `sg` computes a
-// 2x2 block of score fragments (two row blocks by two key fragments) and writes it out;
-// then it normalizes row block `sg`'s scores in place; then it owns output dims
-// [64 sg, 64 sg + 64) of all 32 rows, so every value fragment it loads multiplies four
-// row blocks of weights. Key chunks stream through two buffers, and the value block
-// stages beside the last key chunk.
+// Dense F16 query tiles of 256-dimension heads, sized for occupancy. GPU counters on the
+// per-row layout showed the ALUs half idle with one threadgroup per core, its threadgroup
+// memory the limit, so this kernel walks keys in blocks of 16 and keeps its threadgroup at
+// 14.3 KiB: two fit on a core, and one's barriers hide behind the other's work. Simdgroup
+// `sg` computes the scores and online softmax of rows 8 sg.. in registers and stores the
+// weights; then it owns output dims [64 sg, 64 sg + 64) of all 32 rows, so each value
+// fragment it loads multiplies four row blocks of weights. Key chunks stream through two
+// buffers, and each chunk's next keys and value chunk load while the current one multiplies.
 #define SPLIT_D 256
+// Keys per block: 16 keep the threadgroup at 14.3 KiB, so two fit on a core.
+#define SK 16
+#define SPLIT_LOADS (SK * TD / 4 / TT)
+#define SPLIT_KEY_STRIDE (TT / (TD / 4))
 #define SPLIT_CHUNKS (SPLIT_D / TD)
+// Largest growth, in natural log, the reference maximum allows before it moves.
+#define SPLIT_RESCALE 8.0f
+
+// This thread's share of one staged chunk: four dims of each of its keys, zero past `keys`.
+static inline void split_fetch(thread vec<half, 4> *raw, device const half *data, thread const uint *slot, uint kb, uint keys, uint key0, uint kv_heads, uint g, uint d) {
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < SPLIT_LOADS; ++i) {
+        ulong head = ulong(slot[i]) * kv_heads + g;
+        raw[i] = kb + key0 + i * SPLIT_KEY_STRIDE < keys ? *(device const vec<half, 4> *)(data + head * SPLIT_D + d) : vec<half, 4>(0);
+    }
+}
+
+// Scores of this simdgroup's 8 rows over a staged chunk of SK keys.
+static inline void split_scores(thread simdgroup_float8x8 *s, threadgroup const half *stage, device const float *qr, uint c, ushort2 fc) {
+    #pragma clang loop unroll(full)
+    for (uint x = 0; x < TD / 8; ++x) {
+        simdgroup_float8x8 a;
+        float2 pair = *(device const float2 *)(qr + c * TD + 8 * x + fc.y);
+        a.thread_elements()[0] = pair[0];
+        a.thread_elements()[1] = pair[1];
+        #pragma clang loop unroll(full)
+        for (uint kt = 0; kt < SK / 8; ++kt) {
+            simdgroup_half8x8 b;
+            simdgroup_load(b, stage + 8 * kt * TD + 8 * x, TD, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(s[kt], a, b, s[kt]);
+        }
+    }
+}
+
 kernel void attention_split_f16(
     device const float *q [[buffer(0)]],
     device const half *k [[buffer(1)]],
@@ -725,9 +758,9 @@ kernel void attention_split_f16(
     uint tid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup half kst[2 * TK * TD];
-    threadgroup half vst[TK * SPLIT_D];
-    threadgroup float sp[TQ * TK];
+    threadgroup half kst[2 * SK * TD];
+    threadgroup half vst[SK * SPLIT_D];
+    threadgroup float sp[TQ * SK];
     threadgroup float lrow[TQ];
     threadgroup float crow[TQ];
     uint h = tg % p.heads;
@@ -740,7 +773,7 @@ kernel void attention_split_f16(
     uint g = h / (p.heads / p.kv_heads);
     ushort2 fc = fragment_coord(lane);
     uint keys = visible[t0 + n - 1];
-    uint start = p.window > 0 && visible[t0] > p.window ? (visible[t0] - p.window) / TK * TK : 0;
+    uint start = p.window > 0 && visible[t0] > p.window ? (visible[t0] - p.window) / SK * SK : 0;
     uint base = first_block[t0];
     // Scores and softmax per simdgroup: rows 8 sg.. in registers, as the per-row tiles.
     uint row = 8 * sg + fc.x;
@@ -760,38 +793,41 @@ kernel void attention_split_f16(
     }
     uint key0 = tid / (TD / 4);
     uint d0 = 4 * (tid % (TD / 4));
-    tile_keys none = {nullptr, 0};
-    for (uint kb = start; kb < keys; kb += TK) {
-        uint slot[LOADS];
-        kv_slots(slot, table, base, kb, keys, key0, p.page, none);
-        vec<half, 4> fetched[LOADS];
-        kv_fetch<half>(fetched, k, slot, kb, keys, key0, p.kv_heads, g, SPLIT_D, d0);
+    for (uint kb = start; kb < keys; kb += SK) {
+        uint slot[SPLIT_LOADS];
         #pragma clang loop unroll(full)
-        for (uint i = 0; i < LOADS; ++i) {
-            *(threadgroup vec<half, 4> *)(kst + (key0 + i * KEY_STRIDE) * TD + d0) = fetched[i];
+        for (uint i = 0; i < SPLIT_LOADS; ++i) {
+            uint j = kb + key0 + i * SPLIT_KEY_STRIDE;
+            slot[i] = j < keys ? table[base + j / p.page] * p.page + j % p.page : 0;
+        }
+        vec<half, 4> fetched[SPLIT_LOADS];
+        split_fetch(fetched, k, slot, kb, keys, key0, p.kv_heads, g, d0);
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < SPLIT_LOADS; ++i) {
+            *(threadgroup vec<half, 4> *)(kst + (key0 + i * SPLIT_KEY_STRIDE) * TD + d0) = fetched[i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        simdgroup_float8x8 s[TK / 8];
+        simdgroup_float8x8 s[SK / 8];
         #pragma clang loop unroll(full)
-        for (uint kt = 0; kt < TK / 8; ++kt) {
+        for (uint kt = 0; kt < SK / 8; ++kt) {
             s[kt] = simdgroup_float8x8(0.0f);
         }
         #pragma clang loop unroll(full)
         for (uint c = 0; c < SPLIT_CHUNKS; ++c) {
             // Read the next key chunk and value chunk `c` while this key chunk multiplies,
             // then stage them; the value block's last reader was the previous block's P.V.
-            vec<half, 4> next_keys[LOADS];
-            vec<half, 4> values[LOADS];
+            vec<half, 4> next_keys[SPLIT_LOADS];
+            vec<half, 4> values[SPLIT_LOADS];
             if (c + 1 < SPLIT_CHUNKS) {
-                kv_fetch<half>(next_keys, k, slot, kb, keys, key0, p.kv_heads, g, SPLIT_D, (c + 1) * TD + d0);
+                split_fetch(next_keys, k, slot, kb, keys, key0, p.kv_heads, g, (c + 1) * TD + d0);
             }
-            kv_fetch<half>(values, v, slot, kb, keys, key0, p.kv_heads, g, SPLIT_D, c * TD + d0);
-            tile_scores<half, false>(s, kst + (c % 2) * TK * TD, qr, c, fc, p.scale);
+            split_fetch(values, v, slot, kb, keys, key0, p.kv_heads, g, c * TD + d0);
+            split_scores(s, kst + (c % 2) * SK * TD, qr, c, fc);
             #pragma clang loop unroll(full)
-            for (uint i = 0; i < LOADS; ++i) {
-                uint key = key0 + i * KEY_STRIDE;
+            for (uint i = 0; i < SPLIT_LOADS; ++i) {
+                uint key = key0 + i * SPLIT_KEY_STRIDE;
                 if (c + 1 < SPLIT_CHUNKS) {
-                    *(threadgroup vec<half, 4> *)(kst + ((c + 1) % 2) * TK * TD + key * TD + d0) = next_keys[i];
+                    *(threadgroup vec<half, 4> *)(kst + ((c + 1) % 2) * SK * TD + key * TD + d0) = next_keys[i];
                 }
                 *(threadgroup vec<half, 4> *)(vst + key * SPLIT_D + c * TD + d0) = values[i];
             }
@@ -801,7 +837,7 @@ kernel void attention_split_f16(
         // simdgroups that own the output dims.
         float block = -FLT_MAX;
         #pragma clang loop unroll(full)
-        for (uint kt = 0; kt < TK / 8; ++kt) {
+        for (uint kt = 0; kt < SK / 8; ++kt) {
             #pragma clang loop unroll(full)
             for (uint e = 0; e < 2; ++e) {
                 uint key = kb + 8 * kt + fc.y + e;
@@ -810,10 +846,14 @@ kernel void attention_split_f16(
                 block = key >= lower && key < limit ? max(block, score) : block;
             }
         }
-        float m_new = max(m, row_max(block));
+        // The reference maximum moves only when a block's maximum passes it by more than
+        // SPLIT_RESCALE, so weights stay below e^SPLIT_RESCALE and most blocks rescale
+        // nothing; the final division uses the same reference, so the result is exact.
+        float block_max = row_max(block);
+        float m_new = block_max > m + SPLIT_RESCALE ? block_max : m;
         float total = 0.0f;
         #pragma clang loop unroll(full)
-        for (uint kt = 0; kt < TK / 8; ++kt) {
+        for (uint kt = 0; kt < SK / 8; ++kt) {
             #pragma clang loop unroll(full)
             for (uint e = 0; e < 2; ++e) {
                 uint key = kb + 8 * kt + fc.y + e;
@@ -821,28 +861,36 @@ kernel void attention_split_f16(
                 s[kt].thread_elements()[e] = w;
                 total += w;
             }
-            simdgroup_store(s[kt], sp + 8 * sg * TK + 8 * kt, TK);
+            simdgroup_store(s[kt], sp + 8 * sg * SK + 8 * kt, SK);
         }
-        float correction = exp(m - m_new);
+        float correction = m_new != m ? exp(m - m_new) : 1.0f;
         l = l * correction + row_sum(total);
         m = m_new;
         crow[row] = correction;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        float scales[4];
+        bool moved = false;
         #pragma clang loop unroll(full)
         for (uint rb = 0; rb < 4; ++rb) {
-            float scale = crow[8 * rb + fc.x];
+            scales[rb] = crow[8 * rb + fc.x];
+            moved = moved || scales[rb] != 1.0f;
+        }
+        if (simd_any(moved)) {
             #pragma clang loop unroll(full)
-            for (uint u = 0; u < TD / 8; ++u) {
-                o[rb][u].thread_elements()[0] *= scale;
-                o[rb][u].thread_elements()[1] *= scale;
+            for (uint rb = 0; rb < 4; ++rb) {
+                #pragma clang loop unroll(full)
+                for (uint u = 0; u < TD / 8; ++u) {
+                    o[rb][u].thread_elements()[0] *= scales[rb];
+                    o[rb][u].thread_elements()[1] *= scales[rb];
+                }
             }
         }
         #pragma clang loop unroll(full)
-        for (uint kt = 0; kt < TK / 8; ++kt) {
+        for (uint kt = 0; kt < SK / 8; ++kt) {
             simdgroup_float8x8 w[4];
             #pragma clang loop unroll(full)
             for (uint rb = 0; rb < 4; ++rb) {
-                simdgroup_load(w[rb], sp + 8 * rb * TK + 8 * kt, TK);
+                simdgroup_load(w[rb], sp + 8 * rb * SK + 8 * kt, SK);
             }
             #pragma clang loop unroll(full)
             for (uint u = 0; u < TD / 8; ++u) {

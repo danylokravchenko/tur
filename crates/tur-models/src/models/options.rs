@@ -198,7 +198,7 @@ impl SparseAttention {
     /// sparsely past 16K keys, prefill included. On the 0.8B, sparse decode is no slower
     /// than dense from 8K, but gains only from 16K to 24K (4 to 12%), and from 16K it
     /// answered every needle question as dense did; below 16K the budget is over a quarter
-    /// of the context. Sparse prefill ran a 2048-token chunk 2.1 to 4.3 times faster at 32K
+    /// of the context. Sparse prefill ran a 2048-token chunk 1.7 to 4.3 times faster at 32K
     /// to 64K on the 0.8B and Gemma 4 E2B, and answered the needle questions as well as
     /// dense prefill.
     pub fn new(map: std::path::PathBuf) -> Self {

@@ -8,11 +8,13 @@
 //! `TUR_BENCH_LINEAR=q8_0,q4k,q6k,q5k,q3k,q2k` selects projection formats (default `q8_0,q4k`);
 //! Q5K and Q6K have no Tur kernels and measure Candle's only.
 //! `TUR_BENCH_SHAPE=<substring>` selects tiled attention shapes for focused tuning.
+//! `TUR_BENCH_KV=f16` narrows the tiled cases to those K/V formats and `TUR_BENCH_PER_QUERY=0`
+//! skips their per-query comparison, so a profiler sees one kernel.
 
 use candle_core::{D, DType, Device, Tensor, quantized::GgmlDType};
 use serde_json::{Value, json};
 use std::time::Instant;
-use tur_core::{Result, execution::KvFormat};
+use tur_core::{Result, TurError, execution::KvFormat};
 use tur_metal::{
     blocks::BlockFormat,
     kernels::{
@@ -529,6 +531,18 @@ fn paged_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
 
 /// Tiled matrix-unit kernel against the per-query kernel (with its split-K choice), to
 /// place the dispatch crossover: (label, past keys, new tokens per sequence, sequences).
+/// K/V formats of the tiled cases: `TUR_BENCH_KV=f16,q8` narrows them, for profiling one.
+fn tiled_formats() -> Result<Vec<KvFormat>> {
+    std::env::var("TUR_BENCH_KV").map_or_else(
+        |_| Ok(vec![KvFormat::F32, KvFormat::F16, KvFormat::Q8]),
+        |list| {
+            list.split(',')
+                .map(|f| f.parse().map_err(TurError::Other))
+                .collect()
+        },
+    )
+}
+
 fn tiled_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     let tiled = kernels.clone().with_tuning(Tuning {
         attention_tiled_groups: 0,
@@ -565,7 +579,7 @@ fn tiled_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
         let tokens = new * sequences;
         let q = random(device, &[tokens, HEADS, HEAD_DIM], 5, 1.0)?;
         let gate = random(device, &[tokens, HEADS * 2 * HEAD_DIM], 6, 1.0)?;
-        for format in [KvFormat::F32, KvFormat::F16, KvFormat::Q8] {
+        for format in tiled_formats()? {
             let paged = paged(
                 device, kernels, format, 16, KV_HEADS, HEAD_DIM, past, new, sequences,
             )?;
@@ -574,7 +588,12 @@ fn tiled_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
                     k.attention(&q, &paged.pool, &paged.kv, &gate, gate_heads())
                 })
             };
-            let (t, s) = (run(&tiled)?, run(&simd)?);
+            let t = run(&tiled)?;
+            let s = if std::env::var("TUR_BENCH_PER_QUERY").is_ok_and(|v| v == "0") {
+                json!({"median_seconds": 0.0})
+            } else {
+                run(&simd)?
+            };
             eprintln!(
                 "{label:23} {format:5}: tiled {:8.3} ms  per-query {:8.3} ms  x{:.2}",
                 t["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,

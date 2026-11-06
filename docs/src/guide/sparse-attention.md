@@ -1,6 +1,6 @@
 # Long contexts with sparse attention
 
-Without sparse attention, every prompt token and every generated token reads every key and value the request has written, in every full attention layer. At 64K tokens of context those reads dominate: prefilling a 2048-token chunk takes 1.7 times as long as at 32K, and each new token gets slower as the context grows. Latent sparse attention (LSA) caps those reads. Past 16K keys, each token reads about 4,600 keys chosen for it, however long the context is. On Qwen3.5-0.8B on an M1, a 64K prompt's first token arrives in 80 s instead of 194 s, and a decode step at 128K drops from 46 ms to 21 ms, the same time it takes at 32K.
+Without sparse attention, every prompt token and every generated token reads every key and value the request has written, in every full attention layer. At 64K tokens of context those reads dominate: prefilling a 2048-token chunk takes 1.6 times as long as at 32K, and each new token gets slower as the context grows. Latent sparse attention (LSA) caps those reads. Past 16K keys, each token reads about 4,600 keys chosen for it, however long the context is. On Qwen3.5-0.8B on an M1, a 64K prompt's first token arrives in 80 s instead of 194 s, and a decode step at 128K drops from 46 ms to 21 ms, the same time it takes at 32K.
 
 LSA is an experiment and is off by default. It changes outputs compared with dense attention, and so far it has been checked on two small models, Qwen3.5-0.8B and Gemma 4 E2B. It works on Qwen3.5-family models, dense and MoE, and on Gemma 4's full attention layers. gpt-oss reads every key, because it rotates every dimension of its keys and leaves nothing position-free to cluster.
 
@@ -45,7 +45,7 @@ Bursts of long prompts through the full server on Qwen3.5-0.8B, Q8_0 weights, F1
 | 64K, 1 | 194 s | 80 s | 32.4 ms | 21.8 ms |
 | 64K, 4 | 737 s | 308 s | 78.2 ms | 31.9 ms |
 
-The dense rows ran before the current dense prefill kernel, which is 13 to 27% faster after 32K to 64K of context, so dense first tokens now arrive somewhat sooner than shown. Against llama.cpp on the same Q8_0 weights, one sequence decodes 47.5 tokens/s at 128K against llama.cpp's 20.2, and a 2048-token chunk after 128K prefills at 679 tokens/s against 159. [Measured performance](performance.md#long-contexts-with-sparse-attention) has every depth, dense Tur alongside, and Gemma 4 E2B.
+The dense rows ran before the current dense prefill kernel, which is 39 to 61% faster after 32K to 64K of context, so dense first tokens now arrive sooner than shown and the gap to LSA is smaller. Against llama.cpp on the same Q8_0 weights, one sequence decodes 47.5 tokens/s at 128K against llama.cpp's 20.2, and a 2048-token chunk after 128K prefills at 679 tokens/s against 159. [Measured performance](performance.md#long-contexts-with-sparse-attention) has every depth, dense Tur alongside, and Gemma 4 E2B.
 
 ## What it costs in quality
 

@@ -99,9 +99,9 @@ Dense prefill attention grows with the square of the prompt, so past 32K it domi
 
 | Context before the chunk | Dense | Sparse prefill | Speedup |
 | --- | --- | --- | --- |
-| 32K | 5.24 s (391 tokens/s) | 2.48 s (825 tokens/s) | 2.1× |
-| 64K | 8.92 s (230 tokens/s) | 2.79 s (733 tokens/s) | 3.2× |
-| 128K | 16.47 s (124 tokens/s) | 3.02 s (679 tokens/s) | 5.5× |
+| 32K | 4.26 s (481 tokens/s) | 2.48 s (825 tokens/s) | 1.7× |
+| 64K | 7.01 s (292 tokens/s) | 2.79 s (733 tokens/s) | 2.5× |
+| 128K | 12.37 s (165 tokens/s) | 3.02 s (679 tokens/s) | 4.1× |
 
 With sparse prefill as well, the needle check below answered 23 of its 24 questions correctly against dense attention's 22, and 22 answers matched dense attention's text exactly. One of the two that differ is a 16K question dense attention got wrong; the other has the right code and continues differently.
 
