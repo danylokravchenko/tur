@@ -143,6 +143,41 @@ The widest spread between the three repeats was 7% for greedy and 12% for sample
 
 All greedy speculative runs reproduced normal decoding's token IDs. Sampled output matched except in the first eight-request prose repeat with lookup or MTP, where one request differed at output token 60; a focused rerun reproduced the mismatch, and later repeats matched. Same-seed equality remains unresolved for that case.
 
+### Long contexts with sparse attention
+
+[Sparse attention](sparse-attention.md) (`--sparse-attention auto`) with the map `tur sparse-map` fitted on four books, Q8_0 weights, F16 K/V. Past 16K keys each token reads about 4,600 chosen keys, in prefill and in decode; below 16K both modes read every key.
+
+Decode of one sequence at a long context (`model` benchmark, `TUR_BENCH_SPARSE_MAP`), in tokens/s, with the time per step. The llama.cpp column is the same Q8_0 checkpoint as a GGUF (`llama-bench -p 2048 -n 32 -d 32768,65536,131072 -r 2`, llama.cpp 0.7.0 with its defaults, flash attention chosen automatically and F16 K/V), as in [Compared with llama.cpp](#compared-with-llamacpp):
+
+| Context | Dense | Sparse attention | llama.cpp | Step, dense | Step, sparse | Speedup |
+| --- | --- | --- | --- | --- | --- | --- |
+| 32K | 38.9 | 46.0 | 36.8 | 25.7 ms | 21.8 ms | 1.18× |
+| 64K | 30.7 | 48.0 | 29.2 | 32.6 ms | 20.9 ms | 1.56× |
+| 128K | 21.7 | 47.5 | 20.2 | 46.2 ms | 21.1 ms | 2.19× |
+
+Prefill of one 2048-token chunk after a long context (`TUR_BENCH_ONLY=chunk`), in prompt tokens/s, with the time per chunk; llama.cpp's is `pp2048` at the same depth:
+
+| Context before the chunk | Dense | Sparse attention | llama.cpp | Chunk, dense | Chunk, sparse | Speedup |
+| --- | --- | --- | --- | --- | --- | --- |
+| 32K | 346 | 825 | 471 | 5.91 s | 2.48 s | 2.4× |
+| 64K | 181 | 733 | 279 | 11.30 s | 2.79 s | 4.0× |
+| 128K | 107 | 679 | 159 | 19.06 s | 3.02 s | 6.3× |
+
+Dense, Tur decodes 5 to 7% faster than llama.cpp at every depth, but prefills 27 to 35% slower: both engines prefill 2K tokens without context in about 1.55 s, so the gap is attention over the context. Counting attention's multiply-adds, Tur's tiled kernel runs at about 0.7 to 0.8 TFLOPS there and llama.cpp's at about 1.2. With sparse attention Tur decodes 1.25 to 2.35 times as fast as llama.cpp and prefills 1.75 to 4.3 times as fast, but its outputs differ slightly from dense attention while llama.cpp's don't.
+
+With 128 tokens of context the same build decodes 57.5 tokens/s and prefills a 2K prompt at 1,311 tokens/s, so sparse attention keeps decode at 83% of its short-context speed out to 128K, where dense falls to 38%.
+
+Bursts of long prompts through the full server (`TUR_BENCH_WORKLOADS=long`), cold prefix cache, greedy decoding, 256 output tokens per request, one run each. Output tokens/s counts the whole burst, prefill included:
+
+| Prompt, requests | TTFT p50, dense | TTFT p50, sparse | ITL p50, dense | ITL p50, sparse | Output tok/s, dense | Output tok/s, sparse |
+| --- | --- | --- | --- | --- | --- | --- |
+| 32K, 1 | 61.3 s | 39.4 s | 25.3 ms | 21.2 ms | 3.8 | 5.7 |
+| 32K, 4 | 229 s | 152 s | 44.0 ms | 29.1 ms | 3.4 | 5.0 |
+| 64K, 1 | 194 s | 79.7 s | 32.4 ms | 21.8 ms | 1.3 | 3.0 |
+| 64K, 4 | 737 s | 308 s | 78.2 ms | 31.9 ms | 1.4 | 2.9 |
+
+The first token arrives 1.6 to 2.4 times sooner and the gap between tokens shrinks up to 2.5 times, most with four 64K requests, whose K/V reads dominate dense decode. Prompts still prefill below 16K keys densely, so the gain grows with prompt length. On the needle check (eight codes hidden in a held-out book, asked one at a time) sparse attention answered 23 of 24 correctly at 16K, 32K and 64K, against 22 for dense attention.
+
 ### Loading
 
 A fresh process with a warm file cache, timed until the last weight reaches the GPU. Peak memory comes from `/usr/bin/time -l`.
@@ -198,7 +233,7 @@ Bursts of N requests with 128-token prompts and 64 output tokens, in output toke
 | llama.cpp Q8_0 | 47.6 | 75.5 | 114 | 155 | 170 |
 | llama.cpp Q4_K_M | 59.4 | 78.7 | 114 | 151 | 160 |
 
-Tur decodes 1.1 to 1.4× faster with one sequence and up to 1.55× faster with 8 to 16, and finishes bursts of 8 to 16 requests 1.2× faster end to end. Prefill is level at 2K tokens; at 8K, llama.cpp is 6 to 11% faster.
+Tur decodes 1.1 to 1.4× faster with one sequence and up to 1.55× faster with 8 to 16, and finishes bursts of 8 to 16 requests 1.2× faster end to end. Prefill is level at 2K tokens; at 8K, llama.cpp is 6 to 11% faster, and after 32K to 128K of context 27 to 35% faster with dense attention (see [Long contexts with sparse attention](#long-contexts-with-sparse-attention)).
 
 #### On the same GGUF files
 
@@ -300,6 +335,18 @@ With one sequence, the assistant now chains several drafts per pass, which measu
 | Q8_0 artifact (`tur quantize --method rtn`) | 4.8 to 5.5 s | 7.12 GB | 3.2 GB |
 
 The artifact reads embeddings from its packed output layer, which saves the 805 MB embedding table. Of either total, 4.4 GiB is Gemma's per-layer embedding table.
+
+### Sparse attention on E2B
+
+`--sparse-attention auto` with a map fitted on four books, `model` benchmark, one sequence. The 16 GB M1 ran out of memory for a dense 2048-token chunk after 64K, so that row is missing.
+
+| Case | Dense | Sparse attention |
+| --- | --- | --- |
+| Decode at 32K | 17.5 tokens/s (57.3 ms) | 18.4 tokens/s (54.3 ms) |
+| Decode at 64K | 15.2 tokens/s (66.0 ms) | 19.5 tokens/s (51.3 ms) |
+| Prefill, 2048-token chunk after 32K | 188 tokens/s (10.9 s) | 806 tokens/s (2.54 s) |
+
+E2B spends 47 ms of each decode step on weights, so the context's share is small and so is the decode gain; prefill gains 4.3×. Both modes answered all 16 needle questions at 16K and 32K with identical text.
 
 ## gpt-oss-20b
 

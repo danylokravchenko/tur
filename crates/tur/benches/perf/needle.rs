@@ -1,14 +1,14 @@
 //! Long-context retrieval with dense and latent sparse decoding on a real checkpoint. Facts
 //! are planted at evenly spaced depths of a long document of filler text; one prefill per
 //! document serves every question, each asked from a snapshot of it and answered greedily.
-//! The prompt prefills densely in both modes unless sparse prefill is on, so the answer
-//! tokens are where sparse selection must find the planted keys. Prints one JSON document.
+//! Past the crossover the sparse mode prefills sparsely too, unless told not to. Prints one
+//! JSON document.
 //!
 //! `TUR_BENCH_MODEL=<snapshot> TUR_BENCH_TEXT=<filler.txt> TUR_BENCH_SPARSE_MAP=<map>
 //! cargo bench --offline -p tur --bench perf -- needle > out.json`
 //! `TUR_BENCH_CONTEXTS=16384,32768` sets the document lengths, `TUR_BENCH_NEEDLES=8` the
 //! facts per document, `TUR_BENCH_SPARSE_CROSSOVER=<keys>` the sparse crossover and
-//! `TUR_BENCH_SPARSE_PREFILL=1` reads the document and questions sparsely too.
+//! `TUR_BENCH_SPARSE_PREFILL=0` prefills the document and questions densely.
 
 use crate::model::{pool, prefilled};
 use candle_core::Device;

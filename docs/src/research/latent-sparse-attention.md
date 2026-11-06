@@ -80,22 +80,22 @@ Through the whole model (`TUR_BENCH_SPARSE_MAP=<map> just bench model`), with th
 
 The sparse step stays near 21 ms from 64K on, as the kernel measurements predicted. These steps don't close a block, so the clustering stall once every 512 tokens isn't in them.
 
-Through the serving pipeline (`TUR_BENCH_WORKLOADS=long just bench serving`), with prompts prefilled cold, greedy decoding and 256 output tokens per request:
+Through the serving pipeline (`TUR_BENCH_WORKLOADS=long just bench serving`), with prompts prefilled cold, greedy decoding and 256 output tokens per request, and `auto` reading prefill sparsely too:
 
-| Prompt, requests | Inter-token p50, dense | Inter-token p50, sparse | Decode speedup | First token, dense | First token, sparse |
-| --- | --- | --- | --- | --- | --- |
-| 32K, 1 | 25.2 ms | 20.9 ms | 1.21× | 63.5 s | 63.5 s |
-| 32K, 4 | 43.9 ms | 30.3 ms | 1.45× | 241 s | 242 s |
-| 64K, 1 | 32.3 ms | 22.2 ms | 1.45× | 209 s | 215 s |
-| 64K, 4 | 78.2 ms | 33.3 ms | 2.35× | 787 s | 815 s |
+| Prompt, requests | Inter-token p50, dense | Inter-token p50, sparse | First token, dense | First token, sparse | Output tok/s, dense | Output tok/s, sparse |
+| --- | --- | --- | --- | --- | --- | --- |
+| 32K, 1 | 25.3 ms | 21.2 ms | 61.3 s | 39.4 s | 3.8 | 5.7 |
+| 32K, 4 | 44.0 ms | 29.1 ms | 229 s | 152 s | 3.4 | 5.0 |
+| 64K, 1 | 32.4 ms | 21.8 ms | 194 s | 79.7 s | 1.3 | 3.0 |
+| 64K, 4 | 78.2 ms | 31.9 ms | 737 s | 308 s | 1.4 | 2.9 |
 
-The gain grows with concurrency, because every request adds its own K/V reads while the weights are read once per pass: four requests at 64K decode as fast as one did dense. The first token comes up to 3% later, from clustering every block during prefill. Overall throughput didn't change, because prefill dominates these bursts: four 64K prompts take 13 minutes to prefill and 34 seconds to decode, at 313 prompt tokens/s against 520 at 32K, as dense attention's quadratic cost takes over.
+The decode gain grows with concurrency, because every request adds its own K/V reads while the weights are read once per pass: four requests at 64K decode faster than one did dense. The first-token gain grows with the prompt, because dense prefill attention grows with the square of the prompt while sparse prefill reads a fixed budget past 16K. With sparse decode alone, the first token came up to 3% later than dense, from clustering every block during prefill.
 
 ### Sparse prefill
 
 Dense prefill attention grows with the square of the prompt, so past 32K it dominates time to first token. Sparse prefill gives the same budget to each tile of 32 consecutive prompt queries past the crossover. The tile scores buckets with the sum of its rows' normalized index queries, which ranks buckets by the mean of the rows' scores, and the tiled attention kernel reads the tile's list: the selected keys before the first row's window, the sinks, then every key from that window's start to the last row. Row `r` of the tile reads the list up to its own position, so causality holds and the matrix units still share each staged key across the tile's 32 queries. Lists per query would give up that sharing, since each query would stage its own keys.
 
-It is opt-in (`SparseAttention::prefill`), because it changes every prompt token's hidden state rather than only the generated ones, so errors can compound through the layers. One 2048-token chunk after a long context, on the 0.8B with Q8_0 weights and F16 K/V on the M1 (`TUR_BENCH_ONLY=chunk just bench model`):
+`auto` includes it. It changes every prompt token's hidden state rather than only the generated ones, so errors could compound through the layers; the needle check below and the E2B check found no loss, and `SparseAttention::prefill` turns it off for experiments. One 2048-token chunk after a long context, on the 0.8B with Q8_0 weights and F16 K/V on the M1 (`TUR_BENCH_ONLY=chunk just bench model`):
 
 | Context before the chunk | Dense | Sparse prefill | Speedup |
 | --- | --- | --- | --- |
@@ -144,7 +144,7 @@ The kernels live in `tur-metal`'s `lsa.metal` and `lsa.rs`:
 - `[model] sparse_attention` (`--sparse-attention`) is `off` or `auto`, and `off` is the default, because outputs change compared with dense attention and every golden test assumes dense attention. Under `auto`, a request reads sparsely once its context passes the crossover; below it, and for models without a map, attention stays dense. A model can default to `auto` only after it passes the retrieval budget.
 - The crossover defaults to 16K keys. Measured on the 0.8B with sparse reads forced from the first key, sparse decode is no slower than dense from 8K (20.2 against 20.9 ms) but gains only 4% at 16K and 12% at 24K, where the budget is still a large share of the context; the needle check above matched dense from 16K. A per-device value in the tuning table would replace it once more Macs are measured. The budget (`k`, `p`, window, sinks) is an advanced setting with the paper's values as defaults.
 - Verification runs one selection per verified position, as plain decoding would at that position, so speculation stays exact with respect to the sparse model. The MTP head's own attention layer stays dense.
-- Prefill attention stays dense and tiled, and only builds index blocks, unless sparse prefill is on. A pass then sorts its rows into dense rows, decoding rows that select per query, and prefill rows that select per tile, and dispatches each kind on its own.
+- Prefill below the crossover stays dense and tiled, and only builds index blocks; past it, each query tile selects its own keys. A pass sorts its rows into dense rows, decoding rows that select per query, and prefill rows that select per tile, and dispatches each kind on its own. With serving bursts of long prompts on the 0.8B, `auto` brought the first token 1.6 to 2.4 times sooner and cut the median gap between tokens up to 2.5 times (see [Measured performance](../guide/performance.md#long-contexts-with-sparse-attention)).
 
 ## Validation
 

@@ -180,7 +180,7 @@ impl DraftHead {
 /// recent keys and the first `sink` keys, chosen through the per-layer index map stored at
 /// `map` (`tur sparse-map` writes one). With `prefill`, each tile of 32 consecutive prompt
 /// queries past the crossover reads the same budget, selected for the tile, plus the run of
-/// keys to its last query; otherwise prefill stays dense. Qwen3.5-family and Gemma 4 models
+/// keys to its last query; without it, prefill stays dense. Qwen3.5-family and Gemma 4 models
 /// only; Gemma's sliding window layers stay dense.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SparseAttention {
@@ -195,9 +195,12 @@ pub struct SparseAttention {
 
 impl SparseAttention {
     /// The paper's budget for Qwen3.8-27B (4,612 keys) over the map at `map`, reading
-    /// sparsely past 16K keys. On the 0.8B, sparse decode is no slower than dense from 8K,
-    /// but gains only from 16K to 24K (4 to 12%), and from 16K it answered every needle
-    /// question as dense did; below 16K the budget is over a quarter of the context.
+    /// sparsely past 16K keys, prefill included. On the 0.8B, sparse decode is no slower
+    /// than dense from 8K, but gains only from 16K to 24K (4 to 12%), and from 16K it
+    /// answered every needle question as dense did; below 16K the budget is over a quarter
+    /// of the context. Sparse prefill ran a 2048-token chunk 2.4 to 4.3 times faster at 32K
+    /// to 64K on the 0.8B and Gemma 4 E2B, and answered the needle questions as well as
+    /// dense prefill.
     pub fn new(map: std::path::PathBuf) -> Self {
         Self {
             map,
@@ -206,7 +209,7 @@ impl SparseAttention {
             window: 512,
             sink: 4,
             crossover: 16_384,
-            prefill: false,
+            prefill: true,
         }
     }
 

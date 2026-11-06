@@ -549,6 +549,7 @@ fn tiled_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
         ("chunk 16 after 2048", 2048, 16, 1),
         ("chunk 64 after 2048", 2048, 64, 1),
         ("chunk 256 after 8192", 8192, 256, 1),
+        ("chunk 2048 after 32768", 32_768, 2048, 1),
         ("chunk 32 x4 after 1024", 1024, 32, 4),
         ("decode ctx 2048 x8", 2047, 1, 8),
     ];

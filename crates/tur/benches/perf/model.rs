@@ -13,7 +13,7 @@
 //! such as Gemma 4 E2B use fewer of both to keep a run short.
 //! `TUR_BENCH_SPARSE_MAP=<index map>` reads attention sparsely through that map, with the
 //! default budget, over indexed pools; `TUR_BENCH_SPARSE_CROSSOVER=<keys>` replaces the
-//! default crossover and `TUR_BENCH_SPARSE_PREFILL=1` reads prefill sparsely too.
+//! default crossover and `TUR_BENCH_SPARSE_PREFILL=0` keeps prefill dense.
 //! `TUR_BENCH_ONLY=chunk`, never on by default, times one 2048-token prefill chunk after
 //! each of `TUR_BENCH_CONTEXTS`.
 
@@ -327,10 +327,9 @@ fn engine_case(model: Arc<TextModel>, generated: usize) -> Result<Value> {
     }))
 }
 
-/// Whether `TUR_BENCH_ONLY` (comma-separated `prefill`, `decode`, `engine`) selects `case`.
 /// `TUR_BENCH_SPARSE_MAP` reads attention sparsely through that index map, past
-/// `TUR_BENCH_SPARSE_CROSSOVER` keys if set, and in prefill too with
-/// `TUR_BENCH_SPARSE_PREFILL=1`.
+/// `TUR_BENCH_SPARSE_CROSSOVER` keys if set, and in prefill too unless
+/// `TUR_BENCH_SPARSE_PREFILL=0`.
 pub(crate) fn sparse_settings() -> Result<Option<SparseAttention>> {
     let Some(map) = std::env::var_os("TUR_BENCH_SPARSE_MAP") else {
         return Ok(None);
@@ -341,10 +340,11 @@ pub(crate) fn sparse_settings() -> Result<Option<SparseAttention>> {
             .parse()
             .map_err(|_| invalid("TUR_BENCH_SPARSE_CROSSOVER"))?;
     }
-    sparse.prefill = std::env::var("TUR_BENCH_SPARSE_PREFILL").is_ok_and(|v| v == "1");
+    sparse.prefill = std::env::var("TUR_BENCH_SPARSE_PREFILL").map_or(true, |v| v != "0");
     Ok(Some(sparse))
 }
 
+/// Whether `TUR_BENCH_ONLY` (comma-separated `prefill`, `decode`, `engine`) selects `case`.
 fn selected(case: &str) -> bool {
     std::env::var("TUR_BENCH_ONLY").map_or(true, |only| only.split(',').any(|c| c == case))
 }

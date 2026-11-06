@@ -25,7 +25,7 @@
 //! `TUR_BENCH_WORKLOADS=long TUR_BENCH_LONG=32768,65536` bursts of requests with prompts of
 //! that many tokens, from a cold prefix cache. `TUR_BENCH_SPARSE_MAP=<index map>` reads
 //! attention sparsely through that map (`TUR_BENCH_SPARSE_CROSSOVER=<keys>` replaces the
-//! default crossover, `TUR_BENCH_SPARSE_PREFILL=1` reads prefill sparsely too).
+//! default crossover, `TUR_BENCH_SPARSE_PREFILL=0` keeps prefill dense).
 //! `TUR_BENCH_WORKLOADS=speculation TUR_BENCH_DRAFT=0,4` compares adaptive prompt lookup
 //! (`TUR_BENCH_MTP=1` adds the native MTP head to drafted configurations, `0,1` runs both)
 //! with ordinary decoding, including acceptance counters, memory and exact token IDs, on

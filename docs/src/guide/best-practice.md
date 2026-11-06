@@ -31,6 +31,25 @@ These rules apply to every model:
 - Speculation needs `recurrent_state = "f32"`, the default. Outputs match normal decoding with every speculative configuration.
 - Set `context_tokens` if you need more than 8K tokens per request, so the start fails early with the largest context that fits.
 
+## Long contexts
+
+Turn on [sparse attention](sparse-attention.md) when requests regularly carry more than 16K tokens: long documents, large codebases, agent loops whose history keeps growing. Past 16K keys each token reads about 4,600 chosen keys instead of all of them, in prefill and in decode, so both stay nearly flat as the context grows. Below 16K it reads every key and costs only the clustering, so short chats neither gain nor lose.
+
+- It works on Qwen3.5-family and Gemma 4 models, not gpt-oss. Fit one map per model and weight format with `tur sparse-map`, on text like what you serve, and keep it beside the model.
+- Set `context_tokens` to the longest request you accept (65,536 for 64K prompts), so the state pool is sized for it. By default it holds about 8K tokens per concurrent request, below the crossover.
+- Expect the largest gains on Qwen, where long-context decode is mostly K/V reads, and with several long requests at once. A small Gemma spends most of a decode step on weights, so it gains more in prefill than in decode.
+- Outputs differ from dense attention. On the needle check both models found every planted fact dense attention found, but check your own long requests with greedy sampling before relying on it.
+- Index blocks add about 2% to state memory, which the memory plan counts.
+
+```toml
+[model]
+sparse_attention = "auto"
+sparse_map = "maps/qwen3.5-0.8b.safetensors"
+
+[engine]
+context_tokens = 65536
+```
+
 ## Qwen3.5-0.8B
 
 Use a Q8_0 artifact. It agrees with F32 on the top token 98 to 99% of the time and holds 801 MB. Q4K decodes one sequence 1.6× faster (90 tokens/s against 57), but from two sequences on the formats converge and its top-1 agreement falls to 84 to 95%. If one conversation's speed matters most, a mixed 5.5-bit GPTQ artifact is the better compromise: 79 tokens/s, 521 MB, and about half the KL divergence of Q4K GPTQ.

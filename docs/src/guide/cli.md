@@ -89,8 +89,8 @@ Flags and the file override what a name brings. To run `gpt-oss` with every expe
 | `--vision-encoder [true\|false]` | `true` | Load the checkpoint's vision encoder when it has one (Qwen3.5 and Gemma 4); `false` saves its memory |
 | `--video-input [true\|false]` | `true` | Accept video through the vision encoder; `false` refuses it before any decoder reads the file, for untrusted clients, and images still work |
 | `--expert-cache-mb <MiB>` | every expert resident | Keep the experts of gpt-oss, a Qwen artifact or a Qwen GGUF file on disk and read them into this much memory; see [Expert cache](../architecture/expert-cache.md) |
-| `--sparse-attention off\|auto\|prefill` | `off` | Experiment: past 16K keys, decoding and verifying queries of Qwen3.5-family and Gemma 4 models read only the keys `--sparse-map` selects, and with `prefill` each tile of 32 prompt queries reads keys selected for it; outputs differ from dense attention. See [Long contexts with sparse attention](sparse-attention.md) |
-| `--sparse-map <file>` | none | Index map for `--sparse-attention auto` or `prefill`, from `tur sparse-map` |
+| `--sparse-attention off\|auto` | `off` | Experiment: past 16K keys, each decoding token and each tile of 32 prompt tokens of Qwen3.5-family and Gemma 4 models reads only the keys `--sparse-map` selects for it; outputs differ from dense attention. See [Long contexts with sparse attention](sparse-attention.md) |
+| `--sparse-map <file>` | none | Index map for `--sparse-attention auto`, from `tur sparse-map` |
 | `--cpu-reference` | off | Run the slow F32 CPU reference instead of Metal, for development |
 
 Gemma 4 uses the same commands. For the E2B model used in development:
