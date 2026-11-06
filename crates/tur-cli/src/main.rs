@@ -67,7 +67,8 @@ enum Command {
     Quantize(quantize::Args),
     /// Write a gpt-oss checkpoint with fewer experts, keeping those each layer can least lose.
     Prune(prune::Args),
-    /// Fit a Qwen3.5-family model's latent sparse attention index map from calibration text.
+    /// Fit a Qwen3.5-family or Gemma 4 model's latent sparse attention index map from calibration
+    /// text.
     SparseMap(sparse_map::Args),
     /// Transcribe a WAV file with a Whisper checkpoint and print the text.
     Transcribe(transcribe::Args),

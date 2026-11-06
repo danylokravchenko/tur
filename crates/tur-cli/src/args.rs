@@ -153,11 +153,12 @@ pub(crate) struct ModelArgs {
     #[arg(long)]
     expert_cache_mb: Option<usize>,
     /// Latent sparse attention: `auto` lets decoding and verifying queries past 16K keys read
-    /// only the keys `--sparse-map` selects, on Qwen3.5-family models. Outputs differ from
-    /// dense attention (default: off).
-    #[arg(long, value_parser = PossibleValuesParser::new(["off", "auto"]))]
+    /// only the keys `--sparse-map` selects, on Qwen3.5-family and Gemma 4 models, and
+    /// `prefill` also gives each tile of prompt queries past 16K keys its own selection.
+    /// Outputs differ from dense attention (default: off).
+    #[arg(long, value_parser = PossibleValuesParser::new(["off", "auto", "prefill"]))]
     sparse_attention: Option<String>,
-    /// Index map for `--sparse-attention auto`, written by `tur sparse-map`.
+    /// Index map for `--sparse-attention auto` or `prefill`, written by `tur sparse-map`.
     #[arg(long)]
     sparse_map: Option<PathBuf>,
     /// Use the CPU numerical reference for development checks.
@@ -283,12 +284,17 @@ impl ModelArgs {
     fn sparse(&self) -> Result<Option<tur::models::SparseAttention>> {
         match (self.sparse_attention.as_deref(), &self.sparse_map) {
             (None | Some("off"), _) => Ok(None),
-            (Some("auto"), Some(map)) => Ok(Some(tur::models::SparseAttention::new(map.clone()))),
-            (Some("auto"), None) => Err(TurError::Other(
-                "--sparse-attention auto needs --sparse-map; `tur sparse-map` writes one".into(),
-            )),
+            (Some(mode @ ("auto" | "prefill")), Some(map)) => {
+                Ok(Some(tur::models::SparseAttention {
+                    prefill: mode == "prefill",
+                    ..tur::models::SparseAttention::new(map.clone())
+                }))
+            }
+            (Some(mode @ ("auto" | "prefill")), None) => Err(TurError::Other(format!(
+                "--sparse-attention {mode} needs --sparse-map; `tur sparse-map` writes one"
+            ))),
             (Some(other), _) => Err(TurError::Other(format!(
-                "sparse attention is off or auto, not {other}"
+                "sparse attention is off, auto or prefill, not {other}"
             ))),
         }
     }
@@ -685,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sparse_attention_auto_needs_a_map_and_off_loads_none() -> Result<()> {
+    fn test_sparse_attention_auto_and_prefill_need_a_map_and_off_loads_none() -> Result<()> {
         let args = |mode: &str, map: Option<&str>| ModelArgs {
             sparse_attention: Some(mode.into()),
             sparse_map: map.map(PathBuf::from),
@@ -695,9 +701,12 @@ mod tests {
         assert!(args("auto", None).sparse().is_err());
         let sparse = args("auto", Some("map.safetensors")).sparse()?;
         assert_eq!(
-            sparse.map(|s| s.map),
-            Some(PathBuf::from("map.safetensors"))
+            sparse.as_ref().map(|s| (s.map.clone(), s.prefill)),
+            Some((PathBuf::from("map.safetensors"), false))
         );
+        let prefill = args("prefill", Some("map.safetensors")).sparse()?;
+        assert!(prefill.is_some_and(|s| s.prefill));
+        assert!(args("prefill", None).sparse().is_err());
         let mut relative = args("auto", Some("maps/qwen.safetensors"));
         relative.relative_to(Path::new("/etc/tur"));
         assert_eq!(

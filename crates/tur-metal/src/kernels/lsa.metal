@@ -17,36 +17,51 @@
 #define LSA_MAX_P 1024
 #define LSA_MAX_FREE 2048
 #define LSA_SCORE_CHUNK 256
+#define LSA_POOL_GROUPS 16
+#define LSA_SG_POOLS 2
 
+// A head's position-free dims run [first, first + split) then from `second` on.
 struct LsaClusterParams {
     uint jobs;
     uint kv_heads;
     uint dim;
-    uint rotary;
+    uint first;
+    uint split;
+    uint second;
     uint page;
     uint group;
     uint free_dims;
 };
 
 struct LsaScoreParams {
-    uint tokens;
+    uint groups;
     uint heads;
     uint kv_heads;
     uint dim;
-    uint rotary;
+    uint first;
+    uint split;
+    uint second;
     uint free_dims;
     uint score_stride;
 };
 
 struct LsaSelectParams {
-    uint tokens;
+    uint groups;
     uint score_stride;
     uint top_k;
     uint top_p;
     uint window;
     uint sink;
     uint width;
+    // Nonzero for groups of a tiled pass: sinks before the window, which runs on to the
+    // group's last row.
+    uint tiled;
 };
+
+// Head dim of position-free dim `e` of a head.
+static inline uint lsa_free_dim(uint e, uint first, uint split, uint second) {
+    return e < split ? first + e : second + (e - split);
+}
 
 template <typename T, uint QUANT>
 static inline float lsa_key(device const T *data, device const half *scales, ulong row, uint e,
@@ -58,53 +73,168 @@ static inline float lsa_key(device const T *data, device const half *scales, ulo
     return x;
 }
 
-// Index keys of one job's block, summed per pool of 4 consecutive keys into `sums`.
-// Each simdgroup owns whole pools; lane l holds output dims l and l + 32. Index key =
-// normalize(map^T x) over the concatenated position-free dims x of every K/V head; the
-// reference's normalization of x first is a positive scale that the second one removes.
+// Grid (jobs, LSA_POOL_GROUPS): threadgroup g of a job sums the index keys of pools
+// [8g, 8g + 8) of its block into `sums`, so one block spreads over 16 threadgroups. Each
+// simdgroup projects 2 pools (8 keys) together, so every map row it loads serves 8 keys;
+// lane l holds output dims l and l + 32. Index key = normalize(map^T x) over the
+// concatenated position-free dims x of every K/V head; the reference's normalization of x
+// first is a positive scale that the second one removes.
 template <typename T, uint QUANT>
-static inline void lsa_pools(device const T *k_data, device const half *k_scales,
-                             device const uint *table, uint first, uint block,
-                             device const float *map, device float *sums,
-                             constant LsaClusterParams &p, uint sg, uint sgs, uint lane) {
-    uint free = p.dim - p.rotary;
-    for (uint pool = sg; pool < LSA_POOLS; pool += sgs) {
-        float a0 = 0.0f, a1 = 0.0f;
-        for (uint r = 0; r < LSA_POOL; ++r) {
+kernel void lsa_pools(
+    device const T *k_data [[buffer(0)]],
+    device const half *k_scales [[buffer(1)]],
+    device const uint *table [[buffer(2)]],
+    device const uint *jobs [[buffer(3)]],
+    device const float *map [[buffer(4)]],
+    device float *scratch [[buffer(5)]],
+    constant LsaClusterParams &p [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint sgs [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint KEYS = LSA_SG_POOLS * LSA_POOL;
+    constexpr uint PER_GROUP = LSA_POOLS / LSA_POOL_GROUPS;
+    if (group.x >= p.jobs) {
+        return;
+    }
+    uint first = jobs[group.x * 3], block = jobs[group.x * 3 + 1];
+    device float *sums = scratch + ulong(group.x) * LSA_POOLS * LSA_DIM;
+    uint free = p.free_dims / p.kv_heads;
+    uint end = (group.y + 1) * PER_GROUP;
+    for (uint pool = group.y * PER_GROUP + sg * LSA_SG_POOLS; pool < end;
+         pool += sgs * LSA_SG_POOLS) {
+        ulong rows[KEYS];
+        float y0[KEYS], y1[KEYS];
+        for (uint r = 0; r < KEYS; ++r) {
             uint j = block * LSA_BLOCK + pool * LSA_POOL + r;
-            ulong slot = ulong(table[first + j / p.page]) * p.page + j % p.page;
-            float y0 = 0.0f, y1 = 0.0f;
-            for (uint d0 = 0; d0 < p.free_dims; d0 += SIMD) {
-                uint d = d0 + lane;
-                float x = lsa_key<T, QUANT>(k_data, k_scales, slot * p.kv_heads + d / free,
-                                            p.rotary + d % free, p);
-                for (uint i = 0; i < SIMD; ++i) {
-                    float xi = simd_broadcast(x, ushort(i));
-                    device const float *m = map + ulong(d0 + i) * LSA_DIM;
-                    y0 += xi * m[lane];
-                    y1 += xi * m[lane + SIMD];
+            rows[r] = (ulong(table[first + j / p.page]) * p.page + j % p.page) * p.kv_heads;
+            y0[r] = 0.0f;
+            y1[r] = 0.0f;
+        }
+        for (uint d0 = 0; d0 < p.free_dims; d0 += SIMD) {
+            uint d = d0 + lane;
+            float x[KEYS];
+            for (uint r = 0; r < KEYS; ++r) {
+                x[r] = lsa_key<T, QUANT>(k_data, k_scales, rows[r] + d / free, lsa_free_dim(d % free, p.first, p.split, p.second), p);
+            }
+            device const float *m = map + ulong(d0) * LSA_DIM;
+            for (uint i = 0; i < SIMD; ++i) {
+                float m0 = m[i * LSA_DIM + lane], m1 = m[i * LSA_DIM + lane + SIMD];
+                for (uint r = 0; r < KEYS; ++r) {
+                    float xi = simd_broadcast(x[r], ushort(i));
+                    y0[r] += xi * m0;
+                    y1[r] += xi * m1;
                 }
             }
-            float norm = sqrt(simd_sum(y0 * y0 + y1 * y1));
-            float inv = 1.0f / max(norm, 1e-12f);
-            a0 += y0 * inv;
-            a1 += y1 * inv;
         }
-        sums[pool * LSA_DIM + lane] = a0;
-        sums[pool * LSA_DIM + lane + SIMD] = a1;
+        for (uint q = 0; q < LSA_SG_POOLS; ++q) {
+            float a0 = 0.0f, a1 = 0.0f;
+            for (uint r = q * LSA_POOL; r < (q + 1) * LSA_POOL; ++r) {
+                float inv = 1.0f / max(sqrt(simd_sum(y0[r] * y0[r] + y1[r] * y1[r])), 1e-12f);
+                a0 += y0[r] * inv;
+                a1 += y1[r] * inv;
+            }
+            sums[(pool + q) * LSA_DIM + lane] = a0;
+            sums[(pool + q) * LSA_DIM + lane + SIMD] = a1;
+        }
+    }
+}
+
+// Gram matrix of a block's pool sums: entry (i, j) is sums_i . sums_j, read through its upper
+// triangle so both sides of a pair see the same value.
+static inline float lsa_gram(device const float *gram, uint i, uint j) {
+    return gram[min(i, j) * LSA_POOLS + max(i, j)];
+}
+
+// Each alive bucket's cheapest partner under the cap, ties to the lower index: simdgroups
+// own buckets and lanes their candidates.
+static inline void lsa_partners(device const float *gram, threadgroup float *squares,
+                                threadgroup float *costs, threadgroup uint *best,
+                                threadgroup const uint *sizes, threadgroup const uint *alive,
+                                uint sg, uint sgs, uint lane) {
+    for (uint i = sg; i < LSA_POOLS; i += sgs) {
+        if (alive[i] == 0) {
+            continue;
+        }
+        float own = sqrt(max(squares[i], 0.0f));
+        float cheapest = INFINITY;
+        uint partner = i;
+        for (uint j = lane; j < LSA_POOLS; j += SIMD) {
+            if (j == i || alive[j] == 0 || sizes[i] + sizes[j] > LSA_BUCKET_CAP) {
+                continue;
+            }
+            float merged = sqrt(max(squares[i] + squares[j] + 2.0f * lsa_gram(gram, i, j), 0.0f));
+            float cost = own + sqrt(max(squares[j], 0.0f)) - merged;
+            if (cost < cheapest) {
+                cheapest = cost;
+                partner = j;
+            }
+        }
+        float least = simd_min(cheapest);
+        uint pick = simd_min(cheapest == least ? partner : 0xFFFFFFFFu);
+        if (lane == 0) {
+            costs[i] = least;
+            best[i] = least < INFINITY ? pick : i;
+        }
+    }
+}
+
+// Merge each kept bucket's partner into it: key sums, sizes, and the Gram matrix, whose
+// rows then columns add the partner's. Partners are never kept, so neither pass reads an
+// entry it writes.
+static inline void lsa_merge(device float *sums, device float *gram, threadgroup const uint *keep,
+                             threadgroup const uint *best, threadgroup uint *sizes,
+                             threadgroup uint *alive, threadgroup uint *parent, uint tid,
+                             uint threads, uint sg, uint sgs, uint lane) {
+    for (uint i = sg; i < LSA_POOLS; i += sgs) {
+        if (keep[i] == 0) {
+            continue;
+        }
+        uint j = best[i];
+        sums[i * LSA_DIM + lane] += sums[j * LSA_DIM + lane];
+        sums[i * LSA_DIM + lane + SIMD] += sums[j * LSA_DIM + lane + SIMD];
+        if (lane == 0) {
+            sizes[i] += sizes[j];
+            alive[j] = 0;
+            parent[j] = i;
+        }
+    }
+    for (uint e = tid; e < LSA_POOLS * LSA_POOLS; e += threads) {
+        uint i = e / LSA_POOLS;
+        if (keep[i] != 0) {
+            gram[e] += gram[best[i] * LSA_POOLS + e % LSA_POOLS];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    for (uint e = tid; e < LSA_POOLS * LSA_POOLS; e += threads) {
+        uint i = e % LSA_POOLS;
+        if (keep[i] != 0) {
+            gram[e] += gram[e - i + best[i]];
+        }
     }
 }
 
 // Ward rounds over one block's pools, as `lsa.core.ward.ward_rounds`: each round every
 // alive bucket finds its cheapest partner under the cap (ties to the lower index), and
 // mutual pairs merge into the lower one, cheapest first, until 64 remain. Merging costs
-// |a| + |b| - |a + b| over key sums.
-static inline void lsa_ward(device float *sums, threadgroup float *squares,
+// |a| + |b| - |a + b| over key sums, from the Gram matrix a merge updates linearly.
+static inline void lsa_ward(device float *sums, device float *gram, threadgroup float *squares,
                             threadgroup uint *best, threadgroup float *costs,
                             threadgroup uint *sizes, threadgroup uint *alive,
                             threadgroup uint *parent, threadgroup uint *keep,
                             threadgroup uint *count, uint tid, uint threads, uint sg,
                             uint sgs, uint lane) {
+    for (uint e = tid; e < LSA_POOLS * LSA_POOLS; e += threads) {
+        uint i = e / LSA_POOLS, j = e % LSA_POOLS;
+        if (j >= i) {
+            float g = 0.0f;
+            for (uint d = 0; d < LSA_DIM; ++d) {
+                g += sums[i * LSA_DIM + d] * sums[j * LSA_DIM + d];
+            }
+            gram[e] = g;
+            gram[j * LSA_POOLS + i] = g;
+        }
+    }
     for (uint i = tid; i < LSA_POOLS; i += threads) {
         sizes[i] = LSA_POOL;
         alive[i] = 1;
@@ -119,39 +249,11 @@ static inline void lsa_ward(device float *sums, threadgroup float *squares,
             break;
         }
         uint left = count[0] - LSA_BUCKETS;
-        for (uint i = sg; i < LSA_POOLS; i += sgs) {
-            float s0 = sums[i * LSA_DIM + lane], s1 = sums[i * LSA_DIM + lane + SIMD];
-            float sq = simd_sum(s0 * s0 + s1 * s1);
-            if (lane == 0) {
-                squares[i] = sq;
-            }
+        for (uint i = tid; i < LSA_POOLS; i += threads) {
+            squares[i] = gram[i * LSA_POOLS + i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = sg; i < LSA_POOLS; i += sgs) {
-            if (alive[i] == 0) {
-                continue;
-            }
-            float s0 = sums[i * LSA_DIM + lane], s1 = sums[i * LSA_DIM + lane + SIMD];
-            float own = sqrt(max(squares[i], 0.0f));
-            float cheapest = INFINITY;
-            uint partner = i;
-            for (uint j = 0; j < LSA_POOLS; ++j) {
-                if (j == i || alive[j] == 0 || sizes[i] + sizes[j] > LSA_BUCKET_CAP) {
-                    continue;
-                }
-                float g = simd_sum(s0 * sums[j * LSA_DIM + lane] + s1 * sums[j * LSA_DIM + lane + SIMD]);
-                float merged = sqrt(max(squares[i] + squares[j] + 2.0f * g, 0.0f));
-                float cost = own + sqrt(max(squares[j], 0.0f)) - merged;
-                if (cost < cheapest) {
-                    cheapest = cost;
-                    partner = j;
-                }
-            }
-            if (lane == 0) {
-                costs[i] = cheapest;
-                best[i] = partner;
-            }
-        }
+        lsa_partners(gram, squares, costs, best, sizes, alive, sg, sgs, lane);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = tid; i < LSA_POOLS; i += threads) {
             uint j = best[i];
@@ -176,19 +278,7 @@ static inline void lsa_ward(device float *sums, threadgroup float *squares,
             keep[i] = ranked[n++];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = sg; i < LSA_POOLS; i += sgs) {
-            if (keep[i] == 0) {
-                continue;
-            }
-            uint j = best[i];
-            sums[i * LSA_DIM + lane] += sums[j * LSA_DIM + lane];
-            sums[i * LSA_DIM + lane + SIMD] += sums[j * LSA_DIM + lane + SIMD];
-            if (lane == 0) {
-                sizes[i] += sizes[j];
-                alive[j] = 0;
-                parent[j] = i;
-            }
-        }
+        lsa_merge(sums, gram, keep, best, sizes, alive, parent, tid, threads, sg, sgs, lane);
         threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         // A round without a merge ends the clustering, as the reference's does.
         if (tid == 0) {
@@ -206,21 +296,16 @@ static inline void lsa_ward(device float *sums, threadgroup float *squares,
     }
 }
 
-// One threadgroup per job (`first`, `block`, `slot`): cluster logical block `block` of the
-// sequence whose page table starts at `table[first]` into index block `slot`. Writes each
-// bucket's normalized key sum and its pools in ascending order, -1 past its size; buckets
-// are numbered by their first pool.
-template <typename T, uint QUANT>
-kernel void lsa_cluster(
-    device const T *k_data [[buffer(0)]],
-    device const half *k_scales [[buffer(1)]],
-    device const uint *table [[buffer(2)]],
-    device const uint *jobs [[buffer(3)]],
-    device const float *map [[buffer(4)]],
-    device float *scratch [[buffer(5)]],
-    device float *centroids [[buffer(6)]],
-    device float *members [[buffer(7)]],
-    constant LsaClusterParams &p [[buffer(8)]],
+// One threadgroup per job (`first`, `block`, `slot`), after `lsa_pools` filled its sums:
+// cluster the pools into index block `slot`. Writes each bucket's normalized key sum and
+// its pools in ascending order, -1 past its size; buckets are numbered by their first pool.
+kernel void lsa_ward_f32(
+    device const uint *jobs [[buffer(0)]],
+    device float *scratch [[buffer(1)]],
+    device float *grams [[buffer(2)]],
+    device float *centroids [[buffer(3)]],
+    device float *members [[buffer(4)]],
+    constant LsaClusterParams &p [[buffer(5)]],
     uint job [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint threads [[threads_per_threadgroup]],
@@ -238,13 +323,11 @@ kernel void lsa_cluster(
     if (job >= p.jobs) {
         return;
     }
-    uint first = jobs[job * 3], block = jobs[job * 3 + 1];
     ulong slot = jobs[job * 3 + 2];
     device float *sums = scratch + ulong(job) * LSA_POOLS * LSA_DIM;
-    lsa_pools<T, QUANT>(k_data, k_scales, table, first, block, map, sums, p, sg, sgs, lane);
-    threadgroup_barrier(mem_flags::mem_device);
-    lsa_ward(sums, squares, best, costs, sizes, alive, parent, keep, count, tid, threads, sg,
-             sgs, lane);
+    device float *gram = grams + ulong(job) * LSA_POOLS * LSA_POOLS;
+    lsa_ward(sums, gram, squares, best, costs, sizes, alive, parent, keep, count, tid, threads,
+             sg, sgs, lane);
     // Every merged pool points at the pool it merged into; its bucket is the chain's end,
     // numbered by the alive pools before it.
     for (uint i = tid; i < LSA_POOLS; i += threads) {
@@ -289,36 +372,15 @@ kernel void lsa_cluster(
     }
 }
 
-// Grid (chunks of 256 buckets, tokens). Each threadgroup forms its token's index query
-// (query heads summed per K/V group over the position-free dims, carried through the map
-// and normalized) and scores the chunk's buckets of the closed blocks before the token's
-// own: logical bucket b is bucket b % 64 of the token's index block b / 64.
-kernel void lsa_score_f32(
-    device const float *q [[buffer(0)]],
-    device const float *map [[buffer(1)]],
-    device const float *centroids [[buffer(2)]],
-    device const uint *index_table [[buffer(3)]],
-    device const uint *index_first [[buffer(4)]],
-    device const uint *visible [[buffer(5)]],
-    device float *scores [[buffer(6)]],
-    constant LsaScoreParams &p [[buffer(7)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint2 local [[thread_position_in_threadgroup]],
-    uint2 width [[threads_per_threadgroup]]) {
-    threadgroup float x[LSA_MAX_FREE];
-    threadgroup float y[LSA_DIM];
-    uint tid = local.x, threads = width.x;
-    uint t = group.y;
-    uint pos = visible[t] - 1;
-    uint buckets = (pos / LSA_BLOCK) * LSA_BUCKETS;
-    uint start = group.x * LSA_SCORE_CHUNK;
-    if (t >= p.tokens || start >= buckets) {
-        return;
-    }
-    uint free = p.dim - p.rotary, per = p.heads / p.kv_heads;
+// Index query of q row `t` (query heads summed per K/V group over the position-free dims,
+// carried through the map) into `y`, and the inverse of its norm.
+static inline float lsa_query(device const float *q, device const float *map, uint t,
+                              threadgroup float *x, threadgroup float *y,
+                              constant LsaScoreParams &p, uint tid, uint threads) {
+    uint free = p.free_dims / p.kv_heads, per = p.heads / p.kv_heads;
     device const float *qt = q + ulong(t) * p.heads * p.dim;
     for (uint d = tid; d < p.free_dims; d += threads) {
-        uint h = d / free, e = p.rotary + d % free;
+        uint h = d / free, e = lsa_free_dim(d % free, p.first, p.split, p.second);
         float s = 0.0f;
         for (uint g = 0; g < per; ++g) {
             s += qt[(h * per + g) * p.dim + e];
@@ -338,14 +400,67 @@ kernel void lsa_score_f32(
     for (uint j = 0; j < LSA_DIM; ++j) {
         norm += y[j] * y[j];
     }
-    float inv = 1.0f / max(sqrt(norm), 1e-12f);
+    return 1.0f / max(sqrt(norm), 1e-12f);
+}
+
+// Grid (chunks of 256 buckets, groups). Group `t` is q rows [rows[2t], rows[2t] + rows[2t + 1]);
+// each threadgroup forms its group's index query and scores the chunk's buckets of the
+// closed blocks before the group's first row: logical bucket b is bucket b % 64 of index
+// block b / 64. A group of several rows scores with the sum of their normalized index
+// queries, the mean of their scores; a single row scales once at the end, as the
+// reference does.
+kernel void lsa_score_f32(
+    device const float *q [[buffer(0)]],
+    device const float *map [[buffer(1)]],
+    device const float *centroids [[buffer(2)]],
+    device const uint *index_table [[buffer(3)]],
+    device const uint *index_first [[buffer(4)]],
+    device const uint *visible [[buffer(5)]],
+    device float *scores [[buffer(6)]],
+    constant LsaScoreParams &p [[buffer(7)]],
+    device const uint *rows [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 local [[thread_position_in_threadgroup]],
+    uint2 width [[threads_per_threadgroup]]) {
+    threadgroup float x[LSA_MAX_FREE];
+    threadgroup float y[LSA_DIM];
+    threadgroup float sum[LSA_DIM];
+    uint tid = local.x, threads = width.x;
+    uint t = group.y;
+    if (t >= p.groups) {
+        return;
+    }
+    uint pos = visible[t] - 1;
+    uint buckets = (pos / LSA_BLOCK) * LSA_BUCKETS;
+    uint start = group.x * LSA_SCORE_CHUNK;
+    if (start >= buckets) {
+        return;
+    }
+    uint r0 = rows[2 * t], n = rows[2 * t + 1];
+    float inv = lsa_query(q, map, r0, x, y, p, tid, threads);
+    threadgroup float *query = y;
+    if (n > 1) {
+        for (uint j = tid; j < LSA_DIM; j += threads) {
+            sum[j] = y[j] * inv;
+        }
+        for (uint r = r0 + 1; r < r0 + n; ++r) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float scale = lsa_query(q, map, r, x, y, p, tid, threads);
+            for (uint j = tid; j < LSA_DIM; j += threads) {
+                sum[j] += y[j] * scale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        query = sum;
+        inv = 1.0f;
+    }
     for (uint b = start + tid; b < min(buckets, start + LSA_SCORE_CHUNK); b += threads) {
         uint phys = index_table[index_first[t] + b / LSA_BUCKETS];
         device const float4 *c = (device const float4 *)(centroids + (ulong(phys) * LSA_BUCKETS + b % LSA_BUCKETS) * LSA_DIM);
         float s = 0.0f;
         for (uint j = 0; j < LSA_DIM / 4; ++j) {
             float4 cj = c[j];
-            s += y[4 * j] * cj.x + y[4 * j + 1] * cj.y + y[4 * j + 2] * cj.z + y[4 * j + 3] * cj.w;
+            s += query[4 * j] * cj.x + query[4 * j + 1] * cj.y + query[4 * j + 2] * cj.z + query[4 * j + 3] * cj.w;
         }
         scores[ulong(t) * p.score_stride + b] = s * inv;
     }
@@ -499,6 +614,7 @@ kernel void lsa_select_f32(
     device float *keys [[buffer(5)]],
     device float *lengths [[buffer(6)]],
     constant LsaSelectParams &p [[buffer(7)]],
+    device const uint *rows [[buffer(8)]],
     uint t [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint threads [[threads_per_threadgroup]],
@@ -511,7 +627,7 @@ kernel void lsa_select_f32(
     threadgroup uint partial[SIMD + 1];
     threadgroup uint shared[2];
     threadgroup atomic_uint cursor;
-    if (t >= p.tokens) {
+    if (t >= p.groups) {
         return;
     }
     uint pos = visible[t] - 1;
@@ -570,13 +686,16 @@ kernel void lsa_select_f32(
         }
     }
     uint expanded = min(total, p.top_k);
-    uint recent = pos + 1 - window_start;
+    uint tail = p.tiled != 0 ? rows[2 * t + 1] - 1 : 0u;
+    uint recent = pos + 1 + tail - window_start;
     uint sinks = min(min(p.sink, window_start), pos + 1);
+    uint recent_at = expanded + (p.tiled != 0 ? sinks : 0u);
+    uint sinks_at = expanded + (p.tiled != 0 ? 0u : recent);
     for (uint i = tid; i < recent; i += threads) {
-        out[expanded + i] = float(window_start + i);
+        out[recent_at + i] = float(window_start + i);
     }
     for (uint i = tid; i < sinks; i += threads) {
-        out[expanded + recent + i] = float(i);
+        out[sinks_at + i] = float(i);
     }
     uint length = expanded + recent + sinks;
     for (uint i = length + tid; i < p.width; i += threads) {
@@ -587,12 +706,12 @@ kernel void lsa_select_f32(
     }
 }
 
-#define LSA_CLUSTER(NAME, T, QUANT) \
-    template [[host_name("lsa_cluster_" #NAME)]] kernel void lsa_cluster<T, QUANT>( \
+#define LSA_POOLS_KERNEL(NAME, T, QUANT) \
+    template [[host_name("lsa_pools_" #NAME)]] kernel void lsa_pools<T, QUANT>( \
         device const T *, device const half *, device const uint *, device const uint *, \
-        device const float *, device float *, device float *, device float *, \
-        constant LsaClusterParams &, uint, uint, uint, uint, uint, uint);
+        device const float *, device float *, constant LsaClusterParams &, uint2, uint, uint, \
+        uint);
 
-LSA_CLUSTER(f32, float, 0)
-LSA_CLUSTER(f16, half, 0)
-LSA_CLUSTER(q8, char, 1)
+LSA_POOLS_KERNEL(f32, float, 0)
+LSA_POOLS_KERNEL(f16, half, 0)
+LSA_POOLS_KERNEL(q8, char, 1)

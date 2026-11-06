@@ -1451,5 +1451,33 @@ fn test_sparse_attention_with_a_budget_over_every_key_matches_dense() -> Result<
         let error = max_relative(&logits[1], &logits[0]);
         assert!(error < 1e-4, "{} tokens: {error}", tokens.len());
     }
+    // Sparse prefill: a 40-token chunk past the crossover reads two query tiles' lists,
+    // alone and beside a dense prefill below it. Its last row's logits depend on every
+    // row's attention through the layers.
+    sparse.sparse_attention(&tur_models::models::SparseAttention {
+        top_k: 8192,
+        crossover: 600,
+        prefill: true,
+        ..tur_models::models::SparseAttention::new(checkpoint.0.join("index-map.safetensors"))
+    })?;
+    let chunk: Vec<u32> = (0..40).map(|i| (i * 11 % 151) as u32 + 2).collect();
+    for fresh in [false, true] {
+        let mut logits = Vec::new();
+        for (model, state) in [(&dense, &dense_state), (&sparse, &sparse_state)] {
+            let empty = ModelState::new(state.pool());
+            let mut batch = vec![(state, &chunk[..], Boundaries::Final)];
+            if fresh {
+                batch.push((&empty, &prompt[..300], Boundaries::Final));
+            }
+            let (steps, _held) = forward(model, &batch)?;
+            let mut pass = Vec::new();
+            for step in steps {
+                pass.extend(rows(&step?.logits)?);
+            }
+            logits.push(pass);
+        }
+        let error = max_relative(&logits[1], &logits[0]);
+        assert!(error < 1e-4, "prefill chunk, fresh {fresh}: {error}");
+    }
     Ok(())
 }

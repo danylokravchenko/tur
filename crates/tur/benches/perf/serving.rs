@@ -25,7 +25,7 @@
 //! `TUR_BENCH_WORKLOADS=long TUR_BENCH_LONG=32768,65536` bursts of requests with prompts of
 //! that many tokens, from a cold prefix cache. `TUR_BENCH_SPARSE_MAP=<index map>` reads
 //! attention sparsely through that map (`TUR_BENCH_SPARSE_CROSSOVER=<keys>` replaces the
-//! default crossover).
+//! default crossover, `TUR_BENCH_SPARSE_PREFILL=1` reads prefill sparsely too).
 //! `TUR_BENCH_WORKLOADS=speculation TUR_BENCH_DRAFT=0,4` compares adaptive prompt lookup
 //! (`TUR_BENCH_MTP=1` adds the native MTP head to drafted configurations, `0,1` runs both)
 //! with ordinary decoding, including acceptance counters, memory and exact token IDs, on
@@ -56,8 +56,8 @@ use tur_engine::{
     hybrid::SamplingOptions,
 };
 use tur_models::models::{
-    DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, DraftHead, SparseAttention, WeightFormat,
-    is_artifact, parse_recurrent_state,
+    DEFAULT_KV_LAYOUT, DEFAULT_RECURRENT_STATE, DraftHead, WeightFormat, is_artifact,
+    parse_recurrent_state,
 };
 
 const CHUNK: usize = 256;
@@ -1272,20 +1272,6 @@ fn long_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
     Ok(runs)
 }
 
-/// `TUR_BENCH_SPARSE_MAP` reads attention sparsely through that index map.
-fn sparse_attention() -> Result<Option<SparseAttention>> {
-    let Some(map) = std::env::var_os("TUR_BENCH_SPARSE_MAP") else {
-        return Ok(None);
-    };
-    let mut sparse = SparseAttention::new(map.into());
-    if let Ok(keys) = std::env::var("TUR_BENCH_SPARSE_CROSSOVER") {
-        sparse.crossover = keys
-            .parse()
-            .map_err(|_| invalid("TUR_BENCH_SPARSE_CROSSOVER".to_owned()))?;
-    }
-    Ok(Some(sparse))
-}
-
 /// `TUR_BENCH_EXPERT_CACHE_MB` keeps a Qwen `MoE` artifact's experts on disk behind a cache of
 /// this many MiB; unset, every expert stays resident.
 fn expert_cache_bytes() -> Result<Option<usize>> {
@@ -1328,7 +1314,7 @@ pub(crate) fn run() -> Result<()> {
         video: false,
         expert_cache: expert_cache_bytes()?,
         gguf: None,
-        sparse: sparse_attention()?,
+        sparse: crate::model::sparse_settings()?,
     };
     let bench = Bench {
         factory: &factory,

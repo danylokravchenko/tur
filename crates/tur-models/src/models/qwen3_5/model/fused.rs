@@ -8,9 +8,9 @@
 //! format) and reads every key in place through one page table shared by all layers; no
 //! committed key is copied.
 
-use super::sparse::{self, Sparse, SparsePass};
 use super::{Attention, Config, DeltaNet, Dims, LayerKind, Mixer, Mlp, MtpHead, Pass, Qwen35};
 use crate::hybrid::{Boundaries, LayerCarry, PackedForward, ReplayCommit, StatePool};
+use crate::models::sparse::{self, Output, PassTable, SpanRows, Sparse, SparsePass};
 use candle_core::{DType, Tensor};
 use tur_core::{
     Result,
@@ -107,6 +107,36 @@ impl Fused {
             &first,
             &visible,
         )
+    }
+}
+
+impl Fused {
+    /// The sparse plan of `pass`, over the page table [`Self::paging`] lays out.
+    fn sparse_plan(
+        &self,
+        model: &Qwen35,
+        sparse: &Sparse,
+        pass: &Pass<'_, '_>,
+    ) -> Result<SparsePass> {
+        let mut pages = Vec::new();
+        let mut spans = Vec::with_capacity(pass.spans.len());
+        for span in pass.spans {
+            spans.push(SpanRows {
+                page_base: u32::try_from(pages.len())
+                    .map_err(|_| invalid("page table overflow"))?,
+                indexes: &span.addresses.indexes,
+                past: span.past,
+                len: span.len,
+                queries: (span.past..span.past + span.len).collect(),
+            });
+            pages.extend_from_slice(&span.addresses.pages);
+        }
+        let table = PassTable {
+            pages: &pages,
+            page: self.page,
+            slots: model.attention_slots(pass)?,
+        };
+        sparse::plan(&self.kernels, sparse, pass.pool, &table, &spans)
     }
 }
 
@@ -221,13 +251,7 @@ impl Qwen35 {
             None
         };
         let sparse = match &fused.sparse {
-            Some(model) if has_attention => Some(sparse::plan(
-                &fused.kernels,
-                model,
-                pass,
-                fused.page,
-                self.attention_slots(pass)?,
-            )?),
+            Some(model) if has_attention => Some(fused.sparse_plan(self, model, pass)?),
             _ => None,
         };
         let has_delta = self
@@ -463,8 +487,9 @@ impl Qwen35 {
         let gate = heads(d.heads, 2 * d.head_dim, d.head_dim);
         let sparse = match (&fused.sparse, plan) {
             (Some(model), Some(plan)) => {
-                let rows = (&q, &q_gate, gate);
-                sparse::attend(k, model, plan, layer, rows, pass.pool, paging)?
+                let output = Output::Gated(&q_gate, gate);
+                let layer = (layer, true);
+                sparse::attend(k, model, plan, layer, &q, output, pass.pool, paging)?
             }
             _ => None,
         };

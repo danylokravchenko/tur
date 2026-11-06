@@ -2,14 +2,16 @@
 //! Training-free latent sparse attention index maps: calibration keys read back from the
 //! state pool, and the leading principal subspace of their position-free dims.
 
-use super::{Mixer, Qwen35};
 use crate::hybrid::{Boundaries, HybridModel, PackedForward, SequenceForward};
-use candle_core::{DType, Device};
+use candle_core::{DType, Device, Tensor};
 use std::sync::Arc;
-use tur_core::{Result, execution::invalid};
+use tur_core::{
+    Result,
+    execution::{LayerStateKind, invalid},
+};
 use tur_metal::{
     pool::{INDEX_DIM, PoolConfig, StatePool},
-    state::{LayerSnapshot, ModelState},
+    state::ModelState,
 };
 
 /// Prompt tokens per pass while collecting calibration keys.
@@ -17,80 +19,94 @@ const FIT_CHUNK: usize = 2048;
 /// Subspace iterations of a fit; the map only needs the leading subspace, not its basis.
 const FIT_ITERATIONS: usize = 100;
 
-impl Qwen35 {
-    /// Each full attention layer's index input rows over `document`: the position-free
-    /// dims of every K/V head, concatenated and normalized, at most `rows` per layer spread
-    /// evenly across the document, as the reference samples its PCA rows.
-    pub fn index_rows(&self, document: &[u32], rows: usize) -> Result<Vec<(usize, Vec<f32>)>> {
-        let pool = StatePool::new(
-            Arc::new(self.description.clone()),
-            &self.device,
-            PoolConfig {
-                pages: self.description.pages_for(document.len()).max(1),
-                window_pages: 0,
-                recurrent_slots: 2,
-                index_blocks: 0,
-            },
-        )?;
-        let mut state = ModelState::new(&pool);
-        for chunk in document.chunks(FIT_CHUNK) {
-            let mut reservation = state.reserve(chunk.len(), Boundaries::Final)?;
-            reservation.prepare()?;
-            let binding = reservation.binding();
-            let positions: Vec<usize> =
-                (state.position()..state.position() + chunk.len()).collect();
-            let sequences = [SequenceForward {
-                tokens: 0..chunk.len(),
-                state: &binding,
-                logits: &[],
-                hidden: false,
-            }];
-            let batch = PackedForward {
-                embeddings: &[],
-                axial: &[],
-                tokens: chunk,
-                positions: &positions,
-                sequences: &sequences,
-                pool: &pool,
-            };
-            for step in self.forward(&batch)? {
-                step?;
-            }
-            state = reservation.commit(chunk.len())?;
-            drop(reservation);
-            self.device.synchronize()?;
-            pool.reclaim();
+/// A layer an index map covers: its name in the map file (`layer.{name}`), the pool layer
+/// holding its keys, and the `(start, len)` runs of position-free dims in each head.
+pub(crate) struct IndexedLayer {
+    pub(crate) name: usize,
+    pub(crate) pool: usize,
+    pub(crate) runs: [(usize, usize); 2],
+}
+
+/// Each of `layers`' index input rows over `document`, prefilled through `model`: the
+/// position-free dims of every K/V head, concatenated and normalized, at most `rows` per
+/// layer spread evenly across the document, as the reference samples its PCA rows. Rows
+/// come back by layer name.
+pub(crate) fn index_rows(
+    model: &dyn HybridModel,
+    device: &Device,
+    layers: &[IndexedLayer],
+    document: &[u32],
+    rows: usize,
+) -> Result<Vec<(usize, Vec<f32>)>> {
+    let description = model.description();
+    let pages = description.pages_for(document.len()).max(1);
+    let windowed = description.layers.iter().any(LayerStateKind::windowed);
+    let pool = StatePool::new(
+        Arc::new(description),
+        device,
+        PoolConfig {
+            pages,
+            window_pages: if windowed { pages } else { 0 },
+            recurrent_slots: 2,
+            index_blocks: 0,
+        },
+    )?;
+    let mut state = ModelState::new(&pool);
+    for chunk in document.chunks(FIT_CHUNK) {
+        let mut reservation = state.reserve(chunk.len(), Boundaries::Final)?;
+        reservation.prepare()?;
+        let binding = reservation.binding();
+        let positions: Vec<usize> = (state.position()..state.position() + chunk.len()).collect();
+        let sequences = [SequenceForward {
+            tokens: 0..chunk.len(),
+            state: &binding,
+            logits: &[],
+            hidden: false,
+        }];
+        let batch = PackedForward {
+            embeddings: &[],
+            axial: &[],
+            tokens: chunk,
+            positions: &positions,
+            sequences: &sequences,
+            pool: &pool,
+        };
+        for step in model.forward(&batch)? {
+            step?;
         }
-        let d = self.dims;
-        let layers = state.read_layers()?;
-        let mut out = Vec::new();
-        for (index, layer) in self.layers.iter().enumerate() {
-            let (Mixer::Attention(_), Some(LayerSnapshot::Attention { key, .. })) =
-                (&layer.mixer, layers.get(index))
-            else {
-                continue;
-            };
-            let free = key
-                .narrow(2, d.rotary_dim, d.head_dim - d.rotary_dim)?
-                .to_device(&Device::Cpu)?;
-            let free = free
-                .to_dtype(DType::F32)?
-                .reshape((document.len(), d.kv_heads * (d.head_dim - d.rotary_dim)))?;
-            let all = free.to_vec2::<f32>()?;
-            let stride = (all.len() / rows.max(1)).max(1);
-            let sampled = all.iter().step_by(stride).take(rows).flat_map(|row| {
-                let norm = row
-                    .iter()
-                    .map(|v| f64::from(*v).powi(2))
-                    .sum::<f64>()
-                    .sqrt()
-                    .max(1e-12);
-                row.iter().map(move |v| (f64::from(*v) / norm) as f32)
-            });
-            out.push((index, sampled.collect()));
-        }
-        Ok(out)
+        state = reservation.commit(chunk.len())?;
+        drop(reservation);
+        device.synchronize()?;
+        pool.reclaim();
     }
+    let mut out = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let key = state.read_keys(layer.pool)?;
+        let parts = layer
+            .runs
+            .iter()
+            .filter(|&&(_, len)| len > 0)
+            .map(|&(start, len)| key.narrow(2, start, len))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let free = Tensor::cat(&parts, 2)?.to_device(&Device::Cpu)?;
+        let width = free.dim(1)? * free.dim(2)?;
+        let all = free
+            .to_dtype(DType::F32)?
+            .reshape((document.len(), width))?
+            .to_vec2::<f32>()?;
+        let stride = (all.len() / rows.max(1)).max(1);
+        let sampled = all.iter().step_by(stride).take(rows).flat_map(|row| {
+            let norm = row
+                .iter()
+                .map(|v| f64::from(*v).powi(2))
+                .sum::<f64>()
+                .sqrt()
+                .max(1e-12);
+            row.iter().map(move |v| (f64::from(*v) / norm) as f32)
+        });
+        out.push((layer.name, sampled.collect()));
+    }
+    Ok(out)
 }
 
 /// A training-free index map `[dim, 64]` from `rows` (`dim` wide, unit length): an

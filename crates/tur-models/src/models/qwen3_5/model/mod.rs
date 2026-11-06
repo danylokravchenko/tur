@@ -35,9 +35,7 @@ use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
 
 #[cfg(feature = "metal")]
 mod fused;
-mod index_map;
 mod moe;
-pub use index_map::principal_map;
 #[cfg(feature = "metal")]
 mod sparse;
 
@@ -1977,5 +1975,23 @@ impl HybridModel for Qwen35 {
             .into_iter()
             .map(|r| r.unwrap_or_else(|| Err(invalid("draft sequence was not executed"))))
             .collect())
+    }
+}
+
+impl Qwen35 {
+    /// Full attention layers an index map covers: every one, each head's position-free
+    /// dims following its rotated prefix.
+    pub(crate) fn indexed_layers(&self) -> Vec<crate::models::index_map::IndexedLayer> {
+        let d = self.dims;
+        self.layers
+            .iter()
+            .enumerate()
+            .filter(|(_, layer)| matches!(layer.mixer, Mixer::Attention(_)))
+            .map(|(index, _)| crate::models::index_map::IndexedLayer {
+                name: index,
+                pool: index,
+                runs: [(d.rotary_dim, d.head_dim - d.rotary_dim), (d.head_dim, 0)],
+            })
+            .collect()
     }
 }

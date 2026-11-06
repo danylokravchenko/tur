@@ -4,16 +4,20 @@ mod checkpoint;
 mod encoder;
 mod generation;
 mod gguf;
+mod index_map;
 mod math;
 mod media_cache;
 mod options;
 #[cfg(feature = "metal")]
 mod paging;
+#[cfg(feature = "metal")]
+mod sparse;
 pub use artifact::{ARTIFACT_FILE, CalibrationInfo, Conversion, Manifest, Quantizer, is_artifact};
 pub use checkpoint::Adjust;
 pub use generation::GenerationDefaults;
 pub use gguf::{GgufFile, GgufTensor};
 pub(crate) use gguf::{shard_name, split_name};
+pub use index_map::principal_map;
 pub(crate) use weights::STAGING_BYTES;
 pub mod weights;
 pub use options::{

@@ -33,6 +33,8 @@ use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
 mod assistant;
 mod audio;
 mod moe;
+#[cfg(feature = "metal")]
+mod sparse;
 pub(super) mod vision;
 
 struct Layer {
@@ -97,6 +99,8 @@ struct Fused {
     unrotated: Tensor,
     /// Unit scale of residual updates that the layer scalar does not follow.
     one: Tensor,
+    /// Latent sparse attention over the full attention layers, when attached.
+    sparse: Option<crate::models::sparse::Sparse>,
 }
 
 /// The drafter checkpoint of a Gemma draft head: Gemma 4 has no head inside the target.
@@ -553,6 +557,7 @@ impl Gemma4 {
             ones: Tensor::ones(widest, DType::F32, &self.device)?,
             unrotated: Tensor::zeros(1, DType::F32, &self.device)?,
             one: Tensor::ones(1, DType::F32, &self.device)?,
+            sparse: None,
         })
     }
     #[cfg(feature = "metal")]
@@ -1161,6 +1166,11 @@ impl Gemma4 {
         let eps = self.config.text.rms_norm_eps;
         let tokens = x.dim(0)?;
         let mut paging = self.paging(k, pass.pool, pass.spans, tokens)?;
+        let mut plan = f
+            .sparse
+            .as_ref()
+            .map(|sparse| self.sparse_plan(k, sparse, pass, None))
+            .transpose()?;
         let positions = pass
             .positions
             .iter()
@@ -1193,8 +1203,14 @@ impl Gemma4 {
                 positions = positions.index_select(&index, 0)?;
                 inputs = inputs.map(|t| t.index_select(&index, 0)).transpose()?;
                 paging = self.kept_paging(k, pass, kept)?;
+                plan = f
+                    .sparse
+                    .as_ref()
+                    .map(|sparse| self.sparse_plan(k, sparse, pass, Some(kept)))
+                    .transpose()?;
             }
-            let attention = self.fused_attention(f, l, i, &h, &positions, pass.pool, &paging)?;
+            let addressing = (&paging, plan.as_ref());
+            let attention = self.fused_attention(f, l, i, &h, &positions, pass.pool, addressing)?;
             let (sum, normed) = k.residual_rms_norm(
                 &x,
                 &attention,
@@ -1263,7 +1279,7 @@ impl Gemma4 {
         hidden: &Tensor,
         positions: &Tensor,
         pool: &StatePool,
-        paging: &Paging,
+        (paging, plan): (&Paging, Option<&crate::models::sparse::SparsePass>),
     ) -> Result<Tensor> {
         let config = &self.config;
         let k = &fused.kernels;
@@ -1326,11 +1342,21 @@ impl Gemma4 {
                 paging,
             )?;
         }
-        let window = config.windowed(index).then_some(config.text.sliding_window);
-        k.linear(
-            &layer.o,
-            &k.attention_ungated(&query, store, paging, window, 1.0)?,
-        )
+        let sparse = match (&fused.sparse, plan) {
+            (Some(sparse), Some(plan)) if !config.windowed(index) => {
+                let layer = (config.state_layer(index), layer.k_norm.is_some());
+                let output = crate::models::sparse::Output::Ungated(1.0);
+                crate::models::sparse::attend(k, sparse, plan, layer, &query, output, pool, paging)?
+            }
+            _ => None,
+        };
+        let attended = if let Some(attended) = sparse {
+            attended
+        } else {
+            let window = config.windowed(index).then_some(config.text.sliding_window);
+            k.attention_ungated(&query, store, paging, window, 1.0)?
+        };
+        k.linear(&layer.o, &attended)
     }
     /// Page addressing of this pass for full and windowed layers.
     fn paging(
@@ -1596,7 +1622,7 @@ fn ple_dtype(config: &Config, plan: &WeightPlan) -> Result<DType> {
 /// Inverse rotary frequencies over `dim / 2` pairs; proportional rotation leaves the pairs past
 /// its rotated fraction at zero frequency.
 fn inverse_frequencies(dim: usize, rope: &super::config::Rope) -> Vec<f32> {
-    let rotated = (dim as f64 * rope.partial_rotary_factor) as usize / 2;
+    let rotated = rotated_pairs(dim, rope);
     (0..dim / 2)
         .map(|i| {
             if i < rotated {
@@ -1734,7 +1760,20 @@ impl HybridModel for Gemma4 {
         });
         #[cfg(not(feature = "metal"))]
         let attention = None;
-        workspace(&self.config, batch.tokens.len(), &contexts, attention)
+        let base = workspace(&self.config, batch.tokens.len(), &contexts, attention)?;
+        #[cfg(feature = "metal")]
+        if let Some(sparse) = self.fused.as_ref().and_then(|f| f.sparse.as_ref()) {
+            return base
+                .checked_add(sparse.workspace(batch.tokens.len(), &contexts)?)
+                .ok_or_else(|| invalid("Gemma 4 workspace overflow"));
+        }
+        Ok(base)
+    }
+    fn indexed(&self) -> bool {
+        #[cfg(feature = "metal")]
+        return self.fused.as_ref().is_some_and(|f| f.sparse.is_some());
+        #[cfg(not(feature = "metal"))]
+        false
     }
     #[cfg(feature = "metal")]
     fn kernels(&self) -> Option<tur_metal::kernels::Kernels> {
@@ -1816,4 +1855,30 @@ impl HybridModel for Gemma4 {
             .map(|r| r.unwrap_or_else(|| Err(invalid("sequence was not executed"))))
             .collect())
     }
+}
+
+impl Gemma4 {
+    /// Full attention layers an index map covers: those owning their K/V. Proportional
+    /// rotation leaves each half of a head unrotated past its rotated pairs.
+    pub(crate) fn indexed_layers(&self) -> Vec<crate::models::index_map::IndexedLayer> {
+        let config = &self.config;
+        (0..config.layers())
+            .filter(|&i| !config.windowed(i) && config.owners[i] == i)
+            .map(|i| {
+                let (dim, half) = (config.dim(i), config.dim(i) / 2);
+                let pairs = rotated_pairs(dim, config.rope(i));
+                crate::models::index_map::IndexedLayer {
+                    name: i,
+                    pool: config.state_layer(i),
+                    runs: [(pairs, half - pairs), (half + pairs, half - pairs)],
+                }
+            })
+            .collect()
+    }
+}
+
+/// Rotated frequency pairs of a head of `dim` under `rope`, as [`inverse_frequencies`]
+/// rotates them.
+fn rotated_pairs(dim: usize, rope: &super::config::Rope) -> usize {
+    ((dim as f64 * rope.partial_rotary_factor) as usize / 2).min(dim / 2)
 }

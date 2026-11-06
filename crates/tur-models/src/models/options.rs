@@ -178,7 +178,10 @@ impl DraftHead {
 /// Latent sparse attention: past `crossover` keys, a decoding or verifying query of a full
 /// attention layer reads up to `top_k` keys of its `top_p` best buckets, its `window` most
 /// recent keys and the first `sink` keys, chosen through the per-layer index map stored at
-/// `map` (`tur sparse-map` writes one). Prefill stays dense. Qwen3.5 family only.
+/// `map` (`tur sparse-map` writes one). With `prefill`, each tile of 32 consecutive prompt
+/// queries past the crossover reads the same budget, selected for the tile, plus the run of
+/// keys to its last query; otherwise prefill stays dense. Qwen3.5-family and Gemma 4 models
+/// only; Gemma's sliding window layers stay dense.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SparseAttention {
     pub map: std::path::PathBuf,
@@ -187,6 +190,7 @@ pub struct SparseAttention {
     pub window: usize,
     pub sink: usize,
     pub crossover: usize,
+    pub prefill: bool,
 }
 
 impl SparseAttention {
@@ -202,6 +206,7 @@ impl SparseAttention {
             window: 512,
             sink: 4,
             crossover: 16_384,
+            prefill: false,
         }
     }
 
@@ -212,14 +217,14 @@ impl SparseAttention {
 
     /// Scratch of one attention layer's clustering and selection over a pass of `n` rows
     /// whose sequences end at `contexts`: scores of every visible bucket, key lists, and
-    /// one cluster job per closed block. Up to 64 buckets of 64-dimensional F32 pools per
-    /// block of 512 keys.
+    /// one cluster job per closed block. Each job holds its block's 128 pool sums of 64 F32
+    /// dims and their 128 x 128 Gram matrix.
     pub fn workspace_bytes(&self, n: usize, contexts: &[usize]) -> Option<usize> {
         const BLOCK: usize = 512;
         let buckets = contexts.iter().map(|&c| c / BLOCK).max().unwrap_or(0) * 64;
         let jobs = n / BLOCK + contexts.len();
         n.checked_mul(self.width() + buckets + 1)?
             .checked_mul(4)?
-            .checked_add(jobs.checked_mul(BLOCK / 4 * 64 * 4)?)
+            .checked_add(jobs.checked_mul(BLOCK / 4 * (64 + BLOCK / 4) * 4)?)
     }
 }

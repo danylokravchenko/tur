@@ -41,6 +41,9 @@ struct Case {
     heads: usize,
     dim: usize,
     rotary: usize,
+    /// Whether `rotary` counts rotated pairs `(i, i + dim / 2)`, as proportional rotation
+    /// rotates them, rather than a rotated prefix of each head.
+    split: bool,
     segment: usize,
     topics: usize,
     /// Tokens of each sequence and the positions whose queries select.
@@ -55,6 +58,7 @@ impl Case {
             heads: 4,
             dim: 256,
             rotary: 64,
+            split: false,
             segment: 23,
             topics: 6,
             sequences: vec![(1700, vec![511, 512, 1023, 1024, 1300, 1535, 1536, 1699])],
@@ -62,7 +66,21 @@ impl Case {
     }
 
     fn free(&self) -> usize {
-        self.dim - self.rotary
+        if self.split {
+            self.dim - 2 * self.rotary
+        } else {
+            self.dim - self.rotary
+        }
+    }
+
+    /// Head dim of position-free dim `e`.
+    fn free_dim(&self, e: usize) -> usize {
+        let run = self.dim / 2 - self.rotary;
+        if self.split && e >= run {
+            self.dim / 2 + self.rotary + (e - run)
+        } else {
+            self.rotary + e
+        }
     }
 
     /// Keys `[tokens, kv_heads, dim]` of sequence `s`; the first matches the golden script.
@@ -177,7 +195,11 @@ fn build(case: &Case, device: &Device, kernels: &Kernels, format: KvFormat) -> R
     let slots: Vec<u32> = (0..blocks).map(|i| blocks + 1 - i).collect();
     let rows = case.kv_heads * case.free();
     let map = Tensor::from_vec(case.map(), (rows, INDEX_DIM), device)?;
-    let map = IndexMap::new(map, case.kv_heads, case.dim, case.rotary)?;
+    let map = if case.split {
+        IndexMap::split_rotary(map, case.kv_heads, case.dim, case.rotary)?
+    } else {
+        IndexMap::new(map, case.kv_heads, case.dim, case.rotary)?
+    };
     Ok(Built {
         pool,
         exact,
@@ -216,6 +238,26 @@ fn selections(
     device: &Device,
     index: &IndexPool,
 ) -> Result<(IndexTable, Tensor)> {
+    let inputs = selection_inputs(case, built, device)?;
+    let table = kernels.index_table(
+        &inputs.table,
+        &inputs.first,
+        &inputs.visible,
+        index.blocks(),
+    )?;
+    Ok((table, inputs.q))
+}
+
+/// What selection reads: index table entries, each query's first entry and visible keys,
+/// and the queries.
+struct Inputs {
+    table: Vec<u32>,
+    first: Vec<u32>,
+    visible: Vec<u32>,
+    q: Tensor,
+}
+
+fn selection_inputs(case: &Case, built: &Built, device: &Device) -> Result<Inputs> {
     let (mut table, mut first, mut visible, mut queries) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let blocks = case.blocks();
@@ -234,10 +276,17 @@ fn selections(
         }
         queries.extend(case.queries(s));
     }
-    let table = kernels.index_table(&table, &first, &visible, index.blocks())?;
     let q = Tensor::from_vec(queries, (visible.len(), case.heads, case.dim), device)?;
-    Ok((table, q))
+    Ok(Inputs {
+        table,
+        first,
+        visible,
+        q,
+    })
 }
+
+/// Key lists, one per query or tile.
+type Lists = Vec<Vec<i64>>;
 
 /// Each row's keys up to its length.
 fn rows_of(keys: &[f32], lengths: &[f32], width: usize) -> Vec<Vec<i64>> {
@@ -338,7 +387,7 @@ fn index_keys(case: &Case, built: &Built, s: usize, block: usize) -> Vec<Vec<f64
             let x: Vec<f64> = (0..case.kv_heads * free)
                 .map(|d| {
                     f64::from(
-                        built.exact[slot * row + (d / free) * case.dim + case.rotary + d % free],
+                        built.exact[slot * row + (d / free) * case.dim + case.free_dim(d % free)],
                     )
                 })
                 .collect();
@@ -471,6 +520,35 @@ fn reference_read(
     blocks: &[Block],
     budget: SparseBudget,
 ) -> Vec<i64> {
+    let window_start = (position + 1).saturating_sub(budget.window);
+    let mut keys = reference_expanded(query, position, blocks, budget);
+    keys.extend((window_start..=position).map(|k| k as i64));
+    keys.extend((0..budget.sink.min(window_start).min(position + 1)).map(|k| k as i64));
+    keys
+}
+
+/// Reference key list of a query tile whose first row is at `first` and last at `last`,
+/// scored by `query`: expanded buckets, sinks, then the window run to the last row.
+fn reference_tile_read(
+    query: &[f64],
+    (first, last): (usize, usize),
+    blocks: &[Block],
+    budget: SparseBudget,
+) -> Vec<i64> {
+    let window_start = (first + 1).saturating_sub(budget.window);
+    let mut keys = reference_expanded(query, first, blocks, budget);
+    keys.extend((0..budget.sink.min(window_start).min(first + 1)).map(|k| k as i64));
+    keys.extend((window_start..=last).map(|k| k as i64));
+    keys
+}
+
+/// Keys of the best buckets before `position`'s block, outside its sinks and window.
+fn reference_expanded(
+    query: &[f64],
+    position: usize,
+    blocks: &[Block],
+    budget: SparseBudget,
+) -> Vec<i64> {
     let visible = (position / INDEX_BLOCK_TOKENS) * INDEX_BUCKETS;
     let mut order: Vec<(f64, usize)> = (0..visible)
         .map(|b| {
@@ -496,8 +574,6 @@ fn reference_read(
         }
     }
     keys.truncate(budget.top_k);
-    keys.extend((window_start..=position).map(|k| k as i64));
-    keys.extend((0..budget.sink.min(window_start).min(position + 1)).map(|k| k as i64));
     keys
 }
 
@@ -506,7 +582,7 @@ fn index_query(case: &Case, q: &[f32]) -> Vec<f64> {
     let (free, per) = (case.free(), case.heads / case.kv_heads);
     let x: Vec<f64> = (0..case.kv_heads * free)
         .map(|d| {
-            let (h, e) = (d / free, case.rotary + d % free);
+            let (h, e) = (d / free, case.free_dim(d % free));
             (0..per)
                 .map(|g| f64::from(q[(h * per + g) * case.dim + e]))
                 .sum()
@@ -573,12 +649,13 @@ fn check_against_scalar(case: &Case, format: KvFormat) -> Result<()> {
 }
 
 #[test]
-fn test_lsa_index_matches_scalar_reference_for_every_format_and_sequence() -> Result<()> {
+fn test_lsa_index_matches_scalar_reference_for_every_format_sequence_and_rotation() -> Result<()> {
     let wide = Case {
         kv_heads: 4,
         heads: 8,
         dim: 256,
         rotary: 64,
+        split: false,
         segment: 37,
         topics: 5,
         sequences: vec![(1100, vec![1099, 700]), (2100, vec![2099, 1536, 1600])],
@@ -588,14 +665,27 @@ fn test_lsa_index_matches_scalar_reference_for_every_format_and_sequence() -> Re
         heads: 2,
         dim: 128,
         rotary: 32,
+        split: false,
         segment: 19,
         topics: 7,
         sequences: vec![(1600, vec![1599, 1024])],
     };
+    // Gemma 4's full attention heads: 512 dims, 64 rotated pairs, two runs of 192 free.
+    let split = Case {
+        kv_heads: 1,
+        heads: 4,
+        dim: 512,
+        rotary: 64,
+        split: true,
+        segment: 31,
+        topics: 5,
+        sequences: vec![(1100, vec![1099, 1030])],
+    };
     for format in [KvFormat::F32, KvFormat::F16, KvFormat::Q8 { group: 32 }] {
         check_against_scalar(&wide, format)?;
     }
-    check_against_scalar(&narrow, KvFormat::F16)
+    check_against_scalar(&narrow, KvFormat::F16)?;
+    check_against_scalar(&split, KvFormat::F16)
 }
 
 /// F64 gated attention of each selecting token over exactly the keys of its list.
@@ -671,6 +761,7 @@ fn test_sparse_attention_matches_scalar_reference_over_selected_keys() -> Result
         heads: 8,
         dim: 256,
         rotary: 64,
+        split: false,
         segment: 29,
         topics: 6,
         sequences: vec![(1300, vec![1299, 600]), (2100, vec![2099, 1536])],
@@ -720,6 +811,140 @@ fn test_sparse_attention_matches_scalar_reference_over_selected_keys() -> Result
     Ok(())
 }
 
+/// Expected lists of each query tile of `kv` and, per query row, the prefix of its tile's
+/// list that row sees: everything but the run past its own position.
+fn tile_references(
+    case: &Case,
+    built: &Built,
+    index: &IndexPool,
+    queries: &[f32],
+    kv: &PagedKv,
+    budget: SparseBudget,
+) -> Result<(Lists, Lists)> {
+    let per_sequence = reference_blocks(case, built, index)?;
+    let owners: Vec<(usize, usize)> = case
+        .sequences
+        .iter()
+        .enumerate()
+        .flat_map(|(s, (_, positions))| positions.iter().map(move |&p| (s, p)))
+        .collect();
+    let row = case.heads * case.dim;
+    let (mut tiles, mut rows) = (Vec::new(), Vec::new());
+    for tile in kv
+        .tile_rows()
+        .ok_or_else(|| TurError::Other("no tiles".into()))?
+        .as_chunks::<2>()
+        .0
+    {
+        let (t0, n) = (tile[0] as usize, tile[1] as usize);
+        let (s, first) = owners[t0];
+        let last = owners[t0 + n - 1].1;
+        let mut query = vec![0.0f64; INDEX_DIM];
+        for t in t0..t0 + n {
+            let y = index_query(case, &queries[t * row..(t + 1) * row]);
+            query.iter_mut().zip(y).for_each(|(a, b)| *a += b);
+        }
+        let list = reference_tile_read(&query, (first, last), &per_sequence[s], budget);
+        for t in t0..t0 + n {
+            rows.push(list[..list.len() - (last - owners[t].1)].to_vec());
+        }
+        tiles.push(list);
+    }
+    Ok((tiles, rows))
+}
+
+/// Reference buckets of every closed block, by sequence, from the case's stored keys.
+fn reference_blocks(case: &Case, built: &Built, index: &IndexPool) -> Result<Vec<Vec<Block>>> {
+    let mut per_sequence: Vec<Vec<Block>> = vec![Vec::new(); case.sequences.len()];
+    let members = read(index.members())?;
+    let row_m = INDEX_BUCKETS * BUCKET_POOLS;
+    for (&(s, block), &slot) in case.blocks().iter().zip(&built.slots) {
+        let (expected, centroids) = reference_block(&index_keys(case, built, s, block));
+        let slot = slot as usize;
+        assert_eq!(members[slot * row_m..(slot + 1) * row_m], expected[..]);
+        per_sequence[s].push((expected, centroids));
+    }
+    Ok(per_sequence)
+}
+
+#[test]
+fn test_tiled_sparse_attention_reads_each_tiles_shared_list() -> Result<()> {
+    let (device, kernels, _gpu) = setup()?;
+    // Runs of consecutive prefill rows: 36 rows make a full and a partial tile, and the
+    // second run crosses a block boundary inside its tile. F32 pools stage as F16 do.
+    let case = Case {
+        kv_heads: 2,
+        heads: 8,
+        dim: 256,
+        rotary: 64,
+        split: false,
+        segment: 29,
+        topics: 6,
+        sequences: vec![
+            (2100, (2064..2100).collect()),
+            (1100, (1020..1030).collect()),
+        ],
+    };
+    let budget = SparseBudget {
+        top_k: 300,
+        top_p: 48,
+        window: 512,
+        sink: 4,
+    };
+    for format in [KvFormat::F16, KvFormat::Q8 { group: 32 }] {
+        let built = build(&case, &device, &kernels, format)?;
+        let index = cluster(&case, &built, &kernels, &device)?;
+        let Inputs {
+            table: entries,
+            first: index_first,
+            visible,
+            q,
+        } = selection_inputs(&case, &built, &device)?;
+        let page_first: Vec<u32> = case
+            .sequences
+            .iter()
+            .enumerate()
+            .flat_map(|(s, (_, positions))| {
+                std::iter::repeat_n(built.page_first[s] as u32, positions.len())
+            })
+            .collect();
+        let kv = kernels.paged_kv(
+            PAGE,
+            built.pool_slots,
+            &built.page_table,
+            &page_first,
+            &visible,
+        )?;
+        let table =
+            kernels.index_table_tiles(&entries, &index_first, &visible, &kv, index.blocks())?;
+        let selected = kernels.lsa_select(&q, &built.map, &index, &table, budget)?;
+        assert!(selected.tiled());
+        let queries = read(&q)?;
+        let (tiles, rows) = tile_references(&case, &built, &index, &queries, &kv, budget)?;
+        let lists = rows_of(
+            &read(selected.keys())?,
+            &read(selected.lengths())?,
+            selected.width(),
+        );
+        assert_eq!(lists, tiles, "{format:?} tile lists");
+        let tokens = visible.len();
+        let gate = unit(16, tokens * case.heads * 2 * case.dim);
+        let gate_tensor =
+            Tensor::from_vec(gate.clone(), (tokens, case.heads * 2 * case.dim), &device)?;
+        let heads = tur_metal::kernels::Heads {
+            count: case.heads,
+            dim: case.dim,
+            head_stride: 2 * case.dim,
+            col_offset: case.dim,
+        };
+        let out = kernels.attention_sparse(&q, &built.pool, &kv, &gate_tensor, heads, &selected)?;
+        let expected = sparse_reference(&case, &built, &queries, &gate, &rows);
+        let error = relative_error(&read(&out)?, &expected);
+        assert!(error < 1e-5, "{format:?}: {error}");
+    }
+    Ok(())
+}
+
 #[test]
 fn test_lsa_rejects_invalid_maps_jobs_tables_and_budgets() -> Result<()> {
     let (device, kernels, _gpu) = setup()?;
@@ -728,6 +953,15 @@ fn test_lsa_rejects_invalid_maps_jobs_tables_and_budgets() -> Result<()> {
     // 192 position-free dims per head: 384 rows for two heads, not 383, and rotary a multiple of 32.
     assert!(rejected(IndexMap::new(map(383)?, 2, 256, 64).map(drop)));
     assert!(rejected(IndexMap::new(map(400)?, 2, 256, 56).map(drop)));
+    // Split rotation: 512-dim heads with 64 rotated pairs keep 384 free dims each; 40 pairs
+    // would keep 432, not a multiple of 32, and 256 pairs none.
+    assert!(IndexMap::split_rotary(map(768)?, 2, 512, 64).is_ok());
+    assert!(rejected(
+        IndexMap::split_rotary(map(864)?, 2, 512, 40).map(drop)
+    ));
+    assert!(rejected(
+        IndexMap::split_rotary(map(64)?, 2, 512, 256).map(drop)
+    ));
     let case = Case::golden();
     let built = build(&case, &device, &kernels, KvFormat::F32)?;
     let index = IndexPool::new(&device, 4)?;

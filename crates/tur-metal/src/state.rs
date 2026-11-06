@@ -474,6 +474,20 @@ impl ModelState {
         self.pool.device().synchronize()?;
         Ok(layers)
     }
+
+    /// Detached F32 copy `[position, kv_heads, head_dim]` of full attention layer `layer`'s
+    /// keys, as [`Self::read_layers`] copies them, without copying any other layer.
+    pub fn read_keys(&self, layer: usize) -> Result<Tensor> {
+        match self.description().layers.get(layer) {
+            Some(kind @ LayerStateKind::Attention { .. }) if !kind.windowed() => {}
+            _ => return Err(invalid(format!("layer {layer} is no full attention layer"))),
+        }
+        let pages = self.pool.resolve_pages(&ids(&self.pages))?;
+        let (key, _) = self.pool.attention(layer)?.gather(&pages, self.position)?;
+        let key = key.force_contiguous()?;
+        self.pool.device().synchronize()?;
+        Ok(key)
+    }
 }
 
 fn ids(leases: &[Arc<Lease>]) -> Vec<Id> {

@@ -14,6 +14,7 @@
 - [Prepacked weights](guide/quantization.md)
 - [Choosing a quantization](guide/choosing-quantization.md)
 - [Tuning](guide/tuning.md)
+- [Long contexts with sparse attention](guide/sparse-attention.md)
 - [Best practice](guide/best-practice.md)
 - [Rust library](guide/library.md)
 - [Measured performance](guide/performance.md)

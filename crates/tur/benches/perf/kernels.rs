@@ -1079,6 +1079,10 @@ fn lsa_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
             kernels.lsa_cluster(&paged.pool, &paged.kv, &map, &index, &one)?;
             Ok(index.centroids().clone())
         })?;
+        let all = time(device, || {
+            kernels.lsa_cluster(&paged.pool, &paged.kv, &map, &index, &jobs)?;
+            Ok(index.centroids().clone())
+        })?;
         let seconds = |v: &Value| v["median_seconds"].as_f64().unwrap_or(f64::NAN);
         let total =
             seconds(&select) + seconds(&sparse) + seconds(&cluster) / INDEX_BLOCK_TOKENS as f64;
@@ -1087,6 +1091,7 @@ fn lsa_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
             "heads": heads, "kv_heads": kv_heads, "head_dim": dim, "kv_format": "f16",
             "budget": format!("{budget:?}"), "dense_attention": dense, "select": select,
             "sparse_attention": sparse, "cluster_one_block": cluster,
+            "cluster_every_block": all, "blocks": jobs.len(),
             "sparse_total_seconds": total, "speedup": seconds(&dense) / total,
         }));
     }

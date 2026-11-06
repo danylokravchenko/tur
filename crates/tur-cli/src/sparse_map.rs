@@ -1,6 +1,6 @@
-//! Fit a Qwen3.5-family model's training-free latent sparse attention index map: each full
-//! attention layer's leading 64 principal directions of its normalized position-free keys
-//! over calibration text, as the reference's PCA map takes them.
+//! Fit a Qwen3.5-family or Gemma 4 model's training-free latent sparse attention index map:
+//! each full attention layer's leading 64 principal directions of its normalized
+//! position-free keys over calibration text, as the reference's PCA map takes them.
 use crate::{args::checkpoint_dir, quantize::encode_samples, ui::Console};
 use candle_core::{DType, Device, Tensor};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -8,15 +8,15 @@ use tur::{
     Result, TurError,
     core::progress::Stage,
     models::{
-        DEFAULT_KV_LAYOUT, Execution, LoadOptions, Manifest, WeightFormat, Weights, is_artifact,
-        qwen3_5::{Qwen35, principal_map},
+        DEFAULT_KV_LAYOUT, Execution, LoadOptions, Manifest, TextModel, WeightFormat, Weights,
+        is_artifact, principal_map,
     },
 };
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct Args {
-    /// Qwen3.5-family checkpoint, dense or `MoE`: a local directory, a prepacked artifact
-    /// directory, or a Hugging Face repository at `--revision`.
+    /// Qwen3.5-family (dense or `MoE`) or Gemma 4 checkpoint: a local directory, a prepacked
+    /// artifact directory, or a Hugging Face repository at `--revision`.
     #[arg(long)]
     model: PathBuf,
     /// Exact identity of the checkpoint.
@@ -76,7 +76,7 @@ pub(crate) fn run(args: &mut Args, console: &Console) -> Result<()> {
             }
         }
     }
-    let model = Qwen35::load(
+    let model = TextModel::load(
         &args.model,
         &LoadOptions {
             revision: args.revision.clone(),

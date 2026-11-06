@@ -382,6 +382,9 @@ struct TiledParams {
     uint window;
     uint ungated;
     uint sinks;
+    // Nonzero when each tile reads the `sparse_width` key positions its list names.
+    uint sparse;
+    uint sparse_width;
 };
 
 // Row and first column of the two elements a lane holds in an 8x8 simdgroup matrix. Lanes
@@ -408,12 +411,24 @@ static inline float4 kv_vector(device const T *data, device const half *scales, 
     return QUANT == 0 ? x : x * float(scales[head * (dim / group) + d / group]);
 }
 
+// Key list of a sparse tile: logical key `j` is position `list[j]`, clamped below `bound`
+// so a malformed list never reads past the tile's keys; dense tiles read position `j`.
+struct tile_keys {
+    device const float *list;
+    uint bound;
+};
+
+static inline uint key_position(tile_keys keys, uint j) {
+    return keys.list != nullptr ? min(uint(keys.list[j]), keys.bound) : j;
+}
+
 // Pool slots of the keys this thread stages in the block at `kb`; keys past `keys` read slot 0.
-static inline void kv_slots(thread uint *slot, device const uint *table, uint base, uint kb, uint keys, uint key0, uint page) {
+static inline void kv_slots(thread uint *slot, device const uint *table, uint base, uint kb, uint keys, uint key0, uint page, tile_keys list) {
     #pragma clang loop unroll(full)
     for (uint i = 0; i < LOADS; ++i) {
         uint j = kb + key0 + i * KEY_STRIDE;
-        slot[i] = j < keys ? table[base + j / page] * page + j % page : 0;
+        uint pos = j < keys ? key_position(list, j) : 0;
+        slot[i] = j < keys ? table[base + pos / page] * page + pos % page : 0;
     }
 }
 
@@ -520,6 +535,8 @@ kernel void attention_tiled(
     constant TiledParams &p [[buffer(9)]],
     device const half *k_scales [[buffer(10)]],
     device const half *v_scales [[buffer(11)]],
+    device const float *sparse_keys [[buffer(12)]],
+    device const float *sparse_lengths [[buffer(13)]],
     threadgroup float *shared [[threadgroup(0)]],
     uint tg [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
@@ -547,6 +564,17 @@ kernel void attention_tiled(
     uint keys = visible[t0 + n - 1];
     uint start = p.window > 0 && visible[t0] > p.window ? (visible[t0] - p.window) / TK * TK : 0;
     uint base = first_block[t0];
+    // A sparse tile lists far keys and sinks, then the run from its first row's window to
+    // its last row, so row r sees the list's first `length - (keys - visible[r])` entries.
+    tile_keys list = {nullptr, 0};
+    if (p.sparse != 0) {
+        uint length = uint(sparse_lengths[tile]);
+        list = {sparse_keys + ulong(tile) * p.sparse_width, keys - 1};
+        limit = row < n ? length - (keys - limit) : 0;
+        lower = 0;
+        start = 0;
+        keys = length;
+    }
 
     simdgroup_float8x8 o[8 * CHUNKS];
     device const float *qr = q + (ulong(token) * p.heads + h) * D;
@@ -570,10 +598,10 @@ kernel void attention_tiled(
         uint slot[LOADS];
         uint next_slot[LOADS];
         vec<T, 4> fetched[LOADS];
-        kv_slots(slot, table, base, start, keys, key0, p.page);
+        kv_slots(slot, table, base, start, keys, key0, p.page, list);
         kv_fetch<T>(fetched, k, slot, start, keys, key0, p.kv_heads, g, D, d0);
         for (uint kb = start; kb < keys; kb += TK) {
-            kv_slots(next_slot, table, base, kb + TK, keys, key0, p.page);
+            kv_slots(next_slot, table, base, kb + TK, keys, key0, p.page, list);
             simdgroup_float8x8 s[TK / 8];
             #pragma clang loop unroll(full)
             for (uint kt = 0; kt < TK / 8; ++kt) {
@@ -617,7 +645,8 @@ kernel void attention_tiled(
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (tid < TK) {
                 uint j = kb + tid;
-                slots[tid] = j < keys ? table[base + j / p.page] * p.page + j % p.page : 0;
+                uint pos = j < keys ? key_position(list, j) : 0;
+                slots[tid] = j < keys ? table[base + pos / p.page] * p.page + pos % p.page : 0;
             }
             simdgroup_float8x8 s[TK / 8];
             #pragma clang loop unroll(full)
@@ -726,7 +755,7 @@ kernel void attention_reduce_f32(
         device const float *, device const T *, device const T *, device const uint *, \
         device const uint *, device const uint *, device const float *, device float *, \
         device const uint *, constant TiledParams &, device const half *, device const half *, \
-        threadgroup float *, uint, uint, uint, uint, uint);
+        device const float *, device const float *, threadgroup float *, uint, uint, uint, uint, uint);
 #define ATTENTION_KV(R, NAME, T, QUANT, HG, PREFIX) \
     template [[host_name(PREFIX #R "_" #NAME)]] kernel void attention_kv<R, T, QUANT, HG>( \
         device const float *, device const T *, device const T *, device const uint *, \

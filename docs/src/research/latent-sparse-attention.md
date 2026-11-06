@@ -58,7 +58,7 @@ A bandwidth estimate for Qwen3.8-27B with Q4K weights (about 15 GB read per step
 
 Batches gain more, because the weights are read once for the batch and the K/V once per sequence: four sequences at 64K would read 32 GB dense and 16 GB with LSA. The estimate assumes attention reads memory as fast as the projections do. If it reads slower, which the 0.8B numbers suggest on the M1, the real gain is larger.
 
-`TUR_BENCH_ONLY=lsa just bench kernels` times one attention layer of the 0.8B (8 query heads, 2 K/V heads, F16 pool) on the M1 with the paper's budget. Clustering costs 2.0 ms per block, which decode pays once every 512 tokens:
+`TUR_BENCH_ONLY=lsa just bench kernels` times one attention layer of the 0.8B (8 query heads, 2 K/V heads, F16 pool) on the M1 with the paper's budget. Clustering costs 0.37 ms per block, which decode pays once every 512 tokens; prefill, clustering many blocks at once, pays 93 µs each:
 
 | Context, sequences | Dense attention | Selection | Sparse attention | Sparse total | Speedup |
 | --- | --- | --- | --- | --- | --- |
@@ -68,7 +68,7 @@ Batches gain more, because the weights are read once for the batch and the K/V o
 | 32K, 4 | 5.35 ms | 0.33 ms | 0.74 ms | 1.07 ms | 5.0× |
 | 64K, 4 | 9.73 ms | 0.57 ms | 0.77 ms | 1.34 ms | 7.3× |
 
-Six attention layers at 4.78 ms account for the 28.4 ms that context adds to a 128K decode step, so with sparse attention the step should fall from 45 ms to about 21 ms. Clustering runs on one GPU core per block, which adds about 12 ms to the one step in 512 that completes a block on all six layers; spreading each block over several threadgroups would remove that stall.
+Six attention layers at 4.78 ms account for the 28.4 ms that context adds to a 128K decode step, so with sparse attention the step should fall from 45 ms to about 21 ms. Clustering adds about 2.2 ms to the one step in 512 that completes a block on all six layers.
 
 Through the whole model (`TUR_BENCH_SPARSE_MAP=<map> just bench model`), with the map `tur sparse-map` fitted on four books, Q8_0 weights, F16 K/V, one sequence on the M1:
 
@@ -91,11 +91,32 @@ Through the serving pipeline (`TUR_BENCH_WORKLOADS=long just bench serving`), wi
 
 The gain grows with concurrency, because every request adds its own K/V reads while the weights are read once per pass: four requests at 64K decode as fast as one did dense. The first token comes up to 3% later, from clustering every block during prefill. Overall throughput didn't change, because prefill dominates these bursts: four 64K prompts take 13 minutes to prefill and 34 seconds to decode, at 313 prompt tokens/s against 520 at 32K, as dense attention's quadratic cost takes over.
 
-Prefill isn't covered by this design. A 128K prompt on the 27B takes minutes on a Mac, and with dense prefill, decoding at that context is only worth speeding up when [prefix reuse](../architecture/prefix-reuse.md) supplies the long prefix. Sparse prefill comes after decode.
+### Sparse prefill
+
+Dense prefill attention grows with the square of the prompt, so past 32K it dominates time to first token. Sparse prefill gives the same budget to each tile of 32 consecutive prompt queries past the crossover. The tile scores buckets with the sum of its rows' normalized index queries, which ranks buckets by the mean of the rows' scores, and the tiled attention kernel reads the tile's list: the selected keys before the first row's window, the sinks, then every key from that window's start to the last row. Row `r` of the tile reads the list up to its own position, so causality holds and the matrix units still share each staged key across the tile's 32 queries. Lists per query would give up that sharing, since each query would stage its own keys.
+
+It is opt-in (`SparseAttention::prefill`), because it changes every prompt token's hidden state rather than only the generated ones, so errors can compound through the layers. One 2048-token chunk after a long context, on the 0.8B with Q8_0 weights and F16 K/V on the M1 (`TUR_BENCH_ONLY=chunk just bench model`):
+
+| Context before the chunk | Dense | Sparse prefill | Speedup |
+| --- | --- | --- | --- |
+| 32K | 5.91 s (346 tokens/s) | 2.48 s (825 tokens/s) | 2.4× |
+| 64K | 11.30 s (181 tokens/s) | 2.79 s (733 tokens/s) | 4.0× |
+
+With sparse prefill as well, the needle check below answered 23 of its 24 questions correctly against dense attention's 22, and 22 answers matched dense attention's text exactly. One of the two that differ is a 16K question dense attention got wrong; the other has the right code and continues differently.
 
 ## Which models
 
-The method needs no change to model weights, only an index projection per attention layer. Qwen3.8-27B can use the released distilled maps. Qwen3.5-0.8B and Qwen3.6-35B-A3B need training-free maps from a calibration pass, which nobody has evaluated on models that size: a small model's keys may cluster less cleanly, which is why the quality check below comes before any kernel work. Gemma 4's global layers and gpt-oss's full layers could use training-free maps later.
+The method needs no change to model weights, only an index projection per attention layer. Qwen3.8-27B can use the released distilled maps. Qwen3.5-0.8B and Qwen3.6-35B-A3B need training-free maps from a calibration pass, which nobody has evaluated on models that size: a small model's keys may cluster less cleanly, which is why the quality check below comes before any kernel work. Gemma 4's full attention layers rotate only a quarter of each 512-dimension head, with proportional rotation: dims `i` and `i + 256` rotate together for `i` below 64. Their position-free dims are two runs of 192, `[64, 256)` and `[320, 512)`, which `IndexMap::split_rotary` describes, so Gemma 4 takes training-free maps too. Its sliding window layers read at most the window and stay dense. On E2B and E4B, the full layers past the K/V-sharing boundary read an earlier full layer's keys: only the owner clusters them, and the sharer selects through the owner's map and index. gpt-oss rotates every dimension, so its keys have no position-free part to index; it would need unrotated keys stored beside the rotated ones.
+
+On Gemma 4 E2B (Q8_0 weights, F16 K/V, M1), with a map `tur sparse-map` fitted on the same four books (its three K/V-owning full layers, in 7 minutes):
+
+| Measure | Dense | LSA, sparse prefill | Speedup |
+| --- | --- | --- | --- |
+| Decode step at 32K | 57.3 ms | 54.3 ms | 1.06× |
+| Decode step at 64K | 66.0 ms | 51.3 ms | 1.29× |
+| 2048-token prefill chunk after 32K | 10.92 s | 2.54 s | 4.3× |
+
+E2B decodes a short context in 47 ms, almost all of it weights, so context adds only 10 ms at 32K and 19 ms at 64K; sparse reads cut it to 4 to 8 ms, within run-to-run noise of each other. The prefill gain is larger than the 0.8B's at the same context: E2B's full layers have 512-dimension heads, twice Qwen's, so each key costs dense prefill twice the work. A 2048-token chunk after 64K ran out of the M1's 16 GB with dense attention, so the 64K rows cover decode only. The needle check with sparse prefill answered all 16 questions at 16K and 32K correctly in both modes, with identical text.
 
 ## Design
 
@@ -111,9 +132,11 @@ With Q8 pools, clustering reads the dequantized keys, as attention does.
 
 The kernels live in `tur-metal`'s `lsa.metal` and `lsa.rs`:
 
-- `lsa_cluster_{f32,f16,q8}`: one threadgroup per complete block, from a list of jobs (page-table offset, block, index slot). It reads the unrotated dimensions straight from the K pool (rotation doesn't touch them), dequantizing Q8, projects and normalizes each key, sums pools, runs the Ward rounds and writes centroids and pools. The 128 F32 key sums alone fill the M1's 32 KiB of threadgroup memory, so they live in a device scratch row per job, and each round recomputes its costs from them. Decode runs it once every 512 tokens. Prefill runs it for every block a chunk completes.
+- `lsa_pools_{f32,f16,q8}` and `lsa_ward_f32` cluster complete blocks, from a list of jobs (page-table offset, block, index slot). `lsa_pools` spreads each block over 16 threadgroups. It reads the unrotated dimensions straight from the K pool (rotation doesn't touch them), dequantizing Q8, then projects and normalizes each key and sums the pools; each simdgroup projects 8 keys together, so a map row it loads serves all eight. `lsa_ward` then gives each block one threadgroup. It forms the 128×128 Gram matrix of the pool sums once, and every merge adds the partner's row and column to it, since sums merge linearly. Each round then reads its costs from the matrix instead of recomputing 16K dot products. The sums and the matrix don't fit the M1's 32 KiB of threadgroup memory, so they live in device scratch per job. Decode runs the pair once every 512 tokens; prefill runs it for every block a chunk completes. Splitting the projection out and adding the Gram matrix cut one block from 2.06 to 0.37 ms on the M1, and prefill's bulk clustering from 270 to 93 µs per block.
 - `lsa_score_f32`: a grid of 256-bucket chunks by tokens. Each threadgroup forms its token's index query and scores its chunk of centroids, so long contexts spread over the whole GPU.
 - `lsa_select_f32`: one threadgroup per token. It finds the exact `p`-th best score with four 8-bit radix passes, collects the buckets above it plus the lowest-numbered ties, sorts them, and expands them into key positions with a prefix sum. The paper's kernel estimates the threshold from a sample instead; the exact version is what makes Tur's lists identical to the reference's. At 128K that is 16,384 centroids, 4 MiB of reads per layer.
+- `lsa_score_f32` and `lsa_select_f32` also take query groups: each row of the index table is one token, or one query tile of a tiled pass, scored by the sum of its rows' normalized index queries. A tile's list puts the sinks before the window and runs the window on to the tile's last row. A single token keeps the reference's arithmetic and order, so decode lists stay identical to the reference's.
+- `attention_tiled` reads an optional key list per tile, through the same page-table lookup, clamped to the tile's last key. Each row's visible length is the list length less the keys past its own position, so the online softmax and its masking are unchanged.
 - `attention_kv` reads an optional key list (`Kernels::attention_sparse`). Each listed position goes through the page table on its own, splits partition the list instead of a range, and the online softmax and gate stay as they are. A position at or past the token's visible keys is clamped, so a malformed list can't read another sequence's pages. Prefill keeps the tiled kernel. Entry `i` becomes page `table[J[i] / 16]` and slot `J[i] % 16`, and the existing splits, online softmax and gate stay as they are. A pool holds 4 consecutive keys, so a bucket expands into runs of 4 contiguous rows inside a page.
 
 ### Engine
@@ -121,11 +144,11 @@ The kernels live in `tur-metal`'s `lsa.metal` and `lsa.rs`:
 - `[model] sparse_attention` (`--sparse-attention`) is `off` or `auto`, and `off` is the default, because outputs change compared with dense attention and every golden test assumes dense attention. Under `auto`, a request reads sparsely once its context passes the crossover; below it, and for models without a map, attention stays dense. A model can default to `auto` only after it passes the retrieval budget.
 - The crossover defaults to 16K keys. Measured on the 0.8B with sparse reads forced from the first key, sparse decode is no slower than dense from 8K (20.2 against 20.9 ms) but gains only 4% at 16K and 12% at 24K, where the budget is still a large share of the context; the needle check above matched dense from 16K. A per-device value in the tuning table would replace it once more Macs are measured. The budget (`k`, `p`, window, sinks) is an advanced setting with the paper's values as defaults.
 - Verification runs one selection per verified position, as plain decoding would at that position, so speculation stays exact with respect to the sparse model. The MTP head's own attention layer stays dense.
-- Prefill attention stays dense and tiled, and only builds index blocks.
+- Prefill attention stays dense and tiled, and only builds index blocks, unless sparse prefill is on. A pass then sorts its rows into dense rows, decoding rows that select per query, and prefill rows that select per tile, and dispatches each kind on its own.
 
 ## Validation
 
-Model correctness follows the usual rule: a pinned external reference first. The reference repository ships a plain PyTorch oracle for the flat design (`src/lsa/core/reference.py`, `ward.py` and `index_space.py`), which its own CUDA kernels are tested against. `scripts/lsa_reference.py golden` runs it on synthetic keys, queries and a map that the test rebuilds bit for bit from an integer hash, so the fixture holds only the reference's outputs. Tur's kernels reproduce its buckets and key lists exactly, for three blocks, eight query positions and two budgets, and its centroids within 1e-5. A second test checks F32, F16 and Q8 pools, four K/V heads, 128-dimension heads and two sequences in one pass against an F64 scalar reference of the same algorithm, also exactly. Making either the merge cost or the window boundary wrong fails both tests. Sparse attention matches an F64 scalar reference over exactly the selected keys within 1e-5 for every format, with and without split-K, and reading each position off by one fails it.
+Model correctness follows the usual rule: a pinned external reference first. The reference repository ships a plain PyTorch oracle for the flat design (`src/lsa/core/reference.py`, `ward.py` and `index_space.py`), which its own CUDA kernels are tested against. `scripts/lsa_reference.py golden` runs it on synthetic keys, queries and a map that the test rebuilds bit for bit from an integer hash, so the fixture holds only the reference's outputs. Tur's kernels reproduce its buckets and key lists exactly, for three blocks, eight query positions and two budgets, and its centroids within 1e-5. A second test checks F32, F16 and Q8 pools, four K/V heads, 128-dimension heads and two sequences in one pass against an F64 scalar reference of the same algorithm, also exactly. Making either the merge cost or the window boundary wrong fails both tests. Sparse attention matches an F64 scalar reference over exactly the selected keys within 1e-5 for every format, with and without split-K, and reading each position off by one fails it. The same scalar check covers Gemma 4's split rotation (512-dimension heads, two free runs) exactly, and the tiled path: each tile's list matches the reference built from the summed group query, and each row's tiled attention matches the scalar reference over its prefix of the list, in F16 and Q8. Through whole models, a budget that holds every key reproduces dense logits within 1e-4 on Qwen and 2e-5 on a Gemma 4 fixture with a K/V-sharing full layer, for prefill chunks, decoding, verification, mixed passes and passes that keep only their last row; on Gemma a one-bucket budget moves them 40 times past that bound, so the sparse path is the one under test.
 
 For quality, the dense model is the reference. The first check needs no Tur kernels: `scripts/lsa_reference.py` runs Qwen3.5-0.8B in Transformers, prefills a document densely, and runs its last 64 tokens once densely and once with each attention layer reading only the keys the reference selects. It reports how much of each layer's dense attention weight the selected keys hold, against the same number of most recent keys and against the best single list for all heads, and how far next-token logits move.
 
@@ -161,5 +184,4 @@ Sparse decoding retrieved every code dense decoding did. The two misses at 16K a
 ## Open questions
 
 - Whether a single crossover holds across models, or whether each Qwen needs its own.
-- What selection costs per decode step. The kernels match the reference, but they haven't been timed; `lsa_select` runs one threadgroup per token, and its radix passes read every score four times.
 - How often real keys produce near-ties. The GPU sums dot products in a different order from the reference, so a near-tie can flip a merge or a pick; on the fixtures none did. A flip changes which keys are read, not the attention over them.

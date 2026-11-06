@@ -13,7 +13,7 @@ tur stop        Stop a server on this machine
 tur transcribe  Transcribe a WAV file with a Whisper checkpoint
 tur quantize    Prepack weights offline, optionally calibrated, for instant loading
 tur prune       Experiment: write a gpt-oss checkpoint with fewer experts
-tur sparse-map  Experiment: fit a Qwen model's latent sparse attention index map
+tur sparse-map  Experiment: fit a Qwen or Gemma 4 model's latent sparse attention index map
 ```
 
 `tur <command> --help` prints every flag. This page groups the flags by purpose and gives their defaults.
@@ -89,8 +89,8 @@ Flags and the file override what a name brings. To run `gpt-oss` with every expe
 | `--vision-encoder [true\|false]` | `true` | Load the checkpoint's vision encoder when it has one (Qwen3.5 and Gemma 4); `false` saves its memory |
 | `--video-input [true\|false]` | `true` | Accept video through the vision encoder; `false` refuses it before any decoder reads the file, for untrusted clients, and images still work |
 | `--expert-cache-mb <MiB>` | every expert resident | Keep the experts of gpt-oss, a Qwen artifact or a Qwen GGUF file on disk and read them into this much memory; see [Expert cache](../architecture/expert-cache.md) |
-| `--sparse-attention off\|auto` | `off` | Experiment: past 16K keys, decoding and verifying queries of Qwen3.5-family models read only the keys `--sparse-map` selects; outputs differ from dense attention. See [latent sparse attention](../research/latent-sparse-attention.md) |
-| `--sparse-map <file>` | none | Index map for `--sparse-attention auto`, from `tur sparse-map` |
+| `--sparse-attention off\|auto\|prefill` | `off` | Experiment: past 16K keys, decoding and verifying queries of Qwen3.5-family and Gemma 4 models read only the keys `--sparse-map` selects, and with `prefill` each tile of 32 prompt queries reads keys selected for it; outputs differ from dense attention. See [Long contexts with sparse attention](sparse-attention.md) |
+| `--sparse-map <file>` | none | Index map for `--sparse-attention auto` or `prefill`, from `tur sparse-map` |
 | `--cpu-reference` | off | Run the slow F32 CPU reference instead of Metal, for development |
 
 Gemma 4 uses the same commands. For the E2B model used in development:
@@ -207,11 +207,11 @@ tur run qwen 'What happens in this clip?' --video clip.mp4
 
 ## Index maps (`sparse-map`)
 
-`tur sparse-map` prefills each calibration file as one long document, reads every full attention layer's keys back from the state pool, and writes each layer's leading 64 principal directions of their position-free dimensions: the training-free map `--sparse-map` reads.
+`tur sparse-map` prefills each calibration file as one long document, reads every full attention layer's keys back from the state pool, and writes each layer's leading 64 principal directions of their position-free dimensions: the training-free map `--sparse-map` reads. [Long contexts with sparse attention](sparse-attention.md) walks through fitting and serving with one.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--model <dir or org/name>` | required | Qwen3.5-family checkpoint, dense or MoE: a directory, a prepacked artifact, or a Hugging Face repository at `--revision` |
+| `--model <dir or org/name>` | required | Qwen3.5-family (dense or MoE) or Gemma 4 checkpoint: a directory, a prepacked artifact, or a Hugging Face repository at `--revision` |
 | `--revision <rev>` | required | Identity of the checkpoint |
 | `--output <file>` | required | Index map to write |
 | `--calibration <files>` | required | Comma-separated text files, one long document each; the reference fits on eight |

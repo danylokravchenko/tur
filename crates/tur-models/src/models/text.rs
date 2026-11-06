@@ -257,18 +257,37 @@ impl TextModel {
     pub fn has_encoders(&self) -> bool {
         self.audio_prompt().is_some() || self.image_prompt().is_some()
     }
-    /// Read attention sparsely as `sparse` describes; Qwen3.5-family models on fused
-    /// Metal execution only.
+    /// Each full attention layer's index input rows over `document`, at most `rows` per
+    /// layer, by layer name, for fitting a training-free index map with
+    /// [`super::principal_map`]; Qwen3.5-family and Gemma 4 models only.
+    pub fn index_rows(&self, document: &[u32], rows: usize) -> Result<Vec<(usize, Vec<f32>)>> {
+        let layers = match self {
+            Self::Qwen35(model) => model.indexed_layers(),
+            Self::Gemma4(model) => model.indexed_layers(),
+            Self::GptOss(_) => {
+                return Err(tur_core::TurError::Other(
+                    "gpt-oss rotates every key dimension, so it has no index map".into(),
+                ));
+            }
+        };
+        super::index_map::index_rows(self.model(), self.device(), &layers, document, rows)
+    }
+
+    /// Read attention sparsely as `sparse` describes; Qwen3.5-family and Gemma 4 models on
+    /// fused Metal execution only.
     #[cfg_attr(
         not(feature = "metal"),
-        allow(unused_variables, reason = "only Qwen on Metal reads sparse attention")
+        allow(unused_variables, reason = "only Metal reads sparse attention")
     )]
     pub fn sparse_attention(&mut self, sparse: &super::SparseAttention) -> Result<()> {
         match self {
             #[cfg(feature = "metal")]
             Self::Qwen35(model) => model.sparse_attention(sparse),
+            #[cfg(feature = "metal")]
+            Self::Gemma4(model) => model.sparse_attention(sparse),
             _ => Err(tur_core::TurError::Other(
-                "latent sparse attention supports Qwen3.5-family models on Metal only".into(),
+                "latent sparse attention supports Qwen3.5-family and Gemma 4 models on Metal only"
+                    .into(),
             )),
         }
     }

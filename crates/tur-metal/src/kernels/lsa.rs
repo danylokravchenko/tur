@@ -1,7 +1,7 @@
 //! Latent sparse attention index: Ward buckets over closed blocks of keys, and the keys a
 //! decoding query reads. Follows the flat design of Prefrontal-AI's reference implementation;
 //! see the book's latent sparse attention chapter.
-use super::{Kernels, PagedKv, runtime::to_u32};
+use super::{Kernels, PagedKv, TILE_QUERIES, runtime::to_u32};
 use crate::pool::{AttentionPool, INDEX_BLOCK_TOKENS, INDEX_BUCKETS, INDEX_DIM, IndexPool};
 use candle_core::{DType, Tensor};
 use tur_core::{
@@ -10,52 +10,96 @@ use tur_core::{
 };
 
 const POOLS: usize = INDEX_BLOCK_TOKENS / 4;
+/// Threadgroups that project one block's pools: 16 spread a decode step's block over the
+/// GPU's cores instead of one.
+const POOL_GROUPS: usize = 16;
+/// Four simdgroups of two pools each, the 8 pools of one group.
+const POOL_THREADS: usize = 128;
 const MAX_TOP_P: usize = 1024;
 const MAX_FREE_DIMS: usize = 2048;
 const SCORE_CHUNK: usize = 256;
 /// Key positions travel as F32, exact below 2^24.
 const MAX_POSITION: usize = 1 << 24;
 
-/// A layer's map `[kv_heads * (head_dim - rotary), 64]` from the position-free key dims of
-/// every K/V head, concatenated, to index space. Rotation covers each head's first `rotary`
-/// dims, so the rest score the same before and after it.
+/// A layer's map `[kv_heads * free, 64]` from the position-free key dims of every K/V head,
+/// concatenated, to index space. Rotation leaves those dims alone, so they score the same
+/// before and after it. A head's `free` position-free dims are one or two runs of it.
 pub struct IndexMap {
     map: Tensor,
     kv_heads: usize,
     head_dim: usize,
-    rotary: usize,
+    /// `(start, len)` of each run of position-free dims in a head; the second may be empty.
+    runs: [(usize, usize); 2],
 }
 
 impl IndexMap {
-    /// Validate `map` against heads of `head_dim` whose first `rotary` dims rotate.
+    /// Validate `map` against heads of `head_dim` whose first `rotary` dims rotate, as
+    /// partial rotary encoding over a prefix of each head does.
     pub fn new(map: Tensor, kv_heads: usize, head_dim: usize, rotary: usize) -> Result<Self> {
         let free = head_dim.checked_sub(rotary).filter(|&f| f > 0);
-        let rows = free.and_then(|f| f.checked_mul(kv_heads));
-        let valid = match (free, rows) {
-            (Some(free), Some(rows)) => {
-                free.is_multiple_of(32)
-                    && rotary.is_multiple_of(32)
-                    && rows <= MAX_FREE_DIMS
-                    && map.dims() == [rows, INDEX_DIM]
-                    && map.dtype() == DType::F32
-            }
-            _ => false,
-        };
+        let free = free.filter(|_| rotary.is_multiple_of(32));
+        Self::validated(
+            map,
+            kv_heads,
+            head_dim,
+            [(rotary, free.unwrap_or(0)), (head_dim, 0)],
+        )
+    }
+
+    /// Validate `map` against heads of `head_dim` that rotate dims `i` and `i + head_dim / 2`
+    /// together for `i` below `pairs`, as proportional rotation over a fraction of the
+    /// frequencies does: the dims from `pairs` to each half's end stay unrotated.
+    pub fn split_rotary(
+        map: Tensor,
+        kv_heads: usize,
+        head_dim: usize,
+        pairs: usize,
+    ) -> Result<Self> {
+        let half = head_dim / 2;
+        let len = half
+            .checked_sub(pairs)
+            .filter(|_| head_dim.is_multiple_of(2))
+            .unwrap_or(0);
+        Self::validated(map, kv_heads, head_dim, [(pairs, len), (half + pairs, len)])
+    }
+
+    fn validated(
+        map: Tensor,
+        kv_heads: usize,
+        head_dim: usize,
+        runs: [(usize, usize); 2],
+    ) -> Result<Self> {
+        let free = runs[0].1 + runs[1].1;
+        let rows = free.checked_mul(kv_heads);
+        let valid = runs[0].1 > 0
+            && runs.iter().all(|&(start, len)| start + len <= head_dim)
+            && free.is_multiple_of(32)
+            && rows.is_some_and(|rows| rows <= MAX_FREE_DIMS && map.dims() == [rows, INDEX_DIM])
+            && map.dtype() == DType::F32;
         if kv_heads == 0 || !valid {
             return Err(invalid(
-                "an index map is F32 [kv_heads * position-free dims, 64], with both dim counts multiples of 32 and at most 2048 rows",
+                "an index map is F32 [kv_heads * position-free dims, 64], with a multiple of 32 position-free dims per head and at most 2048 rows",
             ));
         }
         Ok(Self {
             map,
             kv_heads,
             head_dim,
-            rotary,
+            runs,
         })
     }
 
     fn free_dims(&self) -> usize {
-        self.kv_heads * (self.head_dim - self.rotary)
+        self.kv_heads * (self.runs[0].1 + self.runs[1].1)
+    }
+
+    /// `first`, `split` and `second` of the kernels' parameters.
+    fn layout(&self) -> Result<[u32; 3]> {
+        Ok([
+            to_u32(self.runs[0].0, "position-free dims")?,
+            to_u32(self.runs[0].1, "position-free dims")?,
+            to_u32(self.runs[1].0, "position-free dims")?,
+        ])
     }
 }
 
@@ -110,25 +154,33 @@ impl SparseBudget {
     }
 }
 
-/// Validated index addressing of a pass: token `t` sees the closed blocks before its own
-/// position `visible[t] - 1`, logical block `b` at index block `table[first[t] + b]`.
+/// Validated index addressing of a pass, by query group: one token each, or one query tile
+/// of a tiled pass each. Group `g` sees the closed blocks before its first row's position
+/// `visible[g] - 1`, logical block `b` at index block `table[first[g] + b]`.
 pub struct IndexTable {
     table: Tensor,
     first: Tensor,
     visible: Tensor,
+    /// `(first row, rows)` of each group.
+    rows: Tensor,
+    groups: usize,
+    /// Query rows the groups cover.
     tokens: usize,
+    tiled: bool,
     max_buckets: usize,
     /// Index blocks of the pool the table was validated against.
     blocks: usize,
 }
 
-/// Keys each token of a pass reads: positions `[tokens, width]` as F32, -1 past each row's
-/// length `[tokens]`. A row lists the expanded buckets best first, then the window in
-/// order, then the sinks.
+/// Keys each query group of a pass reads: positions `[groups, width]` as F32, -1 past each
+/// row's length `[groups]`. A token's row lists the expanded buckets best first, then the
+/// window in order, then the sinks; a tile's row lists the sinks before the window, which
+/// runs on to the tile's last token.
 pub struct SparseKeys {
     keys: Tensor,
     lengths: Tensor,
     width: usize,
+    tiled: bool,
 }
 
 impl SparseKeys {
@@ -143,6 +195,11 @@ impl SparseKeys {
     pub fn width(&self) -> usize {
         self.width
     }
+
+    /// Whether the rows are a tiled pass's query tiles rather than tokens.
+    pub fn tiled(&self) -> bool {
+        self.tiled
+    }
 }
 
 #[repr(C)]
@@ -150,7 +207,9 @@ struct ClusterParams {
     jobs: u32,
     kv_heads: u32,
     dim: u32,
-    rotary: u32,
+    first: u32,
+    split: u32,
+    second: u32,
     page: u32,
     group: u32,
     free_dims: u32,
@@ -158,29 +217,32 @@ struct ClusterParams {
 
 #[repr(C)]
 struct ScoreParams {
-    tokens: u32,
+    groups: u32,
     heads: u32,
     kv_heads: u32,
     dim: u32,
-    rotary: u32,
+    first: u32,
+    split: u32,
+    second: u32,
     free_dims: u32,
     score_stride: u32,
 }
 
 #[repr(C)]
 struct SelectParams {
-    tokens: u32,
+    groups: u32,
     score_stride: u32,
     top_k: u32,
     top_p: u32,
     window: u32,
     sink: u32,
     width: u32,
+    tiled: u32,
 }
 
 impl Kernels {
     /// Upload index addressing for a pass of `visible.len()` tokens over a pool of `blocks`
-    /// index blocks.
+    /// index blocks, one query group per token.
     pub fn index_table(
         &self,
         table: &[u32],
@@ -188,8 +250,56 @@ impl Kernels {
         visible: &[u32],
         blocks: usize,
     ) -> Result<IndexTable> {
-        if visible.is_empty() || first.len() != visible.len() {
+        let rows: Vec<u32> = (0..to_u32(visible.len(), "tokens")?)
+            .flat_map(|t| [t, 1])
+            .collect();
+        self.upload_index_table(table, first, visible, &rows, blocks, false)
+    }
+
+    /// [`Self::index_table`] with one query group per query tile of `kv`, which addresses
+    /// the same tokens: `first` and `visible` hold one entry per token.
+    pub fn index_table_tiles(
+        &self,
+        table: &[u32],
+        first: &[u32],
+        visible: &[u32],
+        kv: &PagedKv,
+        blocks: usize,
+    ) -> Result<IndexTable> {
+        let rows = kv
+            .tile_rows()
+            .ok_or_else(|| invalid("tiled index addressing needs query tiles"))?;
+        if first.len() != visible.len() || visible.len() != kv.tokens() {
             return Err(invalid("index addressing needs one first entry per token"));
+        }
+        let leading = |source: &[u32]| -> Vec<u32> {
+            rows.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[first, _]| source[first as usize])
+                .collect()
+        };
+        self.upload_index_table(
+            table,
+            &leading(first),
+            &leading(visible),
+            rows,
+            blocks,
+            true,
+        )
+    }
+
+    fn upload_index_table(
+        &self,
+        table: &[u32],
+        first: &[u32],
+        visible: &[u32],
+        rows: &[u32],
+        blocks: usize,
+        tiled: bool,
+    ) -> Result<IndexTable> {
+        if visible.is_empty() || first.len() != visible.len() || rows.len() != 2 * visible.len() {
+            return Err(invalid("index addressing needs one first entry per group"));
         }
         if let Some(&slot) = table.iter().find(|&&slot| slot as usize >= blocks) {
             return Err(invalid(format!(
@@ -208,15 +318,25 @@ impl Kernels {
             }
             max_buckets = max_buckets.max(closed * INDEX_BUCKETS);
         }
+        let tokens = rows
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[_, n]| n as usize)
+            .sum();
         // Every bound buffer must exist, so an empty table uploads one unread entry.
-        let tokens = visible.len();
+        let groups = visible.len();
         let table = if table.is_empty() { &[0][..] } else { table };
-        let [table, first, visible] = self.runtime.indices_packed([table, first, visible])?;
+        let [table, first, visible, rows] =
+            self.runtime.indices_packed([table, first, visible, rows])?;
         Ok(IndexTable {
             table,
             first,
             visible,
+            rows,
+            groups,
             tokens,
+            tiled,
             max_buckets,
             blocks,
         })
@@ -254,35 +374,49 @@ impl Kernels {
         map_view.contiguous("index map")?;
         let centroids = self.view(index.centroids())?;
         let members = self.view(index.members())?;
+        let [first, split, second] = map.layout()?;
         let params = ClusterParams {
             jobs: to_u32(jobs.len(), "cluster jobs")?,
             kv_heads: to_u32(pool.kv_heads, "kv heads")?,
             dim: to_u32(pool.head_dim, "head dim")?,
-            rotary: to_u32(map.rotary, "rotary dims")?,
+            first,
+            split,
+            second,
             page: to_u32(kv.page, "page")?,
             group: to_u32(pool.format.group().unwrap_or(32), "group")?,
             free_dims: to_u32(map.free_dims(), "position-free dims")?,
         };
-        let scratch = self.output(jobs.len() * POOLS, INDEX_DIM)?;
+        let sums = self.output(jobs.len() * POOLS, INDEX_DIM)?;
+        let grams = self.output(jobs.len() * POOLS, POOLS)?;
         let name = match pool.format {
-            KvFormat::F32 => "lsa_cluster_f32",
-            KvFormat::F16 => "lsa_cluster_f16",
-            KvFormat::Q8 { .. } => "lsa_cluster_q8",
+            KvFormat::F32 => "lsa_pools_f32",
+            KvFormat::F16 => "lsa_pools_f16",
+            KvFormat::Q8 { .. } => "lsa_pools_q8",
         };
         let pipeline = self.pipeline(name)?;
-        let threads = pipeline.threads(self.capabilities().max_threads_per_threadgroup);
+        let grid = (jobs.len(), POOL_GROUPS);
         self.runtime
-            .dispatch(pipeline, "tur_lsa_cluster", jobs.len(), threads, |e| {
+            .dispatch_grid(pipeline, "tur_lsa_pools", grid, POOL_THREADS, |e| {
                 k_data.bind(e, 0)?;
                 // Unscaled formats bind the data again; every declared buffer must be bound.
                 k_scales.as_ref().unwrap_or(&k_data).bind(e, 1)?;
                 table.bind(e, 2)?;
                 job_view.bind(e, 3)?;
                 map_view.bind(e, 4)?;
-                scratch.bind(e, 5);
-                centroids.bind_mut(e, 6)?;
-                members.bind_mut(e, 7)?;
-                e.set_bytes(8, &params);
+                sums.bind(e, 5);
+                e.set_bytes(6, &params);
+                Ok(())
+            })?;
+        let pipeline = self.pipeline("lsa_ward_f32")?;
+        let threads = pipeline.threads(self.capabilities().max_threads_per_threadgroup);
+        self.runtime
+            .dispatch(pipeline, "tur_lsa_ward", jobs.len(), threads, |e| {
+                job_view.bind(e, 0)?;
+                sums.bind(e, 1);
+                grams.bind(e, 2);
+                centroids.bind_mut(e, 3)?;
+                members.bind_mut(e, 4)?;
+                e.set_bytes(5, &params);
                 Ok(())
             })
     }
@@ -338,8 +472,10 @@ impl Kernels {
         table: &IndexTable,
         budget: SparseBudget,
     ) -> Result<SparseKeys> {
-        let width = budget.width()?;
+        // A tile's window runs on past its first token to its last.
+        let width = budget.width()? + if table.tiled { TILE_QUERIES - 1 } else { 0 };
         let (tokens, heads, dim) = q.dims3()?;
+        let groups = table.groups;
         if tokens != table.tokens
             || dim != map.head_dim
             || !heads.is_multiple_of(map.kv_heads)
@@ -354,22 +490,26 @@ impl Kernels {
         let index_table = self.runtime.view(&table.table, DType::U32)?;
         let first = self.runtime.view(&table.first, DType::U32)?;
         let visible = self.runtime.view(&table.visible, DType::U32)?;
+        let rows = self.runtime.view(&table.rows, DType::U32)?;
         let centroids = self.view(index.centroids())?;
         let members = self.view(index.members())?;
         let stride = table.max_buckets.max(1);
-        let scores = self.output(tokens, stride)?;
+        let scores = self.output(groups, stride)?;
         if table.max_buckets > 0 {
+            let [free_first, split, second] = map.layout()?;
             let params = ScoreParams {
-                tokens: to_u32(tokens, "tokens")?,
+                groups: to_u32(groups, "query groups")?,
                 heads: to_u32(heads, "heads")?,
                 kv_heads: to_u32(map.kv_heads, "kv heads")?,
                 dim: to_u32(dim, "head dim")?,
-                rotary: to_u32(map.rotary, "rotary dims")?,
+                first: free_first,
+                split,
+                second,
                 free_dims: to_u32(map.free_dims(), "position-free dims")?,
                 score_stride: to_u32(stride, "score stride")?,
             };
             let pipeline = self.pipeline("lsa_score_f32")?;
-            let grid = (table.max_buckets.div_ceil(SCORE_CHUNK), tokens);
+            let grid = (table.max_buckets.div_ceil(SCORE_CHUNK), groups);
             let threads = pipeline.threads(SCORE_CHUNK);
             self.runtime
                 .dispatch_grid(pipeline, "tur_lsa_score", grid, threads, |e| {
@@ -381,24 +521,26 @@ impl Kernels {
                     visible.bind(e, 5)?;
                     scores.bind(e, 6);
                     e.set_bytes(7, &params);
+                    rows.bind(e, 8)?;
                     Ok(())
                 })?;
         }
         let params = SelectParams {
-            tokens: to_u32(tokens, "tokens")?,
+            groups: to_u32(groups, "query groups")?,
             score_stride: to_u32(stride, "score stride")?,
             top_k: to_u32(budget.top_k, "top-k")?,
             top_p: to_u32(budget.top_p, "top-p")?,
             window: to_u32(budget.window, "window")?,
             sink: to_u32(budget.sink, "sinks")?,
             width: to_u32(width, "width")?,
+            tiled: u32::from(table.tiled),
         };
-        let keys = self.output(tokens, width)?;
-        let lengths = self.output(tokens, 1)?;
+        let keys = self.output(groups, width)?;
+        let lengths = self.output(groups, 1)?;
         let pipeline = self.pipeline("lsa_select_f32")?;
         let threads = pipeline.threads(self.capabilities().max_threads_per_threadgroup);
         self.runtime
-            .dispatch(pipeline, "tur_lsa_select", tokens, threads, |e| {
+            .dispatch(pipeline, "tur_lsa_select", groups, threads, |e| {
                 e.set_input_buffer(0, Some(scores.buffer()), 0);
                 members.bind(e, 1)?;
                 index_table.bind(e, 2)?;
@@ -407,12 +549,14 @@ impl Kernels {
                 keys.bind(e, 5);
                 lengths.bind(e, 6);
                 e.set_bytes(7, &params);
+                rows.bind(e, 8)?;
                 Ok(())
             })?;
         Ok(SparseKeys {
-            keys: self.finish(keys, (tokens, width))?,
-            lengths: self.finish(lengths, tokens)?,
+            keys: self.finish(keys, (groups, width))?,
+            lengths: self.finish(lengths, groups)?,
             width,
+            tiled: table.tiled,
         })
     }
 }

@@ -13,7 +13,9 @@
 //! such as Gemma 4 E2B use fewer of both to keep a run short.
 //! `TUR_BENCH_SPARSE_MAP=<index map>` reads attention sparsely through that map, with the
 //! default budget, over indexed pools; `TUR_BENCH_SPARSE_CROSSOVER=<keys>` replaces the
-//! default crossover.
+//! default crossover and `TUR_BENCH_SPARSE_PREFILL=1` reads prefill sparsely too.
+//! `TUR_BENCH_ONLY=chunk`, never on by default, times one 2048-token prefill chunk after
+//! each of `TUR_BENCH_CONTEXTS`.
 
 use candle_core::Device;
 use serde_json::{Value, json};
@@ -210,6 +212,25 @@ fn prefill_case(model: &TextModel, length: usize) -> Result<Value> {
     }))
 }
 
+/// One prefill chunk of `CHUNK` tokens after `context` prefilled ones, where prefill
+/// attention reads the most keys.
+fn chunk_case(model: &TextModel, context: usize) -> Result<Value> {
+    const CHUNK: usize = 2048;
+    let pool = pool(model, &[context], CHUNK)?;
+    let state = prefilled(model, &pool, &tokens(context, 2))?;
+    let chunk = tokens(CHUNK, 3);
+    pass(model, &pool, &[(&state, &chunk)])?;
+    let samples = (0..2)
+        .map(|_| pass(model, &pool, &[(&state, &chunk)]))
+        .collect::<Result<Vec<_>>>()?;
+    let (seconds, encode) = medians(&samples);
+    Ok(json!({
+        "context": context, "chunk_tokens": CHUNK, "median_seconds": seconds,
+        "median_encode_seconds": encode, "tokens_per_second": CHUNK as f64 / seconds,
+        "samples_seconds": samples.iter().map(|s| s.total).collect::<Vec<_>>(),
+    }))
+}
+
 fn decode_case(model: &TextModel, batch: usize, context: usize) -> Result<Value> {
     let pool = pool(model, &vec![context; batch], 1)?;
     let states = (0..batch)
@@ -307,6 +328,23 @@ fn engine_case(model: Arc<TextModel>, generated: usize) -> Result<Value> {
 }
 
 /// Whether `TUR_BENCH_ONLY` (comma-separated `prefill`, `decode`, `engine`) selects `case`.
+/// `TUR_BENCH_SPARSE_MAP` reads attention sparsely through that index map, past
+/// `TUR_BENCH_SPARSE_CROSSOVER` keys if set, and in prefill too with
+/// `TUR_BENCH_SPARSE_PREFILL=1`.
+pub(crate) fn sparse_settings() -> Result<Option<SparseAttention>> {
+    let Some(map) = std::env::var_os("TUR_BENCH_SPARSE_MAP") else {
+        return Ok(None);
+    };
+    let mut sparse = SparseAttention::new(map.into());
+    if let Ok(keys) = std::env::var("TUR_BENCH_SPARSE_CROSSOVER") {
+        sparse.crossover = keys
+            .parse()
+            .map_err(|_| invalid("TUR_BENCH_SPARSE_CROSSOVER"))?;
+    }
+    sparse.prefill = std::env::var("TUR_BENCH_SPARSE_PREFILL").is_ok_and(|v| v == "1");
+    Ok(Some(sparse))
+}
+
 fn selected(case: &str) -> bool {
     std::env::var("TUR_BENCH_ONLY").map_or(true, |only| only.split(',').any(|c| c == case))
 }
@@ -326,6 +364,15 @@ fn measure(model: &TextModel, sweep: &Sweep, contexts: &[usize]) -> Result<Value
         .iter()
         .map(|&length| prefill_case(model, length))
         .collect::<Result<Vec<_>>>()?;
+    let chunks =
+        if std::env::var("TUR_BENCH_ONLY").is_ok_and(|o| o.split(',').any(|c| c == "chunk")) {
+            contexts
+                .iter()
+                .map(|&context| chunk_case(model, context))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
     let mut decode = Vec::new();
     if selected("decode") {
         for &batch in &sweep.batches {
@@ -343,7 +390,7 @@ fn measure(model: &TextModel, sweep: &Sweep, contexts: &[usize]) -> Result<Value
         "kv_token_bytes": description.kv_token_bytes()?,
         "recurrent_slot_bytes": description.recurrent_slot_bytes()?,
         "projection_bytes": model.projection_bytes(), "weight_bytes": model.weight_bytes(),
-        "prefill": prefill, "decode": decode,
+        "prefill": prefill, "chunks": chunks, "decode": decode,
     }))
 }
 
@@ -361,12 +408,7 @@ pub(crate) fn run() -> Result<()> {
     };
     let pages = env_sizes("TUR_BENCH_PAGES", "16")?;
     let reference = std::env::var("TUR_BENCH_REFERENCE").is_ok_and(|v| v == "1");
-    let sparse_map = std::env::var_os("TUR_BENCH_SPARSE_MAP").map(PathBuf::from);
-    let crossover = std::env::var("TUR_BENCH_SPARSE_CROSSOVER")
-        .ok()
-        .map(|keys| keys.parse::<usize>())
-        .transpose()
-        .map_err(|_| invalid("TUR_BENCH_SPARSE_CROSSOVER"))?;
+    let sparse = sparse_settings()?;
     let engine_tokens = env_sizes("TUR_BENCH_ENGINE_TOKENS", "32")?
         .first()
         .copied()
@@ -411,13 +453,11 @@ pub(crate) fn run() -> Result<()> {
                     )?;
                     let load_seconds = load_start.elapsed().as_secs_f64();
                     let mut model = model;
-                    if let Some(map) = &sparse_map {
-                        let mut sparse = SparseAttention::new(map.clone());
-                        sparse.crossover = crossover.unwrap_or(sparse.crossover);
-                        model.sparse_attention(&sparse)?;
+                    if let Some(sparse) = &sparse {
+                        model.sparse_attention(sparse)?;
                     }
                     let mut result = measure(&model, &sweep, &sweep.contexts)?;
-                    result["sparse_map"] = json!(sparse_map);
+                    result["sparse_attention"] = json!(sparse.as_ref().map(|s| format!("{s:?}")));
                     result["format"] = json!(name);
                     result["recurrent_state"] = json!(state);
                     result["execution"] = json!("Fused");
