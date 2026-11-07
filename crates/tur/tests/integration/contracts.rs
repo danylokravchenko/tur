@@ -56,6 +56,7 @@ const POOL: PoolConfig = PoolConfig {
     pages: 8,
     window_pages: 8,
     recurrent_slots: 8,
+    index_blocks: 0,
 };
 
 fn recurrent() -> LayerStateKind {
@@ -668,6 +669,7 @@ fn test_pool_exhaustion_fails_the_pass_before_execution_and_leaves_state_unchang
             pages: 3,
             window_pages: 3,
             recurrent_slots: 4,
+            index_blocks: 0,
         },
     )?;
     let a = allocate(&mut engine, 1)?;
@@ -705,6 +707,7 @@ fn test_released_pages_and_slots_are_reclaimed_after_completion() -> Result<()> 
             pages: 4,
             window_pages: 4,
             recurrent_slots: 3,
+            index_blocks: 0,
         },
     )?;
     // Far more passes than capacity: every cycle's pages and slots come back.

@@ -25,7 +25,8 @@ use tur_core::{Result, TurError, execution::invalid};
 /// 4: windowed ungated attention and learned expert route scales.
 /// 5: windowed ungated tiled attention.
 /// 6: attention sinks and MXFP4 expert banks.
-pub const LAYOUT_VERSION: u32 = 6;
+/// 7: latent sparse attention index blocks and key lists.
+pub const LAYOUT_VERSION: u32 = 8;
 
 // Runtime Metal compilation has no local include search path, so embed the families as
 // one source string with shared helpers first.
@@ -45,6 +46,8 @@ const SOURCE: &str = concat!(
     include_str!("moe.metal"),
     "\n",
     include_str!("sampling.metal"),
+    "\n",
+    include_str!("lsa.metal"),
 );
 const SIMD_WIDTH: usize = 32;
 
@@ -118,6 +121,18 @@ const FUNCTIONS: &[&str] = &[
     "attention_tiled_r8_f32",
     "attention_tiled_r8_f16",
     "attention_tiled_r8_q8",
+    "attention_split_r2_f32",
+    "attention_split_r2_f16",
+    "attention_split_r2_q8",
+    "attention_split_r4_f32",
+    "attention_split_r4_f16",
+    "attention_split_r4_q8",
+    "attention_split_r8_f32",
+    "attention_split_r8_f16",
+    "attention_split_r8_q8",
+    "attention_split_r16_f32",
+    "attention_split_r16_f16",
+    "attention_split_r16_q8",
     "attention_reduce_r2_f32",
     "attention_reduce_r4_f32",
     "attention_reduce_r8_f32",
@@ -172,6 +187,12 @@ const FUNCTIONS: &[&str] = &[
     "delta_step_d256_r16_bf16",
     "delta_step_d256_r32_bf16",
     "argmax_f32",
+    "lsa_pools_f32",
+    "lsa_pools_f16",
+    "lsa_pools_q8",
+    "lsa_ward_f32",
+    "lsa_score_f32",
+    "lsa_select_f32",
     "penalize_f32",
     "mask_f32",
     "sample_f32",

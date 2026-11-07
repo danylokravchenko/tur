@@ -42,17 +42,9 @@ impl Paging {
     ) -> Result<Self> {
         let mut first = Vec::with_capacity(tokens);
         let mut visible = Vec::with_capacity(tokens);
-        let (mut full, mut windows) = (Vec::new(), Vec::new());
+        let mut tables = Tables::default();
         for (addresses, positions) in spans {
-            let base = u32::try_from(full.len().max(windows.len()))
-                .map_err(|_| invalid("page table overflow"))?;
-            // Both tables index the same logical pages; pad the shorter so bases agree.
-            full.extend_from_slice(&addresses.pages);
-            windows.extend_from_slice(&addresses.windows);
-            let end = usize::try_from(base).map_err(|_| invalid("page table overflow"))?
-                + addresses.pages.len().max(addresses.windows.len());
-            full.resize(end, 0);
-            windows.resize(end, 0);
+            let base = tables.push(addresses)?;
             for p in positions {
                 let keys = p
                     .checked_add(1)
@@ -61,7 +53,8 @@ impl Paging {
                 visible.push(u32::try_from(keys).map_err(|_| invalid("context overflow"))?);
             }
         }
-        Self::from_tables(k, description, pool, (&full, &windows), &first, &visible)
+        let (full, windows) = (&tables.full, &tables.windows);
+        Self::from_tables(k, description, pool, (full, windows), &first, &visible)
     }
 
     /// Addressing from page tables already laid out for the pass.
@@ -98,5 +91,28 @@ impl Paging {
         if windowed { &self.windowed } else { &self.full }
             .as_ref()
             .ok_or_else(|| invalid("no page addressing for this attention layer"))
+    }
+}
+
+/// The full and window page tables of a pass, laid out as [`Paging`] lays them out: each
+/// sequence's tables at the same base in both, the shorter padded.
+#[derive(Default)]
+pub(crate) struct Tables {
+    pub(crate) full: Vec<u32>,
+    pub(crate) windows: Vec<u32>,
+}
+
+impl Tables {
+    /// Append one sequence's tables and return their base.
+    pub(crate) fn push(&mut self, addresses: &Addresses) -> Result<u32> {
+        let start = self.full.len().max(self.windows.len());
+        let base = u32::try_from(start).map_err(|_| invalid("page table overflow"))?;
+        // Both tables index the same logical pages; pad the shorter so bases agree.
+        self.full.extend_from_slice(&addresses.pages);
+        self.windows.extend_from_slice(&addresses.windows);
+        let end = start + addresses.pages.len().max(addresses.windows.len());
+        self.full.resize(end, 0);
+        self.windows.resize(end, 0);
+        Ok(base)
     }
 }

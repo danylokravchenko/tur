@@ -5,8 +5,10 @@
 //! ranges) before encoding; nothing falls back to the CPU. Kernels only enqueue work: the
 //! caller fences with [`crate::completion::Completion`] before reading results.
 
+mod lsa;
 mod moe;
 mod runtime;
+pub use lsa::{ClusterJob, IndexMap, IndexTable, SparseBudget, SparseKeys};
 pub use moe::{ExpertRoutes, SharedExpert};
 
 use crate::{
@@ -20,7 +22,7 @@ pub use runtime::{Capabilities, LAYOUT_VERSION, Output, Tuning};
 use runtime::{Pipeline, Runtime, View, to_u32};
 use std::sync::Arc;
 use tur_core::{
-    Result,
+    Result, TurError,
     execution::{KvFormat, invalid},
 };
 
@@ -148,6 +150,8 @@ struct AttentionParams {
     window: u32,
     ungated: u32,
     sinks: u32,
+    sparse: u32,
+    sparse_width: u32,
 }
 
 #[repr(C)]
@@ -164,17 +168,21 @@ struct TiledParams {
     window: u32,
     ungated: u32,
     sinks: u32,
+    sparse: u32,
+    sparse_width: u32,
 }
 
 /// Output and score semantics of one tiled dispatch: the gate's head layout (unread when
 /// `ungated`), the score scale and the sliding window (0 for none).
 #[derive(Clone, Copy)]
-struct TileShape {
+struct TileShape<'a> {
     gate: Heads,
     ungated: bool,
     sinks: bool,
     scale: f32,
     window: u32,
+    /// One key list per query tile, read in place of every visible key.
+    sparse: Option<&'a SparseKeys>,
 }
 
 /// Query tokens per tile (8 rows per simdgroup), key block and staged dimensions of the
@@ -340,9 +348,10 @@ pub struct PagedKv {
     table: Tensor,
     first_block: Tensor,
     visible: Tensor,
-    /// `(first token, count)` query tiles for the tiled kernel, or `None` when some
-    /// sequence's tokens are not consecutive positions sharing one page table.
-    tiles: Option<(Tensor, usize)>,
+    /// `(first token, count)` query tiles for the tiled kernel, uploaded and as uploaded,
+    /// or `None` when some sequence's tokens are not consecutive positions sharing one page
+    /// table.
+    tiles: Option<(Tensor, Vec<u32>)>,
     page: usize,
     slots: usize,
     tokens: usize,
@@ -360,7 +369,12 @@ impl PagedKv {
 
     /// Query tiles of the tiled kernel, if the layout allows it.
     pub fn tiles(&self) -> Option<usize> {
-        self.tiles.as_ref().map(|(_, count)| *count)
+        self.tiles.as_ref().map(|(_, rows)| rows.len() / 2)
+    }
+
+    /// `(first token, count)` of each query tile, if the layout has them.
+    pub fn tile_rows(&self) -> Option<&[u32]> {
+        self.tiles.as_ref().map(|(_, rows)| rows.as_slice())
     }
 }
 
@@ -471,6 +485,26 @@ impl RecurrentSpans {
         }
         Ok(())
     }
+}
+
+/// Optional inputs of one attention dispatch.
+#[derive(Clone, Copy, Default)]
+struct Attend<'a> {
+    output_gate: Option<(&'a Tensor, Heads)>,
+    window: Option<usize>,
+    scale: Option<f64>,
+    sinks: Option<&'a Tensor>,
+    sparse: Option<&'a SparseKeys>,
+}
+
+/// Resolved semantics of a per-query attention dispatch.
+#[derive(Clone, Copy)]
+struct PerQuery {
+    gate: Heads,
+    scale: f32,
+    window: u32,
+    ungated: bool,
+    sinks: bool,
 }
 
 /// Split-K choice for one attention dispatch.
@@ -1558,7 +1592,7 @@ impl Kernels {
                 let [table, first, keys, uploaded] =
                     self.runtime
                         .indices_packed([table, first_block, visible, &tiles])?;
-                (table, first, keys, Some((uploaded, tiles.len() / 2)))
+                (table, first, keys, Some((uploaded, tiles)))
             } else {
                 let [table, first, keys] =
                     self.runtime.indices_packed([table, first_block, visible])?;
@@ -1614,9 +1648,8 @@ impl Kernels {
             tiles.saturating_mul(heads) >= groups
                 // Sparse query tiles waste matrix work and lose split-K parallelism.
                 && (groups == 0 || kv.tokens >= tiles.saturating_mul(TILE_QUERIES / 2))
-                && matches!(dim, 64 | 128 | 256)
+                && matches!(dim, 64 | 128 | 256 | 512)
                 && self.capabilities().max_threads_per_threadgroup >= TILE_THREADS
-                && Self::tiled_memory_bytes() <= self.capabilities().threadgroup_memory_bytes
         })
     }
 
@@ -1786,7 +1819,67 @@ impl Kernels {
         gate_source: &Tensor,
         gate: Heads,
     ) -> Result<Tensor> {
-        self.attend(q, pool, kv, Some((gate_source, gate)), None, None, None)
+        let output_gate = Some((gate_source, gate));
+        self.attend(
+            q,
+            pool,
+            kv,
+            Attend {
+                output_gate,
+                ..Attend::default()
+            },
+        )
+    }
+
+    /// [`Self::attention`] over only the keys each token's list in `keys` names, as
+    /// [`Self::lsa_select`] chooses them. Listed positions must be below the token's visible
+    /// keys in `kv`; the kernel clamps any that are not, so they never read other pages.
+    pub fn attention_sparse(
+        &self,
+        q: &Tensor,
+        pool: &AttentionPool,
+        kv: &PagedKv,
+        gate_source: &Tensor,
+        gate: Heads,
+        keys: &SparseKeys,
+    ) -> Result<Tensor> {
+        let output_gate = Some((gate_source, gate));
+        let sparse = Some(keys);
+        self.attend(
+            q,
+            pool,
+            kv,
+            Attend {
+                output_gate,
+                sparse,
+                ..Attend::default()
+            },
+        )
+    }
+
+    /// [`Self::attention_sparse`] with no output gate and an explicit score scale.
+    pub fn attention_sparse_ungated(
+        &self,
+        q: &Tensor,
+        pool: &AttentionPool,
+        kv: &PagedKv,
+        scale: f64,
+        keys: &SparseKeys,
+    ) -> Result<Tensor> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(invalid("invalid attention scale"));
+        }
+        let (scale, sparse) = (Some(scale), Some(keys));
+        self.attend(
+            q,
+            pool,
+            kv,
+            Attend {
+                scale,
+                sparse,
+                ..Attend::default()
+            },
+        )
     }
 
     /// Causal paged attention with an optional sliding window, explicit score scale and
@@ -1802,7 +1895,17 @@ impl Kernels {
         if window == Some(0) || !scale.is_finite() || scale <= 0.0 {
             return Err(invalid("invalid attention window or scale"));
         }
-        self.attend(q, pool, kv, None, window, Some(scale), None)
+        let scale = Some(scale);
+        self.attend(
+            q,
+            pool,
+            kv,
+            Attend {
+                window,
+                scale,
+                ..Attend::default()
+            },
+        )
     }
 
     /// [`Self::attention_ungated`] with one sink logit per query head in each softmax.
@@ -1818,29 +1921,33 @@ impl Kernels {
         if window == Some(0) || !scale.is_finite() || scale <= 0.0 {
             return Err(invalid("invalid attention window or scale"));
         }
-        self.attend(q, pool, kv, None, window, Some(scale), Some(sinks))
+        let (scale, sinks) = (Some(scale), Some(sinks));
+        self.attend(
+            q,
+            pool,
+            kv,
+            Attend {
+                window,
+                scale,
+                sinks,
+                ..Attend::default()
+            },
+        )
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one argument per attention variant's optional input"
-    )]
     fn attend(
         &self,
         q: &Tensor,
         pool: &AttentionPool,
         kv: &PagedKv,
-        output_gate: Option<(&Tensor, Heads)>,
-        window: Option<usize>,
-        scale: Option<f64>,
-        sinks: Option<&Tensor>,
+        args: Attend<'_>,
     ) -> Result<Tensor> {
         let (tokens, heads, dim) = q.dims3()?;
         let kv_heads = pool.kv_heads;
         let fallback = q.reshape((tokens, heads * dim))?;
         // The kernels read sinks through the unused gate binding.
-        let (gate_source, gate) = output_gate.unwrap_or((
-            sinks.unwrap_or(&fallback),
+        let (gate_source, gate) = args.output_gate.unwrap_or((
+            args.sinks.unwrap_or(&fallback),
             Heads {
                 count: heads,
                 dim,
@@ -1858,21 +1965,22 @@ impl Kernels {
         {
             return Err(invalid("attention shapes do not match"));
         }
-        let hg = self.attention_head_group(heads, kv_heads, pool.format);
-        let name = if hg == 1 {
-            Self::kv_kernel("attention", dim, pool.format)?
-        } else {
-            Self::kv_kernel(&format!("attention_h{hg}"), dim, pool.format)?
-        };
-        let reduce = Self::kv_kernel("attention_reduce", dim, KvFormat::F32)?;
+        if let Some(sparse) = args.sparse
+            && !sparse.tiled()
+            && (args.window.is_some()
+                || sparse.keys().dims() != [tokens, sparse.width()]
+                || sparse.lengths().dims() != [tokens])
+        {
+            return Err(invalid("sparse keys need one list per token and no window"));
+        }
         let (k_data, k_scales) = self.kv_views(&pool.key, pool.format, kv.slots, kv_heads, dim)?;
         let (v_data, v_scales) =
             self.kv_views(&pool.value, pool.format, kv.slots, kv_heads, dim)?;
         let qv = self.view(q)?;
         let gv = self.view(gate_source)?;
         qv.contiguous("queries")?;
-        if let Some(sinks) = sinks {
-            if output_gate.is_some() || sinks.dims() != [heads] {
+        if let Some(sinks) = args.sinks {
+            if args.output_gate.is_some() || sinks.dims() != [heads] {
                 return Err(invalid("attention sinks need one logit per ungated head"));
             }
         } else if gv.rows != tokens
@@ -1880,20 +1988,23 @@ impl Kernels {
         {
             return Err(invalid("attention gate exceeds its projection"));
         }
-        let scale = scale.unwrap_or_else(|| (dim as f64).sqrt().recip()) as f32;
-        let window = to_u32(window.unwrap_or(0), "attention window")?;
-        let tiled = if output_gate.is_some() {
-            self.attention_tiled(kv, heads, dim)
-        } else {
-            self.attention_tiled_ungated(kv, heads, dim)
-        };
+        let scale = args.scale.unwrap_or_else(|| (dim as f64).sqrt().recip()) as f32;
+        let window = to_u32(args.window.unwrap_or(0), "attention window")?;
+        let tiled = args.sparse.is_some_and(SparseKeys::tiled)
+            || args.sparse.is_none()
+                && if args.output_gate.is_some() {
+                    self.attention_tiled(kv, heads, dim)
+                } else {
+                    self.attention_tiled_ungated(kv, heads, dim)
+                };
         if tiled {
             let shape = TileShape {
                 gate,
-                ungated: output_gate.is_none(),
-                sinks: sinks.is_some(),
+                ungated: args.output_gate.is_none(),
+                sinks: args.sinks.is_some(),
                 scale,
                 window,
+                sparse: args.sparse,
             };
             return self.attention_tiles(
                 &qv,
@@ -1905,6 +2016,48 @@ impl Kernels {
                 (v_data, v_scales),
             );
         }
+        let shape = PerQuery {
+            gate,
+            scale,
+            window,
+            ungated: args.output_gate.is_none(),
+            sinks: args.sinks.is_some(),
+        };
+        self.attend_per_query(
+            &qv,
+            pool,
+            kv,
+            &gv,
+            shape,
+            args.sparse,
+            [(k_data, k_scales), (v_data, v_scales)],
+        )
+    }
+
+    /// The per-query kernel and, with splits, its reduction; same contract as `attend`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per kernel binding; a struct would only rename them"
+    )]
+    fn attend_per_query(
+        &self,
+        qv: &View<'_>,
+        pool: &AttentionPool,
+        kv: &PagedKv,
+        gv: &View<'_>,
+        shape: PerQuery,
+        sparse: Option<&SparseKeys>,
+        [(k_data, k_scales), (v_data, v_scales)]: [(View<'_>, Option<View<'_>>); 2],
+    ) -> Result<Tensor> {
+        let (tokens, kv_heads, dim) = (kv.tokens, pool.kv_heads, pool.head_dim);
+        let heads = shape.gate.count;
+        let hg = self.attention_head_group(heads, kv_heads, pool.format);
+        let name = if hg == 1 {
+            Self::kv_kernel("attention", dim, pool.format)?
+        } else {
+            Self::kv_kernel(&format!("attention_h{hg}"), dim, pool.format)?
+        };
+        let reduce = Self::kv_kernel("attention_reduce", dim, KvFormat::F32)?;
         // The per-query kernel addresses pool rows (slot × K/V head) in 32 bits.
         to_u32(
             kv.slots
@@ -1915,11 +2068,15 @@ impl Kernels {
         let table = self.runtime.view(&kv.table, DType::U32)?;
         let first = self.runtime.view(&kv.first_block, DType::U32)?;
         let visible = self.runtime.view(&kv.visible, DType::U32)?;
-        // Splits fill the GPU with simdgroups, each serving `hg` heads.
-        // A query reads at most `window` keys, starting at its window's first key.
-        let span = match window {
-            0 => kv.max_visible,
-            w => kv.max_visible.min(w as usize),
+        let lists = sparse
+            .map(|s| Ok::<_, TurError>((self.view(s.keys())?, self.view(s.lengths())?)))
+            .transpose()?;
+        // Splits fill the GPU with simdgroups, each serving `hg` heads. A query reads at
+        // most `window` keys, starting at its window's first key, or its list's keys.
+        let span = match (sparse, shape.window) {
+            (Some(s), _) => s.width(),
+            (None, 0) => kv.max_visible,
+            (None, w) => kv.max_visible.min(w as usize),
         };
         let split = self.attention_split(tokens, heads / hg, span);
         let params = AttentionParams {
@@ -1931,13 +2088,15 @@ impl Kernels {
             splits: to_u32(split.splits, "splits")?,
             split_keys: to_u32(split.split_keys, "split keys")?,
             gate_stride: to_u32(gv.row_stride, "gate stride")?,
-            gate_col: to_u32(gate.col_offset, "gate column")?,
-            gate_head_stride: to_u32(gate.head_stride, "gate head stride")?,
+            gate_col: to_u32(shape.gate.col_offset, "gate column")?,
+            gate_head_stride: to_u32(shape.gate.head_stride, "gate head stride")?,
             group: to_u32(pool.format.group().unwrap_or(32), "group")?,
-            scale,
-            window,
-            ungated: u32::from(output_gate.is_none()),
-            sinks: u32::from(sinks.is_some()),
+            scale: shape.scale,
+            window: shape.window,
+            ungated: u32::from(shape.ungated),
+            sinks: u32::from(shape.sinks),
+            sparse: u32::from(sparse.is_some()),
+            sparse_width: to_u32(sparse.map_or(0, SparseKeys::width), "sparse width")?,
         };
         let items = tokens * heads;
         let out = self.output(items, dim)?;
@@ -1968,6 +2127,10 @@ impl Kernels {
                 e.set_bytes(10, &params);
                 k_scales.as_ref().unwrap_or(&k_data).bind(e, 11)?;
                 v_scales.as_ref().unwrap_or(&v_data).bind(e, 12)?;
+                // Dense passes bind the queries again; the kernel never reads them there.
+                let (keys, lengths) = lists.as_ref().map_or((qv, qv), |(k, l)| (k, l));
+                keys.bind(e, 13)?;
+                lengths.bind(e, 14)?;
                 Ok(())
             })?;
         if let Some((partial, stats)) = &scratch {
@@ -1997,18 +2160,29 @@ impl Kernels {
         pool: &AttentionPool,
         kv: &PagedKv,
         gv: &View<'_>,
-        shape: TileShape,
+        shape: TileShape<'_>,
         (k_data, k_scales): (View<'_>, Option<View<'_>>),
         (v_data, v_scales): (View<'_>, Option<View<'_>>),
     ) -> Result<Tensor> {
         let gate = shape.gate;
-        let (tiles, count) = kv
+        let (tiles, rows) = kv
             .tiles
             .as_ref()
             .ok_or_else(|| invalid("page addressing has no query tiles"))?;
+        let count = rows.len() / 2;
+        if let Some(keys) = shape.sparse
+            && (!keys.tiled()
+                || shape.window != 0
+                || keys.keys().dims() != [count, keys.width()]
+                || keys.lengths().dims() != [count])
+        {
+            return Err(invalid(
+                "tiled sparse keys need one list per query tile and no window",
+            ));
+        }
         let (heads, dim) = (gate.count, pool.head_dim);
         let params = TiledParams {
-            tiles: to_u32(*count, "tiles")?,
+            tiles: to_u32(count, "tiles")?,
             heads: to_u32(heads, "heads")?,
             kv_heads: to_u32(pool.kv_heads, "kv heads")?,
             page: to_u32(kv.page, "page")?,
@@ -2020,8 +2194,22 @@ impl Kernels {
             window: shape.window,
             ungated: u32::from(shape.ungated),
             sinks: u32::from(shape.sinks),
+            sparse: u32::from(shape.sparse.is_some()),
+            sparse_width: to_u32(shape.sparse.map_or(0, SparseKeys::width), "sparse width")?,
         };
-        let pipeline = self.pipeline(&Self::kv_kernel("attention_tiled", dim, pool.format)?)?;
+        // 128- and 256-dimension heads use the occupancy-sized tiles; 64-dimension heads
+        // measured level with the per-row tiles and 512-dimension ones faster with them.
+        let split = matches!(dim, 128 | 256);
+        let name = Self::kv_kernel(
+            if split {
+                "attention_split"
+            } else {
+                "attention_tiled"
+            },
+            dim,
+            pool.format,
+        )?;
+        let pipeline = self.pipeline(&name)?;
         if pipeline.threads(TILE_THREADS) != TILE_THREADS {
             return Err(invalid(
                 "tiled attention pipeline cannot run a full query tile",
@@ -2032,6 +2220,11 @@ impl Kernels {
         let first = self.runtime.view(&kv.first_block, DType::U32)?;
         let visible = self.runtime.view(&kv.visible, DType::U32)?;
         let out = self.output(kv.tokens * heads, dim)?;
+        // Dense tiles bind the queries in place of the unread key lists.
+        let lists = shape
+            .sparse
+            .map(|keys| Ok::<_, TurError>((self.view(keys.keys())?, self.view(keys.lengths())?)))
+            .transpose()?;
         let groups = count
             .checked_mul(heads)
             .ok_or_else(|| invalid("tile count overflow"))?;
@@ -2049,7 +2242,13 @@ impl Kernels {
                 e.set_bytes(9, &params);
                 k_scales.as_ref().unwrap_or(&k_data).bind(e, 10)?;
                 v_scales.as_ref().unwrap_or(&v_data).bind(e, 11)?;
-                e.set_threadgroup_memory_length(0, Self::tiled_memory_bytes());
+                let (keys, lengths) = lists.as_ref().map_or((qv, qv), |(k, l)| (k, l));
+                keys.bind(e, 12)?;
+                lengths.bind(e, 13)?;
+                // The split tiles declare their threadgroup memory statically.
+                if !split {
+                    e.set_threadgroup_memory_length(0, Self::tiled_memory_bytes());
+                }
                 Ok(())
             })?;
         self.finish(out, (kv.tokens, heads * dim))

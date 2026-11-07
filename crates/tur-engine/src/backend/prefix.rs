@@ -637,6 +637,7 @@ mod tests {
                 pages: 16,
                 window_pages: 16,
                 recurrent_slots: 8,
+                index_blocks: 0,
             },
         )
     }

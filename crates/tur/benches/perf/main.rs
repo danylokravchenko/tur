@@ -13,6 +13,7 @@ mod kernels;
 mod kv_quality;
 mod load_weights;
 mod model;
+mod needle;
 mod prefix;
 mod serving;
 mod tensorops;
@@ -21,7 +22,7 @@ mod whisper;
 
 use tur_core::{Result, TurError};
 
-const CASES: &str = "drafter | experts <dir> <cache MiB> <text> [reference dir] | kernels | model | serving | prefix | kv_quality | tensorops | vision | whisper | load_weights <dir> <variant>";
+const CASES: &str = "drafter | experts <dir> <cache MiB> <text> [reference dir] | kernels | model | needle | serving | prefix | kv_quality | tensorops | vision | whisper | load_weights <dir> <variant>";
 
 fn main() -> Result<()> {
     // `cargo bench` passes `--bench`; every other argument belongs to the case.
@@ -38,6 +39,7 @@ fn main() -> Result<()> {
         "experts" => experts::run(rest),
         "kernels" => kernels::run(),
         "model" => model::run(),
+        "needle" => needle::run(),
         "serving" => serving::run(),
         "prefix" => prefix::run(),
         "kv_quality" => kv_quality::run(),

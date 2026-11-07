@@ -3,21 +3,26 @@
 //! enqueues `reps` operations and then synchronizes.
 //!
 //! `cargo bench --offline -p tur --bench perf -- kernels > out.json`
-//! `TUR_BENCH_ONLY=delta|replay|linear|paged|tiled|sample|moe|blocks` restricts the run to one group;
+//! `TUR_BENCH_ONLY=delta|replay|linear|paged|tiled|sample|moe|blocks|lsa` restricts the run to one group;
 //! `TUR_BENCH_MOE=q8_0,q4k,f32` selects expert weight formats.
 //! `TUR_BENCH_LINEAR=q8_0,q4k,q6k,q5k,q3k,q2k` selects projection formats (default `q8_0,q4k`);
 //! Q5K and Q6K have no Tur kernels and measure Candle's only.
 //! `TUR_BENCH_SHAPE=<substring>` selects tiled attention shapes for focused tuning.
+//! `TUR_BENCH_KV=f16` narrows the tiled cases to those K/V formats and `TUR_BENCH_PER_QUERY=0`
+//! skips their per-query comparison, so a profiler sees one kernel.
 
 use candle_core::{D, DType, Device, Tensor, quantized::GgmlDType};
 use serde_json::{Value, json};
 use std::time::Instant;
-use tur_core::{Result, execution::KvFormat};
+use tur_core::{Result, TurError, execution::KvFormat};
 use tur_metal::{
     blocks::BlockFormat,
-    kernels::{DeltaShape, Heads, Kernels, PagedKv, RecurrentSpan, Tuning},
+    kernels::{
+        ClusterJob, DeltaShape, Heads, IndexMap, Kernels, PagedKv, RecurrentSpan, SparseBudget,
+        Tuning,
+    },
     packed::{PackedLinear, StoredPart},
-    pool::{AttentionPool, KvPool},
+    pool::{AttentionPool, INDEX_BLOCK_TOKENS, INDEX_DIM, IndexPool, KvPool},
     quantize::quantize,
     sampling::{self, PenaltyEntry, PenaltyParams, SampleParams},
 };
@@ -526,6 +531,18 @@ fn paged_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
 
 /// Tiled matrix-unit kernel against the per-query kernel (with its split-K choice), to
 /// place the dispatch crossover: (label, past keys, new tokens per sequence, sequences).
+/// K/V formats of the tiled cases: `TUR_BENCH_KV=f16,q8` narrows them, for profiling one.
+fn tiled_formats() -> Result<Vec<KvFormat>> {
+    std::env::var("TUR_BENCH_KV").map_or_else(
+        |_| Ok(vec![KvFormat::F32, KvFormat::F16, KvFormat::Q8]),
+        |list| {
+            list.split(',')
+                .map(|f| f.parse().map_err(TurError::Other))
+                .collect()
+        },
+    )
+}
+
 fn tiled_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     let tiled = kernels.clone().with_tuning(Tuning {
         attention_tiled_groups: 0,
@@ -546,6 +563,7 @@ fn tiled_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
         ("chunk 16 after 2048", 2048, 16, 1),
         ("chunk 64 after 2048", 2048, 64, 1),
         ("chunk 256 after 8192", 8192, 256, 1),
+        ("chunk 2048 after 32768", 32_768, 2048, 1),
         ("chunk 32 x4 after 1024", 1024, 32, 4),
         ("decode ctx 2048 x8", 2047, 1, 8),
     ];
@@ -561,7 +579,7 @@ fn tiled_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
         let tokens = new * sequences;
         let q = random(device, &[tokens, HEADS, HEAD_DIM], 5, 1.0)?;
         let gate = random(device, &[tokens, HEADS * 2 * HEAD_DIM], 6, 1.0)?;
-        for format in [KvFormat::F32, KvFormat::F16, KvFormat::Q8] {
+        for format in tiled_formats()? {
             let paged = paged(
                 device, kernels, format, 16, KV_HEADS, HEAD_DIM, past, new, sequences,
             )?;
@@ -570,7 +588,12 @@ fn tiled_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
                     k.attention(&q, &paged.pool, &paged.kv, &gate, gate_heads())
                 })
             };
-            let (t, s) = (run(&tiled)?, run(&simd)?);
+            let t = run(&tiled)?;
+            let s = if std::env::var("TUR_BENCH_PER_QUERY").is_ok_and(|v| v == "0") {
+                json!({"median_seconds": 0.0})
+            } else {
+                run(&simd)?
+            };
             eprintln!(
                 "{label:23} {format:5}: tiled {:8.3} ms  per-query {:8.3} ms  x{:.2}",
                 t["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
@@ -586,6 +609,69 @@ fn tiled_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
                 } else {
                     "per_query"
                 },
+                "tiled": t, "per_query": s, "speedup": speedup(&t, &s),
+            }));
+        }
+    }
+    Ok(cases)
+}
+
+/// The tiled-against-per-query crossover at Gemma 4 E2B's full layers: 8 ungated query heads
+/// over one K/V head of 512 dimensions, unscaled scores, no window. `TUR_BENCH_HEAD_DIM`
+/// replaces the head size.
+fn tiled_global_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+    let dim = std::env::var("TUR_BENCH_HEAD_DIM")
+        .map_or(Ok(512), |v| v.parse::<usize>())
+        .map_err(|_| TurError::Other("TUR_BENCH_HEAD_DIM".into()))?;
+    let (heads, kv_heads) = (8usize, 1usize);
+    let tiled = kernels.clone().with_tuning(Tuning {
+        attention_tiled_ungated_groups: 0,
+        ..kernels.tuning()
+    })?;
+    let simd = kernels.clone().with_tuning(Tuning {
+        attention_tiled_ungated_groups: usize::MAX,
+        ..kernels.tuning()
+    })?;
+    let shapes = [
+        ("global prefill 64", 0usize, 64usize),
+        ("global prefill 256", 0, 256),
+        ("global prefill 2048", 0, 2048),
+        ("global chunk 256 after 8192", 8192, 256),
+        ("global chunk 2048 after 32768", 32_768, 2048),
+    ];
+    let mut cases = Vec::new();
+    let shape_filter = std::env::var("TUR_BENCH_SHAPE").ok();
+    for (label, past, new) in shapes {
+        if shape_filter
+            .as_ref()
+            .is_some_and(|filter| !label.contains(filter))
+        {
+            continue;
+        }
+        let q = random(device, &[new, heads, dim], 5, 1.0)?;
+        for format in tiled_formats()? {
+            let paged = paged(device, kernels, format, 16, kv_heads, dim, past, new, 1)?;
+            let run = |k: &Kernels| {
+                time(device, || {
+                    k.attention_ungated(&q, &paged.pool, &paged.kv, None, 1.0)
+                })
+            };
+            let t = run(&tiled)?;
+            let s = if std::env::var("TUR_BENCH_PER_QUERY").is_ok_and(|v| v == "0") {
+                json!({"median_seconds": 0.0})
+            } else {
+                run(&simd)?
+            };
+            eprintln!(
+                "{label:30} {format:5}: tiled {:8.3} ms  per-query {:8.3} ms  x{:.2}",
+                t["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
+                s["median_seconds"].as_f64().unwrap_or(0.0) * 1e3,
+                speedup(&t, &s),
+            );
+            cases.push(json!({
+                "operation": "attention_tiled_global", "shape": label,
+                "kv_format": format.to_string(), "heads": heads, "kv_heads": kv_heads,
+                "head_dim": dim, "context": past + new, "tiles": paged.kv.tiles(),
                 "tiled": t, "per_query": s, "speedup": speedup(&t, &s),
             }));
         }
@@ -1008,6 +1094,93 @@ fn sample_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
     Ok(cases)
 }
 
+/// Latent sparse attention at Qwen3.5-0.8B attention shapes over F16 pools, per layer: dense
+/// decode attention at each context; choosing the keys (scoring and selection) under the
+/// paper's budget; attention over the chosen keys; and clustering one block, which decode
+/// pays once every 512 tokens.
+fn lsa_cases(device: &Device, kernels: &Kernels) -> Result<Vec<Value>> {
+    let (heads, kv_heads, dim, page, rotary) = (HEADS, KV_HEADS, HEAD_DIM, 16usize, 64usize);
+    let budget = SparseBudget::PAPER;
+    let map = IndexMap::new(
+        random(device, &[kv_heads * (dim - rotary), INDEX_DIM], 7, 1.0)?,
+        kv_heads,
+        dim,
+        rotary,
+    )?;
+    let mut cases = Vec::new();
+    for (context, sequences) in [
+        (32_768usize, 1usize),
+        (65_536, 1),
+        (131_072, 1),
+        (32_768, 4),
+        (65_536, 4),
+    ] {
+        let paged = paged(
+            device,
+            kernels,
+            KvFormat::F16,
+            page,
+            kv_heads,
+            dim,
+            context - 1,
+            1,
+            sequences,
+        )?;
+        let pages = context.div_ceil(page);
+        let closed = (context - 1) / INDEX_BLOCK_TOKENS;
+        let index = IndexPool::new(device, closed * sequences)?;
+        let jobs: Vec<ClusterJob> = (0..sequences * closed)
+            .map(|i| ClusterJob {
+                first_block: ((i / closed) * pages) as u32,
+                block: (i % closed) as u32,
+                slot: i as u32,
+            })
+            .collect();
+        kernels.lsa_cluster(&paged.pool, &paged.kv, &map, &index, &jobs)?;
+        device.synchronize()?;
+        let table: Vec<u32> = (0..(sequences * closed) as u32).collect();
+        let first: Vec<u32> = (0..sequences).map(|s| (s * closed) as u32).collect();
+        let visible = vec![context as u32; sequences];
+        let index_table = kernels.index_table(&table, &first, &visible, index.blocks())?;
+        let q = random(device, &[sequences, heads, dim], 5, 1.0)?;
+        let gate = random(device, &[sequences, heads * 2 * dim], 6, 1.0)?;
+        let dense = time(device, || {
+            kernels.attention(&q, &paged.pool, &paged.kv, &gate, gate_heads())
+        })?;
+        let select = time(device, || {
+            Ok(kernels
+                .lsa_select(&q, &map, &index, &index_table, budget)?
+                .keys()
+                .clone())
+        })?;
+        let keys = kernels.lsa_select(&q, &map, &index, &index_table, budget)?;
+        let sparse = time(device, || {
+            kernels.attention_sparse(&q, &paged.pool, &paged.kv, &gate, gate_heads(), &keys)
+        })?;
+        let one = [jobs[0]];
+        let cluster = time(device, || {
+            kernels.lsa_cluster(&paged.pool, &paged.kv, &map, &index, &one)?;
+            Ok(index.centroids().clone())
+        })?;
+        let all = time(device, || {
+            kernels.lsa_cluster(&paged.pool, &paged.kv, &map, &index, &jobs)?;
+            Ok(index.centroids().clone())
+        })?;
+        let seconds = |v: &Value| v["median_seconds"].as_f64().unwrap_or(f64::NAN);
+        let total =
+            seconds(&select) + seconds(&sparse) + seconds(&cluster) / INDEX_BLOCK_TOKENS as f64;
+        cases.push(json!({
+            "operation": "lsa_decode", "context": context, "sequences": sequences,
+            "heads": heads, "kv_heads": kv_heads, "head_dim": dim, "kv_format": "f16",
+            "budget": format!("{budget:?}"), "dense_attention": dense, "select": select,
+            "sparse_attention": sparse, "cluster_one_block": cluster,
+            "cluster_every_block": all, "blocks": jobs.len(),
+            "sparse_total_seconds": total, "speedup": seconds(&dense) / total,
+        }));
+    }
+    Ok(cases)
+}
+
 /// `TUR_BENCH_ONLY=delta|linear|paged|tiled` restricts the run to one group (normalization runs
 /// with delta, the F32 attention baseline with paged).
 fn skip(group: &str) -> bool {
@@ -1127,9 +1300,11 @@ pub(crate) fn run() -> Result<()> {
             "paged_attention": if skip("paged") { json!([]) } else { json!(paged_cases(&device, &kernels)?) },
             "tiled_attention": if skip("tiled") { json!([]) } else { json!(tiled_cases(&device, &kernels)?) },
             "tiled_window_attention": if skip("tiled") { json!([]) } else { json!(tiled_window_cases(&device, &kernels)?) },
+            "tiled_global_attention": if skip("tiled") { json!([]) } else { json!(tiled_global_cases(&device, &kernels)?) },
             "packed_linear": if skip("linear") { json!([]) } else { json!(gemv_cases(&device, &kernels)?) },
             "sampling": if skip("sample") { json!([]) } else { json!(sample_cases(&device, &kernels)?) },
             "moe": if skip("moe") { json!([]) } else { json!(moe_cases(&device, &kernels)?) },
+            "lsa": if skip("lsa") { json!([]) } else { json!(lsa_cases(&device, &kernels)?) },
         },
     });
     let text = serde_json::to_string_pretty(&document)?;

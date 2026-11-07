@@ -53,6 +53,7 @@ fn pool(model: &Gemma4) -> Result<StatePool> {
             pages: 256,
             window_pages: 256,
             recurrent_slots: 1,
+            index_blocks: 0,
         },
     )
 }
@@ -346,6 +347,7 @@ fn test_gemma4_batched_assistant_chains_keep_their_rows() -> Result<()> {
             pages: 64,
             window_pages: 64,
             recurrent_slots: 2,
+            index_blocks: 0,
         },
     )?;
     engine.enable_draft_head();
@@ -608,6 +610,7 @@ fn test_gemma4_e2b_checkpoint_logits_match_transformers() -> Result<()> {
             pages: 64,
             window_pages: 64,
             recurrent_slots: 1,
+            index_blocks: 0,
         },
         &tokens,
         &stops,
@@ -974,5 +977,103 @@ fn test_gemma4_e2b_assistant_drafts_agree_with_transformers_past_the_window() ->
         state.window_count() < state.page_count(),
         "a prompt past the window releases sliding pages"
     );
+    Ok(())
+}
+
+/// Sparse reads under a budget that holds every key reproduce dense attention on Gemma 4:
+/// full layer 1 owns its K/V and clusters it, full layer 3 shares it and selects through
+/// layer 1's map, and heads rotate 64 of their 256 pairs. Prefill chunks read by tile, a
+/// pass keeping only its last row selects for that row's tile in the sharing layer, and
+/// decoding and verification read per query.
+#[test]
+#[cfg(feature = "metal")]
+fn test_gemma4_sparse_attention_with_a_budget_over_every_key_matches_dense() -> Result<()> {
+    let device = Device::new_metal(0)?;
+    let load = || {
+        Gemma4::load(
+            &fixture("dense"),
+            &options(
+                device.clone(),
+                Execution::Fused,
+                WeightFormat::F32,
+                KvFormat::F32,
+            ),
+        )
+    };
+    let dense = load()?;
+    let mut sparse = load()?;
+    let map = common::Checkpoint(
+        std::env::temp_dir().join(format!("tur-gemma4-map-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir_all(&map.0)?;
+    let file = map.0.join("index-map.safetensors");
+    let layer =
+        candle_core::Tensor::from_vec(common::values(384 * 64, 7, 1.0), (384, 64), &Device::Cpu)?;
+    candle_core::safetensors::save(
+        &[("layer.1".to_string(), layer)].into_iter().collect(),
+        &file,
+    )?;
+    sparse.sparse_attention(&tur_models::models::SparseAttention {
+        top_k: 8192,
+        crossover: 600,
+        prefill: true,
+        ..tur_models::models::SparseAttention::new(file)
+    })?;
+    assert!(sparse.indexed() && !dense.indexed());
+    let config = |index_blocks| PoolConfig {
+        pages: 640,
+        window_pages: 640,
+        recurrent_slots: 1,
+        index_blocks,
+    };
+    let pools = [
+        StatePool::new(Arc::new(dense.description()), &device, config(0))?,
+        StatePool::new(Arc::new(sparse.description()), &device, config(16))?,
+    ];
+    let prompt: Vec<u32> = (0..1100).map(|i| (i * 37 % 47 + 2) as u32).collect();
+    let (dense_logits, dense_state) =
+        common::prefill(&dense, ModelState::new(&pools[0]), &prompt, 256)?;
+    let (sparse_logits, sparse_state) =
+        common::prefill(&sparse, ModelState::new(&pools[1]), &prompt, 256)?;
+    assert_eq!(sparse_state.index_count(), 2);
+    let error = max_relative(&sparse_logits, &dense_logits);
+    assert!(error < 2e-5, "prefill: {error}");
+    let chunk: Vec<u32> = (0..40).map(|i| (i * 11 % 43 + 2) as u32).collect();
+    for (tokens, logits) in [
+        (&chunk[..], &[39][..]),
+        (&[5][..], &[0][..]),
+        (&[6, 7, 8, 9][..], &[0, 1, 2, 3][..]),
+    ] {
+        let mut out = Vec::new();
+        for (model, state) in [(&dense, &dense_state), (&sparse, &sparse_state)] {
+            let (mut steps, _held) =
+                common::forward_rows(model, &[(state, tokens, Boundaries::Final, logits, false)])?;
+            out.push(rows(
+                &steps.pop().ok_or_else(|| invalid("missing step"))??.logits,
+            )?);
+        }
+        let error = max_relative(&out[1], &out[0]);
+        assert!(error < 2e-5, "{} tokens: {error}", tokens.len());
+    }
+    // A budget of one bucket's keys moves the decode two orders of magnitude past those
+    // errors, so the sparse path is the one read. The fixture's far keys weigh little.
+    sparse.sparse_attention(&tur_models::models::SparseAttention {
+        top_k: 4,
+        top_p: 1,
+        crossover: 600,
+        ..tur_models::models::SparseAttention::new(map.0.join("index-map.safetensors"))
+    })?;
+    let mut out = Vec::new();
+    for (model, state) in [(&dense, &dense_state), (&sparse, &sparse_state)] {
+        let (mut steps, _held) = common::forward_rows(
+            model,
+            &[(state, &[5][..], Boundaries::Final, &[0][..], false)],
+        )?;
+        out.push(rows(
+            &steps.pop().ok_or_else(|| invalid("missing step"))??.logits,
+        )?);
+    }
+    let error = max_relative(&out[1], &out[0]);
+    assert!(error > 2e-4, "a small budget read every key: {error}");
     Ok(())
 }

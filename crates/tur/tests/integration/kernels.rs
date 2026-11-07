@@ -24,7 +24,7 @@ use tur_metal::{
 /// this file run one at a time.
 static GPU: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-fn setup() -> Result<(Device, Kernels, parking_lot::MutexGuard<'static, ()>)> {
+pub(crate) fn setup() -> Result<(Device, Kernels, parking_lot::MutexGuard<'static, ()>)> {
     let guard = GPU.lock();
     let device = Device::new_metal(0)?;
     let kernels = Kernels::new(&device)?;
@@ -48,12 +48,12 @@ fn upload(device: &Device, data: &[f32], shape: &[usize]) -> Result<Tensor> {
     Ok(Tensor::from_slice(data, shape, device)?)
 }
 
-fn read(tensor: &Tensor) -> Result<Vec<f32>> {
+pub(crate) fn read(tensor: &Tensor) -> Result<Vec<f32>> {
     Ok(tensor.flatten_all()?.to_vec1::<f32>()?)
 }
 
 /// Max absolute error relative to the reference's largest magnitude.
-fn relative_error(actual: &[f32], expected: &[f64]) -> f64 {
+pub(crate) fn relative_error(actual: &[f32], expected: &[f64]) -> f64 {
     assert_eq!(actual.len(), expected.len(), "length");
     assert!(actual.iter().all(|v| v.is_finite()), "non-finite output");
     let scale = expected
@@ -72,7 +72,7 @@ fn silu(x: f64) -> f64 {
     x / (1.0 + (-x).exp())
 }
 
-fn sigmoid(x: f64) -> f64 {
+pub(crate) fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
 
@@ -824,7 +824,7 @@ fn paged_pool(case: &AttentionCase, seed: u64) -> Pool {
 /// Store F32 pool rows in `format`. Quantized pools keep NaN poison in the scales of
 /// unused slots (codes cannot hold NaN); returns the device pool and its exact dequantized
 /// host values, which are what a correct kernel reads.
-fn stored(
+pub(crate) fn stored(
     device: &Device,
     rows: &[f32],
     slots: usize,
@@ -1137,7 +1137,7 @@ fn test_tiled_attention_matches_reference_for_every_format_and_tile_shape() -> R
         attention_tiled_groups: 0,
         ..kernels.tuning()
     })?;
-    for dim in [64usize, 128, 256] {
+    for dim in [64usize, 128, 256, 512] {
         // Partial and whole query tiles, key counts off the 32-key blocks, a single-token
         // sequence and a long prefill continuing 37 committed keys.
         let case = AttentionCase {
@@ -1197,7 +1197,7 @@ fn test_tiled_ungated_windowed_attention_matches_scalar_reference() -> Result<()
         attention_tiled_ungated_groups: 0,
         ..kernels.tuning()
     })?;
-    for dim in [64, 128, 256] {
+    for dim in [64, 128, 256, 512] {
         // Tiles crossing pages and key blocks, a long prefill continuing committed keys,
         // and windows shorter than, across and longer than one 32-key block.
         let case = AttentionCase {
@@ -1266,10 +1266,10 @@ fn test_tiled_attention_dispatch_preserves_decode_parallelism() -> Result<()> {
     assert!(!kernels.attention_tiled(&short, 8, 256));
     assert!(kernels.attention_tiled(&crossover, 8, 256));
     let prefill = kernels.paged_kv(16, 256, &table, &[0; 256], &visible)?;
-    for dim in [64, 128, 256] {
+    for dim in [64, 128, 256, 512] {
         assert!(kernels.attention_tiled(&prefill, 32, dim));
     }
-    for dim in [0, 32, 192, 512] {
+    for dim in [0, 32, 192] {
         assert!(!kernels.attention_tiled(&prefill, 32, dim));
     }
     let per_query = kernels.clone().with_tuning(Tuning {

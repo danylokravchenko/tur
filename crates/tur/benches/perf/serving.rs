@@ -21,7 +21,12 @@
 //! per three 64-token ones, on four running slots (`TUR_BENCH_SHORTEST_FIRST=1` orders prefill
 //! by remaining prompt length), and
 //! `TUR_BENCH_WORKLOADS=grammar` grammar-constrained requests, and
-//! `TUR_BENCH_WORKLOADS=logprobs` the cost of reporting log probabilities.
+//! `TUR_BENCH_WORKLOADS=logprobs` the cost of reporting log probabilities, and
+//! `TUR_BENCH_WORKLOADS=long TUR_BENCH_LONG=32768,65536` bursts of requests with prompts of
+//! that many tokens, from a cold prefix cache (`TUR_BENCH_MTP=0,1` adds four MTP drafts).
+//! `TUR_BENCH_SPARSE_MAP=<index map>` reads
+//! attention sparsely through that map (`TUR_BENCH_SPARSE_CROSSOVER=<keys>` replaces the
+//! default crossover, `TUR_BENCH_SPARSE_PREFILL=0` keeps prefill dense).
 //! `TUR_BENCH_WORKLOADS=speculation TUR_BENCH_DRAFT=0,4` compares adaptive prompt lookup
 //! (`TUR_BENCH_MTP=1` adds the native MTP head to drafted configurations, `0,1` runs both)
 //! with ordinary decoding, including acceptance counters, memory and exact token IDs, on
@@ -1240,6 +1245,80 @@ fn speculation_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
     Ok(runs)
 }
 
+/// Bursts of `concurrency` requests whose prompts hold `TUR_BENCH_LONG` tokens each, on a
+/// pipeline sized for that context with prefix reuse off, so every request prefills cold.
+/// `TUR_BENCH_LONG_TEXT=<file>` takes each prompt from that text and asks for a summary, so
+/// the output is prose; `TUR_BENCH_MTP=0,1` runs each burst without and with four lookup
+/// drafts plus the native MTP head.
+fn long_runs(bench: &Bench<'_>) -> Result<Vec<Value>> {
+    let text = std::env::var_os("TUR_BENCH_LONG_TEXT")
+        .map(std::fs::read_to_string)
+        .transpose()?;
+    let mut runs = Vec::new();
+    for context in env_sizes("TUR_BENCH_LONG", "32768,65536")? {
+        for &count in &bench.concurrency {
+            for mtp in env_sizes("TUR_BENCH_MTP", "0")? {
+                let mut config = PipelineConfig::new(count, CHUNK);
+                config.prefix = PrefixConfig::DISABLED;
+                config.device_sampling = bench.device_sampling;
+                // Indexed pools hold whole 512-token index blocks of pages, so an unaligned
+                // context would leave the pool a few pages short of it.
+                config.context_tokens = Some((context + bench.output + 256).next_multiple_of(512));
+                if mtp == 1 {
+                    config.speculation = SpeculationConfig::with_mtp(4);
+                }
+                let mut pipeline = InferencePipeline::new(bench.factory, config)?;
+                let prompts = (0..count)
+                    .map(|i| {
+                        text.as_ref().map_or_else(
+                            || prompt(bench.tokenizer, context, 20_000 + context + i),
+                            |text| excerpt(bench.tokenizer, text, context, i),
+                        )
+                    })
+                    .collect::<Result<_>>()?;
+                let case = Burst {
+                    prompts,
+                    output: bench.output,
+                };
+                let result = burst(&mut pipeline, &case, bench.options)?;
+                let label = if mtp == 1 { "+mtp" } else { "" };
+                report(&format!("long {context} c={count}{label}"), &result);
+                runs.push(
+                    json!({"workload": "long", "prompt": context, "concurrency": count,
+                    "sparse": bench.factory.sparse.is_some(), "mtp": mtp == 1,
+                    "speculation_totals": format!("{:?}", pipeline.speculation_stats()),
+                    "result": result}),
+                );
+            }
+        }
+    }
+    Ok(runs)
+}
+
+/// About `tokens` tokens of `text`, starting at a different paragraph for each request,
+/// followed by a request to summarize them.
+fn excerpt(tokenizer: &Tokenizer, text: &str, tokens: usize, request: usize) -> Result<String> {
+    let ids = tokenizer
+        .encode(text, false)
+        .map_err(|e| TurError::Tokenizer(e.to_string()))?
+        .get_ids()
+        .to_vec();
+    let start = (request * 997) % ids.len().max(1);
+    let body: Vec<u32> = ids
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(tokens)
+        .copied()
+        .collect();
+    let passage = tokenizer
+        .decode(&body, true)
+        .map_err(|e| TurError::Tokenizer(e.to_string()))?;
+    Ok(format!(
+        "{passage}\n\nSummarize the passage above in a few paragraphs."
+    ))
+}
+
 /// `TUR_BENCH_EXPERT_CACHE_MB` keeps a Qwen `MoE` artifact's experts on disk behind a cache of
 /// this many MiB; unset, every expert stays resident.
 fn expert_cache_bytes() -> Result<Option<usize>> {
@@ -1282,6 +1361,7 @@ pub(crate) fn run() -> Result<()> {
         video: false,
         expert_cache: expert_cache_bytes()?,
         gguf: None,
+        sparse: crate::model::sparse_settings()?,
     };
     let bench = Bench {
         factory: &factory,
@@ -1302,6 +1382,9 @@ pub(crate) fn run() -> Result<()> {
     }
     if workloads.contains("grammar") {
         runs.extend(grammar_runs(&bench)?);
+    }
+    if workloads.contains("long") {
+        runs.extend(long_runs(&bench)?);
     }
     if workloads.contains("logprobs") {
         runs.extend(logprob_runs(&bench)?);
@@ -1346,6 +1429,7 @@ pub(crate) fn run() -> Result<()> {
         serde_json::to_string_pretty(&json!({
             "benchmark": "serving", "checkpoint": dir, "weights": weights_label,
             "expert_cache_bytes": factory.expert_cache,
+            "sparse_attention": format!("{:?}", factory.sparse),
             "kv": format!("{:?}", DEFAULT_KV_LAYOUT), "prefill_chunk": CHUNK,
             "output_tokens": output, "workload": "closed-loop bursts submitted at once",
             "sampling": format!("{options:?}"), "device_sampling": device_sampling,

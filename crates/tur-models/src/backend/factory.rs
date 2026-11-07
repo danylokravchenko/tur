@@ -56,6 +56,8 @@ pub struct ModelFactory {
     pub video: bool,
     /// Device bytes of a bounded expert cache ([`LoadOptions::expert_cache`]).
     pub expert_cache: Option<usize>,
+    /// Read attention sparsely past a crossover through the index map it names.
+    pub sparse: Option<crate::models::SparseAttention>,
     /// Load weights from this GGUF file instead; `source` then supplies the config and a
     /// tokenizer the file's tokens must agree with. The file's chat template, when it has
     /// one, replaces the checkpoint's.
@@ -236,7 +238,10 @@ impl ModelFactory {
             config
         };
         let reservation = reserve(&config, &options)?;
-        let model = config.load(&dir, &options)?;
+        let mut model = config.load(&dir, &options)?;
+        if let Some(sparse) = &self.sparse {
+            model.sparse_attention(sparse)?;
+        }
         Ok((model, tokenizer, template, defaults, reservation))
     }
 }
@@ -531,6 +536,7 @@ mod tests {
             video: false,
             expert_cache: None,
             gguf: None,
+            sparse: None,
         };
         let error = factory
             .resolve()

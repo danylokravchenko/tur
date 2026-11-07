@@ -701,6 +701,7 @@ fn test_gemma_gguf_with_shared_keys_and_per_layer_inputs_matches_decoded_weights
                 pages: 256,
                 window_pages: 256,
                 recurrent_slots: 1,
+                index_blocks: 0,
             },
         )?;
         Ok(prefill(model, ModelState::new(&pool), &tokens, 4)?.0)

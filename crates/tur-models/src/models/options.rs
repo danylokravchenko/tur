@@ -174,3 +174,60 @@ impl DraftHead {
         self.model.is_some()
     }
 }
+
+/// Latent sparse attention: past `crossover` keys, a decoding or verifying query of a full
+/// attention layer reads up to `top_k` keys of its `top_p` best buckets, its `window` most
+/// recent keys and the first `sink` keys, chosen through the per-layer index map stored at
+/// `map` (`tur sparse-map` writes one). With `prefill`, each tile of 32 consecutive prompt
+/// queries past the crossover reads the same budget, selected for the tile, plus the run of
+/// keys to its last query; without it, prefill stays dense. Qwen3.5-family and Gemma 4 models
+/// only; Gemma's sliding window layers stay dense.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SparseAttention {
+    pub map: std::path::PathBuf,
+    pub top_k: usize,
+    pub top_p: usize,
+    pub window: usize,
+    pub sink: usize,
+    pub crossover: usize,
+    pub prefill: bool,
+}
+
+impl SparseAttention {
+    /// The paper's budget for Qwen3.8-27B (4,612 keys) over the map at `map`, reading
+    /// sparsely past 16K keys, prefill included. On the 0.8B, sparse decode is no slower
+    /// than dense from 8K, but gains only from 16K to 24K (4 to 12%), and from 16K it
+    /// answered every needle question as dense did; below 16K the budget is over a quarter
+    /// of the context. Sparse prefill ran a 2048-token chunk 1.7 to 4.3 times faster at 32K
+    /// to 64K on the 0.8B and Gemma 4 E2B, and answered the needle questions as well as
+    /// dense prefill.
+    pub fn new(map: std::path::PathBuf) -> Self {
+        Self {
+            map,
+            top_k: 4096,
+            top_p: 1024,
+            window: 512,
+            sink: 4,
+            crossover: 16_384,
+            prefill: true,
+        }
+    }
+
+    /// Keys one query reads at most.
+    pub fn width(&self) -> usize {
+        self.top_k + self.window + self.sink
+    }
+
+    /// Scratch of one attention layer's clustering and selection over a pass of `n` rows
+    /// whose sequences end at `contexts`: scores of every visible bucket, key lists, and
+    /// one cluster job per closed block. Each job holds its block's 128 pool sums of 64 F32
+    /// dims and their 128 x 128 Gram matrix.
+    pub fn workspace_bytes(&self, n: usize, contexts: &[usize]) -> Option<usize> {
+        const BLOCK: usize = 512;
+        let buckets = contexts.iter().map(|&c| c / BLOCK).max().unwrap_or(0) * 64;
+        let jobs = n / BLOCK + contexts.len();
+        n.checked_mul(self.width() + buckets + 1)?
+            .checked_mul(4)?
+            .checked_add(jobs.checked_mul(BLOCK / 4 * (64 + BLOCK / 4) * 4)?)
+    }
+}

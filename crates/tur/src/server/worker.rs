@@ -774,6 +774,7 @@ mod tests {
                 video: false,
                 expert_cache: None,
                 gguf: None,
+                sparse: None,
             },
             pipeline: PipelineConfig::new(1, 64),
             budget: DeviceBudget::new(None),

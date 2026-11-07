@@ -304,6 +304,7 @@ fn growth(description: &tur_core::execution::ModelDescription, sequences: usize)
             0
         },
         slots: 0,
+        indexes: 0,
     }
 }
 

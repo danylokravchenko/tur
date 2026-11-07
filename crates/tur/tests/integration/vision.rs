@@ -282,6 +282,7 @@ fn factory(checkpoint: &crate::common::Checkpoint, device: &Device) -> tur::Mode
         video: true,
         expert_cache: None,
         gguf: None,
+        sparse: None,
     }
 }
 
@@ -948,6 +949,7 @@ fn test_qwen_0_8b_image_answer_matches_transformers() -> Result<()> {
         video: true,
         expert_cache: None,
         gguf: None,
+        sparse: None,
     };
     let mut pipeline = InferencePipeline::new(&factory, PipelineConfig::new(1, 512))?;
     let mut request = image_request(picture, ("", "Describe this image in one sentence."), 48);
@@ -984,6 +986,7 @@ fn test_qwen_0_8b_video_answer_matches_transformers() -> Result<()> {
         video: true,
         expert_cache: None,
         gguf: None,
+        sparse: None,
     };
     let mut pipeline = InferencePipeline::new(&factory, PipelineConfig::new(1, 512))?;
     let mut request = video_request(video, 48);

@@ -10,6 +10,9 @@
 //! return to the free list only through [`StatePool::reclaim`], which the execution owner
 //! calls when no unfenced device work can reference them. Reclaiming bumps the id's
 //! generation, so an id captured before reuse no longer resolves.
+//!
+//! An indexed pool also keeps latent sparse attention index blocks: an index block id spans
+//! every full-attention layer and holds the buckets of one block of 512 committed keys.
 
 use candle_core::{DType, Device, Shape, Tensor};
 #[cfg(feature = "metal")]
@@ -24,13 +27,54 @@ use tur_core::{
     execution::{KvFormat, LayerStateKind, ModelDescription, invalid},
 };
 
+/// Keys in one index block: clustered once, when its last key is committed.
+pub const INDEX_BLOCK_TOKENS: usize = 512;
+/// Buckets of one index block.
+pub const INDEX_BUCKETS: usize = 64;
+/// Dimensions of index keys and queries.
+pub const INDEX_DIM: usize = 64;
+/// Pools of four consecutive keys that one bucket holds at most (16 keys).
+pub const BUCKET_POOLS: usize = 4;
+/// Bytes of one index block in one layer: F32 centroids and F32 pool numbers.
+const INDEX_LAYER_BYTES: usize = INDEX_BUCKETS * (INDEX_DIM + BUCKET_POOLS) * 4;
+
+/// Index blocks a sequence holding `tokens` committed tokens has closed.
+pub fn index_blocks_for(tokens: usize) -> usize {
+    tokens / INDEX_BLOCK_TOKENS
+}
+
+/// Index blocks an indexed pool of `pages` keeps for `holders` sequences and snapshots:
+/// one per 512 tokens of pages, one per holder whose last block's page diverged by
+/// copy-on-write, and one spare.
+pub fn index_capacity(description: &ModelDescription, pages: usize, holders: usize) -> usize {
+    let pages_per_block = INDEX_BLOCK_TOKENS / description.kv.page_tokens.max(1);
+    (pages / pages_per_block.max(1))
+        .saturating_add(holders)
+        .saturating_add(1)
+}
+
+/// Device bytes of one index block across `description`'s full-attention layers.
+pub fn index_block_bytes(description: &ModelDescription) -> usize {
+    full_attention_layers(description) * INDEX_LAYER_BYTES
+}
+
+fn full_attention_layers(description: &ModelDescription) -> usize {
+    description
+        .layers
+        .iter()
+        .filter(|kind| matches!(kind, LayerStateKind::Attention { .. }) && !kind.windowed())
+        .count()
+}
+
 /// Pool capacities: K/V pages of full attention layers, window pages of windowed ones
-/// (the placeholder page is extra) and usable recurrent slots (the zero slot is extra).
+/// (the placeholder page is extra), usable recurrent slots (the zero slot is extra) and
+/// latent sparse attention index blocks (none unless the pool is indexed).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PoolConfig {
     pub pages: usize,
     pub window_pages: usize,
     pub recurrent_slots: usize,
+    pub index_blocks: usize,
 }
 
 impl PoolConfig {
@@ -39,12 +83,15 @@ impl PoolConfig {
     /// reuse) and the permanent zero slot; then window pages for every sequence and
     /// retained snapshot to hold its window plus a pass of `pass_tokens`; then as many
     /// K/V pages as remain. Fails if any kind of state the model needs gets no capacity.
+    /// An `indexed` pool gives every 32 pages an index block, plus one per holder for blocks
+    /// whose last page diverged by copy-on-write.
     pub fn for_budget(
         description: &ModelDescription,
         bytes: usize,
         sequences: usize,
         retained: usize,
         pass_tokens: usize,
+        indexed: bool,
     ) -> Result<Self> {
         let recurrent_slots = if description.has_recurrent() {
             sequences
@@ -87,18 +134,43 @@ impl PoolConfig {
                  ({window_bytes} bytes)"
             ))
         })?;
-        let pages = if description.has_full_attention() {
-            remaining / description.page_bytes()?.max(1)
+        let (pages, index_blocks) = if !description.has_full_attention() {
+            (0, 0)
+        } else if indexed {
+            Self::indexed_pages(description, remaining, sequences.saturating_add(retained))?
         } else {
-            0
+            (remaining / description.page_bytes()?.max(1), 0)
         };
         let config = Self {
             pages,
             window_pages,
             recurrent_slots,
+            index_blocks,
         };
         config.validate(description)?;
         Ok(config)
+    }
+
+    /// Pages and index blocks that fit `bytes`: `holders + 1` spare blocks, then each page
+    /// carries a 32nd of a block.
+    fn indexed_pages(
+        description: &ModelDescription,
+        bytes: usize,
+        holders: usize,
+    ) -> Result<(usize, usize)> {
+        let pages_per_block = INDEX_BLOCK_TOKENS / description.kv.page_tokens.max(1);
+        let block = index_block_bytes(description);
+        let spare = holders
+            .checked_add(1)
+            .and_then(|blocks| blocks.checked_mul(block))
+            .ok_or_else(|| invalid("index block count overflow"))?;
+        let per_block_of_pages = description
+            .page_bytes()?
+            .checked_mul(pages_per_block)
+            .and_then(|b| b.checked_add(block))
+            .ok_or_else(|| invalid("index block size overflow"))?;
+        let pages = bytes.saturating_sub(spare) / per_block_of_pages.max(1) * pages_per_block;
+        Ok((pages, index_capacity(description, pages, holders)))
     }
 
     /// Device bytes of pools with this capacity, including the zero slot.
@@ -121,7 +193,11 @@ impl PoolConfig {
             .checked_mul(description.page_bytes()?)
             .zip(slots.checked_mul(description.recurrent_slot_bytes()?))
             .zip(windows.checked_mul(description.window_page_bytes()?))
-            .and_then(|((p, s), w)| p.checked_add(s)?.checked_add(w))
+            .zip(
+                self.index_blocks
+                    .checked_mul(index_block_bytes(description)),
+            )
+            .and_then(|(((p, s), w), i)| p.checked_add(s)?.checked_add(w)?.checked_add(i))
             .ok_or_else(|| invalid("pool size overflow"))
     }
 
@@ -157,6 +233,15 @@ impl PoolConfig {
             .ok_or_else(|| invalid("recurrent slot count overflow"))?;
         u32::try_from(recurrent_slots)
             .map_err(|_| invalid("recurrent pool exceeds u32 slot indices"))?;
+        u32::try_from(self.index_blocks).map_err(|_| invalid("index pool exceeds u32 ids"))?;
+        if self.index_blocks > 0
+            && (!description.has_full_attention()
+                || !INDEX_BLOCK_TOKENS.is_multiple_of(description.kv.page_tokens))
+        {
+            return Err(invalid(
+                "index blocks need full attention and pages that divide 512 tokens",
+            ));
+        }
         Ok(())
     }
 }
@@ -186,9 +271,11 @@ pub struct PoolUsage {
     pub pages: Usage,
     pub windows: Usage,
     pub slots: Usage,
+    pub indexes: Usage,
     pub page_bytes: usize,
     pub window_bytes: usize,
     pub slot_bytes: usize,
+    pub index_bytes: usize,
 }
 
 impl PoolUsage {
@@ -207,6 +294,7 @@ impl PoolUsage {
         self.pages.capacity * self.page_bytes
             + windows * self.window_bytes
             + slots * self.slot_bytes
+            + self.indexes.capacity * self.index_bytes
     }
 
     /// Bytes held by leases.
@@ -214,6 +302,7 @@ impl PoolUsage {
         self.pages.leased * self.page_bytes
             + self.windows.leased * self.window_bytes
             + self.slots.leased * self.slot_bytes
+            + self.indexes.leased * self.index_bytes
     }
 }
 
@@ -222,6 +311,7 @@ enum Space {
     Pages,
     Windows,
     Slots,
+    Indexes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,6 +449,42 @@ pub struct AttentionPool {
     pub head_dim: usize,
 }
 
+/// One full-attention layer's latent sparse attention index: for each index block, 64 unit
+/// centroids `[blocks, 64 * 64]` and each bucket's pools in ascending order
+/// `[blocks, 64 * 4]`, as F32 integers with -1 past a bucket's size. Pool `i` of a block
+/// holds that block's keys `4 i ..= 4 i + 3`.
+pub struct IndexPool {
+    centroids: Tensor,
+    members: Tensor,
+    blocks: usize,
+}
+
+impl IndexPool {
+    /// A zeroed index of `blocks` index blocks on `device`.
+    pub fn new(device: &Device, blocks: usize) -> Result<Self> {
+        if blocks == 0 {
+            return Err(invalid("an index pool needs at least one block"));
+        }
+        Ok(Self {
+            centroids: zeroed((blocks, INDEX_BUCKETS * INDEX_DIM), DType::F32, device)?,
+            members: zeroed((blocks, INDEX_BUCKETS * BUCKET_POOLS), DType::F32, device)?,
+            blocks,
+        })
+    }
+
+    pub fn blocks(&self) -> usize {
+        self.blocks
+    }
+
+    pub fn centroids(&self) -> &Tensor {
+        &self.centroids
+    }
+
+    pub fn members(&self) -> &Tensor {
+        &self.members
+    }
+}
+
 /// One recurrent layer's slots: `[slots, conv_width, conv_channels]` histories and
 /// `[slots, heads, key_dim, value_dim]` matrices.
 pub struct RecurrentPool {
@@ -367,7 +493,7 @@ pub struct RecurrentPool {
 }
 
 enum LayerPool {
-    Attention(AttentionPool),
+    Attention(AttentionPool, Option<IndexPool>),
     Recurrent(RecurrentPool),
 }
 
@@ -379,6 +505,7 @@ struct Shared {
     pages: Mutex<Allocator>,
     windows: Mutex<Allocator>,
     slots: Mutex<Allocator>,
+    indexes: Mutex<Allocator>,
 }
 
 impl Shared {
@@ -387,6 +514,7 @@ impl Shared {
             Space::Pages => &self.pages,
             Space::Windows => &self.windows,
             Space::Slots => &self.slots,
+            Space::Indexes => &self.indexes,
         }
     }
 }
@@ -481,14 +609,20 @@ impl StatePool {
                                 .transpose()?,
                         })
                     };
-                    LayerPool::Attention(AttentionPool {
-                        key: store()?,
-                        value: store()?,
-                        format: kv.format,
-                        page_tokens: kv.page_tokens,
-                        kv_heads,
-                        head_dim,
-                    })
+                    let index = (window.is_none() && config.index_blocks > 0)
+                        .then(|| IndexPool::new(device, config.index_blocks))
+                        .transpose()?;
+                    LayerPool::Attention(
+                        AttentionPool {
+                            key: store()?,
+                            value: store()?,
+                            format: kv.format,
+                            page_tokens: kv.page_tokens,
+                            kv_heads,
+                            head_dim,
+                        },
+                        index,
+                    )
                 }
                 LayerStateKind::Recurrent {
                     conv_channels,
@@ -525,6 +659,7 @@ impl StatePool {
             pages: Mutex::new(Allocator::new(config.pages, 0)),
             windows: Mutex::new(Allocator::new(window_capacity, 1)),
             slots: Mutex::new(Allocator::new(slot_capacity, 1)),
+            indexes: Mutex::new(Allocator::new(config.index_blocks, 0)),
         })))
     }
 
@@ -545,10 +680,18 @@ impl StatePool {
 
     /// Current occupancy and unit sizes.
     pub fn usage(&self) -> Result<PoolUsage> {
+        // Before the literal: its lock guards live until the statement ends, and taking
+        // the index allocator's lock twice would deadlock.
+        let index_bytes = if self.indexed() {
+            index_block_bytes(&self.0.description)
+        } else {
+            0
+        };
         Ok(PoolUsage {
             pages: self.0.pages.lock().usage(),
             windows: self.0.windows.lock().usage(),
             slots: self.0.slots.lock().usage(),
+            indexes: self.0.indexes.lock().usage(),
             page_bytes: self.0.description.page_bytes()?,
             window_bytes: self.0.description.window_page_bytes()?,
             slot_bytes: if self.0.description.has_recurrent() {
@@ -556,6 +699,7 @@ impl StatePool {
             } else {
                 0
             },
+            index_bytes,
         })
     }
 
@@ -565,14 +709,28 @@ impl StatePool {
         self.0.pages.lock().reclaim()
             + self.0.windows.lock().reclaim()
             + self.0.slots.lock().reclaim()
+            + self.0.indexes.lock().reclaim()
     }
 
     /// Storage of attention layer `layer`.
     pub fn attention(&self, layer: usize) -> Result<&AttentionPool> {
         match self.0.layers.get(layer) {
-            Some(LayerPool::Attention(pool)) => Ok(pool),
+            Some(LayerPool::Attention(pool, _)) => Ok(pool),
             _ => Err(invalid(format!("layer {layer} has no attention pool"))),
         }
+    }
+
+    /// Latent sparse attention index of full-attention layer `layer`, in an indexed pool.
+    pub fn index(&self, layer: usize) -> Result<&IndexPool> {
+        match self.0.layers.get(layer) {
+            Some(LayerPool::Attention(_, Some(index))) => Ok(index),
+            _ => Err(invalid(format!("layer {layer} has no index pool"))),
+        }
+    }
+
+    /// Whether the pool keeps index blocks for latent sparse attention.
+    pub fn indexed(&self) -> bool {
+        self.0.indexes.lock().usage().capacity > 0
     }
 
     /// Storage of recurrent layer `layer`.
@@ -593,6 +751,7 @@ impl StatePool {
                 Space::Pages => "K/V page pool exhausted".into(),
                 Space::Windows => "K/V window pool exhausted".into(),
                 Space::Slots => "recurrent state pool exhausted".into(),
+                Space::Indexes => "sparse attention index pool exhausted".into(),
             })
         })?;
         Ok(Arc::new(Lease {
@@ -612,6 +771,15 @@ impl StatePool {
 
     pub(crate) fn lease_slot(&self) -> Result<Arc<Lease>> {
         self.lease(Space::Slots)
+    }
+
+    pub(crate) fn lease_index(&self) -> Result<Arc<Lease>> {
+        self.lease(Space::Indexes)
+    }
+
+    /// Resolve index block ids, failing if any was released and reclaimed.
+    pub(crate) fn resolve_indexes(&self, ids: &[Id]) -> Result<Vec<u32>> {
+        resolve(&self.0.indexes, ids)
     }
 
     /// Resolve window page ids; a released page (`None`) resolves to the placeholder 0.
@@ -879,18 +1047,19 @@ mod tests {
         // Two sequences and one snapshot, each holding a 3-key window plus a 4-token pass:
         // pages_for(7) + 1 = 5 window pages apiece.
         let fixed = 6 * slot + 16 * window;
-        let config = PoolConfig::for_budget(&model, fixed + 4 * page + 1, 2, 1, 4)?;
+        let config = PoolConfig::for_budget(&model, fixed + 4 * page + 1, 2, 1, 4, false)?;
         assert_eq!(
             config,
             PoolConfig {
                 pages: 4,
                 window_pages: 15,
-                recurrent_slots: 5
+                recurrent_slots: 5,
+                index_blocks: 0,
             }
         );
         // The placeholder window page is allocated beside them.
         assert_eq!(config.bytes(&model)?, 4 * page + 16 * window + 6 * slot);
-        assert!(PoolConfig::for_budget(&model, fixed - 1, 2, 1, 4).is_err());
+        assert!(PoolConfig::for_budget(&model, fixed - 1, 2, 1, 4, false).is_err());
         let pool = StatePool::new(Arc::new(model), &Device::Cpu, config)?;
         assert_eq!(pool.attention(2)?.key.data.dim(0)?, 16 * 2);
         assert_eq!(pool.usage()?.windows.capacity, 15);
@@ -910,20 +1079,21 @@ mod tests {
         let page = model.page_bytes()?;
         let slot = model.recurrent_slot_bytes()?;
         let budget = 3 * page + 5 * slot + 7;
-        let config = PoolConfig::for_budget(&model, budget, 2, 0, 0)?;
+        let config = PoolConfig::for_budget(&model, budget, 2, 0, 0, false)?;
         assert_eq!(
             config,
             PoolConfig {
                 pages: 3,
                 window_pages: 0,
-                recurrent_slots: 4
+                recurrent_slots: 4,
+                index_blocks: 0,
             }
         );
         assert_eq!(config.bytes(&model)?, 3 * page + 5 * slot);
         assert!(config.bytes(&model)? <= budget);
-        assert!(PoolConfig::for_budget(&model, 4 * slot, 2, 0, 0).is_err());
+        assert!(PoolConfig::for_budget(&model, 4 * slot, 2, 0, 0, false).is_err());
         assert!(matches!(
-            PoolConfig::for_budget(&model, slot, 2, 0, 0),
+            PoolConfig::for_budget(&model, slot, 2, 0, 0, false),
             Err(TurError::MemoryAllocation(_))
         ));
         Ok(())
@@ -935,9 +1105,9 @@ mod tests {
         let page = model.page_bytes()?;
         let slot = model.recurrent_slot_bytes()?;
         let minimum = page + 3 * slot;
-        assert!(PoolConfig::for_budget(&model, minimum - 1, 1, 0, 0).is_err());
+        assert!(PoolConfig::for_budget(&model, minimum - 1, 1, 0, 0, false).is_err());
         for budget in [minimum, minimum + page - 1, minimum + page] {
-            let config = PoolConfig::for_budget(&model, budget, 1, 0, 0)?;
+            let config = PoolConfig::for_budget(&model, budget, 1, 0, 0, false)?;
             assert_eq!(config.pages, (budget - 3 * slot) / page);
             assert!(config.bytes(&model)? <= budget);
         }
@@ -945,23 +1115,24 @@ mod tests {
         recurrent
             .layers
             .retain(|kind| matches!(kind, LayerStateKind::Recurrent { .. }));
-        assert!(PoolConfig::for_budget(&recurrent, 3 * slot - 1, 1, 0, 0).is_err());
-        let config = PoolConfig::for_budget(&recurrent, 3 * slot, 1, 0, 0)?;
+        assert!(PoolConfig::for_budget(&recurrent, 3 * slot - 1, 1, 0, 0, false).is_err());
+        let config = PoolConfig::for_budget(&recurrent, 3 * slot, 1, 0, 0, false)?;
         assert_eq!(config.bytes(&recurrent)?, 3 * slot);
 
         let mut attention = (*model).clone();
         attention
             .layers
             .retain(|kind| matches!(kind, LayerStateKind::Attention { .. }));
-        let config = PoolConfig::for_budget(&attention, page, 1, 0, 0)?;
+        let config = PoolConfig::for_budget(&attention, page, 1, 0, 0, false)?;
         assert_eq!(config.bytes(&attention)?, page);
         assert_eq!(config.recurrent_slots, 0);
-        assert!(PoolConfig::for_budget(&model, usize::MAX, usize::MAX, 0, 0).is_err());
+        assert!(PoolConfig::for_budget(&model, usize::MAX, usize::MAX, 0, 0, false).is_err());
         assert!(
             PoolConfig {
                 pages: 1,
                 window_pages: 1,
-                recurrent_slots: usize::MAX
+                recurrent_slots: usize::MAX,
+                index_blocks: 0,
             }
             .bytes(&model)
             .is_err()
@@ -978,6 +1149,7 @@ mod tests {
                 pages: 2,
                 window_pages: 2,
                 recurrent_slots: 1,
+                index_blocks: 0,
             },
         )?;
         let a = pool.lease_page()?;
@@ -1074,6 +1246,7 @@ mod tests {
                     pages: 5,
                     window_pages: 5,
                     recurrent_slots: 1,
+                    index_blocks: 0,
                 },
             )?;
             let attention = pool.attention(0)?;
@@ -1107,6 +1280,7 @@ mod tests {
             pages: 100,
             window_pages: 0,
             recurrent_slots: 3,
+            index_blocks: 0,
         };
         let planned = config.bytes(&model)?;
         let before = allocated_bytes(&device).ok_or_else(|| invalid("no device accounting"))?;

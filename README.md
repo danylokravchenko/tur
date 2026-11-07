@@ -36,6 +36,8 @@ Producing a token on a Mac is mostly a memory problem: the GPU spends more time 
 
 Prefix reuse computes a shared system prompt or an agent's growing conversation once. Speculative decoding drafts several tokens and verifies them in one pass, which pays off on repetitive output such as code edits. Neither changes the generated text.
 
+For long contexts, the experimental [sparse attention](docs/src/guide/sparse-attention.md) clusters keys as they are written, and past 16K keys each token reads only about 4,600 chosen ones, so prefill and decode stay nearly flat as the context grows. It changes outputs slightly and is off by default.
+
 The [architecture chapters](docs/src/architecture/overview.md) explain each mechanism and the measurements behind it.
 
 ## Performance
@@ -48,15 +50,16 @@ Tur against llama.cpp on an M3 Pro with 36 GB, in tokens per second. 4-bit rows 
 | Qwen3.5-0.8B, 8-bit, decode, 8 sequences | 729 | 456 | +60% |
 | Qwen3.5-0.8B, 4-bit, decode, 1 sequence | 182 | 141 | +29% |
 | Qwen3.5-0.8B, 8-bit, prefill, 2K tokens | 3,799 | 3,383 | +12% |
-| Qwen3.6-35B, 4-bit, decode, 1 sequence | 47.1 | 35.6 | +32% |
+| Qwen3.6-35B, 4-bit, decode, 1 sequence | 47.2 | 35.6 | +33% |
 
-Tur doesn't win everywhere: on a 16 GB M1, llama.cpp prefills 8K-token prompts 6 to 11% faster. Prefill is mostly compute, so Tur's savings on memory reads help less there.
+Tur doesn't win everywhere: on a 16 GB M1, prefill of 2K and 8K-token prompts is level with llama.cpp, within 1 to 4% either way. Prefill is mostly compute, so Tur's savings on memory reads help less there. After 32K to 128K of context Tur's dense prefill is 2 to 5% ahead, and with sparse attention it prefills after 64K of context 2.6 times as fast as llama.cpp.
 
 Other results for Qwen3.5-0.8B on that 16 GB M1:
 
-- Through the full server with sampling, eight concurrent requests produce 186 tokens/s in total, with 27 ms between tokens.
+- Through the full server with sampling, eight concurrent requests produce 187 tokens/s in total, with 26 ms between tokens.
 - Eight users behind a cached 1.5K-token system prompt get their first token in 0.56 s at the median, against 9.5 s without prefix reuse.
 - Prompt-lookup speculation reaches up to 2.9× normal decoding on repetitive text.
+- With sparse attention, one sequence decodes 47.5 tokens/s at 128K tokens of context instead of 21.7, prefill after 64K runs at 733 tokens/s instead of 181, and a 64K-token prompt gets its first token in 80 s instead of 194 s.
 
 [Measured performance](docs/src/guide/performance.md) has the full tables, versions and methods.
 

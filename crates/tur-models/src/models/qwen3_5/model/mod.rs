@@ -36,6 +36,8 @@ use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
 #[cfg(feature = "metal")]
 mod fused;
 mod moe;
+#[cfg(feature = "metal")]
+mod sparse;
 
 use super::vision;
 
@@ -1026,6 +1028,7 @@ impl Qwen35 {
                 pages: self.description.pages_for(tokens.len()).max(1),
                 window_pages: self.description.pages_for(tokens.len()).max(1),
                 recurrent_slots: 1,
+                index_blocks: 0,
             },
         )?;
         let mut reservation = ModelState::new(&pool).reserve(tokens.len(), Boundaries::Final)?;
@@ -1765,6 +1768,16 @@ impl HybridModel for Qwen35 {
         Ok(0)
     }
 
+    fn indexed(&self) -> bool {
+        #[cfg(feature = "metal")]
+        return self
+            .fused
+            .as_ref()
+            .is_some_and(|fused| fused.sparse.is_some());
+        #[cfg(not(feature = "metal"))]
+        false
+    }
+
     /// Fused kernels replay; the reference path keeps every token's state instead.
     fn replays(&self) -> bool {
         #[cfg(feature = "metal")]
@@ -1962,5 +1975,23 @@ impl HybridModel for Qwen35 {
             .into_iter()
             .map(|r| r.unwrap_or_else(|| Err(invalid("draft sequence was not executed"))))
             .collect())
+    }
+}
+
+impl Qwen35 {
+    /// Full attention layers an index map covers: every one, each head's position-free
+    /// dims following its rotated prefix.
+    pub(crate) fn indexed_layers(&self) -> Vec<crate::models::index_map::IndexedLayer> {
+        let d = self.dims;
+        self.layers
+            .iter()
+            .enumerate()
+            .filter(|(_, layer)| matches!(layer.mixer, Mixer::Attention(_)))
+            .map(|(index, _)| crate::models::index_map::IndexedLayer {
+                name: index,
+                pool: index,
+                runs: [(d.rotary_dim, d.head_dim - d.rotary_dim), (d.head_dim, 0)],
+            })
+            .collect()
     }
 }

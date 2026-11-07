@@ -11,6 +11,11 @@
 //! `TUR_BENCH_BATCHES=1,2,4,8,16` sets the decode batches at the short context and
 //! `TUR_BENCH_CONTEXT_BATCHES=1,4` those at each of `TUR_BENCH_CONTEXTS`; larger models
 //! such as Gemma 4 E2B use fewer of both to keep a run short.
+//! `TUR_BENCH_SPARSE_MAP=<index map>` reads attention sparsely through that map, with the
+//! default budget, over indexed pools; `TUR_BENCH_SPARSE_CROSSOVER=<keys>` replaces the
+//! default crossover and `TUR_BENCH_SPARSE_PREFILL=0` keeps prefill dense.
+//! `TUR_BENCH_ONLY=chunk`, never on by default, times one 2048-token prefill chunk after
+//! each of `TUR_BENCH_CONTEXTS`.
 
 use candle_core::Device;
 use serde_json::{Value, json};
@@ -28,7 +33,9 @@ use tur_engine::hybrid::{
     SamplingOptions, SequenceForward, StatePool,
 };
 use tur_models::models::TextModel;
-use tur_models::models::{Execution, LoadOptions, WeightFormat, Weights, parse_recurrent_state};
+use tur_models::models::{
+    Execution, LoadOptions, SparseAttention, WeightFormat, Weights, parse_recurrent_state,
+};
 use tur_models::models::{GgufFile, Manifest, is_artifact};
 
 const SHORT_CONTEXT: usize = 128;
@@ -63,12 +70,17 @@ fn median(mut samples: Vec<f64>) -> f64 {
 }
 
 /// A pool holding `contexts` sequences plus one pass of new tokens each.
-fn pool(model: &TextModel, contexts: &[usize], extra: usize) -> Result<StatePool> {
+pub(crate) fn pool(model: &TextModel, contexts: &[usize], extra: usize) -> Result<StatePool> {
     let description = model.description();
     let pages = contexts
         .iter()
         .map(|c| description.pages_for(c + extra) + 1)
         .sum();
+    let index_blocks = if model.indexed() {
+        tur_metal::pool::index_capacity(&description, pages, contexts.len())
+    } else {
+        0
+    };
     StatePool::new(
         Arc::new(description),
         model.device(),
@@ -76,6 +88,7 @@ fn pool(model: &TextModel, contexts: &[usize], extra: usize) -> Result<StatePool
             pages,
             window_pages: pages,
             recurrent_slots: 2 * contexts.len() + 2,
+            index_blocks,
         },
     )
 }
@@ -148,7 +161,7 @@ fn pass(model: &TextModel, pool: &StatePool, sequences: &[(&ModelState, &[u32])]
 }
 
 /// Committed state after prefilling `prompt` in chunks of 2048 tokens.
-fn prefilled(model: &TextModel, pool: &StatePool, prompt: &[u32]) -> Result<ModelState> {
+pub(crate) fn prefilled(model: &TextModel, pool: &StatePool, prompt: &[u32]) -> Result<ModelState> {
     let mut state = ModelState::new(pool);
     for piece in prompt.chunks(2048) {
         let mut reservation = state.reserve(piece.len(), Boundaries::Final)?;
@@ -199,6 +212,25 @@ fn prefill_case(model: &TextModel, length: usize) -> Result<Value> {
     }))
 }
 
+/// One prefill chunk of `CHUNK` tokens after `context` prefilled ones, where prefill
+/// attention reads the most keys.
+fn chunk_case(model: &TextModel, context: usize) -> Result<Value> {
+    const CHUNK: usize = 2048;
+    let pool = pool(model, &[context], CHUNK)?;
+    let state = prefilled(model, &pool, &tokens(context, 2))?;
+    let chunk = tokens(CHUNK, 3);
+    pass(model, &pool, &[(&state, &chunk)])?;
+    let samples = (0..2)
+        .map(|_| pass(model, &pool, &[(&state, &chunk)]))
+        .collect::<Result<Vec<_>>>()?;
+    let (seconds, encode) = medians(&samples);
+    Ok(json!({
+        "context": context, "chunk_tokens": CHUNK, "median_seconds": seconds,
+        "median_encode_seconds": encode, "tokens_per_second": CHUNK as f64 / seconds,
+        "samples_seconds": samples.iter().map(|s| s.total).collect::<Vec<_>>(),
+    }))
+}
+
 fn decode_case(model: &TextModel, batch: usize, context: usize) -> Result<Value> {
     let pool = pool(model, &vec![context; batch], 1)?;
     let states = (0..batch)
@@ -235,6 +267,7 @@ fn engine_case(model: Arc<TextModel>, generated: usize) -> Result<Value> {
         pages: model.description().pages_for(SHORT_CONTEXT + generated) + 1,
         window_pages: model.description().pages_for(SHORT_CONTEXT + generated) + 1,
         recurrent_slots: 2,
+        index_blocks: 0,
     };
     let mut engine = HybridEngine::new(model, device, config)?;
     let handle = engine.allocate(0, SamplingOptions::default(), None)?;
@@ -294,6 +327,23 @@ fn engine_case(model: Arc<TextModel>, generated: usize) -> Result<Value> {
     }))
 }
 
+/// `TUR_BENCH_SPARSE_MAP` reads attention sparsely through that index map, past
+/// `TUR_BENCH_SPARSE_CROSSOVER` keys if set, and in prefill too unless
+/// `TUR_BENCH_SPARSE_PREFILL=0`.
+pub(crate) fn sparse_settings() -> Result<Option<SparseAttention>> {
+    let Some(map) = std::env::var_os("TUR_BENCH_SPARSE_MAP") else {
+        return Ok(None);
+    };
+    let mut sparse = SparseAttention::new(map.into());
+    if let Ok(keys) = std::env::var("TUR_BENCH_SPARSE_CROSSOVER") {
+        sparse.crossover = keys
+            .parse()
+            .map_err(|_| invalid("TUR_BENCH_SPARSE_CROSSOVER"))?;
+    }
+    sparse.prefill = std::env::var("TUR_BENCH_SPARSE_PREFILL").map_or(true, |v| v != "0");
+    Ok(Some(sparse))
+}
+
 /// Whether `TUR_BENCH_ONLY` (comma-separated `prefill`, `decode`, `engine`) selects `case`.
 fn selected(case: &str) -> bool {
     std::env::var("TUR_BENCH_ONLY").map_or(true, |only| only.split(',').any(|c| c == case))
@@ -314,6 +364,15 @@ fn measure(model: &TextModel, sweep: &Sweep, contexts: &[usize]) -> Result<Value
         .iter()
         .map(|&length| prefill_case(model, length))
         .collect::<Result<Vec<_>>>()?;
+    let chunks =
+        if std::env::var("TUR_BENCH_ONLY").is_ok_and(|o| o.split(',').any(|c| c == "chunk")) {
+            contexts
+                .iter()
+                .map(|&context| chunk_case(model, context))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
     let mut decode = Vec::new();
     if selected("decode") {
         for &batch in &sweep.batches {
@@ -331,7 +390,7 @@ fn measure(model: &TextModel, sweep: &Sweep, contexts: &[usize]) -> Result<Value
         "kv_token_bytes": description.kv_token_bytes()?,
         "recurrent_slot_bytes": description.recurrent_slot_bytes()?,
         "projection_bytes": model.projection_bytes(), "weight_bytes": model.weight_bytes(),
-        "prefill": prefill, "decode": decode,
+        "prefill": prefill, "chunks": chunks, "decode": decode,
     }))
 }
 
@@ -349,6 +408,7 @@ pub(crate) fn run() -> Result<()> {
     };
     let pages = env_sizes("TUR_BENCH_PAGES", "16")?;
     let reference = std::env::var("TUR_BENCH_REFERENCE").is_ok_and(|v| v == "1");
+    let sparse = sparse_settings()?;
     let engine_tokens = env_sizes("TUR_BENCH_ENGINE_TOKENS", "32")?
         .first()
         .copied()
@@ -392,7 +452,12 @@ pub(crate) fn run() -> Result<()> {
                         },
                     )?;
                     let load_seconds = load_start.elapsed().as_secs_f64();
+                    let mut model = model;
+                    if let Some(sparse) = &sparse {
+                        model.sparse_attention(sparse)?;
+                    }
                     let mut result = measure(&model, &sweep, &sweep.contexts)?;
+                    result["sparse_attention"] = json!(sparse.as_ref().map(|s| format!("{s:?}")));
                     result["format"] = json!(name);
                     result["recurrent_state"] = json!(state);
                     result["execution"] = json!("Fused");

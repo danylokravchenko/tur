@@ -121,6 +121,7 @@ python -I scripts/gemma4_assistant_reference.py --tiny crates/tur/tests/fixtures
 python -I scripts/gemma4_reference.py --templates crates/tur/tests/fixtures/gemma4/templates.json
 python -I scripts/audio_reference.py --tiny crates/tur/tests/fixtures/audio
 python -I scripts/vision_reference.py --tiny crates/tur/tests/fixtures/vision
+python -I scripts/lsa_reference.py golden --lsa <latent-sparse-attention checkout at 5ebea73>/src --out crates/tur/tests/fixtures/lsa/golden.safetensors
 ```
 
 ## Continuous integration

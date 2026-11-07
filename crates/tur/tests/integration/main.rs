@@ -16,6 +16,7 @@ mod gemma4;
 mod gguf;
 mod gpt_oss;
 mod kernels;
+mod lsa;
 mod model_common;
 mod moe;
 mod operations;

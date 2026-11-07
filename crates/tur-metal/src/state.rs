@@ -17,8 +17,13 @@
 //! logical page numbers. A committed state releases the window pages wholly before its
 //! window ([`ModelDescription::first_window_page`]); released entries address a
 //! placeholder page that no query reads.
+//!
+//! In an indexed pool a state also holds one index block per closed block of 512 keys,
+//! which the pass that commits the block's last key clusters. Committed keys never change,
+//! so index blocks are shared like pages and never copied; a pass whose accepted prefix
+//! stops short of a block it clustered drops that block's index.
 
-use crate::pool::{Id, Lease, PoolUsage, StatePool};
+use crate::pool::{Id, Lease, PoolUsage, StatePool, index_block_bytes, index_blocks_for};
 use candle_core::{DType, Tensor};
 use std::sync::Arc;
 use tur_core::{
@@ -93,6 +98,8 @@ pub struct ModelState {
     pages: Vec<Arc<Lease>>,
     windows: Windows,
     slot: Slot,
+    /// Index block of each closed block of keys, in an indexed pool.
+    indexes: Vec<Arc<Lease>>,
 }
 
 /// States are equal when they hold the same leases of the same pool at the same position.
@@ -103,6 +110,7 @@ impl PartialEq for ModelState {
             && ids(&self.pages) == ids(&other.pages)
             && window_ids(&self.windows) == window_ids(&other.windows)
             && self.slot.id() == other.slot.id()
+            && ids(&self.indexes) == ids(&other.indexes)
     }
 }
 
@@ -122,6 +130,7 @@ pub struct Demand {
     pub pages: usize,
     pub windows: usize,
     pub slots: usize,
+    pub indexes: usize,
 }
 
 impl std::ops::Add for Demand {
@@ -133,6 +142,7 @@ impl std::ops::Add for Demand {
             pages: self.pages + other.pages,
             windows: self.windows + other.windows,
             slots: self.slots + other.slots,
+            indexes: self.indexes + other.indexes,
         }
     }
 }
@@ -146,6 +156,7 @@ impl std::ops::Sub for Demand {
             pages: self.pages.saturating_sub(other.pages),
             windows: self.windows.saturating_sub(other.windows),
             slots: self.slots.saturating_sub(other.slots),
+            indexes: self.indexes.saturating_sub(other.indexes),
         }
     }
 }
@@ -156,6 +167,7 @@ impl Demand {
         self.pages <= usage.pages.free()
             && self.windows <= usage.windows.free()
             && self.slots <= usage.slots.free()
+            && self.indexes <= usage.indexes.free()
     }
 
     /// Bytes this demand leases.
@@ -163,6 +175,7 @@ impl Demand {
         self.pages * usage.page_bytes
             + self.windows * usage.window_bytes
             + self.slots * usage.slot_bytes
+            + self.indexes * usage.index_bytes
     }
 }
 
@@ -192,6 +205,7 @@ impl ModelState {
             pages: Vec::new(),
             windows: Vec::new(),
             slot: Slot::Zero,
+            indexes: Vec::new(),
         }
     }
 
@@ -220,8 +234,13 @@ impl ModelState {
         self.windows.iter().flatten().count()
     }
 
-    /// Pages, window pages and slot that only this snapshot holds: what dropping it would
-    /// release.
+    /// Index blocks this snapshot holds.
+    pub fn index_count(&self) -> usize {
+        self.indexes.len()
+    }
+
+    /// Pages, window pages, slot and index blocks that only this snapshot holds: what
+    /// dropping it would release.
     pub fn exclusive(&self) -> Demand {
         Demand {
             pages: self
@@ -238,6 +257,20 @@ impl ModelState {
             slots: usize::from(
                 matches!(&self.slot, Slot::Leased(slot) if Arc::strong_count(slot) == 1),
             ),
+            indexes: self
+                .indexes
+                .iter()
+                .filter(|block| Arc::strong_count(block) == 1)
+                .count(),
+        }
+    }
+
+    /// Index blocks a pass ending at `end` would lease: one per block it closes.
+    fn closed_blocks(&self, end: usize) -> usize {
+        if self.pool.indexed() {
+            index_blocks_for(end) - self.indexes.len()
+        } else {
+            0
         }
     }
 
@@ -293,6 +326,7 @@ impl ModelState {
             pages,
             windows,
             slots,
+            indexes: self.closed_blocks(end),
         })
     }
 
@@ -342,7 +376,13 @@ impl ModelState {
         let slots = (0..count)
             .map(|_| self.pool.lease_slot())
             .collect::<Result<Vec<_>>>()?;
+        let mut indexes = self.indexes.clone();
+        for _ in 0..self.closed_blocks(end) {
+            indexes.push(self.pool.lease_index()?);
+        }
         Ok(Reservation {
+            new_indexes: indexes.len() - self.indexes.len(),
+            indexes,
             base: self.clone(),
             new_pages: pages.len() - self.pages.len() + usize::from(copy.is_some()),
             new_windows: windows.len() - self.windows.len() + usize::from(window_copy.is_some()),
@@ -400,6 +440,7 @@ impl ModelState {
             read: self.slot.id(),
             writes: Vec::new(),
             boundaries: Boundaries::Final,
+            indexes: ids(&self.indexes),
         })
     }
 
@@ -433,6 +474,20 @@ impl ModelState {
         self.pool.device().synchronize()?;
         Ok(layers)
     }
+
+    /// Detached F32 copy `[position, kv_heads, head_dim]` of full attention layer `layer`'s
+    /// keys, as [`Self::read_layers`] copies them, without copying any other layer.
+    pub fn read_keys(&self, layer: usize) -> Result<Tensor> {
+        match self.description().layers.get(layer) {
+            Some(kind @ LayerStateKind::Attention { .. }) if !kind.windowed() => {}
+            _ => return Err(invalid(format!("layer {layer} is no full attention layer"))),
+        }
+        let pages = self.pool.resolve_pages(&ids(&self.pages))?;
+        let (key, _) = self.pool.attention(layer)?.gather(&pages, self.position)?;
+        let key = key.force_contiguous()?;
+        self.pool.device().synchronize()?;
+        Ok(key)
+    }
 }
 
 fn ids(leases: &[Arc<Lease>]) -> Vec<Id> {
@@ -462,6 +517,9 @@ pub struct Reservation {
     /// Pages leased by this reservation: opened pages plus a copied tail.
     new_pages: usize,
     new_windows: usize,
+    /// Index blocks after the pass: committed ones plus one per block the pass closes.
+    indexes: Vec<Arc<Lease>>,
+    new_indexes: usize,
     tokens: usize,
     boundaries: Boundaries,
     /// [`Boundaries::ends`] of the pass: the accepted counts that have a state.
@@ -489,7 +547,8 @@ impl Reservation {
             } else {
                 0
             }))
-            .and_then(|((p, w), s)| p.checked_add(w)?.checked_add(s))
+            .zip(self.new_indexes.checked_mul(index_block_bytes(description)))
+            .and_then(|(((p, w), s), i)| p.checked_add(w)?.checked_add(s)?.checked_add(i))
             .ok_or_else(|| invalid("reservation size overflow"))
     }
 
@@ -543,6 +602,7 @@ impl Reservation {
             read: self.base.slot.id(),
             writes: ids(&self.slots),
             boundaries: self.boundaries.clone(),
+            indexes: ids(&self.indexes),
         }
     }
 
@@ -550,7 +610,8 @@ impl Reservation {
     /// A partial accept must be one of the pass's [`Boundaries`], whose state is selected
     /// exactly, except for [`Boundaries::Replayed`], whose model must rewrite the slot
     /// before reading the returned state. Window pages wholly behind the new boundary's
-    /// window are released.
+    /// window are released, and so are index blocks of blocks the accepted prefix leaves
+    /// open.
     pub fn commit(&self, accepted: usize) -> Result<ModelState> {
         if accepted == 0 {
             return Ok(self.base.clone());
@@ -586,6 +647,11 @@ impl Reservation {
             pages: self.pages.get(..keep).unwrap_or(&self.pages).to_vec(),
             windows,
             slot: slot.map_or(Slot::Zero, |s| Slot::Leased(Arc::clone(s))),
+            indexes: self
+                .indexes
+                .get(..index_blocks_for(position).min(self.indexes.len()))
+                .unwrap_or(&self.indexes)
+                .to_vec(),
         })
     }
 }
@@ -603,6 +669,7 @@ pub struct SequenceState {
     read: Id,
     writes: Vec<Id>,
     boundaries: Boundaries,
+    indexes: Vec<Id>,
 }
 
 /// Resolved indices of a [`SequenceState`] in its pool.
@@ -616,6 +683,9 @@ pub struct Addresses {
     pub read: u32,
     /// Recurrent slots receiving the state after the last token, or after every token.
     pub writes: Vec<u32>,
+    /// Index block of each closed block of keys after the pass, in an indexed pool: the
+    /// committed blocks', then those of blocks the pass closes, which it clusters.
+    pub indexes: Vec<u32>,
 }
 
 impl SequenceState {
@@ -656,6 +726,7 @@ impl SequenceState {
             windows: pool.resolve_windows(&self.windows)?,
             read: read.first().copied().unwrap_or(0),
             writes: pool.resolve_slots(&self.writes)?,
+            indexes: pool.resolve_indexes(&self.indexes)?,
         })
     }
 }
@@ -706,8 +777,89 @@ mod tests {
                 pages,
                 window_pages: pages,
                 recurrent_slots: slots,
+                index_blocks: 0,
             },
         )
+    }
+
+    /// One full attention layer and one recurrent layer over 16-token pages, with
+    /// `index_blocks` index blocks.
+    fn indexed(index_blocks: usize) -> Result<StatePool> {
+        StatePool::new(
+            Arc::new(ModelDescription {
+                identity: ModelIdentity {
+                    revision: "index-fixture".into(),
+                    state_format: 1,
+                },
+                layers: vec![
+                    LayerStateKind::Attention {
+                        kv_heads: 1,
+                        head_dim: 32,
+                        window: None,
+                    },
+                    LayerStateKind::Recurrent {
+                        conv_channels: 1,
+                        conv_width: 1,
+                        heads: 1,
+                        key_dim: 1,
+                        value_dim: 1,
+                        dtype: DType::F32,
+                    },
+                ],
+                kv: KvLayout::new(16, KvFormat::F32),
+                modalities: vec![Modality::Text],
+                vocab_size: 8,
+                max_position: 2048,
+            }),
+            &Device::Cpu,
+            PoolConfig {
+                pages: 80,
+                window_pages: 0,
+                recurrent_slots: 4,
+                index_blocks,
+            },
+        )
+    }
+
+    #[test]
+    fn test_index_blocks_are_leased_per_closed_block() -> Result<()> {
+        let pool = indexed(4)?;
+        let fresh = ModelState::new(&pool);
+        // 600 tokens close block 0 only.
+        assert_eq!(fresh.demand(600, &Boundaries::Final)?.indexes, 1);
+        let reservation = fresh.reserve(600, Boundaries::Final)?;
+        assert_eq!(reservation.binding().resolve(&pool)?.indexes.len(), 1);
+        assert_eq!(reservation.commit(600)?.index_count(), 1);
+        let plain = ModelState::new(&indexed(0)?);
+        assert_eq!(plain.demand(600, &Boundaries::Final)?.indexes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_accepted_prefix_short_of_a_block_drops_its_index() -> Result<()> {
+        let pool = indexed(4)?;
+        let state = ModelState::new(&pool)
+            .reserve(600, Boundaries::Final)?
+            .commit(600)?;
+        // A draft pass to 1030 closes block 1 at 1024.
+        let draft = state.reserve(430, Boundaries::Replayed)?;
+        assert_eq!(draft.commit(400)?.index_count(), 1);
+        assert_eq!(draft.commit(430)?.index_count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_snapshots_share_index_blocks() -> Result<()> {
+        let pool = indexed(4)?;
+        let state = ModelState::new(&pool)
+            .reserve(600, Boundaries::Final)?
+            .commit(600)?;
+        let snapshot = state.clone();
+        assert_eq!(state.exclusive().indexes, 0);
+        drop(state);
+        assert_eq!(snapshot.exclusive().indexes, 1);
+        assert_eq!(pool.usage()?.indexes.leased, 1);
+        Ok(())
     }
 
     /// Run one pass that writes token values `values` and recurrent boundary values.
@@ -774,7 +926,8 @@ mod tests {
             Demand {
                 pages: 0,
                 windows: 0,
-                slots: 1
+                slots: 1,
+                indexes: 0,
             }
         );
         let three = pass(&one, &[2.0, 3.0], Boundaries::Final, 2)?;
@@ -805,7 +958,8 @@ mod tests {
             Demand {
                 pages: 1,
                 windows: 0,
-                slots: 1
+                slots: 1,
+                indexes: 0,
             }
         );
         let a = pass(&saved, &[4.0], Boundaries::Final, 1)?;
@@ -862,7 +1016,8 @@ mod tests {
             !Demand {
                 pages: 1,
                 windows: 0,
-                slots: 0
+                slots: 0,
+                indexes: 0,
             }
             .fits(&usage)
         );
@@ -871,7 +1026,8 @@ mod tests {
             Demand {
                 pages: 2,
                 windows: 0,
-                slots: 2
+                slots: 2,
+                indexes: 0,
             }
             .fits(&pool.usage()?)
         );
@@ -923,7 +1079,8 @@ mod tests {
             Demand {
                 pages: 2,
                 windows: 0,
-                slots: 1
+                slots: 1,
+                indexes: 0,
             }
         );
         // A continuation shares both full pages; each keeps its own slot.
@@ -933,7 +1090,8 @@ mod tests {
             Demand {
                 pages: 0,
                 windows: 0,
-                slots: 1
+                slots: 1,
+                indexes: 0,
             }
         );
         assert_eq!(
@@ -941,7 +1099,8 @@ mod tests {
             Demand {
                 pages: 2,
                 windows: 0,
-                slots: 1
+                slots: 1,
+                indexes: 0,
             }
         );
         let copy = longer.clone();
@@ -976,6 +1135,7 @@ mod tests {
                 pages,
                 window_pages: windows,
                 recurrent_slots: 0,
+                index_blocks: 0,
             },
         )
     }
@@ -1035,7 +1195,8 @@ mod tests {
             Demand {
                 pages: 1,
                 windows: 1,
-                slots: 0
+                slots: 0,
+                indexes: 0,
             }
         );
         let saved = state.clone();

@@ -706,6 +706,7 @@ pub(crate) fn run() -> Result<()> {
         video: false,
         expert_cache: None,
         gguf: None,
+        sparse: None,
     };
     let (traces, mapped) = record(&factory, &tokenizer, output, options)?;
     eprintln!("candidate text mapped back to its id for {mapped:.4} of tokens");

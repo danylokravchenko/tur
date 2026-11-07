@@ -8,6 +8,7 @@ mod prune;
 mod quantize;
 mod run;
 mod serve;
+mod sparse_map;
 mod transcribe;
 mod ui;
 
@@ -66,6 +67,9 @@ enum Command {
     Quantize(quantize::Args),
     /// Write a gpt-oss checkpoint with fewer experts, keeping those each layer can least lose.
     Prune(prune::Args),
+    /// Fit a Qwen3.5-family or Gemma 4 model's latent sparse attention index map from calibration
+    /// text.
+    SparseMap(sparse_map::Args),
     /// Transcribe a WAV file with a Whisper checkpoint and print the text.
     Transcribe(transcribe::Args),
 }
@@ -182,6 +186,11 @@ fn execute(cli: Cli, console: &ui::Console) -> Result<()> {
             job_arguments_only(cli.config.as_deref(), "prune")?;
             ui::welcome(console, &tagline());
             prune::run(&mut args, console)
+        }
+        Command::SparseMap(mut args) => {
+            job_arguments_only(cli.config.as_deref(), "sparse-map")?;
+            ui::welcome(console, &tagline());
+            sparse_map::run(&mut args, console)
         }
         Command::Quantize(mut args) => {
             job_arguments_only(cli.config.as_deref(), "quantize")?;

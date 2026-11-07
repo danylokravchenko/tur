@@ -10,6 +10,7 @@
 
 use super::{Attention, Config, DeltaNet, Dims, LayerKind, Mixer, Mlp, MtpHead, Pass, Qwen35};
 use crate::hybrid::{Boundaries, LayerCarry, PackedForward, ReplayCommit, StatePool};
+use crate::models::sparse::{self, Output, PassTable, SpanRows, Sparse, SparsePass};
 use candle_core::{DType, Tensor};
 use tur_core::{
     Result,
@@ -32,12 +33,15 @@ pub(super) struct Fused {
     axial: Option<tur_metal::kernels::AxialRotation>,
     page: usize,
     delta: DeltaShape,
+    /// Latent sparse attention, when attached.
+    pub(super) sparse: Option<Sparse>,
 }
 
 /// Addressing shared by every layer of one pass.
 struct Addressing {
     positions: Tensor,
     paging: Option<PagedKv>,
+    sparse: Option<SparsePass>,
     recurrent: Option<RecurrentSpans>,
     /// Packed rows of the sequences with [`Boundaries::Replayed`], whose projection rows
     /// each recurrent layer keeps for a replay.
@@ -71,6 +75,7 @@ impl Fused {
                 .transpose()?,
             page,
             delta: delta_shape(&d),
+            sparse: None,
             scan_only: kernels.clone().with_tuning(Tuning {
                 delta_step: false,
                 ..kernels.tuning()
@@ -95,18 +100,57 @@ impl Fused {
                 );
             }
         }
-        let slots = pass
-            .pool
-            .attention(model.first_attention()?)?
-            .key
-            .data
-            .dim(0)?;
-        self.kernels
-            .paged_kv(self.page, slots, &table, &first, &visible)
+        self.kernels.paged_kv(
+            self.page,
+            model.attention_slots(pass)?,
+            &table,
+            &first,
+            &visible,
+        )
+    }
+}
+
+impl Fused {
+    /// The sparse plan of `pass`, over the page table [`Self::paging`] lays out.
+    fn sparse_plan(
+        &self,
+        model: &Qwen35,
+        sparse: &Sparse,
+        pass: &Pass<'_, '_>,
+    ) -> Result<SparsePass> {
+        let mut pages = Vec::new();
+        let mut spans = Vec::with_capacity(pass.spans.len());
+        for span in pass.spans {
+            spans.push(SpanRows {
+                page_base: u32::try_from(pages.len())
+                    .map_err(|_| invalid("page table overflow"))?,
+                indexes: &span.addresses.indexes,
+                past: span.past,
+                len: span.len,
+                queries: (span.past..span.past + span.len).collect(),
+            });
+            pages.extend_from_slice(&span.addresses.pages);
+        }
+        let table = PassTable {
+            pages: &pages,
+            page: self.page,
+            slots: model.attention_slots(pass)?,
+        };
+        sparse::plan(&self.kernels, sparse, pass.pool, &table, &spans)
     }
 }
 
 impl Qwen35 {
+    /// K/V pool slots of the pass's full attention layers.
+    fn attention_slots(&self, pass: &Pass<'_, '_>) -> Result<usize> {
+        Ok(pass
+            .pool
+            .attention(self.first_attention()?)?
+            .key
+            .data
+            .dim(0)?)
+    }
+
     fn first_attention(&self) -> Result<usize> {
         self.layers
             .iter()
@@ -206,6 +250,10 @@ impl Qwen35 {
         } else {
             None
         };
+        let sparse = match &fused.sparse {
+            Some(model) if has_attention => Some(fused.sparse_plan(self, model, pass)?),
+            _ => None,
+        };
         let has_delta = self
             .layers
             .iter()
@@ -237,6 +285,7 @@ impl Qwen35 {
         Ok(Addressing {
             positions: self.position_tensor(pass)?,
             paging,
+            sparse,
             recurrent,
             replayed: (!replayed.is_empty())
                 .then(|| Tensor::new(replayed.as_slice(), &self.device))
@@ -274,7 +323,8 @@ impl Qwen35 {
                         .as_ref()
                         .ok_or_else(|| invalid("attention layer without page addressing"))?;
                     let positions = &addressing.positions;
-                    self.fused_attention(fused, a, &h, positions, pass, paging, index)?
+                    let paged = (paging, addressing.sparse.as_ref());
+                    self.fused_attention(fused, a, &h, positions, pass, paged, index)?
                 }
                 Mixer::Delta(net) => {
                     let spans = addressing
@@ -340,8 +390,9 @@ impl Qwen35 {
         let x = k.linear(&mtp.fc, &joined)?;
         let h = k.rms_norm(&x, &mtp.layer.input_norm, d.eps)?;
         let paging = fused.paging(self, pass)?;
+        let paged = (&paging, None);
         let mixed =
-            self.fused_attention(fused, a, &h, &positions, pass, &paging, self.layers.len())?;
+            self.fused_attention(fused, a, &h, &positions, pass, paged, self.layers.len())?;
         let (sum, normed) = k.add_rms_norm(&x, &mixed, &mtp.layer.post_norm, d.eps)?;
         let out = match &mtp.layer.mlp {
             Mlp::Dense(mlp) => {
@@ -400,7 +451,7 @@ impl Qwen35 {
         h: &Tensor,
         positions: &Tensor,
         pass: &Pass<'_, '_>,
-        paging: &PagedKv,
+        (paging, plan): (&PagedKv, Option<&SparsePass>),
         layer: usize,
     ) -> Result<Tensor> {
         let k = &fused.kernels;
@@ -433,13 +484,19 @@ impl Qwen35 {
             pool,
             paging,
         )?;
-        let attended = k.attention(
-            &q,
-            pool,
-            paging,
-            &q_gate,
-            heads(d.heads, 2 * d.head_dim, d.head_dim),
-        )?;
+        let gate = heads(d.heads, 2 * d.head_dim, d.head_dim);
+        let sparse = match (&fused.sparse, plan) {
+            (Some(model), Some(plan)) => {
+                let output = Output::Gated(&q_gate, gate);
+                let layer = (layer, true);
+                sparse::attend(k, model, plan, layer, &q, output, pass.pool, paging)?
+            }
+            _ => None,
+        };
+        let attended = match sparse {
+            Some(attended) => attended,
+            None => k.attention(&q, pool, paging, &q_gate, gate)?,
+        };
         k.linear(&a.o, &attended)
     }
 
@@ -603,13 +660,21 @@ impl Qwen35 {
         n: usize,
         contexts: &[usize],
     ) -> Result<usize> {
+        let sparse = fused
+            .sparse
+            .as_ref()
+            .map(|sparse| sparse.workspace(n, contexts))
+            .transpose()?
+            .unwrap_or(0);
         workspace(
             &self.config,
             &fused.kernels,
             &self.description.kv,
             n,
             contexts,
-        )
+        )?
+        .checked_add(sparse)
+        .ok_or_else(|| invalid("workspace overflow"))
     }
 }
 

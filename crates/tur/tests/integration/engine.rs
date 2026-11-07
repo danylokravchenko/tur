@@ -34,6 +34,7 @@ const POOL: PoolConfig = PoolConfig {
     pages: 128,
     window_pages: 128,
     recurrent_slots: 8,
+    index_blocks: 0,
 };
 
 const TINY: &str = r#"{
@@ -559,6 +560,7 @@ fn test_mtp_head_matches_transformers_reference() -> Result<()> {
                 pages: description.pages_for(count),
                 window_pages: description.pages_for(count),
                 recurrent_slots: 2,
+                index_blocks: 0,
             },
         )?;
         let mut reservation = ModelState::new(&pool).reserve(count, Boundaries::Final)?;

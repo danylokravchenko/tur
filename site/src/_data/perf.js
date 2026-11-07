@@ -233,6 +233,68 @@ const formats = barChart({
   source: source("Measured performance", "quality-of-weight-formats"),
 });
 
+const longSection = "Long contexts with sparse attention";
+const longSource = source("Measured performance", "long-contexts-with-sparse-attention");
+const denseSeries = (values) => ({ name: "Dense", color: "s-muted", values });
+const sparseSeries = (values) => ({ name: "Sparse attention", color: "s1", values });
+const contextChart = (firstHeader, title, note, unit) => {
+  const table = perf.table(longSection, firstHeader);
+  const contexts = table.firstColumn();
+  return lineChart({
+    title,
+    note,
+    x: contexts.map((label) => toNumber(label)),
+    xLabel: "K tokens of context",
+    unit,
+    series: [
+      denseSeries(contexts.map((c) => table.num(c, "Dense"))),
+      sparseSeries(contexts.map((c) => table.num(c, "Sparse attention"))),
+      llama(contexts.map((c) => table.num(c, "llama.cpp"))),
+    ],
+    source: longSource,
+  });
+};
+const longDecode = contextChart(
+  "Context",
+  "Decode as the context grows",
+  "Qwen3.5-0.8B Q8_0 on a 16 GB M1, one sequence, against llama.cpp on the same GGUF weights. Past 16K keys each token reads about 4,600 chosen keys, so decode stays near its short-context speed.",
+  "tok/s",
+);
+const longPrefill = contextChart(
+  "Context before the chunk",
+  "Prefill after a long context",
+  "The same model, prompt tokens per second for one 2048-token chunk after the context. Dense, Tur's attention kernel trails llama.cpp's; with sparse attention each tile of 32 prompt tokens reads its own selection.",
+  "tok/s",
+);
+const longServing = perf.table(longSection, "Prompt, requests");
+const longBars = (pair, title, note, unit) =>
+  barChart({
+    title,
+    note,
+    unit,
+    series: [
+      { name: "Dense", color: "s-muted" },
+      { name: "Sparse attention", color: "s1" },
+    ],
+    groups: longServing.firstColumn().map((label) => ({
+      label: `${label.replace(",", " ×")}`,
+      values: pair.map((column) => longServing.num(label, column)),
+    })),
+    source: longSource,
+  });
+const longFirstToken = longBars(
+  ["TTFT p50, dense", "TTFT p50, sparse"],
+  "First token behind a long prompt",
+  "Bursts of long prompts through the full server, median time to first token. Lower is better.",
+  "s",
+);
+const longGap = longBars(
+  ["ITL p50, dense", "ITL p50, sparse"],
+  "Gap between tokens at long contexts",
+  "The same bursts, median inter-token latency. Lower is better.",
+  "ms",
+);
+
 const eight = headline.num("Decode, 8 sequences", "Tur");
 const eightBase = headline.num("Decode, 8 sequences", "llama.cpp");
 const repetitive = speculationRows.find((row) => row[0] === "Repetitive");
@@ -365,5 +427,9 @@ export default {
     loadTime,
     loadMemory,
     formats,
+    longDecode,
+    longPrefill,
+    longFirstToken,
+    longGap,
   },
 };

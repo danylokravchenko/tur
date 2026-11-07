@@ -11,7 +11,7 @@ description: "Tur's measured throughput, latency, prefix reuse, speculation, loa
   <p class="page__lead"><a href="/docs/guide/performance/">Measured performance</a> has the versions and methods behind these charts. Hover or tap a mark for its values, or open the numbers under any chart. Re-measure on your own Mac with <a href="/docs/development/benchmarks/"><code>just bench</code></a> before relying on a figure.</p>
 
   <nav class="jump" aria-label="Sections">
-    <a href="#overall">Overall</a><a href="#batching">Batching</a><a href="#serving">Serving</a><a href="#moe">Mixture of experts</a><a href="#reuse">Skipping work</a><a href="#start">Loading and weights</a>
+    <a href="#overall">Overall</a><a href="#batching">Batching</a><a href="#serving">Serving</a><a href="#moe">Mixture of experts</a><a href="#long">Long contexts</a><a href="#reuse">Skipping work</a><a href="#start">Loading and weights</a>
   </nav>
 
   <section id="overall" class="band">
@@ -53,6 +53,17 @@ description: "Tur's measured throughput, latency, prefix reuse, speculation, loa
     </div>
     <div class="lab" data-lab="moeSpeculation" style="margin-top:20px"></div>
     <p class="band__after">Sixteen concurrent requests don't fit with every expert resident: Tur runs out of GPU memory. With a 4 GiB <a href="/docs/architecture/expert-cache/">expert cache</a> the burst completes at {{ perf.moe.sixteenTur }} tok/s, while llama.cpp keeps its weights resident and reaches {{ perf.moe.sixteenLlama }} tok/s.</p>
+  </section>
+
+  <section id="long" class="band">
+    <h2>Long contexts</h2>
+    <p class="band__lead">With <a href="/docs/guide/sparse-attention/">sparse attention</a>, each token past 16K keys reads about 4,600 chosen keys instead of all of them, in prefill and in decode, so neither slows down much as the context grows.</p>
+    <div class="chart-grid">
+      {{ perf.charts.longDecode | safe }}
+      {{ perf.charts.longPrefill | safe }}
+      {{ perf.charts.longFirstToken | safe }}
+      {{ perf.charts.longGap | safe }}
+    </div>
   </section>
 
   <section id="reuse" class="band">
