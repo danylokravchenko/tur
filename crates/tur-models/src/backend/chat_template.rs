@@ -166,7 +166,7 @@ impl ChatTemplate {
     /// The template is validated at construction time; returns an error if
     /// the syntax is invalid.
     pub fn from_template(template: impl Into<String>) -> Result<Self> {
-        let source = template.into();
+        let source = transparent_generation(&template.into());
         faithful_environment()
             .and_then(|mut env| env.add_template("chat", &source))
             .map_err(|e| TurError::Other(format!("invalid chat template syntax: {e}")))?;
@@ -329,6 +329,46 @@ fn raise_exception(msg: String) -> std::result::Result<minijinja::Value, minijin
     ))
 }
 
+/// Hugging Face's `{% generation %}…{% endgeneration %}` blocks (its `AssistantTracker`
+/// extension) only record where assistant text lands, for training masks, and render their
+/// body unchanged. They become `{% if true %}…{% endif %}`, keeping each tag's
+/// whitespace-control markers, so trimming around them is unchanged too.
+fn transparent_generation(source: &str) -> String {
+    let marker = |c: &char| matches!(c, '-' | '+');
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some((before, tail)) = rest.split_once("{%") {
+        let Some((inner, after)) = tail.split_once("%}") else {
+            break;
+        };
+        out.push_str(before);
+        out.push_str("{%");
+        let body = inner
+            .trim_start_matches(['-', '+'])
+            .trim_end_matches(['-', '+'])
+            .trim();
+        let statement = match body {
+            "generation" => Some("if true"),
+            "endgeneration" => Some("endif"),
+            _ => None,
+        };
+        match statement {
+            Some(statement) => {
+                out.extend(inner.chars().next().filter(marker));
+                out.push(' ');
+                out.push_str(statement);
+                out.push(' ');
+                out.extend(inner.chars().next_back().filter(marker));
+            }
+            None => out.push_str(inner),
+        }
+        out.push_str("%}");
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Environment matching Hugging Face's sandboxed Jinja2 setup for chat templates.
 fn faithful_environment() -> std::result::Result<minijinja::Environment<'static>, minijinja::Error>
 {
@@ -421,10 +461,14 @@ fn python_method(
     })
 }
 
-/// `json.dumps(value, ensure_ascii=False)` separators: `", "` and `": "`.
-struct PythonJson;
+/// `json.dumps(value, ensure_ascii=False)` with its item and key separators, by default
+/// `", "` and `": "`.
+struct PythonJson<'a> {
+    item: &'a str,
+    key: &'a str,
+}
 
-impl serde_json::ser::Formatter for PythonJson {
+impl serde_json::ser::Formatter for PythonJson<'_> {
     fn begin_array_value<W: ?Sized + std::io::Write>(
         &mut self,
         writer: &mut W,
@@ -433,7 +477,7 @@ impl serde_json::ser::Formatter for PythonJson {
         if first {
             Ok(())
         } else {
-            writer.write_all(b", ")
+            writer.write_all(self.item.as_bytes())
         }
     }
 
@@ -445,7 +489,7 @@ impl serde_json::ser::Formatter for PythonJson {
         if first {
             Ok(())
         } else {
-            writer.write_all(b", ")
+            writer.write_all(self.item.as_bytes())
         }
     }
 
@@ -453,17 +497,68 @@ impl serde_json::ser::Formatter for PythonJson {
         &mut self,
         writer: &mut W,
     ) -> std::io::Result<()> {
-        writer.write_all(b": ")
+        writer.write_all(self.key.as_bytes())
     }
 }
 
+/// `value` with every mapping's keys in sorted order, as `json.dumps(sort_keys=True)` writes.
+fn sorted_keys(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, sorted_keys(value)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sorted_keys).collect())
+        }
+        other => other,
+    }
+}
+
+/// Jinja's `tojson` as Hugging Face's template environment defines it: `json.dumps` with
+/// `ensure_ascii=False`, and its `sort_keys` and `separators` arguments.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "minijinja hands filters their keyword arguments by value"
+)]
 fn python_tojson(
     value: &minijinja::Value,
+    kwargs: minijinja::value::Kwargs,
 ) -> std::result::Result<minijinja::Value, minijinja::Error> {
+    let sort = kwargs.get::<Option<bool>>("sort_keys")?.unwrap_or(false);
+    let separators = kwargs.get::<Option<minijinja::Value>>("separators")?;
+    kwargs.assert_all_used()?;
+    let (item, key) = match &separators {
+        None => (", ".to_owned(), ": ".to_owned()),
+        Some(pair) => {
+            let parts: Vec<String> = pair
+                .try_iter()?
+                .map(|part| part.as_str().map(str::to_owned))
+                .collect::<Option<_>>()
+                .ok_or_else(|| template_error("tojson separators must be strings"))?;
+            let [item, key] = <[String; 2]>::try_from(parts)
+                .map_err(|_| template_error("tojson separators must be a pair"))?;
+            (item, key)
+        }
+    };
+    let mut json =
+        serde_json::to_value(value).map_err(|e| template_error(format!("tojson: {e}")))?;
+    if sort {
+        json = sorted_keys(json);
+    }
     let mut out = Vec::new();
-    let mut serializer = serde_json::Serializer::with_formatter(&mut out, PythonJson);
-    value
-        .serialize(&mut serializer)
+    let formatter = PythonJson {
+        item: &item,
+        key: &key,
+    };
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, formatter);
+    json.serialize(&mut serializer)
         .map_err(|e| template_error(format!("tojson: {e}")))?;
     let text = String::from_utf8(out).map_err(|e| template_error(format!("tojson: {e}")))?;
     Ok(minijinja::Value::from_safe_string(text))

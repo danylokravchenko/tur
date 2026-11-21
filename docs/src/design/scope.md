@@ -7,7 +7,7 @@ Tur is an inference service for Apple Silicon Macs. It aims for three things at 
 ## In scope
 
 - Apple Silicon Macs with Metal. CPU execution exists only as a numerical reference for tests.
-- Qwen3.5-family hybrid text models (dense Qwen3.5 and Qwen3.8, and experimentally the Qwen3.6 MoE), Gemma 4 text models and gpt-oss text models. The architecture is identified from checkpoint fields, never from the name.
+- Qwen3.5-family hybrid text models (dense Qwen3.5 and Qwen3.8, and experimentally the Qwen3.6 MoE), Gemma 4 text models, gpt-oss text models and Inkling 2 text models. The architecture is identified from checkpoint fields, never from the name.
 - GGUF weights for those models, in any format mix llama.cpp's Q-, IQ- and MXFP4-based files use (see [GGUF files](../guide/gguf.md)).
 - Images and H.264 or HEVC video, as input to Qwen3.5-family models and Gemma 4 through their own encoders (see [Images and video](../architecture/vision.md)).
 - Speech: audio input to Gemma 4 E2B and E4B through their own encoder, and Whisper transcription (see [Audio](../architecture/audio.md)).
@@ -32,6 +32,7 @@ Tur is an inference service for Apple Silicon Macs. It aims for three things at 
 | Whisper large-v3-turbo | Small Transformers fixture for the encoder, decoder and cached greedy decode; real F32 and Q8_0 transcripts equal Transformers' on a pinned clip, and F32 long-form tokens and segment times equal its `generate` on a clip beyond 30 s |
 | Gemma 4 E4B, 12B, 26B-A4B, 31B | Architecture fixtures and configuration checks; full checkpoints not yet run |
 | gpt-oss-20b | Pinned Transformers F32 fixture, and real weights compared per layer through the expert cache |
+| Inkling 2 Mini | Transformers F32 fixture in the published layout, per layer application, in logits and through cached decoding, plus the real checkpoint's config, tensor table and template. The real weights haven't been run |
 
 ## Principles
 

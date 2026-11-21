@@ -1,0 +1,29 @@
+{
+  "model": {
+    "parameter_groups": [
+      {
+        "compute_dtype": "nvfp4",
+        "tensors": [
+          "model.llm.layers.0.mlp.experts.w13_weight",
+          "model.llm.layers.0.mlp.experts.w2_weight",
+          "model.llm.layers.1.mlp.experts.w13_weight",
+          "model.llm.layers.1.mlp.experts.w2_weight",
+          "model.llm.layers.2.mlp.experts.w13_weight",
+          "model.llm.layers.2.mlp.experts.w2_weight",
+          "model.llm.layers.3.mlp.experts.w13_weight",
+          "model.llm.layers.3.mlp.experts.w2_weight"
+        ]
+      },
+      {
+        "compute_dtype": "mxfp8",
+        "tensors": [
+          "model.llm.layers.4.mlp.experts.w13_weight",
+          "model.llm.layers.4.mlp.experts.w2_weight",
+          "model.llm.layers.5.mlp.experts.w13_weight",
+          "model.llm.layers.5.mlp.experts.w2_weight"
+        ]
+      }
+    ]
+  },
+  "quant_method": "inkling2"
+}

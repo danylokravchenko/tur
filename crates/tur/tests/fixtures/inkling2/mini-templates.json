@@ -1,0 +1,101 @@
+{
+ "single": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 84 * 3 / 2?"
+   }
+  ],
+  "kwargs": {},
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 84 * 3 / 2?<|end_message|>"
+ },
+ "system_effort": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "kwargs": {
+   "reasoning_effort": "low"
+  },
+  "text": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ "history": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Name a prime."
+   },
+   {
+    "role": "assistant",
+    "content": "7",
+    "reasoning_content": "Small primes: 2, 3, 5, 7."
+   },
+   {
+    "role": "user",
+    "content": "Another?"
+   }
+  ],
+  "kwargs": {},
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Name a prime.<|end_message|><|message_model|><|content_thinking|>Small primes: 2, 3, 5, 7.<|end_message|><|message_model|><|content_text|>7<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Another?<|end_message|>"
+ },
+ "tools": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "unit": "c",
+        "city": "Paris"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "18"
+   }
+  ],
+  "kwargs": {
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "unit": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "text": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Current weather\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"unit\":\"c\"}}<|end_message|><|content_model_end_sampling|><|message_tool|><|content_text|>18<|end_message|>"
+ }
+}

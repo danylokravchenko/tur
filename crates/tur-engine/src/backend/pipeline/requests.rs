@@ -424,6 +424,7 @@ impl InferencePipeline {
             ToolSyntax::Gemma => thinking == Some(true),
             // A template that ignored the request hasn't opened anything to close.
             ToolSyntax::Xml => thinking == Some(true) && self.prompt_opens_thinking(prompt),
+            ToolSyntax::Inkling => false,
         };
         if reasons {
             Preamble::Reasoning
@@ -438,7 +439,7 @@ impl InferencePipeline {
     /// into the answer.
     fn free_preamble(&self, prompt: &[u32]) -> Preamble {
         let reasons = match self.tool_syntax() {
-            ToolSyntax::Harmony => false,
+            ToolSyntax::Harmony | ToolSyntax::Inkling => false,
             ToolSyntax::Gemma => true,
             ToolSyntax::Xml => self.prompt_opens_thinking(prompt),
         };
@@ -471,7 +472,7 @@ impl InferencePipeline {
         }
         let id = |token: &str| self.tokenizer.token_to_id(token);
         match self.tool_syntax() {
-            ToolSyntax::Harmony => None,
+            ToolSyntax::Harmony | ToolSyntax::Inkling => None,
             ToolSyntax::Xml => Some(ReasoningSplit::opened(&self.tokenizer, id("</think>")?)),
             ToolSyntax::Gemma => Some(ReasoningSplit::channel(
                 &self.tokenizer,

@@ -57,6 +57,55 @@ kernel void moe_route_f32(device const float *x [[buffer(0)]], device float *y [
     if (lane == 0) for (uint n = 0; n < p.top_k; ++n) out[n * 2 + 1] = (out[n * 2 + 1] / sum) * (p.scaled ? scales[uint(out[n * 2])] : 1.0f);
 }
 
+// Sigmoid routing (DeepSeek-V3 style): experts are selected by score + bias[e], with the
+// bias steering selection only; the weights are the selected sigmoid scores normalized to
+// sum one, times `scale`. One simdgroup per token, eight experts per lane, ties to the lowest
+// expert ID as in moe_route_f32. Output rows hold (expert, weight) in rank order.
+struct MoeSigmoidParams { uint tokens, experts, top_k, stride; float scale; };
+kernel void moe_route_sigmoid_f32(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
+    constant MoeSigmoidParams &p [[buffer(2)]], device const float *bias [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    float scores[MOE_LANE_EXPERTS], keys[MOE_LANE_EXPERTS];
+    bool taken[MOE_LANE_EXPERTS];
+    bool valid = true;
+    for (uint i = 0; i < MOE_LANE_EXPERTS; ++i) {
+        uint e = lane + 32 * i;
+        taken[i] = e >= p.experts;
+        float logit = taken[i] ? 0.0f : x[ulong(row) * p.stride + e];
+        scores[i] = 1.0f / (1.0f + exp(-logit));
+        keys[i] = taken[i] ? -INFINITY : scores[i] + bias[e];
+        valid = valid && (taken[i] || isfinite(keys[i]));
+    }
+    valid = simd_all(valid);
+    device float *out = y + ulong(row) * p.top_k * 2;
+    if (!valid) {
+        for (uint i = lane; i < p.top_k; i += 32) {
+            out[i * 2] = float(i);
+            out[i * 2 + 1] = NAN;
+        }
+        return;
+    }
+    float sum = 0.0f;
+    for (uint n = 0; n < p.top_k; ++n) {
+        float best = -INFINITY, score = 0.0f;
+        uint best_id = 0xFFFFFFFFu;
+        for (uint i = 0; i < MOE_LANE_EXPERTS; ++i) {
+            if (!taken[i] && (best_id == 0xFFFFFFFFu || keys[i] > best)) {
+                best = keys[i];
+                best_id = lane + 32 * i;
+                score = scores[i];
+            }
+        }
+        float m = simd_max(best);
+        uint id = simd_min(best_id != 0xFFFFFFFFu && best == m ? best_id : 0xFFFFFFFFu);
+        float chosen = simd_shuffle(score, id % 32);
+        for (uint i = 0; i < MOE_LANE_EXPERTS; ++i) taken[i] = taken[i] || lane + 32 * i == id;
+        sum += chosen;
+        if (lane == 0) { out[n * 2] = float(id); out[n * 2 + 1] = chosen; }
+    }
+    if (lane == 0) for (uint n = 0; n < p.top_k; ++n) out[n * 2 + 1] = out[n * 2 + 1] / (sum + 1e-20f) * p.scale;
+}
+
 // Per block of assignments: each expert's count, and each assignment's rank among the
 // earlier assignments of its expert in the block (kept in its permutation slot).
 kernel void moe_histogram_f32(device const float *selected [[buffer(0)]], device float *hist [[buffer(1)]],
@@ -507,6 +556,8 @@ EXPERT_GEMM(1, 4, "q8_0")
 EXPERT_GEMM(2, 4, "q4k")
 EXPERT_GEMM(3, 4, "mxfp4")
 EXPERT_GEMM(4, 4, "blocks")
+EXPERT_GEMM(5, 4, "nvfp4")
+EXPERT_GEMM(6, 4, "mxfp8")
 
 // y = x + bias[expert], for one row per assignment in group order.
 kernel void moe_bias_f32(device const float *x [[buffer(0)]], device const float *order [[buffer(1)]],
@@ -533,6 +584,27 @@ kernel void moe_glu_f32(device const float *x [[buffer(0)]], device const float 
         float gate = min(xr[2 * i] + b[2 * i], p.limit);
         float up = clamp(xr[2 * i + 1] + b[2 * i + 1], -p.limit, p.limit);
         yr[i] = (up + 1.0f) * (gate * (1.0f / (1.0f + exp(-gate * p.alpha))));
+    }
+}
+
+// Softcapped SwiGLU over interleaved gate|up columns of one row per assignment in group
+// order: softcap(gate, gate_cap) * sigmoid(gate) * softcap(up, up_cap), where the sigmoid
+// sees the raw gate. Both columns first take their expert's `gate_up` factor, and the
+// output its `down` factor, which the down projection is linear in: a per-expert factor of
+// the weights (an NVFP4 checkpoint's second-level scale) moves out of the matrices.
+struct MoeSoftcapParams { uint rows, width, stride; float gate_cap, up_cap; };
+kernel void moe_softcap_glu_f32(device const float *x [[buffer(0)]], device const float *order [[buffer(1)]],
+    device const float *factors [[buffer(2)]], device float *y [[buffer(3)]], constant MoeSoftcapParams &p [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]]) {
+    if (row >= p.rows) return;
+    uint expert = uint(order[ulong(row) * 3 + 1]);
+    float up_factor = factors[2 * expert], down_factor = factors[2 * expert + 1];
+    device const float *xr = x + ulong(row) * p.stride;
+    device float *yr = y + ulong(row) * p.width;
+    for (uint i = tid; i < p.width; i += threads) {
+        float gate = xr[2 * i] * up_factor, up = xr[2 * i + 1] * up_factor;
+        float capped = tanh(gate / p.gate_cap) * p.gate_cap;
+        yr[i] = capped * (1.0f / (1.0f + exp(-gate))) * (tanh(up / p.up_cap) * p.up_cap) * down_factor;
     }
 }
 

@@ -37,6 +37,11 @@ pub(crate) enum Preamble {
 }
 
 /// Compile `output` for a model writing `syntax`. `eos_tokens` can't appear in reasoning.
+/// Inkling 2 writes calls and answers inside its own messages, which no grammar here covers.
+fn unsupported() -> tur_core::TurError {
+    invalid("structured output and tool grammars are not supported for Inkling 2 yet")
+}
+
 pub(crate) fn grammar(
     output: &StructuredOutput,
     syntax: ToolSyntax,
@@ -45,6 +50,9 @@ pub(crate) fn grammar(
     preamble: Preamble,
     eos_tokens: &[u32],
 ) -> Result<TopLevelGrammar> {
+    if syntax == ToolSyntax::Inkling {
+        return Err(unsupported());
+    }
     let mut lark = Lark::new(tokenizer);
     let body = match output {
         StructuredOutput::JsonObject => lark.answer(syntax, &json!({"type": "object"}))?,
@@ -87,7 +95,7 @@ pub(crate) fn lazy_call(
     tools: &[ToolDefinition],
     tokenizer: &Tokenizer,
 ) -> Result<Option<(TopLevelGrammar, u32)>> {
-    if syntax == ToolSyntax::Harmony || tools.is_empty() {
+    if matches!(syntax, ToolSyntax::Harmony | ToolSyntax::Inkling) || tools.is_empty() {
         return Ok(None);
     }
     let mut lark = Lark::new(tokenizer);
@@ -201,6 +209,7 @@ impl<'a> Lark<'a> {
                 );
                 format!("{rule}?")
             }
+            ToolSyntax::Inkling => return Err(unsupported()),
         })
     }
 
@@ -242,6 +251,7 @@ impl<'a> Lark<'a> {
                 ToolSyntax::Xml => self.xml_call(tool),
                 ToolSyntax::Gemma => self.gemma_call(tool),
                 ToolSyntax::Harmony => self.harmony_call(tool),
+                ToolSyntax::Inkling => Err(unsupported()),
             })
             .collect::<Result<Vec<_>>>()?
             .join(" | ");
@@ -262,6 +272,7 @@ impl<'a> Lark<'a> {
             }
             // A Harmony call ends the turn with `<|call|>`, so a turn holds exactly one.
             ToolSyntax::Harmony => calls,
+            ToolSyntax::Inkling => return Err(unsupported()),
         })
     }
 

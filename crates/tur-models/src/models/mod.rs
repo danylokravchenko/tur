@@ -27,6 +27,7 @@ pub use options::{
 pub use weights::{Embedding, Method, Packer, Precision, Projection, WeightPlan};
 pub mod gemma4;
 pub mod gpt_oss;
+pub mod inkling2;
 pub mod qwen3_5;
 pub mod whisper;
 

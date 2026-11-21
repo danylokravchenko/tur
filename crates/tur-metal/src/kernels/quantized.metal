@@ -422,13 +422,44 @@ static inline void iq_weights32(device const uchar *w, ulong row, uint chunk, ui
 }
 
 // Eight consecutive dequantized weights of `row` from element 32 * chunk + start, where
-// start is a multiple of four below 32. FORMAT: 0 F32, 1 Q8_0, 2 Q4_K, 3 MXFP4, whose scale
-// bytes follow the blocks at byte offset `scales`, 4 the pipeline's specialized block format.
+// start is a multiple of four below 32. FORMAT: 0 F32, 1 Q8_0, 2 Q4_K, 3 MXFP4, 4 the
+// pipeline's specialized block format, 5 NVFP4, 6 MXFP8. The microscaled formats (3, 5, 6)
+// hold every value byte of the matrix, then its scale bytes from byte offset `scales`.
 constant float MXFP4_VALUES[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+
+// An E4M3 byte as F32 bits: four exponent bits biased by 7 rebias to 127, three mantissa
+// bits move to the top of F32's; exponent 0 is subnormal (mantissa × 2^-9). NaN bytes, which
+// checkpoints never store, decode as 480.
+inline float e4m3(uint b) {
+    uint e = (b >> 3) & 15u, m = b & 7u;
+    float v = e == 0 ? float(m) * 0.001953125f : as_type<float>(((e + 120u) << 23) | (m << 20));
+    return (b & 128u) != 0 ? -v : v;
+}
+
+inline float4 e4m3x4(uint q) {
+    return float4(e4m3(q & 255u), e4m3((q >> 8) & 255u), e4m3((q >> 16) & 255u), e4m3(q >> 24));
+}
+
+inline float4 e2m1x4(uint q) {
+    return float4(MXFP4_VALUES[q & 15], MXFP4_VALUES[(q >> 4) & 15], MXFP4_VALUES[(q >> 8) & 15],
+        MXFP4_VALUES[(q >> 12) & 15]);
+}
+
 template <uint FORMAT> inline void packed_weights8(device const uchar *w, ulong row, uint chunk,
     uint start, uint width, thread float4 &lo, thread float4 &hi, ulong scales = 0) {
-    if (FORMAT == 4) {
+    if (FORMAT == 5) {
+        // Sixteen-value blocks: the two halves may take different scales.
+        ulong first = row * width + chunk * 32 + start;
+        uint q = as_type<uint>(uchar4(*((device const packed_uchar4 *)(w + first / 2))));
+        lo = e2m1x4(q) * e4m3(w[scales + first / 16]);
+        hi = e2m1x4(q >> 16) * e4m3(w[scales + (first + 4) / 16]);
+    } else if (FORMAT == 6) {
+        ulong first = row * width + chunk * 32 + start;
+        float d = as_type<float>(uint(w[scales + first / 32]) << 23);
+        lo = e4m3x4(as_type<uint>(uchar4(*((device const packed_uchar4 *)(w + first))))) * d;
+        hi = e4m3x4(as_type<uint>(uchar4(*((device const packed_uchar4 *)(w + first + 4))))) * d;
+    } else if (FORMAT == 4) {
         block_weights8(w, row, chunk, start, width, lo, hi);
     } else if (FORMAT == 3) {
         ulong block = row * (width / 32) + chunk;

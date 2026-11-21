@@ -10,6 +10,10 @@ pub enum ToolSyntax {
     Gemma,
     /// `<|channel|>commentary to=functions.name <|constrain|>json<|message|>{...}`
     Harmony,
+    /// `<|message_model|>name<|content_invoke_tool_json|>{"name":…,"args":{…}}<|end_message|>`,
+    /// with the reply's text and reasoning in messages of their own. Grammars, streamed call
+    /// splitting and reasoning splitting do not cover it yet.
+    Inkling,
 }
 
 /// Definition of a callable tool (function) that the model can invoke.

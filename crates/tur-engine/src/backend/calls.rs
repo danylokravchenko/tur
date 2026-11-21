@@ -28,7 +28,7 @@ impl CallSplit {
         let (open, close) = match syntax {
             ToolSyntax::Xml => ("<tool_call>", "</tool_call>"),
             ToolSyntax::Gemma => ("<|tool_call>", "<tool_call|>"),
-            ToolSyntax::Harmony => return None,
+            ToolSyntax::Harmony | ToolSyntax::Inkling => return None,
         };
         Some(Self {
             open: tokenizer.token_to_id(open)?,

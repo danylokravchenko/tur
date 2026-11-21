@@ -65,7 +65,7 @@ Other results for Qwen3.5-0.8B on that 16 GB M1:
 
 ## Models
 
-Tur supports the Qwen3.5 family, Gemma 4 and gpt-oss for text, plus Whisper for transcription. Qwen3.5-family models and Gemma 4 also accept images and H.264 or HEVC video, and Gemma 4 E2B and E4B accept WAV audio. [Scope and principles](docs/src/design/scope.md) lists how far each model has been validated.
+Tur supports the Qwen3.5 family, Gemma 4, gpt-oss and Inkling 2 for text, plus Whisper for transcription. Qwen3.5-family models and Gemma 4 also accept images and H.264 or HEVC video, and Gemma 4 E2B and E4B accept WAV audio. [Scope and principles](docs/src/design/scope.md) lists how far each model has been validated.
 
 ## Get started
 

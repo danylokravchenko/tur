@@ -15,6 +15,7 @@ mod fused;
 mod gemma4;
 mod gguf;
 mod gpt_oss;
+mod inkling2;
 mod kernels;
 mod lsa;
 mod model_common;

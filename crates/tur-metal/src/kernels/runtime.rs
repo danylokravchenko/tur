@@ -26,7 +26,8 @@ use tur_core::{Result, TurError, execution::invalid};
 /// 5: windowed ungated tiled attention.
 /// 6: attention sinks and MXFP4 expert banks.
 /// 7: latent sparse attention index blocks and key lists.
-pub const LAYOUT_VERSION: u32 = 8;
+/// 9: NVFP4 and MXFP8 expert banks, sigmoid routing and Inkling 2's kernels.
+pub const LAYOUT_VERSION: u32 = 9;
 
 // Runtime Metal compilation has no local include search path, so embed the families as
 // one source string with shared helpers first.
@@ -48,6 +49,8 @@ const SOURCE: &str = concat!(
     include_str!("sampling.metal"),
     "\n",
     include_str!("lsa.metal"),
+    "\n",
+    include_str!("inkling.metal"),
 );
 const SIMD_WIDTH: usize = 32;
 
@@ -74,6 +77,26 @@ const FUNCTIONS: &[&str] = &[
     "moe_gemm_wide_mxfp4",
     "moe_bias_f32",
     "moe_glu_f32",
+    "moe_route_sigmoid_f32",
+    "moe_softcap_glu_f32",
+    "moe_gemv_nvfp4",
+    "moe_gemm_nvfp4",
+    "moe_gemm_wide_nvfp4",
+    "moe_gemv_mxfp8",
+    "moe_gemm_mxfp8",
+    "moe_gemm_wide_mxfp8",
+    "inkling_head_norm_f32",
+    "inkling_block_residual_f32",
+    "inkling_short_conv_f32",
+    "inkling_attention_r2_f32",
+    "inkling_attention_r2_f16",
+    "inkling_attention_r2_q8",
+    "inkling_attention_r4_f32",
+    "inkling_attention_r4_f16",
+    "inkling_attention_r4_q8",
+    "inkling_attention_r8_f32",
+    "inkling_attention_r8_f16",
+    "inkling_attention_r8_q8",
     "rope_scaled_f32",
     "rms_norm_f32",
     "add_rms_norm_f32",

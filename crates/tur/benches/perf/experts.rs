@@ -105,7 +105,7 @@ fn compare(reference: &[Vec<Vec<f32>>], candidate: &[Vec<Vec<f32>>]) -> (f64, f6
 /// routed to four experts, in MXFP4 and in `Q8_0`, and the cost of one GPU round trip.
 fn kernel_case() -> Result<()> {
     use candle_core::{Tensor, quantized::GgmlDType};
-    use tur_metal::{kernels::Kernels, packed::PackedLinear};
+    use tur_metal::{kernels::Kernels, packed::PackedLinear, quantize::Microscale};
     let device = Device::new_metal(0)?;
     let k = Kernels::new(&device)?;
     let (experts, rows, cols) = (32, 5760, 2880);
@@ -122,8 +122,8 @@ fn kernel_case() -> Result<()> {
         .map(|_| 118 + (next() % 6) as u8)
         .collect();
     let shape = (experts * rows, cols);
-    let mxfp4 = PackedLinear::mxfp4(&blocks, &scales, shape, &device)?;
-    let values = tur_metal::quantize::mxfp4_decode(&blocks, &scales)?;
+    let mxfp4 = PackedLinear::microscaled(Microscale::Mxfp4, &blocks, &scales, shape, &device)?;
+    let values = Microscale::Mxfp4.decode(&blocks, &scales)?;
     let q8 = PackedLinear::quantized(
         &Tensor::from_vec(values, shape, &Device::Cpu)?,
         GgmlDType::Q8_0,

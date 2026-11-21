@@ -87,6 +87,15 @@ python -I scripts/gpt_oss_reference.py --model "$TUR_GPT_OSS_20B" --golden "$TUR
 just test-checkpoint -E 'test(gpt_oss_20b)'
 ```
 
+The Inkling 2 Mini test compares all 48 layer applications and the logits with Transformers' own decoder layers, which the script runs one at a time, with F32 projections and the experts as published (about 22 GB resident):
+
+```sh
+export TUR_INKLING2_MINI=/models/Inkling-2-Mini   # ed40e7da625f594fc9c4990f5f66be24873c22d7
+export TUR_INKLING2_GOLDEN=/tmp/inkling2-mini.safetensors
+python -I scripts/inkling2_reference.py --model "$TUR_INKLING2_MINI" --golden "$TUR_INKLING2_GOLDEN"
+just test-checkpoint -j1 -E 'test(inkling2_mini)'
+```
+
 The image tests need an image file and goldens from `scripts/vision_reference.py`. The Qwen test compares F32 soft tokens and the whole greedy answer with Transformers; the Gemma test compares the Q8_0 tower by cosine similarity.
 
 ```sh
