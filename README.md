@@ -61,7 +61,7 @@ Other results for Qwen3.5-0.8B on that 16 GB M1:
 - Prompt-lookup speculation reaches up to 2.9× normal decoding on repetitive text.
 - With sparse attention, one sequence decodes 47.5 tokens/s at 128K tokens of context instead of 21.7, prefill after 64K runs at 733 tokens/s instead of 181, and a 64K-token prompt gets its first token in 80 s instead of 194 s.
 
-Inkling 2 Mini on the M3 Pro decodes 21.7 tokens/s for one sequence with 8-bit projections (25.2 with 4-bit), and its own block drafter generates new prose 1.2× and code up to 1.5× faster with the same output.
+Inkling 2 Mini on the M3 Pro decodes 22.5 tokens/s for one sequence with 8-bit projections (26.3 with 4-bit), and its own block drafter generates new prose 1.2× and code up to 1.5× faster with the same output.
 
 [Measured performance](docs/src/guide/performance.md) has the full tables, versions and methods.
 

@@ -6,7 +6,7 @@ use super::{
     Kernels, PagedKv, RecurrentSpans,
     runtime::{View, to_u32},
 };
-use crate::pool::AttentionPool;
+use crate::{packed::PackedLinear, pool::AttentionPool};
 use candle_core::{DType, Tensor};
 use candle_metal_kernels::metal::ComputeCommandEncoder;
 use tur_core::{
@@ -54,6 +54,48 @@ struct GateGemvParams {
 /// Most rows per group [`Kernels::gate_projection`] multiplies with its GEMV; each row reads
 /// the weights again, from cache at these sizes.
 pub const GATE_GEMV_ROWS: usize = 16;
+
+#[repr(C)]
+struct SmallExpertsParams {
+    up_scales: u64,
+    down_scales: u64,
+    tokens: u32,
+    experts: u32,
+    top_k: u32,
+    hidden: u32,
+    inter: u32,
+    x_stride: u32,
+    scale: f32,
+    gate_cap: f32,
+    up_cap: f32,
+}
+
+/// Most tokens [`Kernels::small_experts`] serves. On the M3 Pro one token's experts took
+/// 1.3 ms less per Inkling 2 decode step than the grouped kernels, while two tokens took
+/// 6.5 ms more and four 21 ms more: the grouped kernels read each expert once for its rows.
+pub const SMALL_EXPERT_TOKENS: usize = 1;
+/// Most experts a token selects there, and most a router scores.
+const SMALL_EXPERTS_K: usize = 8;
+const SMALL_ROUTER_EXPERTS: usize = 256;
+
+/// One layer's routed experts for [`Kernels::small_experts`].
+#[derive(Clone, Copy)]
+pub struct SmallExperts<'a> {
+    /// `[experts, hidden]` F32 router and its `[experts]` selection bias.
+    pub router: &'a Tensor,
+    pub bias: &'a Tensor,
+    /// Microscaled banks of one format: `[experts * 2 * inter, hidden]` with interleaved
+    /// gate and up rows, and `[experts * hidden, inter]`.
+    pub gate_up: &'a PackedLinear,
+    pub down: &'a PackedLinear,
+    /// `[experts, 2]` factors of the gate|up and down weights.
+    pub factors: &'a Tensor,
+    pub top_k: usize,
+    /// Scale of the normalized routing weights.
+    pub scale: f32,
+    /// Softcaps of the gate and the up halves.
+    pub caps: (f32, f32),
+}
 
 #[repr(C)]
 struct ShortConvParams {
@@ -294,6 +336,139 @@ impl Kernels {
                 Ok(())
             })?;
         self.finish(out, (groups, rows, outs))
+    }
+
+    /// Routed experts of up to [`SMALL_EXPERT_TOKENS`] tokens in four dispatches: the
+    /// router product, the selection of sigmoid routing without its grouping tables
+    /// (selection by score plus bias, weights normalized over the selection times `scale`,
+    /// ties to the lower ID), each selected expert's gate|up GEMV with the softcapped
+    /// `SwiGLU`, and the down GEMVs summed by routing weight in ascending expert ID. Each token gets what [`Self::route_sigmoid`]
+    /// and the grouped expert kernels give it. Returns `[tokens, hidden]`.
+    pub fn small_experts(&self, x: &Tensor, experts: SmallExperts<'_>) -> Result<Tensor> {
+        let (p, banks) = self.small_experts_params(x, &experts)?;
+        let ((up, up_format), (down, _)) = banks;
+        let xv = self.view(x)?;
+        let fv = self.view(experts.factors)?;
+        let (tokens, top_k) = (p.tokens as usize, p.top_k as usize);
+        let (hidden, inter) = (p.hidden as usize, p.inter as usize);
+        // The router's GEMV, then only the selection: no grouping tables.
+        let logits = x.matmul(&experts.router.t()?)?;
+        let selected = self.sigmoid_pairs(&logits, top_k, experts.bias, experts.scale)?;
+        let sv = self.view(&selected)?;
+        let act = self.output(tokens * top_k, inter)?;
+        let suffix = up_format.suffix();
+        let pipeline = self.pipeline(&format!("inkling_experts_up_small_{suffix}"))?;
+        let (groups, threads) = self.simdgroup_launch(pipeline, tokens * top_k * 2 * inter / 4);
+        self.runtime
+            .dispatch(pipeline, "tur_inkling_experts_up", groups, threads, |e| {
+                e.set_input_buffer(0, Some(up), 0);
+                xv.bind(e, 1)?;
+                sv.bind(e, 2)?;
+                fv.bind(e, 3)?;
+                act.bind(e, 4);
+                e.set_bytes(5, &p);
+                Ok(())
+            })?;
+        let out = self.output(tokens, hidden)?;
+        // A threadgroup per (token, four rows), a simdgroup per selected expert.
+        let pipeline = self.pipeline(&format!("inkling_experts_down_small_{suffix}"))?;
+        let threads = top_k * 32;
+        if pipeline.threads(threads) != threads {
+            return Err(invalid("small expert selections do not fit a threadgroup"));
+        }
+        self.runtime.dispatch(
+            pipeline,
+            "tur_inkling_experts_down",
+            tokens * hidden.div_ceil(4),
+            threads,
+            |e| {
+                e.set_input_buffer(0, Some(down), 0);
+                act.bind(e, 1);
+                sv.bind(e, 2)?;
+                out.bind(e, 3);
+                e.set_bytes(4, &p);
+                Ok(())
+            },
+        )?;
+        self.finish(out, (tokens, hidden))
+    }
+
+    /// Validated parameters of [`Self::small_experts`], and its banks' buffers and format.
+    #[allow(
+        clippy::type_complexity,
+        reason = "each bank's buffer and format, used once by the caller"
+    )]
+    fn small_experts_params<'b>(
+        &self,
+        x: &Tensor,
+        e: &SmallExperts<'b>,
+    ) -> Result<(
+        SmallExpertsParams,
+        (
+            (
+                &'b candle_metal_kernels::metal::Buffer,
+                crate::quantize::Microscale,
+            ),
+            (
+                &'b candle_metal_kernels::metal::Buffer,
+                crate::quantize::Microscale,
+            ),
+        ),
+    )> {
+        let xv = self.view(x)?;
+        let (tokens, hidden) = (xv.rows, xv.cols);
+        let [experts, router_width] = e.router.dims() else {
+            return Err(invalid("expert router is not a matrix"));
+        };
+        let experts = *experts;
+        let bank = |layer: &'b PackedLinear| {
+            layer
+                .microscaled_buffer()
+                .filter(|(buffer, _, _)| buffer.length() >= layer.resident_bytes())
+                .ok_or_else(|| invalid("small expert banks are microscaled"))
+        };
+        let (up, up_scales, up_format) = bank(e.gate_up)?;
+        let (down, down_scales, down_format) = bank(e.down)?;
+        let inter = e.down.in_features();
+        let caps = [e.caps.0, e.caps.1, e.scale];
+        if tokens == 0
+            || tokens > SMALL_EXPERT_TOKENS
+            || *router_width != hidden
+            || experts == 0
+            || experts > SMALL_ROUTER_EXPERTS
+            || e.top_k == 0
+            || e.top_k > SMALL_EXPERTS_K.min(experts)
+            || e.bias.dims() != [experts]
+            || e.factors.dims() != [experts, 2]
+            || up_format != down_format
+            || !matches!(
+                up_format,
+                crate::quantize::Microscale::Nvfp4 | crate::quantize::Microscale::Mxfp8
+            )
+            || e.gate_up.in_features() != hidden
+            || e.gate_up.out_features() != experts * 2 * inter
+            || e.down.out_features() != experts * hidden
+            || !hidden.is_multiple_of(32)
+            || !inter.is_multiple_of(32)
+            || !caps.iter().all(|c| c.is_finite() && *c > 0.0)
+        {
+            return Err(invalid("small expert shapes do not match"));
+        }
+        self.view(e.router)?.contiguous("expert router")?;
+        let p = SmallExpertsParams {
+            up_scales: up_scales as u64,
+            down_scales: down_scales as u64,
+            tokens: to_u32(tokens, "tokens")?,
+            experts: to_u32(experts, "experts")?,
+            top_k: to_u32(e.top_k, "top-k")?,
+            hidden: to_u32(hidden, "hidden")?,
+            inter: to_u32(inter, "intermediate width")?,
+            x_stride: to_u32(xv.row_stride, "row stride")?,
+            scale: e.scale,
+            gate_cap: e.caps.0,
+            up_cap: e.caps.1,
+        };
+        Ok((p, ((up, up_format), (down, down_format))))
     }
 
     /// Mix each message into its input as [`Self::message_pair`] pairs them:

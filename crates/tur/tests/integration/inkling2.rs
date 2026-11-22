@@ -617,6 +617,82 @@ mod kernels {
         Ok(())
     }
 
+    /// The fused path equals the grouped one: sigmoid routing's selection, the gate|up GEMV
+    /// and softcapped `SwiGLU` with per-expert factors, and the down GEMVs summed in
+    /// ascending expert ID, for NVFP4 and MXFP8 banks and up to its token limit, including
+    /// gates large enough that an unclamped `tanh` returned NaN.
+    #[test]
+    fn test_small_experts_match_the_grouped_kernels() -> Result<()> {
+        use tur_metal::kernels::{SMALL_EXPERT_TOKENS, SmallExperts};
+        let (device, kernels, _gpu) = setup()?;
+        let (experts, top_k, hidden, inter) = (32, 8, 64, 96);
+        let values = |count: usize, seed: u64, scale: f32| -> Vec<f32> {
+            let mut state = seed;
+            (0..count)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((state >> 40) as f32 / (1u64 << 24) as f32).mul_add(2.0, -1.0) * scale
+                })
+                .collect()
+        };
+        let router =
+            Tensor::from_vec(values(experts * hidden, 1, 0.5), (experts, hidden), &device)?;
+        let bias = Tensor::from_vec(values(experts, 2, 0.2), experts, &device)?;
+        let factors: Vec<f32> = values(experts * 2, 3, 0.5)
+            .iter()
+            .map(|v| 1.0 + v)
+            .collect();
+        let factors = Tensor::from_vec(factors, (experts, 2), &device)?;
+        for format in [Microscale::Nvfp4, Microscale::Mxfp8] {
+            let (up_values, up_scales) = bank(format, experts * 2 * inter, hidden, 4);
+            let gate_up = PackedLinear::microscaled(
+                format,
+                &up_values,
+                &up_scales,
+                (experts * 2 * inter, hidden),
+                &device,
+            )?;
+            let (down_values, down_scales) = bank(format, experts * hidden, inter, 5);
+            let down = PackedLinear::microscaled(
+                format,
+                &down_values,
+                &down_scales,
+                (experts * hidden, inter),
+                &device,
+            )?;
+            for tokens in 1..=SMALL_EXPERT_TOKENS {
+                let x = values(tokens * hidden, 6 + tokens as u64, 1.0);
+                let x = Tensor::from_vec(x, (tokens, hidden), &device)?;
+                let (scale, caps) = (2.5, (4.0, 25.0));
+                let logits = x.matmul(&router.t()?)?;
+                let routes = kernels.route_sigmoid(&logits, top_k, &bias, scale)?;
+                let up = kernels.expert_linear_routed(&gate_up, &x, &routes)?;
+                let act = kernels.expert_softcap_glu(&up, &factors, &routes, caps)?;
+                let grouped = kernels
+                    .expert_scatter(&kernels.expert_linear(&down, &act, &routes)?, &routes)?;
+                let fused = kernels.small_experts(
+                    &x,
+                    SmallExperts {
+                        router: &router,
+                        bias: &bias,
+                        gate_up: &gate_up,
+                        down: &down,
+                        factors: &factors,
+                        top_k,
+                        scale,
+                        caps,
+                    },
+                )?;
+                let expected: Vec<f64> = read(&grouped)?.into_iter().map(f64::from).collect();
+                let error = relative_error(&read(&fused)?, &expected);
+                assert!(error < 1e-5, "{format:?} tokens {tokens}: {error}");
+            }
+        }
+        Ok(())
+    }
+
     /// Selection by sigmoid score plus bias, weights from the sigmoid scores alone,
     /// normalized over the selection and scaled.
     #[test]

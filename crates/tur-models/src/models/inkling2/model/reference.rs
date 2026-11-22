@@ -259,6 +259,7 @@ impl Reference<'_, '_> {
         let columns = config.conv_columns();
         let state = 2 * application + 1;
         let projected = a.query.forward(inputs[0])?;
+        let (keys, values) = (a.key.forward(inputs[1])?, a.value.forward(inputs[2])?);
         let tau = (!sliding)
             .then(|| log_scale(self.model, self.pass.positions, projected.device()))
             .transpose()?;
@@ -290,25 +291,23 @@ impl Reference<'_, '_> {
         } else {
             ((2 * taps + 1) as f64).sqrt()
         };
-        let mut side =
-            |input: &Tensor, weights: &tur_metal::packed::PackedLinear, conv: &Tensor, column| {
-                let projected = weights.forward(input)?;
-                let dynamic = (!sliding)
-                    .then(|| projected.narrow(1, width, kv_heads * taps))
-                    .transpose()?;
-                let rows = projected.narrow(1, 0, width)?;
-                let spec = (column, dynamic.as_ref().map(|d| (d, dim)), divisor);
-                Ok::<_, tur_core::TurError>(
-                    self.conv(state, &rows, conv, spec, pending)?
-                        .reshape((n, kv_heads, dim))?,
-                )
-            };
+        let mut side = |projected: &Tensor, conv: &Tensor, column| {
+            let dynamic = (!sliding)
+                .then(|| projected.narrow(1, width, kv_heads * taps))
+                .transpose()?;
+            let rows = projected.narrow(1, 0, width)?;
+            let spec = (column, dynamic.as_ref().map(|d| (d, dim)), divisor);
+            Ok::<_, tur_core::TurError>(
+                self.conv(state, &rows, conv, spec, pending)?
+                    .reshape((n, kv_heads, dim))?,
+            )
+        };
         let key = clip(
-            &side(inputs[1], &a.key, &a.key_taps, columns.key)?,
+            &side(&keys, &a.key_taps, columns.key)?,
             t.qk_l2_clip_threshold,
         )?;
         let value = unit_rms(
-            &side(inputs[2], &a.value, &a.value_taps, columns.value)?,
+            &side(&values, &a.value_taps, columns.value)?,
             t.rms_norm_eps,
         )?;
         let store = super::attention_store(self.pass.pool, application)?;

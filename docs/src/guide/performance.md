@@ -641,11 +641,11 @@ The machine is the M3 Pro described above, on macOS 27.2, with F16 K/V. Figures 
 
 | Case | Q8_0 projections | Q4K projections |
 | --- | --- | --- |
-| Prefill, 512 tokens | 327 tokens/s | 319 tokens/s |
+| Prefill, 512 tokens | 327 tokens/s | 325 tokens/s |
 | Prefill, 2,048 tokens | 294 tokens/s | |
-| Decode, 1 sequence at 128 tokens | 21.7 tokens/s (46.0 ms per step) | 25.2 tokens/s (39.7 ms) |
-| Decode, 4 sequences at 128 tokens | 44.5 tokens/s | 46.9 tokens/s |
-| Decode, 1 sequence at 4K tokens | 21.0 tokens/s | 23.9 tokens/s |
+| Decode, 1 sequence at 128 tokens | 22.5 tokens/s (44.4 ms per step) | 26.3 tokens/s (38.0 ms) |
+| Decode, 4 sequences at 128 tokens | 46.1 tokens/s | 51.8 tokens/s |
+| Decode, 1 sequence at 4K tokens | 21.5 tokens/s | 24.8 tokens/s |
 | Load time | 8.7 s | 17.4 s |
 
 With one sequence, removing a part of the step and timing the rest attributes about 19 ms to the experts and 14 ms to attention, close to what reading their weights costs at this Mac's bandwidth, so Q4K projections are the remaining lever for one sequence. Splitting keys across simdgroups keeps decode at 4K tokens within 5% of decode at 128; before the split, one sequence at 4K took 77 ms per step. A 2,048-token prefill spends about half its time in the experts, which do three times the arithmetic per token of Qwen3.6-35B-A3B's, and about 30% in the per-query attention kernel.

@@ -175,12 +175,31 @@ impl Kernels {
         self.routing(logits, top_k, Selection::Sigmoid { bias, scale })
     }
 
-    fn routing(
+    /// Each token's `(expert, weight)` pairs in rank order, `[tokens, 2 * top_k]` F32, from
+    /// sigmoid routing as [`Self::route_sigmoid`] selects them, without the grouping tables
+    /// the grouped expert kernels read.
+    pub(super) fn sigmoid_pairs(
+        &self,
+        logits: &Tensor,
+        top_k: usize,
+        bias: &Tensor,
+        scale: f32,
+    ) -> Result<Tensor> {
+        if !scale.is_finite() {
+            return Err(invalid("routing scale must be finite"));
+        }
+        Ok(self
+            .selected_pairs(logits, top_k, Selection::Sigmoid { bias, scale })?
+            .0)
+    }
+
+    /// Validate routing and dispatch its selection: the pairs and their parameters.
+    fn selected_pairs(
         &self,
         logits: &Tensor,
         top_k: usize,
         selection: Selection<'_>,
-    ) -> Result<ExpertRoutes> {
+    ) -> Result<(Tensor, RouteParams)> {
         let x = self.view(logits)?;
         let (tokens, experts) = (x.rows, x.cols);
         let assignments = tokens
@@ -237,7 +256,18 @@ impl Kernels {
                 sv.as_ref().unwrap_or(&x).bind(e, 3)?;
                 Ok(())
             })?;
-        let selected = self.finish(selected, (tokens, top_k * 2))?;
+        Ok((self.finish(selected, (tokens, top_k * 2))?, p))
+    }
+
+    fn routing(
+        &self,
+        logits: &Tensor,
+        top_k: usize,
+        selection: Selection<'_>,
+    ) -> Result<ExpertRoutes> {
+        let (selected, p) = self.selected_pairs(logits, top_k, selection)?;
+        let (tokens, experts) = (p.tokens as usize, p.experts as usize);
+        let assignments = tokens * top_k;
         let sv = self.view(&selected)?;
         let blocks = assignments.div_ceil(BLOCK);
         let hist = self.output(blocks, experts)?;

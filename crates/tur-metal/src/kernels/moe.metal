@@ -593,6 +593,11 @@ kernel void moe_glu_f32(device const float *x [[buffer(0)]], device const float 
 // output its `down` factor, which the down projection is linear in: a per-expert factor of
 // the weights (an NVFP4 checkpoint's second-level scale) moves out of the matrices.
 struct MoeSoftcapParams { uint rows, width, stride; float gate_cap, up_cap; };
+// cap * tanh(x / cap). Metal's tanh returned NaN for arguments near 50, so they are clamped
+// first: tanh(±20) already rounds to ±1 in F32, so no finite result changes.
+static inline float softcap(float x, float cap) {
+    return tanh(clamp(x / cap, -20.0f, 20.0f)) * cap;
+}
 kernel void moe_softcap_glu_f32(device const float *x [[buffer(0)]], device const float *order [[buffer(1)]],
     device const float *factors [[buffer(2)]], device float *y [[buffer(3)]], constant MoeSoftcapParams &p [[buffer(4)]],
     uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]]) {
@@ -603,8 +608,7 @@ kernel void moe_softcap_glu_f32(device const float *x [[buffer(0)]], device cons
     device float *yr = y + ulong(row) * p.width;
     for (uint i = tid; i < p.width; i += threads) {
         float gate = xr[2 * i] * up_factor, up = xr[2 * i + 1] * up_factor;
-        float capped = tanh(gate / p.gate_cap) * p.gate_cap;
-        yr[i] = capped * (1.0f / (1.0f + exp(-gate))) * (tanh(up / p.up_cap) * p.up_cap) * down_factor;
+        yr[i] = softcap(gate, p.gate_cap) * (1.0f / (1.0f + exp(-gate))) * softcap(up, p.up_cap) * down_factor;
     }
 }
 

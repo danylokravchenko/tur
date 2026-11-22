@@ -11,7 +11,7 @@ mod moe;
 mod runtime;
 pub use inkling::{
     Clipped, GATE_GEMV_ROWS, HeadNorm, LogScale, RESIDUAL_ENTRIES, RESIDUAL_QUERIES, Relative,
-    ShortConv,
+    SMALL_EXPERT_TOKENS, ShortConv, SmallExperts,
 };
 pub use lsa::{ClusterJob, IndexMap, IndexTable, SparseBudget, SparseKeys};
 pub use moe::{ExpertRoutes, SharedExpert};

@@ -566,7 +566,10 @@ kernel void inkling_message_gate_f32(
     device float *o = out + ulong(row) * p.width;
     float sum = 0.0f;
     for (uint i = tid; i < p.width; i += threads) {
-        float v = xr[i] - tanh(gr[i]) * xr[i] + tanh(gr[p.width + i]) * mr[i];
+        // Clamped as softcap clamps: tanh(±20) rounds to ±1, and larger arguments gave NaN.
+        float forget = tanh(clamp(gr[i], -20.0f, 20.0f));
+        float gain = tanh(clamp(gr[p.width + i], -20.0f, 20.0f));
+        float v = xr[i] - forget * xr[i] + gain * mr[i];
         o[i] = v;
         sum = fma(v, v, sum);
     }
@@ -620,3 +623,155 @@ kernel void inkling_gate_gemv_f32(
         }
     }
 }
+
+// Routed experts of a few tokens after their selection (moe_route_sigmoid_f32), for decode
+// and verification passes: each selected expert's gate|up GEMV with the softcapped SwiGLU,
+// then the down GEMV of every selected expert with their weighted sum. The GEMVs walk rows
+// as moe_gemv does and the sum runs in ascending expert ID as moe_scatter_f32 does, so each
+// token's result is what the grouped kernels compute without their grouping tables.
+#define SMALL_EXPERTS_K 8u
+#define SMALL_EXPERTS_NR 4u
+
+struct InklingSmallExpertsParams {
+    // Byte offsets of the gate|up and down banks' scales.
+    ulong up_scales;
+    ulong down_scales;
+    uint tokens;
+    uint experts;
+    uint top_k;
+    uint hidden;
+    uint inter;
+    uint x_stride;
+    float scale;
+    float gate_cap;
+    float up_cap;
+};
+
+// One simdgroup per (token, selected expert, four interleaved gate|up rows): the GEMV of
+// moe_gemv, then two softcapped SwiGLU outputs with the expert's factors, as
+// moe_softcap_glu_f32 computes them. Writes act[token][k][inter].
+template <uint FORMAT>
+kernel void inkling_experts_up_small(
+    device const uchar *w [[buffer(0)]],
+    device const float *x [[buffer(1)]],
+    device const float *selected [[buffer(2)]],
+    device const float *factors [[buffer(3)]],
+    device float *act [[buffer(4)]],
+    constant InklingSmallExpertsParams &p [[buffer(5)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgs [[simdgroups_per_threadgroup]]) {
+    constexpr uint NR = SMALL_EXPERTS_NR;
+    uint rows = 2 * p.inter, blocks = rows / NR;
+    uint item = tg * sgs + sg;
+    if (item >= p.tokens * p.top_k * blocks) {
+        return;
+    }
+    uint block = item % blocks, assignment = item / blocks;
+    uint token = assignment / p.top_k;
+    uint expert = uint(selected[ulong(assignment) * 2]);
+    uint col = block * NR;
+    ulong base = ulong(expert) * rows;
+    device const float *xr = x + ulong(token) * p.x_stride;
+    float acc[NR];
+    for (uint r = 0; r < NR; ++r) {
+        acc[r] = 0.0f;
+    }
+    uint ix = lane / 4, start = (lane % 4) * 8;
+    for (uint chunk = ix; chunk < p.hidden / 32; chunk += 8) {
+        device const float *xb = xr + chunk * 32 + start;
+        float4 xl = float4(xb[0], xb[1], xb[2], xb[3]);
+        float4 xh = float4(xb[4], xb[5], xb[6], xb[7]);
+        for (uint r = 0; r < NR; ++r) {
+            float4 lo, hi;
+            packed_weights8<FORMAT>(w, base + col + r, chunk, start, p.hidden, lo, hi, p.up_scales);
+            acc[r] += dot(lo, xl) + dot(hi, xh);
+        }
+    }
+    for (uint r = 0; r < NR; ++r) {
+        acc[r] = simd_sum(acc[r]);
+    }
+    if (lane != 0) {
+        return;
+    }
+    float up_factor = factors[2 * expert], down_factor = factors[2 * expert + 1];
+    for (uint pair = 0; pair < NR / 2; ++pair) {
+        float gate = acc[2 * pair] * up_factor, up = acc[2 * pair + 1] * up_factor;
+        act[ulong(assignment) * p.inter + col / 2 + pair] =
+            softcap(gate, p.gate_cap) * (1.0f / (1.0f + exp(-gate))) * softcap(up, p.up_cap) * down_factor;
+    }
+}
+
+// One threadgroup per (token, four output rows) with a simdgroup per selected expert: its
+// down GEMV over its activations, then, in threadgroup memory, their weighted sum in
+// ascending expert ID. Writes y[token][hidden].
+template <uint FORMAT>
+kernel void inkling_experts_down_small(
+    device const uchar *w [[buffer(0)]],
+    device const float *act [[buffer(1)]],
+    device const float *selected [[buffer(2)]],
+    device float *y [[buffer(3)]],
+    constant InklingSmallExpertsParams &p [[buffer(4)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint k [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint NR = SMALL_EXPERTS_NR, K = SMALL_EXPERTS_K;
+    threadgroup float partial[K][NR];
+    uint blocks = (p.hidden + NR - 1) / NR;
+    uint token = tg / blocks, col = (tg % blocks) * NR;
+    device const float *sel = selected + ulong(token) * p.top_k * 2;
+    ulong base = ulong(uint(sel[k * 2])) * p.hidden;
+    device const float *xr = act + (ulong(token) * p.top_k + k) * p.inter;
+    float acc[NR];
+    for (uint r = 0; r < NR; ++r) {
+        acc[r] = 0.0f;
+    }
+    uint ix = lane / 4, start = (lane % 4) * 8;
+    for (uint chunk = ix; chunk < p.inter / 32; chunk += 8) {
+        device const float *xb = xr + chunk * 32 + start;
+        float4 xl = float4(xb[0], xb[1], xb[2], xb[3]);
+        float4 xh = float4(xb[4], xb[5], xb[6], xb[7]);
+        for (uint r = 0; r < NR; ++r) {
+            float4 lo, hi;
+            packed_weights8<FORMAT>(w, base + min(col + r, p.hidden - 1), chunk, start, p.inter, lo, hi,
+                p.down_scales);
+            acc[r] += dot(lo, xl) + dot(hi, xh);
+        }
+    }
+    for (uint r = 0; r < NR; ++r) {
+        acc[r] = simd_sum(acc[r]);
+        if (lane == 0) {
+            partial[k][r] = acc[r] * sel[k * 2 + 1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid >= NR || col + tid >= p.hidden) {
+        return;
+    }
+    // Ascending expert ID, as the grouped path's scatter sums.
+    float sum = 0.0f;
+    for (uint n = 0; n < p.top_k; ++n) {
+        uint k_n = 0;
+        for (uint j = 0; j < p.top_k; ++j) {
+            uint rank = 0;
+            for (uint i = 0; i < p.top_k; ++i) {
+                rank += sel[i * 2] < sel[j * 2];
+            }
+            k_n = rank == n ? j : k_n;
+        }
+        sum += partial[k_n][tid];
+    }
+    y[ulong(token) * p.hidden + col + tid] = sum;
+}
+
+#define INKLING_SMALL_EXPERTS(FORMAT, NAME) \
+    template [[host_name("inkling_experts_up_small_" #NAME)]] kernel void inkling_experts_up_small<FORMAT>( \
+        device const uchar *, device const float *, device const float *, device const float *, device float *, \
+        constant InklingSmallExpertsParams &, uint, uint, uint, uint); \
+    template [[host_name("inkling_experts_down_small_" #NAME)]] kernel void inkling_experts_down_small<FORMAT>( \
+        device const uchar *, device const float *, device const float *, device float *, \
+        constant InklingSmallExpertsParams &, uint, uint, uint, uint);
+INKLING_SMALL_EXPERTS(5, nvfp4)
+INKLING_SMALL_EXPERTS(6, mxfp8)

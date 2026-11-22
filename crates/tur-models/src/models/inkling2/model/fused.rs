@@ -4,7 +4,8 @@ use crate::models::paging::Paging;
 use candle_core::Tensor;
 use tur_core::{Result, execution::invalid};
 use tur_metal::kernels::{
-    Clipped, HeadNorm, Heads, Kernels, LogScale, RecurrentSpan, RecurrentSpans, Relative, ShortConv,
+    Clipped, HeadNorm, Heads, Kernels, LogScale, RecurrentSpan, RecurrentSpans, Relative,
+    SMALL_EXPERT_TOKENS, ShortConv, SmallExperts,
 };
 
 /// Addressing and per-pass inputs every layer shares.
@@ -106,13 +107,12 @@ impl Fused<'_, '_> {
             .message_gate(h, &message, &mix, &layer.post_norm, self.eps())
     }
 
-    /// One convolved side of the attention: its projection, then the short convolution
-    /// reading dynamic taps from the projection's last columns in full attention layers,
-    /// with each head normalized as `norm` says in the same pass.
+    /// One convolved side of the attention from its `projected` rows: the short
+    /// convolution, reading dynamic taps from the rows' last columns in full attention
+    /// layers, with each head normalized as `norm` says in the same pass.
     fn side(
         &self,
-        input: &Tensor,
-        weights: &tur_metal::packed::PackedLinear,
+        projected: &Tensor,
         taps: &Tensor,
         (application, index, column): (usize, usize, usize),
         norm: HeadNorm,
@@ -120,7 +120,6 @@ impl Fused<'_, '_> {
         let t = &self.config().text;
         let width = t.num_key_value_heads * t.head_dim;
         let sliding = self.config().sliding(index);
-        let projected = self.k.linear(weights, input)?;
         let taps_count = t.sconv_kernel_size;
         let divisor = if sliding {
             taps_count + 1
@@ -128,13 +127,13 @@ impl Fused<'_, '_> {
             2 * taps_count + 1
         };
         self.k.short_conv(
-            &projected,
+            projected,
             &self.recurrent,
             ShortConv {
                 taps,
                 pool: &self.pass.pool.recurrent(2 * application + 1)?.convolution,
                 offset: column,
-                dynamic: (!sliding).then_some((&projected, width, t.head_dim)),
+                dynamic: (!sliding).then_some((projected, width, t.head_dim)),
                 divisor: (divisor as f32).sqrt(),
                 residual: None,
                 norm: Some((t.head_dim, norm)),
@@ -155,6 +154,8 @@ impl Fused<'_, '_> {
         let sliding = config.sliding(index);
         let columns = config.conv_columns();
         let projected = self.k.linear(&a.query, &inputs[0])?;
+        let keys = self.k.linear(&a.key, &inputs[1])?;
+        let values = self.k.linear(&a.value, &inputs[2])?;
         let log_scale = (!sliding).then_some(LogScale {
             positions: &self.positions,
             alpha: t.log_scaling_alpha as f32,
@@ -168,8 +169,7 @@ impl Fused<'_, '_> {
             threshold: threshold as f32,
         };
         let key = self.side(
-            &inputs[1],
-            &a.key,
+            &keys,
             &a.key_taps,
             (application, index, columns.key),
             HeadNorm::Clip {
@@ -177,8 +177,7 @@ impl Fused<'_, '_> {
             },
         )?;
         let value = self.side(
-            &inputs[2],
-            &a.value,
+            &values,
             &a.value_taps,
             (application, index, columns.value),
             HeadNorm::Rms {
@@ -212,9 +211,26 @@ impl Fused<'_, '_> {
         self.k.linear(&a.output, &attended)
     }
 
+    /// The routed experts of `h`: three fused dispatches for decode-sized passes, the
+    /// grouped kernels (which read each selected expert once for all its rows) beyond.
     fn experts(&self, layer: &Layer, h: &Tensor) -> Result<Tensor> {
         let t = &self.config().text;
         let e = &layer.experts;
+        if h.dim(0)? <= SMALL_EXPERT_TOKENS {
+            return self.k.small_experts(
+                h,
+                SmallExperts {
+                    router: &e.router,
+                    bias: &e.bias,
+                    gate_up: &e.gate_up,
+                    down: &e.down,
+                    factors: &e.factors,
+                    top_k: t.num_experts_per_tok,
+                    scale: t.route_scale as f32,
+                    caps: (t.mlp_gate_softcap as f32, t.mlp_up_softcap as f32),
+                },
+            );
+        }
         let logits = h.matmul(&e.router.t()?)?;
         let routes = self.k.route_sigmoid(
             &logits,

@@ -28,6 +28,7 @@ Custom kernels pay off in three places. Fusing small steps such as norms, gates 
 | Decode attention, Q8 pools | below the tiled crossover, even query heads per K/V head | `attention_h2_r*_q8`: two query heads share each K/V load |
 | Decode attention, F32/F16 pools | below the tiled crossover | `attention_r*`, split over ranges of at least 64 keys |
 | MoE experts | ≤ 3 / 4–16 / > 16 rows per expert | GEMV / matrix units / wide F16-staged tiles |
+| Inkling 2 experts | one-token passes | the router product, `moe_route_sigmoid_f32` alone, `inkling_experts_up_small_*` (gate\|up GEMV and softcapped `SwiGLU`), `inkling_experts_down_small_*` (a simdgroup per selected expert, summed in ascending ID) |
 | Inkling 2 attention | every pass | `inkling_attention_r*`: one simdgroup per query and head over pages in place, split over ranges of at least 64 keys; `inkling_attention_reduce_r*` joins the splits |
 | Inkling 2 convolutions and attention residuals | every pass | `inkling_short_conv` (adding the residual stream), `inkling_short_conv_norm` (keys and values, a threadgroup per head), `inkling_block_residual` |
 | Inkling 2 loop-pass messages | looped layers after the first pass | `inkling_message_pair`, `inkling_gate_gemv` over BF16 weights twice (up to 16 rows; Candle's product above), then `inkling_message_gate` |
@@ -48,6 +49,8 @@ Inkling 2's attention adds its relative bias inside the score reduction: lane `r
 ## Decisions
 
 On the M3 Pro, a dependent small dispatch costs about 5 µs: 480 extra norm launches per Inkling 2 token added 2.5 ms. Folding the residual adds into the convolutions, the key and value norms into theirs, and the query and relative-state clips into the attention removes six launches from each of its 48 layer applications; in alternating runs, decode with one sequence took 46.4 to 47.0 ms per step against 47.5 to 48.0 without.
+
+Inkling 2 runs a single token's routed experts in four dispatches instead of nine: the selection skips the grouping tables, the activation joins the up GEMV, and the weighted sum joins the down GEMV. Each expert's GEMV walks its rows as `moe_gemv` does and the sum runs in ascending expert ID, so the result is the grouped kernels'. In alternating runs on the M3 Pro, decode with one sequence took 44.2 ms per step against 45.3 to 45.7; two tokens or more stay on the grouped kernels (see [Rejected experiments](../design/rejected.md)). The softcapped activation clamps its `tanh` argument to ±20, where `tanh` already rounds to ±1: Metal's `tanh` returned NaN near 50, which a gate of about 190 reached.
 
 Measured on an M1:
 

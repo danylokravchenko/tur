@@ -270,7 +270,7 @@ On a Mac with room for 12.8 GiB, remove `expert_cache_mb` so that no token waits
 
 Load the published checkpoint directly. Its experts run as the NVFP4 and MXFP8 blocks they ship in, and only the attention projections and the unembedding convert at load, so there is no artifact or GGUF form to make. The experts are 15.7 GB of the 16.6 GiB of weights whatever the format, so the model needs a Mac with 32 GB or more; on a 36 GB M3 Pro the plan reserves 23 GB with one 8K-token context. It has no expert cache.
 
-Q8_0 projections decode one sequence at 21.7 tokens/s. `weight_format = "q4k"` reaches 25.2 tokens/s and saves only 0.5 GiB, because the experts don't change, and its quality against Transformers hasn't been measured, so start with Q8_0. Each token runs 48 layer applications, so a 2K-token prompt prefills at about 290 tokens/s, about 7 s.
+Q8_0 projections decode one sequence at 22.5 tokens/s. `weight_format = "q4k"` reaches 26.3 tokens/s and saves only 0.5 GiB, because the experts don't change, and its quality against Transformers hasn't been measured, so start with Q8_0. Each token runs 48 layer applications, so a 2K-token prompt prefills at about 290 tokens/s, about 7 s.
 
 With one user, turn on the drafter in `mtp.safetensors` and give it room for its whole block. New prose generated 1.2× and code 1.2 to 1.5× faster, and outputs match normal decoding. It chains its drafts only while one request is decoding, and a verified draft costs about 14 ms on this MoE, so leave it off for wider batches until that is measured:
 
@@ -287,7 +287,7 @@ served_model_name = "inkling-2-mini"
 max_batch_size = 1
 ```
 
-Prompt lookup alone (`speculative_draft = 4`) ran 1.4× faster on repetitive output. Decode stays nearly flat with context, 47.6 ms per step at 4K tokens against 46.0 at 128, so `context_tokens` is limited by memory rather than speed. Two gaps remain: the model writes its reasoning and answer as separate messages that Tur doesn't split yet, so reasoning reaches the answer text, and images aren't supported.
+Prompt lookup alone (`speculative_draft = 4`) ran 1.4× faster on repetitive output. Decode stays nearly flat with context, 46.6 ms per step at 4K tokens against 44.4 at 128, so `context_tokens` is limited by memory rather than speed. Two gaps remain: the model writes its reasoning and answer as separate messages that Tur doesn't split yet, so reasoning reaches the answer text, and images aren't supported.
 
 ## Whisper large-v3-turbo
 
