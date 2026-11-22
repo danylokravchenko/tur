@@ -1,7 +1,7 @@
 //! Separates a forced answer from the reasoning before it, for models that write both in one
 //! stream. Without this, a client parsing `content` as JSON would read the reasoning too.
 
-use super::{harmony::Fragment, tokenizer::TokenOutputStream};
+use super::{messages::Fragment, tokenizer::TokenOutputStream};
 use crate::Result;
 use tokenizers::Tokenizer;
 

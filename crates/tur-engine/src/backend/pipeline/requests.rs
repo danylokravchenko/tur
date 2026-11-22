@@ -3,7 +3,7 @@
 use super::super::{
     calls::{CallSplit, Calls},
     guidance::{GuidanceControl, ParserFactory, TopLevelGrammar, build_llg_factory, token_bytes},
-    harmony::{Fragment, Harmony},
+    messages::{Fragment, MessageSplit},
     prefix::HeadEntry,
     reasoning::{ReasoningSplit, Route},
     speculation::{Acceptance, NgramIndex},
@@ -261,9 +261,9 @@ impl Pending {
             Some(split) => split.push(token)?,
             None => Route::Answer,
         };
-        let fragment = match (route, &mut self.harmony) {
+        let fragment = match (route, &mut self.messages) {
             (Route::Taken(fragment), _) => fragment,
-            (Route::Answer, Some(harmony)) => harmony.push(token)?,
+            (Route::Answer, Some(messages)) => messages.push(token)?,
             (Route::Answer, None) if self.calls.as_mut().is_some_and(|c| c.take(token)) => {
                 Fragment::default()
             }
@@ -287,8 +287,8 @@ impl Pending {
             .as_ref()
             .map(|split| split.finish(self.stream.tokenizer(), &self.tools))
             .transpose()?;
-        let mut fragment = match &mut self.harmony {
-            Some(harmony) => harmony.finish()?,
+        let mut fragment = match &mut self.messages {
+            Some(messages) => messages.finish()?,
             None => Fragment {
                 content: self.stream.decode_rest()?,
                 reasoning: self
@@ -306,11 +306,11 @@ impl Pending {
         if let Some(text) = self.stop.flush() {
             output.new_tokens.push((id, text));
         }
-        let (mut content, reasoning, tool_calls) = if let Some(harmony) = &mut self.harmony {
+        let (mut content, reasoning, tool_calls) = if let Some(messages) = &mut self.messages {
             (
-                harmony.content()?,
-                harmony.reasoning()?,
-                harmony.tool_calls(&self.tools)?,
+                messages.content()?,
+                messages.reasoning()?,
+                messages.tool_calls(&self.tools)?,
             )
         } else {
             let reasoning = self
@@ -638,9 +638,7 @@ impl InferencePipeline {
                 prefix_checked: None,
                 running: false,
                 stream: TokenOutputStream::new(self.tokenizer.clone()),
-                harmony: (self.tool_syntax() == ToolSyntax::Harmony)
-                    .then(|| Harmony::new(&self.tokenizer))
-                    .flatten(),
+                messages: MessageSplit::new(self.tool_syntax(), &self.tokenizer),
                 stop,
                 max_tokens,
                 arrival,
