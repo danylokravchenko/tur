@@ -17,8 +17,8 @@ pub use scoring::Scoring;
 use super::{
     calls::CallSplit,
     guidance::ParserFactory,
-    harmony::Harmony,
     memory::{BudgetLease, MemoryPlan},
+    messages::MessageSplit,
     prefix::{PrefixCache, PrefixKeys, PrefixStats},
     reasoning::ReasoningSplit,
     scheduler::{Candidate, Chunk, Scheduler},
@@ -88,8 +88,8 @@ struct Pending {
     /// Holds model state. Preemption clears it and `consumed`, so the request recomputes.
     running: bool,
     stream: TokenOutputStream,
-    /// Splits output by channel, for models that speak Harmony.
-    harmony: Option<Harmony>,
+    /// Splits output by message, for models that write reasoning, answer and calls apart.
+    messages: Option<MessageSplit>,
     /// Ends the answer at the request's stop sequences.
     stop: StopMatcher,
     max_tokens: usize,
