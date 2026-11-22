@@ -23,7 +23,7 @@ pub const FORMATS: [GgmlDType; 10] = [
     GgmlDType::Q2K,
 ];
 
-/// Values one MXFP4 nibble selects, before its block's power-of-two scale.
+/// Values one E2M1 (MXFP4 or NVFP4) nibble selects, before its block's scale.
 pub const MXFP4_VALUES: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
@@ -31,22 +31,102 @@ pub const MXFP4_VALUES: [f32; 16] = [
 pub const MXFP4_BLOCK_VALUES: usize = 32;
 pub const MXFP4_BLOCK_BYTES: usize = 16;
 
-/// Row-major F32 values of MXFP4 `blocks` and their `scales`, one byte per block: each
-/// value is `MXFP4_VALUES[nibble] * 2^(scale - 127)`, low nibble first.
-pub fn mxfp4_decode(blocks: &[u8], scales: &[u8]) -> Result<Vec<f32>> {
-    let (groups, tail) = blocks.as_chunks::<MXFP4_BLOCK_BYTES>();
-    if groups.len() != scales.len() || !tail.is_empty() {
-        return Err(invalid("MXFP4 blocks and scales differ in count"));
-    }
-    let mut values = Vec::with_capacity(scales.len() * MXFP4_BLOCK_VALUES);
-    for (block, &scale) in groups.iter().zip(scales) {
-        let factor = 2f32.powi(i32::from(scale) - 127);
-        for &byte in block {
-            values.push(MXFP4_VALUES[usize::from(byte & 15)] * factor);
-            values.push(MXFP4_VALUES[usize::from(byte >> 4)] * factor);
+/// Block formats whose values share one scale byte per block, stored as every value byte
+/// of a matrix followed by every scale byte, both row-major. Weights stay in them on the
+/// device; only the expert kernels read them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Microscale {
+    /// E2M1 nibbles (low nibble first), one power-of-two E8M0 scale per 32 values.
+    Mxfp4,
+    /// E2M1 nibbles (low nibble first), one E4M3 scale per 16 values. Checkpoints add a
+    /// per-tensor factor, which the caller applies.
+    Nvfp4,
+    /// E4M3 bytes, one power-of-two E8M0 scale per 32 values.
+    Mxfp8,
+}
+
+impl Microscale {
+    /// Values sharing one scale.
+    pub fn block_values(self) -> usize {
+        match self {
+            Self::Mxfp4 | Self::Mxfp8 => 32,
+            Self::Nvfp4 => 16,
         }
     }
-    Ok(values)
+
+    /// Value bytes of `values` values.
+    pub fn value_bytes(self, values: usize) -> usize {
+        match self {
+            Self::Mxfp4 | Self::Nvfp4 => values / 2,
+            Self::Mxfp8 => values,
+        }
+    }
+
+    /// Value plus scale bytes of a `rows × cols` matrix, which must hold whole blocks.
+    pub fn bytes(self, rows: usize, cols: usize) -> Result<usize> {
+        if cols == 0 || !cols.is_multiple_of(self.block_values()) {
+            return Err(invalid(format!("{self:?} rows must hold whole blocks")));
+        }
+        rows.checked_mul(self.value_bytes(cols) + cols / self.block_values())
+            .ok_or_else(|| invalid("microscaled size overflow"))
+    }
+
+    /// Kernel name suffix.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Self::Mxfp4 => "mxfp4",
+            Self::Nvfp4 => "nvfp4",
+            Self::Mxfp8 => "mxfp8",
+        }
+    }
+
+    /// Row-major F32 values of `values` and their `scales`, one byte per block.
+    pub fn decode(self, values: &[u8], scales: &[u8]) -> Result<Vec<f32>> {
+        let block = self.block_values();
+        let bytes = self.value_bytes(block);
+        if values.len() != scales.len() * bytes {
+            return Err(invalid(format!(
+                "{self:?} values and scales differ in count"
+            )));
+        }
+        let mut out = Vec::with_capacity(scales.len() * block);
+        for (chunk, &scale) in values.chunks_exact(bytes).zip(scales) {
+            let factor = match self {
+                Self::Mxfp4 | Self::Mxfp8 => e8m0(scale),
+                Self::Nvfp4 => e4m3(scale),
+            };
+            for &byte in chunk {
+                if self == Self::Mxfp8 {
+                    out.push(e4m3(byte) * factor);
+                } else {
+                    out.push(MXFP4_VALUES[usize::from(byte & 15)] * factor);
+                    out.push(MXFP4_VALUES[usize::from(byte >> 4)] * factor);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// `2^(scale - 127)`, the value of an E8M0 scale.
+pub fn e8m0(scale: u8) -> f32 {
+    2f32.powi(i32::from(scale) - 127)
+}
+
+/// The value of an E4M3 (`float8_e4m3fn`) byte: four exponent bits biased by 7, three
+/// mantissa bits, no infinities, and NaN only at `0x7F` and `0xFF`.
+pub fn e4m3(byte: u8) -> f32 {
+    let (exponent, mantissa) = (i32::from((byte >> 3) & 15), f32::from(byte & 7));
+    let magnitude = match (exponent, byte & 0x7F) {
+        (_, 0x7F) => f32::NAN,
+        (0, _) => mantissa * 2f32.powi(-9),
+        _ => (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7),
+    };
+    if byte & 0x80 == 0 {
+        magnitude
+    } else {
+        -magnitude
+    }
 }
 
 /// Packed bytes of `rows` rows of `cols` values in `format`.
@@ -546,11 +626,54 @@ mod tests {
         let mut block = [0u8; MXFP4_BLOCK_BYTES];
         block[0] = 0xF1; // 0.5 then -6
         block[15] = 0x27; // 6 then 1
-        let decoded = mxfp4_decode(&block, &[128])?;
+        let decoded = Microscale::Mxfp4.decode(&block, &[128])?;
         assert_eq!(decoded.len(), MXFP4_BLOCK_VALUES);
         assert_eq!(decoded[..2], [1.0, -12.0]);
         assert_eq!(decoded[30..], [12.0, 2.0]);
-        assert!(mxfp4_decode(&block, &[128, 128]).is_err());
+        assert!(Microscale::Mxfp4.decode(&block, &[128, 128]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_e4m3_decodes_normals_subnormals_signs_and_nan() {
+        // 0x38: exponent 7, mantissa 0 → 1; 0x7E: the largest finite, 448.
+        assert_eq!(e4m3(0x38), 1.0);
+        assert_eq!(e4m3(0x7E), 448.0);
+        assert_eq!(e4m3(0xBC), -1.5);
+        // Exponent 0 is subnormal: mantissa × 2^-9.
+        assert_eq!(e4m3(0x01), 2f32.powi(-9));
+        assert_eq!(e4m3(0x07), 7.0 * 2f32.powi(-9));
+        assert!(e4m3(0x7F).is_nan() && e4m3(0xFF).is_nan());
+        assert_eq!(e8m0(127), 1.0);
+        assert_eq!(e8m0(120), 2f32.powi(-7));
+    }
+
+    #[test]
+    fn test_nvfp4_scales_each_sixteen_values_by_their_e4m3_byte() -> Result<()> {
+        // Two blocks of 16 values: eight bytes each, low nibble first.
+        let mut values = [0u8; 16];
+        values[0] = 0x92; // 1.0 then -0.5
+        values[8] = 0x07; // 6.0 then 0
+        let decoded = Microscale::Nvfp4.decode(&values, &[0x40, 0xB8])?;
+        assert_eq!(decoded.len(), 32);
+        // 0x40 is 2.0; 0xB8 is -1.0.
+        assert_eq!(decoded[..2], [2.0, -1.0]);
+        assert_eq!(decoded[16..18], [-6.0, -0.0]);
+        assert!(Microscale::Nvfp4.decode(&values, &[0x40]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_mxfp8_scales_e4m3_values_by_a_power_of_two() -> Result<()> {
+        let mut values = [0u8; 32];
+        values[0] = 0x38;
+        values[31] = 0xC4; // -3.0
+        let decoded = Microscale::Mxfp8.decode(&values, &[125])?;
+        assert_eq!(decoded[0], 0.25);
+        assert_eq!(decoded[31], -0.75);
+        assert_eq!(Microscale::Mxfp8.bytes(2, 64)?, 2 * (64 + 2));
+        assert_eq!(Microscale::Nvfp4.bytes(2, 64)?, 2 * (32 + 4));
+        assert!(Microscale::Nvfp4.bytes(1, 24).is_err());
         Ok(())
     }
 

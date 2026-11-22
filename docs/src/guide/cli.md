@@ -69,6 +69,7 @@ tur run ./my-checkpoint     # a directory
 | `qwen` | `qwen3.5:0.8b` | `Qwen/Qwen3.5-0.8B` | Its commit |
 | `gemma` | `gemma4:e2b` | `google/gemma-4-E2B-it` | Its commit |
 | `gpt-oss` | `gpt-oss:20b` | `openai/gpt-oss-20b` | Its commit, `--expert-cache-mb 2048`, and for `serve` `--max-batch-size 1` |
+| `inkling` | `inkling2:mini` | `thinkingmachines/Inkling-2-Mini` | Its commit |
 
 Flags and the file override what a name brings. To run `gpt-oss` with every expert resident on a Mac with room for it, name the repository, which brings nothing. Without a model, `run` and `serve` use `[model].source` from the file.
 
@@ -106,6 +107,12 @@ tur run gemma 'Explain river deltas.' --draft-model google/gemma-4-E2B-it-assist
   --draft-revision 2d874ef7d29f9a30599a1e4b3c1cbc9595f005df
 ```
 
+Inkling 2 Mini's block drafter is opt-in and needs room for seven drafts:
+
+```sh
+tur run inkling 'Write a Rust function that reverses a string.' --mtp --speculative-draft 7
+```
+
 ## Passes and memory (`run`, `serve`)
 
 | Flag | Default | Meaning |
@@ -114,7 +121,7 @@ tur run gemma 'Explain river deltas.' --draft-model google/gemma-4-E2B-it-assist
 | `--context-tokens <n>` | what the pool and model allow | Most tokens one request may hold, prompt and output together. Sizes the state pool for that many per concurrent request; a start that can't fit it fails and names what would |
 | `--state-memory-mb <n>` | derived | Memory for K/V pages and recurrent state. By default, room for an 8K-token context per concurrent request |
 | `--speculative-draft <n>` | 0 | Most tokens drafted from the request's own text per step; 0 turns speculation off |
-| `--mtp [true\|false]` | off | Also draft with the checkpoint's multi-token-prediction head |
+| `--mtp [true\|false]` | off | Also draft with the checkpoint's multi-token-prediction head (Qwen3.5) or block drafter (Inkling 2, with `--speculative-draft 7`) |
 | `--draft-model <dir\|repo>` | none | Draft with a separate assistant checkpoint (Gemma 4) |
 | `--draft-revision <commit>` | none | Commit of a remote `--draft-model`, or a name for a local one |
 

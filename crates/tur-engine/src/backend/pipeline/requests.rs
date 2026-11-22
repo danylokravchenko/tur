@@ -424,6 +424,7 @@ impl InferencePipeline {
             ToolSyntax::Gemma => thinking == Some(true),
             // A template that ignored the request hasn't opened anything to close.
             ToolSyntax::Xml => thinking == Some(true) && self.prompt_opens_thinking(prompt),
+            ToolSyntax::Inkling => false,
         };
         if reasons {
             Preamble::Reasoning
@@ -438,7 +439,7 @@ impl InferencePipeline {
     /// into the answer.
     fn free_preamble(&self, prompt: &[u32]) -> Preamble {
         let reasons = match self.tool_syntax() {
-            ToolSyntax::Harmony => false,
+            ToolSyntax::Harmony | ToolSyntax::Inkling => false,
             ToolSyntax::Gemma => true,
             ToolSyntax::Xml => self.prompt_opens_thinking(prompt),
         };
@@ -471,7 +472,7 @@ impl InferencePipeline {
         }
         let id = |token: &str| self.tokenizer.token_to_id(token);
         match self.tool_syntax() {
-            ToolSyntax::Harmony => None,
+            ToolSyntax::Harmony | ToolSyntax::Inkling => None,
             ToolSyntax::Xml => Some(ReasoningSplit::opened(&self.tokenizer, id("</think>")?)),
             ToolSyntax::Gemma => Some(ReasoningSplit::channel(
                 &self.tokenizer,
@@ -661,6 +662,7 @@ impl InferencePipeline {
                 mtp_done: 0,
                 head_seed: None,
                 mtp_drafts: Vec::new(),
+                head_reach: Vec::new(),
                 mtp_acceptance: self.mtp_acceptance,
                 mtp_verifying: Vec::new(),
                 drafted: 0,
@@ -884,12 +886,7 @@ impl InferencePipeline {
     /// Whether the draft head keeps keys and values, so that a snapshot's entries for it
     /// depend on the token after the snapshot (see [`super::super::prefix`]).
     pub(super) fn keyed_head(&self) -> bool {
-        self.speculation.mtp_enabled()
-            && self
-                .speculation
-                .mtp
-                .as_ref()
-                .is_some_and(|head| !head.chains())
+        self.speculation.mtp_enabled() && self.model.draft_head().is_some_and(|head| head.keyed)
     }
 
     /// Insert this step's snapshots, after the draft head wrote its entries for them: the

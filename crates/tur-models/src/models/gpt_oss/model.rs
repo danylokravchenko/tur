@@ -26,7 +26,7 @@ use tur_core::{
     Result,
     execution::{ModelDescription, checked_elements, invalid},
 };
-use tur_metal::{packed::PackedLinear, pool::PoolConfig, state::ModelState};
+use tur_metal::{packed::PackedLinear, pool::PoolConfig, quantize::Microscale, state::ModelState};
 
 struct Attention {
     q: PackedLinear,
@@ -168,9 +168,15 @@ fn expert_bank(tensors: &Tensors, name: &str, packed: bool) -> Result<PackedLine
         checked_elements(&[*groups, tur_metal::quantize::MXFP4_BLOCK_VALUES])?,
     );
     if packed {
-        return PackedLinear::mxfp4(&blocks, &scales, shape, &tensors.device);
+        return PackedLinear::microscaled(
+            Microscale::Mxfp4,
+            &blocks,
+            &scales,
+            shape,
+            &tensors.device,
+        );
     }
-    let values = tur_metal::quantize::mxfp4_decode(&blocks, &scales)?;
+    let values = Microscale::Mxfp4.decode(&blocks, &scales)?;
     PackedLinear::dense(
         &Tensor::from_vec(values, shape, &Device::Cpu)?,
         &tensors.device,

@@ -321,7 +321,7 @@ fn test_decodes_draft_beside_a_prefill_and_match_plain_decoding() -> Result<()> 
 
 /// Lookup needs eight-token matches, which the random fixtures' text rarely repeats, so the
 /// head drafts. The fixtures' 96 tokens are below the default draft vocabulary.
-fn mtp_config(drafts: usize, batch: usize) -> PipelineConfig {
+pub(crate) fn mtp_config(drafts: usize, batch: usize) -> PipelineConfig {
     PipelineConfig {
         prefix: PrefixConfig::DISABLED,
         speculation: SpeculationConfig {
@@ -345,7 +345,7 @@ fn assert_mtp_preserves_outputs(factory: &tur::ModelFactory) -> Result<()> {
     Ok(())
 }
 
-fn assert_mtp_preserves_outputs_with(
+pub(crate) fn assert_mtp_preserves_outputs_with(
     factory: &tur::ModelFactory,
     mtp: PipelineConfig,
 ) -> Result<()> {

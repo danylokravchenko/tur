@@ -153,7 +153,7 @@ impl ModelFactory {
             Some(source) => Some(Arc::new(GgufFile::open(&source.resolve()?)?)),
             None => None,
         };
-        let config = ModelConfig::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?;
+        let config = ModelConfig::from_dir(&dir)?;
         let generation = match std::fs::read_to_string(dir.join("generation_config.json")) {
             Ok(json) => Some(json),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -485,6 +485,7 @@ fn serving_file(name: &str) -> bool {
                 name,
                 "model.safetensors.index.json"
                     | "generation_config.json"
+                    | "hf_quant_config.json"
                     | "chat_template.jinja"
                     | "processor_config.json"
                     | "preprocessor_config.json"

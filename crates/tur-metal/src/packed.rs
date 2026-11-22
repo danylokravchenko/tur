@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Projection weights kept in their packed storage format.
 
-use crate::blocks::BlockFormat;
+use crate::{blocks::BlockFormat, quantize::Microscale};
 use candle_core::{
     DType, Device, Module, Tensor,
     quantized::{GgmlDType, QMatMul, QStorage, QTensor},
@@ -21,12 +21,13 @@ enum Weights {
         #[cfg(feature = "metal")]
         buffer: Option<candle_metal_kernels::metal::Buffer>,
     },
-    /// MXFP4 blocks then one scale byte per block, read only by the expert kernels. The
-    /// `Arc` is what keeps Candle's pool from recycling the buffer.
+    /// Microscaled values then one scale byte per block, read only by the expert kernels.
+    /// The `Arc` is what keeps Candle's pool from recycling the buffer.
     #[cfg(feature = "metal")]
-    Mxfp4 {
+    Microscaled {
         buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
         scales: usize,
+        format: Microscale,
     },
     /// Blocks in an arena the expert cache fills; the expert kernels read them in place.
     #[cfg(feature = "metal")]
@@ -191,42 +192,43 @@ impl PackedLinear {
         )
     }
 
-    /// A `[rows, cols]` expert bank in MXFP4 on `device`: read in place by the expert
-    /// kernels on Metal, and decoded to F32 for host reference execution.
-    pub fn mxfp4(
-        blocks: &[u8],
+    /// A `[rows, cols]` expert bank in a microscaled `format` on `device`: read in place by
+    /// the expert kernels on Metal, and decoded to F32 for host reference execution.
+    pub fn microscaled(
+        format: Microscale,
+        values: &[u8],
         scales: &[u8],
         (rows, cols): (usize, usize),
         device: &Device,
     ) -> Result<Self> {
+        let block = format.block_values();
         let count = rows
-            .checked_mul(cols / crate::quantize::MXFP4_BLOCK_VALUES)
-            .filter(|_| cols.is_multiple_of(crate::quantize::MXFP4_BLOCK_VALUES))
+            .checked_mul(cols / block)
+            .filter(|_| cols.is_multiple_of(block))
             .filter(|&count| count > 0 && scales.len() == count)
-            .ok_or_else(|| invalid("MXFP4 scales do not form the projection"))?;
-        if blocks.len() / crate::quantize::MXFP4_BLOCK_BYTES != count {
-            return Err(invalid("MXFP4 blocks do not form the projection"));
+            .ok_or_else(|| invalid(format!("{format:?} scales do not form the projection")))?;
+        if values.len() != count * format.value_bytes(block) {
+            return Err(invalid(format!(
+                "{format:?} values do not form the projection"
+            )));
         }
         match device {
             #[cfg(feature = "metal")]
             Device::Metal(metal) => {
-                let buffer = metal.new_buffer_with_data(&[blocks, scales].concat())?;
+                let buffer = metal.new_buffer_with_data(&[values, scales].concat())?;
                 Ok(Self {
-                    weights: Weights::Mxfp4 {
+                    weights: Weights::Microscaled {
                         buffer,
-                        scales: blocks.len(),
+                        scales: values.len(),
+                        format,
                     },
                     out_features: rows,
                     in_features: cols,
-                    resident_bytes: blocks.len() + scales.len(),
+                    resident_bytes: values.len() + scales.len(),
                 })
             }
             _ => Self::dense(
-                &Tensor::from_vec(
-                    crate::quantize::mxfp4_decode(blocks, scales)?,
-                    (rows, cols),
-                    &Device::Cpu,
-                )?,
+                &Tensor::from_vec(format.decode(values, scales)?, (rows, cols), &Device::Cpu)?,
                 device,
             ),
         }
@@ -244,7 +246,11 @@ impl PackedLinear {
             return Err(invalid("expert arena has no room for its scales"));
         }
         Ok(Self {
-            weights: Weights::Mxfp4 { buffer, scales },
+            weights: Weights::Microscaled {
+                buffer,
+                scales,
+                format: Microscale::Mxfp4,
+            },
             out_features: rows,
             in_features: cols,
             resident_bytes,
@@ -279,9 +285,14 @@ impl PackedLinear {
                 buffer: std::sync::Arc::clone(buffer),
                 format: *format,
             },
-            Weights::Mxfp4 { buffer, scales } => Weights::Mxfp4 {
+            Weights::Microscaled {
+                buffer,
+                scales,
+                format,
+            } => Weights::Microscaled {
                 buffer: std::sync::Arc::clone(buffer),
                 scales: *scales,
+                format: *format,
             },
             _ => return Err(invalid("only arena weights can be shared")),
         };
@@ -388,9 +399,17 @@ impl PackedLinear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         Ok(match &self.weights {
             Weights::Dense(weight) => x.matmul(&weight.t()?)?,
+            // Candle's multi-row Metal GGML GEMM reads its input from the buffer's start,
+            // ignoring the layout's start offset, so a view into a larger buffer (rows of a
+            // stacked activation) gets its own copy first.
+            Weights::Packed { matmul, .. }
+                if x.device().is_metal() && x.layout().start_offset() > 0 =>
+            {
+                matmul.forward(&x.force_contiguous()?)?
+            }
             Weights::Packed { matmul, .. } => matmul.forward(x)?,
             #[cfg(feature = "metal")]
-            Weights::Mxfp4 { .. } | Weights::Arena { .. } | Weights::Blocks { .. } => {
+            Weights::Microscaled { .. } | Weights::Arena { .. } | Weights::Blocks { .. } => {
                 return Err(host_read());
             }
             Weights::Stack(parts) => {
@@ -431,9 +450,9 @@ impl PackedLinear {
                     upload_bytes(bytes, *format, (rows, self.in_features), &Device::Cpu)?;
                 QMatMul::from_qtensor(slice)?.forward(x)?
             }
-            Weights::Packed { matmul, .. } => matmul.forward(x)?.narrow(1, start, rows)?,
+            Weights::Packed { .. } => self.forward(x)?.narrow(1, start, rows)?,
             #[cfg(feature = "metal")]
-            Weights::Mxfp4 { .. } | Weights::Arena { .. } | Weights::Blocks { .. } => {
+            Weights::Microscaled { .. } | Weights::Arena { .. } | Weights::Blocks { .. } => {
                 return Err(host_read());
             }
             Weights::Stack(parts) => {
@@ -537,10 +556,16 @@ impl PackedLinear {
         }
     }
 
-    /// MXFP4 buffer and the byte offset of its scales, when these weights are in MXFP4.
-    pub(crate) fn mxfp4_buffer(&self) -> Option<(&candle_metal_kernels::metal::Buffer, usize)> {
+    /// Buffer, byte offset of the scales and format of microscaled weights.
+    pub(crate) fn microscaled_buffer(
+        &self,
+    ) -> Option<(&candle_metal_kernels::metal::Buffer, usize, Microscale)> {
         match &self.weights {
-            Weights::Mxfp4 { buffer, scales } => Some((buffer.as_ref(), *scales)),
+            Weights::Microscaled {
+                buffer,
+                scales,
+                format,
+            } => Some((buffer.as_ref(), *scales, *format)),
             _ => None,
         }
     }

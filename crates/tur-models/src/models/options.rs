@@ -166,13 +166,19 @@ pub struct DraftHead {
     pub model: Option<std::path::PathBuf>,
 }
 
-impl DraftHead {
-    /// Whether the head chains several drafts per pass. A Gemma 4 assistant keeps no state
-    /// and redrafts from its own output; Qwen3.5's head writes its own keys and values and
-    /// drafts one token.
-    pub fn chains(&self) -> bool {
-        self.model.is_some()
-    }
+/// How a loaded draft head behaves ([`super::TextModel::draft_head`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadKind {
+    /// It writes its own keys and values at committed positions, so a snapshot holds its
+    /// entries only once it has run (Qwen3.5's head and Inkling 2's drafter; a Gemma 4
+    /// assistant reads the target's).
+    pub keyed: bool,
+    /// It returns several chained drafts from one pass (a Gemma 4 assistant redrafting from
+    /// its own output, Inkling 2's drafter walking its block); Qwen3.5's head drafts one.
+    pub chains: bool,
+    /// Its chain comes from one block pass whose cost hardly grows with depth (Inkling 2's
+    /// drafter), so it drafts as deep as it can and verification keeps the likely drafts.
+    pub block: bool,
 }
 
 /// Latent sparse attention: past `crossover` keys, a decoding or verifying query of a full

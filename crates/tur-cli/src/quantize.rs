@@ -117,9 +117,7 @@ pub(crate) fn encode_samples(
 
 pub(crate) fn quantize(args: &mut Args, console: &Console) -> Result<()> {
     args.model = checkpoint_dir(&args.model, &args.revision)?;
-    let report = if let ModelConfig::Gemma4(config) =
-        ModelConfig::from_json(&std::fs::read_to_string(args.model.join("config.json"))?)?
-    {
+    let report = if let ModelConfig::Gemma4(config) = ModelConfig::from_dir(&args.model)? {
         quantize_gemma(args, &config)?
     } else {
         quantize_qwen(args)?

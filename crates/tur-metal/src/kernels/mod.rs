@@ -5,9 +5,14 @@
 //! ranges) before encoding; nothing falls back to the CPU. Kernels only enqueue work: the
 //! caller fences with [`crate::completion::Completion`] before reading results.
 
+mod inkling;
 mod lsa;
 mod moe;
 mod runtime;
+pub use inkling::{
+    Clipped, GATE_GEMV_ROWS, HeadNorm, LogScale, RESIDUAL_ENTRIES, RESIDUAL_QUERIES, Relative,
+    SMALL_EXPERT_TOKENS, ShortConv, SmallExperts,
+};
 pub use lsa::{ClusterJob, IndexMap, IndexTable, SparseBudget, SparseKeys};
 pub use moe::{ExpertRoutes, SharedExpert};
 

@@ -32,7 +32,7 @@ pub(crate) fn setup() -> Result<(Device, Kernels, parking_lot::MutexGuard<'stati
 }
 
 /// Deterministic values in (-scale, scale).
-fn values(count: usize, seed: u64, scale: f32) -> Vec<f32> {
+pub(crate) fn values(count: usize, seed: u64, scale: f32) -> Vec<f32> {
     let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
     (0..count)
         .map(|_| {
@@ -44,7 +44,7 @@ fn values(count: usize, seed: u64, scale: f32) -> Vec<f32> {
         .collect()
 }
 
-fn upload(device: &Device, data: &[f32], shape: &[usize]) -> Result<Tensor> {
+pub(crate) fn upload(device: &Device, data: &[f32], shape: &[usize]) -> Result<Tensor> {
     Ok(Tensor::from_slice(data, shape, device)?)
 }
 
@@ -773,21 +773,21 @@ fn test_delta_scan_matches_scalar_recurrence_over_ragged_sequences() -> Result<(
     Ok(())
 }
 
-struct AttentionCase {
-    heads: usize,
-    kv_heads: usize,
-    dim: usize,
-    page: usize,
+pub(crate) struct AttentionCase {
+    pub(crate) heads: usize,
+    pub(crate) kv_heads: usize,
+    pub(crate) dim: usize,
+    pub(crate) page: usize,
     /// (past tokens, new tokens) per sequence.
-    sequences: Vec<(usize, usize)>,
+    pub(crate) sequences: Vec<(usize, usize)>,
 }
 
 /// Pool keys, pool values, slots, page table, first blocks and visible key counts.
-type Pool = (Vec<f32>, Vec<f32>, usize, Vec<u32>, Vec<u32>, Vec<u32>);
+pub(crate) type Pool = (Vec<f32>, Vec<f32>, usize, Vec<u32>, Vec<u32>, Vec<u32>);
 
 /// Build a shuffled page pool whose unused slots hold NaN, so any read outside the
 /// visible keys poisons the result.
-fn paged_pool(case: &AttentionCase, seed: u64) -> Pool {
+pub(crate) fn paged_pool(case: &AttentionCase, seed: u64) -> Pool {
     let pages: Vec<usize> = case
         .sequences
         .iter()
@@ -1426,6 +1426,30 @@ fn test_kv_write_quantizes_into_paged_slots_like_the_host_reference() -> Result<
     let (device, kernels, _gpu) = setup()?;
     for dim in [128, 512] {
         check_kv_write(&kernels, &device, dim)?;
+    }
+    Ok(())
+}
+
+/// Candle's packed projection of rows that start inside a larger buffer, as stacked
+/// activations hand them over, reads those rows: its multi-row GGML GEMM ignores the
+/// input's start offset unless the layer copies the view first.
+#[test]
+fn test_packed_forward_reads_row_views_at_their_offset() -> Result<()> {
+    let (device, _kernels, _gpu) = setup()?;
+    let (n, k) = (37, 256);
+    let weight = upload(&Device::Cpu, &values(n * k, 31, 1.0), &[n, k])?;
+    for format in [GgmlDType::Q8_0, GgmlDType::Q4K] {
+        let layer = PackedLinear::quantized(&weight, format, &device)?;
+        for rows in [1, 24] {
+            let stacked = upload(&device, &values(3 * rows * k, 32, 1.0), &[3 * rows, k])?;
+            let view = stacked.narrow(0, rows, rows)?;
+            let expected: Vec<f64> = read(&layer.forward(&view.force_contiguous()?)?)?
+                .into_iter()
+                .map(f64::from)
+                .collect();
+            let error = relative_error(&read(&layer.forward(&view)?)?, &expected);
+            assert!(error < 1e-6, "{format:?} rows {rows}: {error}");
+        }
     }
     Ok(())
 }

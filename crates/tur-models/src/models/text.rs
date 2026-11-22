@@ -3,6 +3,7 @@ use super::{
     GenerationDefaults, LoadOptions,
     gemma4::{self, Gemma4},
     gpt_oss::{self, GptOss},
+    inkling2::{self, Inkling2},
     qwen3_5::{self, Qwen35},
 };
 use crate::{
@@ -33,6 +34,7 @@ pub enum ModelConfig {
     Qwen35(qwen3_5::Config),
     Gemma4(gemma4::Config),
     GptOss(gpt_oss::Config),
+    Inkling2(inkling2::Config),
 }
 impl ModelConfig {
     /// Parse the architecture before any weight download or allocation.
@@ -43,7 +45,19 @@ impl ModelConfig {
                 Ok(Self::Gemma4(gemma4::Config::from_json(json)?))
             }
             Some("gpt_oss") => Ok(Self::GptOss(gpt_oss::Config::from_json(json)?)),
+            Some("inkling2_loop") => Ok(Self::Inkling2(inkling2::Config::from_json(json)?)),
             _ => Ok(Self::Qwen35(qwen3_5::Config::from_json(json)?)),
+        }
+    }
+    /// [`Self::from_json`] over a checkpoint directory's `config.json`, with what the
+    /// architecture also reads beside it: Inkling 2's expert formats come from
+    /// `hf_quant_config.json`.
+    pub fn from_dir(dir: &Path) -> Result<Self> {
+        match Self::from_json(&std::fs::read_to_string(dir.join("config.json"))?)? {
+            Self::Inkling2(c) => Ok(Self::Inkling2(c.with_quantization(
+                &std::fs::read_to_string(dir.join("hf_quant_config.json"))?,
+            )?)),
+            config => Ok(config),
         }
     }
     /// Exclusive text position limit.
@@ -52,6 +66,7 @@ impl ModelConfig {
             Self::Qwen35(c) => c.max_position(),
             Self::Gemma4(c) => c.max_position(),
             Self::GptOss(c) => c.max_position(),
+            Self::Inkling2(c) => c.max_position(),
         }
     }
     /// Output vocabulary width.
@@ -60,6 +75,7 @@ impl ModelConfig {
             Self::Qwen35(c) => c.vocab_size(),
             Self::Gemma4(c) => c.vocab_size(),
             Self::GptOss(c) => c.vocab_size(),
+            Self::Inkling2(c) => c.vocab_size(),
         }
     }
     /// Merge generation metadata with architecture EOS tokens.
@@ -68,6 +84,7 @@ impl ModelConfig {
             Self::Qwen35(c) => c.generation_defaults(json),
             Self::Gemma4(c) => c.generation_defaults(json),
             Self::GptOss(c) => c.generation_defaults(json),
+            Self::Inkling2(c) => c.generation_defaults(json),
         }
     }
     pub(crate) fn with_mtp(self) -> Result<Self> {
@@ -76,6 +93,7 @@ impl ModelConfig {
             // The assistant is a separate checkpoint, loaded from the draft head's directory.
             Self::Gemma4(c) => Ok(Self::Gemma4(c)),
             Self::GptOss(_) => Err(invalid("gpt-oss has no draft head")),
+            Self::Inkling2(c) => Ok(Self::Inkling2(c.with_mtp()?)),
         }
     }
     /// Whether the model loaded with `options` replays speculative passes
@@ -100,6 +118,7 @@ impl ModelConfig {
             Self::Qwen35(c) => Qwen35::memory_requirements(c, options, tokens, contexts),
             Self::Gemma4(c) => Gemma4::memory_requirements(c, options, tokens, contexts),
             Self::GptOss(c) => GptOss::memory_requirements(c, options, tokens, contexts),
+            Self::Inkling2(c) => Inkling2::memory_requirements(c, options, tokens, contexts),
         }
     }
     pub(crate) fn load(&self, dir: &Path, options: &LoadOptions) -> Result<TextModel> {
@@ -107,6 +126,7 @@ impl ModelConfig {
             Self::Qwen35(_) => Ok(TextModel::Qwen35(Box::new(Qwen35::load(dir, options)?))),
             Self::Gemma4(_) => Ok(TextModel::Gemma4(Box::new(Gemma4::load(dir, options)?))),
             Self::GptOss(_) => Ok(TextModel::GptOss(Box::new(GptOss::load(dir, options)?))),
+            Self::Inkling2(_) => Ok(TextModel::Inkling2(Box::new(Inkling2::load(dir, options)?))),
         }
     }
 }
@@ -116,12 +136,12 @@ pub enum TextModel {
     Qwen35(Box<Qwen35>),
     Gemma4(Box<Gemma4>),
     GptOss(Box<GptOss>),
+    Inkling2(Box<Inkling2>),
 }
 impl TextModel {
     /// Load a validated architecture from a local checkpoint using shared placement settings.
     pub fn load(dir: &Path, options: &LoadOptions) -> Result<Self> {
-        ModelConfig::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?
-            .load(dir, options)
+        ModelConfig::from_dir(dir)?.load(dir, options)
     }
     /// Device holding immutable weights and executing model passes.
     pub fn device(&self) -> &candle_core::Device {
@@ -129,6 +149,7 @@ impl TextModel {
             Self::Qwen35(m) => m.device(),
             Self::Gemma4(m) => m.device(),
             Self::GptOss(m) => m.device(),
+            Self::Inkling2(m) => m.device(),
         }
     }
     /// Resident bytes of projection matrices, excluding embeddings and auxiliary tensors.
@@ -137,6 +158,7 @@ impl TextModel {
             Self::Qwen35(m) => m.projection_bytes(),
             Self::Gemma4(m) => m.projection_bytes(),
             Self::GptOss(m) => m.projection_bytes(),
+            Self::Inkling2(m) => m.projection_bytes(),
         }
     }
     /// Switch between the common Metal path and the numerical reference on the same weights.
@@ -145,6 +167,7 @@ impl TextModel {
             Self::Qwen35(m) => Ok(Self::Qwen35(Box::new((*m).with_execution(execution)?))),
             Self::Gemma4(m) => Ok(Self::Gemma4(Box::new((*m).with_execution(execution)?))),
             Self::GptOss(m) => Ok(Self::GptOss(Box::new((*m).with_execution(execution)?))),
+            Self::Inkling2(m) => Ok(Self::Inkling2(Box::new((*m).with_execution(execution)?))),
         }
     }
     /// Device bytes held by loaded weights.
@@ -153,6 +176,7 @@ impl TextModel {
             Self::Qwen35(m) => m.weight_bytes(),
             Self::Gemma4(m) => m.weight_bytes(),
             Self::GptOss(m) => m.weight_bytes(),
+            Self::Inkling2(m) => m.weight_bytes(),
         }
     }
     /// Exclusive text position limit.
@@ -161,6 +185,7 @@ impl TextModel {
             Self::Qwen35(m) => m.config().max_position(),
             Self::Gemma4(m) => m.config().max_position(),
             Self::GptOss(m) => m.config().max_position(),
+            Self::Inkling2(m) => m.config().max_position(),
         }
     }
     /// How this model writes tool calls. [`ToolSyntax::Harmony`] models write all of their
@@ -170,12 +195,13 @@ impl TextModel {
             Self::Qwen35(_) => ToolSyntax::Xml,
             Self::Gemma4(_) => ToolSyntax::Gemma,
             Self::GptOss(_) => ToolSyntax::Harmony,
+            Self::Inkling2(_) => ToolSyntax::Inkling,
         }
     }
     /// How a clip appears in prompts, when the model has an audio encoder loaded.
     pub fn audio_prompt(&self) -> Option<MediaPrompt> {
         match self {
-            Self::Qwen35(_) | Self::GptOss(_) => None,
+            Self::Qwen35(_) | Self::GptOss(_) | Self::Inkling2(_) => None,
             Self::Gemma4(m) => m.audio_prompt(),
         }
     }
@@ -183,7 +209,7 @@ impl TextModel {
     pub fn image_prompt(&self) -> Option<MediaPrompt> {
         match self {
             Self::Qwen35(m) => m.image_prompt(),
-            Self::GptOss(_) => None,
+            Self::GptOss(_) | Self::Inkling2(_) => None,
             Self::Gemma4(m) => m.image_prompt(),
         }
     }
@@ -191,7 +217,7 @@ impl TextModel {
     pub fn video_prompt(&self) -> Option<MediaPrompt> {
         match self {
             Self::Qwen35(m) => m.video_prompt(),
-            Self::GptOss(_) => None,
+            Self::GptOss(_) | Self::Inkling2(_) => None,
             Self::Gemma4(m) => m.video_prompt(),
         }
     }
@@ -203,11 +229,25 @@ impl TextModel {
             Media::Video(_) => self.video_prompt(),
         }
     }
+    /// The loaded draft head's behavior; `None` without one.
+    pub fn draft_head(&self) -> Option<super::HeadKind> {
+        let (loaded, keyed, chains, block) = match self {
+            Self::Qwen35(m) => (m.has_mtp(), true, false, false),
+            Self::Gemma4(m) => (m.has_assistant(), false, true, false),
+            Self::GptOss(_) => (false, false, false, false),
+            Self::Inkling2(m) => (m.has_drafter(), true, true, true),
+        };
+        loaded.then_some(super::HeadKind {
+            keyed,
+            chains,
+            block,
+        })
+    }
     /// The token a soft-token position feeds the model, under its embedded row.
     pub fn media_slot(&self) -> Option<u32> {
         match self {
             Self::Qwen35(m) => m.image_prompt().map(|prompt| prompt.placeholder),
-            Self::GptOss(_) => None,
+            Self::GptOss(_) | Self::Inkling2(_) => None,
             Self::Gemma4(m) => m.media_slot(),
         }
     }
@@ -233,7 +273,7 @@ impl TextModel {
         let cache = match self {
             Self::Qwen35(m) => Some(m.media_cache()),
             Self::Gemma4(m) => Some(m.media_cache()),
-            Self::GptOss(_) => None,
+            Self::GptOss(_) | Self::Inkling2(_) => None,
         };
         let key = media.digest();
         if let Some(rows) = cache.and_then(|cache| cache.get(&key)) {
@@ -269,6 +309,11 @@ impl TextModel {
                     "gpt-oss rotates every key dimension, so it has no index map".into(),
                 ));
             }
+            Self::Inkling2(_) => {
+                return Err(tur_core::TurError::Other(
+                    "Inkling 2 attends with a learned position bias, so it has no index map".into(),
+                ));
+            }
         };
         super::index_map::index_rows(self.model(), self.device(), &layers, document, rows)
     }
@@ -297,6 +342,7 @@ impl TextModel {
             Self::Qwen35(m) => m.as_ref(),
             Self::Gemma4(m) => m.as_ref(),
             Self::GptOss(m) => m.as_ref(),
+            Self::Inkling2(m) => m.as_ref(),
         }
     }
 }

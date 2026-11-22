@@ -37,6 +37,32 @@ struct RouteParams {
     scaled: u32,
 }
 #[repr(C)]
+struct SigmoidParams {
+    tokens: u32,
+    experts: u32,
+    top_k: u32,
+    stride: u32,
+    scale: f32,
+}
+#[repr(C)]
+struct SoftcapParams {
+    rows: u32,
+    width: u32,
+    stride: u32,
+    gate_cap: f32,
+    up_cap: f32,
+}
+
+/// How routing turns logits into selected experts and their weights.
+#[derive(Clone, Copy)]
+enum Selection<'a> {
+    /// Softmax over the top-k logits, optionally times a learned scale per expert.
+    Softmax(Option<&'a Tensor>),
+    /// Top-k of `sigmoid(logit) + bias`; weights are the sigmoids normalized, times `scale`.
+    Sigmoid { bias: &'a Tensor, scale: f32 },
+}
+
+#[repr(C)]
 struct ExpertParams {
     rows: u32,
     experts: u32,
@@ -119,7 +145,7 @@ impl Kernels {
     /// All metadata stays on this device and has a bounded size proportional to tokens × k;
     /// the permutation keeps each expert's rows in assignment order.
     pub fn route(&self, logits: &Tensor, top_k: usize) -> Result<ExpertRoutes> {
-        self.routing(logits, top_k, None)
+        self.routing(logits, top_k, Selection::Softmax(None))
     }
 
     /// Normalized top-k routing with a learned scale applied to each selected expert's
@@ -130,15 +156,50 @@ impl Kernels {
         top_k: usize,
         scales: &Tensor,
     ) -> Result<ExpertRoutes> {
-        self.routing(logits, top_k, Some(scales))
+        self.routing(logits, top_k, Selection::Softmax(Some(scales)))
     }
 
-    fn routing(
+    /// Top-k routing by `sigmoid(logit) + bias[expert]` (`bias` `[experts]` steers selection
+    /// only), weighting each selected expert by its sigmoid score normalized over the
+    /// selection, times `scale`. Ties keep the lower expert ID.
+    pub fn route_sigmoid(
         &self,
         logits: &Tensor,
         top_k: usize,
-        scales: Option<&Tensor>,
+        bias: &Tensor,
+        scale: f32,
     ) -> Result<ExpertRoutes> {
+        if !scale.is_finite() {
+            return Err(invalid("routing scale must be finite"));
+        }
+        self.routing(logits, top_k, Selection::Sigmoid { bias, scale })
+    }
+
+    /// Each token's `(expert, weight)` pairs in rank order, `[tokens, 2 * top_k]` F32, from
+    /// sigmoid routing as [`Self::route_sigmoid`] selects them, without the grouping tables
+    /// the grouped expert kernels read.
+    pub(super) fn sigmoid_pairs(
+        &self,
+        logits: &Tensor,
+        top_k: usize,
+        bias: &Tensor,
+        scale: f32,
+    ) -> Result<Tensor> {
+        if !scale.is_finite() {
+            return Err(invalid("routing scale must be finite"));
+        }
+        Ok(self
+            .selected_pairs(logits, top_k, Selection::Sigmoid { bias, scale })?
+            .0)
+    }
+
+    /// Validate routing and dispatch its selection: the pairs and their parameters.
+    fn selected_pairs(
+        &self,
+        logits: &Tensor,
+        top_k: usize,
+        selection: Selection<'_>,
+    ) -> Result<(Tensor, RouteParams)> {
         let x = self.view(logits)?;
         let (tokens, experts) = (x.rows, x.cols);
         let assignments = tokens
@@ -155,33 +216,58 @@ impl Kernels {
                 "MoE routing needs nonempty rows, 1..=256 experts, valid top-k and ≤2^24 assignments",
             ));
         }
-        let sv = scales.map(|s| self.view(s)).transpose()?;
+        let (per_expert, scale) = match selection {
+            Selection::Softmax(scales) => (scales, None),
+            Selection::Sigmoid { bias, scale } => (Some(bias), Some(scale)),
+        };
+        let sv = per_expert.map(|s| self.view(s)).transpose()?;
         if let Some(sv) = &sv {
-            sv.expect(1, experts, "expert scales")?;
-            sv.contiguous("expert scales")?;
+            sv.expect(1, experts, "expert scales or bias")?;
+            sv.contiguous("expert scales or bias")?;
         }
         let p = RouteParams {
             tokens: to_u32(tokens, "tokens")?,
             experts: to_u32(experts, "experts")?,
             top_k: to_u32(top_k, "top-k")?,
             stride: to_u32(x.row_stride, "stride")?,
-            scaled: u32::from(scales.is_some()),
+            scaled: u32::from(per_expert.is_some()),
         };
         let selected = self.output(tokens, top_k * 2)?;
-        self.runtime.dispatch(
-            self.pipeline("moe_route_f32")?,
-            "tur_moe_route",
-            tokens,
-            32,
-            |e| {
+        let sigmoid = scale.map(|scale| SigmoidParams {
+            tokens: p.tokens,
+            experts: p.experts,
+            top_k: p.top_k,
+            stride: p.stride,
+            scale,
+        });
+        let name = if sigmoid.is_some() {
+            "moe_route_sigmoid_f32"
+        } else {
+            "moe_route_f32"
+        };
+        self.runtime
+            .dispatch(self.pipeline(name)?, "tur_moe_route", tokens, 32, |e| {
                 x.bind(e, 0)?;
                 selected.bind(e, 1);
-                e.set_bytes(2, &p);
+                match &sigmoid {
+                    Some(sigmoid) => e.set_bytes(2, sigmoid),
+                    None => e.set_bytes(2, &p),
+                }
                 sv.as_ref().unwrap_or(&x).bind(e, 3)?;
                 Ok(())
-            },
-        )?;
-        let selected = self.finish(selected, (tokens, top_k * 2))?;
+            })?;
+        Ok((self.finish(selected, (tokens, top_k * 2))?, p))
+    }
+
+    fn routing(
+        &self,
+        logits: &Tensor,
+        top_k: usize,
+        selection: Selection<'_>,
+    ) -> Result<ExpertRoutes> {
+        let (selected, p) = self.selected_pairs(logits, top_k, selection)?;
+        let (tokens, experts) = (p.tokens as usize, p.experts as usize);
+        let assignments = tokens * top_k;
         let sv = self.view(&selected)?;
         let blocks = assignments.div_ceil(BLOCK);
         let hist = self.output(blocks, experts)?;
@@ -344,10 +430,11 @@ impl Kernels {
         let mut p = routes.params(width, xv.row_stride, out_width, routed)?;
         // GEMV outputs per simdgroup match the dense GEMV kernels.
         let mut block = None;
-        let (suffix, gemv_rows, packed) = match (layer.packed_buffer(), layer.mxfp4_buffer()) {
-            (_, Some((buffer, scales))) => {
+        let (suffix, gemv_rows, packed) = match (layer.packed_buffer(), layer.microscaled_buffer())
+        {
+            (_, Some((buffer, scales, format))) => {
                 p.scales = scales as u64;
-                ("mxfp4", 4, Some(buffer))
+                (format.suffix(), 4, Some(buffer))
             }
             (Some((buffer, GgmlDType::Q8_0)), _) => ("q8_0", 4, Some(buffer)),
             (Some((buffer, GgmlDType::Q4K)), _) => ("q4k", 4, Some(buffer)),
@@ -511,6 +598,58 @@ impl Kernels {
                 xv.bind(e, 0)?;
                 order.bind(e, 1)?;
                 bv.bind(e, 2)?;
+                out.bind(e, 3);
+                e.set_bytes(4, &p);
+                Ok(())
+            },
+        )?;
+        self.finish(out, (routes.rows(), width))
+    }
+
+    /// `softcap(gate, gate_cap) * sigmoid(gate) * softcap(up, up_cap)` over interleaved
+    /// gate|up columns of one row per assignment, where `softcap(x, c) = c * tanh(x / c)`
+    /// and the sigmoid sees the uncapped gate. `factors` (`[experts, 2]`) holds per expert
+    /// a factor of the `gate_up` weights, applied to both columns first, and one of the
+    /// `down` weights, applied to the output: the down projection is linear, so the
+    /// factor of a checkpoint's weights need not be multiplied into them. Returns
+    /// `[rows, width]`.
+    pub fn expert_softcap_glu(
+        &self,
+        gate_up: &Tensor,
+        factors: &Tensor,
+        routes: &ExpertRoutes,
+        (gate_cap, up_cap): (f32, f32),
+    ) -> Result<Tensor> {
+        let xv = self.view(gate_up)?;
+        let fv = self.view(factors)?;
+        xv.expect(routes.rows(), xv.cols, "expert gate|up")?;
+        fv.expect(routes.experts, 2, "expert factors")?;
+        fv.contiguous("expert factors")?;
+        if !xv.cols.is_multiple_of(2) {
+            return Err(invalid("expert gate|up width is odd"));
+        }
+        if !(gate_cap.is_finite() && up_cap.is_finite() && gate_cap > 0.0 && up_cap > 0.0) {
+            return Err(invalid("softcaps must be positive and finite"));
+        }
+        let width = xv.cols / 2;
+        let order = self.view(&routes.order)?;
+        let p = SoftcapParams {
+            rows: to_u32(routes.rows(), "assignments")?,
+            width: to_u32(width, "width")?,
+            stride: to_u32(xv.row_stride, "row stride")?,
+            gate_cap,
+            up_cap,
+        };
+        let out = self.output(routes.rows(), width)?;
+        self.runtime.dispatch(
+            self.pipeline("moe_softcap_glu_f32")?,
+            "tur_moe_softcap_glu",
+            routes.rows(),
+            BLOCK,
+            |e| {
+                xv.bind(e, 0)?;
+                order.bind(e, 1)?;
+                fv.bind(e, 2)?;
                 out.bind(e, 3);
                 e.set_bytes(4, &p);
                 Ok(())

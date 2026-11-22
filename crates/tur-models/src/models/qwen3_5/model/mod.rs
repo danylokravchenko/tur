@@ -1152,6 +1152,11 @@ impl Qwen35 {
     }
 
     /// Device holding the weights; an engine executing this model must use the same handle.
+    /// Whether the native multi-token prediction head is loaded.
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }

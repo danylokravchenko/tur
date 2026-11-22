@@ -540,6 +540,18 @@ impl Calibration {
         (kept, Acceptance(mean))
     }
 
+    /// Cumulative calibrated acceptance after each of the leading drafts with these
+    /// confidences: the probability that verification reaches and accepts it.
+    pub fn reach(&self, confidences: &[f32]) -> Vec<f64> {
+        confidences
+            .iter()
+            .scan(1.0, |reach, &confidence| {
+                *reach *= self.acceptance(confidence).rate();
+                Some(*reach)
+            })
+            .collect()
+    }
+
     /// Record whether a draft of `confidence` was accepted.
     pub fn observe(&mut self, confidence: f32, accepted: bool) {
         let (hits, total) = &mut self.bins[Self::bin(confidence)];
@@ -583,12 +595,23 @@ impl HeadCosts {
         *cell = Some(cell.map_or(seconds, |mean| HEAD_SMOOTHING.mul_add(seconds - mean, mean)));
     }
 
-    /// Whether computing drafts for sequences with acceptance `rates` raises the expected
-    /// tokens per second of a pass of `decodes` decoding sequences by more than the margin,
-    /// given its drafted cost line. Unmeasured costs are worth measuring.
-    pub fn worthwhile(&self, rates: &[f64], decodes: usize, costs: &DraftCosts) -> bool {
+    /// Whether computing `computed` drafts, of which verification is expected to take one
+    /// per entry of `rates` with that acceptance, raises the expected tokens per second of a
+    /// pass of `decodes` decoding sequences by more than the margin, given its drafted cost
+    /// line. Unmeasured costs are worth measuring.
+    pub fn worthwhile(
+        &self,
+        rates: &[f64],
+        computed: usize,
+        decodes: usize,
+        costs: &DraftCosts,
+    ) -> bool {
         let n = rates.len();
-        let head = self.seconds.get(n.min(COST_BUCKETS)).copied().flatten();
+        let head = self
+            .seconds
+            .get(computed.min(COST_BUCKETS))
+            .copied()
+            .flatten();
         let (Some(head), Some((base, per_draft))) = (head, costs.line(decodes)) else {
             return n > 0;
         };
@@ -851,14 +874,36 @@ mod tests {
         let costs = costs(4, 0.020, 0.0005);
         let mut head = HeadCosts::default();
         // Unmeasured: measure it.
-        assert!(head.worthwhile(&[0.7; 4], 4, &costs));
+        assert!(head.worthwhile(&[0.7; 4], 4, 4, &costs));
         // A 6 ms head beside a 20 ms pass: 70% acceptance across four sequences pays.
         head.record(4, 0.006);
-        assert!(head.worthwhile(&[0.7; 4], 4, &costs));
+        assert!(head.worthwhile(&[0.7; 4], 4, 4, &costs));
         // The same head for a single unlikely draft does not.
         head.record(1, 0.006);
-        assert!(!head.worthwhile(&[0.2], 4, &costs));
-        assert!(!head.worthwhile(&[], 4, &costs));
+        assert!(!head.worthwhile(&[0.2], 1, 4, &costs));
+        assert!(!head.worthwhile(&[], 0, 4, &costs));
+    }
+
+    /// A block head is priced by the drafts it computes and credited with the ones
+    /// verification is expected to keep: seven drafts from one 9 ms pass beside a 48 ms
+    /// decode, at 14 ms per verified draft, pay when the last block kept two likely drafts,
+    /// and not when it kept one unlikely one.
+    #[test]
+    fn test_block_head_pays_by_the_drafts_its_last_block_kept() {
+        let costs = costs(1, 0.048, 0.014);
+        let mut head = HeadCosts::default();
+        head.record(7, 0.009);
+        assert!(head.worthwhile(&[0.95, 0.9], 7, 1, &costs));
+        assert!(!head.worthwhile(&[0.4], 7, 1, &costs));
+    }
+
+    #[test]
+    fn test_reach_multiplies_calibrated_acceptance_along_a_chain() {
+        let calibration = Calibration::default();
+        let reach = calibration.reach(&[0.93, 0.93, 0.05]);
+        assert_eq!(reach.len(), 3);
+        assert!((reach[1] - 0.9025).abs() < 1e-12);
+        assert!((reach[2] - 0.045_125).abs() < 1e-12);
     }
 
     #[test]

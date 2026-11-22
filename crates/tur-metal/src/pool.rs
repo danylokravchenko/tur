@@ -80,9 +80,10 @@ pub struct PoolConfig {
 impl PoolConfig {
     /// Fit `bytes`: two recurrent slots per concurrent sequence (its committed state and one
     /// in-flight state), `retained` slots for snapshots kept beyond live sequences (prefix
-    /// reuse) and the permanent zero slot; then window pages for every sequence and
-    /// retained snapshot to hold its window plus a pass of `pass_tokens`; then as many
-    /// K/V pages as remain. Fails if any kind of state the model needs gets no capacity.
+    /// reuse), `draft_slots` for the per-token boundaries of speculative passes and the
+    /// permanent zero slot; then window pages for every sequence and retained snapshot to
+    /// hold its window plus a pass of `pass_tokens`; then as many K/V pages as remain. A
+    /// draft boundary holds recurrent state only, so it takes no window pages. Fails if any kind of state the model needs gets no capacity.
     /// An `indexed` pool gives every 32 pages an index block, plus one per holder for blocks
     /// whose last page diverged by copy-on-write.
     pub fn for_budget(
@@ -90,6 +91,7 @@ impl PoolConfig {
         bytes: usize,
         sequences: usize,
         retained: usize,
+        draft_slots: usize,
         pass_tokens: usize,
         indexed: bool,
     ) -> Result<Self> {
@@ -97,6 +99,7 @@ impl PoolConfig {
             sequences
                 .checked_mul(2)
                 .and_then(|slots| slots.checked_add(retained))
+                .and_then(|slots| slots.checked_add(draft_slots))
                 .ok_or_else(|| invalid("recurrent slot count overflow"))?
         } else {
             0
@@ -1047,7 +1050,7 @@ mod tests {
         // Two sequences and one snapshot, each holding a 3-key window plus a 4-token pass:
         // pages_for(7) + 1 = 5 window pages apiece.
         let fixed = 6 * slot + 16 * window;
-        let config = PoolConfig::for_budget(&model, fixed + 4 * page + 1, 2, 1, 4, false)?;
+        let config = PoolConfig::for_budget(&model, fixed + 4 * page + 1, 2, 1, 0, 4, false)?;
         assert_eq!(
             config,
             PoolConfig {
@@ -1059,7 +1062,12 @@ mod tests {
         );
         // The placeholder window page is allocated beside them.
         assert_eq!(config.bytes(&model)?, 4 * page + 16 * window + 6 * slot);
-        assert!(PoolConfig::for_budget(&model, fixed - 1, 2, 1, 4, false).is_err());
+        assert!(PoolConfig::for_budget(&model, fixed - 1, 2, 1, 0, 4, false).is_err());
+        // Draft boundaries add recurrent slots and no window pages.
+        let drafted =
+            PoolConfig::for_budget(&model, fixed + 3 * slot + 4 * page, 2, 1, 3, 4, false)?;
+        assert_eq!((drafted.window_pages, drafted.recurrent_slots), (15, 8));
+        assert_eq!(drafted.pages, 4);
         let pool = StatePool::new(Arc::new(model), &Device::Cpu, config)?;
         assert_eq!(pool.attention(2)?.key.data.dim(0)?, 16 * 2);
         assert_eq!(pool.usage()?.windows.capacity, 15);
@@ -1079,7 +1087,7 @@ mod tests {
         let page = model.page_bytes()?;
         let slot = model.recurrent_slot_bytes()?;
         let budget = 3 * page + 5 * slot + 7;
-        let config = PoolConfig::for_budget(&model, budget, 2, 0, 0, false)?;
+        let config = PoolConfig::for_budget(&model, budget, 2, 0, 0, 0, false)?;
         assert_eq!(
             config,
             PoolConfig {
@@ -1091,9 +1099,9 @@ mod tests {
         );
         assert_eq!(config.bytes(&model)?, 3 * page + 5 * slot);
         assert!(config.bytes(&model)? <= budget);
-        assert!(PoolConfig::for_budget(&model, 4 * slot, 2, 0, 0, false).is_err());
+        assert!(PoolConfig::for_budget(&model, 4 * slot, 2, 0, 0, 0, false).is_err());
         assert!(matches!(
-            PoolConfig::for_budget(&model, slot, 2, 0, 0, false),
+            PoolConfig::for_budget(&model, slot, 2, 0, 0, 0, false),
             Err(TurError::MemoryAllocation(_))
         ));
         Ok(())
@@ -1105,9 +1113,9 @@ mod tests {
         let page = model.page_bytes()?;
         let slot = model.recurrent_slot_bytes()?;
         let minimum = page + 3 * slot;
-        assert!(PoolConfig::for_budget(&model, minimum - 1, 1, 0, 0, false).is_err());
+        assert!(PoolConfig::for_budget(&model, minimum - 1, 1, 0, 0, 0, false).is_err());
         for budget in [minimum, minimum + page - 1, minimum + page] {
-            let config = PoolConfig::for_budget(&model, budget, 1, 0, 0, false)?;
+            let config = PoolConfig::for_budget(&model, budget, 1, 0, 0, 0, false)?;
             assert_eq!(config.pages, (budget - 3 * slot) / page);
             assert!(config.bytes(&model)? <= budget);
         }
@@ -1115,18 +1123,18 @@ mod tests {
         recurrent
             .layers
             .retain(|kind| matches!(kind, LayerStateKind::Recurrent { .. }));
-        assert!(PoolConfig::for_budget(&recurrent, 3 * slot - 1, 1, 0, 0, false).is_err());
-        let config = PoolConfig::for_budget(&recurrent, 3 * slot, 1, 0, 0, false)?;
+        assert!(PoolConfig::for_budget(&recurrent, 3 * slot - 1, 1, 0, 0, 0, false).is_err());
+        let config = PoolConfig::for_budget(&recurrent, 3 * slot, 1, 0, 0, 0, false)?;
         assert_eq!(config.bytes(&recurrent)?, 3 * slot);
 
         let mut attention = (*model).clone();
         attention
             .layers
             .retain(|kind| matches!(kind, LayerStateKind::Attention { .. }));
-        let config = PoolConfig::for_budget(&attention, page, 1, 0, 0, false)?;
+        let config = PoolConfig::for_budget(&attention, page, 1, 0, 0, 0, false)?;
         assert_eq!(config.bytes(&attention)?, page);
         assert_eq!(config.recurrent_slots, 0);
-        assert!(PoolConfig::for_budget(&model, usize::MAX, usize::MAX, 0, 0, false).is_err());
+        assert!(PoolConfig::for_budget(&model, usize::MAX, usize::MAX, 0, 0, 0, false).is_err());
         assert!(
             PoolConfig {
                 pages: 1,

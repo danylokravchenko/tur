@@ -61,11 +61,13 @@ Other results for Qwen3.5-0.8B on that 16 GB M1:
 - Prompt-lookup speculation reaches up to 2.9× normal decoding on repetitive text.
 - With sparse attention, one sequence decodes 47.5 tokens/s at 128K tokens of context instead of 21.7, prefill after 64K runs at 733 tokens/s instead of 181, and a 64K-token prompt gets its first token in 80 s instead of 194 s.
 
+Inkling 2 Mini on the M3 Pro decodes 22.5 tokens/s for one sequence with 8-bit projections (26.3 with 4-bit), and its own block drafter generates new prose 1.2× and code up to 1.5× faster with the same output.
+
 [Measured performance](docs/src/guide/performance.md) has the full tables, versions and methods.
 
 ## Models
 
-Tur supports the Qwen3.5 family, Gemma 4 and gpt-oss for text, plus Whisper for transcription. Qwen3.5-family models and Gemma 4 also accept images and H.264 or HEVC video, and Gemma 4 E2B and E4B accept WAV audio. [Scope and principles](docs/src/design/scope.md) lists how far each model has been validated.
+Tur supports the Qwen3.5 family, Gemma 4, gpt-oss and Inkling 2 for text, plus Whisper for transcription. Qwen3.5-family models and Gemma 4 also accept images and H.264 or HEVC video, and Gemma 4 E2B and E4B accept WAV audio. Inkling 2 Mini runs from its published NVFP4 and MXFP8 checkpoint, with the block drafter that ships beside it. [Scope and principles](docs/src/design/scope.md) lists how far each model has been validated, and [Best practice](docs/src/guide/best-practice.md) gives a starting configuration for each.
 
 ## Get started
 
