@@ -1,5 +1,5 @@
 //! The decoder on the Metal kernels.
-use super::{Executor, Inkling2, InputNorms, Layer, MessageGate, Pass, reference::RESIDUAL_EPS};
+use super::{Executor, Inkling2, InputNorms, Layer, Pass, reference::RESIDUAL_EPS};
 use crate::models::paging::Paging;
 use candle_core::Tensor;
 use tur_core::{Result, execution::invalid};
@@ -16,8 +16,6 @@ pub(super) struct Fused<'a, 'b> {
     recurrent: RecurrentSpans,
     /// `[tokens]` U32 positions, for log scaling.
     positions: Tensor,
-    /// A gain of ones: the RMS kernel with it is the gainless norm.
-    ones: Tensor,
 }
 
 fn heads(count: usize, dim: usize, col_offset: usize) -> Heads {
@@ -34,56 +32,78 @@ impl Fused<'_, '_> {
         &self.model.config
     }
 
-    fn unit(&self, x: &Tensor) -> Result<Tensor> {
-        self.k
-            .rms_norm(x, &self.ones, self.config().text.rms_norm_eps)
+    fn eps(&self) -> f32 {
+        self.config().text.rms_norm_eps as f32
     }
 
-    fn gate(&self, gate: &MessageGate, x: &Tensor, message: &Tensor) -> Result<Tensor> {
-        let pair = Tensor::cat(&[self.unit(x)?, self.unit(message)?], 1)?;
-        let gates = pair.matmul(&gate.down)?.matmul(&gate.gates)?.tanh()?;
-        let hidden = x.dim(1)?;
-        let forget = gates.narrow(1, 0, hidden)?;
-        let gain = gates.narrow(1, hidden, hidden)?;
-        Ok(((x - (&forget * x)?)? + (gain * message)?)?)
-    }
-
+    /// The normalized query, key and value inputs. A looped layer mixes the previous pass's
+    /// messages into all three with one pair kernel, one batched low-rank product and one
+    /// kernel that applies the gates and the norms.
     fn inputs(
         &self,
         layer: &Layer,
-        index: usize,
         x: &Tensor,
         blocks: &[Tensor],
         messages: Option<&Tensor>,
     ) -> Result<[Tensor; 3]> {
-        let mut inputs = match &layer.attention_queries {
-            None => [x.clone(), x.clone(), x.clone()],
+        let (tokens, hidden) = x.dims2()?;
+        // `[tokens, hidden]` rows every input shares, or `[3 * tokens, hidden]`.
+        let read = match &layer.attention_queries {
+            None => x.clone(),
             Some(queries) => {
                 let read = self.residual(blocks, x, queries)?;
-                if self.config().sliding(index) {
-                    let h = read.get(0)?;
-                    [h.clone(), h.clone(), h]
-                } else {
-                    [read.get(0)?, read.get(1)?, read.get(2)?]
-                }
+                read.reshape((read.dim(0)? * tokens, hidden))?
+            }
+        };
+        let input = |t: &Tensor, i: usize| -> Result<Tensor> {
+            if t.dim(0)? == tokens {
+                Ok(t.clone())
+            } else {
+                Ok(t.narrow(0, i * tokens, tokens)?)
             }
         };
         if let (Some(messages), Some(gates)) = (messages, &layer.gates) {
-            for (i, input) in inputs.iter_mut().enumerate() {
-                *input = self.gate(&gates[i], input, &messages.get(i)?)?;
-            }
+            let norms = match &layer.norms {
+                InputNorms::Shared(norm) => norm.unsqueeze(0)?,
+                InputNorms::Separate(norms) => norms.clone(),
+            };
+            let messages = messages.narrow(0, 0, 3)?;
+            let mix = self
+                .k
+                .message_pair(&read, &messages, self.eps())?
+                .matmul(&gates.down.narrow(0, 0, 3)?)?
+                .matmul(&gates.up.narrow(0, 0, 3)?)?;
+            let out = self
+                .k
+                .message_gate(&read, &messages, &mix, &norms, self.eps())?;
+            return Ok([input(&out, 0)?, input(&out, 1)?, input(&out, 2)?]);
         }
-        let [q, k, v] = inputs;
         Ok(match &layer.norms {
-            InputNorms::Shared(norm) => [
-                self.norm(&q, norm)?,
-                self.norm(&k, norm)?,
-                self.norm(&v, norm)?,
-            ],
-            InputNorms::Separate([qn, kn, vn]) => {
-                [self.norm(&q, qn)?, self.norm(&k, kn)?, self.norm(&v, vn)?]
+            InputNorms::Shared(norm) => {
+                let normed = self.norm(&read, norm)?;
+                [normed.clone(), normed.clone(), normed]
             }
+            InputNorms::Separate(norms) => [
+                self.norm(&input(&read, 0)?, &norms.get(0)?)?,
+                self.norm(&input(&read, 1)?, &norms.get(1)?)?,
+                self.norm(&input(&read, 2)?, &norms.get(2)?)?,
+            ],
         })
+    }
+
+    /// The experts' normalized input: the MLP message mixed in first in looped layers.
+    fn mlp_input(&self, layer: &Layer, h: &Tensor, messages: Option<&Tensor>) -> Result<Tensor> {
+        let (Some(messages), Some(gates)) = (messages, &layer.gates) else {
+            return self.norm(h, &layer.post_norm);
+        };
+        let message = messages.narrow(0, 3, 1)?;
+        let mix = self
+            .k
+            .message_pair(h, &message, self.eps())?
+            .matmul(&gates.down.narrow(0, 3, 1)?)?
+            .matmul(&gates.up.narrow(0, 3, 1)?)?;
+        self.k
+            .message_gate(h, &message, &mix, &layer.post_norm, self.eps())
     }
 
     /// One convolved side of the attention: its projection, then the short convolution
@@ -251,11 +271,8 @@ impl Executor for Fused<'_, '_> {
     }
 
     fn residual(&self, blocks: &[Tensor], partial: &Tensor, queries: &Tensor) -> Result<Tensor> {
-        let stacked = (!blocks.is_empty())
-            .then(|| Tensor::stack(blocks, 0))
-            .transpose()?;
         self.k
-            .block_residual(stacked.as_ref(), partial, queries, RESIDUAL_EPS as f32)
+            .block_residual(blocks, partial, queries, RESIDUAL_EPS as f32)
     }
 
     fn layer(
@@ -269,7 +286,7 @@ impl Executor for Fused<'_, '_> {
         let config = self.config();
         let layer = &self.model.layers[index];
         let columns = config.conv_columns();
-        let inputs = self.inputs(layer, index, x, blocks, messages)?;
+        let inputs = self.inputs(layer, x, blocks, messages)?;
         let attended = self.attention(application, index, &inputs)?;
         let attended = self.conv(
             application,
@@ -283,11 +300,8 @@ impl Executor for Fused<'_, '_> {
         } else {
             (x + attended)?
         };
-        let mut h = self.residual(blocks, &residual, &layer.mlp_query)?.get(0)?;
-        if let (Some(messages), Some(gates)) = (messages, &layer.gates) {
-            h = self.gate(&gates[3], &h, &messages.get(3)?)?;
-        }
-        let routed = self.experts(layer, &self.norm(&h, &layer.post_norm)?)?;
+        let h = self.residual(blocks, &residual, &layer.mlp_query)?.get(0)?;
+        let routed = self.experts(layer, &self.mlp_input(layer, &h, messages)?)?;
         let routed = self.conv(application, &routed, &layer.mlp_taps, columns.mlp)?;
         Ok((residual + routed)?)
     }
@@ -334,11 +348,6 @@ impl Inkling2 {
             paging,
             recurrent,
             positions: Tensor::new(positions.as_slice(), &self.device)?,
-            ones: Tensor::ones(
-                self.config.text.hidden_size,
-                candle_core::DType::F32,
-                &self.device,
-            )?,
         };
         self.decode(&fused, x, trace)
     }

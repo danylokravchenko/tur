@@ -1,6 +1,6 @@
 //! Reference decoder over Candle operations: the numerical oracle the kernels are tested
 //! against, on any device.
-use super::{Attention, Executor, Inkling2, InputNorms, Layer, MessageGate, Pass};
+use super::{Attention, Executor, Inkling2, InputNorms, Layer, MessageGates, Pass};
 use crate::models::math;
 use candle_core::{D, DType, IndexOp, Tensor};
 use tur_core::{Result, execution::invalid};
@@ -184,10 +184,12 @@ impl Reference<'_, '_> {
         &self.model.config
     }
 
-    fn gate(&self, gate: &MessageGate, x: &Tensor, message: &Tensor) -> Result<Tensor> {
+    /// Mix `message` into `x` through gate `i` of `gates`.
+    fn gate(&self, gates: &MessageGates, i: usize, x: &Tensor, message: &Tensor) -> Result<Tensor> {
         let eps = self.config().text.rms_norm_eps;
+        let (down, up) = gates.get(i)?;
         let pair = Tensor::cat(&[unit_rms(x, eps)?, unit_rms(message, eps)?], 1)?;
-        let gates = pair.matmul(&gate.down)?.matmul(&gate.gates)?.tanh()?;
+        let gates = pair.matmul(&down)?.matmul(&up)?.tanh()?;
         let hidden = x.dim(1)?;
         let forget = gates.narrow(1, 0, hidden)?;
         let gain = gates.narrow(1, hidden, hidden)?;
@@ -424,7 +426,7 @@ impl Reference<'_, '_> {
         };
         if let (Some(messages), Some(gates)) = (messages, &layer.gates) {
             for (i, input) in inputs.iter_mut().enumerate() {
-                *input = self.gate(&gates[i], input, &messages.get(i)?)?;
+                *input = self.gate(gates, i, input, &messages.get(i)?)?;
             }
         }
         match &layer.norms {
@@ -432,9 +434,9 @@ impl Reference<'_, '_> {
             InputNorms::Separate(norms) => {
                 let [query, key, value] = inputs;
                 [
-                    math::rms(&query, &norms[0], eps),
-                    math::rms(&key, &norms[1], eps),
-                    math::rms(&value, &norms[2], eps),
+                    math::rms(&query, &norms.get(0)?, eps),
+                    math::rms(&key, &norms.get(1)?, eps),
+                    math::rms(&value, &norms.get(2)?, eps),
                 ]
             }
         }
@@ -498,7 +500,7 @@ impl Executor for Reference<'_, '_> {
         };
         let mut read = self.residual(blocks, &residual, &layer.mlp_query)?.get(0)?;
         if let (Some(messages), Some(gates)) = (messages, &layer.gates) {
-            read = self.gate(&gates[3], &read, &messages.get(3)?)?;
+            read = self.gate(gates, 3, &read, &messages.get(3)?)?;
         }
         let routed = self.experts(
             layer,

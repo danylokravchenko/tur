@@ -330,10 +330,90 @@ fn test_inkling2_packed_experts_match_reference_and_plan() -> Result<()> {
 
 #[cfg(feature = "metal")]
 mod kernels {
-    use crate::kernels::{read, relative_error, setup};
+    use crate::kernels::{
+        AttentionCase, paged_pool, read, relative_error, setup, stored, upload, values,
+    };
     use candle_core::{Device, Tensor};
-    use tur_core::Result;
-    use tur_metal::{packed::PackedLinear, quantize::Microscale};
+    use tur_core::{Result, execution::KvFormat};
+    use tur_metal::{
+        kernels::{Relative, Tuning},
+        packed::PackedLinear,
+        pool::AttentionPool,
+        quantize::Microscale,
+    };
+
+    /// Keys split across threadgroups, their partials combined with each token's sink logit
+    /// and gated afterwards, give what one pass over every key gives, for full and windowed
+    /// layers over each pool format. Splits of 2 and 8 keys cut through pages, windows and
+    /// the relative bias's extent; unused pool slots hold NaN, so a stray read shows.
+    #[test]
+    fn test_relative_attention_splits_match_one_pass() -> Result<()> {
+        let (device, kernels, _gpu) = setup()?;
+        let case = AttentionCase {
+            heads: 6,
+            kv_heads: 2,
+            dim: 128,
+            page: 4,
+            sequences: vec![(37, 3), (0, 9)],
+        };
+        let (heads, dim, rel_dim, extent) = (case.heads, case.dim, 16, 7);
+        let (key, value, slots, table, first, visible) = paged_pool(&case, 41);
+        let tokens = visible.len();
+        let q = upload(
+            &device,
+            &values(tokens * heads * dim, 1, 0.3),
+            &[tokens, heads, dim],
+        )?;
+        let rel = values(tokens * heads * rel_dim, 2, 1.0);
+        let rel = upload(&device, &rel, &[tokens, heads * rel_dim])?;
+        let proj = upload(
+            &device,
+            &values(rel_dim * extent, 3, 1.0),
+            &[rel_dim, extent],
+        )?;
+        // Each row holds the sink logits, then the gates.
+        let width = heads + heads * dim;
+        let side = upload(&device, &values(tokens * width, 4, 2.0), &[tokens, width])?;
+        let paged = kernels.paged_kv(case.page, slots, &table, &first, &visible)?;
+        for format in [KvFormat::F32, KvFormat::F16, KvFormat::Q8] {
+            let (key, _) = stored(&device, &key, slots, case.kv_heads, dim, format)?;
+            let (value, _) = stored(&device, &value, slots, case.kv_heads, dim, format)?;
+            let pool = AttentionPool {
+                key,
+                value,
+                format,
+                page_tokens: case.page,
+                kv_heads: case.kv_heads,
+                head_dim: dim,
+            };
+            for window in [None, Some(5), Some(24)] {
+                let run = |minimum: usize| -> Result<Vec<f32>> {
+                    let tuned = kernels.clone().with_tuning(Tuning {
+                        min_split_keys: minimum,
+                        ..kernels.tuning()
+                    })?;
+                    let relative = Relative {
+                        rel: &rel,
+                        proj: &proj,
+                        sinks: (&side, 0),
+                        gate: (&side, heads),
+                        window,
+                        scale: 0.09,
+                    };
+                    read(&tuned.relative_attention(&q, &pool, &paged, relative)?)
+                };
+                let whole: Vec<f64> = run(1024)?.into_iter().map(f64::from).collect();
+                for minimum in [2, 8] {
+                    let error = relative_error(&run(minimum)?, &whole);
+                    assert!(
+                        error < 1e-5,
+                        "{format} window {window:?} split {minimum}: {error}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Bytes of a microscaled bank: random values (never an E4M3 NaN) and moderate scales.
     fn bank(format: Microscale, rows: usize, cols: usize, seed: u64) -> (Vec<u8>, Vec<u8>) {

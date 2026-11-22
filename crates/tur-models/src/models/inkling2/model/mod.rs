@@ -44,17 +44,19 @@ struct Attention {
 /// Norms before the attention: one for sliding layers, one per input for full layers.
 enum InputNorms {
     Shared(Tensor),
-    Separate([Tensor; 3]),
+    /// `[3, hidden]` query, key and value gains.
+    Separate(Tensor),
 }
 
-/// Mixes a message of the previous loop pass into an input:
-/// `(1 - tanh(forget)) * x + tanh(gain) * message`, both gates of a rank-`r` projection of
-/// the normalized pair.
-struct MessageGate {
-    /// `[2 * hidden, rank]`, transposed for `x @ down`.
+/// The query, key, value and MLP message gates of a looped layer, stacked so that several
+/// run as one batched product. Gate `i` mixes a message of the previous loop pass into
+/// its input: `(1 - tanh(forget)) * x + tanh(gain) * message`, both gates of a rank-`r`
+/// projection of the normalized pair `[x, message]`.
+struct MessageGates {
+    /// `[4, 2 * hidden, rank]`, transposed for `pair @ down`.
     down: Tensor,
-    /// `[rank, 2 * hidden]`: forget columns, then gain columns.
-    gates: Tensor,
+    /// `[4, rank, 2 * hidden]`: forget columns, then gain columns.
+    up: Tensor,
 }
 
 struct Experts {
@@ -81,7 +83,7 @@ struct Layer {
     mlp_taps: Tensor,
     experts: Experts,
     /// Query, key, value and MLP message gates of looped layers.
-    gates: Option<[MessageGate; 4]>,
+    gates: Option<MessageGates>,
 }
 
 /// Inkling 2 text tower: immutable weights, with all request state in the engine's pools.
@@ -310,21 +312,29 @@ impl Experts {
     }
 }
 
-impl MessageGate {
+impl MessageGates {
+    /// The `attn`, `k`, `v` and `mlp` controllers under `prefix`.
     fn load(tensors: &Tensors, prefix: &str) -> Result<Self> {
-        let take = |name: &str| -> Result<Tensor> {
-            Ok(tensors
-                .take(&format!("{prefix}.{name}"))?
-                .to_dtype(DType::F32)?)
-        };
-        let gates = Tensor::cat(&[take("forget_weight")?, take("gain_weight")?], 0)?;
+        let (mut downs, mut ups) = (Vec::new(), Vec::new());
+        for name in ["attn", "k", "v", "mlp"] {
+            let take = |weight: &str| -> Result<Tensor> {
+                Ok(tensors
+                    .take(&format!("{prefix}.{name}.{weight}"))?
+                    .to_dtype(DType::F32)?)
+            };
+            let up = Tensor::cat(&[take("forget_weight")?, take("gain_weight")?], 0)?;
+            downs.push(take("down_weight")?.t()?);
+            ups.push(up.t()?);
+        }
         Ok(Self {
-            down: take("down_weight")?
-                .t()?
-                .contiguous()?
-                .to_device(&tensors.device)?,
-            gates: gates.t()?.contiguous()?.to_device(&tensors.device)?,
+            down: Tensor::stack(&downs, 0)?.to_device(&tensors.device)?,
+            up: Tensor::stack(&ups, 0)?.to_device(&tensors.device)?,
         })
+    }
+
+    /// Gate `i`'s `[2 * hidden, rank]` and `[rank, 2 * hidden]` projections.
+    fn get(&self, i: usize) -> Result<(Tensor, Tensor)> {
+        Ok((self.down.get(i)?, self.up.get(i)?))
     }
 }
 
@@ -349,11 +359,14 @@ impl Layer {
         let norms = if sliding {
             InputNorms::Shared(take(&format!("{p}.attn_norm.weight"))?)
         } else {
-            InputNorms::Separate([
-                take(&format!("{p}.q_input_norm.weight"))?,
-                take(&format!("{p}.k_input_norm.weight"))?,
-                take(&format!("{p}.v_input_norm.weight"))?,
-            ])
+            InputNorms::Separate(Tensor::stack(
+                &[
+                    take(&format!("{p}.q_input_norm.weight"))?,
+                    take(&format!("{p}.k_input_norm.weight"))?,
+                    take(&format!("{p}.v_input_norm.weight"))?,
+                ],
+                0,
+            )?)
         };
         let attention_queries = (index > 0)
             .then(|| -> Result<Tensor> {
@@ -364,11 +377,7 @@ impl Layer {
             .transpose()?;
         let gates = config
             .looped(index)
-            .then(|| -> Result<[MessageGate; 4]> {
-                let gate =
-                    |name: &str| MessageGate::load(tensors, &format!("{p}.controllers.{name}"));
-                Ok([gate("attn")?, gate("k")?, gate("v")?, gate("mlp")?])
-            })
+            .then(|| MessageGates::load(tensors, &format!("{p}.controllers")))
             .transpose()?;
         Ok(Self {
             attention_queries,
@@ -412,11 +421,10 @@ impl Layer {
         ];
         tensors.extend(self.attention_queries.as_ref());
         match &self.norms {
-            InputNorms::Shared(norm) => tensors.push(norm),
-            InputNorms::Separate(norms) => tensors.extend(norms.iter()),
+            InputNorms::Shared(norms) | InputNorms::Separate(norms) => tensors.push(norms),
         }
-        for gate in self.gates.iter().flatten() {
-            tensors.extend([&gate.down, &gate.gates]);
+        if let Some(gates) = &self.gates {
+            tensors.extend([&gates.down, &gates.up]);
         }
         tensors.iter().map(|t| t.elem_count() * 4).sum()
     }
@@ -437,9 +445,9 @@ impl Layer {
     }
 }
 
-/// Bound live hidden and projection buffers, block states, routed rows and convolution
-/// outputs of one pass.
-fn workspace(config: &Config, tokens: usize) -> Result<usize> {
+/// Bound live hidden and projection buffers, block states, routed rows, convolution
+/// outputs and `split` bytes of attention split partials of one pass.
+fn workspace(config: &Config, tokens: usize, split: usize) -> Result<usize> {
     let t = &config.text;
     let query = checked_elements(&[t.num_attention_heads, 2 * t.head_dim + t.d_rel + 1])?;
     let kv = checked_elements(&[t.num_key_value_heads, t.head_dim + t.sconv_kernel_size])?;
@@ -458,7 +466,32 @@ fn workspace(config: &Config, tokens: usize) -> Result<usize> {
     activations
         .checked_add(routed)
         .and_then(|n| n.checked_add(routing))
+        .and_then(|n| n.checked_add(split))
         .ok_or_else(|| invalid("Inkling 2 workspace overflow"))
+}
+
+/// Split partials of the widest attention dispatch of a pass of `tokens` over sequences
+/// reaching `context` keys: full layers read every key, sliding layers their window.
+#[cfg(feature = "metal")]
+fn split_workspace(
+    config: &Config,
+    kernels: &tur_metal::kernels::Kernels,
+    tokens: usize,
+    context: usize,
+) -> usize {
+    let t = &config.text;
+    [context, context.min(t.sliding_window_size)]
+        .into_iter()
+        .map(|span| {
+            kernels.relative_attention_scratch_bytes(
+                tokens,
+                t.num_attention_heads,
+                t.head_dim,
+                span,
+            )
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 impl Inkling2 {
@@ -467,7 +500,7 @@ impl Inkling2 {
         config: &Config,
         options: &LoadOptions,
         tokens: usize,
-        _contexts: &[usize],
+        contexts: &[usize],
     ) -> Result<(ModelDescription, usize, usize)> {
         let description = config.description(
             format!("{}#{}", options.revision, options.weights.tag()),
@@ -498,7 +531,20 @@ impl Inkling2 {
                     .ok_or_else(|| invalid("Inkling 2 weight bytes overflow"))?;
             }
         }
-        Ok((description, weights, workspace(config, tokens)?))
+        #[cfg(feature = "metal")]
+        let split = if options.device.is_metal() {
+            let kernels = tur_metal::kernels::Kernels::new(&options.device)?;
+            let context = contexts.iter().copied().max().unwrap_or(0);
+            split_workspace(config, &kernels, tokens, context)
+        } else {
+            0
+        };
+        #[cfg(not(feature = "metal"))]
+        let split = {
+            let _ = contexts;
+            0
+        };
+        Ok((description, weights, workspace(config, tokens, split)?))
     }
 
     /// Validate headers, then load the text tower onto `options.device`. Expert formats
@@ -861,7 +907,21 @@ impl HybridModel for Inkling2 {
         self.description.clone()
     }
     fn workspace_bytes(&self, batch: &PackedForward<'_>) -> Result<usize> {
-        workspace(&self.config, batch.tokens.len())
+        #[cfg(feature = "metal")]
+        let split = match &self.kernels {
+            Some(kernels) => {
+                let mut context = 0;
+                for s in batch.sequences {
+                    let end = s.state.past().checked_add(s.tokens.len());
+                    context = context.max(end.ok_or_else(|| invalid("context overflow"))?);
+                }
+                split_workspace(&self.config, kernels, batch.tokens.len(), context)
+            }
+            None => 0,
+        };
+        #[cfg(not(feature = "metal"))]
+        let split = 0;
+        workspace(&self.config, batch.tokens.len(), split)
     }
     #[cfg(feature = "metal")]
     fn kernels(&self) -> Option<tur_metal::kernels::Kernels> {

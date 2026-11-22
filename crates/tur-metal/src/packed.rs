@@ -399,6 +399,14 @@ impl PackedLinear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         Ok(match &self.weights {
             Weights::Dense(weight) => x.matmul(&weight.t()?)?,
+            // Candle's multi-row Metal GGML GEMM reads its input from the buffer's start,
+            // ignoring the layout's start offset, so a view into a larger buffer (rows of a
+            // stacked activation) gets its own copy first.
+            Weights::Packed { matmul, .. }
+                if x.device().is_metal() && x.layout().start_offset() > 0 =>
+            {
+                matmul.forward(&x.force_contiguous()?)?
+            }
             Weights::Packed { matmul, .. } => matmul.forward(x)?,
             #[cfg(feature = "metal")]
             Weights::Microscaled { .. } | Weights::Arena { .. } | Weights::Blocks { .. } => {
@@ -442,7 +450,7 @@ impl PackedLinear {
                     upload_bytes(bytes, *format, (rows, self.in_features), &Device::Cpu)?;
                 QMatMul::from_qtensor(slice)?.forward(x)?
             }
-            Weights::Packed { matmul, .. } => matmul.forward(x)?.narrow(1, start, rows)?,
+            Weights::Packed { .. } => self.forward(x)?.narrow(1, start, rows)?,
             #[cfg(feature = "metal")]
             Weights::Microscaled { .. } | Weights::Arena { .. } | Weights::Blocks { .. } => {
                 return Err(host_read());

@@ -632,3 +632,20 @@ Batched decode at about 128 tokens of context, in tokens/s over all sequences (T
 | llama.cpp | 7.3 | 11.8 | 23.2 | 41.1 |
 
 Prefill is level, with llama.cpp 1 to 3% ahead. Both engines are limited by compute there. Decode is where they differ: Tur is 8% faster with one sequence at 128 tokens, 19% at 8K, and 25 to 29% faster with 2 to 8 sequences. Bursts through the serving pipeline were not compared, because the two harnesses use different output lengths and sampling. MLX was not run on this model.
+
+## Inkling 2 Mini
+
+Inkling 2 Mini runs 48 layer applications per token, because its middle 12 layers loop three times, and each application routes the token to 8 of 128 experts. Decode therefore reads about 36 MB of NVFP4 or MXFP8 experts and about 29 MB of Q8_0 attention projections per application, plus a 490 MB unembedding, roughly twice what a Qwen3.6-35B-A3B token reads. The rows below load the pinned `thinkingmachines/Inkling-2-Mini` snapshot's SafeTensors directly, with the experts as published and the projections converted at load time.
+
+The machine is the M3 Pro described above, on macOS 27.2, with F16 K/V. Figures come from the `model` benchmark (median of 12 decode steps or 2 to 4 prefill passes):
+
+| Case | Q8_0 projections | Q4K projections |
+| --- | --- | --- |
+| Prefill, 512 tokens | 328 tokens/s | 323 tokens/s |
+| Prefill, 2,048 tokens | 292 tokens/s | |
+| Decode, 1 sequence at 128 tokens | 21.2 tokens/s (47.1 ms per step) | 24.4 tokens/s (41.0 ms) |
+| Decode, 4 sequences at 128 tokens | 41.9 tokens/s | 46.1 tokens/s |
+| Decode, 1 sequence at 4K tokens | 20.3 tokens/s | 22.7 tokens/s |
+| Load time | 8.5 s | 16.1 s |
+
+With one sequence, removing a part of the step and timing the rest attributes 18.7 ms to the experts and 13.9 ms to attention, close to what reading their weights costs at this Mac's bandwidth, so Q4K projections are the remaining lever for one sequence. Splitting keys across simdgroups keeps decode at 4K tokens within 5% of decode at 128; before the split, one sequence at 4K took 77 ms per step. A 2,048-token prefill spends about half its time in the experts, which do three times the arithmetic per token of Qwen3.6-35B-A3B's, and about 30% in the per-query attention kernel.
