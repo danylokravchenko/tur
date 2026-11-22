@@ -523,8 +523,8 @@ impl Inkling2 {
         &self,
         pass: &Pass<'_, '_>,
         x: &Tensor,
-        trace: Option<&mut Vec<Tensor>>,
+        capture: super::Capture<'_>,
     ) -> Result<Tensor> {
-        self.decode(&Reference { model: self, pass }, x, trace)
+        self.decode(&Reference { model: self, pass }, x, capture)
     }
 }

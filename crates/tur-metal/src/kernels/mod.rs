@@ -9,7 +9,10 @@ mod inkling;
 mod lsa;
 mod moe;
 mod runtime;
-pub use inkling::{HeadNorm, LogScale, RESIDUAL_ENTRIES, RESIDUAL_QUERIES, Relative, ShortConv};
+pub use inkling::{
+    Clipped, GATE_GEMV_ROWS, HeadNorm, LogScale, RESIDUAL_ENTRIES, RESIDUAL_QUERIES, Relative,
+    ShortConv,
+};
 pub use lsa::{ClusterJob, IndexMap, IndexTable, SparseBudget, SparseKeys};
 pub use moe::{ExpertRoutes, SharedExpert};
 

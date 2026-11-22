@@ -52,6 +52,16 @@ pub(crate) const MODELS: &[Model] = &[
         expert_cache_mb: Some(2048),
         max_batch_size: Some(1),
     },
+    Model {
+        name: "inkling2:mini",
+        alias: "inkling",
+        repository: "thinkingmachines/Inkling-2-Mini",
+        revision: "ed40e7da625f594fc9c4990f5f66be24873c22d7",
+        download: "19 GB",
+        about: "Looped MoE with its own drafter; needs a 32 GB Mac",
+        expert_cache_mb: None,
+        max_batch_size: None,
+    },
 ];
 
 /// The model called `name`, by its full name or its family's alias.

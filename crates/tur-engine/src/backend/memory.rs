@@ -228,14 +228,12 @@ impl MemoryPlan {
         } else {
             0
         };
-        let extra = retained
-            .checked_add(draft_slots)
-            .ok_or_else(|| invalid("recurrent slot count overflow"))?;
         let config = PoolConfig::for_budget(
             description,
             bytes,
             inputs.sequences,
-            extra,
+            retained,
+            draft_slots,
             inputs.pass_tokens,
             inputs.indexed,
         )?;

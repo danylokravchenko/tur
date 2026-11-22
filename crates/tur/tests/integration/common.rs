@@ -119,6 +119,53 @@ impl Checkpoint {
         })
     }
 
+    /// The Inkling 2 fixture's checkpoint and drafter beside a word-level tokenizer of its
+    /// vocabulary and a plain template, so a pipeline can serve it.
+    pub(crate) fn inkling2() -> Result<Self> {
+        let source =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/inkling2");
+        let dir = std::env::temp_dir().join(format!("tur-inkling2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let fixture = Self(dir);
+        for file in [
+            "config.json",
+            "hf_quant_config.json",
+            "model.safetensors",
+            "mtp.safetensors",
+        ] {
+            std::fs::copy(source.join(file), fixture.0.join(file))?;
+        }
+        fixture.tokenizer(100)?;
+        Ok(fixture)
+    }
+
+    /// Word-level tokens `t0` to `t{vocab - 1}`, a template joining message contents, and
+    /// greedy generation defaults.
+    fn tokenizer(&self, vocab: u32) -> Result<()> {
+        let wordlevel = WordLevel::builder()
+            .vocab((0..vocab).map(|id| (format!("t{id}"), id)).collect())
+            .unk_token("t0".into())
+            .build()
+            .map_err(|error| TurError::Tokenizer(error.to_string()))?;
+        let mut tokenizer = Tokenizer::new(wordlevel);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        tokenizer
+            .save(self.0.join("tokenizer.json"), false)
+            .map_err(|error| TurError::Tokenizer(error.to_string()))?;
+        std::fs::write(
+            self.0.join("tokenizer_config.json"),
+            serde_json::json!({
+                "chat_template": "{% for m in messages %}{{ m.content }} {% endfor %}"
+            })
+            .to_string(),
+        )?;
+        std::fs::write(
+            self.0.join("generation_config.json"),
+            r#"{"do_sample":false}"#,
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn write(
         config: &str,
         weights: impl Fn(&str, usize, u64) -> Vec<f32>,
@@ -142,27 +189,7 @@ impl Checkpoint {
             );
         }
         candle_core::safetensors::save(&tensors, fixture.0.join("model.safetensors"))?;
-        let wordlevel = WordLevel::builder()
-            .vocab((0..96u32).map(|id| (format!("t{id}"), id)).collect())
-            .unk_token("t0".into())
-            .build()
-            .map_err(|error| TurError::Tokenizer(error.to_string()))?;
-        let mut tokenizer = Tokenizer::new(wordlevel);
-        tokenizer.with_pre_tokenizer(Some(Whitespace));
-        tokenizer
-            .save(fixture.0.join("tokenizer.json"), false)
-            .map_err(|error| TurError::Tokenizer(error.to_string()))?;
-        std::fs::write(
-            fixture.0.join("tokenizer_config.json"),
-            serde_json::json!({
-                "chat_template": "{% for m in messages %}{{ m.content }} {% endfor %}"
-            })
-            .to_string(),
-        )?;
-        std::fs::write(
-            fixture.0.join("generation_config.json"),
-            r#"{"do_sample":false}"#,
-        )?;
+        fixture.tokenizer(96)?;
         Ok(fixture)
     }
 

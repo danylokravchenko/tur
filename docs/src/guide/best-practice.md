@@ -12,6 +12,7 @@ This page gives a starting configuration for each model Tur supports: which weig
 | Gemma 4 E4B, 12B, 31B | Dense | Q8_0 artifact if it fits | Assistant not run | Not supported | Not run |
 | Gemma 4 26B-A4B | MoE | Q8_0 (Q4K can't pack its experts) | Assistant not run | Not supported | Not run |
 | gpt-oss-20b | MoE | Q8_0 at load, MXFP4 experts as published | No MTP head | 2 GiB on 16 GB | Measured, M1 16 GB |
+| Inkling 2 Mini | Looped MoE | Q8_0 at load, NVFP4 and MXFP8 experts as published | Lookup and its drafter for one user | Not supported | Speed measured, M3 Pro 36 GB; quality of Q8_0 and Q4K not |
 | Whisper large-v3-turbo | Speech | Q8_0 | None | None | Measured, M1 16 GB |
 
 "Not run" rows are starting points worked out from the configuration and the rules below. Read the memory plan that Tur logs at startup, and [check quality on your own text](choosing-quantization.md#check-quality-on-your-own-text) before you rely on them.
@@ -264,6 +265,29 @@ max_batch_size = 1
 Each extra request slows the others, since they share the cache's slots. Total throughput rises only from 2.1 to 2.7 tokens/s between one and four requests, each request's speed falls from 2.6 to 0.7 tokens/s, and four requests swapped 251 MiB on a tight machine. Keep the prompt prefix stable: repeating a 2,037-token prompt with a different ending takes 10 s instead of 18 s.
 
 On a Mac with room for 12.8 GiB, remove `expert_cache_mb` so that no token waits for the SSD. That configuration hasn't been measured.
+
+## Inkling 2 Mini
+
+Load the published checkpoint directly. Its experts run as the NVFP4 and MXFP8 blocks they ship in, and only the attention projections and the unembedding convert at load, so there is no artifact or GGUF form to make. The experts are 15.7 GB of the 16.6 GiB of weights whatever the format, so the model needs a Mac with 32 GB or more; on a 36 GB M3 Pro the plan reserves 23 GB with one 8K-token context. It has no expert cache.
+
+Q8_0 projections decode one sequence at 21.7 tokens/s. `weight_format = "q4k"` reaches 25.2 tokens/s and saves only 0.5 GiB, because the experts don't change, and its quality against Transformers hasn't been measured, so start with Q8_0. Each token runs 48 layer applications, so a 2K-token prompt prefills at about 290 tokens/s, about 7 s.
+
+With one user, turn on the drafter in `mtp.safetensors` and give it room for its whole block. New prose generated 1.2× and code 1.2 to 1.5× faster, and outputs match normal decoding. It chains its drafts only while one request is decoding, and a verified draft costs about 14 ms on this MoE, so leave it off for wider batches until that is measured:
+
+```toml
+[model]
+source = "inkling"
+
+[engine]
+speculative_draft = 7
+mtp = true
+
+[server]
+served_model_name = "inkling-2-mini"
+max_batch_size = 1
+```
+
+Prompt lookup alone (`speculative_draft = 4`) ran 1.4× faster on repetitive output. Decode stays nearly flat with context, 47.6 ms per step at 4K tokens against 46.0 at 128, so `context_tokens` is limited by memory rather than speed. Two gaps remain: the model writes its reasoning and answer as separate messages that Tur doesn't split yet, so reasoning reaches the answer text, and images aren't supported.
 
 ## Whisper large-v3-turbo
 

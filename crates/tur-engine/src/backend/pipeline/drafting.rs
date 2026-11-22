@@ -209,7 +209,9 @@ impl InferencePipeline {
             .map(|draft| draft.confidence)
             .collect();
         if !chain.is_empty() {
-            let (kept, head) = self.calibration[usize::from(pending.greedy)].chain(&chain);
+            let calibration = &self.calibration[usize::from(pending.greedy)];
+            let (kept, head) = calibration.chain(&chain);
+            pending.head_reach = calibration.reach(&chain[..kept]);
             // The head's drafts replace a lookup proposal whose acceptance is lower.
             if proposal.is_empty() || head.rate() > acceptance.rate() {
                 proposal = pending.mtp_drafts[..kept].iter().map(|d| d.token).collect();
@@ -224,7 +226,7 @@ impl InferencePipeline {
     /// for the whole next pass. Beyond the measured beneficial range its drafts are not
     /// computed; its keys and values still are, so drafting resumes when fewer sequences
     /// decode. A losing head is retried after exponentially growing skips.
-    fn head_drafts_pay(&mut self, rates: &[f64]) -> bool {
+    fn head_drafts_pay(&mut self, rates: &[f64], computed: usize) -> bool {
         let decodes = self
             .pending
             .values()
@@ -238,7 +240,7 @@ impl InferencePipeline {
         }
         if self
             .head_costs
-            .worthwhile(rates, decodes, &self.draft_costs)
+            .worthwhile(rates, computed, decodes, &self.draft_costs)
         {
             (self.head_skips, self.head_explore) = (0, speculation::HEAD_EXPLORE_PASSES);
             return true;
@@ -296,12 +298,10 @@ impl InferencePipeline {
             .values()
             .filter(|p| p.running && p.tokens.len() == p.consumed + 1)
             .count();
-        let chains = decodes <= speculation::CHAIN_MAX_DECODES
-            && self
-                .speculation
-                .mtp
-                .as_ref()
-                .is_some_and(tur_models::models::DraftHead::chains);
+        let kind = self.model.draft_head();
+        let chains = decodes <= speculation::CHAIN_MAX_DECODES && kind.is_some_and(|h| h.chains);
+        let block = chains && kind.is_some_and(|h| h.block);
+        let mut computed = 0;
         for (id, before, hidden) in heads {
             let (pending, finished) = match self.pending.get_mut(&id) {
                 Some(pending) => (pending, false),
@@ -314,13 +314,13 @@ impl InferencePipeline {
             let Some((start, hidden)) = head_rows(pending, before, hidden)? else {
                 continue;
             };
-            let (drafts, rate) = if finished {
-                (0, 0.0)
+            let drafts = if finished {
+                0
             } else {
-                head_drafts(pending, &self.speculation, chains)
+                head_drafts(pending, &self.speculation, chains, block)
             };
-            // Each chained draft is expected to add the probability of reaching it.
-            rates.extend((1..=drafts).map(|depth| rate.powi(depth as i32)));
+            computed += drafts;
+            rates.extend(expected_gains(pending, drafts, block));
             let tokens = pending
                 .tokens
                 .get(start + 1..=pending.consumed)
@@ -355,7 +355,7 @@ impl InferencePipeline {
         if requests.is_empty() {
             return Ok(Duration::ZERO);
         }
-        if !self.head_drafts_pay(&rates) {
+        if !self.head_drafts_pay(&rates, computed) {
             for request in &mut requests {
                 request.drafts = 0;
             }
@@ -403,6 +403,19 @@ impl InferencePipeline {
     }
 }
 
+/// What verifying `drafts` head drafts of `pending` is expected to add, one entry per draft
+/// verification is expected to take. A block's drafts are kept by calibrated confidence, so
+/// the last block's kept drafts predict this one; before any, its first draft stands for it.
+/// Each draft of another chain adds the probability of reaching it.
+fn expected_gains(pending: &Pending, drafts: usize, block: bool) -> Vec<f64> {
+    if block && drafts > 0 && !pending.head_reach.is_empty() {
+        return pending.head_reach.clone();
+    }
+    let rate = pending.mtp_acceptance.rate();
+    let depth = if block { drafts.min(1) } else { drafts };
+    (1..=depth).map(|depth| rate.powi(depth as i32)).collect()
+}
+
 /// The first position and `[rows, hidden]` final hidden states the head runs over for
 /// `pending`, whose pass committed the positions from `before` with `hidden`: those
 /// positions, preceded by a restored snapshot's last position when the head must recompute
@@ -426,11 +439,16 @@ fn head_rows(
     Ok((pending.mtp_done == start && aligned).then_some((start, hidden)))
 }
 
-/// Drafts the head computes for `pending`, and its acceptance rate. Its LM-head projection
-/// costs about a third of a small model's decode: draft only when the next pass decodes,
-/// prompt lookup has no proposal or a less accepted one, and the head's acceptance can repay
-/// it. A chaining head drafts as deep as its rate supports.
-fn head_drafts(pending: &mut Pending, config: &SpeculationConfig, chains: bool) -> (usize, f64) {
+/// Drafts the head computes for `pending`. Its LM-head projection costs about a third of a
+/// small model's decode: draft only when the next pass decodes, prompt lookup has no
+/// proposal or a less accepted one, and the head's acceptance can repay it. A chaining head
+/// drafts as deep as its rate supports, and a block head as deep as the request allows.
+fn head_drafts(
+    pending: &mut Pending,
+    config: &SpeculationConfig,
+    chains: bool,
+    block: bool,
+) -> usize {
     let mut draft = pending.tokens.len() == pending.consumed + 1;
     if draft && pending.mtp_acceptance.rate() < speculation::MTP_MIN_RATE {
         // Towards the neutral prior, not the pipeline's rate, which may itself sit below
@@ -444,7 +462,6 @@ fn head_drafts(pending: &mut Pending, config: &SpeculationConfig, chains: bool) 
                 .ngrams
                 .propose(&pending.tokens, config, 1)
                 .is_empty());
-    let rate = pending.mtp_acceptance.rate();
     // Outputs after the pending token that the request may still publish.
     let limit = config.max_draft.min(
         pending
@@ -452,12 +469,13 @@ fn head_drafts(pending: &mut Pending, config: &SpeculationConfig, chains: bool) 
             .saturating_sub(pending.generated())
             .saturating_sub(1),
     );
-    let drafts = if !draft || limit == 0 {
+    if !draft || limit == 0 {
         0
+    } else if block {
+        limit
     } else if chains {
-        speculation::chain_depth(rate, limit)
+        speculation::chain_depth(pending.mtp_acceptance.rate(), limit)
     } else {
         1
-    };
-    (drafts, rate)
+    }
 }

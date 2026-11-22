@@ -9,6 +9,14 @@ The real checkpoint runs one decoder layer at a time, so its decoded F32 experts
 layer) never share memory (immutable thinkingmachines/Inkling-2-Mini revision):
   python -I scripts/inkling2_reference.py --model <dir> --golden <file>
 The tiny mode also runs that layer-at-a-time path and checks it against `from_pretrained`.
+
+Transformers does not run the block drafter in `mtp.safetensors`. Its reference is an F32
+transcription of vLLM's Inkling 2 DSpark drafter (vllm-project/vllm@443b51e52fad36bbbd7960fd272c8baf23f14dbb,
+`vllm/models/inkling2/nvidia/dspark.py` and `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py`;
+SGLang's `inkling2_mtp.py` at sgl-project/sglang@3117f5801752bfd8ea9aee8d3ba3dff8562378fd agrees),
+fed by the layer-at-a-time path's application inputs. It adds tiny drafter weights in the
+published layout and the drafted logits after a committed prefix to the tiny fixture:
+  python -I scripts/inkling2_reference.py --tiny-mtp crates/tur/tests/fixtures/inkling2
 """
 import argparse
 import json
@@ -41,6 +49,14 @@ PROMPT = (
 )
 # Tokens the tiny golden prefills before decoding the rest one at a time.
 PREFILL = 13
+# Positions the tiny drafter golden commits before drafting from the next token.
+COMMITTED = 16
+TINY_MTP = dict(
+    hidden_size=64, num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2, head_dim=64,
+    intermediate_size=96, max_position_embeddings=4096, torch_dtype="bfloat16", q_bias=False, o_bias=False,
+    rms_norm_eps=1e-6, rope_theta=10000.0, local_layer_ids=[0, 2], sliding_window_size=5, block_size=8,
+    markov_rank=32, markov_head_type="rnn_hidden", target_layer_ids=[1, 5, 8, 10],
+)
 
 
 def tiny_config():
@@ -382,6 +398,7 @@ def layer_by_layer(config, tensors, ids):
 
     def run(index, hidden, blocks, messages=None):
         nonlocal applications
+        result[f"input.{applications}"] = hidden.squeeze(0).contiguous().clone()
         layer = build_layer(config, index, tensors)
         kwargs = dict(attention_mask=mask[layer.attention_type], relative_distance=distance, conv_mask=None,
                       position_ids=positions)
@@ -416,11 +433,160 @@ def layer_by_layer(config, tensors, ids):
     final.query.data = tensors.get("model.llm.attn_res.output_query").float()
     norm.weight.data = tensors.get("model.llm.norm.weight").float()
     hidden = norm(final(blocks, hidden)[0])
+    result["final"] = hidden.squeeze(0).contiguous().clone()
     head = tensors.get("model.llm.unembed.weight").float()[: config.unpadded_vocab_size]
     logits = hidden @ head.T
     cap = config.final_logit_softcapping
     result["logits"] = (torch.tanh(logits / cap) * cap).squeeze(0).contiguous()
     return result
+
+
+def tiny_mtp_weights(config, generator):
+    """Random drafter tensors in `mtp.safetensors`' layout and dtypes."""
+    m, vocab = config["mtp_config"], config["text_config"]["vocab_size"]
+    hidden, heads, kv, dim = m["hidden_size"], m["num_attention_heads"], m["num_key_value_heads"], m["head_dim"]
+    inter, rank, layers = m["intermediate_size"], m["markov_rank"], m["num_hidden_layers"]
+
+    def normal(*shape, scale=0.1):
+        return (torch.randn(*shape, generator=generator) * scale).to(torch.bfloat16)
+
+    def gain(*shape):
+        return (1 + 0.1 * torch.randn(*shape, generator=generator)).to(torch.bfloat16)
+
+    data = {}
+    for i in range(layers):
+        p, a = f"layers.{i}", f"layers.{i}.self_attn"
+        for norm in ("input_layernorm", "post_attention_layernorm", "dflare_norm"):
+            data[f"{p}.{norm}.weight"] = gain(hidden)
+        for norm in ("q_norm", "k_norm", "k_norm_ctx"):
+            data[f"{a}.{norm}.weight"] = gain(dim)
+        data[f"{a}.q_proj.weight"] = normal(heads * dim, hidden)
+        for name in ("k_proj", "v_proj", "k_proj_ctx", "v_proj_ctx"):
+            data[f"{a}.{name}.weight"] = normal(kv * dim, hidden)
+        data[f"{a}.o_proj.weight"] = normal(hidden, heads * dim)
+        data[f"{p}.mlp.gate_proj.weight"] = normal(inter, hidden)
+        data[f"{p}.mlp.up_proj.weight"] = normal(inter, hidden)
+        data[f"{p}.mlp.down_proj.weight"] = normal(hidden, inter)
+    h = "markov_head"
+    data.update({
+        "fuse_weight": normal(layers + 1, len(m["target_layer_ids"]), scale=1.0),
+        "mask_embed": normal(hidden, scale=1.0),
+        "norm.weight": gain(hidden),
+        f"{h}.dflare_norm.weight": gain(hidden),
+        f"{h}.hidden_out.weight": normal(hidden, rank, scale=0.3),
+        f"{h}.hidden_out.bias": normal(hidden, scale=0.3),
+        f"{h}.markov_w1.weight": normal(vocab, rank, scale=1.0),
+        f"{h}.rnn_proj.weight": normal(3 * rank, 2 * rank + 2 * hidden, scale=0.1),
+        f"{h}.rnn_proj.bias": normal(3 * rank),
+    })
+    return data
+
+
+def rms(x, weight, eps):
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
+
+
+def rope(x, positions, theta):
+    """Neox (split-half) rotary of `[n, heads, dim]` rows, as vLLM's default rope."""
+    dim = x.shape[-1]
+    angles = positions[:, None].double() * theta ** (-torch.arange(0, dim, 2).double() / dim)
+    cos, sin = angles.cos().float()[:, None], angles.sin().float()[:, None]
+    first, second = x[..., : dim // 2], x[..., dim // 2:]
+    return torch.cat([first * cos - second * sin, second * cos + first * sin], -1)
+
+
+@torch.inference_mode()
+def draft_reference(text, mtp, weights, main, features, anchor):
+    """The drafter's chained logits after `features.shape[0]` committed positions, the
+    anchor (the next token) at position `features.shape[0]`: vLLM's
+    `Inkling2DSparkModel.precompute_and_store_context_kv`, `forward` and its speculator's
+    `_sample_sequential` with greedy picks, in F32 without its BF16 rounding."""
+    w = {k: v.float() for k, v in weights.items()}
+    eps, layers, block = mtp["rms_norm_eps"], mtp["num_hidden_layers"], mtp["block_size"]
+    heads, kv, dim, rank = mtp["num_attention_heads"], mtp["num_key_value_heads"], mtp["head_dim"], mtp["markov_rank"]
+    committed = features.shape[0]
+    alpha = torch.softmax(w["fuse_weight"], dim=-1)
+
+    def mix(rows, row, norm):
+        return rms((alpha[row][None, :, None] * rows).sum(1), norm, eps)
+
+    context = []
+    for i in range(layers):
+        a = f"layers.{i}.self_attn"
+        mixed = mix(features, i, w[f"layers.{i}.dflare_norm.weight"])
+        key = rms((mixed @ w[f"{a}.k_proj_ctx.weight"].T).view(committed, kv, dim), w[f"{a}.k_norm_ctx.weight"], eps)
+        context.append((rope(key, torch.arange(committed), mtp["rope_theta"]),
+                        (mixed @ w[f"{a}.v_proj_ctx.weight"].T).view(committed, kv, dim)))
+    embed = main.get("model.llm.embed.weight").float()
+    first = rms(embed[anchor][None], main.get("model.llm.embed_norm.weight").float(), text["rms_norm_eps"])
+    x = torch.cat([first, w["mask_embed"][None].expand(block - 1, -1)])
+    positions = torch.arange(committed, committed + block)
+    residual, out = x, None
+    for i in range(layers):
+        p, a = f"layers.{i}", f"layers.{i}.self_attn"
+        if out is not None:
+            residual = residual + out
+        h = rms(residual, w[f"{p}.input_layernorm.weight"], eps)
+        q = rope(rms((h @ w[f"{a}.q_proj.weight"].T).view(block, heads, dim), w[f"{a}.q_norm.weight"], eps),
+                 positions, mtp["rope_theta"])
+        k = rope(rms((h @ w[f"{a}.k_proj.weight"].T).view(block, kv, dim), w[f"{a}.k_norm.weight"], eps),
+                 positions, mtp["rope_theta"])
+        v = (h @ w[f"{a}.v_proj.weight"].T).view(block, kv, dim)
+        keys, values = context[i]
+        if i in mtp["local_layer_ids"]:
+            keys, values = keys[-mtp["sliding_window_size"]:], values[-mtp["sliding_window_size"]:]
+        # Bidirectional over the context (or its window before the block) and the block.
+        keys = torch.cat([keys, k]).repeat_interleave(heads // kv, dim=1)
+        values = torch.cat([values, v]).repeat_interleave(heads // kv, dim=1)
+        scores = torch.einsum("qhd,khd->hqk", q, keys) / dim ** 0.5
+        attended = torch.einsum("hqk,khd->qhd", torch.softmax(scores, -1), values).reshape(block, heads * dim)
+        residual = residual + attended @ w[f"{a}.o_proj.weight"].T
+        h = rms(residual, w[f"{p}.post_attention_layernorm.weight"], eps)
+        gate, up = h @ w[f"{p}.mlp.gate_proj.weight"].T, h @ w[f"{p}.mlp.up_proj.weight"].T
+        out = (torch.nn.functional.silu(gate) * up) @ w[f"{p}.mlp.down_proj.weight"].T
+    rows = rms(residual + out, w["norm.weight"], eps)[1:]
+    unembed = main.get("model.llm.unembed.weight").float()
+    base = rows @ unembed.T
+    h = "markov_head"
+    feature = mix(features[-1:], layers, w[f"{h}.dflare_norm.weight"])
+    recurrent = w[f"{h}.rnn_proj.weight"]
+    steps = torch.cat([rows, feature.expand(block - 1, -1)], 1) @ recurrent[:, 2 * rank:].T + w[f"{h}.rnn_proj.bias"]
+    state, previous, logits = torch.zeros(rank), anchor, []
+    cap, vocab = text["final_logit_softcapping"], text["unpadded_vocab_size"]
+    for step in range(block - 1):
+        raw = steps[step] + torch.cat([state, w[f"{h}.markov_w1.weight"][previous]]) @ recurrent[:, : 2 * rank].T
+        gate = torch.sigmoid(raw[:rank])
+        state = gate * state + (1 - gate) * torch.tanh(raw[rank: 2 * rank])
+        latent = torch.tanh(raw[2 * rank:])
+        bias = (latent @ w[f"{h}.hidden_out.weight"].T + w[f"{h}.hidden_out.bias"]) @ unembed.T
+        row = (torch.tanh((base[step] + bias) / cap) * cap)[:vocab]
+        logits.append(row)
+        previous = int(row.argmax())
+    return torch.stack(logits)
+
+
+def features_of(result, ids):
+    """`[positions, features, hidden]` drafter features: the inputs of the target
+    applications, then the final-normed output (the id equal to the application count)."""
+    return torch.stack([result["final"] if i == ids[-1] else result[f"input.{i}"] for i in ids], dim=1)
+
+
+def tiny_mtp(directory):
+    config = json.loads((directory / "config.json").read_text())
+    config["mtp_config"] = TINY_MTP
+    (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    weights = tiny_mtp_weights(config, torch.Generator().manual_seed(29))
+    save_file({k: v.contiguous() for k, v in weights.items()}, directory / "mtp.safetensors",
+              metadata={"format": "pt"})
+    tokens = safe_open(directory / "golden.safetensors", "pt").get_tensor("tokens")
+    text = transformers_text_config(config["text_config"])
+    main = Tensors(directory)
+    result = layer_by_layer(text, main, tokens[None])
+    features = features_of(result, TINY_MTP["target_layer_ids"])[:COMMITTED]
+    logits = draft_reference(config["text_config"], TINY_MTP, weights, main, features, int(tokens[COMMITTED]))
+    save_file({"logits": logits.contiguous(), "committed": torch.tensor([COMMITTED])},
+              directory / "draft-golden.safetensors", metadata={"vllm": "443b51e52fad36bbbd7960fd272c8baf23f14dbb"})
+    print(f"tiny drafter: {logits.shape[0]} chained drafts after {COMMITTED} positions")
 
 
 def real(directory, output):
@@ -436,11 +602,14 @@ def real(directory, output):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tiny", type=Path)
+    parser.add_argument("--tiny-mtp", type=Path)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--golden", type=Path)
     args = parser.parse_args()
     if args.tiny:
         tiny(args.tiny)
+    elif args.tiny_mtp:
+        tiny_mtp(args.tiny_mtp)
     else:
         real(args.model, args.golden)
 

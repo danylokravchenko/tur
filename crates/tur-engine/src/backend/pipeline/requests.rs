@@ -662,6 +662,7 @@ impl InferencePipeline {
                 mtp_done: 0,
                 head_seed: None,
                 mtp_drafts: Vec::new(),
+                head_reach: Vec::new(),
                 mtp_acceptance: self.mtp_acceptance,
                 mtp_verifying: Vec::new(),
                 drafted: 0,
@@ -885,12 +886,7 @@ impl InferencePipeline {
     /// Whether the draft head keeps keys and values, so that a snapshot's entries for it
     /// depend on the token after the snapshot (see [`super::super::prefix`]).
     pub(super) fn keyed_head(&self) -> bool {
-        self.speculation.mtp_enabled()
-            && self
-                .speculation
-                .mtp
-                .as_ref()
-                .is_some_and(|head| !head.chains())
+        self.speculation.mtp_enabled() && self.model.draft_head().is_some_and(|head| head.keyed)
     }
 
     /// Insert this step's snapshots, after the draft head wrote its entries for them: the

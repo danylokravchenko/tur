@@ -1,66 +1,9 @@
 // ---------------------------------------------------------------------------------------
-// Inkling 2: per-head norms, attention residuals over block states, short causal
-// convolutions with slot-addressed history, and paged attention with a learned relative
-// position bias, per-token sinks and a sigmoid output gate.
+// Inkling 2: attention residuals over block states, loop-pass message gates, short causal
+// convolutions with slot-addressed history (normalizing keys and values per head), and paged
+// attention with in-place query clips, a learned relative position bias, per-token sinks and
+// a sigmoid output gate.
 // ---------------------------------------------------------------------------------------
-
-struct InklingNormParams {
-    uint tokens;
-    uint heads;
-    uint dim;
-    uint stride;
-    uint col;
-    // 0: scale by `scale`, then clip the head's L2 norm to `threshold`; 1: unweighted RMS.
-    uint mode;
-    uint scaled;
-    float threshold;
-    float eps;
-    // Nonzero: also multiply by 1 + alpha * log(max((position + 1) / floor, 1)).
-    uint log_scaled;
-    float log_alpha;
-    float log_floor;
-};
-
-// One simdgroup per (token, head): head h of row t starts at column col + h * dim.
-// Writes contiguous [tokens, heads * dim] rows.
-kernel void inkling_head_norm_f32(
-    device const float *x [[buffer(0)]],
-    device float *out [[buffer(1)]],
-    device const float *scale [[buffer(2)]],
-    device const uint *positions [[buffer(3)]],
-    constant InklingNormParams &p [[buffer(4)]],
-    uint tg [[threadgroup_position_in_grid]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint sgs [[simdgroups_per_threadgroup]]) {
-    uint item = tg * sgs + sg;
-    if (item >= p.tokens * p.heads) {
-        return;
-    }
-    uint t = item / p.heads, h = item % p.heads;
-    device const float *src = x + ulong(t) * p.stride + p.col + ulong(h) * p.dim;
-    device float *dst = out + ulong(item) * p.dim;
-    float sum = 0.0f;
-    for (uint d = lane; d < p.dim; d += SIMD) {
-        float v = src[d] * (p.scaled != 0 ? scale[h * p.dim + d] : 1.0f);
-        sum = fma(v, v, sum);
-    }
-    sum = simd_sum(sum);
-    float factor;
-    if (p.mode == 0) {
-        factor = min(p.threshold / (sqrt(sum) + 1e-6f), 1.0f);
-        if (p.log_scaled != 0) {
-            float ratio = max(float(positions[t] + 1) / p.log_floor, 1.0f);
-            factor *= 1.0f + p.log_alpha * log(ratio);
-        }
-    } else {
-        factor = rsqrt(sum / float(p.dim) + p.eps);
-    }
-    for (uint d = lane; d < p.dim; d += SIMD) {
-        float v = src[d] * (p.scaled != 0 ? scale[h * p.dim + d] : 1.0f);
-        dst[d] = v * factor;
-    }
-}
 
 #define RESIDUAL_ENTRIES 8u
 #define RESIDUAL_QUERIES 4u
@@ -178,6 +121,13 @@ struct InklingConvParams {
     uint dyn_col;
     uint head_dim;
     float divisor;
+    // Nonzero: add row r of `residual` (stride res_stride) to the output.
+    uint residual;
+    uint res_stride;
+    // The norm kernel: 0 clips each head's L2 norm to `threshold`, 1 divides it by its RMS.
+    uint norm;
+    float threshold;
+    float eps;
 };
 
 static inline float short_conv_input(
@@ -186,28 +136,17 @@ static inline float short_conv_input(
     return r < kept ? history[r * p.pool_width + c] : x[ulong(r - kept) * p.x_stride + c];
 }
 
-// Depthwise causal convolution plus the input, divided by `divisor`, for every sequence of
-// a packed pass over [history; x]. `taps` is [channels, taps] by lag (0 = the token itself).
+// Channel c of packed row `row`: the depthwise causal convolution over [history; x] plus the
+// input, divided by `divisor`. `taps` is [channels, taps] by lag (0 = the token itself).
 // With `dynamic`, each token adds its own taps per head of `head_dim` channels from `dyn`
 // (head h, lag l at column dyn_col + h * taps + l). Each sequence writes the (taps-1)-row
 // history after each token its written slots list, as delta_conv_f32 does, into columns
 // offset..offset + channels of the slot rows.
-kernel void inkling_short_conv_f32(
-    device const float *x [[buffer(0)]],
-    device float *pool [[buffer(1)]],
-    device const float *taps [[buffer(2)]],
-    device float *out [[buffer(3)]],
-    constant InklingConvParams &p [[buffer(4)]],
-    device const RecurrentSpan *spans [[buffer(5)]],
-    device const uint *row_span [[buffer(6)]],
-    device const uint *slots [[buffer(7)]],
-    device const float *dyn [[buffer(8)]],
-    uint gid [[thread_position_in_grid]]) {
-    if (gid >= p.rows * p.channels) {
-        return;
-    }
-    uint row = gid / p.channels;
-    uint c = gid % p.channels;
+static inline float short_conv_channel(
+    device const float *x, device float *pool, device const float *taps,
+    constant InklingConvParams &p, device const RecurrentSpan *spans,
+    device const uint *row_span, device const uint *slots, device const float *dyn,
+    uint row, uint c) {
     RecurrentSpan s = spans[row_span[row]];
     uint t = row - s.row;
     uint kept = p.taps - 1;
@@ -219,7 +158,6 @@ kernel void inkling_short_conv_f32(
         float w = taps[c * p.taps + lag] + (p.dynamic != 0 ? own[lag] : 0.0f);
         acc = fma(w, short_conv_input(xs, history, t + kept - lag, c, kept, p), acc);
     }
-    out[gid] = (acc + xs[ulong(t) * p.x_stride + c]) / p.divisor;
     uint written = written_after(s, slots, t);
     if (written < s.count) {
         ulong base = ulong(slots[s.writes + written]) * kept * p.pool_width + p.offset;
@@ -227,6 +165,56 @@ kernel void inkling_short_conv_f32(
             pool[base + ulong(r) * p.pool_width + c] = short_conv_input(xs, history, t + 1 + r, c, kept, p);
         }
     }
+    return (acc + xs[ulong(t) * p.x_stride + c]) / p.divisor;
+}
+
+// Every channel of every row, one thread each, plus the residual row when given.
+kernel void inkling_short_conv_f32(
+    device const float *x [[buffer(0)]],
+    device float *pool [[buffer(1)]],
+    device const float *taps [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant InklingConvParams &p [[buffer(4)]],
+    device const RecurrentSpan *spans [[buffer(5)]],
+    device const uint *row_span [[buffer(6)]],
+    device const uint *slots [[buffer(7)]],
+    device const float *dyn [[buffer(8)]],
+    device const float *residual [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.rows * p.channels) {
+        return;
+    }
+    uint row = gid / p.channels, c = gid % p.channels;
+    float v = short_conv_channel(x, pool, taps, p, spans, row_span, slots, dyn, row, c);
+    out[gid] = p.residual != 0 ? v + residual[ulong(row) * p.res_stride + c] : v;
+}
+
+// One threadgroup per (row, head of head_dim channels), a thread per channel: the
+// convolution, then the head's L2 clip or RMS norm, so the attention reads normalized keys
+// and values without another pass.
+kernel void inkling_short_conv_norm_f32(
+    device const float *x [[buffer(0)]],
+    device float *pool [[buffer(1)]],
+    device const float *taps [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant InklingConvParams &p [[buffer(4)]],
+    device const RecurrentSpan *spans [[buffer(5)]],
+    device const uint *row_span [[buffer(6)]],
+    device const uint *slots [[buffer(7)]],
+    device const float *dyn [[buffer(8)]],
+    uint item [[threadgroup_position_in_grid]],
+    uint d [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgs [[simdgroups_per_threadgroup]]) {
+    threadgroup float scratch[SIMD];
+    uint heads = p.channels / p.head_dim;
+    uint row = item / heads, c = (item % heads) * p.head_dim + d;
+    float v = short_conv_channel(x, pool, taps, p, spans, row_span, slots, dyn, row, c);
+    float sum = threadgroup_sum(v * v, scratch, sg, lane, sgs);
+    float factor = p.norm == 0 ? min(p.threshold / (sqrt(sum) + 1e-6f), 1.0f)
+                               : rsqrt(sum / float(p.head_dim) + p.eps);
+    out[ulong(row) * p.channels + c] = v * factor;
 }
 
 struct InklingAttentionParams {
@@ -248,7 +236,23 @@ struct InklingAttentionParams {
     uint gate_col;
     uint splits;
     uint split_keys;
+    // Queries are read from projection rows at q_col + h * dim, scaled by q_scale and
+    // shrunk to L2 norm q_threshold; relative states likewise with rel_scale and
+    // rel_threshold. With log_scaled both grow by 1 + log_alpha * ln(max((pos + 1) / floor, 1)).
+    uint q_stride;
+    uint q_col;
+    float q_threshold;
+    float rel_threshold;
+    uint log_scaled;
+    float log_alpha;
+    float log_floor;
 };
+
+// Scale factor of a head whose scaled values have squared L2 norm `squares`: shrink to
+// `threshold`, then grow by the token's log scaling.
+static inline float clip_factor(float squares, float threshold, float tau) {
+    return min(threshold / (sqrt(squares) + 1e-6f), 1.0f) * tau;
+}
 
 // Paged attention of one simdgroup per (token, head, split), as attention_kv reads pages.
 // Splits partition each query's own window, so short batches still fill the GPU at long
@@ -276,6 +280,9 @@ kernel void inkling_attention(
     device const half *v_scales [[buffer(13)]],
     device float *partial [[buffer(14)]],
     device float *stats [[buffer(15)]],
+    device const float *q_scale [[buffer(16)]],
+    device const float *rel_scale [[buffer(17)]],
+    device const uint *positions [[buffer(18)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -298,18 +305,34 @@ kernel void inkling_attention(
     uint groups = QUANT == 0 ? 0 : p.dim / p.group;
     uint dims[C], sidx[C];
     float qv[C][V], acc[C][V];
-    device const float *qr = q + (ulong(t) * p.heads + h) * p.dim;
+    device const float *qr = q + ulong(t) * p.q_stride + p.q_col + ulong(h) * p.dim;
+    device const float *qs = q_scale + ulong(h) * p.dim;
+    float squares = 0.0f;
     for (uint c = 0; c < C; ++c) {
         dims[c] = V * lane + SIMD * V * c;
         sidx[c] = QUANT == 0 ? 0 : dims[c] / p.group;
         kv_dims<V>(qr + dims[c], qv[c]);
         for (uint i = 0; i < V; ++i) {
+            qv[c][i] *= qs[dims[c] + i];
+            squares = fma(qv[c][i], qv[c][i], squares);
             acc[c][i] = 0.0f;
+        }
+    }
+    float tau = p.log_scaled != 0
+        ? 1.0f + p.log_alpha * log(max(float(positions[t] + 1) / p.log_floor, 1.0f))
+        : 1.0f;
+    float q_factor = clip_factor(simd_sum(squares), p.q_threshold, tau);
+    for (uint c = 0; c < C; ++c) {
+        for (uint i = 0; i < V; ++i) {
+            qv[c][i] *= q_factor;
         }
     }
     // Lane r < rel_dim keeps component r of the relative state and reads row r of `proj`.
     bool rel_lane = lane < p.rel_dim;
-    float rel_value = rel_lane ? rel[ulong(t) * p.rel_stride + p.rel_col + h * p.rel_dim + lane] : 0.0f;
+    float rel_value = rel_lane
+        ? rel[ulong(t) * p.rel_stride + p.rel_col + h * p.rel_dim + lane] * rel_scale[h * p.rel_dim + lane]
+        : 0.0f;
+    rel_value *= clip_factor(simd_sum(rel_value * rel_value), p.rel_threshold, tau);
     device const float *proj_row = proj + ulong(rel_lane ? lane : 0) * p.extent;
     // The sink joins the softmax as a key without a value: here with one split, in the
     // reduction otherwise.
@@ -451,7 +474,8 @@ kernel void inkling_attention_reduce(
         device const float *, device const T *, device const T *, device const uint *, device const uint *, \
         device const uint *, device const float *, device const float *, device const float *, \
         device const float *, device float *, constant InklingAttentionParams &, device const half *, \
-        device const half *, device float *, device float *, uint, uint, uint, uint);
+        device const half *, device float *, device float *, device const float *, device const float *, \
+        device const uint *, uint, uint, uint, uint);
 INKLING_ATTENTION(2, float, 0, f32)
 INKLING_ATTENTION(2, half, 0, f16)
 INKLING_ATTENTION(2, char, 1, q8)
@@ -549,5 +573,50 @@ kernel void inkling_message_gate_f32(
     float inv = rsqrt(threadgroup_sum(sum, scratch, sg, lane, sgs) / float(p.width) + p.eps);
     for (uint i = tid; i < p.width; i += threads) {
         o[i] = o[i] * inv * w[i];
+    }
+}
+
+struct InklingGateGemvParams {
+    uint groups;
+    uint rows;
+    uint outs;
+    uint k;
+    uint per;
+};
+
+// out[g][r][o] = sum_k x[g][r][k] * w[g][o][k] for small row counts: F32 activations and
+// accumulation over BF16 weights (their raw bits, widened exactly), so stored BF16 gate
+// weights multiply as their F32 values would. One simdgroup per `per` outputs of a row.
+kernel void inkling_gate_gemv_f32(
+    device const float *x [[buffer(0)]],
+    device const ushort *w [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    constant InklingGateGemvParams &p [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgs [[simdgroups_per_threadgroup]]) {
+    uint blocks = (p.outs + p.per - 1) / p.per;
+    uint item = tg * sgs + sg;
+    if (item >= p.groups * p.rows * blocks) {
+        return;
+    }
+    uint b = item % blocks, row = item / blocks;
+    uint g = row / p.rows;
+    device const float *xr = x + ulong(row) * p.k;
+    for (uint j = 0; j < p.per; ++j) {
+        uint o = b * p.per + j;
+        if (o >= p.outs) {
+            break;
+        }
+        device const ushort *wr = w + (ulong(g) * p.outs + o) * p.k;
+        float acc = 0.0f;
+        for (uint i = lane; i < p.k; i += SIMD) {
+            acc = fma(xr[i], as_type<float>(uint(wr[i]) << 16), acc);
+        }
+        acc = simd_sum(acc);
+        if (lane == 0) {
+            out[ulong(row) * p.outs + o] = acc;
+        }
     }
 }

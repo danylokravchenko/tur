@@ -328,6 +328,105 @@ fn test_inkling2_packed_experts_match_reference_and_plan() -> Result<()> {
     Ok(())
 }
 
+/// The block drafter after a committed prefix against an F32 transcription of vLLM's Inkling
+/// 2 `DSpark` drafter (`scripts/inkling2_reference.py --tiny-mtp`): each committed position's
+/// context keys and values from its four target features, the anchor-and-masks block over
+/// them, and the recurrent head's seven chained, softcapped logit rows. F32 projections, so
+/// only execution can differ.
+#[cfg(feature = "metal")]
+#[test]
+fn test_inkling2_drafter_matches_reference_block() -> Result<()> {
+    use crate::model_common::forward_rows;
+    use tur_models::{
+        hybrid::{DraftForward, DraftSequence},
+        models::DraftHead,
+    };
+    let device = Device::new_metal(0)?;
+    let mut options = options(&device, WeightFormat::F32, Execution::Fused);
+    options.mtp = Some(DraftHead::default());
+    let model = Inkling2::load(&fixture(), &options)?;
+    let mut data =
+        candle_core::safetensors::load(fixture().join("draft-golden.safetensors"), &Device::Cpu)?;
+    let expected = data
+        .remove("logits")
+        .ok_or_else(|| invalid("missing draft logits"))?;
+    let committed = 16;
+    let ids = golden()?.ids;
+    let pool = pool(&model)?;
+    let (mut steps, reservations) = forward_rows(
+        &model,
+        &[(
+            &ModelState::new(&pool),
+            &ids[..committed],
+            Boundaries::Final,
+            &[committed - 1],
+            true,
+        )],
+    )?;
+    let features = steps
+        .pop()
+        .ok_or_else(|| invalid("missing step"))??
+        .hidden
+        .ok_or_else(|| invalid("missing features"))?;
+    let state = reservations
+        .first()
+        .ok_or_else(|| invalid("missing reservation"))?
+        .commit(committed)?;
+    drop(reservations);
+    let side = state.side(0, committed, &[])?;
+    let positions: Vec<usize> = (0..committed).collect();
+    let sequences = [DraftSequence {
+        tokens: 0..committed,
+        state: &side,
+        hidden: &features,
+        drafts: 7,
+    }];
+    let actual = model
+        .draft(&DraftForward {
+            tokens: &ids[1..=committed],
+            positions: &positions,
+            sequences: &sequences,
+            pool: &pool,
+        })?
+        .pop()
+        .ok_or_else(|| invalid("missing draft"))??
+        .ok_or_else(|| invalid("no drafted logits"))?;
+    let error = max_relative(&logit_rows(&actual)?, &expected.to_vec2::<f32>()?);
+    assert!(error < 1e-4, "drafted logits: {error}");
+    // Drafts past the depth the head offers are refused.
+    let deeper = [DraftSequence {
+        tokens: 0..committed,
+        state: &side,
+        hidden: &features,
+        drafts: 8,
+    }];
+    let refused = model.draft(&DraftForward {
+        tokens: &ids[1..=committed],
+        positions: &positions,
+        sequences: &deeper,
+        pool: &pool,
+    })?;
+    assert!(refused.first().is_some_and(Result::is_err));
+    Ok(())
+}
+
+/// Drafts of the block drafter verified by the target, through the serving pipeline: whatever
+/// the (random) drafter proposes, greedy and sampled outputs equal ordinary decoding, the
+/// drafter's chained drafts are verified, and every page and slot is returned.
+#[cfg(feature = "metal")]
+#[test]
+fn test_inkling2_drafter_preserves_target_sampling() -> Result<()> {
+    let fixture = crate::common::Checkpoint::inkling2()?;
+    let mut factory = fixture.factory();
+    factory.revision = "inkling2-fixture-v1".into();
+    factory.device = Device::new_metal(0)?;
+    factory.kv = KvLayout::new(16, KvFormat::F32);
+    crate::speculation::assert_mtp_preserves_outputs_with(
+        &factory,
+        crate::speculation::mtp_config(4, 1),
+    )
+}
+
 #[cfg(feature = "metal")]
 mod kernels {
     use crate::kernels::{
@@ -336,7 +435,7 @@ mod kernels {
     use candle_core::{Device, Tensor};
     use tur_core::{Result, execution::KvFormat};
     use tur_metal::{
-        kernels::{Relative, Tuning},
+        kernels::{Clipped, LogScale, Relative, Tuning},
         packed::PackedLinear,
         pool::AttentionPool,
         quantize::Microscale,
@@ -359,13 +458,18 @@ mod kernels {
         let (heads, dim, rel_dim, extent) = (case.heads, case.dim, 16, 7);
         let (key, value, slots, table, first, visible) = paged_pool(&case, 41);
         let tokens = visible.len();
-        let q = upload(
+        // Queries, then relative states, as one projection row holds them; scales and
+        // thresholds that clip some heads, and log scaling past position 8.
+        let width = heads * (dim + rel_dim);
+        let rows = upload(&device, &values(tokens * width, 1, 0.3), &[tokens, width])?;
+        let q_scale = upload(&device, &values(heads * dim, 5, 2.0), &[heads * dim])?;
+        let rel_scale = upload(
             &device,
-            &values(tokens * heads * dim, 1, 0.3),
-            &[tokens, heads, dim],
+            &values(heads * rel_dim, 6, 2.0),
+            &[heads * rel_dim],
         )?;
-        let rel = values(tokens * heads * rel_dim, 2, 1.0);
-        let rel = upload(&device, &rel, &[tokens, heads * rel_dim])?;
+        let positions: Vec<u32> = visible.iter().map(|&keys| keys - 1).collect();
+        let positions = Tensor::new(positions.as_slice(), &device)?;
         let proj = upload(
             &device,
             &values(rel_dim * extent, 3, 1.0),
@@ -393,14 +497,30 @@ mod kernels {
                         ..kernels.tuning()
                     })?;
                     let relative = Relative {
-                        rel: &rel,
+                        rel: Clipped {
+                            rows: &rows,
+                            col: heads * dim,
+                            scale: &rel_scale,
+                            threshold: 1.5,
+                        },
+                        log_scale: Some(LogScale {
+                            positions: &positions,
+                            alpha: 0.1,
+                            floor: 8.0,
+                        }),
                         proj: &proj,
                         sinks: (&side, 0),
                         gate: (&side, heads),
                         window,
                         scale: 0.09,
                     };
-                    read(&tuned.relative_attention(&q, &pool, &paged, relative)?)
+                    let q = Clipped {
+                        rows: &rows,
+                        col: 0,
+                        scale: &q_scale,
+                        threshold: 2.0,
+                    };
+                    read(&tuned.relative_attention((q, heads), &pool, &paged, relative)?)
                 };
                 let whole: Vec<f64> = run(1024)?.into_iter().map(f64::from).collect();
                 for minimum in [2, 8] {

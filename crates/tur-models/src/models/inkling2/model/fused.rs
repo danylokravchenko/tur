@@ -4,7 +4,7 @@ use crate::models::paging::Paging;
 use candle_core::Tensor;
 use tur_core::{Result, execution::invalid};
 use tur_metal::kernels::{
-    HeadNorm, Heads, Kernels, LogScale, RecurrentSpan, RecurrentSpans, Relative, ShortConv,
+    Clipped, HeadNorm, Heads, Kernels, LogScale, RecurrentSpan, RecurrentSpans, Relative, ShortConv,
 };
 
 /// Addressing and per-pass inputs every layer shares.
@@ -68,11 +68,11 @@ impl Fused<'_, '_> {
                 InputNorms::Separate(norms) => norms.clone(),
             };
             let messages = messages.narrow(0, 0, 3)?;
-            let mix = self
+            let pair = self.k.message_pair(&read, &messages, self.eps())?;
+            let low = self
                 .k
-                .message_pair(&read, &messages, self.eps())?
-                .matmul(&gates.down.narrow(0, 0, 3)?)?
-                .matmul(&gates.up.narrow(0, 0, 3)?)?;
+                .gate_projection(&pair, &gates.down.narrow(0, 0, 3)?)?;
+            let mix = self.k.gate_projection(&low, &gates.up.narrow(0, 0, 3)?)?;
             let out = self
                 .k
                 .message_gate(&read, &messages, &mix, &norms, self.eps())?;
@@ -97,23 +97,25 @@ impl Fused<'_, '_> {
             return self.norm(h, &layer.post_norm);
         };
         let message = messages.narrow(0, 3, 1)?;
-        let mix = self
+        let pair = self.k.message_pair(h, &message, self.eps())?;
+        let low = self
             .k
-            .message_pair(h, &message, self.eps())?
-            .matmul(&gates.down.narrow(0, 3, 1)?)?
-            .matmul(&gates.up.narrow(0, 3, 1)?)?;
+            .gate_projection(&pair, &gates.down.narrow(0, 3, 1)?)?;
+        let mix = self.k.gate_projection(&low, &gates.up.narrow(0, 3, 1)?)?;
         self.k
             .message_gate(h, &message, &mix, &layer.post_norm, self.eps())
     }
 
     /// One convolved side of the attention: its projection, then the short convolution
-    /// reading dynamic taps from the projection's last columns in full attention layers.
+    /// reading dynamic taps from the projection's last columns in full attention layers,
+    /// with each head normalized as `norm` says in the same pass.
     fn side(
         &self,
         input: &Tensor,
         weights: &tur_metal::packed::PackedLinear,
         taps: &Tensor,
         (application, index, column): (usize, usize, usize),
+        norm: HeadNorm,
     ) -> Result<Tensor> {
         let t = &self.config().text;
         let width = t.num_key_value_heads * t.head_dim;
@@ -134,6 +136,8 @@ impl Fused<'_, '_> {
                 offset: column,
                 dynamic: (!sliding).then_some((&projected, width, t.head_dim)),
                 divisor: (divisor as f32).sqrt(),
+                residual: None,
+                norm: Some((t.head_dim, norm)),
             },
         )
     }
@@ -156,37 +160,20 @@ impl Fused<'_, '_> {
             alpha: t.log_scaling_alpha as f32,
             floor: t.log_scaling_n_floor as f32,
         });
-        let clip = |scale, threshold: f64| HeadNorm::Clip {
-            scale: Some(scale),
+        // The attention clips the queries and relative states as it reads them.
+        let clip = |col, scale, threshold: f64| Clipped {
+            rows: &projected,
+            col,
+            scale,
             threshold: threshold as f32,
-            log_scale,
         };
-        let q = self
-            .k
-            .head_norm(
-                &projected,
-                heads(count, dim, 0),
-                clip(&a.q_scale, t.qk_l2_clip_threshold),
-            )?
-            .reshape((inputs[0].dim(0)?, count, dim))?;
-        let states = self.k.head_norm(
-            &projected,
-            heads(count, rel, 2 * count * dim),
-            clip(&a.rel_scale, t.rel_l2_clip_threshold),
-        )?;
         let key = self.side(
             &inputs[1],
             &a.key,
             &a.key_taps,
             (application, index, columns.key),
-        )?;
-        let key = self.k.head_norm(
-            &key,
-            heads(kv, dim, 0),
             HeadNorm::Clip {
-                scale: None,
                 threshold: t.qk_l2_clip_threshold as f32,
-                log_scale: None,
             },
         )?;
         let value = self.side(
@@ -194,10 +181,6 @@ impl Fused<'_, '_> {
             &a.value,
             &a.value_taps,
             (application, index, columns.value),
-        )?;
-        let value = self.k.head_norm(
-            &value,
-            heads(kv, dim, 0),
             HeadNorm::Rms {
                 eps: t.rms_norm_eps as f32,
             },
@@ -213,11 +196,12 @@ impl Fused<'_, '_> {
             paged,
         )?;
         let attended = self.k.relative_attention(
-            &q,
+            (clip(0, &a.q_scale, t.qk_l2_clip_threshold), count),
             store,
             paged,
             Relative {
-                rel: &states,
+                rel: clip(2 * count * dim, &a.rel_scale, t.rel_l2_clip_threshold),
+                log_scale,
                 proj: &a.rel_proj,
                 sinks: (&projected, 2 * count * dim + count * rel),
                 gate: (&projected, count * dim),
@@ -249,7 +233,14 @@ impl Fused<'_, '_> {
         self.k.expert_scatter(&out, &routes)
     }
 
-    fn conv(&self, application: usize, x: &Tensor, taps: &Tensor, column: usize) -> Result<Tensor> {
+    /// The short convolution after a sublayer, plus `residual` when given.
+    fn conv(
+        &self,
+        application: usize,
+        x: &Tensor,
+        (taps, column): (&Tensor, usize),
+        residual: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let count = self.config().text.sconv_kernel_size;
         self.k.short_conv(
             x,
@@ -260,6 +251,8 @@ impl Fused<'_, '_> {
                 offset: column,
                 dynamic: None,
                 divisor: ((count + 1) as f32).sqrt(),
+                residual,
+                norm: None,
             },
         )
     }
@@ -288,22 +281,25 @@ impl Executor for Fused<'_, '_> {
         let columns = config.conv_columns();
         let inputs = self.inputs(layer, x, blocks, messages)?;
         let attended = self.attention(application, index, &inputs)?;
-        let attended = self.conv(
+        // A block boundary restarts the residual stream; elsewhere the convolution adds it.
+        let boundary = config.boundary(index);
+        let residual = self.conv(
             application,
             &attended,
-            &layer.attention_taps,
-            columns.attention,
+            (&layer.attention_taps, columns.attention),
+            (!boundary).then_some(x),
         )?;
-        let residual = if config.boundary(index) {
+        if boundary {
             blocks.push(x.clone());
-            attended
-        } else {
-            (x + attended)?
-        };
+        }
         let h = self.residual(blocks, &residual, &layer.mlp_query)?.get(0)?;
         let routed = self.experts(layer, &self.mlp_input(layer, &h, messages)?)?;
-        let routed = self.conv(application, &routed, &layer.mlp_taps, columns.mlp)?;
-        Ok((residual + routed)?)
+        self.conv(
+            application,
+            &routed,
+            (&layer.mlp_taps, columns.mlp),
+            Some(&residual),
+        )
     }
 }
 
@@ -313,7 +309,7 @@ impl Inkling2 {
         k: &Kernels,
         pass: &Pass<'_, '_>,
         x: &Tensor,
-        trace: Option<&mut Vec<Tensor>>,
+        capture: super::Capture<'_>,
     ) -> Result<Tensor> {
         let tokens = x.dim(0)?;
         let paging = Paging::new(
@@ -349,6 +345,6 @@ impl Inkling2 {
             recurrent,
             positions: Tensor::new(positions.as_slice(), &self.device)?,
         };
-        self.decode(&fused, x, trace)
+        self.decode(&fused, x, capture)
     }
 }

@@ -1,5 +1,7 @@
 //! Inkling 2 equations over the common packed weights and persistent state pools.
 #[cfg(feature = "metal")]
+mod draft;
+#[cfg(feature = "metal")]
 mod fused;
 mod reference;
 
@@ -51,11 +53,12 @@ enum InputNorms {
 /// The query, key, value and MLP message gates of a looped layer, stacked so that several
 /// run as one batched product. Gate `i` mixes a message of the previous loop pass into
 /// its input: `(1 - tanh(forget)) * x + tanh(gain) * message`, both gates of a rank-`r`
-/// projection of the normalized pair `[x, message]`.
+/// projection of the normalized pair `[x, message]`. Kept in their stored BF16, which the
+/// kernels widen exactly.
 struct MessageGates {
-    /// `[4, 2 * hidden, rank]`, transposed for `pair @ down`.
+    /// `[4, rank, 2 * hidden]`.
     down: Tensor,
-    /// `[4, rank, 2 * hidden]`: forget columns, then gain columns.
+    /// `[4, 2 * hidden, rank]`: forget rows, then gain rows.
     up: Tensor,
 }
 
@@ -102,6 +105,9 @@ pub struct Inkling2 {
     layers: Vec<Layer>,
     #[cfg(feature = "metal")]
     kernels: Option<tur_metal::kernels::Kernels>,
+    /// The block drafter, when loaded ([`Config::with_mtp`]).
+    #[cfg(feature = "metal")]
+    drafter: Option<draft::Drafter>,
 }
 
 struct Span<'a> {
@@ -112,6 +118,16 @@ struct Span<'a> {
     ends: Vec<usize>,
     addresses: Addresses,
     sequence: &'a SequenceForward<'a>,
+}
+
+/// What a pass records besides its output.
+#[derive(Default)]
+struct Capture<'a> {
+    /// Every layer application's output.
+    trace: Option<&'a mut Vec<Tensor>>,
+    /// The drafter's features: the stream entering each of its target applications, then
+    /// the final-normed output.
+    features: Option<&'a mut Vec<Tensor>>,
 }
 
 /// Addressing shared by every layer of one packed pass.
@@ -320,11 +336,13 @@ impl MessageGates {
             let take = |weight: &str| -> Result<Tensor> {
                 Ok(tensors
                     .take(&format!("{prefix}.{name}.{weight}"))?
-                    .to_dtype(DType::F32)?)
+                    .to_dtype(DType::BF16)?)
             };
-            let up = Tensor::cat(&[take("forget_weight")?, take("gain_weight")?], 0)?;
-            downs.push(take("down_weight")?.t()?);
-            ups.push(up.t()?);
+            downs.push(take("down_weight")?);
+            ups.push(Tensor::cat(
+                &[take("forget_weight")?, take("gain_weight")?],
+                0,
+            )?);
         }
         Ok(Self {
             down: Tensor::stack(&downs, 0)?.to_device(&tensors.device)?,
@@ -332,9 +350,11 @@ impl MessageGates {
         })
     }
 
-    /// Gate `i`'s `[2 * hidden, rank]` and `[rank, 2 * hidden]` projections.
+    /// Gate `i`'s F32 `[2 * hidden, rank]` and `[rank, 2 * hidden]` projections, for
+    /// `pair @ down @ up`.
     fn get(&self, i: usize) -> Result<(Tensor, Tensor)> {
-        Ok((self.down.get(i)?, self.up.get(i)?))
+        let f32 = |t: Tensor| -> Result<Tensor> { Ok(t.to_dtype(DType::F32)?.t()?) };
+        Ok((f32(self.down.get(i)?)?, f32(self.up.get(i)?)?))
     }
 }
 
@@ -423,10 +443,11 @@ impl Layer {
         match &self.norms {
             InputNorms::Shared(norms) | InputNorms::Separate(norms) => tensors.push(norms),
         }
-        if let Some(gates) = &self.gates {
-            tensors.extend([&gates.down, &gates.up]);
-        }
-        tensors.iter().map(|t| t.elem_count() * 4).sum()
+        let gates = self
+            .gates
+            .as_ref()
+            .map_or(0, |g| (g.down.elem_count() + g.up.elem_count()) * 2);
+        tensors.iter().map(|t| t.elem_count() * 4).sum::<usize>() + gates
     }
 
     fn projection_bytes(&self) -> usize {
@@ -510,9 +531,11 @@ impl Inkling2 {
         plan.validate(config)?;
         let packed = packed_experts(options);
         let t = &config.text;
+        let gates = checked_elements(&[config.resident_bf16_elements()?, 2])?;
         let mut weights = plan
             .bytes(config)?
             .checked_add(checked_elements(&[config.resident_f32_elements()?, 4])?)
+            .and_then(|b| b.checked_add(gates))
             .ok_or_else(|| invalid("Inkling 2 weight bytes overflow"))?;
         for format in config.expert_formats()? {
             let banks = [
@@ -531,17 +554,26 @@ impl Inkling2 {
                     .ok_or_else(|| invalid("Inkling 2 weight bytes overflow"))?;
             }
         }
+        let context = contexts.iter().copied().max().unwrap_or(0);
         #[cfg(feature = "metal")]
         let split = if options.device.is_metal() {
             let kernels = tur_metal::kernels::Kernels::new(&options.device)?;
-            let context = contexts.iter().copied().max().unwrap_or(0);
             split_workspace(config, &kernels, tokens, context)
         } else {
             0
         };
+        #[cfg(feature = "metal")]
+        if config.mtp().is_some() {
+            weights = weights
+                .checked_add(draft::Drafter::planned_bytes(config, options)?)
+                .ok_or_else(|| invalid("Inkling 2 weight bytes overflow"))?;
+        }
+        // A draft pass runs between passes, so its scratch only has to fit beside the pool.
+        #[cfg(feature = "metal")]
+        let split = split.max(draft::Drafter::workspace(config)?);
         #[cfg(not(feature = "metal"))]
         let split = {
-            let _ = contexts;
+            let _ = context;
             0
         };
         Ok((description, weights, workspace(config, tokens, split)?))
@@ -552,6 +584,16 @@ impl Inkling2 {
     pub fn load(dir: &Path, options: &LoadOptions) -> Result<Self> {
         let config = Config::from_json(&std::fs::read_to_string(dir.join("config.json"))?)?
             .with_quantization(&std::fs::read_to_string(dir.join("hf_quant_config.json"))?)?;
+        // The drafter scores the whole vocabulary: a reduced draft vocabulary is Qwen3.5's.
+        let config = match &options.mtp {
+            None => config,
+            Some(head) if head.model.is_none() => config.with_mtp()?,
+            Some(_) => {
+                return Err(invalid(
+                    "Inkling 2 drafts with the head inside its checkpoint, not a separate model",
+                ));
+            }
+        };
         if matches!(options.weights, Weights::Prepacked(_) | Weights::Gguf(_))
             || artifact::is_artifact(dir)
         {
@@ -559,10 +601,11 @@ impl Inkling2 {
                 "Inkling 2 loads its SafeTensors directly; it has no prepacked or GGUF form",
             ));
         }
-        if options.mtp.is_some() || options.expert_cache.is_some() {
-            return Err(invalid(
-                "Inkling 2 loads without a draft head or an expert cache",
-            ));
+        if options.expert_cache.is_some() {
+            return Err(invalid("Inkling 2 loads without an expert cache"));
+        }
+        if config.mtp().is_some() && !packed_experts(options) {
+            return Err(invalid("Inkling 2's drafter runs on the Metal kernels"));
         }
         let plan = options.weights.plan(&config)?;
         plan.validate(&config)?;
@@ -608,6 +651,12 @@ impl Inkling2 {
             1,
         )?
         .contiguous()?;
+        let head = tensors.projection("lm_head")?;
+        #[cfg(feature = "metal")]
+        let drafter = config
+            .mtp()
+            .map(|_| draft::Drafter::load(dir, &config, options, &tensors, &head))
+            .transpose()?;
         Self {
             description: config.description(
                 format!("{}#{}", options.revision, options.weights.tag()),
@@ -623,11 +672,13 @@ impl Inkling2 {
             norm: take("norm.weight")?,
             output_query: take("attn_res.output_query")?.unsqueeze(0)?,
             message_queries,
-            head: tensors.projection("lm_head")?,
+            head,
             layers,
             config,
             #[cfg(feature = "metal")]
             kernels: None,
+            #[cfg(feature = "metal")]
+            drafter,
         }
         .with_execution(options.execution)
     }
@@ -649,6 +700,14 @@ impl Inkling2 {
             let _ = execution;
             Ok(self)
         }
+    }
+
+    /// Whether the block drafter is loaded.
+    pub fn has_drafter(&self) -> bool {
+        #[cfg(feature = "metal")]
+        return self.drafter.is_some();
+        #[cfg(not(feature = "metal"))]
+        false
     }
 
     /// Device holding the immutable weights.
@@ -679,10 +738,15 @@ impl Inkling2 {
             &self.output_query,
             &self.message_queries,
         ];
+        #[cfg(feature = "metal")]
+        let drafter = self.drafter.as_ref().map_or(0, draft::Drafter::bytes);
+        #[cfg(not(feature = "metal"))]
+        let drafter = 0;
         self.projection_bytes()
             + self.embedding.bytes()
             + globals.iter().map(|t| t.elem_count() * 4).sum::<usize>()
             + self.layers.iter().map(Layer::bytes).sum::<usize>()
+            + drafter
     }
 
     fn check<'a>(
@@ -745,6 +809,13 @@ impl Inkling2 {
         spans: &[Span<'_>],
         trace: Option<&mut Vec<Tensor>>,
     ) -> Result<Vec<SequenceStep>> {
+        // A drafter reads its target features wherever the engine asks for hidden rows.
+        let mut features = Vec::new();
+        let drafting = self.config.mtp().is_some() && spans.iter().any(|s| s.sequence.hidden);
+        let capture = Capture {
+            trace,
+            features: drafting.then_some(&mut features),
+        };
         let mut tokens = Vec::new();
         let mut positions = Vec::new();
         for s in spans {
@@ -761,17 +832,23 @@ impl Inkling2 {
         };
         #[cfg(feature = "metal")]
         let hidden = match &self.kernels {
-            Some(k) => self.run_fused(k, &pass, &x, trace)?,
-            None => self.run_reference(&pass, &x, trace)?,
+            Some(k) => self.run_fused(k, &pass, &x, capture)?,
+            None => self.run_reference(&pass, &x, capture)?,
         };
         #[cfg(not(feature = "metal"))]
-        let hidden = self.run_reference(&pass, &x, trace)?;
-        spans.iter().map(|s| self.step(s, &hidden)).collect()
+        let hidden = self.run_reference(&pass, &x, capture)?;
+        let rows = if drafting {
+            Tensor::cat(&features, 1)?
+        } else {
+            hidden.clone()
+        };
+        spans.iter().map(|s| self.step(s, &hidden, &rows)).collect()
     }
 
     /// One sequence's outputs from the final-normed rows of its pass: the head over its
-    /// real vocabulary rows, softcapped.
-    fn step(&self, s: &Span<'_>, hidden: &Tensor) -> Result<SequenceStep> {
+    /// real vocabulary rows, softcapped, and its rows of `states` when it asked for hidden
+    /// states (the drafter's features when one is loaded, else the final-normed rows).
+    fn step(&self, s: &Span<'_>, hidden: &Tensor, states: &Tensor) -> Result<SequenceStep> {
         let rows = s
             .sequence
             .logits
@@ -796,7 +873,7 @@ impl Inkling2 {
             hidden: s
                 .sequence
                 .hidden
-                .then(|| hidden.narrow(0, s.start, s.len))
+                .then(|| states.narrow(0, s.start, s.len))
                 .transpose()?,
             replay: None,
         })
@@ -814,18 +891,26 @@ impl Inkling2 {
     /// layers once per pass, each later pass restarting from the pre-loop state and reading
     /// messages from the previous pass, then the remaining layers and the final residual.
     /// Returns the final-normed rows; `trace` receives every application's output.
-    fn decode(
-        &self,
-        e: &impl Executor,
-        x: &Tensor,
-        mut trace: Option<&mut Vec<Tensor>>,
-    ) -> Result<Tensor> {
+    fn decode(&self, e: &impl Executor, x: &Tensor, capture: Capture<'_>) -> Result<Tensor> {
+        let Capture {
+            mut trace,
+            mut features,
+        } = capture;
+        let targets = self
+            .config
+            .mtp()
+            .map_or(&[][..], |d| d.target_layer_ids.as_slice());
         let l = self.config.text.loop_config;
         let mut x = e.norm(x, &self.embed_norm)?;
         let mut blocks = Vec::new();
         let mut application = 0;
         let mut apply =
             |index: usize, x: &Tensor, blocks: &mut Vec<Tensor>, messages: Option<&Tensor>| {
+                if let Some(features) = features.as_mut()
+                    && targets.contains(&application)
+                {
+                    features.push(x.clone());
+                }
                 let out = e.layer(application, index, x, blocks, messages)?;
                 application += 1;
                 if let Some(trace) = trace.as_mut() {
@@ -858,7 +943,11 @@ impl Inkling2 {
             x = apply(index, &x, &mut blocks, None)?;
         }
         let out = e.residual(&blocks, &x, &self.output_query)?.get(0)?;
-        e.norm(&out, &self.norm)
+        let out = e.norm(&out, &self.norm)?;
+        if let Some(features) = features {
+            features.push(out.clone());
+        }
+        Ok(out)
     }
 
     /// Run a fresh sequence and return each layer application's output, in execution
@@ -957,5 +1046,22 @@ impl HybridModel for Inkling2 {
             .into_iter()
             .map(|r| r.unwrap_or_else(|| Err(invalid("sequence was not executed"))))
             .collect())
+    }
+    /// The block drafter: context keys and values of every given position from its target
+    /// features, then up to [`crate::hybrid::DraftSequence::drafts`] chained drafts.
+    #[cfg(feature = "metal")]
+    fn draft(
+        &self,
+        batch: &crate::hybrid::DraftForward<'_>,
+    ) -> Result<Vec<Result<Option<Tensor>>>> {
+        let (Some(k), Some(drafter)) = (&self.kernels, &self.drafter) else {
+            return Err(invalid("Inkling 2 was loaded without its drafter"));
+        };
+        if batch.pool.description() != &self.description
+            || !batch.pool.device().same_device(&self.device)
+        {
+            return Err(invalid("state pool belongs to another model or device"));
+        }
+        self.draft_pass(k, drafter, batch)
     }
 }

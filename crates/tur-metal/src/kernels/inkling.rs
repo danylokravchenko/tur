@@ -1,12 +1,14 @@
-//! Inkling 2's kernels: per-head norms, attention residuals over block states, short
-//! causal convolutions whose history lives in recurrent slots, and paged attention with a
-//! learned relative position bias, per-token sinks and a sigmoid output gate.
+//! Inkling 2's kernels: attention residuals over block states, loop-pass message gates,
+//! short causal convolutions whose history lives in recurrent slots (normalizing keys and
+//! values per head), and paged attention that clips its queries and relative states as it
+//! reads them, with a learned relative position bias, per-token sinks and a sigmoid gate.
 use super::{
-    Heads, Kernels, PagedKv, RecurrentSpans,
+    Kernels, PagedKv, RecurrentSpans,
     runtime::{View, to_u32},
 };
 use crate::pool::AttentionPool;
 use candle_core::{DType, Tensor};
+use candle_metal_kernels::metal::ComputeCommandEncoder;
 use tur_core::{
     Result,
     execution::{KvFormat, invalid},
@@ -17,22 +19,6 @@ pub const RESIDUAL_ENTRIES: usize = 8;
 /// Most learned queries of one attention residual.
 pub const RESIDUAL_QUERIES: usize = 4;
 const RESIDUAL_THREADS: usize = 256;
-
-#[repr(C)]
-struct HeadNormParams {
-    tokens: u32,
-    heads: u32,
-    dim: u32,
-    stride: u32,
-    col: u32,
-    mode: u32,
-    scaled: u32,
-    threshold: f32,
-    eps: f32,
-    log_scaled: u32,
-    log_alpha: f32,
-    log_floor: f32,
-}
 
 #[repr(C)]
 struct ResidualParams {
@@ -57,6 +43,19 @@ struct MessageParams {
 }
 
 #[repr(C)]
+struct GateGemvParams {
+    groups: u32,
+    rows: u32,
+    outs: u32,
+    k: u32,
+    per: u32,
+}
+
+/// Most rows per group [`Kernels::gate_projection`] multiplies with its GEMV; each row reads
+/// the weights again, from cache at these sizes.
+pub const GATE_GEMV_ROWS: usize = 16;
+
+#[repr(C)]
 struct ShortConvParams {
     rows: u32,
     channels: u32,
@@ -69,6 +68,11 @@ struct ShortConvParams {
     dyn_col: u32,
     head_dim: u32,
     divisor: f32,
+    residual: u32,
+    res_stride: u32,
+    norm: u32,
+    threshold: f32,
+    eps: f32,
 }
 
 #[repr(C)]
@@ -91,20 +95,20 @@ struct RelativeParams {
     gate_col: u32,
     splits: u32,
     split_keys: u32,
+    q_stride: u32,
+    q_col: u32,
+    q_threshold: f32,
+    rel_threshold: f32,
+    log_scaled: u32,
+    log_alpha: f32,
+    log_floor: f32,
 }
 
-/// How [`Kernels::head_norm`] normalizes each head.
+/// How a normalizing [`Kernels::short_conv`] normalizes each head.
 #[derive(Clone, Copy, Debug)]
-pub enum HeadNorm<'a> {
-    /// Multiply by `scale` (`[heads * dim]`, if any), then shrink the head to L2 norm
-    /// `threshold` when longer: `x * min(threshold / (|x| + 1e-6), 1)`. With `log_scale`,
-    /// also multiply by `1 + alpha * ln(max((position + 1) / floor, 1))` at each token's
-    /// position.
-    Clip {
-        scale: Option<&'a Tensor>,
-        threshold: f32,
-        log_scale: Option<LogScale<'a>>,
-    },
+pub enum HeadNorm {
+    /// Shrink the head to L2 norm `threshold` when longer: `x * min(threshold / (|x| + 1e-6), 1)`.
+    Clip { threshold: f32 },
     /// `x / sqrt(mean(x^2) + eps)`, with no gain.
     Rms { eps: f32 },
 }
@@ -132,15 +136,36 @@ pub struct ShortConv<'a> {
     pub dynamic: Option<(&'a Tensor, usize, usize)>,
     /// What the convolution plus its input is divided by.
     pub divisor: f32,
+    /// `[rows, channels]` rows added to the output, such as the residual stream.
+    pub residual: Option<&'a Tensor>,
+    /// Normalize each head of this many channels afterwards. Excludes `residual`.
+    pub norm: Option<(usize, HeadNorm)>,
 }
 
-/// What [`Kernels::relative_attention`] adds to plain paged attention. Each of `rel`,
-/// `sinks` and `gate` is read in place from projection rows, at the column where its
+/// Most channels per head of a normalizing convolution: one threadgroup holds a head.
+const CONV_NORM_DIM: usize = 1024;
+
+/// Heads read in place from projection rows, multiplied by a scale per dimension and shrunk
+/// to an L2 norm: `x * scale * min(threshold / (|x * scale| + 1e-6), 1)`.
+#[derive(Clone, Copy, Debug)]
+pub struct Clipped<'a> {
+    /// `[tokens, cols]` rows; head 0 starts at column `col`, and heads follow contiguously.
+    pub rows: &'a Tensor,
+    pub col: usize,
+    /// `[heads * dim]` scale.
+    pub scale: &'a Tensor,
+    pub threshold: f32,
+}
+
+/// What [`Kernels::relative_attention`] adds to plain paged attention. The relative states,
+/// `sinks` and `gate` are read in place from projection rows, at the column where their
 /// head 0 starts.
 #[derive(Clone, Copy, Debug)]
 pub struct Relative<'a> {
-    /// `[tokens, heads * rel_dim]` relative states, contiguous.
-    pub rel: &'a Tensor,
+    /// `rel_dim` relative state components per head.
+    pub rel: Clipped<'a>,
+    /// Growth of the queries and relative states in long contexts.
+    pub log_scale: Option<LogScale<'a>>,
     /// `[rel_dim, extent]`: bias of each relative state component by backward distance.
     pub proj: &'a Tensor,
     /// One sink logit per head of each token, from column `sinks.1`.
@@ -227,6 +252,50 @@ impl Kernels {
         self.finish(out, (inputs, tokens, 2 * width))
     }
 
+    /// `x @ w^T` per group for `x` `[groups, rows, k]` F32 and `w` `[groups, outs, k]` BF16:
+    /// F32 accumulation over the exactly widened weights, so BF16-stored loop-gate weights
+    /// multiply as their F32 values do at half the bytes. Up to [`GATE_GEMV_ROWS`] rows per
+    /// group take the GEMV; more convert the weights once and use the matrix multiply.
+    /// Returns `[groups, rows, outs]`.
+    pub fn gate_projection(&self, x: &Tensor, w: &Tensor) -> Result<Tensor> {
+        let (groups, rows, k) = x.dims3()?;
+        let (w_groups, outs, w_k) = w.dims3()?;
+        if (w_groups, w_k) != (groups, k) || w.dtype() != DType::BF16 || outs == 0 || k == 0 {
+            return Err(invalid("gate projection shapes do not match"));
+        }
+        if rows > GATE_GEMV_ROWS {
+            return Ok(x.matmul(&w.to_dtype(DType::F32)?.transpose(1, 2)?)?);
+        }
+        let x = x.reshape((groups * rows, k))?;
+        let w = w.reshape((groups * outs, k))?;
+        let (xv, wv) = (self.view(&x)?, self.runtime.view(&w, DType::BF16)?);
+        xv.contiguous("gate projection input")?;
+        wv.contiguous("gate projection weights")?;
+        // Long rows give each simdgroup one output; short ones four, so a launch stays
+        // a few thousand simdgroups either way.
+        let per = if k >= 256 { 1 } else { 4 };
+        let p = GateGemvParams {
+            groups: to_u32(groups, "groups")?,
+            rows: to_u32(rows, "rows")?,
+            outs: to_u32(outs, "outputs")?,
+            k: to_u32(k, "width")?,
+            per,
+        };
+        let items = groups * rows * outs.div_ceil(per as usize);
+        let pipeline = self.pipeline("inkling_gate_gemv_f32")?;
+        let (launch, threads) = self.simdgroup_launch(pipeline, items);
+        let out = self.output(groups * rows, outs)?;
+        self.runtime
+            .dispatch(pipeline, "tur_inkling_gate_gemv", launch, threads, |e| {
+                xv.bind(e, 0)?;
+                wv.bind(e, 1)?;
+                out.bind(e, 2);
+                e.set_bytes(3, &p);
+                Ok(())
+            })?;
+        self.finish(out, (groups, rows, outs))
+    }
+
     /// Mix each message into its input as [`Self::message_pair`] pairs them:
     /// `x - tanh(forget) * x + tanh(gain) * m`, with `gates` (`[inputs, tokens, 2 * width]`)
     /// holding the forget then the gain columns, then RMS-normalize it with its input's row
@@ -272,78 +341,6 @@ impl Kernels {
             },
         )?;
         self.finish(out, (mv.rows, mv.cols))
-    }
-
-    /// Normalize `heads` of every row of `x`, read in place, into contiguous
-    /// `[rows, heads.count * heads.dim]` rows.
-    pub fn head_norm(&self, x: &Tensor, heads: Heads, norm: HeadNorm<'_>) -> Result<Tensor> {
-        let xv = self.view(x)?;
-        let (count, dim) = (heads.count, heads.dim);
-        if count == 0
-            || dim == 0
-            || heads.head_stride != dim
-            || heads.col_offset + count * dim > xv.cols
-        {
-            return Err(invalid("normalized heads exceed their rows"));
-        }
-        let (mode, scale, threshold, eps, log) = match norm {
-            HeadNorm::Clip {
-                scale,
-                threshold,
-                log_scale,
-            } => (0, scale, threshold, 0.0, log_scale),
-            HeadNorm::Rms { eps } => (1, None, 0.0, eps, None),
-        };
-        if !(threshold.is_finite() && eps.is_finite() && eps >= 0.0)
-            || (mode == 0 && threshold <= 0.0)
-        {
-            return Err(invalid("invalid head norm threshold or epsilon"));
-        }
-        let sv = scale.map(|s| self.view(s)).transpose()?;
-        if let Some(sv) = &sv {
-            sv.contiguous("head norm scale")?;
-            if sv.rows * sv.cols != count * dim {
-                return Err(invalid("head norm scale does not cover its heads"));
-            }
-        }
-        let positions = log
-            .map(|l| {
-                if l.positions.dims() != [xv.rows] || !(l.floor > 0.0 && l.alpha.is_finite()) {
-                    return Err(invalid("log scaling needs one position per row"));
-                }
-                self.runtime.view(l.positions, DType::U32)
-            })
-            .transpose()?;
-        let p = HeadNormParams {
-            tokens: to_u32(xv.rows, "tokens")?,
-            heads: to_u32(count, "heads")?,
-            dim: to_u32(dim, "head dim")?,
-            stride: to_u32(xv.row_stride, "row stride")?,
-            col: to_u32(heads.col_offset, "head column")?,
-            mode,
-            scaled: u32::from(sv.is_some()),
-            threshold,
-            eps,
-            log_scaled: u32::from(log.is_some()),
-            log_alpha: log.map_or(0.0, |l| l.alpha),
-            log_floor: log.map_or(1.0, |l| l.floor),
-        };
-        let out = self.output(xv.rows, count * dim)?;
-        let pipeline = self.pipeline("inkling_head_norm_f32")?;
-        let (groups, threads) = self.simdgroup_launch(pipeline, xv.rows * count);
-        self.runtime
-            .dispatch(pipeline, "tur_inkling_head_norm", groups, threads, |e| {
-                xv.bind(e, 0)?;
-                out.bind(e, 1);
-                sv.as_ref().unwrap_or(&xv).bind(e, 2)?;
-                match &positions {
-                    Some(view) => view.bind(e, 3)?,
-                    None => xv.bind(e, 3)?,
-                }
-                e.set_bytes(4, &p);
-                Ok(())
-            })?;
-        self.finish(out, (xv.rows, count * dim))
     }
 
     /// Attention of each of `queries` (`[queries, width]`) over every token's block states
@@ -453,7 +450,32 @@ impl Kernels {
                 }
                 (view.row_stride, col, head_dim)
             }
-            _ => (0, 0, 1),
+            _ => (0, 0, conv.norm.map_or(1, |(dim, _)| dim)),
+        };
+        let rv = conv.residual.map(|r| self.view(r)).transpose()?;
+        if let Some(rv) = &rv {
+            rv.expect(xv.rows, channels, "convolution residual")?;
+        }
+        let (norm, threshold, eps) = match conv.norm {
+            None => (0, 0.0, 0.0),
+            Some((dim, norm)) => {
+                let (mode, threshold, eps) = match norm {
+                    HeadNorm::Clip { threshold } if threshold.is_finite() && threshold > 0.0 => {
+                        (0, threshold, 0.0)
+                    }
+                    HeadNorm::Rms { eps } if eps.is_finite() && eps >= 0.0 => (1, 0.0, eps),
+                    _ => return Err(invalid("invalid convolution norm threshold or epsilon")),
+                };
+                if dim != head_dim
+                    || dim == 0
+                    || dim > CONV_NORM_DIM
+                    || !channels.is_multiple_of(dim)
+                    || rv.is_some()
+                {
+                    return Err(invalid("normalized convolution heads do not fit"));
+                }
+                (mode, threshold, eps)
+            }
         };
         let p = ShortConvParams {
             rows: to_u32(xv.rows, "rows")?,
@@ -467,6 +489,11 @@ impl Kernels {
             dyn_col: to_u32(dyn_col, "dynamic column")?,
             head_dim: to_u32(head_dim, "head dim")?,
             divisor: conv.divisor,
+            residual: u32::from(rv.is_some()),
+            res_stride: to_u32(rv.as_ref().map_or(0, |r| r.row_stride), "residual stride")?,
+            norm,
+            threshold,
+            eps,
         };
         let count = xv.rows * channels;
         to_u32(count, "elements")?;
@@ -474,85 +501,116 @@ impl Kernels {
         let rows = self.runtime.view(&spans.rows, DType::U32)?;
         let slot_list = self.runtime.view(&spans.slots, DType::U32)?;
         let out = self.output(xv.rows, channels)?;
-        let pipeline = self.pipeline("inkling_short_conv_f32")?;
-        let threads = pipeline.threads(self.tuning.elementwise_threads);
-        self.runtime.dispatch(
-            pipeline,
-            "tur_inkling_short_conv",
-            count.div_ceil(threads),
-            threads,
-            |e| {
-                xv.bind(e, 0)?;
-                hv.bind_mut(e, 1)?;
-                tv.bind(e, 2)?;
-                out.bind(e, 3);
-                e.set_bytes(4, &p);
-                table.bind(e, 5)?;
-                rows.bind(e, 6)?;
-                slot_list.bind(e, 7)?;
-                dv.as_ref().unwrap_or(&xv).bind(e, 8)?;
-                Ok(())
-            },
-        )?;
+        let bind = |e: &ComputeCommandEncoder| -> Result<()> {
+            xv.bind(e, 0)?;
+            hv.bind_mut(e, 1)?;
+            tv.bind(e, 2)?;
+            out.bind(e, 3);
+            e.set_bytes(4, &p);
+            table.bind(e, 5)?;
+            rows.bind(e, 6)?;
+            slot_list.bind(e, 7)?;
+            dv.as_ref().unwrap_or(&xv).bind(e, 8)?;
+            Ok(())
+        };
+        if conv.norm.is_some() {
+            // A threadgroup per head, a thread per channel; whole simdgroups for the reduction.
+            let pipeline = self.pipeline("inkling_short_conv_norm_f32")?;
+            if !head_dim.is_multiple_of(32) || pipeline.threads(head_dim) != head_dim {
+                return Err(invalid(
+                    "normalized convolution heads do not fit a threadgroup",
+                ));
+            }
+            self.runtime.dispatch(
+                pipeline,
+                "tur_inkling_short_conv_norm",
+                xv.rows * channels / head_dim,
+                head_dim,
+                bind,
+            )?;
+        } else {
+            let pipeline = self.pipeline("inkling_short_conv_f32")?;
+            let threads = pipeline.threads(self.tuning.elementwise_threads);
+            self.runtime.dispatch(
+                pipeline,
+                "tur_inkling_short_conv",
+                count.div_ceil(threads),
+                threads,
+                |e| {
+                    bind(e)?;
+                    // Unread without a residual, but every declared buffer must be bound.
+                    rv.as_ref().unwrap_or(&xv).bind(e, 9)
+                },
+            )?;
+        }
         self.finish(out, (xv.rows, channels))
     }
 
-    /// Paged attention of contiguous `[tokens, heads, dim]` queries over `pool`, with each
-    /// score `q · k * scale` plus the learned bias at its backward distance, a sink logit
-    /// per token and head in each softmax, and the output gated by `sigmoid(gate)`.
-    /// Windowed layers read the last `window` keys. Returns `[tokens, heads * dim]`.
-    pub fn relative_attention(
+    /// Validated parameters of [`Self::relative_attention`], without its split.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one check or field per kernel input; splitting would only scatter them"
+    )]
+    fn relative_params(
         &self,
-        q: &Tensor,
+        (q, heads): (&Clipped<'_>, usize),
         pool: &AttentionPool,
         kv: &PagedKv,
-        relative: Relative<'_>,
-    ) -> Result<Tensor> {
-        let (tokens, heads, dim) = q.dims3()?;
-        let kv_heads = pool.kv_heads;
+        relative: &Relative<'_>,
+    ) -> Result<RelativeParams> {
+        let (tokens, kv_heads, dim) = (kv.tokens, pool.kv_heads, pool.head_dim);
         let [rel_dim, extent] = relative.proj.dims() else {
             return Err(invalid("relative bias projection is not a matrix"));
         };
         let (rel_dim, extent) = (*rel_dim, *extent);
-        let qv = self.view(q)?;
-        let rv = self.view(relative.rel)?;
-        let pv = self.view(relative.proj)?;
-        let sv = self.view(relative.sinks.0)?;
-        let gv = self.view(relative.gate.0)?;
-        qv.contiguous("queries")?;
-        rv.contiguous("relative states")?;
-        pv.contiguous("relative bias projection")?;
+        let (qv, rv) = (self.view(q.rows)?, self.view(relative.rel.rows)?);
+        let (sv, gv) = (self.view(relative.sinks.0)?, self.view(relative.gate.0)?);
+        self.view(relative.proj)?
+            .contiguous("relative bias projection")?;
+        let scales = [
+            (q.scale, heads * dim),
+            (relative.rel.scale, heads * rel_dim),
+        ];
+        for (scale, len) in scales {
+            let view = self.view(scale)?;
+            view.contiguous("clip scale")?;
+            if view.rows * view.cols != len {
+                return Err(invalid("clip scale does not cover its heads"));
+            }
+        }
+        // Each lane loads its query dimensions as aligned vectors of up to four floats.
+        let aligned = qv.row_stride.is_multiple_of(4) && q.col.is_multiple_of(4);
         if kv_heads == 0
+            || heads == 0
             || !heads.is_multiple_of(kv_heads)
-            || pool.head_dim != dim
             || kv.page != pool.page_tokens
-            || tokens != kv.tokens
+            || !aligned
+            || qv.rows != tokens
+            || q.col + heads * dim > qv.cols
             || rel_dim == 0
             || rel_dim > 32
             || extent == 0
             || rv.rows != tokens
-            || rv.cols != heads * rel_dim
+            || relative.rel.col + heads * rel_dim > rv.cols
             || sv.rows != tokens
             || relative.sinks.1 + heads > sv.cols
             || gv.rows != tokens
             || relative.gate.1 + heads * dim > gv.cols
             || relative.window == Some(0)
             || !(relative.scale.is_finite() && relative.scale > 0.0)
+            || ![q.threshold, relative.rel.threshold]
+                .iter()
+                .all(|t| t.is_finite() && *t > 0.0)
         {
             return Err(invalid("relative attention shapes do not match"));
         }
-        let (k_data, k_scales) = self.kv_views(&pool.key, pool.format, kv.slots, kv_heads, dim)?;
-        let (v_data, v_scales) =
-            self.kv_views(&pool.value, pool.format, kv.slots, kv_heads, dim)?;
-        let table = self.runtime.view(&kv.table, DType::U32)?;
-        let first = self.runtime.view(&kv.first_block, DType::U32)?;
-        let visible = self.runtime.view(&kv.visible, DType::U32)?;
-        // A query reads at most `window` keys, from its window's first key.
-        let span = relative
-            .window
-            .map_or(kv.max_visible, |w| kv.max_visible.min(w));
-        let split = self.attention_split(tokens, heads, span);
-        let p = RelativeParams {
+        if let Some(l) = relative.log_scale
+            && (l.positions.dims() != [tokens] || !(l.floor > 0.0 && l.alpha.is_finite()))
+        {
+            return Err(invalid("log scaling needs one position per query"));
+        }
+        let log = relative.log_scale;
+        Ok(RelativeParams {
             tokens: to_u32(tokens, "tokens")?,
             heads: to_u32(heads, "heads")?,
             kv_heads: to_u32(kv_heads, "kv heads")?,
@@ -564,14 +622,62 @@ impl Kernels {
             rel_dim: to_u32(rel_dim, "relative dim")?,
             extent: to_u32(extent, "relative extent")?,
             rel_stride: to_u32(rv.row_stride, "relative stride")?,
-            rel_col: 0,
+            rel_col: to_u32(relative.rel.col, "relative column")?,
             sink_stride: to_u32(sv.row_stride, "sink stride")?,
             sink_col: to_u32(relative.sinks.1, "sink column")?,
             gate_stride: to_u32(gv.row_stride, "gate stride")?,
             gate_col: to_u32(relative.gate.1, "gate column")?,
-            splits: to_u32(split.splits, "splits")?,
-            split_keys: to_u32(split.split_keys, "split keys")?,
-        };
+            splits: 1,
+            split_keys: 0,
+            q_stride: to_u32(qv.row_stride, "query stride")?,
+            q_col: to_u32(q.col, "query column")?,
+            q_threshold: q.threshold,
+            rel_threshold: relative.rel.threshold,
+            log_scaled: u32::from(log.is_some()),
+            log_alpha: log.map_or(0.0, |l| l.alpha),
+            log_floor: log.map_or(1.0, |l| l.floor),
+        })
+    }
+
+    /// Paged attention of `heads` queries per token over `pool`, the queries read from
+    /// projection rows and clipped as `q` says, with each score `q · k * scale` plus the
+    /// learned bias at its backward distance, a sink logit per token and head in each
+    /// softmax, and the output gated by `sigmoid(gate)`. Windowed layers read the last
+    /// `window` keys. Returns `[tokens, heads * dim]`.
+    pub fn relative_attention(
+        &self,
+        (q, heads): (Clipped<'_>, usize),
+        pool: &AttentionPool,
+        kv: &PagedKv,
+        relative: Relative<'_>,
+    ) -> Result<Tensor> {
+        let mut p = self.relative_params((&q, heads), pool, kv, &relative)?;
+        let (tokens, kv_heads, dim) = (kv.tokens, pool.kv_heads, pool.head_dim);
+        let qv = self.view(q.rows)?;
+        let rv = self.view(relative.rel.rows)?;
+        let pv = self.view(relative.proj)?;
+        let sv = self.view(relative.sinks.0)?;
+        let gv = self.view(relative.gate.0)?;
+        let (qs, rs) = (self.view(q.scale)?, self.view(relative.rel.scale)?);
+        let positions = relative
+            .log_scale
+            .map(|l| self.runtime.view(l.positions, DType::U32))
+            .transpose()?;
+        let (k_data, k_scales) = self.kv_views(&pool.key, pool.format, kv.slots, kv_heads, dim)?;
+        let (v_data, v_scales) =
+            self.kv_views(&pool.value, pool.format, kv.slots, kv_heads, dim)?;
+        let table = self.runtime.view(&kv.table, DType::U32)?;
+        let first = self.runtime.view(&kv.first_block, DType::U32)?;
+        let visible = self.runtime.view(&kv.visible, DType::U32)?;
+        // A query reads at most `window` keys, from its window's first key.
+        let span = relative
+            .window
+            .map_or(kv.max_visible, |w| kv.max_visible.min(w));
+        let split = self.attention_split(tokens, heads, span);
+        (p.splits, p.split_keys) = (
+            to_u32(split.splits, "splits")?,
+            to_u32(split.split_keys, "split keys")?,
+        );
         let items = tokens * heads;
         let pipeline = self.pipeline(&Self::kv_kernel("inkling_attention", dim, pool.format)?)?;
         let (groups, threads) = self.simdgroup_launch(pipeline, items * split.splits);
@@ -605,6 +711,10 @@ impl Kernels {
                 let (partial, stats) = scratch.as_ref().map_or((&out, &out), |(p, s)| (p, s));
                 partial.bind(e, 14);
                 stats.bind(e, 15);
+                qs.bind(e, 16)?;
+                rs.bind(e, 17)?;
+                // Unread without log scaling.
+                positions.as_ref().unwrap_or(&qv).bind(e, 18)?;
                 Ok(())
             })?;
         if let Some((partial, stats)) = &scratch {

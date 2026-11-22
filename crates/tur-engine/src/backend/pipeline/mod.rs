@@ -120,6 +120,9 @@ struct Pending {
     /// recomputed first: a restored snapshot's entry read another next token.
     head_seed: Option<Tensor>,
     mtp_drafts: Vec<Draft>,
+    /// Cumulative calibrated acceptance of each draft verification kept from the head's last
+    /// chain: what a block head's next chain is expected to add.
+    head_reach: Vec<f64>,
     mtp_acceptance: Acceptance,
     /// Confidences of the head's drafts verified by the pass in flight.
     mtp_verifying: Vec<f32>,

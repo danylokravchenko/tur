@@ -75,6 +75,51 @@ struct Published {
     architectures: Vec<String>,
     eos_token_id: serde_json::Value,
     text_config: Text,
+    #[serde(default)]
+    mtp_config: Option<Mtp>,
+}
+
+/// The block drafter in `mtp.safetensors` (DSpark): an anchor and `block_size - 1` mask
+/// rows run through a small dense decoder over keys and values projected from target
+/// features, then a recurrent head adds a bias from each previous draft.
+#[derive(Clone, Debug, Deserialize)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "mirrors the checkpoint's mtp_config keys"
+)]
+pub(super) struct Mtp {
+    hidden_size: usize,
+    pub(super) num_hidden_layers: usize,
+    pub(super) num_attention_heads: usize,
+    pub(super) num_key_value_heads: usize,
+    pub(super) head_dim: usize,
+    pub(super) intermediate_size: usize,
+    pub(super) rms_norm_eps: f64,
+    pub(super) rope_theta: f64,
+    local_layer_ids: Vec<usize>,
+    sliding_window_size: usize,
+    pub(super) block_size: usize,
+    pub(super) markov_rank: usize,
+    markov_head_type: String,
+    /// Layer applications (loop passes counted) whose input stream the drafter reads, then
+    /// the number of applications, which names the final-normed output.
+    pub(super) target_layer_ids: Vec<usize>,
+    #[serde(default)]
+    q_bias: bool,
+    #[serde(default)]
+    o_bias: bool,
+}
+
+impl Mtp {
+    /// Whether draft layer `i` reads only the window before its block.
+    pub(super) fn sliding(&self, layer: usize) -> bool {
+        self.local_layer_ids.contains(&layer)
+    }
+
+    /// Target features each committed position contributes.
+    pub(super) fn features(&self) -> usize {
+        self.target_layer_ids.len()
+    }
 }
 
 /// How one layer's routed experts are stored.
@@ -120,6 +165,9 @@ pub struct Config {
     pub(super) text: Text,
     eos: Vec<u32>,
     experts: Option<Vec<ExpertFormat>>,
+    draft: Option<Mtp>,
+    /// Whether the drafter is loaded ([`Self::with_mtp`]).
+    mtp: bool,
 }
 
 /// Most states one attention residual reads: the bound of the Metal residual kernel.
@@ -157,7 +205,63 @@ impl Config {
             text: published.text_config,
             eos,
             experts: None,
+            draft: published.mtp_config,
+            mtp: false,
         })
+    }
+
+    /// Whether the checkpoint declares a drafter this code runs ([`Mtp`]).
+    pub fn supports_mtp(&self) -> bool {
+        self.draft
+            .as_ref()
+            .is_some_and(|d| self.check_mtp(d).is_ok())
+    }
+
+    /// Also load and run the drafter, whose keys and values add one state layer per draft
+    /// layer after the text layers.
+    pub fn with_mtp(self) -> Result<Self> {
+        let draft = self
+            .draft
+            .as_ref()
+            .ok_or_else(|| invalid("checkpoint declares no Inkling 2 drafter (mtp_config)"))?;
+        self.check_mtp(draft)?;
+        Ok(Self { mtp: true, ..self })
+    }
+
+    /// The loaded drafter's settings.
+    pub(super) fn mtp(&self) -> Option<&Mtp> {
+        self.draft.as_ref().filter(|_| self.mtp)
+    }
+
+    /// The drafter shares the target's embedding, unembedding, residual width and window,
+    /// and reads features at layer applications the target runs.
+    fn check_mtp(&self, d: &Mtp) -> Result<()> {
+        let t = &self.text;
+        let applications = self.applications().len();
+        let ids = &d.target_layer_ids;
+        if d.hidden_size != t.hidden_size
+            || d.markov_head_type != "rnn_hidden"
+            || d.q_bias
+            || d.o_bias
+            || d.num_hidden_layers == 0
+            || d.local_layer_ids.iter().any(|&i| i >= d.num_hidden_layers)
+            || (!d.local_layer_ids.is_empty() && d.sliding_window_size != t.sliding_window_size)
+            || d.block_size < 2
+            || d.markov_rank == 0
+            || d.intermediate_size == 0
+            || d.num_key_value_heads == 0
+            || !d.num_attention_heads.is_multiple_of(d.num_key_value_heads)
+            || d.head_dim == 0
+            || !d.head_dim.is_multiple_of(2)
+            || !(d.rope_theta.is_finite() && d.rope_theta > 1.0)
+            || !(d.rms_norm_eps.is_finite() && d.rms_norm_eps > 0.0)
+            || d.features() < 2
+            || ids.windows(2).any(|w| w[0] >= w[1])
+            || ids.last() != Some(&applications)
+        {
+            return Err(invalid("unsupported Inkling 2 drafter settings"));
+        }
+        Ok(())
     }
 
     fn validate(t: &Text) -> Result<()> {
@@ -410,6 +514,22 @@ impl Config {
             vocab_size: self.vocab_size(),
             max_position: self.max_position(),
         };
+        let description = match self.mtp() {
+            None => description,
+            Some(d) => {
+                let mut description = description;
+                description.identity.revision.push_str("+mtp");
+                // The drafter's context keys and values, after every application's layers.
+                description.layers.extend((0..d.num_hidden_layers).map(|i| {
+                    LayerStateKind::Attention {
+                        kv_heads: d.num_key_value_heads,
+                        head_dim: d.head_dim,
+                        window: d.sliding(i).then_some(t.sliding_window_size),
+                    }
+                }));
+                description
+            }
+        };
         description.validate()?;
         Ok(description)
     }
@@ -570,8 +690,8 @@ impl Config {
         Ok(shapes)
     }
 
-    /// F32 elements the model keeps besides projections, the embedding and expert
-    /// banks: norms, scales, convolution taps, routers, residual queries, message gates and
+    /// F32 elements the model keeps besides projections, the embedding, expert banks and the
+    /// BF16 message gates: norms, scales, convolution taps, routers, residual queries and
     /// two factors per expert of every layer.
     pub(super) fn resident_f32_elements(&self) -> Result<usize> {
         let projected: std::collections::BTreeSet<String> = self
@@ -584,6 +704,7 @@ impl Config {
             let expert_part = name.contains(".mlp.experts.");
             if kind != Stored::Float
                 || expert_part
+                || name.contains(CONTROLLERS)
                 || projected.contains(&name)
                 || name == format!("{PREFIX}.embed.weight")
             {
@@ -602,6 +723,23 @@ impl Config {
             .ok_or_else(|| invalid("Inkling 2 weight size overflow"))
     }
 }
+
+impl Config {
+    /// BF16 elements the model keeps as stored: the loop-pass message gates.
+    pub(super) fn resident_bf16_elements(&self) -> Result<usize> {
+        self.weight_shapes()?
+            .iter()
+            .filter(|(name, _)| name.contains(CONTROLLERS))
+            .try_fold(0usize, |total, (_, (shape, _))| {
+                total
+                    .checked_add(checked_elements(shape)?)
+                    .ok_or_else(|| invalid("Inkling 2 weight size overflow"))
+            })
+    }
+}
+
+/// Infix of the loop-pass message gates' tensors.
+const CONTROLLERS: &str = ".controllers.";
 
 /// What a checkpoint tensor holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

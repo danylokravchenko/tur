@@ -96,6 +96,12 @@ python -I scripts/inkling2_reference.py --model "$TUR_INKLING2_MINI" --golden "$
 just test-checkpoint -j1 -E 'test(inkling2_mini)'
 ```
 
+Transformers doesn't run Inkling 2's drafter. Its fixture weights and golden come from the same script's F32 transcription of vLLM's drafter, which reads the tiny fixture's application inputs and adds `mtp_config` to its config:
+
+```sh
+python -I scripts/inkling2_reference.py --tiny-mtp crates/tur/tests/fixtures/inkling2
+```
+
 The image tests need an image file and goldens from `scripts/vision_reference.py`. The Qwen test compares F32 soft tokens and the whole greedy answer with Transformers; the Gemma test compares the Q8_0 tower by cosine similarity.
 
 ```sh

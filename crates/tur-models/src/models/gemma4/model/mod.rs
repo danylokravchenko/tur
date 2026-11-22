@@ -565,6 +565,11 @@ impl Gemma4 {
         self.fused.as_ref().map(|f| &f.kernels)
     }
     /// Device holding the immutable weights.
+    /// Whether an assistant drafter is loaded.
+    pub fn has_assistant(&self) -> bool {
+        self.assistant.is_some()
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }

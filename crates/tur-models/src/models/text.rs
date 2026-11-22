@@ -93,7 +93,7 @@ impl ModelConfig {
             // The assistant is a separate checkpoint, loaded from the draft head's directory.
             Self::Gemma4(c) => Ok(Self::Gemma4(c)),
             Self::GptOss(_) => Err(invalid("gpt-oss has no draft head")),
-            Self::Inkling2(_) => Err(invalid("Inkling 2's draft head is not supported")),
+            Self::Inkling2(c) => Ok(Self::Inkling2(c.with_mtp()?)),
         }
     }
     /// Whether the model loaded with `options` replays speculative passes
@@ -228,6 +228,20 @@ impl TextModel {
             Media::Image(_) => self.image_prompt(),
             Media::Video(_) => self.video_prompt(),
         }
+    }
+    /// The loaded draft head's behavior; `None` without one.
+    pub fn draft_head(&self) -> Option<super::HeadKind> {
+        let (loaded, keyed, chains, block) = match self {
+            Self::Qwen35(m) => (m.has_mtp(), true, false, false),
+            Self::Gemma4(m) => (m.has_assistant(), false, true, false),
+            Self::GptOss(_) => (false, false, false, false),
+            Self::Inkling2(m) => (m.has_drafter(), true, true, true),
+        };
+        loaded.then_some(super::HeadKind {
+            keyed,
+            chains,
+            block,
+        })
     }
     /// The token a soft-token position feeds the model, under its embedded row.
     pub fn media_slot(&self) -> Option<u32> {

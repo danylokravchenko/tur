@@ -637,15 +637,24 @@ Prefill is level, with llama.cpp 1 to 3% ahead. Both engines are limited by comp
 
 Inkling 2 Mini runs 48 layer applications per token, because its middle 12 layers loop three times, and each application routes the token to 8 of 128 experts. Decode therefore reads about 36 MB of NVFP4 or MXFP8 experts and about 29 MB of Q8_0 attention projections per application, plus a 490 MB unembedding, roughly twice what a Qwen3.6-35B-A3B token reads. The rows below load the pinned `thinkingmachines/Inkling-2-Mini` snapshot's SafeTensors directly, with the experts as published and the projections converted at load time.
 
-The machine is the M3 Pro described above, on macOS 27.2, with F16 K/V. Figures come from the `model` benchmark (median of 12 decode steps or 2 to 4 prefill passes):
+The machine is the M3 Pro described above, on macOS 27.2, with F16 K/V. Figures come from the `model` benchmark (median of 12 decode steps or 2 to 4 prefill passes). A background indexing process ran during these measurements, and repeats varied by up to 3%:
 
 | Case | Q8_0 projections | Q4K projections |
 | --- | --- | --- |
-| Prefill, 512 tokens | 328 tokens/s | 323 tokens/s |
-| Prefill, 2,048 tokens | 292 tokens/s | |
-| Decode, 1 sequence at 128 tokens | 21.2 tokens/s (47.1 ms per step) | 24.4 tokens/s (41.0 ms) |
-| Decode, 4 sequences at 128 tokens | 41.9 tokens/s | 46.1 tokens/s |
-| Decode, 1 sequence at 4K tokens | 20.3 tokens/s | 22.7 tokens/s |
-| Load time | 8.5 s | 16.1 s |
+| Prefill, 512 tokens | 327 tokens/s | 319 tokens/s |
+| Prefill, 2,048 tokens | 294 tokens/s | |
+| Decode, 1 sequence at 128 tokens | 21.7 tokens/s (46.0 ms per step) | 25.2 tokens/s (39.7 ms) |
+| Decode, 4 sequences at 128 tokens | 44.5 tokens/s | 46.9 tokens/s |
+| Decode, 1 sequence at 4K tokens | 21.0 tokens/s | 23.9 tokens/s |
+| Load time | 8.7 s | 17.4 s |
 
-With one sequence, removing a part of the step and timing the rest attributes 18.7 ms to the experts and 13.9 ms to attention, close to what reading their weights costs at this Mac's bandwidth, so Q4K projections are the remaining lever for one sequence. Splitting keys across simdgroups keeps decode at 4K tokens within 5% of decode at 128; before the split, one sequence at 4K took 77 ms per step. A 2,048-token prefill spends about half its time in the experts, which do three times the arithmetic per token of Qwen3.6-35B-A3B's, and about 30% in the per-query attention kernel.
+With one sequence, removing a part of the step and timing the rest attributes about 19 ms to the experts and 14 ms to attention, close to what reading their weights costs at this Mac's bandwidth, so Q4K projections are the remaining lever for one sequence. Splitting keys across simdgroups keeps decode at 4K tokens within 5% of decode at 128; before the split, one sequence at 4K took 77 ms per step. A 2,048-token prefill spends about half its time in the experts, which do three times the arithmetic per token of Qwen3.6-35B-A3B's, and about 30% in the per-query attention kernel.
+
+The drafter (`--mtp --speculative-draft 7`) through the `serving` benchmark's speculation workload, one greedy request with 128 output tokens, against the same pipeline without drafting:
+
+| Prompt | Without drafting | With the drafter |
+| --- | --- | --- |
+| New prose | 20.8 to 21.0 tokens/s | 25.0 to 25.3 tokens/s |
+| Code | 20.7 to 20.9 tokens/s | 24.4 to 32.3 tokens/s |
+
+Outputs matched normal decoding token for token. A verified draft costs about 14 ms, because each row of the verification pass brings 8 more experts into every layer application, so the head pays mostly where its drafts are confident, as in code. The spread across repeats comes from calibration and cost estimates settling within a run.
